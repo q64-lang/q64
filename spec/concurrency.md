@@ -208,8 +208,10 @@ scope {
 
 `Cancelled` is the auto-prelude payload type from
 [`errors.md` §"Auto-prelude payload types"](./errors.md); it fits
-`Panic` with `code = some("CONC011")`. Cancellation observation
-unwinds the task — it does not consume a recoverable-error slot in
+`Panic` with `code() = none` — cancellation is a runtime
+control-flow event, not a diagnostic, and the `CONC*` codes are
+reserved for compile-time diagnostics. Cancellation observation
+unwinds the task; it does not consume a recoverable-error slot in
 the function's return type.
 
 `Cancel` is an opaque value of type `Cancel`. `ctx.cancelled()`
@@ -253,8 +255,7 @@ Code that must complete (releasing a lock, flushing a buffer)
 opts out of cancellation observation:
 
 ```q64
-@uncancellable
-fn flush_journal(env: Env, j: ref Journal) {
+fn flush_journal(env: Env, j: ref Journal) @uncancellable {
     db.write_all(env, j.pending)        // no Cancelled panic even if ctx flips
 }
 ```

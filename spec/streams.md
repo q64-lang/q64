@@ -555,8 +555,8 @@ graph is allowed; only the `@realtime` segment pins.
 The compiler verifies effect compatibility across `|>`:
 
 ```q64
-@stage @realtime
-fn play(pcm: Signal<PCM<f32>, 48.kHz>) { … }
+@stage
+fn play(pcm: Signal<PCM<f32>, 48.kHz>) @realtime { … }
 
 @stage
 fn http_post(env: Env, url: Url, body: Bytes) { … }       // not @realtime
@@ -630,8 +630,8 @@ fn counter(clicks: Event<()>) -> Signal<i64, 60.Hz> {
     clicks.fold(0, |n, _| n + 1)
 }
 
-@stage @realtime @fuse
-fn render(count: Signal<i64, 60.Hz>) -> Signal<Frame, 60.Hz> {
+@stage @fuse
+fn render(count: Signal<i64, 60.Hz>) -> Signal<Frame, 60.Hz> @realtime {
     count.map(|n| render_button(text: "Clicks: {n}"))
 }
 

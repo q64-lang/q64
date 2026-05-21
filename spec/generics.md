@@ -205,13 +205,19 @@ argument is omitted at the use site.
 ```q64
 pub struct Vec<T, R: Region = Arena>
 pub struct Map<K: Eq + Hash, V, R: Region = Arena>
-pub fn channel<T, const N: i64 = 16, P: Policy = Backpressure>(
-) -> (Sender<T>, Receiver<T>) { ... }
+pub struct Box<T, R: Region = Arena>
 
-let v: Vec<i64> = Vec.new()                  // R defaults to Arena
+let v: Vec<i64>      = Vec.new()             // R defaults to Arena
 let m: Map<str, i64> = Map.new()             // R defaults to Arena
-let (tx, rx) = channel<Frame>()              // N=16, P=Backpressure
+let b: Box<i64>      = Box.new(42)           // R defaults to Arena
 ```
+
+Region-defaulting is the most common case. Other parameter kinds
+take defaults the same way; per
+[`concurrency.md` §"`channel<T>(…)` construction"](./concurrency.md),
+the channel constructor deliberately does **not** default its
+`policy:` argument — every channel construction states its
+bounded / overwriting / blocking choice (`CONC050`).
 
 ### Rules
 
