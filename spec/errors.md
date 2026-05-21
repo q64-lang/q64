@@ -37,7 +37,7 @@ type, `try` for propagation, `panic` / `trap` for fatal bugs, and
 | Word        | Meaning                                                                  |
 |-------------|--------------------------------------------------------------------------|
 | `Result<T, E>` | Tagged union — either `Ok(T)` or `Err(E)`.                            |
-| `Option<T>` / `T?` | Tagged union — either `some(T)` or `none`. Sugar: `T?` ≡ `Option<T>`. |
+| `Option<T>` / `T?` | Tagged union — either `Some(T)` or `None`. Sugar: `T?` ≡ `Option<T>`. |
 | **try**     | Prefix keyword; propagates `Err` to the enclosing function.              |
 | **panic**   | Structured user-level unwind with a typed payload (fits `Panic`).        |
 | **trap**    | Bare Wasm trap. Immediate halt, no payload, no unwind, no allocation.    |
@@ -57,16 +57,16 @@ pub enum Result<T, E> {
 }
 
 pub enum Option<T> {
-    some(T),
-    none,
+    Some(T),
+    None,
 }
 
 pub type T? = Option<T>          // sugar
 ```
 
-Constructor casing matches the convention from `example.md` (`Ok` /
-`Err` capitalized, `some` / `none` lowercase to match their use as
-sentinels).
+Constructor casing is PascalCase throughout — `Ok` / `Err` /
+`Some` / `None` follow the same rule as every other enum variant
+in the spec (`Increment`, `Get`, `Io`, `Cancelled`, `Rgb`, …).
 
 ## The `try` keyword
 
@@ -117,7 +117,7 @@ error). q64 does not include either in v0. The same effects are
 achievable with explicit code:
 
 ```q64
-let maybe: T?  = match fallible() { Ok(v) -> some(v), Err(_) -> none }   // ≈ try?
+let maybe: T?  = match fallible() { Ok(v) -> Some(v), Err(_) -> None }   // ≈ try?
 let v:     T   = fallible().unwrap_or_panic()                            // ≈ try!
 ```
 
@@ -199,7 +199,7 @@ never `panic`.
 
 ```q64
 pub face Error : Display {
-    fn source(self) -> Option<&dyn Error> { none }      // default: no inner error
+    fn source(self) -> Option<&dyn Error> { None }      // default: no inner error
 }
 ```
 
@@ -228,8 +228,8 @@ pub fit LoadConfigError : Display {
 pub fit LoadConfigError : Error {
     fn source(self) -> Option<&dyn Error> {
         match self {
-            Io(e)    -> some(&e),
-            Parse(e) -> some(&e),
+            Io(e)    -> Some(&e),
+            Parse(e) -> Some(&e),
         }
     }
 }
@@ -262,7 +262,7 @@ a legal payload.
 
 ```q64
 pub face Panic : Display {
-    fn code(self) -> Option<str> { none }      // default: no diagnostic code
+    fn code(self) -> Option<str> { None }      // default: no diagnostic code
 }
 ```
 
@@ -279,8 +279,8 @@ The language ships four blessed `Panic`-fitting types:
 | Type            | Shape                                  | Where it comes from                                                      |
 |-----------------|----------------------------------------|--------------------------------------------------------------------------|
 | `PanicMessage`  | `struct PanicMessage(str)`             | `panic "string"` desugars to `panic(PanicMessage(s))`.                    |
-| `Cancelled`     | `struct Cancelled`                     | Cancellation observation in `@cancel` functions; the implicit `select` cancellation branch; cancel-aware channel ops. `code()` returns `none` (cancellation is a runtime control-flow event, not a diagnostic). |
-| `Closed`        | `struct Closed`                        | A blocking `recv(ctx)` on a closed-and-empty channel (per [`concurrency.md` §"`Sender<T, P>` and `Receiver<T, P>` API"](./concurrency.md)). `code()` returns `none`. |
+| `Cancelled`     | `struct Cancelled`                     | Cancellation observation in `@cancel` functions; the implicit `select` cancellation branch; cancel-aware channel ops. `code()` returns `None` (cancellation is a runtime control-flow event, not a diagnostic). |
+| `Closed`        | `struct Closed`                        | A blocking `recv(ctx)` on a closed-and-empty channel (per [`concurrency.md` §"`Sender<T, P>` and `Receiver<T, P>` API"](./concurrency.md)). `code()` returns `None`. |
 | `RuntimeDenied` | `struct RuntimeDenied { code: str, detail: str }` | Runtime-emitted denials such as `with_capabilities` (`ENV030`). The `code` and `detail` fields back the values seen on `Panic`-bound catch variables. |
 
 All three are in the auto-prelude (no import required). User code may
@@ -296,7 +296,7 @@ pub fit ParseLimitExceeded : Display {
     fn fmt(self) -> str { "parse limit exceeded in {self.file} ({self.bytes} bytes)" }
 }
 pub fit ParseLimitExceeded : Panic {
-    fn code(self) -> Option<str> { some("PARSE_LIMIT") }
+    fn code(self) -> Option<str> { Some("PARSE_LIMIT") }
 }
 ```
 
@@ -343,7 +343,7 @@ blanket fit:
 // Conceptual; the compiler generates this automatically for every Error type.
 pub fit T : Panic where T: Error {
     fn fmt(self) -> str { Error.fmt(self) }
-    fn code(self) -> Option<str> { none }
+    fn code(self) -> Option<str> { None }
 }
 ```
 
@@ -361,7 +361,7 @@ Consequences:
   arm sees it through the `Panic` face.
 - The bridge can be **shadowed** by an explicit `fit T : Panic { … }`
   on a specific error type when the default `Error.fmt` /
-  `none`-coded behavior isn't right; this is the conventional
+  `None`-coded behavior isn't right; this is the conventional
   override path. Two competing fits (the bridge and an explicit
   one) resolve in favor of the explicit fit (per `faces.md`'s
   coherence rules).
@@ -440,10 +440,10 @@ Equivalent to:
 
 ```q64
 let first_name: str? = match user {
-    none    -> none,
-    some(u) -> match u.profile {
-        none    -> none,
-        some(p) -> some(p.name)
+    None    -> None,
+    Some(u) -> match u.profile {
+        None    -> None,
+        Some(p) -> Some(p.name)
     }
 }
 ```
@@ -456,7 +456,7 @@ let first_name: str? = match user {
 ```q64
 let (obj, err) = env.net.get(url).json()
 if let e = err { return e }
-// obj is non-none here by flow typing
+// obj is non-None here by flow typing
 ```
 
 Sugar over `Result<T, E>`:
@@ -464,7 +464,7 @@ Sugar over `Result<T, E>`:
 - `let (x, y) = expr` where `expr: Result<T, E>` binds:
   - `x: Option<T>`
   - `y: Option<E>`
-  - With the invariant: exactly one is `some`.
+  - With the invariant: exactly one is `Some`.
 - After `if let e = err { return ... }`, the flow-typer narrows
   `obj` from `Option<T>` to `T` on the fall-through path.
 
@@ -509,7 +509,7 @@ The error-handling auto-prelude (no import needed):
 | Name           | Kind   | Provides                                         |
 |----------------|--------|--------------------------------------------------|
 | `Result`       | enum   | `Ok(T)`, `Err(E)`                                |
-| `Option`       | enum   | `some(T)`, `none`                                |
+| `Option`       | enum   | `Some(T)`, `None`                                |
 | `T?`           | sugar  | `Option<T>`                                      |
 | `try`          | keyword| `Result` propagation                             |
 | `panic`        | keyword| typed-payload structured unwind                  |
@@ -517,8 +517,8 @@ The error-handling auto-prelude (no import needed):
 | `Error`        | face   | the recoverable-error contract                   |
 | `Panic`        | face   | the panic-payload contract                       |
 | `PanicMessage` | struct | wraps a `str` payload for `panic "msg"` sugar    |
-| `Cancelled`    | struct | unit payload signalling cooperative cancellation (per `concurrency.md`); `code()` returns `none` (cancellation is a runtime control-flow event, not a diagnostic) |
-| `Closed`       | struct | unit payload for blocking `recv(ctx)` on a closed-and-empty channel (per `concurrency.md`); `code()` returns `none` |
+| `Cancelled`    | struct | unit payload signalling cooperative cancellation (per `concurrency.md`); `code()` returns `None` (cancellation is a runtime control-flow event, not a diagnostic) |
+| `Closed`       | struct | unit payload for blocking `recv(ctx)` on a closed-and-empty channel (per `concurrency.md`); `code()` returns `None` |
 | `RuntimeDenied`| struct | payload for runtime denials (e.g. `with_capabilities` `ENV030`); fields `code: str`, `detail: str` |
 | `From`         | face   | error conversion target (already in prelude)     |
 | `Into`         | face   | error conversion source (already in prelude)     |
@@ -548,7 +548,7 @@ pub fit ConfigError : Display {
 
 pub fit ConfigError : Error {
     fn source(self) -> Option<&dyn Error> {
-        match self { Io(e) -> some(&e), Parse(e) -> some(&e) }
+        match self { Io(e) -> Some(&e), Parse(e) -> Some(&e) }
     }
 }
 
@@ -590,8 +590,8 @@ struct Profile { name: str? }
 
 fn greet(env: Env, user: User?) {
     match user?.profile?.name {
-        some(n) -> env.out("Hello, {n}!"),
-        none    -> env.out("Hello, stranger."),
+        Some(n) -> env.out("Hello, {n}!"),
+        None    -> env.out("Hello, stranger."),
     }
 }
 ```

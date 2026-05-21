@@ -447,13 +447,13 @@ subsequent code.
    }
    ```
 
-2. **`match` over the optional that exits the `none` branch**:
+2. **`match` over the optional that exits the `None` branch**:
 
    ```q64
    fn require_user(user: User?) -> str {
        match user {
-           none    -> return "anonymous",
-           some(u) -> u.name,     // ✓ u: User
+           None    -> return "anonymous",
+           Some(u) -> u.name,     // ✓ u: User
        }
    }
    ```
@@ -462,24 +462,24 @@ subsequent code.
 
    ```q64
    fn process(user: User?) -> str {
-       if let none = user { return "anonymous" }
+       if let None = user { return "anonymous" }
        user.name            // ❌ TYP047 — user is still User? here
    }
    ```
 
-   Narrowing does **not** propagate past an `if-let-none` exit in
-   v0. To narrow, use the `if let some(u) = user` form (above).
+   Narrowing does **not** propagate past an `if-let-None` exit in
+   v0. To narrow, use the `if let Some(u) = user` form (above).
 
 ### What is **not** narrowed in v0
 
 - `if user.is_some() { user.name }` does not narrow. The condition
   is a regular boolean; the compiler does no smart-cast analysis
   past it. Compiler emits `TYP080` (note, not error) suggesting
-  the `if let some(u) = user` form.
+  the `if let Some(u) = user` form.
 - Narrowing inside a closure or nested function. The narrowed
   scope ends at the closure's body boundary.
 - Narrowing across `&&` chains. `if user.is_some() && user.age > 18`
-  is `TYP047`; rewrite to `if let some(u) = user { if u.age > 18 }`.
+  is `TYP047`; rewrite to `if let Some(u) = user { if u.age > 18 }`.
 
 This is the deliberate v0 stance: a single, syntactic rule users
 can recognize without an inference engine. Kotlin-style smart
@@ -578,7 +578,7 @@ own `TYP100–TYP149`, faces own `TYP200–TYP219`, errors own
 | `TYP060` | parameter mode keyword in call argument    | `process(in: x)`-style call; v0 uses bare arguments.                              |
 | `TYP070` | shape mismatch in tensor op                | Shape arithmetic fails the broadcast/concat compatibility predicate.              |
 | `TYP071` | SIMD lane width mismatch                   | `Simd<f32, 4> + Simd<f32, 8>` or similar.                                          |
-| `TYP080` | suggestion: prefer `if let some(u)` form   | (Note severity.) `if user.is_some()` followed by `user.method()` without narrowing.|
+| `TYP080` | suggestion: prefer `if let Some(u)` form   | (Note severity.) `if user.is_some()` followed by `user.method()` without narrowing.|
 | `TYP090` | endianness not specified                   | An external-data read without `_le` / `_be` suffix.                                |
 
 All codes are emitted using the standard envelope from
@@ -632,7 +632,7 @@ beforehand) by consulting the signature.
 
 ```q64
 fn greet(env: Env, user: User?) {
-    if let some(u) = user {
+    if let Some(u) = user {
         env.out("Hello, {u.name}!")
     } else {
         env.out("Hello, stranger.")
@@ -641,8 +641,8 @@ fn greet(env: Env, user: User?) {
 
 fn require_age(user: User?) -> i32 {
     match user {
-        some(u) -> u.age,
-        none    -> return -1,
+        Some(u) -> u.age,
+        None    -> return -1,
     }
 }
 ```

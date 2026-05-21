@@ -481,8 +481,8 @@ struct Node {
 }
 
 fn build_tree() -> ManagedBox<Node> {
-    let root  = Managed.box(Node { children: Vec.new(), parent: none })
-    let child = Managed.box(Node { children: Vec.new(), parent: some(root) })
+    let root  = Managed.box(Node { children: Vec.new(), parent: None })
+    let child = Managed.box(Node { children: Vec.new(), parent: Some(root) })
     root.children.push(child)
     root
 }

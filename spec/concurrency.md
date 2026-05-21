@@ -208,7 +208,7 @@ scope {
 
 `Cancelled` is the auto-prelude payload type from
 [`errors.md` §"Auto-prelude payload types"](./errors.md); it fits
-`Panic` with `code() = none` — cancellation is a runtime
+`Panic` with `code() = None` — cancellation is a runtime
 control-flow event, not a diagnostic, and the `CONC*` codes are
 reserved for compile-time diagnostics. Cancellation observation
 unwinds the task; it does not consume a recoverable-error slot in
