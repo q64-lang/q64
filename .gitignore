@@ -1,0 +1,27 @@
+# Zig
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Node / Astro / web tooling
+node_modules/
+.astro/
+dist/
+.cache/
+.wrangler/
+.dev.vars
+.env
+.env.local
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Build outputs
+*.wasm
+!stdlib/**/*.wasm
+*.o
+*.obj
