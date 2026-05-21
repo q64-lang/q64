@@ -2,7 +2,7 @@
 // SPEC: types.md#bool
 // EXPECTED: error
 
-fn main(env: Env) {
+fn main {
     if 1 {
         env.out("yes")
     }

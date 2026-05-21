@@ -219,11 +219,11 @@ pub fn dot<T: Mul<T> + Add<T>>(a: Vec3<T>, b: Vec3<T>) -> T @pure {
     a.x*b.x + a.y*b.y + a.z*b.z
 }
 
-pub fn write_log(env: Env, msg: str) @io {
+pub fn write_log(msg: str) @io {
     env.out("{msg}")
 }
 
-pub fn fetch(env: Env, u: Url) -> Result<Bytes, IoError> @network {
+pub fn fetch(u: Url) -> Result<Bytes, IoError> @network {
     env.net.get(u).bytes()
 }
 ```
@@ -354,13 +354,13 @@ with any core marker. A `pub effect` declaration is re-exportable via
 ### Using
 
 ```q64
-pub fn record(env: Env, evt: Event) @logging {
+pub fn record(evt: Event) @logging {
     env.fs.append("audit.log", evt.to_bytes())
 }
 
-pub fn process(env: Env, items: [Item]) @logging + @io {
+pub fn process(items: [Item]) @logging + @io {
     for item in items {
-        record(env, item.as_event())     // @logging propagates
+        record(item.as_event())          // @logging propagates
         env.out("{item}")                // @io propagates
     }
 }
@@ -423,9 +423,9 @@ a `@cancel` function picks up `@cancel` unless it asserts
 `@uncancellable`.
 
 ```q64
-fn fetch(ctx: Cancel, env: Env, url: Url) -> Result<Response, IoError> @cancel {
+fn fetch(ctx: Cancel, url: Url) -> Result<Response, IoError> @cancel {
     if ctx.cancelled() { panic Cancelled }
-    try http.get(ctx, env.net, url)
+    try http.get(ctx, url)
 }
 ```
 
@@ -442,8 +442,8 @@ call `@cancel` functions; doing so is `CONC012` (per
 `concurrency.md`) — the marker would be defeated.
 
 ```q64
-fn flush_journal(env: Env, j: ref Journal) @uncancellable {
-    db.write_all(env, j.pending)        // db.write_all must not be @cancel
+fn flush_journal(j: ref Journal) @uncancellable {
+    db.write_all(j.pending)             // db.write_all must not be @cancel
 }
 ```
 
@@ -706,7 +706,7 @@ pub fn run_audio<F: Filter<PCM<f32>, @realtime>>(
 
 ```q64
 // src/lib.q
-pub fn write(env: Env, line: str) @io {
+pub fn write(line: str) @io {
     env.fs.append("app.log", "{line}\n".to_bytes())
 }
 ```
@@ -725,7 +725,7 @@ pub effect @traced
 ```q64
 import q64.telemetry.{traced}
 
-pub fn submit(env: Env, payload: Bytes) @traced + @network {
+pub fn submit(payload: Bytes) @traced + @network {
     span("submit") {
         env.net.post(url"https://api.example.com/events", payload)
     }
@@ -739,7 +739,7 @@ lists `@traced` next to the core markers.
 ### Effect contradiction
 
 ```q64
-pub fn render(env: Env) @realtime + @io {     // ❌ EFF120
+pub fn render @realtime + @io {     // ❌ EFF120
     // @realtime forbids @io
 }
 ```

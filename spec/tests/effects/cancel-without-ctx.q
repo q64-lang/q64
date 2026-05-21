@@ -5,10 +5,10 @@
 // Declaring `@cancel` requires a `ctx: Cancel` parameter in the
 // signature.
 
-pub fn watcher(env: Env) @cancel {
+pub fn watcher @cancel {
     env.out("watching")
 }
 
-fn main(env: Env) {
-    watcher(env)
+fn main {
+    watcher()
 }

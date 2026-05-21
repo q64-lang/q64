@@ -7,7 +7,7 @@
 // the function header — the runner is responsible for materializing
 // the byte; this comment documents intent.
 
-fn main(env: Env) {
+fn main {
     env.out("line one")
     env.out("line two")
 }

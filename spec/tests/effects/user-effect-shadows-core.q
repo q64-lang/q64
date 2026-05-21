@@ -4,6 +4,6 @@
 
 pub effect @realtime
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

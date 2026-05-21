@@ -23,14 +23,14 @@ pub fit ConfigError : Error { }
 
 pub struct Config { name: str }
 
-pub fn load_config(env: Env, path: str) -> Result<Config, ConfigError> {
+pub fn load_config(path: str) -> Result<Config, ConfigError> {
     let bytes        = try env.fs.read(path)
     let cfg: Config  = try bytes.json()
     Ok(cfg)
 }
 
-fn main(env: Env) -> Result<(), Error> {
-    let cfg = try load_config(env, "config.json")
+fn main -> Result<(), Error> {
+    let cfg = try load_config("config.json")
     env.out("loaded: {cfg.name}")
     Ok(())
 }

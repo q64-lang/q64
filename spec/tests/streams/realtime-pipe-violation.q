@@ -14,13 +14,13 @@ fn http_post(n: Net, url: Url, body: Signal<Bytes, 60.Hz>) {
     n.post(url, body.current())
 }
 
-fn main(env: Env) {
+fn main {
     scope {
         let g = graph audio_path {
             let _ = mic_input(env.audio)
                 |> play(env.audio)
                 |> http_post(env.net, url"https://example.com")
         }
-        let _ = g.start(env)
+        let _ = g.start()
     }
 }

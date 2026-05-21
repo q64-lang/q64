@@ -2,7 +2,7 @@
 // SPEC: types.md#typed-prefix-form
 // EXPECTED: error
 
-fn main(env: Env) {
+fn main {
     let bogus = xyz"hello"
     env.out(bogus)
 }

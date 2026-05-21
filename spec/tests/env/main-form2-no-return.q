@@ -2,6 +2,6 @@
 // SPEC: env.md#main-signature
 // EXPECTED: error
 
-fn main(env: Env) -> Result<(), Error> {
+fn main -> Result<(), Error> {
     env.out("hello")
 }

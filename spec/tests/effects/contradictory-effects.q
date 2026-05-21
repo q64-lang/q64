@@ -4,10 +4,10 @@
 //
 // `@realtime` forbids `@io`; declaring both is a contradiction.
 
-pub fn render(env: Env) @realtime + @io {
+pub fn render @realtime + @io {
     env.out("rendering")
 }
 
-fn main(env: Env) {
-    render(env)
+fn main {
+    render()
 }

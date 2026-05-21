@@ -3,8 +3,8 @@
 // EXPECTED: ok
 
 @stage
-fn mic_input(a: Audio) -> Signal<PCM<f32>, 48.kHz> {
-    a.input()
+fn mic_input -> Signal<PCM<f32>, 48.kHz> {
+    env.audio.input()
 }
 
 @stage @fuse
@@ -15,19 +15,19 @@ fn denoise<const R: Hz>(input: Signal<PCM<f32>, R>, threshold: f32)
 }
 
 @stage
-fn play(a: Audio, pcm: Signal<PCM<f32>, 48.kHz>) @realtime {
-    a.write(pcm)
+fn play(pcm: Signal<PCM<f32>, 48.kHz>) @realtime {
+    env.audio.write(pcm)
 }
 
-graph audio_path(env: Env) {
-    let pcm   = mic_input(env.audio)
+graph audio_path {
+    let pcm   = mic_input()
     let clean = pcm |> denoise(threshold: 0.05)
-    let _     = clean |> play(env.audio)
+    let _     = clean |> play
 }
 
-fn main(env: Env) {
+fn main {
     scope {
-        let h = audio_path.start(env)
+        let h = audio_path.start()
         sleep(60.s)
         h.cancel()
     }

@@ -8,6 +8,6 @@ fn render(target: dyn Clone) {
     let _copy = target.clone()
 }
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

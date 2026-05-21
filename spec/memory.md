@@ -606,11 +606,11 @@ scope {
 ### Real-time audio path — pool-backed channel
 
 ```q64
-fn audio_engine(env: Env) {
+fn audio_engine {
     region pool: Pool<Frame, 64> {                      // 64 slots, lock-free
         let (tx, rx) = channel<Frame>(pool, policy: RingBuffer, capacity: 64)
 
-        spawn { capture_loop(env, tx) }                 // producer; allocates into the pool
+        spawn { capture_loop(tx) }                      // producer; allocates into the pool
 
         scope @realtime {
             loop {

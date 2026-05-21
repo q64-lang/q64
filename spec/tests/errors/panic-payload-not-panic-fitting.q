@@ -4,6 +4,6 @@
 
 struct NotAPanic { x: i64 }
 
-fn main(env: Env) {
+fn main {
     panic NotAPanic { x: 42 }
 }

@@ -783,7 +783,7 @@ allocation by future revisions.
 ```q64
 //! hello — entry point.
 
-fn main(env: Env) {
+fn main {
     env.out("Hello, q64.")
 }
 ```
@@ -841,15 +841,15 @@ match user?.profile?.name {
 ### Concurrency and a stream graph in one program
 
 ```q64
-graph voice(env: Env) {
-    let pcm    = mic_input(env.audio)
+graph voice {
+    let pcm    = mic_input()
     let denoised = pcm |> denoise(threshold: 0.05)
-    let _      = denoised |> play(env.audio)
+    let _      = denoised |> play
 }
 
-fn main(env: Env) {
+fn main {
     scope {
-        let h = voice.start(env)
+        let h = voice.start()
         select {
             _ = h.await()       -> {},
             _ = ctx.cancelled() -> h.cancel(),

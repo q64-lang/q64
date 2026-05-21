@@ -6,6 +6,6 @@ pub struct Buffer<T = i64, const N: i64> {
     data: [T; N],
 }
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

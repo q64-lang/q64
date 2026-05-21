@@ -8,7 +8,7 @@ fn drain(rx: Receiver<i64, Backpressure>) {
     }
 }
 
-fn main(env: Env) {
+fn main {
     scope {
         let (tx, rx) = channel<i64>(policy: Backpressure, capacity: 4)
         spawn { tx.send(ctx, 1) }

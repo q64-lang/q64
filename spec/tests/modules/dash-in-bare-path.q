@@ -4,6 +4,6 @@
 
 import audio-filters.{LowPass}
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

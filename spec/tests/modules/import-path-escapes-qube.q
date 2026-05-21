@@ -4,6 +4,6 @@
 
 import "../../../other-qube/src/foo.q"
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }
