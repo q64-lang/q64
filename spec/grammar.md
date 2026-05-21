@@ -550,7 +550,12 @@ RegionStmt    := "region" IDENT ":" TypeExpr Block
 
 PanicStmt     := "panic" Expr                    (* expr's type must fit Panic *)
 
-WithCapsStmt  := "with_capabilities" "(" "deny" ":" "[" FaceRef ("," FaceRef)* ","? "]" ")" Block
+WithCapsStmt  := "with_capabilities" "(" CapsOverrides ")" Block
+CapsOverrides := CapsUse ("," CapsDeny)?
+              | CapsDeny ("," CapsUse)?
+CapsUse       := "use" ":" "{" CapField ("," CapField)* ","? "}"
+CapsDeny      := "deny" ":" "[" FaceRef ("," FaceRef)* ","? "]"
+CapField      := IDENT ":" Expr        (* e.g., net: MockNet.new() *)
 ```
 
 Notes:

@@ -180,24 +180,43 @@ design calls resolved. Notable points:
 - Capabilities are **faces**, not sealed types. Runtime provides
   one fit per face; tests + libraries can fit their own
   (`fit MockNet : Net`).
-- Smallest-capability passing: helpers take `n: Net`, not
-  `env: Env`. Lint ENV010 catches over-broad params.
-- Sandboxing via `with_capabilities(deny: [Net, Fs]) { … }`
-  block. Runtime-enforced denied set; ENV030 panics on
-  attempted use.
-- Two valid `main` signatures: `fn main(env: Env)` (falls off =
-  exit 0; `?` panics) **and** `fn main(env: Env) -> Result<(),
-  Error>` (Err's exit_code drives exit). The runtime dispatches
-  on the return type.
+- **Ambient `env` binding (v0 redesign).** Functions reference
+  `env.X` directly without declaring it as a parameter; the
+  compiler synthesizes an implicit capability parameter per
+  reference, the same machinery as `generics.md`'s implicit
+  face parameters. The earlier "passed, not ambient" model
+  with smallest-capability lint `ENV010` is superseded.
+  Explicit `pub fn helper(n: Net, …)` remains a valid power-
+  user form for parametric library code.
+- Sandboxing via `with_capabilities { … }` block — now the
+  primary override mechanism, with two flavors: `use: { net:
+  MockNet.new() }` substitutes a fit (compile-time-resolved),
+  `deny: [Net, Fs]` strips capabilities (runtime-enforced;
+  `ENV030` panics on attempted use). Both compose.
+- Four valid `main` signatures: `fn main`, `fn main -> Result<(),
+  Error>`, and the explicit `fn main(env: Env)` / `fn main(env:
+  Env) -> Result<(), Error>` forms. Runtime dispatches on
+  presence and return type.
 - Capability disclosure is **both** manifest-asserted in
   `qube.json5` **and** compiler-derived from the effect graph
   (@network → Net, @fs → Fs, …). `qube publish` cross-checks;
   mismatch is ENV040. Lock-file pattern: intent + verification.
 
-`ENV010`-`ENV054` diagnostic band.
+`ENV010` / `ENV011` retired by the redesign; the rest of the
+`ENV020`-`ENV056` diagnostic band stays. New: `ENV055` (`use:`
+field not on `Env`), `ENV056` (`env` reference from `@pure`
+function).
 
 Introduces a `capabilities` field in `qube.json5`. The qube.json5
 spec will need a matching section update — tracked as a follow-up.
+
+**Cross-spec sweep needed (post-redesign):** The illustrative
+examples in `errors.md`, `concurrency.md`, `streams.md`,
+`faces.md`, `effects.md`, `memory.md`, plus the golden tests in
+`spec/tests/golden/`, currently thread `env: Env` through library-
+style helpers — a pattern the redesign deprecates. The substantive
+content of those specs is unaffected; only the example shape
+needs updating. Tracked as a single follow-up pass.
 
 ### Priority 5 — short follow-up specs
 
