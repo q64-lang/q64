@@ -24,6 +24,7 @@ suite.
 | [`generics.md`](./generics.md)                           | Type / const / region / effect parameters, bounds, where, defaults, inference |
 | [`types.md`](./types.md)                                 | Numeric tower, bool, arb-width ints, parameter modes, optional narrowing |
 | [`memory.md`](./memory.md)                               | Regions, dual heap, transfers, multi-memory layout, shared / managed annotations |
+| [`concurrency.md`](./concurrency.md)                     | Scopes, tasks, channels, select, actors, cancellation, panics, host translation |
 
 ## Scope (forthcoming)
 
@@ -33,8 +34,6 @@ suite.
   inference rules. (Primitive types and parameter modes landed in
   `types.md`; effect markers in `effects.md`; generics in
   `generics.md`.)
-- **Concurrency model** — scopes, tasks, channels, ordering guarantees,
-  cancellation semantics.
 - **Stream semantics** — synchronous-tick model, `pre` operator, graph
   scheduling, fusion rules.
 - **Conformance test suite** — q64 source files plus expected outputs.
