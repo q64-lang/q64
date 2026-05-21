@@ -76,8 +76,9 @@ assert to every task spawned directly inside it:
 scope @realtime {
     loop {
         select {
-            f = rx_frame.recv(ctx) -> play(move f),
-            // cancellation observed at select boundary
+            // rx_frame: Receiver<Frame, RingBuffer> — no ctx; RingBuffer is non-cancel-aware.
+            // Cancellation is still observed at the implicit select branch below.
+            f = rx_frame.recv() -> play(move f),
         }
     }
 }
@@ -226,7 +227,7 @@ signature).
 
 ### Where `ctx` comes from
 
-Three sources introduce a `ctx: Cancel` binding visible to the
+Four sources introduce a `ctx: Cancel` binding visible to the
 code below:
 
 1. **Function parameter.** A function that declares `ctx: Cancel`
@@ -245,6 +246,17 @@ code below:
    Inside a scope, `ctx` resolves to the **lexically nearest**
    binding: the spawned task's own ctx when inside `spawn { … }`,
    otherwise the enclosing scope's ctx.
+4. **Stage in a graph.** A stage that declares `ctx: Cancel` in
+   its signature observes cancellation explicitly and acquires
+   `@cancel` per [`effects.md`](./effects.md). A stage *without*
+   `ctx` is still cancellable: the runtime injects a shutdown
+   path equivalent to `panic Cancelled` at the next channel
+   `recv` / `send` on a cancel-aware policy, or at the
+   stage's natural completion. `g.start(env)` returns a
+   `Handle<Out>` whose ctx is the graph's root; `g.stop()` is
+   semantically `h.cancel()` on that handle, which propagates
+   to every stage's ctx through the standard scope-cancellation
+   path above. See [`streams.md` §"Effects on stages"](./streams.md).
 
 `main`'s top-level body has an implicit ctx tied to the program's
 lifetime: it never flips (the program ends via `env.exit()` or by
@@ -493,7 +505,10 @@ select {
 ```
 
 Timeouts and channels are uniform: `timeout(d)` returns a
-`Receiver<()>` that fires once after `d` elapses.
+`Receiver<(), LatestValue>` that fires once after `d` elapses.
+The single-slot `LatestValue` policy is the natural fit for a
+one-shot signal; the receiver observes `ctx` per the
+cancel-aware contract above.
 
 ### Implicit cancellation branch
 
@@ -589,7 +604,7 @@ discarded).
 ```q64
 enum CounterMsg {
     Increment,
-    Get(reply: Sender<i64>),
+    Get(reply: Sender<i64, LatestValue>),
 }
 
 fn run_counter(ctx: Cancel, rx: Receiver<CounterMsg, Backpressure>) {
@@ -598,7 +613,7 @@ fn run_counter(ctx: Cancel, rx: Receiver<CounterMsg, Backpressure>) {
         select {
             msg = rx.recv(ctx) -> match msg {
                 Increment    -> count += 1,
-                Get(reply)   -> reply.send(count),
+                Get(reply)   -> reply.send(ctx, count),
             },
         }
     }
@@ -1028,8 +1043,8 @@ fn audio_engine(env: Env) {
         spawn scope @realtime {
             loop {
                 select {
-                    f   = rx_frame.recv(ctx) -> play(move f),
-                    cmd = rx_cmd.recv(ctx)   -> apply(cmd),
+                    f   = rx_frame.recv()    -> play(move f),    // RingBuffer: no ctx
+                    cmd = rx_cmd.recv(ctx)   -> apply(cmd),       // LatestValue: ctx-aware
                     // implicit cancel branch
                 }
             }

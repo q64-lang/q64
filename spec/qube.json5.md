@@ -322,12 +322,19 @@ PascalCase name of the underlying face.
 
 ### Publishing
 
-| Field      | Type     | Default                          | Notes                                                            |
-|------------|----------|----------------------------------|------------------------------------------------------------------|
-| `publish`  | boolean  | `true`                           | Set `false` to prevent `qube publish` from ever uploading.       |
-| `registry` | URL      | continuum production URL         | Override per-qube (private or alternate registries).             |
-| `include`  | string[] | source + `README` + `LICENSE-*`  | File globs included in the tarball.                              |
-| `exclude`  | string[] | none                             | File globs excluded; applied after the include list.             |
+| Field      | Type     | Default                                       | Notes                                                                  |
+|------------|----------|-----------------------------------------------|------------------------------------------------------------------------|
+| `publish`  | boolean  | `true`                                        | Set `false` to prevent `qube publish` from ever uploading.             |
+| `registry` | URL      | continuum production URL                      | Override per-qube (private or alternate registries).                   |
+| `include`  | string[] | omitted ⇒ default file set (see below)        | Globs **added to** the default set; never replaces it.                 |
+| `exclude`  | string[] | none                                          | Globs excluded; applied after include resolution. May drop defaults.   |
+
+The default tarball file set (when `include` is omitted) is
+specified in [`continuum-api.md` §Tarball format](./continuum-api.md):
+`qube.json5`, `src/**`, `tests/**`, the README, and
+`LICENSE-*` files at the root. `include` adds files on top; it
+does not replace the default. To drop a default file, use
+`exclude`.
 
 ## Versioning policy for the schema
 

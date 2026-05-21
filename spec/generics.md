@@ -72,8 +72,11 @@ pub fn dedup<T: Eq + Ord>(items: ref [T]) { ... }
 
 Const, region, and effect parameters do not take face bounds. Const
 parameters are bounded by their **type** (`const N: i64`); region
-parameters bound by the `Region` face (always); effect variables are
-unconstrained at declaration and unified per use-site by the fit (see
+parameters are bounded by the auto-prelude `Region` face (per
+[`memory.md` §"Region kinds"](./memory.md)) — the bound is implicit
+in the `: Region` syntax and is the only bound a region parameter
+can carry in v0. Effect variables are unconstrained at declaration
+and unified per use-site by the fit (see
 [`faces.md` §Effect-polymorphic faces](./faces.md)).
 
 For verbose or associated-type-touching bounds, use a `where` clause.
@@ -245,8 +248,13 @@ The same arithmetic works in fixed-size array shapes
 
 Expressions allowed in v0: `+`, `-`, `*`, `/`, `%`, comparisons,
 and references to other const-generic parameters of the same item.
-Comptime function calls are deferred — they wait for the comptime
-spec.
+Operator precedence and associativity match the value-level
+arithmetic grammar (multiplicative ops bind tighter than additive;
+comparisons sit below both; parentheses always allowed). The
+expression `W + 2 * Pad` parses as `W + (2 * Pad)`; explicit
+parentheses are recommended for any expression that isn't a
+trivial sum or product. Comptime function calls are deferred —
+they wait for the comptime spec.
 
 The diagnostic for "comptime expression too complex for v0" is
 `TYP107`.

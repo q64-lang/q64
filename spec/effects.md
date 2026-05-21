@@ -104,9 +104,15 @@ covers. They are peer capabilities. A function that both writes
 to stdout and reads the clock declares `@stdout + @time`.
 
 `@exit` is a diverging marker — a function whose effect set
-includes `@exit` may never return on some paths. It does not
-imply `@no_panic`/`@no_trap` (those are still observable side
-effects on the path that *did* return).
+includes `@exit` may never return on some paths. It does **not**
+imply `@no_panic` / `@no_trap`. Effect checking applies path-
+insensitively: in a function declared `@exit + @no_panic`, no
+path — returning or diverging — may invoke `panic`. The fact that
+`env.exit(N)` terminates the program on the diverging path does
+not launder a `panic` somewhere else in the body. Read `@exit`
+as "this function *may* call `env.exit`"; the assert markers
+still apply to every instruction the function executes before
+the call to `env.exit`.
 
 ### Other markers
 
@@ -148,7 +154,7 @@ expansion.
 |-------------------|---------------------------------------------------------------|
 | `@pure`           | `@no_alloc`, `@no_suspend`, `@no_panic`, `@no_trap`, `@uncancellable` |
 | `@realtime`       | `@no_alloc`, `@no_suspend`, `@no_panic`, `@uncancellable`     |
-| `@no_alloc`       | `@no_panic` (panic allocates the message string)              |
+| `@no_alloc`       | `@no_panic` (panic allocates the payload in the current scope's arena — per [`memory.md` §"Scope's implicit arena"](./memory.md) and [`errors.md` §`panic` and `trap`](./errors.md)) |
 | `@uncancellable`  | — (forbids `@cancel` callees by intersection)                 |
 | `@network`        | `@io`                                                         |
 | `@fs`             | `@io`                                                         |
@@ -180,6 +186,28 @@ governs which functions are allowed to invoke them.
 
 A function whose declared effect set is internally contradictory
 (`@realtime + @io`) is `EFF120`.
+
+### What `@no_alloc` and `@no_suspend` forbid
+
+`@no_alloc` and `@no_suspend` are derivation rules over operations,
+not just other markers. The full list of operations that violate
+them — keyed to the region kinds defined in
+[`memory.md` §"Region kinds"](./memory.md) — is:
+
+| Operation                                            | Violates                       |
+|------------------------------------------------------|--------------------------------|
+| `Arena` / `Pool` / `Stack` / `FreeList` allocation   | `@no_alloc`                    |
+| `Managed` allocation (`Managed.box(value)`)          | `@no_alloc` **and** `@no_suspend` (the GC may yield) |
+| `transfer(to: <linear region>)`                      | `@no_alloc` (allocates in the target; unbounded size also raises `EFF110` under `@realtime`) |
+| `transfer(to: Managed)` / `transfer(to: Interned<Managed>)` | `@no_alloc` and `@no_suspend` |
+| `panic` (any payload)                                | `@no_alloc` (payload allocates) and `@no_panic` |
+| `dyn Error` boxing on an `Err` path                  | `@no_alloc` (`EFF103`)         |
+
+Because `@realtime` implies both `@no_alloc` and `@no_suspend`, a
+`@realtime` body forbids every operation above. `Managed` allocation
+specifically fails *two* asserts (allocation and suspension), so an
+`@no_suspend`-only function and an `@no_alloc`-only function both
+reject it, even though the rejecting marker differs.
 
 ## Effect annotations on functions
 
@@ -429,8 +457,9 @@ effects declared").
 
 - `@realtime` implies `@uncancellable` (real-time bodies don't
   observe cancellation at arbitrary points; they run to their
-  next natural yield, per `concurrency.md`). `@realtime + @cancel`
-  is therefore `EFF120`.
+  next natural yield, per `concurrency.md`). The `@uncancellable +
+  @cancel = EFF120` rule then rejects `@realtime + @cancel`
+  transitively — there is no separate rule for that pair.
 - `@pure` implies `@uncancellable` (a pure function has no
   ambient state to observe; cancellation observation would
   be a side effect).
@@ -490,12 +519,36 @@ A type is `@send` if every component is `@send`. The base cases:
 
 - All numeric primitives (`i8…i64`, `u8…u64`, `f16/f32/f64`, `bool`)
   are `@send`.
-- A struct is `@send` iff every field is `@send`.
+- A struct is `@send` iff every field is `@send`, **except** when
+  the struct carries an annotation that overrides field-wise
+  derivation (see "Annotation carve-outs" below).
 - An enum is `@send` iff every variant payload is `@send`.
 - `Vec<T, R>` is `@send` iff `T` is `@send` and `R` is sharable or
   single-owner (per [`memory.md` §"`@send` derivation"](./memory.md)).
-- Any type containing a managed (WasmGC) reference is **not** `@send`
-  — the GC arena is per-Wasm-instance.
+- Any type containing a managed (WasmGC) reference (`ManagedBox<T>`,
+  `Vec<T, Managed>`, a `@managed` struct, …) is **not** `@send` —
+  the GC arena is per-Wasm-instance. The cross-thread escape hatch
+  is `transfer(to: <thread-local Managed>)` on the receiving side
+  (per [`memory.md` §"`@send` derivation"](./memory.md)).
+- A `ref T` is **not** `@send` — the borrow's region is local to
+  the borrowing thread (per [`memory.md` §"Cross-region
+  transfers"](./memory.md)).
+
+### Annotation carve-outs
+
+Two struct annotations override the field-wise rule:
+
+- **`@shared` structs are unconditionally `@send`** — their handle
+  is SAB-backed, so the handle itself crosses threads even though
+  individual fields (e.g. `Atomic<T>`) wouldn't be `@send` by the
+  field rule alone. See [`memory.md` §"Shared regions"](./memory.md).
+- **`@managed` structs are unconditionally not `@send`** — even if
+  every field is itself `@send`, the struct's identity is a per-
+  Wasm-instance WasmGC root. See [`memory.md` §"Marking a struct
+  managed"](./memory.md).
+
+These two annotations are the *only* way to override field-wise
+`@send` derivation; user code cannot declare a third carve-out.
 
 ### Use sites
 

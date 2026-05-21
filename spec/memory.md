@@ -70,6 +70,28 @@ Each kind is a concrete type fitting the auto-prelude face
 `Region`. Generic code over "any region" uses the `R: Region`
 parameter (per [`generics.md` §"The four parameter kinds"](./generics.md)).
 
+The `Region` face is the compiler-blessed marker for "this
+type is a region kind." It carries no user-visible methods in
+v0; user code never writes `fit MyKind : Region`, because the
+six blessed kinds (`Arena`, `Pool`, `Stack`, `FreeList`,
+`Managed`, plus the `Interned<R>` target marker) are the only
+inhabitants. The face exists so `R: Region` generic bounds and
+the `region <name> : <kind> { … }` declaration form share a
+single name in the type system. Adding new region kinds is a
+language-level change (tracked under "Open items deferred").
+
+The word "Region" therefore has three roles, easy to confuse:
+
+| Use                                  | Meaning                                                                        |
+|--------------------------------------|--------------------------------------------------------------------------------|
+| `Region` (face)                      | The auto-prelude face every region kind fits. Used in bounds (`R: Region`).    |
+| region kind                          | One of `Arena<N>`, `Pool<T, N>`, `Stack`, `FreeList`, `Managed`. A concrete type. |
+| region binding                       | The named value introduced by `region <name> : <kind> { … }`. Lives in scope. |
+
+The rest of this spec uses "the `Region` face," "a region kind,"
+or "a region binding" — never bare "region" — when the
+distinction matters.
+
 ## Region literal syntax
 
 A `region` declaration introduces a named region whose lifetime is
@@ -97,9 +119,9 @@ their enclosing scope (per [`concurrency.md`](./concurrency.md)).
 
 ### Scope's implicit arena
 
-Every `scope { … }` block (per the concurrency spec) carries a
-default arena named `scope`. Code that does not declare its own
-region uses this implicit one:
+Every `scope { … }` block (per [`concurrency.md`](./concurrency.md))
+carries a default `Arena`-kind region binding named `scope`. Code
+that does not declare its own region uses this implicit one:
 
 ```q64
 scope {
@@ -110,6 +132,15 @@ scope {
 
 Functions that don't take an explicit `R: Region` parameter allocate
 into `scope` by default.
+
+**Terminology.** "The scope arena" (used in `errors.md`,
+`effects.md`, `concurrency.md`, `streams.md`) is the value of
+this implicit binding at the nearest enclosing `scope { … }`. It
+is always an `Arena<N>` kind. Panic payloads allocate here (per
+[`errors.md` §`panic` and `trap`](./errors.md)); stage bodies
+allocate here unless they name a different region. The binding
+shadows lexically: a nested `scope { … }` introduces a fresh
+`scope` binding whose lifetime is the nested block.
 
 ## The two heaps
 
@@ -147,13 +178,20 @@ struct GameState {
 
 Effects of `@managed`:
 
-- The struct may only be allocated via `Managed` region constructors
-  (`Managed.box(value)`, `Managed.shared(value)`).
+- The struct may only be allocated via the `Managed` region's
+  constructor `Managed.box(value) -> ManagedBox<T>`, which
+  registers `value` as a fresh WasmGC root and returns a handle.
+  There is no separate "shared managed" constructor in v0;
+  cross-thread sharing of managed values requires
+  `transfer(to: <thread-local Managed>)` on the receiving side
+  (§"Cross-region transfers").
 - Its fields must themselves be managed or be `Copy`-style
   value types (numerics, bool). A `ref` into linear memory is
   `TYP060`-equivalent in this spec: `REG020` ("linear pointer in
   managed struct").
-- The struct is **not** `@send`: WasmGC roots are per-Wasm-instance.
+- The struct is **not** `@send`, regardless of its field
+  composition: WasmGC roots are per-Wasm-instance. See
+  [`effects.md` §"Annotation carve-outs"](./effects.md).
 
 This supersedes the `managed struct …` keyword form sketched in
 `design.md`. The annotation pattern matches `@derive` and other
@@ -576,7 +614,7 @@ fn audio_engine(env: Env) {
 
         scope @realtime {
             loop {
-                let frame: Frame = rx.recv()
+                let frame: Frame = rx.recv()             // RingBuffer recv takes no ctx
                 play(frame)                              // @realtime; no allocation
             }
         }

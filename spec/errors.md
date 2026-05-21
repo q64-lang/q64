@@ -40,7 +40,7 @@ type, `try` for propagation, `panic` / `trap` for fatal bugs, and
 | `Option<T>` / `T?` | Tagged union — either `Some(T)` or `None`. Sugar: `T?` ≡ `Option<T>`. |
 | **try**     | Prefix keyword; propagates `Err` to the enclosing function.              |
 | **panic**   | Structured user-level unwind with a typed payload (fits `Panic`).        |
-| **trap**    | Bare Wasm trap. Immediate halt, no payload, no unwind, no allocation.    |
+| **trap**    | Bare Wasm trap. Module is no longer runnable. No payload, no unwind, no allocation. |
 | **Error**   | Face that error types implement (`Display` + optional `source()`).        |
 | **Panic**   | Face that panic-payload types implement (`Display` + optional `code()`).  |
 
@@ -170,9 +170,9 @@ trap()                       // no message, no allocation, immediate halt
 - Emits the Wasm `unreachable` instruction (or equivalent).
 - No string, no allocation, no unwind.
 - No `panic` payload to inspect.
-- The host engine halts the wasm module. Browser tab keeps running;
-  worker thread terminates; Wasmtime / Wasmer return their respective
-  "trapped" status.
+- The host engine traps the wasm module — the module is no longer
+  runnable. Browser tab keeps running; worker thread terminates;
+  Wasmtime / Wasmer return their respective "trapped" status.
 - Carries an effect: `trap` requires the surrounding function to *not*
   be `@no_trap`.
 

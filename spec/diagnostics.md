@@ -16,6 +16,14 @@ errors uniformly.
   use the same diagnostic *content* — only the rendering differs.
 - The envelope is also written when a CLI subcommand exits non-zero with
   a diagnostic to deliver.
+- When `qube` invokes `q64` as a subprocess, it **forwards `q64`'s
+  envelopes verbatim** rather than wrapping them; the consumer
+  parses one stream of `NAM* / TYP* / REG* / EFF* / STR* / CONC* /
+  ENV*` envelopes from `q64` plus `qube`'s own `PKG* / REG2*`
+  envelopes (manifest validation, registry, resolver) in the same
+  format. `q64` flushes stderr after every envelope so downstream
+  parsers can react incrementally; this is the only flush
+  guarantee — `qube` may stream progress on this basis.
 
 ## Envelope shape
 

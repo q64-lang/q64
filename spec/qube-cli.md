@@ -103,22 +103,45 @@ Resolved dependencies are extracted to a user-global cache:
 ## How `qube` invokes `q64`
 
 `qube build` walks the dependency graph (workspace + transitive deps),
-then for each `.q` source file invokes:
+then for each qube's top-level entry file (per its manifest's
+`entry`) invokes:
 
 ```
-q64 build <file.q>
+q64 build <entry.q>
   --diagnostics json
   --target <triple-or-name>
-  --module q64.math=<cache>/q64-math-0.3.1/src
-  --module q64.audio=<cache>/q64-audio-0.3.0/src
+  --module q64.math=<absolute-path>/q64-math-0.3.1/src
+  --module q64.audio=<absolute-path>/q64-audio-0.3.0/src
+  --module my-local-dep=/abs/path/to/local-dep/src     # path: deps look identical
+  --features fft,mp3                                    # union of activated features
   ...
-  --out target/<host>/<obj>.wasm
+  --out target/<host>/<qube-name>.wasm
 ```
 
-`qube` parses the newline-delimited diagnostic envelopes on stderr,
-renders them in the user's chosen format, and aggregates exit codes.
-The subprocess contract is documented in [`q64-cli.md`](./q64-cli.md)
-under "Subprocess invocation contract".
+One invocation per qube, one `--out` per invocation. Cross-qube
+imports are resolved entirely through `--module`; `q64` never
+reads `qube.json5` itself. Local-path dependencies (`path: "…"`
+in the manifest) are normalised to absolute filesystem paths and
+passed via `--module` exactly the same way registry-resolved
+dependencies are — the compiler cannot tell the two sources
+apart.
+
+`qube` parses the newline-delimited diagnostic envelopes on
+`q64`'s stderr and **forwards them verbatim** (re-rendering in
+text mode if the user requested `--diagnostics text`). It does
+not wrap them in an outer envelope; a downstream consumer
+(editor, CI) sees the same envelopes whether they were produced
+by `q64` directly or relayed through `qube`. Aggregation across
+multiple invocations happens at the exit-code level: the worst
+exit code seen wins (`70` > `64` > `2` > `0`). The subprocess
+contract is documented in [`q64-cli.md`](./q64-cli.md) under
+"Subprocess invocation contract".
+
+`qube`'s own diagnostics (manifest validation, registry errors,
+dependency resolution) use the same envelope format with the
+`PKG` / `REG2` prefixes (per
+[`diagnostics.md`](./diagnostics.md) §"Code conventions") so the
+downstream consumer parses one format end-to-end.
 
 Why a subprocess: clean version boundary, easy mocking in tests,
 independent crash recovery. A later flag (`qube build --in-process`)
