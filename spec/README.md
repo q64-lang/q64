@@ -18,6 +18,7 @@ suite.
 | [`qube-cli.md`](./qube-cli.md)                           | The `qube` binary's CLI surface and how it invokes `q64`          |
 | [`continuum-api.md`](./continuum-api.md)                 | HTTP API between `qube` and the registry                          |
 | [`modules.md`](./modules.md)                             | Module organization, imports, visibility, re-exports              |
+| [`faces.md`](./faces.md)                                 | Polymorphism: faces (interfaces) and fits (implementations)       |
 
 ## Scope (forthcoming)
 

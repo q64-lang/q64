@@ -4,8 +4,8 @@ How q64 source is organized into modules, how modules import each other,
 and how visibility controls what crosses file and qube boundaries.
 
 > **Status: near-final (v0).** The decisions captured here have been
-> resolved; field-level visibility on structs is deferred to a future
-> traits/types spec and is not covered here.
+> resolved; field-level visibility on structs is deferred to the
+> [faces/types spec](./faces.md) and is not covered here.
 
 ## Design goals
 
@@ -146,7 +146,8 @@ pub fn dot[T](a: Vec3[T], b: Vec3[T]): T { ... }
 pub struct Vec3[T] { x: T, y: T, z: T }
 pub enum Color { Rgb, Hsv, Lab }
 pub type Hz = f64
-pub trait Eq { ... }
+pub face Eq[T] { ... }
+pub fit Eq for Vec3[f32] { ... }
 pub const PI: f64 = 3.14159
 pub use Vec3 from "./vec.q"
 
@@ -173,11 +174,11 @@ enumerates a file's contributions to the public surface.
 
 ### Field visibility on structs
 
-Out of scope for this spec. Until the traits/types spec lands, struct
-fields inherit the struct's visibility — fields of a `pub struct` are
-publicly readable. Per-field visibility (`pub` on each field, or an
-explicit `private` marker) is a future addition that will not break
-existing code.
+Out of scope for this spec. Until the [faces/types spec](./faces.md)
+elaborates, struct fields inherit the struct's visibility — fields of a
+`pub struct` are publicly readable. Per-field visibility (`pub` on each
+field, or an explicit `private` marker) is a future addition that will
+not break existing code.
 
 ## Re-exports — `pub use`
 
@@ -384,7 +385,7 @@ AliasBinding   := "as" Ident
 ReExport       := "pub" "use" SelectiveList "from" ImportPath
                 | "pub" "use" Ident ("as" Ident)? "from" ImportPath
 
-Item           := Visibility? (FnDecl | StructDecl | EnumDecl | TypeDecl | TraitDecl | ConstDecl | ReExport)
+Item           := Visibility? (FnDecl | StructDecl | EnumDecl | TypeDecl | FaceDecl | FitDecl | ConstDecl | ReExport)
 Visibility     := "pub"
 ```
 
@@ -401,7 +402,7 @@ The block-`pub` form `Visibility "{" Item* "}"` is intentionally absent.
 
 ## Open items deferred to future specs
 
-- **Field visibility on structs** — pending the traits/types spec.
+- **Field visibility on structs** — pending the [faces/types spec](./faces.md).
 - **Macros / comptime-generated modules** — pending the comptime spec.
 - **Conditional compilation** (`@target("browser")` style) at the module
   level — pending the manifest's `targets` semantics being finalized.
