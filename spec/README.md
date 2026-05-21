@@ -28,6 +28,7 @@ suite.
 | [`streams.md`](./streams.md)                             | Signal / Event / Stream, @stage, graph, |>, pre(), fusion, SharedSignal          |
 | [`env.md`](./env.md)                                     | Capability model, Env structure, main signature, with_capabilities, disclosure   |
 | [`grammar.md`](./grammar.md)                             | Lexical structure and the consolidated syntactic grammar                          |
+| [`tests/`](./tests)                                      | Conformance test corpus — `.q` source files paired with expected diagnostic envelopes. See [`tests/README.md`](./tests/README.md) for conventions and [`tests/INDEX.md`](./tests/INDEX.md) for code coverage. |
 
 ## Scope (forthcoming)
 
@@ -35,8 +36,9 @@ suite.
   inference rules. (Primitive types and parameter modes landed in
   `types.md`; effect markers in `effects.md`; generics in
   `generics.md`.)
-- **Conformance test suite** — q64 source files plus expected outputs.
-  Any future implementation passes these to claim conformance.
+- **Conformance test corpus expansion** — first batch of ~40 tests
+  landed in [`tests/`](./tests); remaining coverage tracked in
+  [`tests/INDEX.md`](./tests/INDEX.md) §"Next batches".
 
 ## Vocabulary
 
