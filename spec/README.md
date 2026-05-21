@@ -23,6 +23,7 @@ suite.
 | [`effects.md`](./effects.md)                             | Effect markers, implication graph, propagation, capability disclosure |
 | [`generics.md`](./generics.md)                           | Type / const / region / effect parameters, bounds, where, defaults, inference |
 | [`types.md`](./types.md)                                 | Numeric tower, bool, arb-width ints, parameter modes, optional narrowing |
+| [`memory.md`](./memory.md)                               | Regions, dual heap, transfers, multi-memory layout, shared / managed annotations |
 
 ## Scope (forthcoming)
 
@@ -32,8 +33,6 @@ suite.
   inference rules. (Primitive types and parameter modes landed in
   `types.md`; effect markers in `effects.md`; generics in
   `generics.md`.)
-- **Memory model** — region kinds, dual heap, cross-heap rules, `@send`
-  derivation, multi-memory layout.
 - **Concurrency model** — scopes, tasks, channels, ordering guarantees,
   cancellation semantics.
 - **Stream semantics** — synchronous-tick model, `pre` operator, graph
