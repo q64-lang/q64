@@ -131,6 +131,12 @@
       }
     },
 
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CapabilityName" },
+      "description": "Runtime capabilities this qube reaches (Net, Fs, Audio, Midi, Ui, AiEnv, Clock, Rng, Stdout, Stderr). Cross-checked at `qube publish` against the compiler-derived set from the effect graph; mismatch is ENV040. See spec/env.md."
+    },
+
     "publish": {
       "type": "boolean",
       "default": true,
@@ -285,7 +291,13 @@
     "EffectMarker": {
       "type": "string",
       "pattern": "^@[a-z][a-z_]*$",
-      "description": "Effect marker. Core set: @realtime, @no_alloc, @no_suspend, @send, @pure, @io, @network. User-defined effects are allowed and follow the same shape."
+      "description": "Effect marker. Core set: @realtime, @no_alloc, @no_suspend, @send, @pure, @io, @network, @cancel, @uncancellable. User-defined effects are allowed and follow the same shape."
+    },
+
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Za-z0-9]*$",
+      "description": "Capability face name (PascalCase). Core set: Net, Fs, Audio, Midi, Ui, AiEnv, Clock, Rng, Stdout, Stderr, ExitFn, EnvVars. User-defined capabilities (e.g. an MQTT adapter) follow the same shape."
     }
   }
 }

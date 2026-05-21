@@ -89,6 +89,9 @@ That is a complete, publishable library qube. The default `entry` is
     declared: ["@realtime", "@io", "@network"],
     deny:     ["@unrestricted_fs"],
   },
+
+  // Capability disclosure (cross-checked at publish; see env.md ENV040)
+  capabilities: ["Net", "Audio", "Stdout"],
 }
 ```
 
@@ -119,7 +122,7 @@ That is a complete, publishable library qube. The default `entry` is
 | `entry` | string | `src/lib.q` for libraries, `src/main.q` for applications                      | Path to the main `.q` source file.                             |
 | `build` | string | none                                                                          | Optional path to `build.q` for computed configuration.         |
 
-Per [`design.md` §"Manifest"](https://github.com/q64-lang/design/blob/main/design.md):
+Per [`docs/history/design.md` §"Manifest"](../docs/history/design.md):
 static configuration lives in `qube.json5`; `build.q` is the imperative escape
 hatch for projects that need to compute target configuration at build time.
 
@@ -234,9 +237,8 @@ effects: {
 | `declared` | Effects this qube is allowed to use. The compiler verifies that source matches this set; declaring `@network` here while using only `@io` is a warning. |
 | `deny`     | Effects this qube refuses to transitively pull in. Build fails if any dependency requires a denied effect. |
 
-Core effect markers (per
-[`design.md` §"Effects"](https://github.com/q64-lang/design/blob/main/design.md)
-and [`concurrency.md`](https://github.com/q64-lang/design/blob/main/concurrency.md)):
+Core effect markers (per [`effects.md`](./effects.md), with
+`@cancel` / `@uncancellable` per [`concurrency.md`](./concurrency.md)):
 
 | Marker         | Meaning                                                       |
 |----------------|---------------------------------------------------------------|
@@ -246,11 +248,60 @@ and [`concurrency.md`](https://github.com/q64-lang/design/blob/main/concurrency.
 | `@send`        | Safe to transfer across thread boundaries.                    |
 | `@pure`        | No mutation, no observable side effects.                      |
 | `@io`          | Performs I/O.                                                 |
-| `@network`     | Performs network operations.                                  |
+| `@network`     | Performs network operations. Implies `@io`.                   |
+| `@cancel`      | Function observes `ctx.cancelled()`. (Per `concurrency.md`.) |
+| `@uncancellable`| Function cannot be interrupted by cancellation.              |
 
 User-defined effects follow the same shape (`^@[a-z][a-z_]*$`). The
 registry surfaces the union of declared effects per qube as part of the
 capability disclosure UI.
+
+### Capabilities
+
+```json5
+capabilities: ["Net", "Fs", "Stdout"]
+```
+
+The `capabilities` field is the developer-asserted summary of
+which runtime capabilities (per [`env.md`](./env.md)) this qube
+reaches. It is **cross-checked** at `qube publish` against the
+compiler-derived set computed from the effect graph; mismatch is
+`ENV040` and blocks publication.
+
+The two records exist because they serve different audiences:
+
+- The **manifest declaration** is human-readable and visible at
+  the top of the file; reviewers and registry users see it
+  immediately.
+- The **compiler-derived set** is emitted into a Wasm custom
+  section (`q64.capabilities`) and is the ground truth used by
+  the registry's installation prompt.
+
+The mapping from effect markers to capability names (per
+`env.md` §"Capability disclosure"):
+
+| Effect       | Implies capability   |
+|--------------|----------------------|
+| `@network`   | `Net`                |
+| `@fs`        | `Fs`                 |
+| `@audio`     | `Audio`              |
+| `@midi`      | `Midi`               |
+| `@ui`        | `Ui`                 |
+| `@inference` | `AiEnv`              |
+| `@time`      | `Clock`              |
+| `@random`    | `Rng`                |
+| `@stdio`     | `Stdout` + `Stderr`  |
+
+Capability names are PascalCase (matching the face names in
+`env.md`). Listing a capability not used by the source is
+`ENV041` at publish (warning). Listing a capability the source
+*does* use, and one it *doesn't*, both raise — `ENV040` for the
+missing entry, `ENV041` for the extraneous one — so the developer
+gets one clean fix on each publish attempt.
+
+User-defined capabilities (introduced by `fit MyAdapter : Net`
+or by user-defined effect markers) are listed by the
+PascalCase name of the underlying face.
 
 ### Publishing
 
@@ -275,6 +326,20 @@ versions together until 1.0.
 
 ## Related
 
-- [`design.md` §"Build Tool: qargo"](https://github.com/q64-lang/design/blob/main/design.md) — the original (pre-qube-rename) design discussion of the manifest.
-- [`concurrency.md`](https://github.com/q64-lang/design/blob/main/concurrency.md) — effect markers and their semantics.
-- [`stdlib.md`](https://github.com/q64-lang/design/blob/main/stdlib.md) — namespaces that show up in `dependencies` (`q64/math`, `q64/audio`, etc.).
+- [`effects.md`](./effects.md) — the formal effect-marker registry;
+  `effects.declared` and `effects.deny` semantics; the cross-check that
+  produces `EFF130` / `EFF131` at publish.
+- [`env.md`](./env.md) — capability model and the `ENV040` /
+  `ENV041` publish cross-checks for the `capabilities` field.
+- [`concurrency.md`](./concurrency.md) — `@cancel` / `@uncancellable`
+  semantics and the M:N task model that `@realtime` pins on.
+- [`continuum-api.md`](./continuum-api.md) — how the registry
+  surfaces declared + detected effects and capabilities at
+  install.
+- [`q64-cli.md`](./q64-cli.md) — `q64 show effects <qube>` and
+  `q64 show capabilities <qube>` introspection.
+- [`docs/history/design.md`](../docs/history/design.md) — original
+  pre-spec design discussion (archived).
+- [`docs/history/stdlib.md`](../docs/history/stdlib.md) — stdlib
+  namespaces that show up in `dependencies` (`q64/math`,
+  `q64/audio`, etc.).
