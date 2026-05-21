@@ -274,13 +274,14 @@ pub face Panic : Display {
 
 ### Auto-prelude payload types
 
-The language ships three blessed `Panic`-fitting types:
+The language ships four blessed `Panic`-fitting types:
 
 | Type            | Shape                                  | Where it comes from                                                      |
 |-----------------|----------------------------------------|--------------------------------------------------------------------------|
 | `PanicMessage`  | `struct PanicMessage(str)`             | `panic "string"` desugars to `panic(PanicMessage(s))`.                    |
-| `Cancelled`     | `struct Cancelled`                     | Cancellation observation in `@cancel` functions; the implicit `select` cancellation branch; cancel-aware channel ops. `code` returns `none`. |
-| `RuntimeDenied` | `struct RuntimeDenied { code: str, detail: str }` | Runtime-emitted denials such as `with_capabilities` (`ENV030`) and cancellation-marker conflicts. The `code` and `detail` fields back the values seen on `Panic`-bound catch variables. |
+| `Cancelled`     | `struct Cancelled`                     | Cancellation observation in `@cancel` functions; the implicit `select` cancellation branch; cancel-aware channel ops. `code()` returns `none` (cancellation is a runtime control-flow event, not a diagnostic). |
+| `Closed`        | `struct Closed`                        | A blocking `recv(ctx)` on a closed-and-empty channel (per [`concurrency.md` §"`Sender<T, P>` and `Receiver<T, P>` API"](./concurrency.md)). `code()` returns `none`. |
+| `RuntimeDenied` | `struct RuntimeDenied { code: str, detail: str }` | Runtime-emitted denials such as `with_capabilities` (`ENV030`). The `code` and `detail` fields back the values seen on `Panic`-bound catch variables. |
 
 All three are in the auto-prelude (no import required). User code may
 define additional `Panic`-fitting types freely:
@@ -515,6 +516,7 @@ The error-handling auto-prelude (no import needed):
 | `Panic`        | face   | the panic-payload contract                       |
 | `PanicMessage` | struct | wraps a `str` payload for `panic "msg"` sugar    |
 | `Cancelled`    | struct | unit payload signalling cooperative cancellation (per `concurrency.md`); `code()` returns `none` (cancellation is a runtime control-flow event, not a diagnostic) |
+| `Closed`       | struct | unit payload for blocking `recv(ctx)` on a closed-and-empty channel (per `concurrency.md`); `code()` returns `none` |
 | `RuntimeDenied`| struct | payload for runtime denials (e.g. `with_capabilities` `ENV030`); fields `code: str`, `detail: str` |
 | `From`         | face   | error conversion target (already in prelude)     |
 | `Into`         | face   | error conversion source (already in prelude)     |

@@ -602,7 +602,7 @@ that every q64 file can name without an explicit import:
 | `Display`    | human-readable string                            |
 | `Debug`      | machine-readable string for diagnostics          |
 | `Iterator`   | sequential access; powers `for` loops            |
-| `Default`    | a "zero" value                                   |
+| `Default`    | a "zero" value: `fn default() -> Self @pure`     |
 | `From, Into` | infallible cross-type conversion (single-param)  |
 | `TryFrom, TryInto` | fallible conversion                       |
 | `Arbitrary`  | random value generator (used by property tests)  |
@@ -754,3 +754,8 @@ pub fn write_to_log(items: [dyn Display]) {
   present. Lands with the coherence work.
 - **Const-evaluated bounds** — `where N == M + 1` for const generics;
   pending the comptime spec.
+- **Blessed stream faces** — `Stage`, `Source`, `Sink`, `RateAware`
+  as auto-prelude faces that `@stage`-annotated functions
+  structurally fit. Referenced by
+  [`streams.md`](./streams.md); the formal face declarations land
+  with the comptime / `@stage`-introspection work.

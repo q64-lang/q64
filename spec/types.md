@@ -174,12 +174,39 @@ A literal like `42.kHz` is parsed as `42` followed by the
 `kHz` suffix, not as a float — the suffix rule beats float
 interpretation when the trailing token is an identifier.
 
+## Strings: `str` and `String<R>`
+
+Two string types, by intent:
+
+| Type            | Lifetime / ownership                                     | Where it appears                                                                |
+|-----------------|----------------------------------------------------------|---------------------------------------------------------------------------------|
+| `str`           | Immutable slice. Borrowed; no owning region.             | Function parameters, struct fields holding read-only text, literal results.     |
+| `String<R>`     | Owned, growable. Allocated in region `R` (default `Arena`). See [`memory.md`](./memory.md). | Construction, mutation, return values that must outlive the caller's borrow.    |
+
+The relationship is the standard Rust shape: `String<R>` owns
+its bytes; `str` is a borrow into someone else's bytes (a static
+literal, a `String<R>`, or a slice of one). Both fit `Display`;
+both interoperate with the interpolation form below.
+
+- A plain string literal (e.g. `"Hello"`) without
+  interpolation has type `str` and lives in `mem.rodata`.
+- An interpolated literal (`"Hello, {name}!"`) allocates a
+  fresh `String<R>` in the enclosing scope's arena, since the
+  interpolation result depends on runtime values.
+- `String<R>.as_str(self) -> str` borrows the owned string as a
+  slice without copying (the slice's lifetime is bounded by
+  `R`'s).
+- `str.to_string<R>(self, r: R) -> String<R>` copies the slice
+  into the named region.
+
+There is no implicit conversion in either direction.
+
 ## String literals
 
-String literals have three forms. All three produce values
-whose type fits `Display` and which can be borrowed as `str`
-(the static-string slice type) when the literal is a
-compile-time constant.
+String literals have three forms. All three either produce a `str`
+(when the literal is a pure compile-time constant) or a fresh
+`String<R>` in the enclosing scope's arena (when the form requires
+runtime work, e.g. interpolation). Both fit `Display`.
 
 ### Plain interpolated form
 
@@ -464,10 +491,19 @@ revision.
 Two builtin compound types live in the auto-prelude:
 
 ```q64
-@kind Simd<T, const N: i64>            // hardware-mapped SIMD lanes
-@kind Tensor<T, const Shape: [i64]>    // static-shape tensor
-@kind DynTensor<T>                     // shape carried at runtime
+@kind Simd<T, const N: i64>                          // hardware-mapped SIMD lanes
+@kind Tensor<T, const Shape: [i64; Rank], const Rank: i64>   // static-shape tensor
+@kind DynTensor<T>                                   // shape and rank carried at runtime
 ```
+
+`Tensor`'s shape parameter is a fixed-length array of `i64`
+(`[i64; Rank]`) per
+[`generics.md` §"Permitted const-generic types"](./generics.md);
+the rank is itself a const-generic so that a `Tensor<f32, [4]>`,
+`Tensor<f32, [4, 4]>`, and `Tensor<f32, [4, 4, 4]>` are three
+distinct types the compiler can monomorphize cleanly. In code,
+`Rank` is almost always inferred from the shape literal:
+`Tensor<f32, [4, 4]>` infers `Rank = 2`.
 
 Why they're language types, not stdlib:
 

@@ -219,8 +219,10 @@ pub fn write_config<F: Fs>(f: F, path: str, cfg: Config) -> Result<(), IoError> 
 
 `fn fetch_users(n: Net, …)` is shorthand for
 `fn fetch_users<N: Net>(n: N, …)` per
-[`generics.md`](./generics.md): face-typed parameters auto-
-generalize. The compiler dispatches the calls statically.
+[`generics.md` §"Implicit face parameters"](./generics.md):
+face-typed parameters introduce an anonymous generic bound by the
+face. The compiler dispatches the calls statically (monomorphized
+per concrete fit).
 
 `q64 fmt --lint` issues `ENV010` when a function takes
 `env: Env` but uses only one or two sub-capabilities:
