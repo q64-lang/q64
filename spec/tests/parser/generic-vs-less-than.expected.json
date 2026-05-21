@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "PAR040", "severity": "error" }
+  ]
+}

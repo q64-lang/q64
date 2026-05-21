@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "LEX020", "severity": "error" }
+  ]
+}

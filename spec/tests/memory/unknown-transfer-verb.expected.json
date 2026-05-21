@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "REG050", "severity": "error" }
+  ]
+}

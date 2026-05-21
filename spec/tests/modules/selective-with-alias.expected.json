@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "NAM004", "severity": "error" }
+  ]
+}

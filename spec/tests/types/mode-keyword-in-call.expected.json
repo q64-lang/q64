@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "TYP060", "severity": "error" }
+  ]
+}
