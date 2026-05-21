@@ -6,7 +6,7 @@ Video frame types and codec interfaces.
 
 ## Surface (planned)
 
-- **Frame types** — `Frame[Pixel, Subsampling, W, H]` with resolution,
+- **Frame types** — `Frame.<Pixel, Subsampling, W, H>` with resolution,
   color standard, transfer function, and chroma subsampling all in the type.
   Concrete aliases: `Hd1080p10`, `Uhd4kHdr`, `MasterF16`.
 - **Video standards** — `BT601`, `BT709`, `BT2020`, `BT2020Pq` (HDR10),

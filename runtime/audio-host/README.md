@@ -12,7 +12,7 @@ The audio plugin runtime adapter. Targets VST3, AU, and AAX hosts (DAWs).
   from the host's UI thread to the audio thread without locks.
 - **Plugin wrappers**: VST3 / AU / AAX wrapper code that exposes the q64
   graph as an audio plugin to the host DAW.
-- **MIDI**: `Event[MidiMessage]` plumbed from the host's MIDI input.
+- **MIDI**: `Event.<MidiMessage>` plumbed from the host's MIDI input.
 - **Preset/state**: persistence using the host's preset mechanisms.
 
 ## Implementation language

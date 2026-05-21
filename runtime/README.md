@@ -31,6 +31,6 @@ the adapter encapsulates everything the user shouldn't see:
 - **Audio-host**: real-time-safe scheduling on the host's audio thread,
   lock-free FIFOs for parameter changes, parameter automation marshaling.
 
-What user code *does* see — `scope`, `spawn`, `channel[T]`, `select`,
-`Shared[T]`, `atomic[T]`, `actor`, `Signal[T]`, `Event[T]`, `Stream[T]` —
+What user code *does* see — `scope`, `spawn`, `channel.<T>`, `select`,
+`Shared.<T>`, `atomic.<T>`, `actor`, `Signal.<T>`, `Event.<T>`, `Stream.<T>` —
 is identical across hosts. The adapter is the boundary.

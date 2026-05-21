@@ -11,7 +11,7 @@ tests for the compiler, the stdlib, and the runtime adapters.
 - **`voice-agent/`** — microphone → ASR → LLM → TTS → speaker pipeline,
   the canonical multi-stream demo from
   [`design/example.md`](https://github.com/q64-lang/design/blob/main/example.md).
-  Exercises `Signal[PCM[f32]]`, `Stream[Token[V]]`, vocab translation, and
+  Exercises `Signal.<PCM.<f32>>`, `Stream.<Token.<V>>`, vocab translation, and
   `@realtime` effect propagation.
 - **`audio-dsp/`** — a small synth + effects chain. Tests `q64.audio`,
   fixed-shape SIMD kernels, and the audio-host runtime adapter.

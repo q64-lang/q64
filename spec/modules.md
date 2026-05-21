@@ -142,12 +142,12 @@ import "./b.q" as b                        // ✓ refer to b.Frame
 Every item declaration carries an optional `pub` prefix:
 
 ```q64
-pub fn dot[T](a: Vec3[T], b: Vec3[T]): T { ... }
-pub struct Vec3[T] { x: T, y: T, z: T }
+pub fn dot.<T>(a: Vec3.<T>, b: Vec3.<T>): T { ... }
+pub struct Vec3.<T> { x: T, y: T, z: T }
 pub enum Color { Rgb, Hsv, Lab }
 pub type Hz = f64
-pub face Eq[T] { ... }
-pub fit Eq for Vec3[f32] { ... }
+pub face Eq.<T> { ... }
+pub fit Eq for Vec3.<f32> { ... }
 pub const PI: f64 = 3.14159
 pub use Vec3 from "./vec.q"
 
@@ -313,13 +313,13 @@ stdlib/math/
 
 import "./_scalar.q"
 
-pub struct Vec3[T] { x: T, y: T, z: T }
+pub struct Vec3.<T> { x: T, y: T, z: T }
 
-pub fn dot[T](a: Vec3[T], b: Vec3[T]): T {
+pub fn dot.<T>(a: Vec3.<T>, b: Vec3.<T>): T {
     a.x*b.x + a.y*b.y + a.z*b.z
 }
 
-fn normalize_in_place(v: ref Vec3[f32]) { ... }   // file-private
+fn normalize_in_place(v: ref Vec3.<f32>) { ... }   // file-private
 ```
 
 ```q64
@@ -337,17 +337,17 @@ pub use Quat, slerp from "./quat.q"
 ```q64
 // Namespace
 import q64.math
-let v: math.Vec3[f32] = ...
+let v: math.Vec3.<f32> = ...
 let d = math.dot(v, v)
 
 // Selective
 import q64.math.{Vec3, dot}
-let v: Vec3[f32] = ...
+let v: Vec3.<f32> = ...
 let d = dot(v, v)
 
 // Alias
 import q64.math as m
-let v: m.Vec3[f32] = ...
+let v: m.Vec3.<f32> = ...
 let d = m.dot(v, v)
 ```
 

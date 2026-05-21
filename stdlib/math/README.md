@@ -8,7 +8,7 @@ Vectors, matrices, quaternions, linear algebra, and FFT.
 
 - **Vectors and matrices**: `Vec2`, `Vec3`, `Vec4`, `Mat3`, `Mat4`,
   parameterized by element type and unit-of-measure where applicable.
-- **Quaternions**: `Quat[T]` as a distinct kind from `Vec4`; Hamilton
+- **Quaternions**: `Quat.<T>` as a distinct kind from `Vec4`; Hamilton
   product, conjugate, slerp.
 - **Linear algebra**: `matmul`, `dot`, `cross`, `transpose`, `inverse`,
   `norm`, decompositions.

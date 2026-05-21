@@ -7,7 +7,7 @@ auto-derive, and laws).
 
 > **Status: draft (v0).** Names settled (`face`, `fit`); core shape
 > settled (hybrid: single-parameter faces use `fit Face for Type`,
-> multi-parameter faces use `fit Face[T1, T2]`). Some surface details
+> multi-parameter faces use `fit Face.<T1, T2>`). Some surface details
 > (`where`-clause grammar, full dyn-safety rules, the auto-derive
 > table) will firm up with implementation.
 
@@ -39,7 +39,7 @@ pub fit Display for Color {
 }
 
 // 3. fn — use the face as a bound on a generic.
-pub fn print_all[T: Display](env: Env, items: [T]) {
+pub fn print_all.<T: Display>(env: Env, items: [T]) {
     for item in items {
         env.out("{item.fmt()}")
     }
@@ -61,7 +61,7 @@ What's happening:
 - **`fit Display for Color`** is the binding. The compiler verifies
   that the body matches the face's signature exactly, including the
   `@pure` effect.
-- **`fn print_all[T: Display]`** is generic over any `T` that fits
+- **`fn print_all.<T: Display>`** is generic over any `T` that fits
   `Display`. At each call site, the compiler monomorphizes `print_all`
   for the concrete `T` — here, `T = Color`. Zero runtime overhead, full
   inlining, predictable `@realtime` behavior.
@@ -76,7 +76,7 @@ three keywords and following the arrows between them.
    monomorphize at compile time — zero runtime overhead, predictable
    `@realtime` reasoning, full inlining across face boundaries.
 2. **Multi-parameter dispatch as a first-class shape.** Conversion
-   lattices (`PCM[i16] → PCM[f32]`, `sRGB → Linear`,
+   lattices (`PCM.<i16> → PCM.<f32>`, `sRGB → Linear`,
    `WhisperVocab → LlamaVocab`) deserve direct expression — no awkward
    "pick one type to be the receiver."
 3. **Effects, regions, and comptime threaded through.** Face systems
@@ -91,16 +91,16 @@ three keywords and following the arrows between them.
 |----------|-----------------------------------------------------------------------------|
 | `face`   | A named interface — methods, associated types, default impls, and laws.      |
 | `fit`    | A binding that says "this type (or these types) fit this face."             |
-| **bound**| A constraint on a generic parameter — `T: Eq[T]` reads "`T` must fit `Eq`." |
+| **bound**| A constraint on a generic parameter — `T: Eq.<T>` reads "`T` must fit `Eq`." |
 | **dyn**  | A type position that erases the concrete type and dispatches at runtime.    |
 
 Compiler error messages use the same vocabulary: *"Vec3 does not fit Eq"*,
-*"face Convert[From, To] is not satisfied for (PCM[i16], PCM[f24])"*.
+*"face Convert.<From, To> is not satisfied for (PCM.<i16>, PCM.<f24>)"*.
 
 ## Face declaration
 
 ```q64
-pub face Eq[T] {
+pub face Eq.<T> {
     fn eq(a: T, b: T): bool @pure
     fn ne(a: T, b: T): bool @pure { !Eq.eq(a, b) }      // default method
 
@@ -112,7 +112,9 @@ pub face Eq[T] {
 
 A face declaration contains:
 
-- **Type parameters** — `[T]`, `[From, To]`, etc.
+- **Generic parameters** — `.<T>`, `.<From, To>`, `.<T, R: Region, @e>`, etc.
+  The `.< >` sigil distinguishes generic parameter lists from array
+  literals and subscript expressions, which use bare `[ ]`.
 - **Method signatures** — each with optional effect markers.
 - **Associated types** — `type Item` declarations whose concrete type each
   fit supplies.
@@ -127,7 +129,7 @@ effect grammar from
 [`design.md` §Effects](https://github.com/q64-lang/design/blob/main/design.md):
 
 ```q64
-pub face Process[In, Out] {
+pub face Process.<In, Out> {
     fn step(self, x: In): Out @realtime
 }
 ```
@@ -151,7 +153,7 @@ Inside the face body, `Self.Item` refers to the associated type. A fit
 supplies the concrete type:
 
 ```q64
-pub fit Iterator for VecIter[T] {
+pub fit Iterator for VecIter.<T> {
     type Item = T
     fn next(self: ref Self): T? { ... }
 }
@@ -174,7 +176,7 @@ pub face Clone {
     fn clone(self): Self
 }
 
-pub face Convert[From, To] {            // no Self; both types named
+pub face Convert.<From, To> {            // no Self; both types named
     fn convert(x: From): To
 }
 ```
@@ -184,12 +186,12 @@ pub face Convert[From, To] {            // no Self; both types named
 A face may require another face as a superface:
 
 ```q64
-pub face Hash[T]: Eq[T] {
+pub face Hash.<T>: Eq.<T> {
     fn hash(self): u64 @pure
 }
 ```
 
-Any `fit Hash[X]` requires that `Eq[X]` is also fit.
+Any `fit Hash.<X>` requires that `Eq.<X>` is also fit.
 
 ## Fit declaration
 
@@ -200,13 +202,13 @@ rule is mechanical, not stylistic, and the compiler enforces it.
 ### Single-parameter faces — use `for`
 
 ```q64
-pub fit Eq for Vec3[f32] {
-    fn eq(a: Vec3[f32], b: Vec3[f32]): bool {
+pub fit Eq for Vec3.<f32> {
+    fn eq(a: Vec3.<f32>, b: Vec3.<f32>): bool {
         a.x == b.x && a.y == b.y && a.z == b.z
     }
 }
 
-pub fit Display for Vec3[f32] {
+pub fit Display for Vec3.<f32> {
     fn fmt(self): str { "Vec3({self.x}, {self.y}, {self.z})" }
 }
 ```
@@ -214,14 +216,14 @@ pub fit Display for Vec3[f32] {
 ### Multi-parameter faces — no `for`
 
 ```q64
-pub fit Convert[PCM[i16], PCM[f32]] {
-    fn convert(x: PCM[i16]): PCM[f32] {
-        PCM[f32](f32(x.0) / 32768.0)
+pub fit Convert.<PCM.<i16>, PCM.<f32>> {
+    fn convert(x: PCM.<i16>): PCM.<f32> {
+        PCM.<f32>(f32(x.0) / 32768.0)
     }
 }
 
-pub fit Convert[Rgb[sRGB, u8], Rgb[Linear, f32]] {
-    fn convert(x: Rgb[sRGB, u8]): Rgb[Linear, f32] { ... }
+pub fit Convert.<Rgb.<sRGB, u8>, Rgb.<Linear, f32>> {
+    fn convert(x: Rgb.<sRGB, u8>): Rgb.<Linear, f32> { ... }
 }
 ```
 
@@ -238,9 +240,9 @@ boundary.
 ### Inline bounds on generic parameters
 
 ```q64
-pub fn unique[T: Eq[T]](items: [T]): [T] { ... }
+pub fn unique.<T: Eq.<T>>(items: [T]): [T] { ... }
 
-pub fn dedup_sorted[T: Eq[T] + Ord[T]](items: ref [T]) { ... }
+pub fn dedup_sorted.<T: Eq.<T> + Ord.<T>>(items: ref [T]) { ... }
 ```
 
 `+` composes bounds. Reads naturally: *"T must fit Eq and Ord."*
@@ -251,9 +253,9 @@ When a bound is verbose or involves associated types, the `where`
 clause keeps the parameter list readable:
 
 ```q64
-pub fn collect[I, C]
+pub fn collect.<I, C>
     where I: Iterator,
-          C: Collection[I.Item, _],
+          C: Collection.<I.Item, _>,
     (it: I): C { ... }
 ```
 
@@ -264,9 +266,9 @@ the inline form.
 ### Bounds on multi-parameter faces
 
 ```q64
-pub fn pipeline[A, B, C]
-    where Convert[A, B],
-          Convert[B, C],
+pub fn pipeline.<A, B, C>
+    where Convert.<A, B>,
+          Convert.<B, C>,
     (x: A): C {
     let mid = Convert.convert(x)
     Convert.convert(mid)
@@ -282,25 +284,25 @@ A face may carry an effect variable that each fit binds. Bounds can
 then constrain on the effect, not just face membership.
 
 ```q64
-pub face Filter[T, @e] {
+pub face Filter.<T, @e> {
     fn step(self: ref Self, x: T): T @e
 
     law preserves_silence: forall self => step(self, T.silence()) == T.silence()
 }
 
-pub fit Filter[PCM[f32], @realtime] for LowPass {
-    fn step(self: ref Self, x: PCM[f32]): PCM[f32] @realtime { ... }
+pub fit Filter.<PCM.<f32>, @realtime> for LowPass {
+    fn step(self: ref Self, x: PCM.<f32>): PCM.<f32> @realtime { ... }
 }
 
-pub fit Filter[Bytes, @io] for FileSink {
+pub fit Filter.<Bytes, @io> for FileSink {
     fn step(self: ref Self, x: Bytes): Bytes @io { ... }
 }
 
 // Caller constrains the effect: only @realtime fits accepted
-pub fn run_audio[F: Filter[PCM[f32], @realtime]](
+pub fn run_audio.<F: Filter.<PCM.<f32>, @realtime>>(
     filter: ref F,
-    input: Stream[PCM[f32]],
-): Stream[PCM[f32]] {
+    input: Stream.<PCM.<f32>>,
+): Stream.<PCM.<f32>> {
     input.map(|x| filter.step(x))
 }
 ```
@@ -313,7 +315,7 @@ contract is rewritten with that binding.
 **Effect bounds compose:**
 
 ```q64
-pub fn audio_no_alloc[F: Filter[PCM[f32], @realtime + @no_alloc]](
+pub fn audio_no_alloc.<F: Filter.<PCM.<f32>, @realtime + @no_alloc>>(
     filter: ref F,
 ) { ... }
 ```
@@ -326,21 +328,21 @@ out non-realtime work at the type level.
 Same shape, with a region variable:
 
 ```q64
-pub face Collection[T, R: Region] {
+pub face Collection.<T, R: Region> {
     fn push(self: ref Self, r: R, x: T)
     fn pop(self: ref Self): T?
     fn len(self): usize
 }
 
-pub fit Collection[i64, Arena] for Vec[i64, Arena] { ... }
-pub fit Collection[i64, Managed] for Vec[i64, Managed] { ... }
+pub fit Collection.<i64, Arena> for Vec.<i64, Arena> { ... }
+pub fit Collection.<i64, Managed> for Vec.<i64, Managed> { ... }
 ```
 
 Callers stay generic over the region:
 
 ```q64
-pub fn collect[T, R: Region, C: Collection[T, R]]
-    (r: R, items: Stream[T]): C { ... }
+pub fn collect.<T, R: Region, C: Collection.<T, R>>
+    (r: R, items: Stream.<T>): C { ... }
 ```
 
 Region parameters interact with the lifetime checker from
@@ -355,7 +357,7 @@ default** when their requirements are satisfiable; you opt out only when
 you need to suppress automatic derivation or supply a hand-written fit.
 
 ```q64
-pub struct Vec3[T] { x: T, y: T, z: T }
+pub struct Vec3.<T> { x: T, y: T, z: T }
 
 // Eq, Hash, Display, Clone are automatic when T fits the same face.
 // The compiler synthesizes the obvious field-by-field implementation.
@@ -405,7 +407,7 @@ methods. `qube test` reads them and auto-generates property tests for
 every fit, using the law statements as predicates.
 
 ```q64
-pub face Monoid[T] {
+pub face Monoid.<T> {
     fn zero(): T
     fn combine(a: T, b: T): T
 
@@ -445,7 +447,7 @@ works, but `qube test` won't claim it does.
 ### Default: static dispatch via monomorphization
 
 ```q64
-pub fn unique[T: Eq[T]](items: [T]): [T] { ... }
+pub fn unique.<T: Eq.<T>>(items: [T]): [T] { ... }
 ```
 
 The compiler emits one monomorphized copy of `unique` per concrete `T`.
@@ -460,7 +462,7 @@ pub fn render(target: dyn Display) {
 ```
 
 `dyn Face` is a type position. It is **separate** from the face-as-a-bound:
-`fn f[T: Display]` is static, `fn f(x: dyn Display)` is dynamic. Per
+`fn f.<T: Display>` is static, `fn f(x: dyn Display)` is dynamic. Per
 [`design/influences.md`](https://github.com/q64-lang/design/blob/main/influences.md)
 §Swift, q64 deliberately separates "face as interface" from "face as
 existential type" — Swift's conflation causes the `Self`-with-existential
@@ -493,7 +495,7 @@ None of these change the default; they are escape hatches.
 
 ## Coherence
 
-q64 relaxes Rust's strict orphan rule. A `fit Face[T1, T2, ...]` is
+q64 relaxes Rust's strict orphan rule. A `fit Face.<T1, T2, ...>` is
 allowed when **at least one of the face or any type parameter is
 declared in the current qube.** This permits the common patterns the
 orphan rule blocks — implementing `Display` for a stdlib type your code
@@ -510,19 +512,20 @@ newtype.
 Conflicts are diagnosed at build time, not runtime — there is no late
 binding that could surprise.
 
-## Static `Face::method` and `Face::Type` paths
+## Static `Face.method` and `Face.Type` paths
 
 Methods and associated types are addressable through the face name
 when type inference can't resolve them from context:
 
 ```q64
-let cf = Convert::<PCM[i16], PCM[f32]>::convert(sample)
-let item_type = Iterator::<MyIter>::Item
+let cf        = Convert.<PCM.<i16>, PCM.<f32>>.convert(sample)
+let item_type = Iterator.<MyIter>.Item
 ```
 
-The `<...>` brackets disambiguate the face's type parameters when
-needed; in most code, inference resolves them and the shorter
-`obj.method(...)` or `Face.method(...)` forms suffice.
+The `.< >` sigil supplies the face's type parameters explicitly. In
+most code, inference resolves them and the shorter `obj.method(...)`
+or `Face.method(...)` forms suffice; the explicit form is the escape
+hatch for the call sites where inference can't.
 
 ## Diagnostic codes
 
@@ -532,8 +535,8 @@ checking is a typecheck concern). Stable numbering, never reused.
 | Code     | Short message                                | When                                                                              |
 |----------|----------------------------------------------|-----------------------------------------------------------------------------------|
 | `TYP200` | type does not fit face                       | Generic instantiation requires a face that the supplied type does not fit.        |
-| `TYP201` | `for` clause required on single-param face   | `fit Face[Type]` for a single-parameter face; use `fit Face for Type`.            |
-| `TYP202` | `for` clause forbidden on multi-param face   | `fit Face for Type` used with a multi-parameter face; use `fit Face[T1, T2]`.     |
+| `TYP201` | `for` clause required on single-param face   | `fit Face.<Type>` for a single-parameter face; use `fit Face for Type`.            |
+| `TYP202` | `for` clause forbidden on multi-param face   | `fit Face for Type` used with a multi-parameter face; use `fit Face.<T1, T2>`.     |
 | `TYP203` | overlapping fits                             | Two fits both match the same type combination.                                    |
 | `TYP204` | coherence violation                          | Fit's face and all parameter types are external to this qube.                     |
 | `TYP205` | face arity mismatch                          | Fit supplies a different number of type parameters than the face declares.        |
@@ -541,7 +544,7 @@ checking is a typecheck concern). Stable numbering, never reused.
 | `TYP207` | face is not dyn-safe                         | `dyn Face` used on a face whose methods preclude dynamic dispatch.                |
 | `TYP208` | face inheritance cycle                       | `face A: B`, `face B: A` form a cycle.                                            |
 | `TYP209` | effect bound mismatch                        | Bound requires effect `@e`, fit provides a different (or weaker) effect.          |
-| `TYP210` | unsatisfied face bound                       | Generic call cannot prove the bound `T: Face[T]`.                                 |
+| `TYP210` | unsatisfied face bound                       | Generic call cannot prove the bound `T: Face.<T>`.                                 |
 | `TYP211` | wrong method signature in fit                | Fit's method does not match the face's declared signature (or effect set).        |
 | `TYP212` | default method recursion                     | A face default calls another default that ultimately calls back, with no override.|
 | `TYP213` | auto-derive failed                           | Auto-derive required a field type to fit a face; it doesn't.                      |
@@ -582,7 +585,7 @@ prelude is curated; user code cannot add to it.
 ## Grammar (informal)
 
 ```
-FaceDecl    := Visibility? "face" Ident TypeParams? FaceSuperList? "{" FaceItem* "}"
+FaceDecl    := Visibility? "face" Ident GenericParams? FaceSuperList? "{" FaceItem* "}"
 FaceSuperList := ":" FaceRef ("+" FaceRef)*
 FaceItem    := TypeAlias | MethodSig | LawDecl
 TypeAlias   := "type" Ident ("=" TypeExpr)?
@@ -592,20 +595,29 @@ LawDecl     := "law" Ident ":" "forall" QuantList "=>" PredicateExpr
 
 FitDecl     := Visibility? "fit" FaceRef FitTarget "{" FitItem* "}"
 FitTarget   := "for" TypeExpr     // single-param face
-             | (empty)             // multi-param face; types in FaceRef[...]
+             | (empty)             // multi-param face; types live in FaceRef's GenericArgs
 FitItem     := TypeAlias | MethodDecl
 MethodDecl  := "fn" Ident "(" Params? ")" (":" TypeExpr)? EffectSpec? MethodBody
 
+FaceRef     := Ident GenericArgs?     // e.g. `Eq`, `Convert.<Rgb, Hex>`
 Bound       := Ident ":" FaceRef ("+" FaceRef)*
 WhereClause := "where" Bound ("," Bound)*
 
 DynType     := "dyn" FaceRef
 
-TypeParams  := "[" TypeParam ("," TypeParam)* "]"
-TypeParam   := Ident (":" BoundList)?            // type
-             | "@" Ident                          // effect variable
-             | Ident ":" "Region"                 // region
+GenericParams := ".<" GenericParam ("," GenericParam)* ">"
+GenericParam  := Ident (":" BoundList)?           // type
+              | "@" Ident                          // effect variable
+              | Ident ":" "Region"                 // region
+
+GenericArgs   := ".<" TypeExpr ("," TypeExpr)* ">"    // application site
 ```
+
+Note: `GenericParams` (declaration) and `GenericArgs` (application) use
+the same `.< >` sigil. Bare `[ ]` is reserved for array literals and
+subscripting; `.< >` is reserved for generic parameter and argument
+lists. The sigil makes the type-level vs value-level distinction
+unambiguous at every use site.
 
 The block-form `face { fit { … } }` is not supported — every `face` and
 every `fit` is a top-level item (per
@@ -616,7 +628,7 @@ every `fit` is a top-level item (per
 ### Equality with laws
 
 ```q64
-pub face Eq[T] {
+pub face Eq.<T> {
     fn eq(a: T, b: T): bool @pure
     fn ne(a: T, b: T): bool @pure { !Eq.eq(a, b) }
 
@@ -626,42 +638,42 @@ pub face Eq[T] {
 }
 
 // Auto-derived; no explicit fit needed
-pub struct Vec3[T] { x: T, y: T, z: T }
+pub struct Vec3.<T> { x: T, y: T, z: T }
 ```
 
 ### Conversion (multi-parameter, no `for`)
 
 ```q64
-pub face Convert[From, To] {
+pub face Convert.<From, To> {
     fn convert(x: From): To
 }
 
-pub fit Convert[PCM[i16], PCM[f32]] {
-    fn convert(x: PCM[i16]): PCM[f32] {
-        PCM[f32](f32(x.0) / 32768.0)
+pub fit Convert.<PCM.<i16>, PCM.<f32>> {
+    fn convert(x: PCM.<i16>): PCM.<f32> {
+        PCM.<f32>(f32(x.0) / 32768.0)
     }
 }
 
-pub fit Convert[Rgb[sRGB, u8], Rgb[Linear, f32]] {
-    fn convert(x: Rgb[sRGB, u8]): Rgb[Linear, f32] { ... }
+pub fit Convert.<Rgb.<sRGB, u8>, Rgb.<Linear, f32>> {
+    fn convert(x: Rgb.<sRGB, u8>): Rgb.<Linear, f32> { ... }
 }
 ```
 
 ### Effect-polymorphic processing
 
 ```q64
-pub face Filter[T, @e] {
+pub face Filter.<T, @e> {
     fn step(self: ref Self, x: T): T @e
 }
 
-pub fit Filter[PCM[f32], @realtime] for LowPass {
-    fn step(self: ref Self, x: PCM[f32]): PCM[f32] @realtime { ... }
+pub fit Filter.<PCM.<f32>, @realtime> for LowPass {
+    fn step(self: ref Self, x: PCM.<f32>): PCM.<f32> @realtime { ... }
 }
 
-pub fn run_audio_chain[F: Filter[PCM[f32], @realtime]](
+pub fn run_audio_chain.<F: Filter.<PCM.<f32>, @realtime>>(
     filter: ref F,
-    input: Stream[PCM[f32]],
-): Stream[PCM[f32]] {
+    input: Stream.<PCM.<f32>>,
+): Stream.<PCM.<f32>> {
     input.map(|x| filter.step(x))
 }
 ```
