@@ -199,7 +199,7 @@ never `panic`.
 
 ```q64
 pub face Error : Display {
-    fn source(self) -> Option<&dyn Error> { None }      // default: no inner error
+    fn source(self) -> Option<ref dyn Error> { None }      // default: no inner error
 }
 ```
 
@@ -226,10 +226,10 @@ pub fit LoadConfigError : Display {
 }
 
 pub fit LoadConfigError : Error {
-    fn source(self) -> Option<&dyn Error> {
+    fn source(self) -> Option<ref dyn Error> {
         match self {
-            Io(e)    -> Some(&e),
-            Parse(e) -> Some(&e),
+            Io(e)    -> Some(ref e),
+            Parse(e) -> Some(ref e),
         }
     }
 }
@@ -381,7 +381,7 @@ pub enum ReadJsonError {
 pub fit ReadJsonError : From<IoError>   { fn from(e: IoError)   -> Self { Io(e)    } }
 pub fit ReadJsonError : From<JsonError> { fn from(e: JsonError) -> Self { Parse(e) } }
 
-pub fn read_json<T>(env: Env, path: Path) -> Result<T, ReadJsonError> {
+pub fn read_json<T>(env: Env, path: str) -> Result<T, ReadJsonError> {
     let bytes  = try env.fs.read(path)        // IoError    -> ReadJsonError via From
     let value: T = try bytes.json()           // JsonError  -> ReadJsonError via From
     Ok(value)
@@ -395,7 +395,7 @@ specific failures.
 ### Inline sum type — anonymous union
 
 ```q64
-pub fn read_json<T>(env: Env, path: Path) -> Result<T, IoError | JsonError> {
+pub fn read_json<T>(env: Env, path: str) -> Result<T, IoError | JsonError> {
     let bytes    = try env.fs.read(path)
     let value: T = try bytes.json()
     Ok(value)
@@ -547,12 +547,12 @@ pub fit ConfigError : Display {
 }
 
 pub fit ConfigError : Error {
-    fn source(self) -> Option<&dyn Error> {
-        match self { Io(e) -> Some(&e), Parse(e) -> Some(&e) }
+    fn source(self) -> Option<ref dyn Error> {
+        match self { Io(e) -> Some(ref e), Parse(e) -> Some(ref e) }
     }
 }
 
-pub fn load_config(env: Env, path: Path) -> Result<Config, ConfigError> {
+pub fn load_config(env: Env, path: str) -> Result<Config, ConfigError> {
     let bytes        = try env.fs.read(path)
     let cfg: Config  = try bytes.json()
     Ok(cfg)

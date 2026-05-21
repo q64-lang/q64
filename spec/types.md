@@ -174,6 +174,177 @@ A literal like `42.kHz` is parsed as `42` followed by the
 `kHz` suffix, not as a float — the suffix rule beats float
 interpretation when the trailing token is an identifier.
 
+## Bindings: `let` and `var`
+
+Every local binding is declared with one of two keywords:
+
+| Keyword | Mutability                | Initialization               |
+|---------|---------------------------|------------------------------|
+| `let`   | Immutable after init      | Required at declaration, **or** definitely-assigned before first use. |
+| `var`   | Mutable                   | Required at declaration, **or** definitely-assigned before first use. |
+
+```q64
+let a: i64 = 42
+let b      = 3.14            // type inferred as f64
+var c: i64 = 0
+c = c + 1                    // OK; var is mutable
+// a = 7                     // ❌ TYP052 — assignment to `let` binding
+
+var d: Frame                 // declared but uninitialized
+if condition {
+    d = Frame.uninit(1920, 1080)
+} else {
+    d = Frame.black()
+}
+use(d)                       // ✓ definitely assigned on both branches
+```
+
+Both forms accept an optional type annotation. Without one, the
+compiler infers from the initializer.
+
+### Interaction with parameter modes
+
+The mode rules in §"Parameter modes" use these binding kinds at
+call sites:
+
+- A `ref` argument requires the caller's binding to be `var`.
+- An `out` argument requires the caller's binding to be `var`;
+  the binding is considered uninitialized for subsequent reads
+  if `out` was the writer.
+- A `move` argument may be either; the binding is consumed
+  after the call regardless.
+
+### Top-level items
+
+`let` and `var` are local-binding keywords. Module-level constants
+use `pub const`/`const` (per [`modules.md`](./modules.md) §Item
+grammar); module-level mutable globals are intentionally not in
+v0.
+
+## Arrays and slices
+
+q64 has three array-shaped types. Two are language built-ins,
+one is the standard owning collection.
+
+| Type        | Length        | Owned?          | Region parameter | Typical use                                 |
+|-------------|---------------|-----------------|------------------|---------------------------------------------|
+| `[T; N]`    | comptime `N`  | by value        | none (inline)    | Fixed-length arrays inside structs / locals |
+| `[T]`       | runtime       | borrowed slice  | none (borrow)    | Function parameters, views into a `Vec`     |
+| `Vec<T, R>` | runtime       | owns its bytes  | `R: Region`      | Growable arrays (see [`memory.md`](./memory.md)) |
+
+### Fixed-length: `[T; N]`
+
+`[T; N]` is a value-type array whose length is part of the type.
+`N` is a comptime integer (per [`generics.md` §"Const
+generics"](./generics.md)):
+
+```q64
+let id_matrix: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+]
+
+struct Color { channels: [u8; 4] }                  // RGBA inline
+
+fn dot<T: Mul<T> + Add<T>, const N: i64>(
+    a: [T; N], b: [T; N],
+) -> T { ... }
+```
+
+Element access uses bare `[ ]`: `a[i]`. Bounds violations trap;
+use `a.get(i) -> T?` for a fallible access.
+
+### Borrowed slice: `[T]`
+
+`[T]` is a length-tagged borrow into a contiguous run of `T`.
+It is the canonical parameter type for "any sequence of `T`":
+
+```q64
+pub fn sum(xs: [i64]) -> i64 {
+    var acc: i64 = 0
+    for x in xs { acc = acc + x }
+    acc
+}
+
+let a: [i64; 4] = [1, 2, 3, 4]
+let v: Vec<i64> = Vec.from([10, 20, 30])
+sum(a)                                              // ✓ [i64; 4] coerces to [i64]
+sum(v.as_slice())                                   // ✓ explicit slice from Vec
+```
+
+A `[T; N]` value implicitly coerces to `[T]` (the slice records
+the length at the coercion site); a `Vec<T, R>` does not — call
+`.as_slice() -> [T]` to obtain a borrow. Both coercion paths are
+zero-cost (no allocation, no copy).
+
+Slices follow the same lifetime rules as any borrow (see
+[`memory.md`](./memory.md) §"Lifetime tracking"): a slice cannot
+outlive the bytes it points at.
+
+### Growable: `Vec<T, R>`
+
+The owning, growable form lives in `q64.collections` (see
+[`modules.md`](./modules.md) §"Auto-prelude additions") and is
+specified by `memory.md` §"Region parameters in types". `Vec`
+takes a region parameter; the default is the enclosing scope's
+arena.
+
+### Slice literals
+
+`[1, 2, 3]` is a `[T; N]` literal with `N` inferred from the
+element count. When the context expects `[T]`, the literal is
+materialized as `[T; N]` and coerced. When the context expects
+`Vec<T, R>`, use `Vec.from([…])` explicitly — there is no
+implicit promotion to an owning collection.
+
+## References: `ref T`
+
+A reference type is an explicit borrow that appears in type
+expressions. It is **not** the same construct as the parameter
+mode `ref` (per §"Parameter modes" below) — that mode controls
+how an argument is passed; this type controls how a value is
+held.
+
+```q64
+pub face Error : Display {
+    fn source(self) -> Option<ref dyn Error> { None }
+}
+
+struct CursorMut {
+    target: ref [u8],                               // a mutable slice borrow
+    pos:    i64,
+}
+
+fn first_word(s: str) -> ref str {                  // borrow into s
+    let space = s.index_of(' ').unwrap_or(s.len())
+    s.slice(0, space)
+}
+```
+
+Rules:
+
+- `ref T` is a borrow into a value of type `T`. The compiler
+  tracks the borrow's lifetime against the value's region per
+  [`memory.md`](./memory.md) §"Lifetime tracking".
+- Two flavors travel with the parameter mode that introduced
+  them: an `in` parameter (`s: str`) yields a read-only `ref T`
+  inside its body; a `ref` parameter (`ref s: Filter`) yields a
+  mutable `ref T`. Mutability flows from the introducing site,
+  not from a separate `ref mut` syntax.
+- `ref T` cannot appear in a `@managed` struct's fields
+  (`REG020`): a borrow into linear memory would escape the
+  GC's reach.
+- `ref T` is **not** `@send` (the borrow's region is local to
+  the borrowing thread). Crossing a thread boundary requires
+  `transfer(to: …)` per [`memory.md`](./memory.md).
+
+The `&` sigil is **not** reserved; references are spelled with
+the `ref` keyword in type position to match the parameter-mode
+spelling. A `&` in a type expression is `LEX021` ("unexpected
+character `&` in type position").
+
 ## Strings: `str` and `String<R>`
 
 Two string types, by intent:
@@ -575,6 +746,9 @@ own `TYP100–TYP149`, faces own `TYP200–TYP219`, errors own
 | `TYP049` | arb-width narrow can fail                  | Assigning a standard-width value to an arb-width binding without `try <T>.from(…)` propagation.       |
 | `TYP050` | `bool` used as integer                     | `let x: i32 = true` or similar.                                                    |
 | `TYP051` | integer used as `bool`                     | `if 1 { … }`.                                                                      |
+| `TYP052` | assignment to `let` binding                | A `let`-declared local is the LHS of an assignment after its initializing one.    |
+| `TYP053` | use of uninitialized binding               | A `let`/`var` declared without an initializer is read on a path that hasn't assigned it. |
+| `TYP054` | slice borrows outlive their bytes          | A `[T]` or `ref T` escapes the region whose bytes it points at.                    |
 | `TYP060` | parameter mode keyword in call argument    | `process(in: x)`-style call; v0 uses bare arguments.                              |
 | `TYP070` | shape mismatch in tensor op                | Shape arithmetic fails the broadcast/concat compatibility predicate.              |
 | `TYP071` | SIMD lane width mismatch                   | `Simd<f32, 4> + Simd<f32, 8>` or similar.                                          |
