@@ -476,7 +476,8 @@ fn main(env: Env) -> Result<(), Error> {
 ```q64
 pub fn fetch_user(n: Net, id: UserId) -> Result<User, Error> {
     let resp = try n.get(url"https://api.q64.dev/users/{id}")
-    resp.json<User>()
+    let user = try resp.json<User>()
+    Ok(user)
 }
 
 fn main(env: Env) -> Result<(), Error> {

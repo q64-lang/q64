@@ -513,7 +513,7 @@ become localized and greppable.
 
 Type-system diagnostics in the `TYP040–TYP099` band (generics
 own `TYP100–TYP149`, faces own `TYP200–TYP219`, errors own
-`TYP300–TYP304`). Numbers are stable, never reused.
+`TYP300–TYP307`). Numbers are stable, never reused.
 
 | Code     | Short message                              | When                                                                              |
 |----------|--------------------------------------------|-----------------------------------------------------------------------------------|

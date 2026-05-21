@@ -182,9 +182,12 @@ parameters:
 
 ```q64
 pub struct Tile<const W: u32, const H: u32, const Pad: u32> {
-    inner: [[Pixel; W + 2 * Pad]; H + 2 * Pad],
+    inner: Tensor<Pixel, [W + 2 * Pad, H + 2 * Pad]>,
 }
 ```
+
+The same arithmetic works in fixed-size array shapes
+(`[T; N + 1]`) and in `Simd<T, const N: i64>` lane counts.
 
 Expressions allowed in v0: `+`, `-`, `*`, `/`, `%`, comparisons,
 and references to other const-generic parameters of the same item.
@@ -346,7 +349,7 @@ Explicitly out of scope for v0; tracked under "Open items deferred":
 All generics-related diagnostics use the `TYP` prefix. Numbers are
 stable, never reused. Codes `TYP100`–`TYP149` are reserved for
 generics; existing TYP allocations: numeric mismatch (`TYP041`),
-faces (`TYP200`–`TYP219`), errors (`TYP300`–`TYP304`).
+faces (`TYP200`–`TYP219`), errors (`TYP300`–`TYP307`).
 
 | Code     | Short message                                | When                                                                              |
 |----------|----------------------------------------------|-----------------------------------------------------------------------------------|

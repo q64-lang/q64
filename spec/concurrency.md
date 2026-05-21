@@ -335,14 +335,14 @@ pub fn channel<T, P: Policy>(
 ### `Sender<T, P>` and `Receiver<T, P>` API
 
 ```q64
-pub face Sender<T, P: Policy> {
-    fn send       (self,            move x: T) @cancel    // P ∈ Backpressure / LatestValue: suspends on full
-    fn send       (self, ctx: Cancel, move x: T) @cancel  // explicit-ctx form for cancel-aware policies
+pub face Sender<T, P: Policy = Backpressure> {
+    fn send       (self,            move x: T)                                // non-cancel-aware policies
+    fn send       (self, ctx: Cancel, move x: T) @cancel                      // cancel-aware policies; may unwind via panic Cancelled
     fn try_send   (self,            move x: T) -> Result<(), SendError<T>>   // non-blocking; never suspends
     fn close      (self)                                                     // signal end-of-stream; remaining values still readable
 }
 
-pub face Receiver<T, P: Policy> {
+pub face Receiver<T, P: Policy = Backpressure> {
     fn recv       (self, ctx: Cancel) -> T @cancel        // suspends until a value is available
     fn try_recv   (self) -> Result<T, RecvError>          // non-blocking; immediate
     fn closed     (self) -> bool                          // whether the sender side has closed

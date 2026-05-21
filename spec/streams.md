@@ -400,7 +400,7 @@ fn denoise<const R: Hz>(input: Signal<f32, R>) -> Signal<f32, R> { … }
 fn resample(input: Signal<f32, 48.kHz>) -> Signal<f32, 16.kHz> { … }
 
 @stage              // not @fuse — task boundary here
-fn whisper_asr<const R: Hz>(input: Signal<f32, R>, ai: AiEnv) -> Stream<Token, 10.Hz> { … }
+fn whisper_asr<const R: Hz>(input: Signal<f32, R>, ai: AiEnv) -> Stream<Token<WhisperVocab>, 10.Hz> { … }
 
 graph voice {
     let asr_in = mic_input(env) |> denoise |> resample      // fused into one task

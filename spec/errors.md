@@ -133,7 +133,7 @@ Two ways to abort. Different costs, different use cases.
 ```q64
 panic "invariant broken: count went negative; got {count}"   // string payload
 panic Cancelled                                              // unit-struct payload
-panic EnvDenied { code: "ENV030", detail: "Net.get(…)" }     // struct payload
+panic RuntimeDenied { code: "ENV030", detail: "Net.get(…)" } // struct payload
 ```
 
 - `panic <expr>` unwinds the current task, attaching `expr` as the
@@ -279,7 +279,7 @@ The language ships three blessed `Panic`-fitting types:
 | Type            | Shape                                  | Where it comes from                                                      |
 |-----------------|----------------------------------------|--------------------------------------------------------------------------|
 | `PanicMessage`  | `struct PanicMessage(str)`             | `panic "string"` desugars to `panic(PanicMessage(s))`.                    |
-| `Cancelled`     | `struct Cancelled`                     | Cancellation observation in `@cancel` functions; the implicit `select` cancellation branch; cancel-aware channel ops. Carries `code = some("CONC011")`. |
+| `Cancelled`     | `struct Cancelled`                     | Cancellation observation in `@cancel` functions; the implicit `select` cancellation branch; cancel-aware channel ops. `code` returns `none`. |
 | `RuntimeDenied` | `struct RuntimeDenied { code: str, detail: str }` | Runtime-emitted denials such as `with_capabilities` (`ENV030`) and cancellation-marker conflicts. The `code` and `detail` fields back the values seen on `Panic`-bound catch variables. |
 
 All three are in the auto-prelude (no import required). User code may
@@ -514,7 +514,7 @@ The error-handling auto-prelude (no import needed):
 | `Error`        | face   | the recoverable-error contract                   |
 | `Panic`        | face   | the panic-payload contract                       |
 | `PanicMessage` | struct | wraps a `str` payload for `panic "msg"` sugar    |
-| `Cancelled`    | struct | unit payload signalling cooperative cancellation (per `concurrency.md`); `code = some("CONC011")` |
+| `Cancelled`    | struct | unit payload signalling cooperative cancellation (per `concurrency.md`); `code()` returns `none` (cancellation is a runtime control-flow event, not a diagnostic) |
 | `RuntimeDenied`| struct | payload for runtime denials (e.g. `with_capabilities` `ENV030`); fields `code: str`, `detail: str` |
 | `From`         | face   | error conversion target (already in prelude)     |
 | `Into`         | face   | error conversion source (already in prelude)     |
