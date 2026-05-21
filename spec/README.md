@@ -27,11 +27,10 @@ suite.
 | [`concurrency.md`](./concurrency.md)                     | Scopes, tasks, channels, select, actors, cancellation, panics, host translation |
 | [`streams.md`](./streams.md)                             | Signal / Event / Stream, @stage, graph, |>, pre(), fusion, SharedSignal          |
 | [`env.md`](./env.md)                                     | Capability model, Env structure, main signature, with_capabilities, disclosure   |
+| [`grammar.md`](./grammar.md)                             | Lexical structure and the consolidated syntactic grammar                          |
 
 ## Scope (forthcoming)
 
-- **Lexical structure** — tokens, literals, comments, identifier rules.
-- **Syntax** — grammar in EBNF or equivalent.
 - **Type system inference algorithm** — the full bidirectional
   inference rules. (Primitive types and parameter modes landed in
   `types.md`; effect markers in `effects.md`; generics in
