@@ -22,14 +22,16 @@ suite.
 | [`errors.md`](./errors.md)                               | `Result<T, E>`, `try`, `panic` / `trap`, `Option<T>`, `Error` face |
 | [`effects.md`](./effects.md)                             | Effect markers, implication graph, propagation, capability disclosure |
 | [`generics.md`](./generics.md)                           | Type / const / region / effect parameters, bounds, where, defaults, inference |
+| [`types.md`](./types.md)                                 | Numeric tower, bool, arb-width ints, parameter modes, optional narrowing |
 
 ## Scope (forthcoming)
 
 - **Lexical structure** — tokens, literals, comments, identifier rules.
 - **Syntax** — grammar in EBNF or equivalent.
-- **Type system** — primitive types, region parameters, the full
-  inference algorithm. (Effect markers landed in `effects.md`;
-  generics land in `generics.md`.)
+- **Type system inference algorithm** — the full bidirectional
+  inference rules. (Primitive types and parameter modes landed in
+  `types.md`; effect markers in `effects.md`; generics in
+  `generics.md`.)
 - **Memory model** — region kinds, dual heap, cross-heap rules, `@send`
   derivation, multi-memory layout.
 - **Concurrency model** — scopes, tasks, channels, ordering guarantees,

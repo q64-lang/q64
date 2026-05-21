@@ -1,0 +1,571 @@
+# Types
+
+The core type system: the numeric tower, bool, arbitrary-width
+integers, SIMD lane vectors, tensors, parameter modes, optional
+types, and the rules that govern conversion between them.
+
+> **Status: draft (v0).** Numeric tower and parameter modes settled
+> in `design.md`, `concurrency.md`, and `memory.md`; this spec pins
+> down the conversion rules (strict — no implicit promotion), the
+> call-site syntax for parameter modes, optional-type flow-typing
+> narrowing, and the diagnostic codes.
+
+## Design goals
+
+1. **No silent conversions.** Mixing numeric types (`i32 + i64`,
+   `i32 + f64`, signed + unsigned) requires an explicit cast.
+   Wasm doesn't promote silently; q64 doesn't either.
+2. **Defaults are obvious.** `42` is `i64`. `3.14` is `f64`.
+   Suffixes (`42.i32`, `48.kHz`, `-6.dB`) attach units, kinds, and
+   smaller widths to literals.
+3. **Parameter modes carry meaning, not call-site noise.** A
+   function signature names its modes (`in`, `ref`, `out`, `move`);
+   call sites are bare. The compiler still enforces mutability,
+   initialization, and move semantics — the rules are signature-
+   driven.
+4. **Optional types narrow only when control flow makes it
+   trivial.** A destructuring `if let`, or a `match` that exits the
+   absent branch, narrows `T?` to `T`. No deep flow analysis in v0.
+5. **AI-agent friendly.** `grep 'fn .*out '` enumerates every
+   `out`-mode parameter; `grep ': u3\b'` finds bit-width work.
+   Numeric types are visible at signatures, not inferred away.
+
+## Vocabulary
+
+| Word                | Meaning                                                                  |
+|---------------------|--------------------------------------------------------------------------|
+| **numeric tower**   | The fixed set of primitive number types and the rules between them.      |
+| **arbitrary-width int** | An opt-in integer with non-standard bit count (`u3`, `u24`, `i17`).   |
+| **literal suffix**  | A dot-delimited tag on a numeric literal (`42.i32`, `48.kHz`).            |
+| **parameter mode**  | A signature-level marker (`in`, `ref`, `out`, `move`) on a parameter.    |
+| **flow narrowing**  | The compiler's rule for turning `T?` into `T` after a syntactic check.   |
+
+## The numeric tower
+
+Fixed primitive types. Adding to this set is a language-level
+change.
+
+| Type    | Width | Signedness | Notes                                                       |
+|---------|-------|------------|-------------------------------------------------------------|
+| `i8`    | 8     | signed     |                                                             |
+| `i16`   | 16    | signed     |                                                             |
+| `i32`   | 32    | signed     |                                                             |
+| `i64`   | 64    | signed     | **Default integer.** Pointers are `i64`.                    |
+| `u8`    | 8     | unsigned   |                                                             |
+| `u16`   | 16    | unsigned   |                                                             |
+| `u32`   | 32    | unsigned   |                                                             |
+| `u64`   | 64    | unsigned   |                                                             |
+| `f16`   | 16    | float      | IEEE-754 half. Used for ML / tensor work.                   |
+| `f32`   | 32    | float      | IEEE-754 single. Used for audio samples and SIMD lanes.     |
+| `f64`   | 64    | float      | **Default float.** IEEE-754 double.                         |
+| `bool`  | 8 (storage) | —      | Distinct from any integer; see §Bool.                       |
+
+Notes:
+
+- **No `usize` / `isize`.** q64 is 64-bit only. Pointers are `i64`
+  throughout; a separate pointer-sized name would be redundant.
+  Pre-spec snippets in `design.md` / `example.md` / `stdlib.md`
+  that mention `usize` are obsolete; replace with `i64`.
+- **`i64` is the integer default.** A literal `42` with no suffix
+  or binding type has type `i64`.
+- **`f64` is the float default.** A literal `3.14` with no suffix
+  or binding type has type `f64`.
+
+## Arbitrary-width integers
+
+Opt-in for bit-level work — packed structs, protocol parsing,
+register layouts, sample formats. The shape mirrors Zig's:
+
+```q64
+let nibble: u4   = 13          // 0..15
+let opcode: u7   = 0b1010110   // 0..127
+let signed: i17  = -65000      // -65536..65535
+```
+
+The compiler emits the masks and shifts on top of `i32` / `i64`
+operations. Arbitrary-width integers cost nothing at rest in a
+struct field; their cost shows up at arithmetic sites (see
+§Arithmetic).
+
+### Allowed widths
+
+- `u1` … `u63` (unsigned, any bit width up to 63)
+- `i1` … `i64` (signed, any bit width up to 64)
+- Widths above 64 are not in v0; they require multi-word lowering
+  and a more involved cost model.
+
+### Naming
+
+Arbitrary-width names follow the same `<letter><width>` shape as
+the fixed-width tower (`u3`, `u24`, `i17`). Canonical code uses
+the standard widths (`u8`, `u16`, `u32`, `u64`, `i8` … `i64`); the
+arbitrary widths are reserved for specific bit-level scenarios.
+
+## Bool
+
+`bool` is a distinct type, not an integer. `if 1 { … }` is
+`TYP051` ("int used as bool"); `if x { … }` requires `x: bool`.
+
+Storage: 8 bits (1 byte) by default. Inside a struct, the
+compiler may pack adjacent `bool` fields into a single byte; a
+struct field declared as `u1` retains its exact 1-bit footprint
+in a packed layout. Use `bool` for "yes/no" semantics, `u1` for
+"a single bit in a layout."
+
+There is **no** implicit `bool → i64` or `i64 → bool` conversion.
+Use `if x { 1i64 } else { 0i64 }` explicitly when an integer
+representation is required.
+
+## Numeric literals and suffixes
+
+A literal carries the default type if there is no suffix and no
+binding-type pin:
+
+```q64
+let a = 42                    // i64 (default)
+let b = 3.14                  // f64 (default)
+```
+
+A binding-type annotation overrides the default when the literal
+fits:
+
+```q64
+let c: i32 = 42               // 42 typed as i32
+let d: u8  = 255              // 255 typed as u8
+let e: u8  = 256              // ❌ TYP040 — out of range
+```
+
+A suffix names the target type or unit explicitly:
+
+```q64
+let f = 42.i32                // i32 literal
+let g = 1.u8                  // u8 literal
+let h = 48.kHz                // Hz (unit; see units spec)
+let i = -6.dB                 // Db (unit)
+let j = 0xFF.u24              // arbitrary-width integer literal
+```
+
+The suffix form mirrors method-call syntax (`42.i32`); the
+compiler recognizes the right-hand side as either a primitive
+type name, an arbitrary-width int name, or a unit (per the
+forthcoming `units.md`).
+
+Float literals require a dot. `3` is `i64`; `3.0` is `f64`.
+A literal like `42.kHz` is parsed as `42` followed by the
+`kHz` suffix, not as a float — the suffix rule beats float
+interpretation when the trailing token is an identifier.
+
+## Arithmetic
+
+q64 performs **no implicit numeric conversion**. Every mix
+requires an explicit cast.
+
+```q64
+let a: i32 = 1
+let b: i64 = 2
+let f: f64 = 1.0
+
+let c = a + b              // ❌ TYP042 — i32 + i64
+let d = a + f              // ❌ TYP042 — i32 + f64
+let g = i64(a) + b         // ✓ c: i64
+let h = f64(a) + f         // ✓ h: f64
+```
+
+This is the deliberate v0 stance: catches sample-rate /
+buffer-size mix-ups (`i32 samples * f64 sample_rate` is a
+common silent bug in other languages) at the price of more
+casts in code that genuinely wants width-mixing. The
+`design.md` line "Numeric promotion rules (Julia-influenced)"
+is superseded by this spec.
+
+### Casts
+
+Every primitive type has a cast operator written as a function
+call:
+
+```q64
+i32(x)        // x: any numeric → i32. Narrowing casts trap on overflow.
+i64(x)        // widening or narrowing.
+f32(x)        // any numeric → f32. Loses precision silently for large i64.
+u8(x)         // any numeric → u8. Narrowing traps on overflow.
+```
+
+The cast is checked at runtime when the source's range exceeds
+the target's. Use `try_into` (auto-prelude `TryFrom`) for
+fallible casts that return `Result<T, RangeError>` instead of
+trapping:
+
+```q64
+let big: i64 = 100_000
+let small: i32  = i32(big)                    // narrowing; traps on overflow
+let safe: Result<i32, RangeError> = big.try_into()
+```
+
+### Arithmetic on arbitrary-width integers
+
+Arbitrary-width ints **auto-widen** to the nearest standard
+width for arithmetic; assignment back to the narrower width
+goes through a fallible `from`:
+
+```q64
+let a: u3 = 5
+let b: u3 = 6
+let c = a + b                       // c: u32 (auto-widen; 11 fits)
+let d: u3 = u3.from(c)?             // explicit narrow, fallible
+let e: u3 = u3.from_trapping(c)     // explicit narrow, traps on overflow
+```
+
+The widening target is the smallest standard width that contains
+the source's value range: `u3 → u32`, `i17 → i32`, `u33 → u64`.
+Signed and unsigned arb-widths widen to signed and unsigned
+standard widths, respectively.
+
+### Bool operations
+
+Logical operators (`&&`, `||`, `!`) take `bool` operands and
+short-circuit; bitwise operators (`&`, `|`, `^`, `~`, `<<`,
+`>>`) take integer operands and do not short-circuit. Mixing
+the two is a type error — `if x & y { … }` requires `x, y: i*`
+and the result is integer, not bool.
+
+## Parameter modes
+
+Function parameters carry an explicit mode at the signature.
+There are four:
+
+| Mode    | Meaning                                                                       |
+|---------|-------------------------------------------------------------------------------|
+| `in`    | Immutable borrow. **Default**; the keyword can be omitted in signatures.       |
+| `ref`   | Mutable borrow. The function may mutate the value; caller retains ownership.   |
+| `out`   | Function writes; caller's prior contents are irrelevant. Must be assigned before return. |
+| `move`  | Function takes ownership; caller cannot use the value after.                   |
+
+### Signature
+
+```q64
+fn process(
+    signal:     Audio,        // implicit `in`
+    ref state:  Filter,
+    out result: Audio,
+    move payload: Bytes,
+) { ... }
+```
+
+`in` is the default and is usually omitted; the other three
+must appear before the parameter name.
+
+### Call site
+
+Calls are bare — there is **no** repeated mode keyword at the
+call site:
+
+```q64
+let signal: Audio  = capture()
+var state:  Filter = Filter.new()
+var result: Audio  = Audio.uninit(4096)
+let payload: Bytes = build_payload()
+
+process(signal, state, result, payload)
+```
+
+The compiler enforces the mode constraints from the signature:
+
+- `ref`: caller's binding must be `var`; not `let`.
+- `out`: caller's binding must be `var`; the binding is
+  considered uninitialized for the purposes of subsequent
+  reads if `out` was the writer.
+- `move`: caller's binding is consumed; using it after the call
+  is `TYP046` ("moved value used after move").
+
+This is a v0 simplification away from the C#-style
+"call sites repeat the keyword" sketched in `design.md`. The
+trade-off: bare call sites read more like ordinary function
+calls; the cost is that mutability and consumption are visible
+only by looking at the callee's signature (or via LSP hover).
+Compiler diagnostics include the callee's mode in their
+messages so the connection is recoverable from text errors.
+
+### `out` parameters and definite assignment
+
+A function with an `out` parameter must assign the parameter on
+every control-flow path before returning. Missing an assignment
+is `TYP045`. The compiler tracks definite-assignment exactly
+the same way it tracks `let`-uninitialized bindings.
+
+### Multiple `out` parameters
+
+A function may have multiple `out` parameters. Caller
+positions match the signature order:
+
+```q64
+fn split(s: str, out left: str, out right: str, at: i64) { ... }
+
+var l: str = ""
+var r: str = ""
+split("hello,world", l, r, 5)
+```
+
+For functions that "return multiple values," prefer a tuple
+return over multiple `out` parameters. `out` is reserved for
+the rarer case where the function needs a pre-allocated
+caller-provided buffer.
+
+## Optional types and flow narrowing
+
+`T?` is sugar for `Option<T>` (per `errors.md` §Auto-prelude
+additions). The narrowing rules below describe **only** when the
+compiler treats a `T?` binding as a non-optional `T` in the
+subsequent code.
+
+### When narrowing happens
+
+1. **`if let` with a destructuring pattern**:
+
+   ```q64
+   fn use_user(user: User?) -> str {
+       if let u = user {
+           u.name           // ✓ u: User (narrowed)
+       } else {
+           "anonymous"
+       }
+   }
+   ```
+
+2. **`match` over the optional that exits the `none` branch**:
+
+   ```q64
+   fn require_user(user: User?) -> str {
+       match user {
+           none    -> return "anonymous",
+           some(u) -> u.name,     // ✓ u: User
+       }
+   }
+   ```
+
+3. **An early-return `if let` that exits**:
+
+   ```q64
+   fn process(user: User?) -> str {
+       if let none = user { return "anonymous" }
+       user.name            // ❌ TYP047 — user is still User? here
+   }
+   ```
+
+   Narrowing does **not** propagate past an `if-let-none` exit in
+   v0. To narrow, use the `if let some(u) = user` form (above).
+
+### What is **not** narrowed in v0
+
+- `if user.is_some() { user.name }` does not narrow. The condition
+  is a regular boolean; the compiler does no smart-cast analysis
+  past it. Compiler emits `TYP080` (note, not error) suggesting
+  the `if let some(u) = user` form.
+- Narrowing inside a closure or nested function. The narrowed
+  scope ends at the closure's body boundary.
+- Narrowing across `&&` chains. `if user.is_some() && user.age > 18`
+  is `TYP047`; rewrite to `if let some(u) = user { if u.age > 18 }`.
+
+This is the deliberate v0 stance: a single, syntactic rule users
+can recognize without an inference engine. Kotlin-style smart
+casts are deferred; the spec may grow toward them in a later
+revision.
+
+## SIMD and Tensor as language types
+
+Two builtin compound types live in the auto-prelude:
+
+```q64
+@kind Simd<T, const N: i64>            // hardware-mapped SIMD lanes
+@kind Tensor<T, const Shape: [i64]>    // static-shape tensor
+@kind DynTensor<T>                     // shape carried at runtime
+```
+
+Why they're language types, not stdlib:
+
+- The compiler maps `Simd<f32, 4>` directly to Wasm 3.0
+  `v128` lanes; lane count and lane type are part of the
+  type, so codegen never has to guess.
+- `Tensor<T, [W, H]>` shape participates in const-generic
+  inference and the broadcasting comptime predicate that
+  `q64.math` uses for elementwise ops.
+- `DynTensor<T>` carries shape at runtime, for model
+  weights / unknown sizes; explicit escape hatch.
+
+Operator overloading on these (elementwise add, matmul, dot,
+etc.) lives in `q64.math` per `stdlib.md`. The base language
+guarantees the type kinds, the lowering, and the comptime
+shape arithmetic.
+
+### Shape expressions
+
+The const-generic expression grammar from `generics.md`
+applies to tensor shapes. `Tile<W, H, Pad>` may declare
+`inner: Tensor<Pixel, [W + 2*Pad, H + 2*Pad]>`.
+
+## Endianness
+
+q64 is **little-endian, period.** Wasm mandates little-endian;
+q64 documents it as part of the language, not as a target-
+dependent fact.
+
+External data formats (network protocols, file formats) that
+are not LE are read through explicit accessors:
+
+```q64
+let value_le: u32 = bytes.read_u32_le(at: 0)
+let value_be: u32 = bytes.read_u32_be(at: 4)
+```
+
+There is no system-default-endian accessor. Specifying the
+endianness at the call site is part of the contract; mistakes
+become localized and greppable.
+
+## Diagnostic codes
+
+Type-system diagnostics in the `TYP040–TYP099` band (generics
+own `TYP100–TYP149`, faces own `TYP200–TYP219`, errors own
+`TYP300–TYP304`). Numbers are stable, never reused.
+
+| Code     | Short message                              | When                                                                              |
+|----------|--------------------------------------------|-----------------------------------------------------------------------------------|
+| `TYP040` | integer literal out of range               | A literal does not fit its declared (or pinned) type.                              |
+| `TYP041` | numeric type mismatch                      | An expression of one numeric type was used where a different one was expected.    |
+| `TYP042` | implicit numeric conversion is forbidden   | `i32 + i64`, `i32 + f64`, signed+unsigned mix at an arithmetic site.              |
+| `TYP043` | narrowing cast may overflow                | Cast from a wider integer to a narrower one where the value isn't comptime-known. |
+| `TYP044` | wrong mode for argument                    | Caller passes an immutable binding to a `ref` parameter, etc.                     |
+| `TYP045` | `out` parameter not assigned before return | A function with an `out` param has a control-flow path that returns without assigning it. |
+| `TYP046` | moved value used after move                | A binding consumed by a `move` argument is used after the call.                   |
+| `TYP047` | optional type not narrowed                 | A `T?` binding is used as `T` outside the narrowing rules above.                   |
+| `TYP048` | arb-width literal exceeds declared width   | `let x: u3 = 8` is out of `u3`'s 0..7 range.                                       |
+| `TYP049` | arb-width narrow can fail                  | Assigning a standard-width value to an arb-width binding without `from(…)?`.       |
+| `TYP050` | `bool` used as integer                     | `let x: i32 = true` or similar.                                                    |
+| `TYP051` | integer used as `bool`                     | `if 1 { … }`.                                                                      |
+| `TYP060` | parameter mode keyword in call argument    | `process(in: x)`-style call; v0 uses bare arguments.                              |
+| `TYP070` | shape mismatch in tensor op                | Shape arithmetic fails the broadcast/concat compatibility predicate.              |
+| `TYP071` | SIMD lane width mismatch                   | `Simd<f32, 4> + Simd<f32, 8>` or similar.                                          |
+| `TYP080` | suggestion: prefer `if let some(u)` form   | (Note severity.) `if user.is_some()` followed by `user.method()` without narrowing.|
+| `TYP090` | endianness not specified                   | An external-data read without `_le` / `_be` suffix.                                |
+
+All codes are emitted using the standard envelope from
+[`diagnostics.md`](./diagnostics.md).
+
+## Examples
+
+### Strict arithmetic — no silent promotion
+
+```q64
+fn beats_to_seconds(beats: i64, bpm: i64) -> f64 {
+    // Need to divide an integer by a float — explicit cast required.
+    f64(beats) * 60.0 / f64(bpm)
+}
+
+fn sample_count(duration: Seconds, sr: Hz) -> i64 {
+    // Same-type arithmetic; no cast needed. Units-of-measure spec handles
+    // the Seconds * Hz → samples reduction.
+    let raw: f64 = f64(duration) * f64(sr)
+    i64(raw)
+}
+```
+
+### Parameter modes — signature carries the meaning
+
+```q64
+fn render(
+    scene:     Scene,         // in (default)
+    ref cache: RenderCache,
+    out frame: Frame,
+) {
+    cache.update(scene)
+    frame = cache.draw(scene)
+}
+
+fn main(env: Env) {
+    var cache: RenderCache = RenderCache.new()
+    var frame: Frame = Frame.uninit(1920, 1080)
+    let scene = load_scene("level1.json")
+    render(scene, cache, frame)
+    env.out("rendered {frame.pixel_count()} pixels")
+}
+```
+
+The call `render(scene, cache, frame)` reads like any function
+call. The compiler enforces `cache` and `frame` being `var`
+bindings and `frame` being assigned-after-call (it was `uninit`
+beforehand) by consulting the signature.
+
+### Optional narrowing — destructure or match-exit
+
+```q64
+fn greet(env: Env, user: User?) {
+    if let some(u) = user {
+        env.out("Hello, {u.name}!")
+    } else {
+        env.out("Hello, stranger.")
+    }
+}
+
+fn require_age(user: User?) -> i32 {
+    match user {
+        some(u) -> u.age,
+        none    -> return -1,
+    }
+}
+```
+
+### Arb-width int arithmetic
+
+```q64
+@derive(FromBits)
+struct OpCode {
+    op:    u4,
+    reg:   u3,
+    flags: u1,
+}
+
+fn dispatch(code: OpCode) {
+    let op:  u4 = code.op
+    let reg: u3 = code.reg
+
+    // Arithmetic auto-widens to u32; narrowing back is fallible.
+    let next_op: u4 = u4.from(op + 1)?     // wraps the increment, may fail
+    let _ = next_op
+}
+```
+
+## Open items deferred
+
+- **Numeric promotion convenience knob.** A future revision may
+  introduce an opt-in `@auto_promote` annotation that re-enables
+  Julia-style implicit promotion within a body. For now: explicit
+  casts everywhere.
+- **`@auto_promote` for struct field initializers.** Same idea
+  scoped to a struct literal.
+- **Per-field visibility on structs.** Cross-references the
+  `modules.md` and `faces.md` deferral.
+- **Tensor broadcasting predicate.** The exact comptime rules for
+  shape compatibility (NumPy / Julia conventions); lives in
+  `q64.math`'s spec when written.
+- **Bool ↔ integer conversions.** Whether `bool.into_i64()` is in
+  the prelude; for now, use `if b { 1i64 } else { 0i64 }`.
+- **Conditional flow-typing inside `&&` chains.** Kotlin-style
+  smart casts; pending real-world demand evidence.
+
+## Related specs
+
+- [`faces.md`](./faces.md) — `Eq`, `Ord`, `From`, `TryFrom` faces
+  for numeric conversion; `Display` / `Debug` for diagnostics.
+- [`errors.md`](./errors.md) — `Option<T>` enum, `?` chaining,
+  `try` propagation, `Result<T, E>`.
+- [`generics.md`](./generics.md) — const generics, the four
+  parameter kinds, the where clause that bounds in this spec
+  reference.
+- [`effects.md`](./effects.md) — arithmetic and casts are
+  `@pure`-compatible; `try_into` is `@no_panic`-compatible.
+- [`modules.md`](./modules.md) — primitive types and `Option` /
+  `Result` are in the auto-prelude; no import required.
+- [`diagnostics.md`](./diagnostics.md) — envelope format for the
+  `TYP040`–`TYP099` codes.
+- *Forthcoming*: [`units.md`](./units.md) — unit suffixes that
+  attach to numeric literals (`48.kHz`, `-6.dB`).
+- *Forthcoming*: [`memory.md`](./memory.md) — region parameters
+  that types may take; the dual-heap interaction with `@send`.
