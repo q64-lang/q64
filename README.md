@@ -15,6 +15,7 @@ discussion lives separately at [`q64-lang/design`](https://github.com/q64-lang/d
 | [`continuum/`](./continuum) | Qube registry server (Cloudflare Workers; hosts qubes published from `qube publish`) |
 | [`docs/`](./docs)           | Language reference and tutorials (source; rendered by `web/`)                        |
 | [`examples/`](./examples)   | Sample qubes (voice-agent, audio DSP, 3D demo)                                       |
+| [`mcp/`](./mcp)             | MCP server exposing the q64 toolchain to AI agents (Bun/TypeScript)                  |
 | [`q64/`](./q64)             | Zig project → `q64` binary — the language tool (`fmt`, `lsp`, `show`, single-file)   |
 | [`qube/`](./qube)           | Zig project → `qube` binary — the package and build tool                             |
 | [`runtime/`](./runtime)     | Host adapters: `browser/`, `wasmtime/`, `wasmer/`, `audio-host/`                     |
@@ -46,6 +47,10 @@ the same way `cargo build` invokes `rustc`.
   Wasmtime/Wasmer/audio-host adapters; TypeScript for the browser adapter).
 - **`continuum/`** — **TypeScript** on Cloudflare Workers, using D1, R2, and
   KV.
+- **`mcp/`** — **TypeScript on Bun**. Thin shim that re-exposes `q64`, `qube`,
+  and `continuum` surfaces as MCP tools for AI agents (`q64.show.*`,
+  `qube.audit`, `continuum.search`, etc.). Adds no new contracts —
+  wraps the existing CLI flags and HTTP endpoints.
 - **`web/`** — **Astro + Starlight**. Starlight runs the docs; marketing
   pages are plain Astro routes; the playground and registry UI are Astro
   islands. The playground loads a wasm build of `q64/` to compile q64 source
