@@ -291,7 +291,7 @@
     "EffectMarker": {
       "type": "string",
       "pattern": "^@[a-z][a-z_]*$",
-      "description": "Effect marker. Core set: @realtime, @no_alloc, @no_suspend, @send, @pure, @io, @network, @cancel, @uncancellable. User-defined effects are allowed and follow the same shape."
+      "description": "Effect marker. Core set: @realtime, @no_alloc, @no_suspend, @no_panic, @no_trap, @send, @pure, @io, @network, @fs, @stdout, @stderr, @audio, @midi, @ui, @inference, @time, @random, @exit, @envvars, @cancel, @uncancellable. User-defined effects are allowed and follow the same shape."
     },
 
     "CapabilityName": {
