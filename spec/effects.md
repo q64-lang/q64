@@ -43,6 +43,7 @@ discloses them.
 | **implication**   | A built-in rule that one effect entails others (e.g., `@realtime` ⇒ `@no_alloc`).|
 | **assert effect** | A *negative* marker: "this function does at most …" (`@pure`, `@realtime`, `@no_*`). |
 | **capability effect** | A *positive* marker: "this function may do …" (`@io`, `@network`).            |
+| **observation effect** | A marker documenting that a function observes runtime state and may diverge on it (`@cancel`). Propagates up like capabilities; restricted by `@uncancellable` like an assert. |
 | **effect variable** | A face-level parameter (`@e`) bound by each fit. See [faces.md §Effect-polymorphic faces](./faces.md). |
 
 Asserts propagate **down**: an `@realtime` caller can only call
@@ -53,20 +54,22 @@ sides with one mechanism.
 
 ## The core effect set
 
-The nine blessed markers. Adding to this set is a language-level
+The eleven blessed markers. Adding to this set is a language-level
 change.
 
-| Marker         | Kind        | Meaning                                                                                       |
-|----------------|-------------|-----------------------------------------------------------------------------------------------|
-| `@pure`        | assert      | No mutation, no allocation, no I/O, no suspension, no panic, no trap. The strongest assertion. |
-| `@realtime`    | assert      | Bounded execution time, no allocation, no suspension, no panic. Audio-thread safe.            |
-| `@no_alloc`    | assert      | No heap allocation (linear or managed).                                                       |
-| `@no_suspend`  | assert      | Does not yield to the scheduler; runs to its next natural return.                             |
-| `@no_panic`    | assert      | Does not invoke `panic` (`trap` remains permitted).                                           |
-| `@no_trap`     | assert      | Does not invoke `trap`. Rare; "this function must complete or unwind."                        |
-| `@io`          | capability  | Performs I/O (filesystem, stdout, stderr, devices). Does **not** imply `@network`.            |
-| `@network`     | capability  | Performs network operations. Implies `@io`.                                                   |
-| `@send`        | type-marker | A value's ownership can transfer across thread boundaries. Derived, not declared. See §`@send`. |
+| Marker            | Kind        | Meaning                                                                                       |
+|-------------------|-------------|-----------------------------------------------------------------------------------------------|
+| `@pure`           | assert      | No mutation, no allocation, no I/O, no suspension, no panic, no trap. The strongest assertion. |
+| `@realtime`       | assert      | Bounded execution time, no allocation, no suspension, no panic. Audio-thread safe.            |
+| `@no_alloc`       | assert      | No heap allocation (linear or managed).                                                       |
+| `@no_suspend`     | assert      | Does not yield to the scheduler; runs to its next natural return.                             |
+| `@no_panic`       | assert      | Does not invoke `panic` (`trap` remains permitted).                                           |
+| `@no_trap`        | assert      | Does not invoke `trap`. Rare; "this function must complete or unwind."                        |
+| `@uncancellable`  | assert      | Body completes without observing cancellation, even if `ctx` is signalled. See §`@cancel` and `@uncancellable`. |
+| `@io`             | capability  | Performs I/O (filesystem, stdout, stderr, devices). Does **not** imply `@network`.            |
+| `@network`        | capability  | Performs network operations. Implies `@io`.                                                   |
+| `@cancel`         | observation | Function observes `ctx.cancelled()` and may raise `Cancelled`. Requires a `ctx: Cancel` parameter. See §`@cancel` and `@uncancellable`. |
+| `@send`           | type-marker | A value's ownership can transfer across thread boundaries. Derived, not declared. See §`@send`. |
 
 Notes:
 
@@ -87,16 +90,18 @@ The compiler treats the following implications as built-in. They
 compose transitively; writing `@realtime` is shorthand for the full
 expansion.
 
-| Marker        | Implies                                                       |
-|---------------|---------------------------------------------------------------|
-| `@pure`       | `@no_alloc`, `@no_suspend`, `@no_panic`, `@no_trap`            |
-| `@realtime`   | `@no_alloc`, `@no_suspend`, `@no_panic`                        |
-| `@no_alloc`   | `@no_panic` (panic allocates the message string)               |
-| `@network`    | `@io`                                                          |
-| `@send`       | (derived from type composition; see §`@send`)                  |
-| `@io`         | —                                                             |
-| `@no_suspend` | —                                                             |
-| `@no_trap`    | —                                                             |
+| Marker            | Implies                                                       |
+|-------------------|---------------------------------------------------------------|
+| `@pure`           | `@no_alloc`, `@no_suspend`, `@no_panic`, `@no_trap`, `@uncancellable` |
+| `@realtime`       | `@no_alloc`, `@no_suspend`, `@no_panic`, `@uncancellable`     |
+| `@no_alloc`       | `@no_panic` (panic allocates the message string)              |
+| `@uncancellable`  | — (forbids `@cancel` callees by intersection)                 |
+| `@network`        | `@io`                                                         |
+| `@send`           | (derived from type composition; see §`@send`)                 |
+| `@io`             | —                                                             |
+| `@no_suspend`     | —                                                             |
+| `@no_trap`        | —                                                             |
+| `@cancel`         | (does not imply other effects; see §`@cancel` and `@uncancellable`) |
 
 Implications fan out by transitive closure: `@pure` implies
 `@no_alloc`, which in turn implies `@no_panic`. A function declared
@@ -292,6 +297,89 @@ selective import of a user effect under a name that collides with a
 core marker is `NAM005` (per
 [`modules.md` §Collisions](./modules.md)).
 
+## The `@cancel` and `@uncancellable` pair
+
+These two markers govern cancellation observation per
+[`concurrency.md`](./concurrency.md) §"Cancellation". They are a
+matched pair: one declares that a function observes cancellation,
+the other declares that a function cannot be interrupted by it.
+
+### `@cancel`
+
+A function marked `@cancel` reads `ctx.cancelled()` or calls
+into another `@cancel` function, and may `raise Cancelled` as a
+result. The marker is **required** when:
+
+- The function calls `ctx.cancelled()` directly.
+- The function awaits a channel `recv` / `send` on a
+  cancel-aware channel policy (`Backpressure`, `LatestValue` —
+  per `concurrency.md`).
+- The function calls any other `@cancel` function transitively.
+
+`@cancel` requires a `ctx: Cancel` parameter in the signature.
+Declaring `@cancel` without `ctx` is `EFF160` ("`@cancel`
+without `ctx` parameter").
+
+The marker propagates **up** like a capability: a caller calling
+a `@cancel` function picks up `@cancel` unless it asserts
+`@uncancellable`.
+
+```q64
+fn fetch(ctx: Cancel, env: Env, url: Url) -> Response @cancel {
+    if ctx.cancelled() { raise Cancelled }
+    http.get(ctx, env.net, url)?
+}
+```
+
+### `@uncancellable`
+
+A function marked `@uncancellable` runs to completion (or to a
+panic / trap) without observing cancellation. The body cannot
+call `@cancel` functions; doing so is `CONC012` (per
+`concurrency.md`) — the marker would be defeated.
+
+```q64
+@uncancellable
+fn flush_journal(env: Env, j: ref Journal) {
+    db.write_all(env, j.pending)        // db.write_all must not be @cancel
+}
+```
+
+`@uncancellable` is an assert that propagates **down**: an
+`@uncancellable` caller can only call callees whose effect sets
+exclude `@cancel`. The intersection rule from §"Composition"
+applies — `@uncancellable + @cancel` is `EFF120` ("contradictory
+effects declared").
+
+### Interactions with other effects
+
+- `@realtime` implies `@uncancellable` (real-time bodies don't
+  observe cancellation at arbitrary points; they run to their
+  next natural yield, per `concurrency.md`). `@realtime + @cancel`
+  is therefore `EFF120`.
+- `@pure` implies `@uncancellable` (a pure function has no
+  ambient state to observe; cancellation observation would
+  be a side effect).
+- `@uncancellable` inside `@realtime` is flagged as redundant
+  but not erroneous (`CONC013` in concurrency.md): the
+  `@realtime` already implies it.
+
+### Effect set in the call graph
+
+For a function whose effect set is inferred:
+
+- If any direct or transitive callee is `@cancel`, the function
+  picks up `@cancel`.
+- If the function asserts `@uncancellable`, the same callees
+  that would have added `@cancel` instead raise `CONC012` at the
+  call site.
+
+The cancellation story is **runtime-cooperative** (`h.cancel()`
+sets a flag; the task observes at the next suspension or
+`@cancel` check) and **statically tracked** (the effect markers
+make observation visible at every signature). The runtime and
+type system are aligned.
+
 ## The `@send` story
 
 `@send` is special: it lives on types, not on functions, and the
@@ -411,6 +499,17 @@ completeness; new codes start at `EFF110`.
 | `EFF141` | invalid effect name                          | User effect name does not match `^@[a-z][a-z_]*$`.                                |
 | `EFF150` | effect variable not bound                    | Fit omitted an `@e` binding the face declared.                                    |
 | `EFF151` | effect variable conflicts with annotation    | `fit X : Filter<T, @realtime>` then writes `step` body as `@io`.                  |
+| `EFF160` | `@cancel` without `ctx` parameter            | Function declares `@cancel` but its signature has no `ctx: Cancel`. See §`@cancel`. |
+
+Cross-prefix codes related to `@cancel` / `@uncancellable`:
+
+- `CONC012` (defined in [`concurrency.md`](./concurrency.md)) —
+  `@uncancellable` function calls `@cancel`. Emitted by the
+  effect checker; not duplicated under `EFF` to avoid two
+  prefixes for the same diagnostic.
+- `CONC013` (defined in [`concurrency.md`](./concurrency.md)) —
+  `@uncancellable` inside `@realtime` (redundant; `@realtime`
+  already implies `@uncancellable`).
 
 All codes are emitted using the standard envelope from
 [`diagnostics.md`](./diagnostics.md).
@@ -538,10 +637,18 @@ type for `Frame<Shared>` whose buffer lives in `mem.shared`.
   polymorphic faces with `@e` variables.
 - [`errors.md`](./errors.md) — `@no_panic` / `@no_trap` / `@no_alloc`
   interactions with `panic` and `trap`; `EFF100`–`EFF103`.
+- [`concurrency.md`](./concurrency.md) — `@cancel` and
+  `@uncancellable` semantics (observation, propagation, the
+  cooperative `ctx.cancelled()` mechanism); the `CONC012` /
+  `CONC013` codes that the effect checker emits for
+  cancellation-related violations.
+- [`env.md`](./env.md) — capability faces (`Net`, `Fs`, `Audio`, …)
+  whose methods carry the corresponding capability effects
+  (`@network`, `@fs`, `@audio`, …) used in the disclosure mapping.
 - [`modules.md`](./modules.md) — `pub effect` declarations participate
   in the standard visibility and re-export rules.
-- [`qube.json5.md`](./qube.json5.md) — `effects.declared` and
-  `effects.deny` manifest fields.
+- [`qube.json5.md`](./qube.json5.md) — `effects.declared`,
+  `effects.deny`, and `capabilities` manifest fields.
 - [`continuum-api.md`](./continuum-api.md) —
   `GET /v1/qubes/{name}/{version}/effects` for capability disclosure.
 - [`q64-cli.md`](./q64-cli.md) — `q64 show effects <fn>` and `q64
