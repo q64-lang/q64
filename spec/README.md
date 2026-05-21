@@ -19,6 +19,7 @@ suite.
 | [`continuum-api.md`](./continuum-api.md)                 | HTTP API between `qube` and the registry                          |
 | [`modules.md`](./modules.md)                             | Module organization, imports, visibility, re-exports              |
 | [`faces.md`](./faces.md)                                 | Polymorphism: faces (interfaces) and fits (implementations)       |
+| [`errors.md`](./errors.md)                               | `Result<T, E>`, `try`, `panic` / `trap`, `Option<T>`, `Error` face |
 
 ## Scope (forthcoming)
 

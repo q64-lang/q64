@@ -32,6 +32,8 @@ qube --help    | -h
 | `qube outdated`                  | List dependencies with newer compatible versions                   |
 | `qube audit`                     | Show effects and capabilities each dependency declares             |
 | `qube clean`                     | Remove build outputs (`target/`)                                   |
+| `qube explain <code>`            | Print structured documentation for a diagnostic code               |
+| `qube fix`                       | Apply or plan automated repairs from diagnostic `repair` fields    |
 | `qube fmt`                       | Format every `.q` source in this qube (delegates to `q64 fmt`)     |
 | `qube workspace <subcommand>`    | Workspace operations (`members`, `each`, …)                        |
 
@@ -122,6 +124,47 @@ Why a subprocess: clean version boundary, easy mocking in tests,
 independent crash recovery. A later flag (`qube build --in-process`)
 may link the compiler library directly for incremental scenarios where
 subprocess overhead matters.
+
+## `qube fix` and `qube explain`
+
+`qube fix` walks the project, runs `q64` per source file with
+`--diagnostics json`, collects every diagnostic that carries a `repair`
+field (per [`diagnostics.md`](./diagnostics.md)), and either prints a
+machine-readable plan or applies it.
+
+```
+qube fix --plan                  # emit JSON plan; do not modify files
+qube fix --apply                 # apply every `safety: "safe"` repair
+qube fix --apply --code TYP041   # only repairs for the named code
+qube fix --apply --unsafe        # include `safety: "unsafe"` repairs
+qube fix --apply --dry-run       # show diff, don't write
+```
+
+The plan format is the union of all `repair` objects across the
+project, plus a `summary` block:
+
+```
+{
+  "summary": { "files": 12, "repairs_safe": 47, "repairs_unsafe": 3, "skipped": 0 },
+  "repairs": [
+    {
+      "file": "src/audio/lowpass.q",
+      "code": "TYP041",
+      "repair": { "id": "wrap-cast", "safety": "safe", "edits": [ ... ] }
+    },
+    ...
+  ]
+}
+```
+
+AI agents driving `qube fix` typically run `qube fix --plan`, inspect
+the result, then `qube fix --apply --code <subset>` for the repairs
+they trust.
+
+`qube explain <code>` delegates to `q64 explain <code>` and adds
+qube-specific context (which dependency a fired diagnostic came from,
+whether a fix is available via `qube fix`). Same JSON shape as
+`q64 explain`.
 
 ## Exit codes
 

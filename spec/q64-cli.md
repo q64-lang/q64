@@ -28,6 +28,7 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 fmt [path]`        | Format source in-place (file or directory)                    |
 | `q64 lsp`               | Run the language server (stdin/stdout LSP)                    |
 | `q64 show <kind> <arg>` | Introspection (see below)                                     |
+| `q64 explain <code>`    | Print structured documentation for a diagnostic code          |
 | `q64 repl`              | Interactive REPL (eventual; not in v0)                        |
 
 ### `q64 show` kinds
@@ -122,6 +123,39 @@ boundary:
    `build`** — it carries only the program's output if `run` was
    invoked. Build mode writes the wasm artifact to `--out` and produces
    no stdout.
+
+## `q64 explain <code>`
+
+Returns structured documentation for any diagnostic code emitted by
+the toolchain — `NAM*`, `TYP*`, `REG*`, `EFF*`, `FMT*`, `LSP*`,
+`Q9xxx`, etc.
+
+```
+$ q64 explain TYP041 --diagnostics json
+{
+  "code": "TYP041",
+  "subsystem": "Type checking",
+  "title": "Numeric type mismatch",
+  "summary": "An expression of one numeric type was used where a different numeric type was expected. q64 has no implicit numeric coercions.",
+  "examples": [
+    {
+      "wrong":   "let x: i64 = compute(); let y: f64 = x;",
+      "right":   "let x: i64 = compute(); let y: f64 = f64(x);"
+    }
+  ],
+  "see_also": ["TYP040", "TYP042"],
+  "url": "https://q64.dev/diagnostics/TYP041"
+}
+```
+
+Without `--diagnostics json`, renders to readable text on stdout. Useful
+for AI agents asking *"what does this error code mean and how do I
+fix it?"* without scraping prose documentation. Mirrors Vercel Zero's
+`zero explain <code>` precedent.
+
+The data backing each code is generated from the per-spec diagnostic
+tables (`spec/modules.md`, `spec/faces.md`, `spec/errors.md`, …) at
+compiler build time; the registry is part of the compiler binary.
 
 ## LSP
 
