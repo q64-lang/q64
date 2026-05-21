@@ -20,21 +20,21 @@ suite.
 | [`modules.md`](./modules.md)                             | Module organization, imports, visibility, re-exports              |
 | [`faces.md`](./faces.md)                                 | Polymorphism: faces (interfaces) and fits (implementations)       |
 | [`errors.md`](./errors.md)                               | `Result<T, E>`, `try`, `panic` / `trap`, `Option<T>`, `Error` face |
+| [`effects.md`](./effects.md)                             | Effect markers, implication graph, propagation, capability disclosure |
 
 ## Scope (forthcoming)
 
 - **Lexical structure** — tokens, literals, comments, identifier rules.
 - **Syntax** — grammar in EBNF or equivalent.
-- **Type system** — primitive types, region parameters, effect markers,
-  generics, the full inference algorithm.
+- **Type system** — primitive types, region parameters, the full
+  inference algorithm. (Effect markers landed in `effects.md`;
+  generics land in `generics.md`.)
 - **Memory model** — region kinds, dual heap, cross-heap rules, `@send`
   derivation, multi-memory layout.
 - **Concurrency model** — scopes, tasks, channels, ordering guarantees,
   cancellation semantics.
 - **Stream semantics** — synchronous-tick model, `pre` operator, graph
   scheduling, fusion rules.
-- **Effect system** — the fixed set of markers, propagation rules,
-  capability disclosure semantics.
 - **Conformance test suite** — q64 source files plus expected outputs.
   Any future implementation passes these to claim conformance.
 
