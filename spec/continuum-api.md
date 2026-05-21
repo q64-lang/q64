@@ -120,13 +120,30 @@ Content-Type: multipart/form-data
   tarball=<binary tarball>
 ```
 
-Server validates: manifest matches schema, version not already
-published, name available or owned by the token's subject, declared
-effects are a subset of what static analysis on the tarball detects
-(or returns 422 with a diagnostic envelope explaining the drift),
-tarball SHA matches the manifest's stated checksum.
+Server validates, in order:
 
-On success: `201 Created` with the new version's metadata.
+1. Manifest matches [`qube.json5.schema.json`](./qube.json5.schema.json).
+2. Version is not already published; name is available or owned by
+   the token's subject.
+3. Tarball SHA matches the manifest's stated checksum.
+4. **Effect indexing.** The server runs the effect analyser (the
+   same code path `qube audit` uses locally — see
+   [`qube-cli.md`](./qube-cli.md) §"Publishing flow") on the
+   uploaded tarball, producing the qube's transitive effect set.
+   The detected set is stored alongside the manifest and surfaced
+   via `GET /v1/qubes/{name}/{version}/effects`.
+5. **Effect cross-check.** The manifest's `effects.declared` must
+   be a superset (after closure under implications) of the detected
+   set. Drift returns `422 Unprocessable Entity` with a diagnostic
+   envelope (`EFF130`) explaining which detected effect was missing
+   from the declaration.
+6. **Capability cross-check.** The manifest's `capabilities` must
+   match the capability set derived from the effect index (per
+   [`env.md`](./env.md) §"Capability disclosure"). Drift returns
+   `422` with `ENV040`.
+
+On success: `201 Created` with the new version's metadata, including
+the indexed effect set.
 
 ### Write — yank / unyank
 

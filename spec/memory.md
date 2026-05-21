@@ -213,8 +213,13 @@ fn (s: str) transfer<R: Region>(to: R) -> String<R>
 | Static       | `Interned`   | Deduplicate; register canonical instance.            |
 
 `Interned` is a target marker (not a region kind, strictly) that
-selects deduplicating semantics. It composes with `Managed`:
-`"hello".transfer(to: Interned<Managed>)`.
+selects deduplicating semantics: the target region keeps a hashtable
+keyed by content hash, and `transfer(to: Interned<R>)` returns a
+handle to the canonical instance — the second `transfer` of an
+equal value re-uses the first allocation. It composes with
+`Managed`: `"hello".transfer(to: Interned<Managed>)` deduplicates
+inside the WasmGC heap. Hashtable lookup after the first allocation
+is `@pure` (no further alloc).
 
 The only verb is `transfer(to: …)`. `copy_to`, `pin_to`, and
 `intern` are not in the language; the compiler rejects them as
@@ -353,6 +358,17 @@ Shared<T, Disjoint<F>>    // compile-time-verified disjoint field access
 
 `Atomic<T>` is the primitive for shared scalars — `Atomic<i64>`,
 `Atomic<bool>`, `Atomic<Ptr<T>>`. Backed by Wasm 3.0 atomic ops.
+Methods: `load() -> T`, `store(v: T)`, `add(v: T) -> T`,
+`sub(v: T) -> T`, `compare_exchange(expected: T, new: T) -> T`
+(returns the prior value), plus the bitwise variants on integer
+payloads (`or`, `and`, `xor`).
+
+**Memory ordering, v0.** Every `Atomic<T>` operation uses
+**sequentially-consistent** ordering — the strongest Wasm 3.0
+ordering. Conservative-by-default; a future revision may add
+`@relaxed` / `@acquire` / `@release` annotations on individual
+operations for hot paths that have measured the need. v0 picks
+correctness over peak throughput.
 
 Most user code uses `Shared<T, Mutex>` or `Atomic<T>`. LockFree
 and Disjoint are advanced; they enable hot paths the compiler can
@@ -530,9 +546,9 @@ hot path.
 - [`generics.md`](./generics.md) — the `R: Region` parameter
   kind, default region parameters on collections, region face
   bounds.
-- [`concurrency.md`](./concurrency.md) *(forthcoming)* — scope's
-  default arena, structured concurrency interaction with regions,
-  `@shared` regions and channels, atomics.
+- [`concurrency.md`](./concurrency.md) — scope's default arena,
+  structured concurrency interaction with regions, `@shared` regions
+  and channels, atomics.
 - [`faces.md`](./faces.md) — `Region` is an auto-prelude face;
   `Arena`, `Pool`, `Stack`, `FreeList`, `Managed`, `Interned` are
   blessed types fitting it.

@@ -509,14 +509,18 @@ The compiler reports a non-dyn-safe face used in `dyn` position as
 
 ### Cost we accept
 
-Monomorphization grows wasm binary size. Mitigations available:
-- `qube build` warns when a single generic exceeds N instantiations.
-- A `@code_size` annotation routes specific functions to dynamic
-  dispatch when binary size matters more than speed.
+Monomorphization grows wasm binary size. Mitigations available in v0:
+- `qube build` warns when a single generic exceeds N instantiations
+  (default threshold N=64).
 - The compiler may dedupe identical post-monomorphization bodies (see
   Rust's polyhedral lowering for prior art).
+- For binary-size-sensitive call sites, rewrite the function to take
+  `dyn Face` instead of `<T: Face>` — the existing dyn-dispatch path
+  already covers this.
 
-None of these change the default; they are escape hatches.
+A dedicated `@code_size` annotation that routes specific functions
+to dynamic dispatch without rewriting the signature is deferred to
+the optimization spec.
 
 ## Coherence
 

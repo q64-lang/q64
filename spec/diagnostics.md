@@ -102,9 +102,13 @@ notes, and help can be present in a successful run).
 - `safety` — `safe` (always applicable), `unsafe` (changes behavior;
   user must confirm), or `n/a` (informational only, no edit).
 - `edits` — array of `{ location, replacement }` covering the change.
-  Multi-file repairs allowed; ordering follows the array.
-- `report_url` — for `severity: internal`, a URL to a bug report
-  template instead of `edits`.
+  Multi-file repairs allowed; ordering follows the array. Omit
+  entirely when no edit is possible (e.g. `severity: internal` ICEs).
+- `report_url` — URL to a bug report or documentation page.
+  Expected on `severity: internal` (ICEs, where no machine-applicable
+  fix exists); permitted on any severity as a pointer to external
+  context. Independent of `edits`: both may be present, either may
+  be omitted.
 
 ## Code conventions
 

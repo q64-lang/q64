@@ -292,6 +292,19 @@ The mapping from effect markers to capability names (per
 | `@random`    | `Rng`                |
 | `@stdio`     | `Stdout` + `Stderr`  |
 
+Two further capabilities are reachable through `Env` but have no
+corresponding effect marker in v0:
+
+| Capability | Reached via   | Notes                                                                  |
+|------------|---------------|------------------------------------------------------------------------|
+| `ExitFn`   | `env.exit`    | Terminates the program; no effect marker because it never returns.     |
+| `EnvVars`  | `env.envvars` | Read-only access to process env vars; treated as ambient configuration.|
+
+Both names appear in the schema's `CapabilityName` enum and in the
+`capabilities` list when the qube's source touches them; the compiler
+derives them from direct call-site reachability rather than from
+effect propagation.
+
 Capability names are PascalCase (matching the face names in
 `env.md`). Listing a capability not used by the source is
 `ENV041` at publish (warning). Listing a capability the source

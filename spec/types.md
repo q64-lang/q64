@@ -147,8 +147,27 @@ let j = 0xFF.u24              // arbitrary-width integer literal
 
 The suffix form mirrors method-call syntax (`42.i32`); the
 compiler recognizes the right-hand side as either a primitive
-type name, an arbitrary-width int name, or a unit (per the
-forthcoming `units.md`).
+type name, an arbitrary-width int name, or a unit suffix.
+
+**Unit suffixes recognized in v0.** Pending the full `units.md`
+spec, the following suffixes are blessed by the language so other
+specs may use them in examples and signatures. Each evaluates to
+an `f64` value carrying a unit phantom; arithmetic between
+compatible units (`s + s`, `kHz * s` → dimensionless) follows the
+obvious dimensional rules.
+
+| Suffix       | Quantity         | Base unit |
+|--------------|------------------|-----------|
+| `Hz`, `kHz`, `MHz`, `GHz` | frequency | Hz |
+| `ns`, `us`, `ms`, `s`     | duration  | s  |
+| `dB`          | gain (logarithmic) | dB |
+| `B`, `KB`, `MB`, `GB`, `TB` | size (decimal multipliers) | bytes |
+| `KiB`, `MiB`, `GiB`        | size (binary multipliers)  | bytes |
+| `deg`, `rad`               | angle | rad |
+
+The full unit lattice (composition rules, user-defined units,
+prefix interactions) lands with `units.md`. Until then, these
+suffix names are reserved and the listed semantics apply.
 
 Float literals require a dot. `3` is `i64`; `3.0` is `f64`.
 A literal like `42.kHz` is parsed as `42` followed by the
@@ -565,7 +584,8 @@ fn dispatch(code: OpCode) {
   `Result` are in the auto-prelude; no import required.
 - [`diagnostics.md`](./diagnostics.md) — envelope format for the
   `TYP040`–`TYP099` codes.
-- *Forthcoming*: [`units.md`](./units.md) — unit suffixes that
-  attach to numeric literals (`48.kHz`, `-6.dB`).
-- *Forthcoming*: [`memory.md`](./memory.md) — region parameters
-  that types may take; the dual-heap interaction with `@send`.
+- [`memory.md`](./memory.md) — region parameters that types may
+  take; the dual-heap interaction with `@send`.
+- *Forthcoming*: [`units.md`](./units.md) — the full units lattice
+  (composition, user-defined units). Until it lands, the suffix
+  table in §"Numeric literals and suffixes" is the contract.

@@ -490,6 +490,11 @@ returning `Err(e)`; the error is delivered through
 `h.await()`. Only an actual `panic` / `trap` invokes the scope
 unwinding above.
 
+A stage inside a `graph { … }` is the exception: stages have no
+`h.await()` consumer, so a stage returning `Err` is converted to
+a panic at the stage boundary and cascades per the rules above.
+This is specified in [`streams.md` §"Error propagation"](./streams.md).
+
 ```q64
 scope {
     let h = spawn { connect_to_db() }    // returns Result<Conn, Error>
@@ -593,8 +598,7 @@ What user code does see:
 - `scope`, `spawn`, `channel<T>`, `select`
 - `@shared`, `Atomic<T>`, `Shared<T, P>` (per `memory.md`)
 - `actor`, `handle`, `tell`, `ask`
-- `Signal<T>`, `Event<T>`, `Stream<T>` (per `streams.md`,
-  forthcoming)
+- `Signal<T>`, `Event<T>`, `Stream<T>` (per [`streams.md`](./streams.md))
 
 The runtime adapter is the boundary. Application code is
 portable across browser, Wasmtime, and audio-host targets without
@@ -620,7 +624,7 @@ queue all use the same primitives, the same scheduler, and the
 same effect-checking. One concurrency story for the whole
 language.
 
-Detailed in [`streams.md`](./streams.md) *(forthcoming)*.
+Detailed in [`streams.md`](./streams.md).
 
 ## Diagnostic codes
 
@@ -776,8 +780,7 @@ clean up bounded resources before exit.
 
 - **Stage / graph DSL.** The `stage` and `graph` keywords from
   the design doc — fusion rules, pipe `|>` semantics, backpressure
-  propagation — live in [`streams.md`](./streams.md)
-  *(forthcoming)*.
+  propagation — live in [`streams.md`](./streams.md).
 - **`select` with `default` (non-blocking poll).** Common in Go;
   deferred for v0. Workaround: `timeout(0.ms)`.
 - **Task-local storage.** Go's `context.Value`, Trio's run-vars.
@@ -805,8 +808,8 @@ clean up bounded resources before exit.
   `Receiver<T>`, `Handle<T>`, `Future<T>`.
 - [`faces.md`](./faces.md) — `Sender`, `Receiver`, `Handle`, the
   `Actor` blessed pattern.
-- [`streams.md`](./streams.md) *(forthcoming)* — `stage`, `graph`,
-  the dataflow DSL; the stream runtime that **is** this scheduler.
+- [`streams.md`](./streams.md) — `stage`, `graph`, the dataflow
+  DSL; the stream runtime that **is** this scheduler.
 - [`modules.md`](./modules.md) — `scope`, `spawn`, `channel`,
   `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`,
   `timeout`, `sleep` are auto-prelude; no import required.
