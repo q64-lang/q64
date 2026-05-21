@@ -200,6 +200,15 @@ section indexes them.
 | Concurrency primitives | `scope`, `spawn`, `channel`, `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`, `Sender`, `Receiver`, `Policy`, `CancelPolicy`, `NonCancelPolicy`, `Backpressure`, `RingBuffer`, `LatestValue`, `Unbounded`, `timeout`, `sleep`, `SendError`, `RecvError` | [`concurrency.md`](./concurrency.md)            |
 | Stream primitives      | `Signal`, `Event`, `Stream`, `SharedSignal`, `Graph`, `@stage`, `graph`, `pre`, `\|>`, `changes`, `hold`, `fold`, `sample` | [`streams.md`](./streams.md)                |
 
+`scope` deliberately appears in **two** rows of the table: the
+"Regions" row covers the implicit `Arena`-kind region binding the
+keyword introduces (per [`memory.md` §"Scope's implicit arena"](./memory.md)),
+and the "Concurrency primitives" row covers the `scope { … }`
+block form itself (per [`concurrency.md` §"Scopes"](./concurrency.md)).
+The two uses share an identifier on purpose — the arena is named
+after the block that owns it — and LSP hover disambiguates by
+syntactic position (block-introducing keyword vs. value-bound name).
+
 ### Reachable through a capability face
 
 Capability faces (`Net`, `Fs`, `Audio`, …) carry parameter and

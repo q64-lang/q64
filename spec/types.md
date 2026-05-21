@@ -345,6 +345,37 @@ the `ref` keyword in type position to match the parameter-mode
 spelling. A `&` in a type expression is `LEX021` ("unexpected
 character `&` in type position").
 
+## Tuple structs
+
+A `struct` declaration may use either the record form
+(`struct Name { field: T, … }`) used throughout the spec or the
+**tuple form** `struct Name(T1, T2, …)`. Tuple structs are the
+spelling for newtypes and other single-purpose wrappers:
+
+```q64
+pub struct PanicMessage(str)            // wraps a single str (auto-prelude payload)
+pub struct UserId(i64)                  // newtype over i64
+pub struct Rgb(u8, u8, u8)              // tuple-struct with three positional fields
+```
+
+Rules:
+
+- Construction uses positional arguments: `UserId(42)`,
+  `Rgb(255, 0, 0)`.
+- Field access uses `.<index>` (zero-based): `userId.0`,
+  `rgb.0`, `rgb.1`, `rgb.2`.
+- Tuple structs participate in the same visibility, fit,
+  auto-derive, and region-parameter rules as record structs.
+- A tuple-struct with one field is the canonical newtype shape
+  for [`faces.md` §"Conflict resolution"](./faces.md)'s
+  newtype-wrap remedy.
+
+The two forms cannot mix in a single declaration (a struct is
+either record-shaped or tuple-shaped). An empty tuple struct
+`struct Name()` is **not** in v0; use the bare unit form
+`struct Name` instead (as used by `Cancelled` and `Closed` in
+[`errors.md`](./errors.md)).
+
 ## Strings: `str` and `String<R>`
 
 Two string types, by intent:
@@ -681,6 +712,20 @@ defining zero-cost semantic newtypes (e.g. `@kind PCM<T>`,
 as the forthcoming `kinds.md` spec; until that lands, only
 these three compiler-blessed kinds exist.
 
+The illustrative type names that appear in audio / AI examples
+across the spec — `PCM<T>` (audio samples), `Token<V>` (tokenizer
+output, parameterized by vocabulary), `Frame` (a video / GPU
+buffer), and similar — are **ordinary user types** living in
+their respective stdlib qubes (`q64.audio`, `q64.ai`,
+`q64.video`). They are spelled as plain `struct`s or tuple
+structs in v0; the `@kind` annotation, when it lands, will give
+them a more compact zero-cost newtype spelling but does not
+change what kind of declaration they are. These names are not
+language builtins and are not in the auto-prelude — examples
+that use them import them implicitly through the corresponding
+capability face per [`modules.md` §"Reachable through a
+capability face"](./modules.md).
+
 `Tensor`'s shape parameter is a fixed-length array of `i64`
 (`[i64; Rank]`) per
 [`generics.md` §"Permitted const-generic types"](./generics.md);
@@ -733,7 +778,7 @@ become localized and greppable.
 ## Diagnostic codes
 
 Type-system diagnostics in the `TYP040–TYP099` band (generics
-own `TYP100–TYP149`, faces own `TYP200–TYP219`, errors own
+own `TYP100–TYP149`, faces own `TYP200–TYP249`, errors own
 `TYP300–TYP307`). Numbers are stable, never reused.
 
 | Code     | Short message                              | When                                                                              |

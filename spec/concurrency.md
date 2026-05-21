@@ -407,6 +407,14 @@ pub face Receiver<T, P: CancelPolicy> : ReceiverBase<T, P> {
 }
 ```
 
+The two declarations each of `Sender` and `Receiver` are the canonical
+instance of the bound-disjoint face overload form specified in
+[`faces.md` §"Bound-disjoint face overload"](./faces.md): `CancelPolicy`
+and `NonCancelPolicy` are provably disjoint, so the compiler treats
+each pair as a single face whose `send` / `recv` signature is selected
+by `P`. The two declarations must not share a method name (`TYP220`);
+common methods live on `SenderBase` / `ReceiverBase`.
+
 `Policy` is the auto-prelude umbrella face;
 `CancelPolicy` and `NonCancelPolicy` are its two disjoint
 sub-faces. `Backpressure` and `LatestValue` fit `CancelPolicy`;

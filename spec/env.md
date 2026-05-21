@@ -103,6 +103,30 @@ implication graph) — declaring both would be redundant. `Fs.read`
 lists `@fs` for the same reason; the implication tables in
 [`effects.md`](./effects.md) cover the closures.
 
+### Capability methods and cancellation
+
+Capability-face methods (`Net.get`, `Fs.read`, …) take no `ctx:
+Cancel` and do not carry `@cancel`. They may suspend on host
+I/O, but the suspension is not observable to the caller's
+cancellation channel — a call in progress runs to its host
+result. This keeps the simple `try env.net.get(url)` shape free
+of ctx threading.
+
+Cancellation-aware variants live one layer up, in the `q64.net.http`
+/ `q64.fs.aio` / similar sub-modules. They are free functions that
+take both the capability value and a `ctx: Cancel`:
+
+```q64
+// Lives in q64.net.http; the concurrency.md examples use this form.
+pub fn get(ctx: Cancel, n: Net, url: Url)
+    -> Result<Response, IoError> @cancel + @network
+```
+
+Use the capability method when the call site has no `ctx` (or
+doesn't want to thread one); use the `http.*` free-function form
+when the caller needs cooperative cancellation. The two paths
+ride on the same fit of the underlying capability face.
+
 The runtime ships exactly one fit per face (browser → `BrowserNet`;
 Wasmtime → `WasmtimeNet`; etc.); the user code never names the
 concrete fit. Test code and libraries provide their own fits:
@@ -255,6 +279,8 @@ revoked capabilities unwind with `panic RuntimeDenied { code:
 "ENV030", detail: … }` at the point of use:
 
 ```q64
+pub type PluginFn = fn(env: Env)
+
 fn run_plugin(env: Env, plugin: PluginFn) {
     with_capabilities(deny: [Net, Fs]) {
         plugin(env)                              // plugin still has env, but
@@ -618,7 +644,7 @@ OK fetcher@0.1.0 — capabilities verified [Net, Fs, Stdout]
   methods; the derivation that produces the disclosed capability
   set.
 - [`errors.md`](./errors.md) — `Result<T, E>`, `panic`, the
-  `Error` face's `exit_code` field used by `main` Form 2.
+  `Error` face's `exit_code()` method used by `main` Form 2.
 - [`generics.md`](./generics.md) — `fn fetch(n: Net, …)` as
   shorthand for `fn fetch<N: Net>(n: N, …)`.
 - [`concurrency.md`](./concurrency.md) — `ENV030` raises panic;

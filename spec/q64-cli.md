@@ -38,6 +38,7 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 show types <expr>`         | Inferred type of `<expr>`                                      |
 | `q64 show effects <fn>`         | Effect set of `<fn>`                                           |
 | `q64 show regions <fn>`         | Regions `<fn>` uses or borrows from                            |
+| `q64 show alloc <fn>`           | Per-allocation-site region attribution for `<fn>`              |
 | `q64 show graph <stage>`        | Stream-graph topology rooted at `<stage>`                      |
 | `q64 show layout <type>`        | Memory layout of `<type>`                                      |
 | `q64 show send <type>`          | `@send`-derivation explanation                                 |
@@ -107,12 +108,12 @@ stdout.
 | Exit  | Meaning                                                          |
 |-------|------------------------------------------------------------------|
 | `0`   | Success                                                          |
-| `1`   | Program panicked (`panic <payload>` in user code; uncaught at top level) |
+| `1`   | Program panicked (`panic <payload>` in user code; uncaught at top level) — or, when the payload also fits `Error`, the value of `payload.exit_code()` (default `1`). |
 | `2`   | Usage error (bad flags, missing args)                            |
 | `64`  | Compile error (any `error`-severity diagnostic)                  |
 | `65`  | Input error (file not found, unreadable)                         |
 | `70`  | Internal compiler error (ICE); diagnostic is in the `Q9xxx` band |
-| `N`   | Program called `env.exit(N)` with `N > 0`                        |
+| `N`   | Program called `env.exit(N)` with `N > 0`; or `main` Form 2 returned `Err(e)` and `e.exit_code()` is `N` (per [`errors.md` §"The `Error` face"](./errors.md) and [`env.md` §"`main` signature"](./env.md)). |
 
 Conventions match sysexits where possible. Subprocess callers (`qube`)
 distinguish "user error" (`64`) from "ICE" (`70`) so they can choose

@@ -61,7 +61,17 @@ the same way `cargo build` invokes `rustc`.
 
 ## Building
 
-To be written. The bootstrap order:
+First, install the pinned Zig toolchain into `vendor/zig/`:
+
+```
+./init.sh
+. ./vendor/zig/activate          # adds vendor/zig to PATH for this shell
+```
+
+`init.sh` is re-runnable and skips work that's already done. Override
+the pinned version with `ZIG_VERSION=… ./init.sh`.
+
+Then the bootstrap order (still in progress; folders are scaffolded):
 
 1. Build `q64/` with `zig build` → produces the `q64` binary.
 2. Build `qube/` with `zig build` → produces the `qube` binary.
