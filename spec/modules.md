@@ -189,11 +189,11 @@ section indexes them.
 |------------------------|----------------------------------------------------------------|------------------------------------------------------|
 | Numeric primitives     | `i8`–`i64`, `u8`–`u64`, `f16`/`f32`/`f64`, `bool`              | [`types.md`](./types.md) §"The numeric tower"        |
 | Compound numerics      | `Simd`, `Tensor`, `DynTensor`                                  | [`types.md`](./types.md) §"SIMD and Tensor as language types" |
-| Optionality / errors   | `Option`, `Result`, `T?`, `try`, `panic`, `trap`               | [`errors.md`](./errors.md) §"Auto-prelude additions" |
-| Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) |
+| Optionality / errors   | `Option`, `Result`, `T?`, `try`, `panic`, `trap`, `PanicMessage`, `Cancelled`, `RuntimeDenied`, `RangeError` | [`errors.md`](./errors.md) §"Auto-prelude additions" |
+| Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error`, `Panic` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) |
 | Regions                | `Region`, `Arena`, `Pool`, `Stack`, `FreeList`, `Managed`, `Interned` | [`memory.md`](./memory.md) §"Region kinds"     |
 | Capabilities           | `Env`, `Net`, `Fs`, `Audio`, `Midi`, `AiEnv`, `Ui`, `Clock`, `Rng`, `Stdout`, `Stderr`, `ExitFn`, `EnvVars`, `with_capabilities` | [`env.md`](./env.md) §"`Env` and its fields" |
-| Concurrency primitives | `scope`, `spawn`, `channel`, `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`, `timeout`, `sleep` | [`concurrency.md`](./concurrency.md)            |
+| Concurrency primitives | `scope`, `spawn`, `channel`, `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`, `Sender`, `Receiver`, `Policy`, `Backpressure`, `RingBuffer`, `LatestValue`, `Unbounded`, `timeout`, `sleep` | [`concurrency.md`](./concurrency.md)            |
 | Stream primitives      | `Signal`, `Event`, `Stream`, `SharedSignal`, `@stage`, `graph`, `pre`, `\|>`, `changes`, `hold`, `fold`, `sample` | [`streams.md`](./streams.md)                |
 
 The prelude is curated; user code cannot add to it. New blessed names
@@ -404,9 +404,14 @@ AliasBinding   := "as" Ident
 ReExport       := "pub" "use" SelectiveList "from" ImportPath
                 | "pub" "use" Ident ("as" Ident)? "from" ImportPath
 
-Item           := Visibility? (FnDecl | StructDecl | EnumDecl | TypeDecl | FaceDecl | FitDecl | ConstDecl | ReExport)
+Item           := Visibility? (FnDecl | StructDecl | EnumDecl | TypeDecl | FaceDecl | FitDecl | ConstDecl | ActorDecl | EffectDecl | ReExport)
 Visibility     := "pub"
 ```
+
+`ActorDecl` is specified in [`concurrency.md`](./concurrency.md)
+§Grammar; `EffectDecl` (`pub effect @<name>`) is specified in
+[`effects.md`](./effects.md) §"User-defined effects". Both follow
+the same visibility model as other top-level items.
 
 The block-`pub` form `Visibility "{" Item* "}"` is intentionally absent.
 

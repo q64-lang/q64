@@ -67,6 +67,45 @@ bounds for their own children. Same shape as Swift `TaskGroup`,
 Trio nursery, Kotlin `coroutineScope` — picked for the
 twenty-year-old safety story, not novelty.
 
+### Scope effect annotations
+
+A `scope` may carry an effect annotation that applies as an
+assert to every task spawned directly inside it:
+
+```q64
+scope @realtime {
+    loop {
+        select {
+            f = rx_frame.recv(ctx) -> play(move f),
+            // cancellation observed at select boundary
+        }
+    }
+}
+```
+
+Grammar: `scope (@<effect> ("+" @<effect>)*)? { … } (catch (e: T) { … })*`.
+The effect list applies the standard implication closure from
+[`effects.md`](./effects.md), then propagates to every task body
+inside the scope. A child task whose effect set exceeds the
+scope's annotation is `EFF110` at its spawn site.
+
+The combined form `spawn scope @<effect> { … }` is sugar for
+`spawn { scope @<effect> { … } }` — it spawns a task whose body
+is a single annotated scope. Useful when an `@realtime` worker
+needs its own scope but no surrounding parent scope wants the
+constraint:
+
+```q64
+spawn scope @realtime {
+    audio_loop(ctx, rx_frame)
+}
+```
+
+`@realtime` is by far the most common annotation; `@no_alloc`
+and user-defined effects are also legal. Asserts compose; a
+`scope @realtime + @no_panic` redundantly tightens (with
+`@realtime` already implying `@no_panic`) and is `EFF132` lint.
+
 ## Tasks
 
 ```q64
@@ -148,24 +187,30 @@ parameter. The convention is C-style: `ctx` is the first
 parameter; it threads through call trees:
 
 ```q64
-fn fetch(ctx: Cancel, env: Env, url: str) -> Response @cancel {
-    let mut buf = Vec<u8>.new()
+fn fetch(ctx: Cancel, env: Env, url: str) -> Result<Response, IoError> @cancel {
+    var buf: Vec<u8> = Vec.new()
     loop {
-        if ctx.cancelled() { raise Cancelled }
-        let chunk = http.read_chunk(ctx, env, url)?
+        if ctx.cancelled() { panic Cancelled }
+        let chunk = try http.read_chunk(ctx, env, url)
         if chunk.is_eof() { break }
         buf.extend(move chunk)
     }
-    Response.parse(buf)
+    Ok(Response.parse(buf))
 }
 
 scope {
     let h = spawn { fetch(ctx, env, "https://...") }
     sleep(2.s)
     h.cancel()
-    h.await()    // raises Cancelled
+    h.await()    // panics with Cancelled payload
 }
 ```
+
+`Cancelled` is the auto-prelude payload type from
+[`errors.md` §"Auto-prelude payload types"](./errors.md); it fits
+`Panic` with `code = some("CONC011")`. Cancellation observation
+unwinds the task — it does not consume a recoverable-error slot in
+the function's return type.
 
 `Cancel` is an opaque value of type `Cancel`. `ctx.cancelled()`
 is `@no_alloc` + `@no_suspend` (cheap to call in hot loops).
@@ -193,6 +238,12 @@ running code. The task observes at:
    `Unbounded`).
 4. Any function that takes `ctx: Cancel` and chooses to check.
 
+Once observed, cancellation unwinds the task via `panic Cancelled`
+(per [`errors.md`](./errors.md)); the panic propagates per
+§"Panics across tasks", and the nearest enclosing `scope … catch
+(e: Cancelled) { … }` (or `catch (e: Panic) { … }`) can intercept
+it.
+
 `@realtime` tasks cannot be cancelled at arbitrary points; they
 run to their next natural yield. Documented in §Effects.
 
@@ -204,7 +255,7 @@ opts out of cancellation observation:
 ```q64
 @uncancellable
 fn flush_journal(env: Env, j: ref Journal) {
-    db.write_all(env, j.pending)        // no Cancelled raised even if ctx flips
+    db.write_all(env, j.pending)        // no Cancelled panic even if ctx flips
 }
 ```
 
@@ -221,12 +272,12 @@ let (tx, rx) = channel<Frame>(policy: Backpressure, capacity: 16)
 
 spawn {
     let f = capture_frame()
-    tx.send(move f)                      // ownership transferred
+    tx.send(ctx, move f)                 // ownership transferred; suspends if full
 }
 
 spawn {
     loop {
-        let f = rx.recv(ctx)?            // suspends until a value is available
+        let f = try rx.recv(ctx)         // suspends until a value is available
         render(move f)
     }
 }
@@ -246,6 +297,24 @@ let (tx, rx) = channel<Cmd>(capacity: 16)
 Forcing the policy at every construction makes the bounded /
 overwriting / blocking choice visible at the call site.
 
+The full constructor signature is:
+
+```q64
+pub fn channel<T, P: Policy>(
+    region:    R     = scope,             // backing allocator; defaults to scope arena
+    policy:    P,
+    capacity:  i64   = 0,                  // required for Backpressure / RingBuffer
+) -> (Sender<T, P>, Receiver<T, P>)
+```
+
+- `region` is normally elided; pass an explicit `Pool<T, N>` (per
+  [`memory.md`](./memory.md)) to back the channel from a fixed
+  slot pool — required when an `@realtime` consumer reads from it
+  (see the audio example at the end of this spec).
+- `policy` is one of the four below.
+- `capacity` is required for `Backpressure` and `RingBuffer`;
+  ignored by `LatestValue` (single slot) and `Unbounded` (grows).
+
 ### Channel policies
 
 | Policy           | Behavior on overflow                                  |
@@ -262,6 +331,41 @@ overwriting / blocking choice visible at the call site.
 - **`LatestValue`** for state mirroring: UI state propagation,
   render-thread "what's the latest?" reads. Cancel-aware.
 - **`Unbounded`** for emergencies only; `q64 fmt --lint` warns.
+
+### `Sender<T, P>` and `Receiver<T, P>` API
+
+```q64
+pub face Sender<T, P: Policy = Backpressure> {
+    fn send       (self,            move x: T)                                // non-cancel-aware policies
+    fn send       (self, ctx: Cancel, move x: T) @cancel                      // cancel-aware policies; may unwind via panic Cancelled
+    fn try_send   (self,            move x: T) -> Result<(), SendError<T>>   // non-blocking; never suspends
+    fn close      (self)                                                     // signal end-of-stream; remaining values still readable
+}
+
+pub face Receiver<T, P: Policy = Backpressure> {
+    fn recv       (self, ctx: Cancel) -> T @cancel        // suspends until a value is available
+    fn try_recv   (self) -> Result<T, RecvError>          // non-blocking; immediate
+    fn closed     (self) -> bool                          // whether the sender side has closed
+}
+```
+
+- For non-cancel-aware policies (`RingBuffer`, `Unbounded`), `send`
+  does not suspend and the `ctx` parameter may be elided —
+  `tx.send(move x)` is the canonical form.
+- For cancel-aware policies (`Backpressure`, `LatestValue`),
+  `send(ctx, …)` and `recv(ctx)` may unwind with `Cancelled` per
+  §"Cancellation". The `@cancel` effect on both sides surfaces in
+  the caller's effect set.
+- `recv(ctx)` returns `T` directly; it does **not** return a
+  `Result`. End-of-stream is detected via `closed()` or by the
+  channel returning from a `for x in rx { … }` loop (per stdlib
+  `Iterator` fit).
+- `try_recv` returns `Err(RecvError::Empty)` when no value is
+  ready and `Err(RecvError::Closed)` when the sender has closed
+  and the buffer is empty.
+- `SendError<T>` carries the rejected value back so the caller can
+  recover ownership on failure: `Err(SendError { value: T, reason:
+  SendErrorReason })` where `SendErrorReason ∈ { Full, Closed }`.
 
 ### Cross-thread channels
 
@@ -300,25 +404,25 @@ Every `select` carries an implicit cancellation branch resolved
 to the lexically nearest `ctx: Cancel`:
 
 ```q64
-fn worker(ctx: Cancel, rx: Receiver<Cmd>) {
+fn worker(ctx: Cancel, rx: Receiver<Cmd, Backpressure>) {
     loop {
         select {
             cmd = rx.recv(ctx) -> handle(cmd),
             _   = timeout(1.s) -> tick(),
-            // _ = ctx.cancelled() -> raise Cancelled   ← implicit
+            // _ = ctx.cancelled() -> panic Cancelled   ← implicit
         }
     }
 }
 ```
 
-The injected branch raises `Cancelled`. A user-written
+The injected branch unwinds with `panic Cancelled`. A user-written
 `_ = ctx.cancelled() -> …` branch overrides the default for
-cleanup-before-raising:
+cleanup-before-unwinding:
 
 ```q64
 select {
     msg = rx.recv(ctx)   -> handle(move msg),
-    _   = ctx.cancelled() -> { flush(env); raise Cancelled },
+    _   = ctx.cancelled() -> { flush(env); panic Cancelled },
 }
 ```
 
@@ -391,8 +495,8 @@ enum CounterMsg {
     Get(reply: Sender<i64>),
 }
 
-fn run_counter(ctx: Cancel, rx: Receiver<CounterMsg>) {
-    let mut count: i64 = 0
+fn run_counter(ctx: Cancel, rx: Receiver<CounterMsg, Backpressure>) {
+    var count: i64 = 0
     loop {
         select {
             msg = rx.recv(ctx) -> match msg {
@@ -440,9 +544,11 @@ non-shareable value at compile time.
 ## Panics across tasks
 
 A failing task's behavior depends on whether its scope declares
-a `catch`.
+a `catch`. Panic payloads — typed per [`errors.md` §"`panic` and
+`trap`"](./errors.md) — flow from the failing task to the
+enclosing scope, optionally intercepted by a `catch` arm.
 
-### Without `catch`: cancel siblings, re-raise at scope close
+### Without `catch`: cancel siblings, re-panic at scope close
 
 ```q64
 scope {
@@ -450,19 +556,20 @@ scope {
     spawn { cache.warm() }              // cancelled when sibling panics
     do_other_work()
 }
-// ← panic re-raises here, into the parent scope
+// ← panic re-emerges here, into the parent scope, with the same payload
 ```
 
 The first panic in a child:
 
 1. Marks the scope as failing.
-2. Cancels every sibling task (signals their `ctx`).
+2. Cancels every sibling task (signals their `ctx`, which observes
+   it at its next yield point and unwinds via `panic Cancelled`).
 3. Waits for siblings to acknowledge.
-4. Re-raises the original panic at the scope's closing brace.
+4. Re-panics with the original payload at the scope's closing brace.
 
 No silent loss. No orphan work.
 
-### With `catch`: handle the panic, suppress propagation
+### With `catch`: intercept the panic, suppress propagation
 
 ```q64
 scope {
@@ -470,18 +577,49 @@ scope {
     spawn { cache.warm() }
     do_other_work()
 } catch (e: Panic) {
-    log.error("subsystem startup failed: {e}")
+    log.error("subsystem startup failed: {e.fmt()}")
     bring_up_degraded_mode()
 }
 ```
 
 If any child panics, siblings are cancelled (same as above) but
-the panic is delivered to the `catch` block instead of re-raising.
-The scope completes normally after the `catch` returns.
+the panic's payload is delivered to the first matching `catch` arm
+instead of re-panicking. The scope completes normally after the
+`catch` returns.
 
 A `catch` block runs after every child task has finished (either
 normally or by cancellation). It cannot spawn new tasks into the
 just-closed scope; spawning in `catch` is `CONC030`.
+
+### Typed `catch` arms
+
+A `scope` may have one or more `catch` arms; each binds the
+payload by type. Arms are tried top-down, most-specific first.
+A `catch (e: Panic)` (or `catch (e: dyn Panic)` — equivalent
+syntax) is the catch-all.
+
+```q64
+scope {
+    spawn { fetch_with_timeout(ctx, env, url, 30.s) }
+} catch (e: Cancelled) {
+    env.out("shutting down cleanly")
+} catch (e: RuntimeDenied) {
+    log.warn("denied: {e.code} — {e.detail}")
+} catch (e: Panic) {
+    log.error("unexpected: {e.fmt()}")
+}
+```
+
+- A `catch (e: T)` arm matches when the panic payload's runtime
+  type fits `T` and `T` itself fits `Panic`. Non-`Panic` types in
+  catch position are `TYP307`.
+- Unmatched panics fall through to the next arm; an unmatched
+  panic with no further arms re-panics at the scope's closing
+  brace (per §"Without `catch`").
+- Re-panic from inside a `catch (e: …)` body uses `panic e` (per
+  `errors.md`) — there is no separate keyword.
+- Two arms with the same type, or a catch-all arm preceding a
+  more specific one, are `CONC033` ("unreachable catch arm").
 
 ### `Result`-returning tasks
 
@@ -631,6 +769,37 @@ Detailed in [`streams.md`](./streams.md).
 All concurrency diagnostics use the `CONC` prefix. Numbers stable,
 never reused. `CONC060`-`CONC099` reserved for expansion.
 
+## Grammar (informal)
+
+```
+ScopeStmt    := "scope" EffectAnnot? Block CatchArm*
+EffectAnnot  := "@" Ident ("+" "@" Ident)*
+CatchArm     := "catch" "(" Ident ":" TypeExpr ")" Block
+
+SpawnExpr    := "spawn" Block
+              | "spawn" "scope" EffectAnnot? Block       // sugar
+              | "spawn" "scope" EffectAnnot? Block CatchArm*
+
+ActorDecl    := Visibility? "actor" Ident ActorBody
+ActorBody    := "{" ActorItem* "}"
+ActorItem    := StateDecl | HandleDecl
+StateDecl    := "state" Ident ":" TypeExpr ("=" Expr)?
+HandleDecl   := "handle" Ident ("(" Params? ")")? ("->" TypeExpr)? Block
+
+ChannelExpr  := "channel" "<" TypeExpr ("," PolicyExpr)? ">"
+                  "(" ChanArgs ")"
+ChanArgs     := (RegionArg ",")? "policy" ":" PolicyExpr ("," "capacity" ":" Expr)?
+
+SelectStmt   := "select" "{" SelectArm ("," SelectArm)* ","? "}"
+SelectArm    := (Pattern "=")? Expr "->" (Block | Expr)
+```
+
+`ActorDecl` joins the top-level `Item` list in
+[`modules.md`](./modules.md) §Grammar; `pub effect` declarations
+introduced in [`effects.md`](./effects.md) do the same. The
+`EffectAnnot` form on `scope` reuses the same `@<ident>` syntax as
+function-level effect annotations from `effects.md`.
+
 | Code     | Short message                                | When                                                                              |
 |----------|----------------------------------------------|-----------------------------------------------------------------------------------|
 | `CONC010`| handle escapes its scope                     | A function returns a `Handle<T>` whose task was spawned in one of its scopes.     |
@@ -642,6 +811,8 @@ never reused. `CONC060`-`CONC099` reserved for expansion.
 | `CONC022`| outside access to actor `state`              | Code outside the actor reads or writes a `state` field directly.                  |
 | `CONC030`| `spawn` inside a `catch` block               | `catch` may not start new tasks into the just-closed scope.                       |
 | `CONC031`| `spawn` outside any `scope`                  | The top-level `spawn` requires an enclosing scope (or the implicit `main` scope). |
+| `CONC032`| `actor` handler not declared in face         | `c.tell(Msg)` / `c.ask(Msg)` where `Msg` is not a declared `handle`.              |
+| `CONC033`| unreachable `catch` arm                      | A later `catch` arm cannot be reached because an earlier arm subsumes it.         |
 | `CONC040`| `select` without timeout or cancel branch    | Lint (advisory). Suppressible with `@allow(CONC040)`.                             |
 | `CONC041`| `select` with no `ctx: Cancel` in scope      | Lint. The implicit cancel branch can't resolve; `select` may hang forever.         |
 | `CONC050`| channel policy required                      | `channel<T>(capacity: N)` with no `policy:` argument.                              |
@@ -663,7 +834,7 @@ fn fetch_with_retry(
     max_attempts: i64,
 ) -> Result<Response, Error> @cancel {
     for attempt in 0..max_attempts {
-        if ctx.cancelled() { raise Cancelled }
+        if ctx.cancelled() { panic Cancelled }
         match http.get(ctx, env.net, url) {
             Ok(r)  -> return Ok(r),
             Err(_) -> sleep(ctx, backoff(attempt)),
@@ -696,7 +867,7 @@ scope {
 
     spawn {
         loop {
-            let f = rx.recv(ctx)?
+            let f = rx.recv(ctx)
             encode_and_write(env, move f)
         }
     }

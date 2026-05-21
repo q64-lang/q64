@@ -174,6 +174,74 @@ A literal like `42.kHz` is parsed as `42` followed by the
 `kHz` suffix, not as a float — the suffix rule beats float
 interpretation when the trailing token is an identifier.
 
+## String literals
+
+String literals have three forms. All three produce values
+whose type fits `Display` and which can be borrowed as `str`
+(the static-string slice type) when the literal is a
+compile-time constant.
+
+### Plain interpolated form
+
+```q64
+let name = "Ada"
+let greeting: str = "Hello, {name}!"             // {expr} interpolates
+let escape:   str = "line one\nline two"          // \n, \t, \\, \", \0, \xHH, \u{…}
+```
+
+- Double-quoted; closes on the next unescaped `"`.
+- Interpolation: `{expr}` evaluates `expr` and concatenates its
+  `Display` rendering. Use `{{` and `}}` for literal braces.
+- Escape sequences match Rust / Swift: `\n`, `\t`, `\r`, `\0`,
+  `\\`, `\"`, `\xHH`, `\u{HHHH}`.
+
+### Raw form (`r"…"` and `r#"…"#`)
+
+```q64
+let path = r"C:\Users\Ada\Desktop"               // no escape processing
+let json = r#"{"id":42,"name":"Ada"}"#           // # delimiters allow embedded "
+let big  = r##"contains "# in body"##            // any number of # pairs
+```
+
+- Prefix `r` (lowercase). Optional `#…#` pads, matched on both
+  sides, let the body contain bare `"`.
+- No escape processing: every character between the delimiters
+  is literal.
+- No interpolation: a `{` is just a brace.
+
+### Typed-prefix form (`url"…"`, future: `re"…"`, `sql"…"`, …)
+
+```q64
+let endpoint = url"https://api.q64.dev/users/{id}"      // type: Url
+let host     = url"https://api.q64.dev"                 // also Url
+```
+
+- Syntax: `<ident>"<body>"` (or `<ident>r"…"` / `<ident>r#"…"#`
+  for raw bodies). The leading identifier names a `StringLit`
+  fit: a comptime function on a literal-handle type that lowers
+  the body to a concrete value at compile time.
+- Each typed prefix is a separate, named function provided by a
+  library (or the auto-prelude) — `url"…"` is provided by
+  `q64.net` and surfaces in the prelude when `q64.net` is
+  imported (`Env` brings it implicitly through `env.net`).
+- Body interpolation follows the same `{expr}` rule as the
+  plain form unless the typed prefix's `StringLit` fit declares
+  it as raw.
+- Unknown prefixes are `LEX020` ("unknown string-literal
+  prefix").
+
+Auto-prelude typed prefixes: none in v0; every typed prefix is
+opt-in via an import. `url"…"` becomes available wherever
+`q64.net.Url` is in scope.
+
+### Multi-line and trim rules
+
+A double-quoted literal may span multiple source lines; each
+embedded newline is preserved verbatim. For block-style literals
+with leading whitespace stripped, an opening `"""` (triple-quote)
+is reserved syntax — its exact trimming algorithm lands with a
+future revision, alongside the comptime spec.
+
 ## Arithmetic
 
 q64 performs **no implicit numeric conversion**. Every mix
@@ -227,11 +295,13 @@ width for arithmetic; assignment back to the narrower width
 goes through a fallible `from`:
 
 ```q64
-let a: u3 = 5
-let b: u3 = 6
-let c = a + b                       // c: u32 (auto-widen; 11 fits)
-let d: u3 = u3.from(c)?             // explicit narrow, fallible
-let e: u3 = u3.from_trapping(c)     // explicit narrow, traps on overflow
+fn narrow(c: u32) -> Result<u3, RangeError> {
+    let a: u3 = 5
+    let b: u3 = 6
+    let d: u3 = try u3.from(c)          // explicit narrow, fallible
+    let e: u3 = u3.from_trapping(c)     // explicit narrow, traps on overflow
+    Ok(d + e)
+}
 ```
 
 The widening target is the smallest standard width that contains
@@ -443,7 +513,7 @@ become localized and greppable.
 
 Type-system diagnostics in the `TYP040–TYP099` band (generics
 own `TYP100–TYP149`, faces own `TYP200–TYP219`, errors own
-`TYP300–TYP304`). Numbers are stable, never reused.
+`TYP300–TYP307`). Numbers are stable, never reused.
 
 | Code     | Short message                              | When                                                                              |
 |----------|--------------------------------------------|-----------------------------------------------------------------------------------|
@@ -456,7 +526,7 @@ own `TYP100–TYP149`, faces own `TYP200–TYP219`, errors own
 | `TYP046` | moved value used after move                | A binding consumed by a `move` argument is used after the call.                   |
 | `TYP047` | optional type not narrowed                 | A `T?` binding is used as `T` outside the narrowing rules above.                   |
 | `TYP048` | arb-width literal exceeds declared width   | `let x: u3 = 8` is out of `u3`'s 0..7 range.                                       |
-| `TYP049` | arb-width narrow can fail                  | Assigning a standard-width value to an arb-width binding without `from(…)?`.       |
+| `TYP049` | arb-width narrow can fail                  | Assigning a standard-width value to an arb-width binding without `try <T>.from(…)` propagation.       |
 | `TYP050` | `bool` used as integer                     | `let x: i32 = true` or similar.                                                    |
 | `TYP051` | integer used as `bool`                     | `if 1 { … }`.                                                                      |
 | `TYP060` | parameter mode keyword in call argument    | `process(in: x)`-style call; v0 uses bare arguments.                              |
@@ -541,13 +611,14 @@ struct OpCode {
     flags: u1,
 }
 
-fn dispatch(code: OpCode) {
+fn dispatch(code: OpCode) -> Result<(), RangeError> {
     let op:  u4 = code.op
     let reg: u3 = code.reg
 
     // Arithmetic auto-widens to u32; narrowing back is fallible.
-    let next_op: u4 = u4.from(op + 1)?     // wraps the increment, may fail
+    let next_op: u4 = try u4.from(op + 1)     // wraps the increment, may fail
     let _ = next_op
+    Ok(())
 }
 ```
 

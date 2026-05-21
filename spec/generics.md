@@ -153,11 +153,23 @@ In v0:
 - `bool`.
 - Arbitrary-width integers (`u3`, `u24`) — opt-in like everywhere
   else; useful for bit-width parameters.
+- **Blessed quantity types** — the unit-tagged scalars from
+  [`types.md` §"Numeric literals and suffixes"](./types.md): `Hz`,
+  `Seconds`, `Db`, `B` / `KB` / `MB` / `GB` / `TB`, `KiB` / `MiB`
+  / `GiB`, `rad`, `deg`. These are `f64`-or-`i64`-backed phantom-
+  tagged values; the const-generic equality used by
+  monomorphization is the equality on their underlying scalar.
+  Used at the type level for dataflow rates (`Signal<f32, R>`
+  where `R: Hz` — per [`streams.md`](./streams.md)) and similar
+  units-of-measure positions. The full unit lattice lands with
+  `units.md`; in the meantime, this fixed list is the contract.
 
 Not in v0 (deferred):
 
-- Floats (`f32`, `f64`) — equality is the blocking concern; no
-  ecosystem demand yet.
+- Unblessed floats (`f32`, `f64`) — equality is the blocking
+  concern outside the quantity types above; user code uses an
+  integer encoding when it needs a non-quantity float-shaped
+  const generic.
 - `str` and string-like — comptime allocator and equality semantics
   unsettled.
 - Custom value types (kinds, enums) — requires a `ConstParamTy`-like
@@ -170,9 +182,12 @@ parameters:
 
 ```q64
 pub struct Tile<const W: u32, const H: u32, const Pad: u32> {
-    inner: [[Pixel; W + 2 * Pad]; H + 2 * Pad],
+    inner: Tensor<Pixel, [W + 2 * Pad, H + 2 * Pad]>,
 }
 ```
+
+The same arithmetic works in fixed-size array shapes
+(`[T; N + 1]`) and in `Simd<T, const N: i64>` lane counts.
 
 Expressions allowed in v0: `+`, `-`, `*`, `/`, `%`, comparisons,
 and references to other const-generic parameters of the same item.
@@ -334,7 +349,7 @@ Explicitly out of scope for v0; tracked under "Open items deferred":
 All generics-related diagnostics use the `TYP` prefix. Numbers are
 stable, never reused. Codes `TYP100`–`TYP149` are reserved for
 generics; existing TYP allocations: numeric mismatch (`TYP041`),
-faces (`TYP200`–`TYP219`), errors (`TYP300`–`TYP304`).
+faces (`TYP200`–`TYP219`), errors (`TYP300`–`TYP307`).
 
 | Code     | Short message                                | When                                                                              |
 |----------|----------------------------------------------|-----------------------------------------------------------------------------------|

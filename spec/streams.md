@@ -328,7 +328,7 @@ and `Stream<T, R>`:
 ```q64
 @stage
 fn iir_filter(input: Signal<f32, R>) -> Signal<f32, R> {
-    let mut state: Signal<f32, R> = 0.0
+    var state: Signal<f32, R> = 0.0
     state = input + 0.95 * state.pre()      // ← state.pre() = previous tick's state
     state
 }
@@ -400,7 +400,7 @@ fn denoise<const R: Hz>(input: Signal<f32, R>) -> Signal<f32, R> { … }
 fn resample(input: Signal<f32, 48.kHz>) -> Signal<f32, 16.kHz> { … }
 
 @stage              // not @fuse — task boundary here
-fn whisper_asr<const R: Hz>(input: Signal<f32, R>, ai: AiEnv) -> Stream<Token, 10.Hz> { … }
+fn whisper_asr<const R: Hz>(input: Signal<f32, R>, ai: AiEnv) -> Stream<Token<WhisperVocab>, 10.Hz> { … }
 
 graph voice {
     let asr_in = mic_input(env) |> denoise |> resample      // fused into one task
@@ -489,24 +489,33 @@ stream.
 
 ## Error propagation
 
-A stage that returns `Result<T, E>` or calls `?` and gets `Err`
-**panics**. The panic propagates per
+A stage has no `Result` return type at the graph boundary —
+stages produce dataflow values, not `Result`-wrapped ones. A
+fallible operation inside a stage body that surfaces an `Err`
+**panics** with that `Err` value as the payload (any error type
+fitting `Error` also fits `Panic` via the auto-derived bridge in
+[`errors.md`](./errors.md)). The panic propagates per
 [`concurrency.md`](./concurrency.md) §"Panics across tasks":
 sibling stages in the same scope are cancelled; the graph's
-enclosing `scope { … } catch { … }` (if any) catches it; otherwise
-it re-raises at the scope's closing brace.
+enclosing `scope { … } catch { … }` (if any) intercepts it;
+otherwise it re-panics at the scope's closing brace.
 
 ```q64
 @stage
 fn decode(input: Stream<Bytes, R>) -> Stream<Frame, R> {
-    input.map(|b| Frame.parse(b)?)              // ← `?` panics on Err
+    input.map(|b| match Frame.parse(b) {
+        Ok(f)  -> f,
+        Err(e) -> panic e,                      // explicit: unwind with the parse error
+    })
 }
 
 scope {
     let g = graph audio { mic_input(env) |> decode |> play(env) }
     g.start(env).await()
+} catch (e: Cancelled) {
+    env.out("graph shut down cleanly")
 } catch (e: Panic) {
-    log.error("audio graph stopped: {e}")
+    log.error("audio graph stopped: {e.fmt()}")
     bring_up_silence()
 }
 ```
@@ -515,11 +524,14 @@ This is deliberate: q64 has one error-handling story (the
 `errors.md` `Result<T, E>` + `panic` model), and graphs reuse it.
 There is no second mechanism for "in-stream errors" (no
 `Stream<Result<T, E>>` convention at the language level, though
-user code can use it).
+user code can use it). Inside a stage body, fallible chains use
+the same `try` propagation as any other function (the `Err` value
+flows out of the stage only when an explicit `panic e` is
+issued).
 
 `Cancelled` (from `concurrency.md`'s cancellation model) is the
-expected way for a graph to shut down cleanly — it's not a panic
-in the error sense.
+expected way for a graph to shut down cleanly — caught as its own
+arm above so the application doesn't conflate cleanup with crash.
 
 ## Effects on stages
 
@@ -636,7 +648,7 @@ graph ui(env: Env) {
 ```q64
 @stage
 fn iir(input: Signal<f32, 48.kHz>, alpha: f32) -> Signal<f32, 48.kHz> {
-    let mut y: Signal<f32, 48.kHz> = 0.0
+    var y: Signal<f32, 48.kHz> = 0.0
     y = input + alpha * y.pre()              // one-tick feedback
     y
 }

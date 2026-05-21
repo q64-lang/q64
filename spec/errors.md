@@ -6,15 +6,22 @@ type, `try` for propagation, `panic` / `trap` for fatal bugs, and
 
 > **Status: near-final (v0).** Names settled (`try`, `panic`, `trap`);
 > `Error` face surface settled; `From`-based propagation conversion
-> settled. Some surface details (multi-error function patterns,
-> stack-trace policy) firm up with implementation.
+> settled; `panic` carries a typed payload via the `Panic` face. Some
+> surface details (multi-error function patterns, stack-trace policy)
+> firm up with implementation.
 
 ## Design goals
 
-1. **Errors are values, not control-flow.** No exceptions. Every
-   fallible function declares its failure mode in its return type.
+1. **Recoverable errors are values.** Every recoverable failure goes
+   through `Result<T, E>` — declared in the return type, propagated
+   with `try`, never silently unwound. Unrecoverable conditions
+   (broken invariants, cancellation, runtime denials) unwind via
+   `panic` with a typed payload; the unwind path is explicit, visible
+   at signatures (via `@no_panic`), and catchable only at `scope`
+   boundaries.
 2. **Propagation is explicit and greppable.** `grep '\btry\b'` finds
-   every fallible call site. No silent unwinding.
+   every fallible call site; `grep '\bpanic\b'` finds every typed
+   unwind. No silent unwinding, no hidden `?` postfix.
 3. **The audio thread is panic-free.** `@realtime` implies `@no_panic`.
    Recoverable errors use `Result`; unrecoverable invariants use `trap`
    (no allocation, no unwind).
@@ -32,9 +39,10 @@ type, `try` for propagation, `panic` / `trap` for fatal bugs, and
 | `Result<T, E>` | Tagged union — either `Ok(T)` or `Err(E)`.                            |
 | `Option<T>` / `T?` | Tagged union — either `some(T)` or `none`. Sugar: `T?` ≡ `Option<T>`. |
 | **try**     | Prefix keyword; propagates `Err` to the enclosing function.              |
-| **panic**   | Structured user-level abort. Unwinds the current task. Carries a string. |
-| **trap**    | Bare Wasm trap. Immediate halt, no message, no unwind, no allocation.    |
+| **panic**   | Structured user-level unwind with a typed payload (fits `Panic`).        |
+| **trap**    | Bare Wasm trap. Immediate halt, no payload, no unwind, no allocation.    |
 | **Error**   | Face that error types implement (`Display` + optional `source()`).        |
+| **Panic**   | Face that panic-payload types implement (`Display` + optional `code()`).  |
 
 ## Result and Option
 
@@ -96,10 +104,11 @@ enclosing function returns `Result<U, E2>`:
 `try` reads at the start of every fallible call site — the line begins
 with the visible intent. `?` is shorter but trails behind the value
 expression; readers (and agents) often miss it on long lines. The
-trailing-`?` form remains *valid Q64 syntax* only on `Option<T>`
-chaining (see "Question-mark chaining on `Option`," below) — never on
-`Result`. There is one canonical way to spell "propagate an error":
-`try`.
+trailing-`?` form is **forbidden** on `Result` — there is one canonical
+way to spell "propagate an error": `try`. Postfix `?` is reserved for
+the `?.` chain operator on `Option<T>` (see "Question-mark chaining on
+`Option`," below); a bare `?` on a `Result` value is `TYP305`
+("`?` on `Result`; use `try`").
 
 ### Variants deferred
 
@@ -119,24 +128,38 @@ can introduce `try?` and `try!` without breaking the v0 surface.
 
 Two ways to abort. Different costs, different use cases.
 
-### `panic(msg)` — structured abort, unwinds
+### `panic <payload>` — structured unwind with a typed payload
 
 ```q64
-panic("invariant broken: count went negative; got {count}")
+panic "invariant broken: count went negative; got {count}"   // string payload
+panic Cancelled                                              // unit-struct payload
+panic RuntimeDenied { code: "ENV030", detail: "Net.get(…)" } // struct payload
 ```
 
-- Carries a string message (interpolation supported per `example.md`).
-- Allocates the message in the current scope's arena.
-- Unwinds the current task: scoped allocators are torn down, sibling
-  tasks in the scope are cancelled.
-- Propagates to the parent scope; the program exits with code 1 if
-  uncaught at the top level (per `example.md` §"Exit codes").
+- `panic <expr>` unwinds the current task, attaching `expr` as the
+  payload. `expr`'s type must fit the `Panic` face (§"The `Panic`
+  face" below); the compiler enforces this at `panic` sites.
+- `panic "msg"` is sugar for `panic(PanicMessage("msg"))`, where
+  `PanicMessage` is an auto-prelude struct fitting `Panic`. String
+  interpolation works as in any string literal.
+- The payload allocates in the current scope's arena (per
+  `concurrency.md`). String panics allocate the message; typed
+  panics allocate the payload value.
+- Unwinding tears down scoped allocators, cancels sibling tasks in
+  the enclosing `scope`, and propagates to the parent scope. The
+  program exits with code 1 if uncaught at the top level (or with
+  the payload's `code()` mapped to an exit, when defined — per
+  `q64-cli.md`).
 - Carries an effect: `panic` requires the surrounding function to
   *not* be `@no_panic` (which would be `EFF100`).
+- Re-raising inside `catch`: `panic e` where `e: Panic` (or any type
+  fitting `Panic`) unwinds with the same payload — there is no
+  separate `raise` or `rethrow` keyword.
 
 Use when: an invariant the developer believed to hold has been
-violated, and there is no meaningful recovery path. "This should never
-happen, but if it does, here's what was happening."
+violated, a runtime check fires (`ENV030`, cancellation), or a
+non-recoverable condition needs to escape to the nearest `scope ...
+catch` — and no meaningful in-line recovery is possible.
 
 ### `trap()` — bare Wasm trap, no unwind
 
@@ -231,6 +254,116 @@ caused by: no such file or directory: ./config.json
   (`continuum-api.md` §"Capability disclosure surface") can in
   principle list "what error types this qube introduces" alongside
   declared effects.
+
+## The `Panic` face
+
+`panic` accepts a typed payload; any type fitting the `Panic` face is
+a legal payload.
+
+```q64
+pub face Panic : Display {
+    fn code(self) -> Option<str> { none }      // default: no diagnostic code
+}
+```
+
+- **Required**: implement `Display` (`fn fmt(self) -> str @pure`).
+- **Optional**: override `code()` to expose a stable string tag that
+  diagnostics, log formatters, and the runtime's exit-code mapping can
+  match on (e.g. `"ENV030"`, `"CONC012"`).
+- The face is in the auto-prelude.
+
+### Auto-prelude payload types
+
+The language ships three blessed `Panic`-fitting types:
+
+| Type            | Shape                                  | Where it comes from                                                      |
+|-----------------|----------------------------------------|--------------------------------------------------------------------------|
+| `PanicMessage`  | `struct PanicMessage(str)`             | `panic "string"` desugars to `panic(PanicMessage(s))`.                    |
+| `Cancelled`     | `struct Cancelled`                     | Cancellation observation in `@cancel` functions; the implicit `select` cancellation branch; cancel-aware channel ops. `code` returns `none`. |
+| `RuntimeDenied` | `struct RuntimeDenied { code: str, detail: str }` | Runtime-emitted denials such as `with_capabilities` (`ENV030`) and cancellation-marker conflicts. The `code` and `detail` fields back the values seen on `Panic`-bound catch variables. |
+
+All three are in the auto-prelude (no import required). User code may
+define additional `Panic`-fitting types freely:
+
+```q64
+pub struct ParseLimitExceeded {
+    file:  str,
+    bytes: i64,
+}
+
+pub fit ParseLimitExceeded : Display {
+    fn fmt(self) -> str { "parse limit exceeded in {self.file} ({self.bytes} bytes)" }
+}
+pub fit ParseLimitExceeded : Panic {
+    fn code(self) -> Option<str> { some("PARSE_LIMIT") }
+}
+```
+
+### Catch syntax
+
+A `scope { … } catch { … }` block binds the panic payload by type
+(per [`concurrency.md` §"Panics across tasks"](./concurrency.md)).
+Two forms:
+
+```q64
+scope { … } catch (e: Panic) { … }            // catch-all; e is dyn Panic
+scope { … } catch (e: Cancelled) { … }        // typed; only this payload type
+```
+
+- `catch (e: Panic)` binds `e: dyn Panic`. Inspect via `e.fmt()`,
+  `e.code()`, or by `match e { c: Cancelled -> …, _ -> … }`-style
+  type-test patterns (forthcoming, per `concurrency.md`'s "Open
+  items deferred").
+- `catch (e: T)` for a concrete `T: Panic` matches only when the
+  payload's runtime type is `T`; non-matching panics propagate to the
+  enclosing scope.
+- Multiple `catch` arms after one `scope` are supported (most
+  specific to least specific); see `concurrency.md`.
+- Re-raising: `panic e` inside `catch (e: …)` unwinds with the same
+  payload, propagating to the enclosing scope.
+
+### Why a face, not a sealed type
+
+- **User extensibility.** Library code defines its own panic payload
+  types — `ParseLimitExceeded`, `ShaderCompileError`, `AssertFailure`
+  — without modifying a closed enum.
+- **Greppable.** `grep '^pub fit .* : Panic'` enumerates every
+  panic-payload type in the qube, the same way `Error` is greppable.
+- **Capability disclosure.** A qube's set of declared `Panic` types
+  is part of its public surface; the registry surfaces it
+  alongside `effects.declared`.
+
+### The `Error → Panic` bridge
+
+Any type fitting `Error` auto-fits `Panic` via a compiler-synthesized
+blanket fit:
+
+```q64
+// Conceptual; the compiler generates this automatically for every Error type.
+pub fit T : Panic where T: Error {
+    fn fmt(self) -> str { Error.fmt(self) }
+    fn code(self) -> Option<str> { none }
+}
+```
+
+Consequences:
+
+- `panic e` is well-typed for any `e` whose type fits `Error` —
+  applications can convert a recoverable failure into a fatal one
+  without writing a separate `Panic` fit.
+- Stage error propagation (per [`streams.md` §"Error
+  propagation"](./streams.md)) and `main` Form 1 (per §"`main`
+  signature" in [`env.md`](./env.md)) rely on this bridge.
+- The bridge is a blanket fit, **not** a conversion: the panic
+  payload's runtime type is the original error type. A `catch (e:
+  IoError)` arm matches the original `IoError`; a `catch (e: Panic)`
+  arm sees it through the `Panic` face.
+- The bridge can be **shadowed** by an explicit `fit T : Panic { … }`
+  on a specific error type when the default `Error.fmt` /
+  `none`-coded behavior isn't right; this is the conventional
+  override path. Two competing fits (the bridge and an explicit
+  one) resolve in favor of the explicit fit (per `faces.md`'s
+  coherence rules).
 
 ## Multi-error functions
 
@@ -358,7 +491,10 @@ effect-system concerns under `EFF*`.
 | `TYP302` | non-exhaustive match on `Result`             | A `match` over `Result` doesn't handle both `Ok` and `Err`.                     |
 | `TYP303` | `?.` on non-`Option` value                   | `?.` chain operator used on a value whose type is not `Option<T>`.              |
 | `TYP304` | mismatched arms in destructure form          | `let (x, y) = expr` where `expr` is not a `Result<_, _>`.                       |
-| `EFF100` | `panic` in `@no_panic` function              | `panic(...)` called from a function declared (or transitively required) `@no_panic`. |
+| `TYP305` | `?` postfix on `Result`                      | Bare `?` used on a `Result` value; use the `try` prefix instead.                |
+| `TYP306` | `panic` payload does not fit `Panic`         | The value passed to `panic` is not a `str` and its type does not fit `Panic`.   |
+| `TYP307` | `catch` type is not `Panic`-fitting          | `catch (e: T)` where `T` is neither `Panic` itself nor a type fitting `Panic`.  |
+| `EFF100` | `panic` in `@no_panic` function              | `panic …` invoked from a function declared (or transitively required) `@no_panic`. |
 | `EFF101` | `trap` in `@no_trap` function                | `trap()` called from a function declared `@no_trap`.                            |
 | `EFF102` | `@realtime` function calls fallible operation that allocates on error | `@realtime` cannot construct heap-allocated `Err` values. |
 | `EFF103` | `dyn Error` in `@no_alloc` path              | Boxing an error allocates; rejected on `@no_alloc` paths.                       |
@@ -367,18 +503,22 @@ effect-system concerns under `EFF*`.
 
 The error-handling auto-prelude (no import needed):
 
-| Name         | Kind   | Provides                                         |
-|--------------|--------|--------------------------------------------------|
-| `Result`     | enum   | `Ok(T)`, `Err(E)`                                |
-| `Option`     | enum   | `some(T)`, `none`                                |
-| `T?`         | sugar  | `Option<T>`                                      |
-| `try`        | keyword| propagation                                      |
-| `panic`      | fn     | structured abort                                 |
-| `trap`       | fn     | bare wasm trap                                   |
-| `Error`      | face   | the error contract                               |
-| `From`       | face   | error conversion target (already in prelude)     |
-| `Into`       | face   | error conversion source (already in prelude)     |
-| `RangeError` | struct | error returned by `try_into` casts (see [`types.md` §Casts](./types.md)) when a numeric value does not fit the target width. One field: `value: i64`. Fits `Error`, `Display`, `Debug`. |
+| Name           | Kind   | Provides                                         |
+|----------------|--------|--------------------------------------------------|
+| `Result`       | enum   | `Ok(T)`, `Err(E)`                                |
+| `Option`       | enum   | `some(T)`, `none`                                |
+| `T?`           | sugar  | `Option<T>`                                      |
+| `try`          | keyword| `Result` propagation                             |
+| `panic`        | keyword| typed-payload structured unwind                  |
+| `trap`         | fn     | bare wasm trap                                   |
+| `Error`        | face   | the recoverable-error contract                   |
+| `Panic`        | face   | the panic-payload contract                       |
+| `PanicMessage` | struct | wraps a `str` payload for `panic "msg"` sugar    |
+| `Cancelled`    | struct | unit payload signalling cooperative cancellation (per `concurrency.md`); `code()` returns `none` (cancellation is a runtime control-flow event, not a diagnostic) |
+| `RuntimeDenied`| struct | payload for runtime denials (e.g. `with_capabilities` `ENV030`); fields `code: str`, `detail: str` |
+| `From`         | face   | error conversion target (already in prelude)     |
+| `Into`         | face   | error conversion source (already in prelude)     |
+| `RangeError`   | struct | error returned by `try_into` casts (see [`types.md` §Casts](./types.md)) when a numeric value does not fit the target width. One field: `value: i64`. Fits `Error`, `Display`, `Debug`. |
 
 ## Examples
 
@@ -456,9 +596,14 @@ fn greet(env: Env, user: User?) {
 
 - **`try?` and `try!` shortcuts** — pending real-world evidence that
   the longhand match / `unwrap_or_panic` is too verbose.
-- **Stack traces in `panic`** — currently the message string is the
-  only payload. A future revision may attach a captured backtrace
-  (cost: ~few kB per panic; opt-in via `@traced_panic`).
+- **Stack traces in `panic`** — today the payload is the only carried
+  state. A future revision may attach a captured backtrace alongside
+  the payload (cost: ~few kB per panic; opt-in via `@traced_panic`).
+- **Type-test patterns in `catch (e: Panic)` arms** — destructuring a
+  `dyn Panic` by concrete type inside one catch body. Currently
+  expressible by an outer `catch (e: Panic)` plus a sequence of
+  typed catches; sugar for combined arms is deferred per
+  `concurrency.md`.
 - **Automatic `From` derivation between sub-enums** — manually
   writing `fit ReadError : From<IoError>` is repetitive. A
   `@derive(From)` for enum wrappers may land later.
@@ -470,7 +615,8 @@ fn greet(env: Env, user: User?) {
 
 - [`diagnostics.md`](./diagnostics.md) — toolchain-side diagnostic
   envelope (different from user-program `Result<T, E>`).
-- [`faces.md`](./faces.md) — `Error`, `From`, `Into`, `Display` faces.
+- [`faces.md`](./faces.md) — `Error`, `Panic`, `From`, `Into`,
+  `Display` faces.
 - [`modules.md`](./modules.md) — auto-prelude listing including these
   new entries.
 - [`q64-cli.md`](./q64-cli.md) — `q64 explain <code>` to look up any

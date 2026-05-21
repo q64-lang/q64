@@ -68,7 +68,7 @@ change.
 | `@uncancellable`  | assert      | Body completes without observing cancellation, even if `ctx` is signalled. See §`@cancel` and `@uncancellable`. |
 | `@io`             | capability  | Performs I/O (filesystem, stdout, stderr, devices). Does **not** imply `@network`.            |
 | `@network`        | capability  | Performs network operations. Implies `@io`.                                                   |
-| `@cancel`         | observation | Function observes `ctx.cancelled()` and may raise `Cancelled`. Requires a `ctx: Cancel` parameter. See §`@cancel` and `@uncancellable`. |
+| `@cancel`         | observation | Function observes `ctx.cancelled()` and may unwind via `panic Cancelled`. Requires a `ctx: Cancel` parameter. See §`@cancel` and `@uncancellable`. |
 | `@send`           | type-marker | A value's ownership can transfer across thread boundaries. Derived, not declared. See §`@send`. |
 
 Notes:
@@ -312,8 +312,8 @@ the other declares that a function cannot be interrupted by it.
 ### `@cancel`
 
 A function marked `@cancel` reads `ctx.cancelled()` or calls
-into another `@cancel` function, and may `raise Cancelled` as a
-result. The marker is **required** when:
+into another `@cancel` function, and may unwind via
+`panic Cancelled` as a result. The marker is **required** when:
 
 - The function calls `ctx.cancelled()` directly.
 - The function awaits a channel `recv` / `send` on a
@@ -330,11 +330,16 @@ a `@cancel` function picks up `@cancel` unless it asserts
 `@uncancellable`.
 
 ```q64
-fn fetch(ctx: Cancel, env: Env, url: Url) -> Response @cancel {
-    if ctx.cancelled() { raise Cancelled }
-    http.get(ctx, env.net, url)?
+fn fetch(ctx: Cancel, env: Env, url: Url) -> Result<Response, IoError> @cancel {
+    if ctx.cancelled() { panic Cancelled }
+    try http.get(ctx, env.net, url)
 }
 ```
+
+`panic Cancelled` is **not** a recoverable error; it unwinds
+through the function and any enclosing `scope` per
+[`errors.md`](./errors.md). The function's `Result<_, _>` return
+type covers ordinary I/O failures only.
 
 ### `@uncancellable`
 
