@@ -21,6 +21,7 @@ suite.
 | [`faces.md`](./faces.md)                                 | Polymorphism: faces (interfaces) and fits (implementations)       |
 | [`errors.md`](./errors.md)                               | `Result<T, E>`, `try`, `panic` / `trap`, `Option<T>`, `Error` face |
 | [`effects.md`](./effects.md)                             | Effect markers, implication graph, propagation, capability disclosure |
+| [`generics.md`](./generics.md)                           | Type / const / region / effect parameters, bounds, where, defaults, inference |
 
 ## Scope (forthcoming)
 

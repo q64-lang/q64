@@ -274,23 +274,27 @@ When a bound is verbose or involves associated types, the `where`
 clause keeps the parameter list readable:
 
 ```q64
-pub fn collect<I, C>
-    where I: Iterator,
-          C: Collection<I.Item, _>,
-    (it: I) -> C { ... }
+pub fn collect<I, C>(it: I) -> C
+where
+    I: Iterator,
+    C: Collection<I.Item, _>,
+{ ... }
 ```
 
 The `where` clause is the only place to express bounds on associated
 types and bounds with effect or region parameters that would clutter
-the inline form.
+the inline form. Placement, grammar, and the full set of allowed
+forms are specified in [`generics.md`](./generics.md) §"The `where`
+clause."
 
 ### Bounds on multi-parameter faces
 
 ```q64
-pub fn pipeline<A, B, C>
-    where Convert<A, B>,
-          Convert<B, C>,
-    (x: A) -> C {
+pub fn pipeline<A, B, C>(x: A) -> C
+where
+    Convert<A, B>,
+    Convert<B, C>,
+{
     let mid = Convert.convert(x)
     Convert.convert(mid)
 }
@@ -622,17 +626,15 @@ MethodDecl  := "fn" Ident "(" Params? ")" ("->" TypeExpr)? EffectSpec? MethodBod
 
 FaceRef     := Ident GenericArgs?     // e.g. `Eq`, `Filter<PCM<f32>, @realtime>`, `Convert<Rgb, Hex>`
 Bound       := Ident ":" FaceRef ("+" FaceRef)*
-WhereClause := "where" Bound ("," Bound)*
 
 DynType     := "dyn" FaceRef
-
-GenericParams := "<" GenericParam ("," GenericParam)* ">"
-GenericParam  := Ident (":" BoundList)?           // type
-              | "@" Ident                          // effect variable
-              | Ident ":" "Region"                 // region
-
-GenericArgs   := "<" TypeExpr ("," TypeExpr)* ">"    // application site
 ```
+
+The `GenericParams`, `GenericArgs`, and `WhereClause` non-terminals
+are defined in [`generics.md`](./generics.md) §Grammar. Faces use
+them unchanged: a face declares parameters of all four kinds (type,
+const, region, effect), bounds compose with `+`, and the `where`
+clause sits after the signature and before the body.
 
 Note: `GenericParams` (declaration) and `GenericArgs` (application) use
 the same `< >` sigil. Bare `[ ]` is reserved for array literals and
