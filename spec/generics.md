@@ -98,10 +98,8 @@ The body's opening `{` follows the (possibly multi-line) `where`
 block. Each comma-separated bound may stand on its own line; a
 trailing comma on the last bound is permitted.
 
-The grammar in [`faces.md`](./faces.md) §Grammar that placed the
-where clause **between** the generic parameters and the parameter
-list is superseded by this spec; the examples in faces.md are
-amended to the new placement.
+This is the canonical placement; [`faces.md`](./faces.md)'s grammar
+and examples reference the rule defined here.
 
 ### When to use `where` vs inline
 
@@ -288,8 +286,8 @@ implications:
   function is `@realtime` at every monomorphized site.
 - **Binary size scales with instantiations.** Per `faces.md`, `qube
   build` warns when a single generic exceeds N instantiations
-  (default threshold N=64); `@code_size` annotation routes specific
-  functions to dyn dispatch.
+  (default threshold N=64); for size-sensitive call sites, rewriting
+  to `dyn Face` is the v0 escape hatch.
 - **Identical post-monomorphization bodies are deduped** by the
   linker, per `faces.md` open items.
 
@@ -455,10 +453,8 @@ FnSignature   := "fn" Ident GenericParams?
 ```
 
 The `where` clause appears **after** the signature (return type and
-effect spec), **before** the body block. This supersedes the
-example shown in [`faces.md`](./faces.md) §Grammar, which placed
-the where clause between generic params and value params; faces.md
-is amended to match.
+effect spec), **before** the body block. [`faces.md`](./faces.md)'s
+grammar references this placement for `MethodSig` / `MethodDecl`.
 
 ## Open items deferred
 
@@ -482,7 +478,7 @@ is amended to match.
   declarations, propagation through monomorphization.
 - [`modules.md`](./modules.md) — generic items follow the standard
   visibility and re-export rules; nothing generics-specific.
-- [`types.md`](./types.md) *(forthcoming)* — the numeric tower and
-  primitive type set that const-generic parameters draw from.
+- [`types.md`](./types.md) — the numeric tower and primitive type
+  set that const-generic parameters draw from.
 - [`diagnostics.md`](./diagnostics.md) — envelope format for every
   `TYP1xx` / `PAR040` error listed above.

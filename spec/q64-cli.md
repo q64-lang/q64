@@ -25,7 +25,7 @@ subcommand, it is treated as `q64 run <file>`.
 |-------------------------|---------------------------------------------------------------|
 | `q64 run <file>`        | Compile to wasm in memory and run                             |
 | `q64 build <file>`      | Compile to wasm; emit `<file>.wasm` (or `--out` path)         |
-| `q64 fmt [path]`        | Format source in-place (file or directory)                    |
+| `q64 fmt [path]`        | Format source in-place (file or directory); add `--stdout` to print to stdout instead and read from stdin when `path` is omitted |
 | `q64 lsp`               | Run the language server (stdin/stdout LSP)                    |
 | `q64 show <kind> <arg>` | Introspection (see below)                                     |
 | `q64 explain <code>`    | Print structured documentation for a diagnostic code          |
@@ -45,6 +45,14 @@ subcommand, it is treated as `q64 run <file>`.
 
 Each form takes additional `--qube <path>` or `--module <name>=<path>`
 flags as needed (see "Global options").
+
+### `q64 fmt` options
+
+| Flag        | Meaning                                                                          |
+|-------------|----------------------------------------------------------------------------------|
+| `--stdout`  | Read source from stdin (when `path` is omitted) or from `path`, write the formatted result to stdout. Leaves the input file untouched. Used by the MCP server and editors that own the file's on-disk state. |
+| `--lint`    | Report formatting issues as diagnostics on stderr; do not modify files.          |
+| `--check`   | Exit `64` if any file would be reformatted; do not modify files.                 |
 
 ## Global options
 

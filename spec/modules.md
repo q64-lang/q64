@@ -119,9 +119,8 @@ import "../../../other-qube/src/foo.q"     // ❌ NAM002 (path escapes qube)
 
 Wildcards are forbidden in every form. Every identifier visible in a
 file is either declared in that file, named at an import, or part of
-the language's auto-prelude (`Simd`, `Tensor`, `DynTensor`, `Result`,
-`Option`, and the numeric primitives). `grep <Name>` always finds the
-import line.
+the language's auto-prelude (see §"The auto-prelude" below).
+`grep <Name>` always finds the import line.
 
 ### Collisions
 
@@ -174,11 +173,31 @@ enumerates a file's contributions to the public surface.
 
 ### Field visibility on structs
 
-Out of scope for this spec. Until the [faces/types spec](./faces.md)
-elaborates, struct fields inherit the struct's visibility — fields of a
-`pub struct` are publicly readable. Per-field visibility (`pub` on each
-field, or an explicit `private` marker) is a future addition that will
-not break existing code.
+Out of scope for this spec. Struct fields inherit the struct's
+visibility in v0: fields of a `pub struct` are publicly readable.
+Per-field visibility (`pub` on each field, or an explicit `private`
+marker) is deferred to a future per-field-visibility spec and will not
+break existing code when it lands.
+
+## The auto-prelude
+
+A small set of names is in scope in every file without an `import`
+line. Each category is owned by the spec that introduces it; this
+section indexes them.
+
+| Category               | Names                                                          | Owning spec                                          |
+|------------------------|----------------------------------------------------------------|------------------------------------------------------|
+| Numeric primitives     | `i8`–`i64`, `u8`–`u64`, `f16`/`f32`/`f64`, `bool`              | [`types.md`](./types.md) §"The numeric tower"        |
+| Compound numerics      | `Simd`, `Tensor`, `DynTensor`                                  | [`types.md`](./types.md) §"SIMD and Tensor as language types" |
+| Optionality / errors   | `Option`, `Result`, `T?`, `try`, `panic`, `trap`               | [`errors.md`](./errors.md) §"Auto-prelude additions" |
+| Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) |
+| Regions                | `Region`, `Arena`, `Pool`, `Stack`, `FreeList`, `Managed`, `Interned` | [`memory.md`](./memory.md) §"Region kinds"     |
+| Capabilities           | `Env`, `Net`, `Fs`, `Audio`, `Midi`, `AiEnv`, `Ui`, `Clock`, `Rng`, `Stdout`, `Stderr`, `ExitFn`, `EnvVars`, `with_capabilities` | [`env.md`](./env.md) §"`Env` and its fields" |
+| Concurrency primitives | `scope`, `spawn`, `channel`, `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`, `timeout`, `sleep` | [`concurrency.md`](./concurrency.md)            |
+| Stream primitives      | `Signal`, `Event`, `Stream`, `SharedSignal`, `@stage`, `graph`, `pre`, `\|>`, `changes`, `hold`, `fold`, `sample` | [`streams.md`](./streams.md)                |
+
+The prelude is curated; user code cannot add to it. New blessed names
+land via spec amendment in the owning file and are mirrored here.
 
 ## Re-exports — `pub use`
 

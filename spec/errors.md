@@ -367,17 +367,18 @@ effect-system concerns under `EFF*`.
 
 The error-handling auto-prelude (no import needed):
 
-| Name      | Kind   | Provides                                         |
-|-----------|--------|--------------------------------------------------|
-| `Result`  | enum   | `Ok(T)`, `Err(E)`                                |
-| `Option`  | enum   | `some(T)`, `none`                                |
-| `T?`      | sugar  | `Option<T>`                                      |
-| `try`     | keyword| propagation                                      |
-| `panic`   | fn     | structured abort                                 |
-| `trap`    | fn     | bare wasm trap                                   |
-| `Error`   | face   | the error contract                               |
-| `From`    | face   | error conversion target (already in prelude)     |
-| `Into`    | face   | error conversion source (already in prelude)     |
+| Name         | Kind   | Provides                                         |
+|--------------|--------|--------------------------------------------------|
+| `Result`     | enum   | `Ok(T)`, `Err(E)`                                |
+| `Option`     | enum   | `some(T)`, `none`                                |
+| `T?`         | sugar  | `Option<T>`                                      |
+| `try`        | keyword| propagation                                      |
+| `panic`      | fn     | structured abort                                 |
+| `trap`       | fn     | bare wasm trap                                   |
+| `Error`      | face   | the error contract                               |
+| `From`       | face   | error conversion target (already in prelude)     |
+| `Into`       | face   | error conversion source (already in prelude)     |
+| `RangeError` | struct | error returned by `try_into` casts (see [`types.md` §Casts](./types.md)) when a numeric value does not fit the target width. One field: `value: i64`. Fits `Error`, `Display`, `Debug`. |
 
 ## Examples
 

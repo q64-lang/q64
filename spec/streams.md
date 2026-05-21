@@ -533,7 +533,7 @@ stages. The compiler enforces them across the graph:
 | `@pure`        | No mutation, no observable side effects. Composes safely.                     |
 | `@no_suspend`  | The stage cannot yield mid-body.                                              |
 | `@send`        | The stage's outputs may cross thread boundaries.                              |
-| `@cancel`      | The stage observes cancellation. Stages running in a `graph` always have `ctx`. |
+| `@cancel`      | The stage observes cancellation. Declared explicitly: a stage that wants to observe cancellation lists `ctx: Cancel` in its signature (acquiring `@cancel` per [`effects.md`](./effects.md)). Stages without `ctx` cannot call `ctx.cancelled()`; the graph still shuts them down at scope close. |
 
 A `@realtime` graph (all stages `@realtime`) pins to a real-time-
 capable thread (audio worklet on browser, low-latency pool on
@@ -768,7 +768,8 @@ All codes use the envelope from [`diagnostics.md`](./diagnostics.md).
 - [`types.md`](./types.md) — units of measure (`48.kHz`, `60.Hz`,
   `1.MB.per.s`) used as rate values.
 - [`faces.md`](./faces.md) — `Stage`, `Source`, `Sink`,
-  `RateAware` as blessed faces (forthcoming additions there).
+  `RateAware` as blessed faces (additions tracked in faces.md's
+  "Open items deferred").
 - [`errors.md`](./errors.md) — `Result<T, E>` and `panic` semantics
   that stage error propagation reuses.
 - [`modules.md`](./modules.md) — `Signal`, `Event`, `Stream`,

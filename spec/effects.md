@@ -108,6 +108,11 @@ Implications fan out by transitive closure: `@pure` implies
 `@pure` may not `panic`, may not allocate, may not suspend, may not
 `trap`, and may not perform I/O.
 
+The runtime semantics of `panic` and `trap` (allocation, unwind,
+how they propagate through scopes) are defined in
+[`errors.md` §"`panic` and `trap`"](./errors.md); this spec only
+governs which functions are allowed to invoke them.
+
 A function whose declared effect set is internally contradictory
 (`@realtime + @io`) is `EFF120`.
 
@@ -363,6 +368,19 @@ effects declared").
 - `@uncancellable` inside `@realtime` is flagged as redundant
   but not erroneous (`CONC013` in concurrency.md): the
   `@realtime` already implies it.
+
+#### What "no arbitrary-point observation" means
+
+`@uncancellable` (and therefore `@realtime`) forbids the body
+from *directly* calling `@cancel` functions or
+`ctx.cancelled()` mid-computation. It does **not** forbid the
+implicit cancellation branch of a `select { … }` (per
+[`concurrency.md` §"Implicit cancellation branch"](./concurrency.md)):
+a `select` is itself a natural yield boundary, and observing
+cancellation at that boundary is the audio thread's normal way
+to shut down cleanly. Concretely, an `@realtime` scope's
+`loop { select { … } }` pattern is well-formed; a `@realtime`
+body that calls `ctx.cancelled()` between two `recv`s is `EFF110`.
 
 ### Effect set in the call graph
 
