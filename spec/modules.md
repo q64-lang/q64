@@ -32,9 +32,9 @@ These goals push every decision toward "explicit, named, local."
 |-----------------------------------|-----------------------|
 | `<qube>/src/lib.q`                | `<qube-name>`         |
 | `<qube>/src/main.q`               | `<qube-name>` (application qubes; no library entry) |
-| `<qube>/src/<name>.q`             | `<qube-name>.<name>`  |
-| `<qube>/src/<dir>/lib.q`          | `<qube-name>.<dir>`   |
-| `<qube>/src/<dir>/<name>.q`       | `<qube-name>.<dir>.<name>` |
+| `<qube>/src/<name>.q`             | `<qube-name><name>`  |
+| `<qube>/src/<dir>/lib.q`          | `<qube-name><dir>`   |
+| `<qube>/src/<dir>/<name>.q`       | `<qube-name><dir><name>` |
 
 Folder = sub-namespace. `lib.q` inside a folder is the entry point when
 the folder is imported by name. A folder without a `lib.q` is still
@@ -142,16 +142,16 @@ import "./b.q" as b                        // ✓ refer to b.Frame
 Every item declaration carries an optional `pub` prefix:
 
 ```q64
-pub fn dot.<T>(a: Vec3.<T>, b: Vec3.<T>): T { ... }
-pub struct Vec3.<T> { x: T, y: T, z: T }
+pub fn dot<T>(a: Vec3<T>, b: Vec3<T>) -> T { ... }
+pub struct Vec3<T> { x: T, y: T, z: T }
 pub enum Color { Rgb, Hsv, Lab }
 pub type Hz = f64
-pub face Eq.<T> { ... }
-pub fit Eq for Vec3.<f32> { ... }
+pub face Eq<T> { ... }
+pub fit Eq for Vec3<f32> { ... }
 pub const PI: f64 = 3.14159
 pub use Vec3 from "./vec.q"
 
-fn helper(): i64 { ... }                   // file-private (no pub)
+fn helper() -> i64 { ... }                   // file-private (no pub)
 ```
 
 - An item without `pub` is **file-private**. It is not visible to
@@ -208,7 +208,7 @@ libraries, `src/main.q` for applications).
 
 ```q64
 // stdlib/math/src/vec.q
-pub fn private_to_qube(): i64 { ... }      // pub, but never re-exported
+pub fn private_to_qube() -> i64 { ... }      // pub, but never re-exported
 
 // stdlib/math/src/lib.q
 pub use Vec3, dot, cross from "./vec.q"    // these three escape
@@ -313,13 +313,13 @@ stdlib/math/
 
 import "./_scalar.q"
 
-pub struct Vec3.<T> { x: T, y: T, z: T }
+pub struct Vec3<T> { x: T, y: T, z: T }
 
-pub fn dot.<T>(a: Vec3.<T>, b: Vec3.<T>): T {
+pub fn dot<T>(a: Vec3<T>, b: Vec3<T>) -> T {
     a.x*b.x + a.y*b.y + a.z*b.z
 }
 
-fn normalize_in_place(v: ref Vec3.<f32>) { ... }   // file-private
+fn normalize_in_place(v: ref Vec3<f32>) { ... }   // file-private
 ```
 
 ```q64
@@ -337,17 +337,17 @@ pub use Quat, slerp from "./quat.q"
 ```q64
 // Namespace
 import q64.math
-let v: math.Vec3.<f32> = ...
+let v: math.Vec3<f32> = ...
 let d = math.dot(v, v)
 
 // Selective
 import q64.math.{Vec3, dot}
-let v: Vec3.<f32> = ...
+let v: Vec3<f32> = ...
 let d = dot(v, v)
 
 // Alias
 import q64.math as m
-let v: m.Vec3.<f32> = ...
+let v: m.Vec3<f32> = ...
 let d = m.dot(v, v)
 ```
 

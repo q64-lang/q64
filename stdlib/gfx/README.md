@@ -6,11 +6,11 @@ Graphics primitives and GPU bridging.
 
 ## Surface (planned)
 
-- **Color types** — `Rgb.<Space, Repr>`, `Hsv.<Space, Repr>`, `Lab.<Repr>`,
-  `Rgba.<Space, Repr, Alpha>`, parameterized by color space (sRGB / Linear /
+- **Color types** — `Rgb<Space, Repr>`, `Hsv<Space, Repr>`, `Lab<Repr>`,
+  `Rgba<Space, Repr, Alpha>`, parameterized by color space (sRGB / Linear /
   Display P3 / Rec.709 / Rec.2020 / ACEScg), representation (`u8`, `u10`,
   `f16`, `f32`), and alpha convention (Straight / Premul).
-- **Images** — `Image.<Pixel>` with stride and bounds in the type.
+- **Images** — `Image<Pixel>` with stride and bounds in the type.
 - **GPU bridging** — WebGPU (in browser), Vulkan/Metal/D3D12 (native) via
   the runtime adapter. The user-facing surface is host-agnostic; the
   adapter picks the backing API.

@@ -10,11 +10,11 @@ inverse kinematics.
 - **`Transform`** — rigid (rotation + translation). **`AffineTransform`** —
   adds non-uniform scale. Kept separate so rigid-bone code doesn't branch on
   whether scale is present.
-- **`Keyframe.<T>`** — time + value.
-- **`Curve.<T>`** — ordered keyframes + interpolation policy. The interpolation
+- **`Keyframe<T>`** — time + value.
+- **`Curve<T>`** — ordered keyframes + interpolation policy. The interpolation
   algorithm comes from `T`'s algebra (slerp for `Quat`, lerp for `Vec3`, etc).
 - **`Skeleton`** — rooted hierarchy of `Bone`.
-- **`AnimClip`** — named tracks of `Curve.<Transform>`.
+- **`AnimClip`** — named tracks of `Curve<Transform>`.
 - **`pose_skeleton(skel, clip, t)`** — produces the skinning matrix array.
 - **IK solvers** — two-bone, FABRIK.
 

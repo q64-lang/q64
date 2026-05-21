@@ -12,7 +12,7 @@ The q64 standard library. A qube workspace; one qube per top-level namespace.
 |-----------------------------------------------|------------------------------------------------------------------------------------|
 | [`math/`](./math)   → `q64.math`              | `Vec`, `Mat`, `Quat`; linear algebra; FFT                                          |
 | [`anim/`](./anim)   → `q64.anim`              | `Transform`, `Keyframe`, `Curve`, `Bone`, skinning, IK                             |
-| [`ai/`](./ai)       → `q64.ai`                | `Vocab`, `Token.<V, Repr>`, `Model.<InV, OutV>`, sampling, decoding                  |
+| [`ai/`](./ai)       → `q64.ai`                | `Vocab`, `Token<V, Repr>`, `Model<InV, OutV>`, sampling, decoding                  |
 | [`net/`](./net)     → `q64.net`               | `Url`, `Net`, `Request`, `Response`, HTTP, WebSocket                               |
 | [`audio/`](./audio) → `q64.audio`             | PCM streams, audio I/O, DSP                                                        |
 | [`gfx/`](./gfx)     → `q64.gfx`               | Graphics types, GPU bridging                                                       |
