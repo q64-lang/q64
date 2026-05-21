@@ -28,3 +28,5 @@ dist/
 !stdlib/**/*.wasm
 *.o
 *.obj
+/q64/zig-out/
+/q64/.zig-cache/
