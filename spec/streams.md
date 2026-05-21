@@ -245,8 +245,10 @@ the dataflow world. The compiler treats them as graph roots.
 
 ## `graph` declaration
 
-A `graph` declares a topology of connected stages. First-class
-value; can be started, stopped, inspected:
+A `graph` declares a topology of connected stages. The
+declaration produces a value of type `Graph<Out>`, where `Out`
+is the body's return type (`()` for a sink-terminated graph,
+otherwise the type produced at the last `|>`):
 
 ```q64
 graph voice_pipeline(env: Env) {
@@ -258,6 +260,7 @@ graph voice_pipeline(env: Env) {
     let synthed    = response |> tts(env.ai)
     let _          = synthed |> play(env)                 // sink
 }
+// voice_pipeline : Graph<()>
 
 scope {
     let h: Handle<()> = voice_pipeline.start(env)
@@ -266,14 +269,38 @@ scope {
 }
 ```
 
+### The `Graph<Out>` type
+
+```q64
+pub face Graph<Out> {
+    fn start    (self, env: Env) -> Handle<Out>            // launches the graph as a task; returns its handle
+    fn stop     (self: ref Self)                           // cancels every stage in the graph
+    fn snapshot (self) -> GraphSnapshot                    // static topology, fused groups, rates, effects
+    fn output   (self) -> Out where Out != ()              // queryable output side (only for non-sink graphs)
+    fn completion (self) -> Future<Result<(), Error>>      // resolves when all sources are exhausted, or with the first error
+}
+```
+
+The `Graph<Out>` face is auto-prelude (per
+[`modules.md`](./modules.md) §"Stream primitives"). A `graph`
+declaration synthesizes one fit of `Graph<Out>` per declaration;
+user code does not write `fit X : Graph<…>` by hand.
+
+For graphs with `Out = ()` (sink-terminated), `output` is absent
+(`STR064`). For graphs whose body returns a dataflow value (e.g.
+`graph chat(env, prompt: str) -> Stream<str, 20.Hz>`),
+`output()` returns that value's runtime handle (a `Stream`,
+`Signal`, or `Event` reader) and `completion()` resolves when
+the underlying sources have drained.
+
 Properties:
 
 - A `graph` body is a sequence of `let` bindings; each binding's
   RHS is a single stage call or a `|>` pipeline.
 - The compiler analyzes the whole topology: rate consistency,
   fusion candidates, effect propagation, resource bounds.
-- `g.start(env)` returns a `Handle<()>` from `concurrency.md`. The
-  graph runs until cancelled, panicked, or all sources are
+- `g.start(env)` returns a `Handle<Out>` from `concurrency.md`.
+  The graph runs until cancelled, panicked, or all sources are
   exhausted.
 - `g.stop()` cancels every stage in the graph.
 - `g.snapshot()` returns a static description (topology, fused
@@ -508,20 +535,38 @@ stream.
 A stage has no `Result` return type at the graph boundary —
 stages produce dataflow values, not `Result`-wrapped ones. A
 fallible operation inside a stage body that surfaces an `Err`
-**panics** with that `Err` value as the payload (any error type
-fitting `Error` also fits `Panic` via the auto-derived bridge in
-[`errors.md`](./errors.md)). The panic propagates per
-[`concurrency.md`](./concurrency.md) §"Panics across tasks":
-sibling stages in the same scope are cancelled; the graph's
-enclosing `scope { … } catch { … }` (if any) intercepts it;
-otherwise it re-panics at the scope's closing brace.
+**panics** with that `Err` value as the payload. The panic
+propagates per [`concurrency.md`](./concurrency.md) §"Panics
+across tasks": sibling stages in the same scope are cancelled;
+the graph's enclosing `scope { … } catch { … }` (if any)
+intercepts it; otherwise it re-panics at the scope's closing
+brace.
+
+`panic e` requires `e: Panic` (per [`errors.md` §"The `Panic`
+face"](./errors.md)). The auto-derived bridge in `errors.md`
+gives every type fitting `Error` an automatic `Panic` fit, so
+`panic e` works directly when the stage's fallible inner call
+returns `Result<T, E>` with `E: Error`. For an `E` that does
+**not** fit `Error` (e.g. a bare `str`), wrap it explicitly in
+a `Panic`-fitting payload before unwinding — typically by
+constructing a stage-local error type:
+
+```q64
+pub struct ParseFailure(str)
+pub fit ParseFailure : Display { fn fmt(self) -> str { "parse failure: {self.0}" } }
+pub fit ParseFailure : Error   { }     // bridge auto-fits Panic
+```
+
+A `panic e` site whose payload doesn't fit `Panic` is `TYP306`
+(per `errors.md`'s diagnostic table); the stage-error case
+surfaces it the same way as any other call site.
 
 ```q64
 @stage
 fn decode(input: Stream<Bytes, R>) -> Stream<Frame, R> {
-    input.map(|b| match Frame.parse(b) {
+    input.map(|b| match Frame.parse(b) {       // Frame.parse: -> Result<Frame, ParseError>
         Ok(f)  -> f,
-        Err(e) -> panic e,                      // explicit: unwind with the parse error
+        Err(e) -> panic e,                      // ParseError fits Error → Panic via the bridge
     })
 }
 
@@ -755,6 +800,7 @@ stable, never reused. `STR070`-`STR099` reserved for expansion.
 | `STR061` | non-`@send` payload crossing thread boundary   | A stage's output is consumed on a different thread; payload isn't `@send`.          |
 | `STR062` | `SharedSignal` with non-`@send` `T`            | The wrapped type must be `@send`.                                                    |
 | `STR063` | multiple writers on `SharedSignal`             | A `SharedSignal<T, R>` may have at most one writer.                                  |
+| `STR064` | `.output()` on a sink-terminated graph         | A `Graph<()>` exposes no `output()`; only graphs whose body returns a dataflow value do. |
 
 All codes use the envelope from [`diagnostics.md`](./diagnostics.md).
 

@@ -257,13 +257,13 @@ Defaults are allowed on any parameter kind and apply when the
 argument is omitted at the use site.
 
 ```q64
-pub struct Vec<T, R: Region = Arena>
-pub struct Map<K: Eq + Hash, V, R: Region = Arena>
-pub struct Box<T, R: Region = Arena>
+pub struct Vec<T, R: Region = scope>
+pub struct Map<K: Eq + Hash, V, R: Region = scope>
+pub struct Box<T, R: Region = scope>
 
-let v: Vec<i64>      = Vec.new()             // R defaults to Arena
-let m: Map<str, i64> = Map.new()             // R defaults to Arena
-let b: Box<i64>      = Box.new(42)           // R defaults to Arena
+let v: Vec<i64>      = Vec.new()             // R defaults to scope's arena
+let m: Map<str, i64> = Map.new()             // R defaults to scope's arena
+let b: Box<i64>      = Box.new(42)           // R defaults to scope's arena
 ```
 
 Region-defaulting is the most common case. Other parameter kinds
@@ -436,20 +436,20 @@ All codes are emitted using the standard envelope from
 ### Generic data type with default region
 
 ```q64
-pub struct Vec<T, R: Region = Arena> {
+pub struct Vec<T, R: Region = scope> {
     ptr:  ref [T] @ R,
     len:  i64,
     cap:  i64,
 }
 
 pub fit Vec<T, R> : Collection<T, R> where T: Clone {
-    fn push(self: ref Self, r: R, x: T) { ... }
+    fn push(self: ref Self, x: T) { ... }         // allocates into Self's own R
     fn pop(self: ref Self) -> T? { ... }
     fn len(self) -> i64 { self.len }
 }
 
-let a: Vec<i64> = Vec.new()                       // R=Arena
-let b: Vec<Frame, Managed> = Vec.new()            // R=Managed
+let a: Vec<i64> = Vec.new()                       // R = scope's arena
+let b: Vec<Frame, Managed> = Vec.new()            // R = Managed
 ```
 
 ### Const generics in numerics

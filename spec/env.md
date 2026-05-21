@@ -50,21 +50,21 @@ discloses what a qube uses.
 (a fit of the corresponding capability face). The exact fields
 shipped by the runtime are:
 
-| Field         | Type            | Provides                                                       |
-|---------------|-----------------|----------------------------------------------------------------|
-| `env.out`     | `Stdout`        | Write to stdout. `env.out("…")` is sugar for `env.out.write("…\n")`. |
-| `env.err`     | `Stderr`        | Write to stderr.                                               |
-| `env.exit`    | `ExitFn`        | Terminate the program with an exit code (and optional stderr message). |
-| `env.args`    | `[str]`         | Command-line arguments, including argv[0] = program path.       |
-| `env.envvars` | `EnvVars`       | Process environment variables. Read-only.                      |
-| `env.time`    | `Clock`         | Wall-clock and monotonic time sources.                         |
-| `env.random`  | `Rng`           | Cryptographically secure randomness.                           |
-| `env.net`     | `Net`           | HTTP, WebSocket, raw sockets. See `q64.net`.                   |
-| `env.fs`      | `Fs`            | Filesystem read / write / list / watch. See `q64.fs`.          |
-| `env.audio`   | `Audio`         | PCM input/output, audio worklets. See `q64.audio`.             |
-| `env.midi`    | `Midi`          | MIDI input/output. See `q64.midi`.                             |
-| `env.ai`      | `AiEnv`         | Model loading, inference, vocabularies. See `q64.ai`.          |
-| `env.ui`      | `Ui`            | Input events (clicks, keys), frame output. See `q64.ui`.       |
+| Field         | Type            | Methods carry  | Provides                                                       |
+|---------------|-----------------|----------------|----------------------------------------------------------------|
+| `env.out`     | `Stdout`        | `@stdout`      | Write to stdout. `env.out("…")` is sugar for `env.out.write("…\n")`. |
+| `env.err`     | `Stderr`        | `@stderr`      | Write to stderr.                                               |
+| `env.exit`    | `ExitFn`        | `@exit`        | Terminate the program with an exit code (and optional stderr message). |
+| `env.args`    | `[str]`         | (none — pure)  | Command-line arguments, including argv[0] = program path.       |
+| `env.envvars` | `EnvVars`       | `@envvars`     | Process environment variables. Read-only.                      |
+| `env.time`    | `Clock`         | `@time`        | Wall-clock and monotonic time sources.                         |
+| `env.random`  | `Rng`           | `@random`      | Cryptographically secure randomness.                           |
+| `env.net`     | `Net`           | `@network`     | HTTP, WebSocket, raw sockets. See `q64.net`.                   |
+| `env.fs`      | `Fs`            | `@fs`          | Filesystem read / write / list / watch. See `q64.fs`.          |
+| `env.audio`   | `Audio`         | `@audio`       | PCM input/output, audio worklets. See `q64.audio`.             |
+| `env.midi`    | `Midi`          | `@midi`        | MIDI input/output. See `q64.midi`.                             |
+| `env.ai`      | `AiEnv`         | `@inference`   | Model loading, inference, vocabularies. See `q64.ai`.          |
+| `env.ui`      | `Ui`            | `@ui`          | Input events (clicks, keys), frame output. See `q64.ui`.       |
 
 Capabilities not listed above (gfx, video, fs.s3, gpu, …) live
 in user qubes or higher-layer stdlib packages — they extend the
@@ -339,11 +339,24 @@ Two records of "what does this qube use" exist:
     | `@inference` | `AiEnv`             |
     | `@time`      | `Clock`             |
     | `@random`    | `Rng`               |
-    | `@stdio`     | `Stdout` + `Stderr` |
+    | `@stdout`    | `Stdout`            |
+    | `@stderr`    | `Stderr`            |
+    | `@exit`      | `ExitFn`            |
+    | `@envvars`   | `EnvVars`           |
 
    `@io` is the umbrella; it does not on its own map to a single
    capability face (every finer-grained capability effect implies
    it). Compiler-verified. Always accurate.
+
+   The mapping is 1:1 from effect marker to capability face.
+   `env.out.write(…)` carries `@stdout` and contributes `Stdout`
+   to the manifest; `env.err.write(…)` carries `@stderr` and
+   contributes `Stderr` independently. `env.exit(N)` carries
+   `@exit` and contributes `ExitFn`; `env.envvars.get("HOME")`
+   carries `@envvars` and contributes `EnvVars`. Every
+   capability is now reachable through an effect marker on the
+   relevant `Env`-field method — no side-channel from
+   call-site reachability.
 
 ### `qube publish` cross-check
 
@@ -540,7 +553,7 @@ fn run_user_plugin(env: Env, plugin: PluginFn) -> Result<(), Error> {
 fn main(env: Env) -> Result<(), Error> {
     let body = try env.net.get(url"https://example.com").body()  // @network
     try env.fs.write("body.txt", body)                            // @fs
-    env.out("done")                                                // @stdio
+    env.out("done")                                                // @stdout
     Ok(())
 }
 ```

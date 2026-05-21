@@ -163,22 +163,59 @@ declaration-level annotations from
 ## Region parameters in types
 
 Allocating types take a region as a type parameter (per the
-generics spec):
+generics spec). The default is the enclosing scope's implicit
+arena (§"Scope's implicit arena", above), spelled `scope`:
 
 ```q64
-Vec<T, R: Region = Arena>            // growable array
-Map<K, V, R: Region = Arena>         // hash map
-String<R: Region = Arena>            // owned string
-Box<T, R: Region = Arena>            // single-value box
+Vec<T, R: Region = scope>            // growable array
+Map<K, V, R: Region = scope>         // hash map
+Set<T, R: Region = scope>            // hash set
+String<R: Region = scope>            // owned string
+Box<T, R: Region = scope>            // single-value box
+Bytes<R: Region = scope>             // owned byte buffer; alias for Vec<u8, R>
 ```
 
-`R` is a compile-time identity, not a runtime pointer. `Vec<i64, arena_a>`
-and `Vec<i64, arena_b>` are different types; you cannot move data
-between them without a `transfer`.
+The names `Vec`, `Map`, `Set`, `Box`, `Bytes`, `String`,
+`ManagedBox`, `Atomic`, and `Shared` are in the language
+auto-prelude (per [`modules.md`](./modules.md) §"The
+auto-prelude"). Their concrete fits live in the stdlib qube
+`q64.collections` (compiled together with the language so the
+prelude can re-export them), but no `import` is required at
+the user side.
 
-The default region is `Arena` (the enclosing scope's arena), so most
-code never names `R`. The Zig-style "thread the allocator through"
-escape hatch is available for libraries that want flexibility:
+`R` is a compile-time identity that names a **specific region
+value**, not a region kind. `Vec<i64, arena_a>` and
+`Vec<i64, arena_b>` are different types; you cannot move data
+between them without a `transfer(to: …)`.
+
+### What "default region" means
+
+The default `R = scope` resolves at each use site to the value
+named `scope` in the enclosing block's lexical scope: the
+implicit arena introduced by the nearest `scope { … }` (or the
+function body's top-level scope) per §"Scope's implicit arena".
+
+```q64
+fn outer() {
+    let a: Vec<i64> = Vec.new()        // a's R = the outer scope's arena
+    inner_a(a)
+    scope {
+        let b: Vec<i64> = Vec.new()    // b's R = the inner scope's arena
+        inner_b(b)
+    }                                   // b's arena freed here
+}
+```
+
+`a` and `b` are not the same type: their `R` parameters refer to
+different region values. A function that takes `v: Vec<i64>`
+without naming `R` introduces an anonymous generic
+`<R: Region>` per [`generics.md` §"Implicit face
+parameters"](./generics.md) — the caller passes a `Vec` from any
+region, the callee is monomorphized per call site.
+
+The Zig-style "thread the allocator through" escape hatch lets
+libraries name `R` explicitly when they need to return a value
+allocated in a caller-supplied region:
 
 ```q64
 pub fn build_index<R: Region>(r: R, terms: [Term]) -> Index<R> {
@@ -188,10 +225,25 @@ pub fn build_index<R: Region>(r: R, terms: [Term]) -> Index<R> {
 }
 ```
 
-A region parameter is not auto-inferred from the caller's scope —
-the caller passes it explicitly. The implicit `scope` arena is what
-makes the default ergonomic; passing `r: R` is the escape hatch for
-flexibility.
+### Constructor calls with the default
+
+A constructor like `Vec.new()` (with no `r` argument) allocates
+into the binding-site's enclosing `scope` arena. The
+desugaring is uniform: `Vec<T>.new()` ≡ `Vec<T, scope>.new(scope)`,
+where `scope` on the RHS is the value of the implicit-arena
+binding. A constructor called from a function that has named a
+region parameter (`fn f<R: Region>(r: R)`) and supplies it
+explicitly — `Vec<T, R>.new(r)` — bypasses the implicit-arena
+sugar.
+
+Methods that grow a collection follow the same rule. The
+`Collection.push(self: ref Self, x: T)` signature takes no `r`
+parameter when the collection's `R` is fixed at construction —
+each `push` allocates into the region the `Vec` was originally
+built with. Libraries that want to allocate into a *different*
+region per push must use the explicit form
+`Collection.push_into(self: ref Self, r: R2, x: T)` and accept
+the resulting transfer cost.
 
 ## Cross-region transfers
 

@@ -84,20 +84,29 @@ authoritative table.
 | `@io`          | Catch-all I/O (devices, generic streams). Implied by every other capability below.  | (umbrella; no single face)    |
 | `@network`     | Performs network operations (HTTP, WebSocket, raw sockets). Implies `@io`.          | `Net`                         |
 | `@fs`          | Performs filesystem operations (read, write, list, watch). Implies `@io`.           | `Fs`                          |
-| `@stdio`       | Writes to stdout or stderr. Implies `@io`.                                          | `Stdout`, `Stderr`            |
+| `@stdout`      | Writes to stdout. Implies `@io`.                                                    | `Stdout`                      |
+| `@stderr`      | Writes to stderr. Implies `@io`.                                                    | `Stderr`                      |
 | `@audio`       | Performs audio I/O (PCM read/write, worklet operations).                            | `Audio`                       |
 | `@midi`        | Performs MIDI I/O.                                                                  | `Midi`                        |
 | `@ui`          | Reads UI input events; writes frames.                                               | `Ui`                          |
 | `@inference`   | Performs AI model load or inference.                                                | `AiEnv`                       |
 | `@time`        | Reads clock time (monotonic or wall).                                               | `Clock`                       |
 | `@random`      | Reads from the system RNG.                                                          | `Rng`                         |
+| `@exit`        | Terminates the program via `env.exit(…)`. Diverges; never returns.                  | `ExitFn`                      |
+| `@envvars`     | Reads process environment variables via `env.envvars`.                              | `EnvVars`                     |
 
-`@audio`, `@midi`, `@ui`, `@inference`, `@time`, and `@random` do
-**not** imply `@io`: the underlying operations target dedicated
-host surfaces (audio worklet, MIDI port, frame buffer, model
-runtime, clock, RNG) rather than the generic-I/O streams `@io`
+`@audio`, `@midi`, `@ui`, `@inference`, `@time`, `@random`,
+`@exit`, and `@envvars` do **not** imply `@io`: the underlying
+operations target dedicated host surfaces (audio worklet, MIDI
+port, frame buffer, model runtime, clock, RNG, process control,
+process environment) rather than the generic-I/O streams `@io`
 covers. They are peer capabilities. A function that both writes
-to stdout and reads the clock declares `@stdio + @time`.
+to stdout and reads the clock declares `@stdout + @time`.
+
+`@exit` is a diverging marker — a function whose effect set
+includes `@exit` may never return on some paths. It does not
+imply `@no_panic`/`@no_trap` (those are still observable side
+effects on the path that *did* return).
 
 ### Other markers
 
@@ -117,8 +126,8 @@ Notes:
   not *purity*.
 - `@no_panic` does not forbid `trap`. Audio paths use `trap()` for
   invariant violations (see [`errors.md` §`panic` and `trap`](./errors.md)).
-- `@network` / `@fs` / `@stdio` imply `@io` so that callers
-  declaring only `@io` may not silently leak finer-grained
+- `@network` / `@fs` / `@stdout` / `@stderr` imply `@io` so that
+  callers declaring only `@io` may not silently leak finer-grained
   capabilities.
 - A few `@realtime`-safe operations exist on otherwise-capability
   surfaces (per [`env.md` §`@realtime` and capabilities](./env.md)):
@@ -143,13 +152,16 @@ expansion.
 | `@uncancellable`  | — (forbids `@cancel` callees by intersection)                 |
 | `@network`        | `@io`                                                         |
 | `@fs`             | `@io`                                                         |
-| `@stdio`          | `@io`                                                         |
+| `@stdout`         | `@io`                                                         |
+| `@stderr`         | `@io`                                                         |
 | `@audio`          | —                                                             |
 | `@midi`           | —                                                             |
 | `@ui`             | —                                                             |
 | `@inference`      | —                                                             |
 | `@time`           | —                                                             |
 | `@random`         | —                                                             |
+| `@exit`           | —                                                             |
+| `@envvars`        | —                                                             |
 | `@io`             | —                                                             |
 | `@no_suspend`     | —                                                             |
 | `@no_trap`        | —                                                             |

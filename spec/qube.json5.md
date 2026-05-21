@@ -245,10 +245,23 @@ Core effect markers (per [`effects.md`](./effects.md), with
 | `@realtime`    | Bounded execution, no alloc, no blocking, no suspending.      |
 | `@no_alloc`    | No heap allocation (linear or managed).                       |
 | `@no_suspend`  | Cannot yield to the scheduler.                                |
+| `@no_panic`    | Does not invoke `panic`.                                      |
+| `@no_trap`     | Does not invoke `trap`.                                       |
 | `@send`        | Safe to transfer across thread boundaries.                    |
 | `@pure`        | No mutation, no observable side effects.                      |
 | `@io`          | Performs I/O.                                                 |
 | `@network`     | Performs network operations. Implies `@io`.                   |
+| `@fs`          | Performs filesystem operations. Implies `@io`.                |
+| `@stdout`      | Writes to stdout. Implies `@io`.                              |
+| `@stderr`      | Writes to stderr. Implies `@io`.                              |
+| `@audio`       | Performs audio I/O.                                           |
+| `@midi`        | Performs MIDI I/O.                                            |
+| `@ui`          | Reads UI input events; writes frames.                         |
+| `@inference`   | Performs AI model load or inference.                          |
+| `@time`        | Reads clock time.                                             |
+| `@random`      | Reads from the system RNG.                                    |
+| `@exit`        | Terminates the program via `env.exit(…)`.                     |
+| `@envvars`     | Reads process environment variables.                          |
 | `@cancel`      | Function observes `ctx.cancelled()`. (Per `concurrency.md`.) |
 | `@uncancellable`| Function cannot be interrupted by cancellation.              |
 
@@ -278,7 +291,8 @@ The two records exist because they serve different audiences:
   the registry's installation prompt.
 
 The mapping from effect markers to capability names (per
-`env.md` §"Capability disclosure"):
+`env.md` §"Capability disclosure") is 1:1 — every capability
+reachable through `Env` is gated by exactly one effect marker:
 
 | Effect       | Implies capability   |
 |--------------|----------------------|
@@ -290,20 +304,10 @@ The mapping from effect markers to capability names (per
 | `@inference` | `AiEnv`              |
 | `@time`      | `Clock`              |
 | `@random`    | `Rng`                |
-| `@stdio`     | `Stdout` + `Stderr`  |
-
-Two further capabilities are reachable through `Env` but have no
-corresponding effect marker in v0:
-
-| Capability | Reached via   | Notes                                                                  |
-|------------|---------------|------------------------------------------------------------------------|
-| `ExitFn`   | `env.exit`    | Terminates the program; no effect marker because it never returns.     |
-| `EnvVars`  | `env.envvars` | Read-only access to process env vars; treated as ambient configuration.|
-
-Both names appear in the schema's `CapabilityName` enum and in the
-`capabilities` list when the qube's source touches them; the compiler
-derives them from direct call-site reachability rather than from
-effect propagation.
+| `@stdout`    | `Stdout`             |
+| `@stderr`    | `Stderr`             |
+| `@exit`      | `ExitFn`             |
+| `@envvars`   | `EnvVars`            |
 
 Capability names are PascalCase (matching the face names in
 `env.md`). Listing a capability not used by the source is

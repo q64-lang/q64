@@ -224,11 +224,35 @@ function cannot take a `ctx: Cancel` parameter (per
 [`effects.md`](./effects.md), the effect must match the
 signature).
 
-### The spawned task's `ctx`
+### Where `ctx` comes from
 
-A `spawn { … }` block introduces a fresh `Cancel` named `ctx`
-that's bound to the handle. `h.cancel()` flips that `ctx`; the
-task sees `ctx.cancelled()` go true at its next observation.
+Three sources introduce a `ctx: Cancel` binding visible to the
+code below:
+
+1. **Function parameter.** A function that declares `ctx: Cancel`
+   in its signature receives the caller's `ctx` and forwards it
+   to `@cancel` callees. This is the most common path —
+   `@cancel` functions take `ctx` as a parameter (§"Cancellation",
+   above).
+2. **Spawned task.** A `spawn { … }` block introduces a fresh
+   `Cancel` named `ctx` that's bound to the handle.
+   `h.cancel()` flips that `ctx`; the task sees `ctx.cancelled()`
+   go true at its next observation.
+3. **Scope binding.** Every `scope { … }` block introduces an
+   implicit `ctx: Cancel` whose lifetime is the scope. The scope's
+   `ctx` is signalled when the scope's parent task is cancelled or
+   when a sibling task panics (per §"Panics across tasks").
+   Inside a scope, `ctx` resolves to the **lexically nearest**
+   binding: the spawned task's own ctx when inside `spawn { … }`,
+   otherwise the enclosing scope's ctx.
+
+`main`'s top-level body has an implicit ctx tied to the program's
+lifetime: it never flips (the program ends via `env.exit()` or by
+falling off the end), but it allows `@cancel` calls and `select`
+arms from inside `main` to type-check. Programs that need to
+shut down on a signal (`SIGINT`, browser `beforeunload`) install
+a signal handler via the runtime adapter that calls
+`top_ctx.cancel()` — the same mechanism as `h.cancel()`.
 
 Cancellation is **cooperative**. `h.cancel()` does not interrupt
 running code. The task observes at:
@@ -335,33 +359,81 @@ pub fn channel<T, P: Policy>(
 
 ### `Sender<T, P>` and `Receiver<T, P>` API
 
+The endpoints' surface depends on whether the policy is
+cancel-aware (`Backpressure`, `LatestValue`) or not
+(`RingBuffer`, `Unbounded`). Two pairs of faces; the
+`channel<T, P>(…)` factory returns the variant matching `P`.
+
 ```q64
-pub face Sender<T, P: Policy = Backpressure> {
-    fn send       (self,            move x: T)                                // non-cancel-aware policies
-    fn send       (self, ctx: Cancel, move x: T) @cancel                      // cancel-aware policies; may unwind via panic Cancelled
-    fn try_send   (self,            move x: T) -> Result<(), SendError<T>>   // non-blocking; never suspends
-    fn close      (self)                                                     // signal end-of-stream; remaining values still readable
+// Common methods on every Sender / Receiver
+pub face SenderBase<T, P: Policy> {
+    fn try_send (self, move x: T) -> Result<(), SendError<T>>   // never suspends
+    fn close    (self)                                          // signal end-of-stream
 }
 
-pub face Receiver<T, P: Policy = Backpressure> {
-    fn recv       (self, ctx: Cancel) -> T @cancel        // suspends until a value is available
-    fn try_recv   (self) -> Result<T, RecvError>          // non-blocking; immediate
-    fn closed     (self) -> bool                          // whether the sender side has closed
+pub face ReceiverBase<T, P: Policy> {
+    fn try_recv (self) -> Result<T, RecvError>                  // never suspends
+    fn closed   (self) -> bool
+}
+
+// Non-cancel-aware policies — send/recv never observe ctx
+pub face Sender<T, P: NonCancelPolicy> : SenderBase<T, P> {
+    fn send (self, move x: T)                                   // never suspends (RingBuffer overwrites; Unbounded grows)
+}
+
+pub face Receiver<T, P: NonCancelPolicy> : ReceiverBase<T, P> {
+    fn recv (self) -> T                                         // suspends but does not observe cancellation
+}
+
+// Cancel-aware policies — send/recv take ctx and are @cancel
+pub face Sender<T, P: CancelPolicy> : SenderBase<T, P> {
+    fn send (self, ctx: Cancel, move x: T) @cancel              // may unwind via panic Cancelled
+}
+
+pub face Receiver<T, P: CancelPolicy> : ReceiverBase<T, P> {
+    fn recv (self, ctx: Cancel) -> T @cancel                    // suspends; observes cancellation
 }
 ```
+
+`Policy` is the auto-prelude umbrella face;
+`CancelPolicy` and `NonCancelPolicy` are its two disjoint
+sub-faces. `Backpressure` and `LatestValue` fit `CancelPolicy`;
+`RingBuffer` and `Unbounded` fit `NonCancelPolicy`. The compiler
+picks the correct `Sender`/`Receiver` fit per the policy at the
+channel-construction site.
+
+Notes:
+
+- `recv` returns `T` directly; it does **not** return a `Result`.
+  End-of-stream is detected via `closed()` or by the `for x in rx
+  { … }` loop form (below).
+- Calling `recv` on a closed-and-empty channel unwinds the task
+  with `panic Closed` — `Closed` is the auto-prelude
+  `Panic`-fitting payload from
+  [`errors.md` §"Auto-prelude payload types"](./errors.md). A
+  receiver that wants to observe close cleanly tests `closed()`
+  first or iterates with `for x in rx { … }`.
+- `try_recv` returns `Err(RecvError::Empty)` when no value is
+  ready and `Err(RecvError::Closed)` when the sender has closed
+  and the buffer is empty.
+- `SendError<T>` carries the rejected value back so the caller can
+  recover ownership on failure: `Err(SendError { value: T, reason:
+  SendErrorReason })` where `SendErrorReason ∈ { Full, Closed }`.
 
 ### `for x in rx { … }` loop form
 
 `Receiver<T, P>` does **not** fit the auto-prelude `Iterator` face
 — `Iterator.next() -> Item?` is non-suspending, and `recv` needs
-to suspend (and observe cancellation). The `for x in rx { body }`
-form is a compiler-recognized desugaring, not an `Iterator` fit:
+to suspend (possibly observing cancellation). The `for x in rx {
+body }` form is a compiler-recognized desugaring, not an
+`Iterator` fit:
 
 ```q64
 for x in rx { body(x) }
 ```
 
-desugars to roughly:
+desugars per the receiver's policy. For a cancel-aware policy
+(`Backpressure`, `LatestValue`):
 
 ```q64
 loop {
@@ -373,35 +445,24 @@ loop {
 }
 ```
 
-Requirements: a `ctx: Cancel` must be in lexical scope (the
-desugaring uses it for the suspending `recv`). A `for x in rx` with
-no `ctx` in scope is `CONC053` ("for-loop over receiver without
-ctx").
+For a non-cancel-aware policy (`RingBuffer`, `Unbounded`):
 
-- For non-cancel-aware policies (`RingBuffer`, `Unbounded`), `send`
-  does not suspend and the `ctx` parameter may be elided —
-  `tx.send(move x)` is the canonical form.
-- For cancel-aware policies (`Backpressure`, `LatestValue`),
-  `send(ctx, …)` and `recv(ctx)` may unwind with `Cancelled` per
-  §"Cancellation". The `@cancel` effect on both sides surfaces in
-  the caller's effect set.
-- `recv(ctx)` returns `T` directly; it does **not** return a
-  `Result`. End-of-stream is detected via `closed()` or by the
-  channel returning from a `for x in rx { … }` loop (the
-  `Receiver<T, P>` fit of `Iterator` uses `try_recv` under the
-  hood and stops the loop on `RecvError::Closed`).
-- Calling `recv(ctx)` when the channel is closed **and** the
-  buffer is empty unwinds the task with `panic Closed` — `Closed`
-  is the auto-prelude `Panic`-fitting payload from
-  [`errors.md` §"Auto-prelude payload types"](./errors.md). A
-  receiver that wants to observe close cleanly tests `closed()`
-  first or iterates with `for x in rx { … }`.
-- `try_recv` returns `Err(RecvError::Empty)` when no value is
-  ready and `Err(RecvError::Closed)` when the sender has closed
-  and the buffer is empty.
-- `SendError<T>` carries the rejected value back so the caller can
-  recover ownership on failure: `Err(SendError { value: T, reason:
-  SendErrorReason })` where `SendErrorReason ∈ { Full, Closed }`.
+```q64
+loop {
+    match rx.try_recv() {
+        Ok(x)                  -> body(x),
+        Err(RecvError::Empty)  -> { let x = rx.recv(); body(x) },     // no ctx
+        Err(RecvError::Closed) -> break,
+    }
+}
+```
+
+Requirements: for a cancel-aware policy, a `ctx: Cancel` must be
+in lexical scope (the desugaring uses it for the suspending
+`recv`). A `for x in rx` over a `CancelPolicy` channel with no
+`ctx` in scope is `CONC053` ("for-loop over cancel-aware
+receiver without ctx"). For a non-cancel-aware policy, `ctx` is
+not required.
 
 ### Cross-thread channels
 
@@ -854,7 +915,7 @@ function-level effect annotations from `effects.md`.
 | `CONC050`| channel policy required                      | `channel<T>(capacity: N)` with no `policy:` argument.                              |
 | `CONC051`| `Unbounded` channel                          | Lint (advisory). `channel<T>(policy: Unbounded)`.                                  |
 | `CONC052`| non-`@send` payload in cross-thread channel  | A channel passed across a thread boundary whose `T` isn't `@send`.                |
-| `CONC053`| `for x in rx` without `ctx` in scope         | The for-loop desugaring needs a `ctx: Cancel` for the suspending `recv` step.     |
+| `CONC053`| `for x in rx` over cancel-aware receiver without `ctx` | The for-loop desugaring needs a `ctx: Cancel` for the suspending `recv(ctx)` step on `Backpressure`/`LatestValue` policies. |
 
 All codes are emitted using the envelope from
 [`diagnostics.md`](./diagnostics.md).

@@ -91,7 +91,7 @@ three keywords and following the arrows between them.
 |----------|-----------------------------------------------------------------------------|
 | `face`   | A named interface — methods, associated types, default impls, and laws.      |
 | `fit`    | A binding that says "this type (or these types) fit this face."             |
-| **bound**| A constraint on a generic parameter — `T: Eq<T>` reads "`T` must fit `Eq`." |
+| **bound**| A constraint on a generic parameter — `T: Eq` reads "`T` must fit `Eq`." |
 | **dyn**  | A type position that erases the concrete type and dispatches at runtime.    |
 
 Compiler error messages use the same vocabulary: *"Vec3 does not fit Eq"*,
@@ -100,13 +100,13 @@ Compiler error messages use the same vocabulary: *"Vec3 does not fit Eq"*,
 ## Face declaration
 
 ```q64
-pub face Eq<T> {
-    fn eq(a: T, b: T) -> bool @pure
-    fn ne(a: T, b: T) -> bool @pure { !Eq.eq(a, b) }      // default method
+pub face Eq {
+    fn eq(self, other: Self) -> bool @pure
+    fn ne(self, other: Self) -> bool @pure { !self.eq(other) }      // default
 
-    law reflexive:  forall a: T          => eq(a, a)
-    law symmetric:  forall a, b: T       => eq(a, b) == eq(b, a)
-    law transitive: forall a, b, c: T    => (eq(a, b) && eq(b, c)) => eq(a, c)
+    law reflexive:  forall a: Self          => a.eq(a)
+    law symmetric:  forall a, b: Self       => a.eq(b) == b.eq(a)
+    law transitive: forall a, b, c: Self    => (a.eq(b) && b.eq(c)) => a.eq(c)
 }
 ```
 
@@ -186,12 +186,12 @@ pub face Convert<From, To> {            // no Self; both types named
 A face may require another face as a superface:
 
 ```q64
-pub face Hash<T>: Eq<T> {
+pub face Hash : Eq {
     fn hash(self) -> u64 @pure
 }
 ```
 
-Any `fit Hash<X>` requires that `Eq<X>` is also fit.
+Any `fit X : Hash` requires that `fit X : Eq` is also present.
 
 ## Fit declaration
 
@@ -211,8 +211,8 @@ based on the face declaration.
 
 ```q64
 pub fit Vec3<f32> : Eq {
-    fn eq(a: Vec3<f32>, b: Vec3<f32>) -> bool {
-        a.x == b.x && a.y == b.y && a.z == b.z
+    fn eq(self, other: Self) -> bool {
+        self.x == other.x && self.y == other.y && self.z == other.z
     }
 }
 
@@ -229,8 +229,8 @@ pub fit LowPass : Filter<PCM<f32>, @realtime> {
     fn step(self: ref Self, x: PCM<f32>) -> PCM<f32> @realtime { ... }
 }
 
-pub fit Vec<i64, Arena> : Collection<i64, Arena> {
-    fn push(self: ref Self, r: Arena, x: i64) { ... }
+pub fit Vec<i64, R: Region> : Collection<i64, R> {
+    fn push(self: ref Self, x: i64) { ... }       // allocates into the Vec's own R
 }
 ```
 
@@ -261,9 +261,9 @@ boundary.
 ### Inline bounds on generic parameters
 
 ```q64
-pub fn unique<T: Eq<T>>(items: [T]) -> [T] { ... }
+pub fn unique<T: Eq>(items: [T]) -> [T] { ... }
 
-pub fn dedup_sorted<T: Eq<T> + Ord<T>>(items: ref [T]) { ... }
+pub fn dedup_sorted<T: Eq + Ord>(items: ref [T]) { ... }
 ```
 
 `+` composes bounds. Reads naturally: *"T must fit Eq and Ord."*
@@ -354,14 +354,20 @@ Same shape, with a region variable:
 
 ```q64
 pub face Collection<T, R: Region> {
-    fn push(self: ref Self, r: R, x: T)
+    fn push(self: ref Self, x: T)         // allocates into Self's own R
     fn pop(self: ref Self) -> T?
     fn len(self) -> i64
 }
 
-pub fit Vec<i64, Arena> : Collection<i64, Arena> { ... }
-pub fit Vec<i64, Managed> : Collection<i64, Managed> { ... }
+pub fit Vec<i64, R: Region> : Collection<i64, R> { ... }
 ```
+
+The `R` in the face's parameter list and the `R` on `Vec` are the
+same — a `Vec<T, R>`'s `push` allocates into its own region, not
+a caller-supplied one. The `push_into(self: ref Self, r: R2, x: T)`
+shape (per [`memory.md`](./memory.md) §"Constructor calls with
+the default") is reserved for the rarer case where a caller wants
+to direct allocation explicitly.
 
 Callers stay generic over the region:
 
@@ -472,7 +478,7 @@ works, but `qube test` won't claim it does.
 ### Default: static dispatch via monomorphization
 
 ```q64
-pub fn unique<T: Eq<T>>(items: [T]) -> [T] { ... }
+pub fn unique<T: Eq>(items: [T]) -> [T] { ... }
 ```
 
 The compiler emits one monomorphized copy of `unique` per concrete `T`.
@@ -657,13 +663,13 @@ every `fit` is a top-level item (per
 ### Equality with laws
 
 ```q64
-pub face Eq<T> {
-    fn eq(a: T, b: T) -> bool @pure
-    fn ne(a: T, b: T) -> bool @pure { !Eq.eq(a, b) }
+pub face Eq {
+    fn eq(self, other: Self) -> bool @pure
+    fn ne(self, other: Self) -> bool @pure { !self.eq(other) }
 
-    law reflexive:  forall a: T          => eq(a, a)
-    law symmetric:  forall a, b: T       => eq(a, b) == eq(b, a)
-    law transitive: forall a, b, c: T    => (eq(a, b) && eq(b, c)) => eq(a, c)
+    law reflexive:  forall a: Self          => a.eq(a)
+    law symmetric:  forall a, b: Self       => a.eq(b) == b.eq(a)
+    law transitive: forall a, b, c: Self    => (a.eq(b) && b.eq(c)) => a.eq(c)
 }
 
 // Auto-derived; no explicit fit needed
@@ -754,8 +760,10 @@ pub fn write_to_log(items: [dyn Display]) {
   present. Lands with the coherence work.
 - **Const-evaluated bounds** — `where N == M + 1` for const generics;
   pending the comptime spec.
-- **Blessed stream faces** — `Stage`, `Source`, `Sink`, `RateAware`
-  as auto-prelude faces that `@stage`-annotated functions
-  structurally fit. Referenced by
-  [`streams.md`](./streams.md); the formal face declarations land
-  with the comptime / `@stage`-introspection work.
+- **Blessed stage-classification faces** — `Source`, `Sink`,
+  `RateAware` as auto-prelude faces that `@stage`-annotated
+  functions structurally fit (the graph-shape predicates
+  exposed at comptime). `Graph<Out>` itself is now declared
+  in [`streams.md`](./streams.md) §"The `Graph<Out>` type"; the
+  remaining stage classification faces land with the comptime /
+  `@stage`-introspection work.
