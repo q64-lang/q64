@@ -229,8 +229,8 @@ pub fit LowPass : Filter<PCM<f32>, @realtime> {
     fn step(self: ref Self, x: PCM<f32>) -> PCM<f32> @realtime { ... }
 }
 
-pub fit Vec<i64, Arena> : Collection<i64, Arena> {
-    fn push(self: ref Self, r: Arena, x: i64) { ... }
+pub fit Vec<i64, R: Region> : Collection<i64, R> {
+    fn push(self: ref Self, x: i64) { ... }       // allocates into the Vec's own R
 }
 ```
 
@@ -354,14 +354,20 @@ Same shape, with a region variable:
 
 ```q64
 pub face Collection<T, R: Region> {
-    fn push(self: ref Self, r: R, x: T)
+    fn push(self: ref Self, x: T)         // allocates into Self's own R
     fn pop(self: ref Self) -> T?
     fn len(self) -> i64
 }
 
-pub fit Vec<i64, Arena> : Collection<i64, Arena> { ... }
-pub fit Vec<i64, Managed> : Collection<i64, Managed> { ... }
+pub fit Vec<i64, R: Region> : Collection<i64, R> { ... }
 ```
+
+The `R` in the face's parameter list and the `R` on `Vec` are the
+same — a `Vec<T, R>`'s `push` allocates into its own region, not
+a caller-supplied one. The `push_into(self: ref Self, r: R2, x: T)`
+shape (per [`memory.md`](./memory.md) §"Constructor calls with
+the default") is reserved for the rarer case where a caller wants
+to direct allocation explicitly.
 
 Callers stay generic over the region:
 
