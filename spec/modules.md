@@ -200,17 +200,45 @@ section indexes them.
 | Concurrency primitives | `scope`, `spawn`, `channel`, `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`, `Sender`, `Receiver`, `Policy`, `CancelPolicy`, `NonCancelPolicy`, `Backpressure`, `RingBuffer`, `LatestValue`, `Unbounded`, `timeout`, `sleep`, `SendError`, `RecvError` | [`concurrency.md`](./concurrency.md)            |
 | Stream primitives      | `Signal`, `Event`, `Stream`, `SharedSignal`, `Graph`, `@stage`, `graph`, `pre`, `\|>`, `changes`, `hold`, `fold`, `sample` | [`streams.md`](./streams.md)                |
 
-Notes on what is **not** auto-prelude:
+### Reachable through a capability face
+
+Capability faces (`Net`, `Fs`, `Audio`, …) carry parameter and
+return types — `Url`, `Response`, `IoError`, `WebSocket`,
+`JsonError`, `MidiMessage`, `Frame`, `Token<V>`, etc. Because
+the face is auto-prelude, the **types in its public-facing
+signatures are also auto-prelude**: any type that appears in a
+prelude face's method signatures, in the return type of a
+constructor on a prelude type, or as a variant payload of a
+prelude enum, is itself reachable without an import.
+
+This is the only transitive auto-prelude rule. It exists so that
+`env.net.get(url"…")` doesn't require importing `q64.net.Url`,
+`q64.net.Response`, and `q64.net.IoError` to type-check the call.
+The reachable set is computed by the compiler and surfaced by
+`q64 show modules --prelude` for auditing.
+
+The transitive rule does **not** apply to stdlib types that are
+not in the prelude faces' signatures — `Mat4`, `Quat`, etc. from
+`q64.math` require explicit import.
+
+### Typed-prefix string literals
+
+The `url"…"` typed prefix (and any future typed prefix like
+`re"…"`, `sql"…"`) is in the auto-prelude exactly when the
+corresponding type is reachable per §"Reachable through a
+capability face". `url"…"` is auto-prelude because `Url` shows
+up in `Net.get`'s signature; `re"…"` would become auto-prelude
+once a regex type is similarly exposed.
+
+### Notes on what is **not** auto-prelude
 
 - `Convert<From, To>` — multi-parameter face; per `faces.md`,
   every use should make the import explicit.
-- Typed-prefix string literals (`url"…"`, future `re"…"`,
-  `sql"…"`) — opt-in per the importing qube; the language
-  reserves no typed prefixes in v0.
 - Stage-classification faces (`Source`, `Sink`, `RateAware`) —
   deferred per `faces.md` §"Open items deferred".
 - Anything from the stdlib namespaces (`q64.math`, `q64.net`,
-  `q64.fs`, …); those require explicit `import`.
+  `q64.fs`, …) **not** reachable through a prelude face — those
+  require explicit `import`.
 
 The prelude is curated; user code cannot add to it. New blessed names
 land via spec amendment in the owning file and are mirrored here.

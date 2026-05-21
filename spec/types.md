@@ -428,9 +428,13 @@ let host     = url"https://api.q64.dev"                 // also Url
 - Unknown prefixes are `LEX020` ("unknown string-literal
   prefix").
 
-Auto-prelude typed prefixes: none in v0; every typed prefix is
-opt-in via an import. `url"…"` becomes available wherever
-`q64.net.Url` is in scope.
+Auto-prelude typed prefixes: a typed prefix is in the
+auto-prelude exactly when its target type is reachable through
+an auto-prelude capability face per
+[`modules.md`](./modules.md) §"Reachable through a capability
+face". `url"…"` is auto-prelude because `Url` appears in `Net`'s
+signatures. Typed prefixes whose target type lives in a
+non-prelude qube remain opt-in via an explicit `import`.
 
 ### Multi-line and trim rules
 
