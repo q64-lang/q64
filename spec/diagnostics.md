@@ -207,6 +207,41 @@ and `{ "ok": true, "diagnostics": [] }` in JSON mode. Consumers should
 not treat the absence of an envelope in JSON mode as success — always
 parse the envelope.
 
+## Suppressing a diagnostic — `@allow(<code>)`
+
+The `@allow` attribute suppresses a specific lint at the
+declaration it precedes. Form: `@allow(<code>)` or
+`@allow(<code1>, <code2>, …)` — each `<code>` is a diagnostic
+code as written in the envelope (`ENV010`, `CONC040`, etc.).
+
+```q64
+@allow(ENV010)
+fn helper_that_takes_full_env(env: Env) { … }      // suppresses the lint
+```
+
+Scope of suppression is the **immediately following item** — a
+function, struct, fit, face, const declaration, etc. To suppress
+the same code across a whole file, attach `@allow` to each item
+that triggers it; there is no block or module-level form in v0.
+
+Restrictions:
+
+- `@allow` only suppresses diagnostics with `severity` of
+  `warning`, `note`, or `help`. An `error`-severity diagnostic
+  (`severity: "error"`) cannot be suppressed — it represents a
+  build-stopping violation. Attempting `@allow(TYP041)` is
+  `FMT060` ("`@allow` on error-severity code").
+- `@allow(<code>)` for a code that does not exist is `FMT061`
+  (warning).
+- `@allow(<code>)` for a code that the wrapped item does not
+  actually emit is `FMT062` (warning; redundant-allow).
+
+The full annotation surface (`@allow`, `@test`, `@derive`,
+`@kind`, …) is sketched across the spec files where each is
+used; the unified `annotations.md` spec listed in
+[`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md) will
+formalize the grammar, scoping, and per-annotation rules.
+
 ## Compatibility
 
 Future versions of the envelope may add fields; consumers must ignore

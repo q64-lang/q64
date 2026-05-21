@@ -429,15 +429,26 @@ effects declared").
 #### What "no arbitrary-point observation" means
 
 `@uncancellable` (and therefore `@realtime`) forbids the body
-from *directly* calling `@cancel` functions or
-`ctx.cancelled()` mid-computation. It does **not** forbid the
-implicit cancellation branch of a `select { … }` (per
-[`concurrency.md` §"Implicit cancellation branch"](./concurrency.md)):
-a `select` is itself a natural yield boundary, and observing
-cancellation at that boundary is the audio thread's normal way
-to shut down cleanly. Concretely, an `@realtime` scope's
-`loop { select { … } }` pattern is well-formed; a `@realtime`
-body that calls `ctx.cancelled()` between two `recv`s is `EFF110`.
+from observing cancellation at an **arbitrary** point — but a
+`select { … }` is a structured yield, and observation **at**
+that yield is the audio thread's normal way to shut down
+cleanly. Concretely:
+
+| Where the `@cancel` call appears                              | Inside `@uncancellable` body? |
+|---------------------------------------------------------------|-------------------------------|
+| A bare `ctx.cancelled()` between two operations               | ❌ `EFF110`                    |
+| A bare `recv(ctx)` / `send(ctx, …)` outside a `select`        | ❌ `EFF110`                    |
+| A `recv(ctx)` / `send(ctx, …)` arm of a `select { … }`        | ✅ allowed (select is a yield) |
+| The implicit `ctx.cancelled()` branch of a `select`           | ✅ allowed (per [`concurrency.md` §"Implicit cancellation branch"](./concurrency.md)) |
+| An explicit `_ = ctx.cancelled() -> …` arm of a `select`      | ✅ allowed (overrides the implicit branch for cleanup) |
+
+The carveout is **lexical**, not transitive: a `@realtime` body
+that calls `helper(ctx)` where `helper` itself does
+`ctx.cancelled()` is `EFF110` at the call to `helper` — putting
+`helper(ctx)` inside a `select` arm doesn't launder it. The
+canonical `@realtime` audio loop is therefore
+`loop { select { f = rx.recv(ctx) -> play(move f), … } }`, never
+`loop { let f = rx.recv(ctx); play(move f) }`.
 
 ### Effect set in the call graph
 

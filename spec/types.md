@@ -491,10 +491,20 @@ revision.
 Two builtin compound types live in the auto-prelude:
 
 ```q64
-@kind Simd<T, const N: i64>                          // hardware-mapped SIMD lanes
-@kind Tensor<T, const Shape: [i64; Rank], const Rank: i64>   // static-shape tensor
-@kind DynTensor<T>                                   // shape and rank carried at runtime
+// Compiler builtins; declarations shown for the type-level shape only.
+Simd<T, const N: i64>                          // hardware-mapped SIMD lanes
+Tensor<T, const Shape: [i64; Rank], const Rank: i64>   // static-shape tensor
+DynTensor<T>                                   // shape and rank carried at runtime
 ```
+
+These three are **language builtins**, not user-declared types:
+the compiler knows their layout, monomorphization rules, and
+Wasm 3.0 lowering. The user-facing `@kind` annotation for
+defining zero-cost semantic newtypes (e.g. `@kind PCM<T>`,
+`@kind UserId`) is a separate construct tracked in
+[`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md)
+as the forthcoming `kinds.md` spec; until that lands, only
+these three compiler-blessed kinds exist.
 
 `Tensor`'s shape parameter is a fixed-length array of `i64`
 (`[i64; Rank]`) per
@@ -640,7 +650,6 @@ fn require_age(user: User?) -> i32 {
 ### Arb-width int arithmetic
 
 ```q64
-@derive(FromBits)
 struct OpCode {
     op:    u4,
     reg:   u3,

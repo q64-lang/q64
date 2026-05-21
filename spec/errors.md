@@ -477,8 +477,10 @@ used by Vercel Zero, the AI SDK, and modern API conventions — a q64
 { "ok": false, "error": {...} }
 ```
 
-`@derive(ToJson)` on a `Result<T, E>` (where `T: ToJson, E: ToJson`)
-produces this envelope.
+The stdlib JSON serializer for `Result<T, E>` (when `T` and `E`
+are themselves JSON-serializable) produces this envelope shape.
+The `ToJson` face and its derive surface live in the JSON-stdlib
+qube; the language has no `@derive(ToJson)` built in.
 
 ## Diagnostic codes
 
