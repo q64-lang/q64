@@ -200,12 +200,18 @@ never `panic`.
 ```q64
 pub face Error : Display {
     fn source(self) -> Option<ref dyn Error> { None }      // default: no inner error
+    fn exit_code(self) -> i64 { 1 }                        // default: process exit 1
 }
 ```
 
 - **Required**: implement `Display` (i.e., `fn fmt(self) -> str @pure`).
 - **Optional**: override `source()` to expose an inner error, enabling
   chain-of-causes display.
+- **Optional**: override `exit_code()` to map this error to a non-default
+  process exit code. Consumed by `main` Form 2 (per
+  [`env.md` §"`main` signature"](./env.md)) and by the `Error → Panic`
+  bridge below when an uncaught panic carries an `Error`-fitting payload
+  (per [`q64-cli.md` §"Exit codes"](./q64-cli.md)).
 - The face is in the auto-prelude.
 
 ### Example: an error type with source chain

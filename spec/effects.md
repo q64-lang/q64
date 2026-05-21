@@ -556,8 +556,11 @@ These two annotations are the *only* way to override field-wise
 // Channel payload must be @send
 pub fn send_frame<T: @send>(tx: Channel<T>, x: T) { tx.send(move x) }
 
-// shared_region members must be @send
-shared_region world { counter: atomic<i64> = 0 }
+// @shared struct fields must be @send (per memory.md §"Shared regions")
+@shared
+struct World {
+    counter: Atomic<i64>,
+}
 ```
 
 `T: @send` is the only place where `@send` appears syntactically on

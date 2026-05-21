@@ -495,7 +495,7 @@ scope {
     let state = AudioState.new()
 
     // audio thread (writer):
-    spawn @realtime {
+    spawn scope @realtime {
         let pcm = mic_input(env.audio)
         state.level = pcm |> rms_envelope          // continuously updates
     }

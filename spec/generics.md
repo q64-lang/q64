@@ -417,7 +417,7 @@ Explicitly out of scope for v0; tracked under "Open items deferred":
 All generics-related diagnostics use the `TYP` prefix. Numbers are
 stable, never reused. Codes `TYP100`–`TYP149` are reserved for
 generics; existing TYP allocations: numeric mismatch (`TYP041`),
-faces (`TYP200`–`TYP219`), errors (`TYP300`–`TYP307`).
+faces (`TYP200`–`TYP249`), errors (`TYP300`–`TYP307`).
 
 | Code     | Short message                                | When                                                                              |
 |----------|----------------------------------------------|-----------------------------------------------------------------------------------|
@@ -484,7 +484,9 @@ pub fn buffer<T, const N: i64 = 16>() -> [T; N] { ... }
 
 let a: [i64; 8]  = buffer()      // N=8 inferred from return-type binding
 let b: [i64; 16] = buffer()      // N defaults to 16
-let c            = buffer<i64>() // ❌ TYP102 — N has a default but T does not infer
+let c            = buffer()      // ❌ TYP102 — N defaults, but T has no default
+                                 //    and no inference target supplies it
+let d: [i64; 16] = buffer<i64>() // ✓ T supplied; N defaults to 16
 ```
 
 ### Where clause with associated types

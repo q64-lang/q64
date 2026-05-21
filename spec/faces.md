@@ -483,11 +483,17 @@ auto-derived generator wouldn't produce useful test inputs.
 
 ```q64
 @skip_laws
-pub fit FloatingPointSum : Monoid {
+pub fit Monoid<f64> {
+    fn zero() -> f64 { 0.0 }
+    fn combine(a: f64, b: f64) -> f64 { a + b }
     // Floating-point addition is not associative — declare the fit
-    // but skip property tests that would fail.
+    // but skip the property test that would fail.
 }
 ```
+
+`Monoid<T>` is a multi-parameter face (all type parameters are named;
+no `Self`-shaped receiver), so the fit uses the
+`fit Face<T1, …>` form per §"Fit declaration".
 
 `@skip_laws` is honest about not satisfying the laws; the fit still
 works, but `qube test` won't claim it does.
@@ -582,6 +588,40 @@ the conflict explicitly, by one of:
 Conflicts are diagnosed at build time, not runtime — there is no late
 binding that could surprise.
 
+### Bound-disjoint face overload
+
+A face name may be declared more than once when the declarations
+differ in their generic parameter bounds **and** the bounds are
+provably disjoint — no concrete argument tuple can satisfy more
+than one of the declarations. The compiler treats the declarations
+as a single named face whose method set is selected per use site
+by which bound the concrete arguments fit.
+
+The canonical use is the channel-endpoint API in
+[`concurrency.md` §"`Sender<T, P>` and `Receiver<T, P>` API"](./concurrency.md):
+
+```q64
+pub face Sender<T, P: NonCancelPolicy> : SenderBase<T, P> {
+    fn send(self, move x: T)                       // no ctx
+}
+
+pub face Sender<T, P: CancelPolicy> : SenderBase<T, P> {
+    fn send(self, ctx: Cancel, move x: T) @cancel  // ctx + @cancel
+}
+```
+
+`CancelPolicy` and `NonCancelPolicy` are disjoint sub-faces of
+`Policy` (no `P` fits both); the compiler picks the correct
+`send` signature at each call site. Per-declaration method sets
+must be disjoint as well — declaring the same method name under
+both bounds is `TYP220` ("overlapping methods across bound-disjoint
+face declarations").
+
+Two face declarations sharing a name whose bounds are **not**
+provably disjoint are `NAM005` (per [`modules.md`](./modules.md)).
+The overload form exists for the policy-driven dispatch pattern;
+it is not a general method-overloading mechanism.
+
 ## Static `Face.method` and `Face.Type` paths
 
 Methods and associated types are addressable through the face name
@@ -624,6 +664,7 @@ checking is a typecheck concern). Stable numbering, never reused.
 | `TYP217` | missing method in fit                        | Fit omits a face method that has no default.                                      |
 | `TYP218` | property test law violated                   | `qube test` found a counter-example for a face law. Shrunk input attached.        |
 | `TYP219` | `@skip_laws` on a fit with no laws           | `@skip_laws` attribute applied to a face that has no laws to skip.                |
+| `TYP220` | overlapping methods in bound-disjoint face overload | Two declarations of the same face name share a method name. See §"Bound-disjoint face overload". |
 
 All codes are emitted using the standard envelope from
 [`diagnostics.md`](./diagnostics.md).
