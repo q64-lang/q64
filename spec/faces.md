@@ -126,7 +126,7 @@ A face declaration contains:
 
 Method effects belong **after** the return type, reusing the function-
 effect grammar from
-[`design.md` §Effects](https://github.com/q64-lang/design/blob/main/design.md):
+[`effects.md`](./effects.md):
 
 ```q64
 pub face Process<In, Out> {
@@ -371,7 +371,7 @@ pub fn collect<T, R: Region, C: Collection<T, R>>
 ```
 
 Region parameters interact with the lifetime checker from
-[`design/memory.md`](https://github.com/q64-lang/design/blob/main/memory.md)
+[`memory.md`](./memory.md)
 exactly as they do on plain function signatures — no separate face
 machinery is needed.
 
@@ -488,7 +488,7 @@ pub fn render(target: dyn Display) {
 
 `dyn Face` is a type position. It is **separate** from the face-as-a-bound:
 `fn f<T: Display>` is static, `fn f(x: dyn Display)` is dynamic. Per
-[`design/influences.md`](https://github.com/q64-lang/design/blob/main/influences.md)
+[`docs/history/influences.md`](../docs/history/influences.md)
 §Swift, q64 deliberately separates "face as interface" from "face as
 existential type" — Swift's conflation causes the `Self`-with-existential
 pain that q64 avoids.

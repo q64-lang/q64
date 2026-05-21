@@ -395,9 +395,7 @@ A type is `@send` if every component is `@send`. The base cases:
 - A struct is `@send` iff every field is `@send`.
 - An enum is `@send` iff every variant payload is `@send`.
 - `Vec<T, R>` is `@send` iff `T` is `@send` and `R` is sharable or
-  single-owner (per [`memory.md` §`@send` is derived from memory
-  composition](https://github.com/q64-lang/design/blob/main/memory.md)
-  — to be ported to `spec/memory.md`).
+  single-owner (per [`memory.md` §"`@send` derivation"](./memory.md)).
 - Any type containing a managed (WasmGC) reference is **not** `@send`
   — the GC arena is per-Wasm-instance.
 
