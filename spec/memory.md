@@ -169,9 +169,19 @@ arena (§"Scope's implicit arena", above), spelled `scope`:
 ```q64
 Vec<T, R: Region = scope>            // growable array
 Map<K, V, R: Region = scope>         // hash map
+Set<T, R: Region = scope>            // hash set
 String<R: Region = scope>            // owned string
 Box<T, R: Region = scope>            // single-value box
+Bytes<R: Region = scope>             // owned byte buffer; alias for Vec<u8, R>
 ```
+
+The names `Vec`, `Map`, `Set`, `Box`, `Bytes`, `String`,
+`ManagedBox`, `Atomic`, and `Shared` are in the language
+auto-prelude (per [`modules.md`](./modules.md) §"The
+auto-prelude"). Their concrete fits live in the stdlib qube
+`q64.collections` (compiled together with the language so the
+prelude can re-export them), but no `import` is required at
+the user side.
 
 `R` is a compile-time identity that names a **specific region
 value**, not a region kind. `Vec<i64, arena_a>` and

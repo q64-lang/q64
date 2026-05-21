@@ -188,13 +188,29 @@ section indexes them.
 | Category               | Names                                                          | Owning spec                                          |
 |------------------------|----------------------------------------------------------------|------------------------------------------------------|
 | Numeric primitives     | `i8`–`i64`, `u8`–`u64`, `f16`/`f32`/`f64`, `bool`              | [`types.md`](./types.md) §"The numeric tower"        |
+| Strings                | `str`, `String`                                                | [`types.md`](./types.md) §"Strings: `str` and `String<R>`" |
+| Bindings & arrays      | `let`, `var`, `[T]`, `[T; N]`, `ref`                           | [`types.md`](./types.md) §"Bindings", §"Arrays and slices", §"References" |
 | Compound numerics      | `Simd`, `Tensor`, `DynTensor`                                  | [`types.md`](./types.md) §"SIMD and Tensor as language types" |
-| Optionality / errors   | `Option`, `Result`, `T?`, `try`, `panic`, `trap`, `PanicMessage`, `Cancelled`, `RuntimeDenied`, `RangeError` | [`errors.md`](./errors.md) §"Auto-prelude additions" |
+| Optionality / errors   | `Option`, `Result`, `T?`, `try`, `panic`, `trap`, `PanicMessage`, `Cancelled`, `Closed`, `RuntimeDenied`, `RangeError` | [`errors.md`](./errors.md) §"Auto-prelude additions" |
 | Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error`, `Panic` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) |
-| Regions                | `Region`, `Arena`, `Pool`, `Stack`, `FreeList`, `Managed`, `Interned` | [`memory.md`](./memory.md) §"Region kinds"     |
+| Collections            | `Vec`, `Map`, `Set`, `Box`, `Bytes`                            | [`memory.md`](./memory.md) §"Region parameters in types" |
+| Regions                | `Region`, `Arena`, `Pool`, `Stack`, `FreeList`, `Managed`, `Interned`, `scope`, `transfer` | [`memory.md`](./memory.md) §"Region kinds"     |
+| Shared memory          | `Atomic`, `Shared`, `ManagedBox`, `Mutex`, `RwLock`, `LockFree`, `Disjoint` | [`memory.md`](./memory.md) §"Shared regions", §"`Shared<T, P>` policies" |
 | Capabilities           | `Env`, `Net`, `Fs`, `Audio`, `Midi`, `AiEnv`, `Ui`, `Clock`, `Rng`, `Stdout`, `Stderr`, `ExitFn`, `EnvVars`, `with_capabilities` | [`env.md`](./env.md) §"`Env` and its fields" |
-| Concurrency primitives | `scope`, `spawn`, `channel`, `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`, `Sender`, `Receiver`, `Policy`, `Backpressure`, `RingBuffer`, `LatestValue`, `Unbounded`, `timeout`, `sleep` | [`concurrency.md`](./concurrency.md)            |
-| Stream primitives      | `Signal`, `Event`, `Stream`, `SharedSignal`, `@stage`, `graph`, `pre`, `\|>`, `changes`, `hold`, `fold`, `sample` | [`streams.md`](./streams.md)                |
+| Concurrency primitives | `scope`, `spawn`, `channel`, `select`, `actor`, `tell`, `ask`, `Cancel`, `Handle`, `Future`, `Sender`, `Receiver`, `Policy`, `CancelPolicy`, `NonCancelPolicy`, `Backpressure`, `RingBuffer`, `LatestValue`, `Unbounded`, `timeout`, `sleep`, `SendError`, `RecvError` | [`concurrency.md`](./concurrency.md)            |
+| Stream primitives      | `Signal`, `Event`, `Stream`, `SharedSignal`, `Graph`, `@stage`, `graph`, `pre`, `\|>`, `changes`, `hold`, `fold`, `sample` | [`streams.md`](./streams.md)                |
+
+Notes on what is **not** auto-prelude:
+
+- `Convert<From, To>` — multi-parameter face; per `faces.md`,
+  every use should make the import explicit.
+- Typed-prefix string literals (`url"…"`, future `re"…"`,
+  `sql"…"`) — opt-in per the importing qube; the language
+  reserves no typed prefixes in v0.
+- Stage-classification faces (`Source`, `Sink`, `RateAware`) —
+  deferred per `faces.md` §"Open items deferred".
+- Anything from the stdlib namespaces (`q64.math`, `q64.net`,
+  `q64.fs`, …); those require explicit `import`.
 
 The prelude is curated; user code cannot add to it. New blessed names
 land via spec amendment in the owning file and are mirrored here.
