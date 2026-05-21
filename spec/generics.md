@@ -153,11 +153,23 @@ In v0:
 - `bool`.
 - Arbitrary-width integers (`u3`, `u24`) — opt-in like everywhere
   else; useful for bit-width parameters.
+- **Blessed quantity types** — the unit-tagged scalars from
+  [`types.md` §"Numeric literals and suffixes"](./types.md): `Hz`,
+  `Seconds`, `Db`, `B` / `KB` / `MB` / `GB` / `TB`, `KiB` / `MiB`
+  / `GiB`, `rad`, `deg`. These are `f64`-or-`i64`-backed phantom-
+  tagged values; the const-generic equality used by
+  monomorphization is the equality on their underlying scalar.
+  Used at the type level for dataflow rates (`Signal<f32, R>`
+  where `R: Hz` — per [`streams.md`](./streams.md)) and similar
+  units-of-measure positions. The full unit lattice lands with
+  `units.md`; in the meantime, this fixed list is the contract.
 
 Not in v0 (deferred):
 
-- Floats (`f32`, `f64`) — equality is the blocking concern; no
-  ecosystem demand yet.
+- Unblessed floats (`f32`, `f64`) — equality is the blocking
+  concern outside the quantity types above; user code uses an
+  integer encoding when it needs a non-quantity float-shaped
+  const generic.
 - `str` and string-like — comptime allocator and equality semantics
   unsettled.
 - Custom value types (kinds, enums) — requires a `ConstParamTy`-like

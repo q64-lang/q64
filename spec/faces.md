@@ -356,7 +356,7 @@ Same shape, with a region variable:
 pub face Collection<T, R: Region> {
     fn push(self: ref Self, r: R, x: T)
     fn pop(self: ref Self) -> T?
-    fn len(self) -> usize
+    fn len(self) -> i64
 }
 
 pub fit Vec<i64, Arena> : Collection<i64, Arena> { ... }
@@ -606,6 +606,8 @@ that every q64 file can name without an explicit import:
 | `From, Into` | infallible cross-type conversion (single-param)  |
 | `TryFrom, TryInto` | fallible conversion                       |
 | `Arbitrary`  | random value generator (used by property tests)  |
+| `Error`      | recoverable-error contract — owned by [`errors.md`](./errors.md) §"The `Error` face" |
+| `Panic`      | panic-payload contract — owned by [`errors.md`](./errors.md) §"The `Panic` face"; auto-derived from `Error` |
 
 `Convert` is **not** auto-prelude because its multi-parameter form is
 typically explicit at call sites; agents should see the import. The

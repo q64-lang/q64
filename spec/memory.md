@@ -199,8 +199,10 @@ The generic transfer primitive moves a value from one region to
 another. Source and target kinds determine the semantics:
 
 ```q64
-fn (v: Vec<u8, R1>) transfer<R2: Region>(to: R2) -> Vec<u8, R2>
-fn (s: str) transfer<R: Region>(to: R) -> String<R>
+// Conceptual signatures, parameterized on the source's static type.
+// The compiler synthesizes one specialization per source-region kind.
+fn transfer<R2: Region>(self: Vec<u8, R1>, to: R2) -> Vec<u8, R2>
+fn transfer<R:  Region>(self: str,         to: R)  -> String<R>
 ```
 
 | Source kind  | Target kind  | Effective semantics                                 |
@@ -297,19 +299,29 @@ shows up in `q64 show memories` (per
 
 ## `@send` derivation
 
-`@send` is a type-level predicate, derived from memory composition
-(specified in [`effects.md` §"The `@send` story"](./effects.md)).
-The derivation rules in terms of regions:
+`@send` is a type-level predicate. The derivation rules and the
+`q64 show send <type>` introspection are normatively specified in
+[`effects.md` §"The `@send` story"](./effects.md); this section
+records only the region-level inputs the derivation consumes:
 
-- Plain-value types are `@send`.
-- A struct is `@send` iff every field is `@send`.
-- A `Vec<T, R>` is `@send` iff `T: @send` and `R` is sharable
-  (a shared region) or single-owner (`@send`-by-construction).
-- A type containing a managed reference is **not** `@send` — WasmGC
-  roots are per-Wasm-instance.
+- **Linear regions** are *single-owner* — a value allocated in
+  `Arena` / `Pool` / `Stack` / `FreeList` is `@send` if and only
+  if its `T` is `@send` and the region's handle is itself
+  `@send` (i.e., the region is not borrowed by a task other than
+  the current one).
+- **Shared regions** (`@shared` structs, backed by `mem.shared`)
+  are *sharable* — their handle is `@send` by construction, so
+  `Vec<T, R>` in a shared region is `@send` whenever `T` is.
+- **Managed memory** (WasmGC) is **per-Wasm-instance**. Any type
+  whose composition includes a managed reference (a `ManagedBox<T>`,
+  a `Vec<T, Managed>`, a `@managed` struct) is **not** `@send`.
+  Crossing a thread boundary with such a value requires
+  `transfer(to: <thread-local Managed>)` on the receiving side
+  (see §"Cross-region transfers").
 
-The full table and the `q64 show send <type>` introspection are in
-the effects spec; this spec specifies only the region-level inputs.
+`effects.md` enumerates the full struct / enum / parameter
+composition rules and defines the `EFF113` / `EFF114`
+diagnostics; this spec does not duplicate them.
 
 ## Shared regions
 
@@ -356,12 +368,16 @@ Shared<T, LockFree>       // requires T: Atomic or T: ImmutableSnapshot
 Shared<T, Disjoint<F>>    // compile-time-verified disjoint field access
 ```
 
-`Atomic<T>` is the primitive for shared scalars — `Atomic<i64>`,
-`Atomic<bool>`, `Atomic<Ptr<T>>`. Backed by Wasm 3.0 atomic ops.
-Methods: `load() -> T`, `store(v: T)`, `add(v: T) -> T`,
-`sub(v: T) -> T`, `compare_exchange(expected: T, new: T) -> T`
-(returns the prior value), plus the bitwise variants on integer
-payloads (`or`, `and`, `xor`).
+`Atomic<T>` is the primitive for shared scalars. The blessed
+payload types in v0 are the integer tower (`Atomic<i32>`,
+`Atomic<i64>`, `Atomic<u32>`, `Atomic<u64>`) and `Atomic<bool>`.
+Backed by Wasm 3.0 atomic ops. Methods: `load() -> T`,
+`store(v: T)`, `add(v: T) -> T`, `sub(v: T) -> T`,
+`compare_exchange(expected: T, new: T) -> T` (returns the prior
+value), plus the bitwise variants on integer payloads (`or`,
+`and`, `xor`). Atomic pointer-sized handles (e.g. atomic
+references into shared regions) are deferred until the shared-
+reference design lands.
 
 **Memory ordering, v0.** Every `Atomic<T>` operation uses
 **sequentially-consistent** ordering — the strongest Wasm 3.0

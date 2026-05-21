@@ -76,19 +76,21 @@ Test infrastructure provides another (`q64.test.MockEnv`).
 
 ### Constructing capabilities — capabilities as faces
 
-Each capability is a face, not a sealed type:
+Each capability is a face, not a sealed type. Face methods use
+the standard `(self, …)` receiver per
+[`faces.md` §"Method signatures"](./faces.md):
 
 ```q64
-face Net {
-    fn (n: Self) get  (url: Url) -> Response @io @network
-    fn (n: Self) post (url: Url, body: Bytes) -> Response @io @network
-    fn (n: Self) ws_connect(url: Url) -> Result<WebSocket, Error> @io @network
+pub face Net {
+    fn get        (self, url: Url) -> Result<Response, IoError> @io @network
+    fn post       (self, url: Url, body: Bytes) -> Result<Response, IoError> @io @network
+    fn ws_connect (self, url: Url) -> Result<WebSocket, IoError> @io @network
     // …
 }
 
-face Fs {
-    fn (f: Self) read  (path: str) -> Result<Bytes, IoError> @io @fs
-    fn (f: Self) write (path: str, data: Bytes) -> Result<(), IoError> @io @fs
+pub face Fs {
+    fn read  (self, path: str)                -> Result<Bytes, IoError> @io @fs
+    fn write (self, path: str, data: Bytes)   -> Result<(), IoError>    @io @fs
     // …
 }
 ```
@@ -98,9 +100,9 @@ Wasmtime → `WasmtimeNet`; etc.); the user code never names the
 concrete fit. Test code and libraries provide their own fits:
 
 ```q64
-fit MockNet : Net {
-    fn (m: MockNet) get(url: Url) -> Response {
-        m.lookup(url).unwrap_or(Response.not_found())
+pub fit MockNet : Net {
+    fn get(self, url: Url) -> Result<Response, IoError> {
+        Ok(self.lookup(url).unwrap_or(Response.not_found()))
     }
     // …
 }
@@ -109,7 +111,7 @@ fit MockNet : Net {
 fn test_fetch_users() {
     let n = MockNet.new()
         .on_get(url"https://api.example.com/users", body: r#"[{"name":"Ada"}]"#)
-    let users = fetch_users(n, url"https://api.example.com/users")?
+    let users = try fetch_users(n, url"https://api.example.com/users")
     assert(users.len() == 1)
 }
 ```
@@ -125,10 +127,11 @@ individually:
 
 ```q64
 let n: Net = env.net
-fetch_users(n, url"…")?
+let users = try fetch_users(n, url"…")
 
 let (logs, audio) = (env.fs, env.audio)        // pair them up
-audio.write(generate(logs.read("track.q64")?))
+let track = try logs.read("track.q")
+try audio.write(generate(track))
 ```
 
 The smallest-capability passing convention (§Passing) builds on
@@ -139,12 +142,15 @@ this: helpers take the field type they need.
 `main` may be declared two ways. Both are valid; the runtime
 dispatches on the return type.
 
-### Form 1 — falls off the end
+### Form 1 — falls off the end (`panic`-on-error)
 
 ```q64
 fn main(env: Env) {
     let path = env.args[1]
-    let content = env.fs.read(path)?           // ← `?` panics on Err
+    let content = match env.fs.read(path) {
+        Ok(b)  -> b,
+        Err(e) -> panic e,
+    }
     env.out(content)
 }
 ```
@@ -152,15 +158,20 @@ fn main(env: Env) {
 - Falling off the end = exit 0.
 - `env.exit(N, msg?)` terminates with code N (and optional
   stderr message).
-- `?` on `Err` panics; the runtime translates the panic to an
-  exit code per the table in [`q64-cli.md`](./q64-cli.md).
+- Form 1 has no `Result` return type, so `try` propagation is
+  unavailable (`TYP300`). Recoverable errors are turned into
+  panics with the `match … panic e` shape above when the
+  application's policy is "any error is fatal." Errors fitting
+  `Error` also fit `Panic` (auto-derive bridge from
+  [`errors.md`](./errors.md)), so the runtime's exit-code
+  mapping in [`q64-cli.md`](./q64-cli.md) still applies.
 
 ### Form 2 — returns `Result`
 
 ```q64
 fn main(env: Env) -> Result<(), Error> {
     let path = env.args[1]
-    let content = env.fs.read(path)?           // ← `?` propagates Err
+    let content = try env.fs.read(path)        // ← `try` propagates Err
     env.out(content)
     Ok(())
 }
@@ -169,14 +180,16 @@ fn main(env: Env) -> Result<(), Error> {
 - `Ok(())` = exit 0.
 - `Err(e)` = exit `e.exit_code` (per `errors.md`'s `Error` face;
   default 1 if not specified).
-- `?` propagates `Err` to the return; no panic.
+- `try` propagates `Err` to the return; no panic.
 - `env.exit(N)` still works for explicit overrides.
 
-The two forms exist because `?` ergonomics differ: in Form 1, a
-deeply chained `?` panics and the runtime maps the panic to an
-exit code, which is fine for one-shot CLIs but loses error
-context. Form 2 keeps the error propagation explicit and the
-exit code is derived from the error type.
+The two forms exist for different cost contracts. Form 1 is the
+"crash on first error" CLI shape — verbose at each fallible call
+site but ergonomic at the top level where panic-equals-exit is
+the natural policy. Form 2 keeps error propagation explicit
+through `try` and derives the exit code from the error type;
+preferred for any application that wants to distinguish error
+kinds cleanly.
 
 Falling off the end is `ENV050` ("`main` returns a value but
 ends without explicit return") in Form 2.
@@ -228,14 +241,14 @@ called scope" as exempt (`ENV011` suppressed).
 
 A `with_capabilities` block dynamically revokes the named
 capabilities for the duration of its body. Calls into the
-revoked capabilities raise `ENV030` ("capability denied") at the
-point of use:
+revoked capabilities unwind with `panic RuntimeDenied { code:
+"ENV030", detail: … }` at the point of use:
 
 ```q64
 fn run_plugin(env: Env, plugin: PluginFn) {
     with_capabilities(deny: [Net, Fs]) {
         plugin(env)                              // plugin still has env, but
-                                                 // net + fs calls raise ENV030
+                                                 // net + fs calls panic RuntimeDenied
     }
     // capabilities restored here
 }
@@ -243,19 +256,22 @@ fn run_plugin(env: Env, plugin: PluginFn) {
 
 Syntax: `with_capabilities(deny: [<face>, …]) { <body> }`. The
 list names capability faces; calls on any value fitting one of
-those faces, inside the block (transitively), raise `ENV030`.
+those faces, inside the block (transitively), unwind with
+`panic RuntimeDenied { code: "ENV030", … }`. `RuntimeDenied` is
+the auto-prelude `Panic`-fitting payload from
+[`errors.md`](./errors.md).
 
 ### Semantics
 
 - Implemented as a thread-local "denied set." Each capability
-  method checks the set on entry and raises `ENV030` if its face
-  is in the set.
+  method checks the set on entry and panics `RuntimeDenied` if
+  its face is in the set.
 - The block restores the previous denied set on exit (LIFO).
 - Nested `with_capabilities` blocks compose by union: inner
   block's denials are added to the outer's.
 - The denial is **runtime-enforced**, not type-level. A function
   receiving `n: Net` inside a `deny: [Net]` block has a valid
-  `Net` value; the value's methods fail at runtime.
+  `Net` value; the value's methods unwind at call time.
 
 ### Why runtime, not type-level
 
@@ -269,16 +285,18 @@ sandboxer, not on every function in the call graph.
 
 `q64 show denials <fn>` prints the call sites where
 `with_capabilities` is used, and the static "this function
-called inside a denial block could fail with ENV030" analysis
+called inside a denial block could panic RuntimeDenied" analysis
 flows through. Sandboxing isn't invisible — it's just not in the
 type.
 
 ### Cancellation interaction
 
-A `ENV030` raise is a panic; it propagates per
-[`concurrency.md`](./concurrency.md) §"Panics across tasks".
-Plugins that may legitimately attempt denied calls should be
-spawned in a scope with a `catch (e: Panic)` block.
+A capability denial unwinds via `panic RuntimeDenied`; it
+propagates per [`concurrency.md`](./concurrency.md) §"Panics
+across tasks". Plugins that may legitimately attempt denied
+calls should be spawned in a scope with a typed
+`catch (e: RuntimeDenied) { … }` (or the catch-all `catch (e:
+Panic) { … }`) block.
 
 ## Capability disclosure
 
@@ -325,8 +343,8 @@ ERR ENV040: capability mismatch — manifest claims [Net, Fs]
             but compiler derived [Net, Fs, Audio]
 
   Audio appears via:
-    src/notify.q64:42  → q64.audio.beep()
-    src/notify.q64:53  → q64.audio.beep()
+    src/notify.q:42  → q64.audio.beep()
+    src/notify.q:53  → q64.audio.beep()
 
   Fix:
     qube.json5:  capabilities: ["Net", "Fs", "Audio"]
@@ -360,9 +378,9 @@ Every capability method carries the corresponding effect (per
 [`effects.md`](./effects.md)):
 
 ```q64
-face Net {
-    fn (n: Self) get(url: Url) -> Response @io @network
-    fn (n: Self) post(url: Url, body: Bytes) -> Response @io @network
+pub face Net {
+    fn get  (self, url: Url)               -> Result<Response, IoError> @io @network
+    fn post (self, url: Url, body: Bytes)  -> Result<Response, IoError> @io @network
     // …
 }
 ```
@@ -427,20 +445,25 @@ fn main(env: Env) {
         env.exit(2, "usage: cat <file>")
     }
     let path = env.args[1]
-    let content = env.fs.read(path)?
+    let content = match env.fs.read(path) {
+        Ok(b)  -> b,
+        Err(e) -> panic e,
+    }
     env.out(content)
 }
 ```
 
-`?` on `Err` panics → exit code 1 (per `q64-cli.md`).
+An uncaught panic from a Form 1 `main` → exit code 1 (or the
+payload's `exit_code` when the payload also fits `Error`, per
+`q64-cli.md`).
 
 ### CLI with Result propagation (Form 2)
 
 ```q64
 fn main(env: Env) -> Result<(), Error> {
-    let path = env.args.get(1)
-        .ok_or(Error.usage(code: 2, msg: "usage: cat <file>"))?
-    let content = env.fs.read(path)?
+    let path = try env.args.get(1)
+        .ok_or(Error.usage(code: 2, msg: "usage: cat <file>"))
+    let content = try env.fs.read(path)
     env.out(content)
     Ok(())
 }
@@ -452,11 +475,12 @@ fn main(env: Env) -> Result<(), Error> {
 
 ```q64
 pub fn fetch_user(n: Net, id: UserId) -> Result<User, Error> {
-    n.get(url"https://api.q64.dev/users/{id}").json<User>()
+    let resp = try n.get(url"https://api.q64.dev/users/{id}")
+    resp.json<User>()
 }
 
 fn main(env: Env) -> Result<(), Error> {
-    let user = fetch_user(env.net, UserId.from(42))?
+    let user = try fetch_user(env.net, UserId.from(42))
     env.out("got user: {user.name}")
     Ok(())
 }
@@ -466,12 +490,13 @@ fn main(env: Env) -> Result<(), Error> {
 
 ```q64
 @test
-fn test_fetch_user() {
+fn test_fetch_user() -> Result<(), Error> {
     let n = MockNet.new()
         .on_get(url"https://api.q64.dev/users/42",
                 body: r#"{"id":42,"name":"Ada"}"#)
-    let u = fetch_user(n, UserId.from(42))?
+    let u = try fetch_user(n, UserId.from(42))
     assert(u.name == "Ada")
+    Ok(())
 }
 ```
 
@@ -482,16 +507,13 @@ production `fetch_user` doesn't know or care.
 
 ```q64
 fn run_user_plugin(env: Env, plugin: PluginFn) -> Result<(), Error> {
-    let result = scope {
+    scope {
         with_capabilities(deny: [Net, Fs]) {
             plugin(env)                          // plugin can't escape
         }
-    } catch (e: Panic) {
-        if e.code == "ENV030" {
-            log.warn("plugin attempted denied capability: {e.detail}")
-            return Err(Error.plugin_denied(e.detail))
-        }
-        raise e                                  // unrelated panic; propagate
+    } catch (e: RuntimeDenied) {
+        log.warn("plugin attempted denied capability: {e.code} — {e.detail}")
+        return Err(Error.plugin_denied(e.detail))
     }
     Ok(())
 }
@@ -500,11 +522,12 @@ fn run_user_plugin(env: Env, plugin: PluginFn) -> Result<(), Error> {
 ### Disclosure walkthrough
 
 ```q64
-// src/main.q64
-fn main(env: Env) {
-    let body = env.net.get(url"https://example.com").body()    // @network
-    env.fs.write("body.txt", body)                              // @fs
-    env.out("done")                                              // @stdio
+// src/main.q
+fn main(env: Env) -> Result<(), Error> {
+    let body = try env.net.get(url"https://example.com").body()  // @network
+    try env.fs.write("body.txt", body)                            // @fs
+    env.out("done")                                                // @stdio
+    Ok(())
 }
 ```
 
@@ -521,7 +544,7 @@ $ qube publish
 ERR ENV040: capability mismatch — manifest [Net, Fs] vs derived [Net, Fs, Stdout]
 
   Stdout appears via:
-    src/main.q64:5  → env.out("done")
+    src/main.q:5  → env.out("done")
 
   Fix: add "Stdout" to capabilities, or remove the env.out call.
 ```

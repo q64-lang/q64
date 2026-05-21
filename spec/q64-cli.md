@@ -102,7 +102,7 @@ stdout.
 | Exit  | Meaning                                                          |
 |-------|------------------------------------------------------------------|
 | `0`   | Success                                                          |
-| `1`   | Program panicked (`panic!(...)` in user code)                    |
+| `1`   | Program panicked (`panic <payload>` in user code; uncaught at top level) |
 | `2`   | Usage error (bad flags, missing args)                            |
 | `64`  | Compile error (any `error`-severity diagnostic)                  |
 | `65`  | Input error (file not found, unreadable)                         |
