@@ -10,7 +10,7 @@ actor Counter {
     }
 }
 
-fn main(env: Env) {
+fn main {
     scope {
         let c = Counter.spawn()
         c.tell(Get)

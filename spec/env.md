@@ -4,45 +4,138 @@ The capability surface. How a q64 program reaches the outside
 world — network, filesystem, audio, time, random, UI — and how
 it doesn't reach anything it wasn't given.
 
-q64's I/O model is **passed, not ambient**. There is no global
-`stdout`, no global `Date.now()`, no global `fetch()`. Every
-side-effecting operation goes through a capability value the
-program received from its caller (ultimately, the runtime). This
-spec specifies what those values look like, who can construct
-them, how they're passed around, and how the package registry
-discloses what a qube uses.
+q64's I/O model is **ambient and typed**, in the SwiftUI
+`@Environment` shape: the runtime hands the program a root `env`
+binding; every function inside the program reads from it directly
+(`env.out`, `env.fs.read`, …) without declaring `env` as a
+parameter; the compiler walks the references and synthesizes an
+implicit parameter at each function boundary so the capability
+flow remains statically tracked and overridable. Sandboxing,
+testing, and capability disclosure all hang off the same single
+mechanism: shadow the ambient binding.
+
+> **Status: v0 redesign.** Supersedes the earlier "passed, not
+> ambient" model. The diagnostic numbering is preserved where it
+> still applies; `ENV010` / `ENV011` (over-broad capability
+> parameter) are retired. A follow-up sweep across `errors.md`,
+> `concurrency.md`, `streams.md`, `faces.md`, `effects.md`,
+> `memory.md`, and `spec/tests/golden/` is required to remove
+> the residual `env: Env` parameters from their examples; tracked
+> in [`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md).
 
 ## Design goals
 
-1. **No ambient capabilities.** Stdout is `env.out`, not a global.
-   The network is `env.net`. Code that doesn't take a capability
-   can't use it.
-2. **Smallest-capability passing.** A helper that needs the
-   network takes `n: Net`, not `env: Env`. The signature
-   documents what it touches.
-3. **Capabilities are faces.** Per [`faces.md`](./faces.md):
-   `Net`, `Fs`, `Audio`, etc. are faces. The runtime provides one
-   fit per capability; user code (tests, libraries, sandboxing
-   layers) provides others.
-4. **Disclosure is mechanical.** The compiler derives the
-   capability set from the effect graph
-   ([`effects.md`](./effects.md)); the registry surfaces it at
-   install. Manifest declarations are cross-checked, not trusted.
-5. **Sandboxing is block-scoped.** A `with_capabilities` block
-   revokes capabilities for its duration; the call graph inside
-   sees them as denied.
+1. **Ambient, not threaded.** A function that uses `env.out`
+   writes `env.out("…")` and stops. It does not declare an `env`
+   parameter; the compiler adds one.
+2. **Typed, not global.** The `env` binding has a static type
+   (`Env`); each field has a static face (`Net`, `Fs`, …). A
+   reference to `env.net` contributes `Net` to the function's
+   inferred capability set. Capability disclosure is mechanical
+   from the call graph, exactly as before.
+3. **Overridable at any node.** A `with_capabilities { … }` block
+   shadows the ambient binding for the duration of its body.
+   Production code, tests, plugins, and sandboxes all use the
+   same mechanism.
+4. **No coloring.** Capability use does not require a syntax
+   marker at the call site beyond `env.X` itself. Helper
+   functions read `env.fs` the same way `main` does. The only
+   `pub`-boundary requirement is that the function's inferred
+   capability set match its declared effects (`effects.md`) and
+   the qube's manifest (`qube.json5.md`).
+5. **AI-agent friendly.** `grep 'env\.net\.'` enumerates every
+   network call site; `qube audit` prints the full transitive
+   capability set per dependency; the registry surfaces the same
+   set at install.
 
 ## Vocabulary
 
-| Word              | Meaning                                                                              |
-|-------------------|--------------------------------------------------------------------------------------|
-| **`Env`**         | The top-level capability bundle. A struct with one field per capability category.    |
-| **capability**    | A face whose fits perform a category of I/O (Net, Fs, Audio, …).                      |
-| **sub-capability**| A field of `Env`; an individual capability value (e.g., `env.net: Net`).             |
-| **fit**           | Per `faces.md` — a concrete type fitting a capability face.                          |
-| **denial**        | Runtime-enforced revocation via `with_capabilities`.                                  |
-| **manifest**      | `qube.json5`'s `capabilities` field — developer-asserted summary.                    |
-| **derived set**   | Compiler-computed capability set; emitted into a Wasm custom section.                |
+| Word                     | Meaning                                                                              |
+|--------------------------|--------------------------------------------------------------------------------------|
+| **`Env`**                | The top-level capability bundle. A struct with one field per capability category.    |
+| **ambient env binding**  | The lexically-scoped `env` value visible at every reference site in a call tree.     |
+| **capability**           | A face whose fits perform a category of I/O (Net, Fs, Audio, …).                     |
+| **sub-capability**       | A field of `Env`; an individual capability value (e.g., `env.net: Net`).             |
+| **fit**                  | Per `faces.md` — a concrete type fitting a capability face.                          |
+| **implicit env parameter** | The parameter the compiler synthesizes at a function boundary when its body references `env.X`. Not visible in the surface signature. |
+| **shadowing**            | A `with_capabilities { … }` block replaces the ambient binding for its sub-tree.    |
+| **derived set**          | Compiler-computed capability set; emitted into a Wasm custom section.                |
+
+## How the ambient binding works
+
+A reference to `env` (or any sub-capability path: `env.net`,
+`env.fs.read(…)`, …) inside a function body desugars to a
+**synthesized implicit parameter**, the same machinery as
+[`generics.md` §"Implicit face parameters"](./generics.md) — the
+parameter is computed from the body's references, then threaded
+at every call site from the enclosing lexical binding.
+
+### Inference rule
+
+For a function body `f`:
+
+1. Collect every `env.X` reference where `X` resolves to a field
+   of `Env` or to a sub-path through one.
+2. Compute the **minimum face** that covers those references:
+   - If the body references only `env.out`, the minimum face is
+     `Stdout`.
+   - If it references `env.out` and `env.fs.read(…)`, the minimum
+     covering shape is `{ out: Stdout, fs: Fs }` — a partial `Env`
+     binding with two fields.
+   - If it references `env.net`, `env.fs`, and `env.audio`, the
+     minimum covering shape is `{ net: Net, fs: Fs, audio: Audio }`.
+3. The compiler adds one **synthesized parameter per distinct
+   sub-capability** (Net, Fs, Audio, …). The function's surface
+   signature is unchanged; the implicit parameters are visible
+   only via `q64 show env <fn>` (per
+   [`q64-cli.md`](./q64-cli.md)).
+
+The synthesized parameters carry the corresponding effect markers
+per [`effects.md`](./effects.md): a `Net` parameter contributes
+`@network` to the function's inferred effect set; an `Fs`
+parameter contributes `@fs`; etc.
+
+### Threading rule
+
+At each call site `f(…)` where `f` has synthesized capability
+parameters, the compiler threads each parameter from the
+**lexically nearest binding** of the corresponding sub-capability.
+The default binding source is the ambient `env`; a
+`with_capabilities { … }` block introduces a new binding for the
+duration of its sub-tree.
+
+```q64
+pub fn fetch_users(url: Url) -> Result<[User], Error> {
+    env.net.get(url).json<[User]>()        // env.net referenced
+}
+// Surface signature: fetch_users(url: Url) -> Result<[User], Error> @network
+// Synthesized:       fetch_users<N: Net>(n: N, url: Url) -> … @network
+
+fn main {                                   // env provided by runtime
+    let users = try fetch_users(url"…")
+    env.out("found {users.len()} users")
+}
+```
+
+The synthesis is per-call-site monomorphization, sharing the
+binary-size considerations of the explicit form (per
+[`faces.md` §"Cost we accept"](./faces.md)).
+
+### Reading vs. naming
+
+| Form                                       | What it does                                                                 |
+|--------------------------------------------|------------------------------------------------------------------------------|
+| `env.out("…")`                              | Reads the ambient `env`. Synthesizes a `Stdout` parameter for the function. |
+| `env.fs.read(path)`                         | Reads the ambient `env`. Synthesizes an `Fs` parameter.                     |
+| `let n: Net = env.net`                      | Names the sub-capability as a local. Still synthesizes via `env.net`.       |
+| `pub fn helper(n: Net, …)` (explicit form)  | Declares the parameter manually. Caller passes the value at the call site.  |
+
+The explicit form is **still valid** and is the right choice when
+a function needs to be parametric over which `Net` it gets — e.g.,
+library code that may be handed a mock or a custom adapter without
+relying on the lexical `with_capabilities` mechanism. Both forms
+coexist; the inferred form is the default for application and
+helper code.
 
 ## `Env` and its fields
 
@@ -71,10 +164,10 @@ in user qubes or higher-layer stdlib packages — they extend the
 capability surface via their own faces and constructors.
 
 `Env` itself is also a face (its fields are field-faces, in
-generics.md terminology); a runtime-provided `Env` is one fit.
-Test infrastructure provides another (`q64.test.MockEnv`).
+`generics.md` terminology); the runtime provides one fit. Test
+infrastructure provides another (`q64.test.MockEnv`).
 
-### Constructing capabilities — capabilities as faces
+### Capabilities as faces
 
 Each capability is a face, not a sealed type. Face methods use
 the standard `(self, …)` receiver per
@@ -85,23 +178,18 @@ pub face Net {
     fn get        (self, url: Url) -> Result<Response, IoError> @network
     fn post       (self, url: Url, body: Bytes) -> Result<Response, IoError> @network
     fn ws_connect (self, url: Url) -> Result<WebSocket, IoError> @network
-    // …
 }
 
 pub face Fs {
     fn read  (self, path: str)                -> Result<Bytes, IoError> @fs
     fn write (self, path: str, data: Bytes)   -> Result<(), IoError>    @fs
-    // …
 }
 ```
 
 Effects compose with `+` per
-[`effects.md` §"Effect annotations on functions"](./effects.md); a
-method with two markers writes them as `@a + @b`. `Net.get` lists
-only `@network` because `@network` implies `@io` (per the core
-implication graph) — declaring both would be redundant. `Fs.read`
-lists `@fs` for the same reason; the implication tables in
-[`effects.md`](./effects.md) cover the closures.
+[`effects.md` §"Effect annotations on functions"](./effects.md);
+the implication graph closes capability markers into `@io` as
+needed.
 
 ### Capability methods and cancellation
 
@@ -113,61 +201,26 @@ result. This keeps the simple `try env.net.get(url)` shape free
 of ctx threading.
 
 Cancellation-aware variants live one layer up, in the `q64.net.http`
-/ `q64.fs.aio` / similar sub-modules. They are free functions that
-take both the capability value and a `ctx: Cancel`:
+/ `q64.fs.aio` / similar sub-modules:
 
 ```q64
 // Lives in q64.net.http; the concurrency.md examples use this form.
-pub fn get(ctx: Cancel, n: Net, url: Url)
+pub fn get(ctx: Cancel, url: Url)
     -> Result<Response, IoError> @cancel + @network
+{
+    env.net.get(url)        // ambient env; same runtime fit
+}
 ```
 
-Use the capability method when the call site has no `ctx` (or
-doesn't want to thread one); use the `http.*` free-function form
-when the caller needs cooperative cancellation. The two paths
-ride on the same fit of the underlying capability face.
+`ctx` is still an explicit parameter — cancellation is a
+control-flow concern, not a capability, so it does not ride on
+the ambient mechanism. Capabilities are *what you may touch*;
+`ctx` is *whether you may continue*.
 
 The runtime ships exactly one fit per face (browser → `BrowserNet`;
-Wasmtime → `WasmtimeNet`; etc.); the user code never names the
-concrete fit. Test code and libraries provide their own fits:
-
-```q64
-pub fit MockNet : Net {
-    fn get(self, url: Url) -> Result<Response, IoError> {
-        Ok(self.lookup(url).unwrap_or(Response.not_found()))
-    }
-    // …
-}
-
-@test
-fn test_fetch_users() {
-    let n = MockNet.new()
-        .on_get(url"https://api.example.com/users", body: r#"[{"name":"Ada"}]"#)
-    let users = try fetch_users(n, url"https://api.example.com/users")
-    assert(users.len() == 1)
-}
-```
-
-User libraries also fit capability faces to add adapters
-(`fit S3Fs : Fs`, `fit OscMidi : Midi`).
-
-### Sub-capabilities are values
-
-Because capability fields are values (whose types fit the
-corresponding face), they can be assigned, named, passed
-individually:
-
-```q64
-let n: Net = env.net
-let users = try fetch_users(n, url"…")
-
-let (logs, audio) = (env.fs, env.audio)        // pair them up
-let track = try logs.read("track.q")
-try audio.write(generate(track))
-```
-
-The smallest-capability passing convention (§Passing) builds on
-this: helpers take the field type they need.
+Wasmtime → `WasmtimeNet`; etc.); user code never names the
+concrete fit. Test code and libraries provide their own fits
+through the override mechanism below.
 
 ## `main` signature
 
@@ -177,7 +230,7 @@ dispatches on the return type.
 ### Form 1 — falls off the end (`panic`-on-error)
 
 ```q64
-fn main(env: Env) {
+fn main {
     let path = env.args[1]
     let content = match env.fs.read(path) {
         Ok(b)  -> b,
@@ -190,20 +243,19 @@ fn main(env: Env) {
 - Falling off the end = exit 0.
 - `env.exit(N, msg?)` terminates with code N (and optional
   stderr message).
-- Form 1 has no `Result` return type, so `try` propagation is
-  unavailable (`TYP300`). Recoverable errors are turned into
-  panics with the `match … panic e` shape above when the
-  application's policy is "any error is fatal." Errors fitting
-  `Error` also fit `Panic` (auto-derive bridge from
-  [`errors.md`](./errors.md)), so the runtime's exit-code
-  mapping in [`q64-cli.md`](./q64-cli.md) still applies.
+- No `Result` return type, so `try` propagation is unavailable
+  (`TYP300`). Recoverable errors turn into panics via
+  `match … panic e` when the application's policy is "any error
+  is fatal." Errors fitting `Error` also fit `Panic` (auto-derive
+  bridge from [`errors.md`](./errors.md)), so the runtime's
+  exit-code mapping in [`q64-cli.md`](./q64-cli.md) still applies.
 
 ### Form 2 — returns `Result`
 
 ```q64
-fn main(env: Env) -> Result<(), Error> {
+fn main -> Result<(), Error> {
     let path = env.args[1]
-    let content = try env.fs.read(path)        // ← `try` propagates Err
+    let content = try env.fs.read(path)
     env.out(content)
     Ok(())
 }
@@ -215,124 +267,157 @@ fn main(env: Env) -> Result<(), Error> {
 - `try` propagates `Err` to the return; no panic.
 - `env.exit(N)` still works for explicit overrides.
 
-The two forms exist for different cost contracts. Form 1 is the
-"crash on first error" CLI shape — verbose at each fallible call
-site but ergonomic at the top level where panic-equals-exit is
-the natural policy. Form 2 keeps error propagation explicit
-through `try` and derives the exit code from the error type;
-preferred for any application that wants to distinguish error
-kinds cleanly.
-
-Falling off the end is `ENV050` ("`main` returns a value but
-ends without explicit return") in Form 2.
-
-## Passing convention: smallest sub-capability
-
-Helpers take the smallest sub-capability they need. A function
-that does HTTP takes `n: Net`, not `env: Env`:
+### Explicit-env forms (still valid)
 
 ```q64
-pub fn fetch_users(n: Net, url: Url) -> Result<[User], Error> {
-    n.get(url).json<[User]>()
+fn main(env: Env) { … }
+fn main(env: Env) -> Result<(), Error> { … }
+```
+
+Naming `env` explicitly is permitted for visibility — useful when
+documenting the entry point, for tests that want to receive a
+prepared `MockEnv` directly, or in library code that publishes a
+`main`-like helper. The body is identical to the implicit forms;
+inside, `env` resolves to the parameter rather than the runtime-
+provided binding.
+
+`ENV050` ("`main` Form 2 ends without explicit return") and
+`ENV052` ("`main` signature mismatch") apply unchanged. `ENV051`
+("`main` not declared") now permits any of the four forms above.
+
+## Overriding the ambient binding — `with_capabilities { … }`
+
+A `with_capabilities` block shadows the ambient `env` binding for
+the duration of its body. Two override flavors, composable:
+
+```q64
+with_capabilities(deny: [Net, Fs]) {
+    plugin()                             // env.net / env.fs panic RuntimeDenied
 }
 
-pub fn write_config<F: Fs>(f: F, path: str, cfg: Config) -> Result<(), IoError> {
-    f.write(path, cfg.serialize())
+with_capabilities(use: { net: MockNet.new() }) {
+    fetch_users(url"…")                  // env.net resolves to MockNet
+}
+
+with_capabilities(
+    use:  { net: MockNet.new() },
+    deny: [Fs],
+) {
+    integration_test()                   // mocked net, denied fs
 }
 ```
 
-`fn fetch_users(n: Net, …)` is shorthand for
-`fn fetch_users<N: Net>(n: N, …)` per
-[`generics.md` §"Implicit face parameters"](./generics.md):
-face-typed parameters introduce an anonymous generic bound by the
-face. The compiler dispatches the calls statically (monomorphized
-per concrete fit).
+Syntax:
 
-`q64 fmt --lint` issues `ENV010` when a function takes
-`env: Env` but uses only one or two sub-capabilities:
-
-```q64
-fn fetch_users(env: Env, url: Url) -> Result<[User], Error> {
-//             ^^^^^^^^^ ENV010: over-broad capability parameter; uses only `env.net`
-    env.net.get(url).json<[User]>()
-}
+```
+WithCapsStmt := "with_capabilities" "(" CapsOverrides ")" Block
+CapsOverrides
+            := ("use" ":" "{" CapField ("," CapField)* ","? "}")?
+               ("," "deny" ":" "[" FaceRef ("," FaceRef)* ","? "]")?
+CapField    := IDENT ":" Expr        (* e.g., net: MockNet.new() *)
 ```
 
-`ENV010` is suppressible with `@allow(ENV010)`. Take `env: Env`
-when you genuinely need multiple sub-capabilities and the
-combinatorics make face bounds noisier than the alternative.
-
-### Top-level helpers vs library functions
-
-The convention applies most strongly at library boundaries:
-exported library functions name their capabilities precisely
-because callers need to know what they require. Application code
-in `main`-adjacent scopes may take `env: Env` freely; the lint
-recognizes "called only from `main` or directly from a `main`-
-called scope" as exempt (`ENV011` suppressed).
-
-## Sandboxing: `with_capabilities { … }`
-
-A `with_capabilities` block dynamically revokes the named
-capabilities for the duration of its body. Calls into the
-revoked capabilities unwind with `panic RuntimeDenied { code:
-"ENV030", detail: … }` at the point of use:
-
-```q64
-pub type PluginFn = fn(env: Env)
-
-fn run_plugin(env: Env, plugin: PluginFn) {
-    with_capabilities(deny: [Net, Fs]) {
-        plugin(env)                              // plugin still has env, but
-                                                 // net + fs calls panic RuntimeDenied
-    }
-    // capabilities restored here
-}
-```
-
-Syntax: `with_capabilities(deny: [<face>, …]) { <body> }`. The
-list names capability faces; calls on any value fitting one of
-those faces, inside the block (transitively), unwind with
-`panic RuntimeDenied { code: "ENV030", … }`. `RuntimeDenied` is
-the auto-prelude `Panic`-fitting payload from
-[`errors.md`](./errors.md).
+`use:` provides a value for one or more `Env` fields; the new
+binding is in scope inside the block. `deny:` lists faces whose
+calls must unwind with `panic RuntimeDenied`. Both arguments are
+optional; at least one must be present.
 
 ### Semantics
 
-- Implemented as a thread-local "denied set." Each capability
-  method checks the set on entry and panics `RuntimeDenied` if
-  its face is in the set.
-- The block restores the previous denied set on exit (LIFO).
-- Nested `with_capabilities` blocks compose by union: inner
-  block's denials are added to the outer's.
-- The denial is **runtime-enforced**, not type-level. A function
-  receiving `n: Net` inside a `deny: [Net]` block has a valid
-  `Net` value; the value's methods unwind at call time.
+- **`use:`** introduces a fresh `env` binding inside the block.
+  The new binding has the listed fields replaced; unlisted fields
+  inherit from the enclosing binding. The compiler resolves the
+  inferred capability parameters of every call inside the block
+  to the new binding.
+- **`deny:`** is a runtime denial set (per the earlier spec).
+  Capability methods check the set on entry and panic
+  `RuntimeDenied` if their face is listed. The denied set
+  composes with the enclosing one by union; nested blocks
+  accumulate denials.
+- The block restores the previous binding on exit (LIFO).
+- **`use:` substitutions are compile-time-resolved**; the
+  compiler statically routes references to the new binding.
+  **`deny:` is runtime-enforced**; a value passed out of the
+  block (e.g., into a returned closure) carries the denial in
+  its captured environment.
 
-### Why runtime, not type-level
+### Why two override mechanisms
 
-A pure type-level denial would require parametrizing every
-function over its denial set, which propagates virally through
-signatures. The runtime mechanism is the pragmatic compromise:
-sandboxing is rare; the language-level cost should fall on the
-sandboxer, not on every function in the call graph.
+`use:` is the testing / mocking story — replace one capability
+with a controlled fit. `deny:` is the sandboxing story — strip a
+capability for a sub-tree, even if the code inside believes it
+has one. They compose: a sandbox can both deny `Fs` and supply
+a mock `Net`.
 
-### Auditability
-
-`q64 show denials <fn>` prints the call sites where
-`with_capabilities` is used, and the static "this function
-called inside a denial block could panic RuntimeDenied" analysis
-flows through. Sandboxing isn't invisible — it's just not in the
-type.
-
-### Cancellation interaction
-
-A capability denial unwinds via `panic RuntimeDenied`; it
+Cancellation interaction is unchanged: a `RuntimeDenied` panic
 propagates per [`concurrency.md`](./concurrency.md) §"Panics
-across tasks". Plugins that may legitimately attempt denied
-calls should be spawned in a scope with a typed
-`catch (e: RuntimeDenied) { … }` (or the catch-all `catch (e:
-Panic) { … }`) block.
+across tasks"; intercept it with a typed
+`catch (e: RuntimeDenied) { … }` arm.
+
+## Inferred capability set — what `pub` exposes
+
+A function's capability set is the union of:
+
+1. Synthesized parameters from `env.X` references in its body.
+2. Explicit face-typed parameters in its signature (e.g., `n: Net`).
+3. Transitive contributions from callees' sets.
+
+For a `pub` function, the inferred set is part of the qube's
+public surface. The compiler emits the set into the function's
+effect signature and (per `effects.md`) verifies it matches any
+explicit effect annotation. The qube manifest's `capabilities`
+field is cross-checked against the union of all `pub` items' sets
+at `qube publish` time (`ENV040`).
+
+The inferred set is computed **after** `with_capabilities`
+resolution: a function whose body wraps every call in
+`with_capabilities(deny: [Net, Fs]) { … }` does **not** contribute
+those capabilities to its inferred set if the denial fully covers
+the call paths. (In practice, denials are leaves of a call tree;
+this rule matters mostly for sandboxing plugins.)
+
+`q64 show env <fn>` prints:
+
+- The synthesized capability parameters for the function.
+- Their contribution to the effect set.
+- Per call site, which ambient binding the parameter routes to.
+
+## Testing with mocks
+
+The mock pattern is the `use:` override:
+
+```q64
+pub fit MockNet : Net {
+    fn get(self, url: Url) -> Result<Response, IoError> {
+        Ok(self.lookup(url).unwrap_or(Response.not_found()))
+    }
+    // …
+}
+
+@test
+fn test_fetch_users() {
+    with_capabilities(use: { net: MockNet.new()
+        .on_get(url"https://api.example.com/users",
+                body: r#"[{"name":"Ada"}]"#) }) {
+        let users = try fetch_users(url"https://api.example.com/users")
+        assert(users.len() == 1)
+    }
+}
+```
+
+The production `fetch_users` reads `env.net` ambiently; the test
+shadows the binding; the test's `MockNet` is the value the
+synthesized parameter resolves to. No alternative entry point,
+no dependency-injection framework.
+
+For library code that wants to be parametric over `Net` without
+relying on the ambient mechanism (e.g., because it needs to fork
+into two parallel `Net` values in one call), the explicit form
+is still available:
+
+```q64
+pub fn race(a: Net, b: Net, url: Url) -> Response { … }
+```
 
 ## Capability disclosure
 
@@ -352,37 +437,28 @@ Two records of "what does this qube use" exist:
 2. **The compiler-derived set**, computed from the effect graph
    (per [`effects.md`](./effects.md)) and emitted into a Wasm
    custom section (`q64.capabilities`). Each core capability
-   effect (per [`effects.md` §"The core effect set"](./effects.md))
-   maps to a capability face:
+   effect maps to a capability face per the table below.
+   Compiler-verified. Always accurate.
 
-    | Effect       | Implies capability  |
-    |--------------|---------------------|
-    | `@network`   | `Net`               |
-    | `@fs`        | `Fs`                |
-    | `@audio`     | `Audio`             |
-    | `@midi`      | `Midi`              |
-    | `@ui`        | `Ui`                |
-    | `@inference` | `AiEnv`             |
-    | `@time`      | `Clock`             |
-    | `@random`    | `Rng`               |
-    | `@stdout`    | `Stdout`            |
-    | `@stderr`    | `Stderr`            |
-    | `@exit`      | `ExitFn`            |
-    | `@envvars`   | `EnvVars`           |
+| Effect       | Implies capability  |
+|--------------|---------------------|
+| `@network`   | `Net`               |
+| `@fs`        | `Fs`                |
+| `@audio`     | `Audio`             |
+| `@midi`      | `Midi`              |
+| `@ui`        | `Ui`                |
+| `@inference` | `AiEnv`             |
+| `@time`      | `Clock`             |
+| `@random`    | `Rng`               |
+| `@stdout`    | `Stdout`            |
+| `@stderr`    | `Stderr`            |
+| `@exit`      | `ExitFn`            |
+| `@envvars`   | `EnvVars`           |
 
-   `@io` is the umbrella; it does not on its own map to a single
-   capability face (every finer-grained capability effect implies
-   it). Compiler-verified. Always accurate.
-
-   The mapping is 1:1 from effect marker to capability face.
-   `env.out.write(…)` carries `@stdout` and contributes `Stdout`
-   to the manifest; `env.err.write(…)` carries `@stderr` and
-   contributes `Stderr` independently. `env.exit(N)` carries
-   `@exit` and contributes `ExitFn`; `env.envvars.get("HOME")`
-   carries `@envvars` and contributes `EnvVars`. Every
-   capability is now reachable through an effect marker on the
-   relevant `Env`-field method — no side-channel from
-   call-site reachability.
+`@io` is the umbrella; finer-grained capability effects imply it.
+The mapping is 1:1 from effect marker to capability face. Every
+capability is reachable through an effect marker on the relevant
+`Env`-field method; no side-channel from call-site reachability.
 
 ### `qube publish` cross-check
 
@@ -395,8 +471,8 @@ ERR ENV040: capability mismatch — manifest claims [Net, Fs]
             but compiler derived [Net, Fs, Audio]
 
   Audio appears via:
-    src/notify.q:42  → q64.audio.beep()
-    src/notify.q:53  → q64.audio.beep()
+    src/notify.q:42  → env.audio.beep()
+    src/notify.q:53  → env.audio.beep()
 
   Fix:
     qube.json5:  capabilities: ["Net", "Fs", "Audio"]
@@ -427,20 +503,11 @@ capability the parent qube hasn't already declared.
 ## Capabilities and effects
 
 Every capability method carries the corresponding effect (per
-[`effects.md`](./effects.md)):
-
-```q64
-pub face Net {
-    fn get  (self, url: Url)               -> Result<Response, IoError> @network
-    fn post (self, url: Url, body: Bytes)  -> Result<Response, IoError> @network
-    // …
-}
-```
-
-The effect markers are what the compiler walks for the derived
-set. Effect propagation rules (transitive closure across calls,
-opaque user effects, `@send` derivation) are specified in
-`effects.md` and apply unchanged to capability methods.
+[`effects.md`](./effects.md)). The effect markers are what the
+compiler walks for the derived set. Effect propagation rules
+(transitive closure across calls, opaque user effects, `@send`
+derivation) are specified in `effects.md` and apply unchanged to
+both ambient-referenced and explicitly-passed capability values.
 
 ### `@realtime` and capabilities
 
@@ -460,21 +527,26 @@ from `effects.md`.
 ## Diagnostic codes
 
 All env diagnostics use the `ENV` prefix. Numbers stable, never
-reused. `ENV060`-`ENV099` reserved for expansion.
+reused. `ENV010` / `ENV011` (over-broad capability parameter) are
+**retired** by this revision — the ambient model removes the
+parameter-shape concern they policed. `ENV060`–`ENV099` reserved
+for expansion.
 
 | Code     | Short message                                  | When                                                                              |
 |----------|------------------------------------------------|-----------------------------------------------------------------------------------|
-| `ENV010` | over-broad capability parameter (lint)         | Function takes `env: Env` but uses only one or two sub-capabilities.              |
-| `ENV011` | (reserved) ENV010 exemption probe              | `q64 fmt --lint` reserves this for "exempted because called only from main."     |
+| `ENV010` | (retired)                                      | Replaced by ambient capability model. Number reserved; not reused.                |
+| `ENV011` | (retired)                                      | Companion to ENV010. Number reserved; not reused.                                 |
 | `ENV020` | `.mock()` outside `@test` context              | A capability fit's mock constructor was called from non-test code.                |
 | `ENV030` | capability denied (runtime)                    | A capability call entered a `with_capabilities(deny: …)` block's denial set.       |
 | `ENV040` | manifest / derived capability mismatch         | `qube publish` cross-check failed; manifest and compiler-derived sets differ.     |
 | `ENV041` | manifest declares unused capability            | `qube publish` warning; manifest lists a capability the code doesn't reach.       |
-| `ENV050` | `main` Form 2 ends without return              | `fn main(env: Env) -> Result<…>` body falls off without an explicit `return` / tail expression. |
+| `ENV050` | `main` Form 2 ends without return              | `fn main -> Result<…>` (or `fn main(env: Env) -> Result<…>`) body falls off without an explicit `return` / tail expression. |
 | `ENV051` | `main` not declared                            | A qube of kind `app` has no `main` function.                                       |
-| `ENV052` | `main` signature mismatch                      | `main` exists but doesn't match Form 1 or Form 2.                                  |
-| `ENV053` | `with_capabilities` outside any scope           | The block requires a stack frame for the LIFO restoration.                         |
+| `ENV052` | `main` signature mismatch                      | `main` exists but doesn't match any of the four permitted shapes.                 |
+| `ENV053` | `with_capabilities` outside any scope          | The block requires a stack frame for the LIFO restoration.                         |
 | `ENV054` | `with_capabilities` body uses non-blocking guard | Audio-worklet `@realtime` body cannot enter a `with_capabilities` block (the runtime guard would allocate). |
+| `ENV055` | `with_capabilities(use:)` field not on `Env`   | A field name in the `use:` map does not correspond to an `Env` field.             |
+| `ENV056` | `env` reference from `@pure` function          | A `@pure` function references `env.X`; ambient capability use is incompatible with `@pure`. |
 
 Codes emitted via the envelope from
 [`diagnostics.md`](./diagnostics.md).
@@ -484,7 +556,7 @@ Codes emitted via the envelope from
 ### Hello world
 
 ```q64
-fn main(env: Env) {
+fn main {
     env.out("Hello, world!")
 }
 ```
@@ -492,7 +564,7 @@ fn main(env: Env) {
 ### CLI with args and exit codes (Form 1)
 
 ```q64
-fn main(env: Env) {
+fn main {
     if env.args.len() < 2 {
         env.exit(2, "usage: cat <file>")
     }
@@ -512,7 +584,7 @@ payload's `exit_code` when the payload also fits `Error`, per
 ### CLI with Result propagation (Form 2)
 
 ```q64
-fn main(env: Env) -> Result<(), Error> {
+fn main -> Result<(), Error> {
     let path = try env.args.get(1)
         .ok_or(Error.usage(code: 2, msg: "usage: cat <file>"))
     let content = try env.fs.read(path)
@@ -523,63 +595,99 @@ fn main(env: Env) -> Result<(), Error> {
 
 `Err(e)` returned from `main` → exit code `e.exit_code` (default 1).
 
-### Library function with smallest-capability passing
+### Library function that uses the network ambiently
 
 ```q64
-pub fn fetch_user(n: Net, id: UserId) -> Result<User, Error> {
-    let resp = try n.get(url"https://api.q64.dev/users/{id}")
+pub fn fetch_user(id: UserId) -> Result<User, Error> {
+    let resp = try env.net.get(url"https://api.q64.dev/users/{id}")
     let user = try resp.json<User>()
     Ok(user)
 }
 
-fn main(env: Env) -> Result<(), Error> {
-    let user = try fetch_user(env.net, UserId.from(42))
+fn main -> Result<(), Error> {
+    let user = try fetch_user(UserId.from(42))
     env.out("got user: {user.name}")
     Ok(())
 }
 ```
+
+The compiler walks `fetch_user`'s body, finds `env.net`,
+synthesizes a `Net` parameter, attaches `@network` to the
+effect signature. At the call site in `main`, the runtime-
+provided `env.net` flows through automatically.
 
 ### Test with a mocked capability
 
 ```q64
 @test
 fn test_fetch_user() -> Result<(), Error> {
-    let n = MockNet.new()
-        .on_get(url"https://api.q64.dev/users/42",
-                body: r#"{"id":42,"name":"Ada"}"#)
-    let u = try fetch_user(n, UserId.from(42))
-    assert(u.name == "Ada")
-    Ok(())
+    with_capabilities(use: {
+        net: MockNet.new()
+            .on_get(url"https://api.q64.dev/users/42",
+                    body: r#"{"id":42,"name":"Ada"}"#)
+    }) {
+        let u = try fetch_user(UserId.from(42))
+        assert(u.name == "Ada")
+        Ok(())
+    }
 }
 ```
 
-`MockNet` (from `q64.test.capabilities`) fits the `Net` face. The
-production `fetch_user` doesn't know or care.
+`MockNet` (from `q64.test.capabilities`) fits the `Net` face.
+Inside the `with_capabilities` block, `env.net` resolves to the
+mock; `fetch_user`'s synthesized parameter receives it; the
+production code path doesn't know it's running against a mock.
 
 ### Sandboxing a plugin
 
 ```q64
-fn run_user_plugin(env: Env, plugin: PluginFn) -> Result<(), Error> {
+pub type PluginFn = fn
+
+fn run_user_plugin(plugin: PluginFn) -> Result<(), Error> {
     scope {
         with_capabilities(deny: [Net, Fs]) {
-            plugin(env)                          // plugin can't escape
+            plugin()                          // plugin can't escape
         }
     } catch (e: RuntimeDenied) {
-        log.warn("plugin attempted denied capability: {e.code} — {e.detail}")
+        env.err.write("plugin attempted denied capability: {e.code} — {e.detail}")
         return Err(Error.plugin_denied(e.detail))
     }
     Ok(())
 }
 ```
 
+`PluginFn` is a parameterless function type; the plugin reads
+the ambient `env` (now shadowed by the `deny: …` block) just
+like any other function.
+
+### Explicit form for parametric library code
+
+```q64
+pub fn race(a: Net, b: Net, url: Url) -> Response {
+    scope {
+        let h1 = spawn { a.get(url) }
+        let h2 = spawn { b.get(url) }
+        select {
+            r = h1.await() -> r,
+            r = h2.await() -> r,
+        }
+    }
+}
+```
+
+`race` is genuinely parametric over two `Net` values — the
+ambient mechanism can't supply them both. The explicit form
+remains the right tool; it's just no longer the default for
+single-capability use.
+
 ### Disclosure walkthrough
 
 ```q64
 // src/main.q
-fn main(env: Env) -> Result<(), Error> {
-    let body = try env.net.get(url"https://example.com").body()  // @network
-    try env.fs.write("body.txt", body)                            // @fs
-    env.out("done")                                                // @stdout
+fn main -> Result<(), Error> {
+    let body = try env.net.get(url"https://example.com").body()
+    try env.fs.write("body.txt", body)
+    env.out("done")
     Ok(())
 }
 ```
@@ -617,48 +725,63 @@ OK fetcher@0.1.0 — capabilities verified [Net, Fs, Stdout]
 
 ## Open items deferred
 
+- **`@TaskLocal`-style user-defined ambients.** The ambient
+  mechanism currently special-cases `env`. Whether to expose the
+  same machinery for user code (`@ambient struct Logger { … }`)
+  is open; the registry's capability disclosure model would need
+  to grow alongside.
+- **Async-task env capture rules.** `spawn { … }` currently
+  captures the lexical env, including any `with_capabilities`
+  overrides in scope. Cross-thread tasks need `@send` on the
+  captured env's substituted fields. The exact compositional
+  rule (does `spawn` clone the binding, or share via a
+  cross-thread handle?) is deferred until the runtime adapter
+  spec lands.
 - **First-class capability composition operators.** Today
-  multiple-capability parameters are spelled `<C: Net + Fs>`;
-  sugar like `cn: Net & Fs` deferred.
+  multiple-capability parameters in the explicit form are spelled
+  `<C: Net + Fs>`; sugar like `cn: Net & Fs` deferred.
 - **Stronger denial: type-level capability sets.** v0 uses
   runtime denial (`ENV030`). A future version may parametrize
   functions over a denial set for compile-time enforcement;
   requires a redesign of face bounds and is out of scope for v0.
 - **Capability versioning.** A qube depending on `Net@1` vs
   `Net@2`; today `Net` is a single face whose face-evolution
-  rules (per `faces.md`) apply. Explicit per-capability versions
-  deferred.
+  rules (per `faces.md`) apply.
 - **Network sub-capabilities.** `Net.http` vs `Net.ws` vs
-  `Net.raw`. v0 treats `Net` as one face; subdividing may matter
-  for finer disclosure later.
-- **Cross-qube capability delegation.** Library qubes that need
-  a runtime-injected capability without taking it as a parameter
-  (e.g., a logging library that uses `env.err` ambient-style).
-  v0 says: pass it.
+  `Net.raw`. v0 treats `Net` as one face.
 
 ## Related specs
 
 - [`faces.md`](./faces.md) — capabilities are faces; runtime
   provides fits; user code provides others.
+- [`generics.md`](./generics.md) — `env`-reference synthesis
+  shares machinery with §"Implicit face parameters"; the inferred
+  parameter is monomorphized per call site like any other.
 - [`effects.md`](./effects.md) — effect markers on capability
   methods; the derivation that produces the disclosed capability
   set.
 - [`errors.md`](./errors.md) — `Result<T, E>`, `panic`, the
   `Error` face's `exit_code()` method used by `main` Form 2.
-- [`generics.md`](./generics.md) — `fn fetch(n: Net, …)` as
-  shorthand for `fn fetch<N: Net>(n: N, …)`.
 - [`concurrency.md`](./concurrency.md) — `ENV030` raises panic;
-  propagation via `scope { … } catch { … }`.
+  propagation via `scope { … } catch { … }`. `with_capabilities`
+  composes with `scope`'s LIFO unwind.
 - [`memory.md`](./memory.md) — capabilities are plain values
-  (`@send` by default); pass through scopes normally.
+  (`@send` by default); pass through scopes normally. The ambient
+  binding lives in the enclosing function's scope arena.
 - [`qube.json5.md`](./qube.json5.md) — the `capabilities` field
   in the manifest; the `qube publish` cross-check.
 - [`continuum-api.md`](./continuum-api.md) — registry surfacing
   of capabilities at install time.
-- [`q64-cli.md`](./q64-cli.md) — `q64 show capabilities <qube>`,
-  `q64 show denials <fn>`, the exit-code table for `main` Form 1.
+- [`q64-cli.md`](./q64-cli.md) — `q64 show env <fn>` (new) prints
+  the synthesized capability parameters; `q64 show capabilities
+  <qube>`, `q64 show denials <fn>`, the exit-code table for
+  `main` Form 1.
 - [`modules.md`](./modules.md) — `Env`, `Net`, `Fs`, `Audio`,
   `Midi`, `AiEnv`, `Ui`, `Clock`, `Rng`, `Stdout`, `Stderr`,
-  `ExitFn`, `with_capabilities` are auto-prelude.
-- [`diagnostics.md`](./diagnostics.md) — envelope format for
-  `ENV*` codes.
+  `ExitFn`, `with_capabilities` are auto-prelude. `env` is the
+  ambient binding the runtime provides at program entry; it
+  does not appear in the auto-prelude name list but is
+  resolvable from every function body.
+- [`grammar.md`](./grammar.md) — `WithCapsStmt` production
+  updated to admit the `use:` overrides; `fn main`-shape entry
+  points covered by `FnDecl`.

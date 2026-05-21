@@ -16,14 +16,14 @@ pub fit Color : Display {
     }
 }
 
-pub fn print_all<T: Display>(env: Env, items: [T]) {
+pub fn print_all<T: Display>(items: [T]) {
     for item in items {
         env.out("{item.fmt()}")
     }
 }
 
-fn main(env: Env) {
-    print_all(env, [
+fn main {
+    print_all([
         Color { r: 255, g: 0,   b: 0   },
         Color { r: 0,   g: 255, b: 0   },
         Color { r: 0,   g: 0,   b: 255 },

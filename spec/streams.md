@@ -40,7 +40,7 @@ Wasm threads.
 | **tick**          | One logical instant. Within a tick, simultaneous values are coherent.            |
 | **rate**          | The frequency at which a `Signal` or `Stream` advances. A type parameter.        |
 | **stage**         | An `@stage`-annotated function. Consumes dataflow types; produces dataflow types.|
-| **graph**         | A `graph`-declared topology. First-class value; `.start(env)` / `.stop()`.       |
+| **graph**         | A `graph`-declared topology. First-class value; `.start()` / `.stop()`.          |
 | **fusion**        | Compile-time merging of adjacent `@fuse` stages into a single task.              |
 | **feedback**      | A cycle in the graph; broken by `pre()` (one-tick delay).                        |
 
@@ -254,19 +254,19 @@ is the body's return type (`()` for a sink-terminated graph,
 otherwise the type produced at the last `|>`):
 
 ```q64
-graph voice_pipeline(env: Env) {
-    let pcm        = mic_input(env.audio)                 // source
+graph voice_pipeline {
+    let pcm        = mic_input()                          // source; reads env.audio
     let denoised   = pcm |> denoise(threshold: 0.1)
     let resampled  = denoised |> resample(target: 16.kHz)
-    let tokens     = resampled |> whisper_asr(env.ai)
-    let response   = tokens |> llama_complete(env.ai)
-    let synthed    = response |> tts(env.ai)
-    let _          = synthed |> play(env.audio)           // sink
+    let tokens     = resampled |> whisper_asr             // reads env.ai
+    let response   = tokens |> llama_complete
+    let synthed    = response |> tts
+    let _          = synthed |> play                      // sink; reads env.audio
 }
 // voice_pipeline : Graph<()>
 
 scope {
-    let h: Handle<()> = voice_pipeline.start(env)
+    let h: Handle<()> = voice_pipeline.start()
     sleep(60.s)
     h.cancel()
 }
@@ -276,7 +276,7 @@ scope {
 
 ```q64
 pub face Graph<Out> {
-    fn start    (self, env: Env) -> Handle<Out>            // launches the graph as a task; returns its handle
+    fn start    (self) -> Handle<Out>                      // launches the graph as a task; returns its handle. Reads ambient env.
     fn stop     (self: ref Self)                           // cancels every stage in the graph
     fn snapshot (self) -> GraphSnapshot                    // static topology, fused groups, rates, effects
     fn output   (self) -> Out where Out != ()              // queryable output side (only for non-sink graphs)
@@ -291,7 +291,7 @@ user code does not write `fit X : Graph<…>` by hand.
 
 For graphs with `Out = ()` (sink-terminated), `output` is absent
 (`STR064`). For graphs whose body returns a dataflow value (e.g.
-`graph chat(env, prompt: str) -> Stream<str, 20.Hz>`),
+`graph chat(prompt: str) -> Stream<str, 20.Hz>`),
 `output()` returns that value's runtime handle (a `Stream`,
 `Signal`, or `Event` reader) and `completion()` resolves when
 the underlying sources have drained.
@@ -302,7 +302,7 @@ Properties:
   RHS is a single stage call or a `|>` pipeline.
 - The compiler analyzes the whole topology: rate consistency,
   fusion candidates, effect propagation, resource bounds.
-- `g.start(env)` returns a `Handle<Out>` from `concurrency.md`.
+- `g.start()` returns a `Handle<Out>` from `concurrency.md`; reads the ambient `env` to wire host-facing stages.
   The graph runs until cancelled, panicked, or all sources are
   exhausted.
 - `g.stop()` cancels every stage in the graph.
@@ -316,10 +316,10 @@ graph subgraph(input: Signal<PCM<f32>, R>) -> Signal<PCM<f32>, R> {
     input |> denoise |> normalize
 }
 
-graph outer(env: Env) {
-    let pcm = mic_input(env.audio)
+graph outer {
+    let pcm = mic_input()
     let clean = pcm |> subgraph
-    let _ = clean |> play(env.audio)
+    let _ = clean |> play
 }
 ```
 
@@ -446,11 +446,11 @@ fn denoise<const R: Hz>(input: Signal<f32, R>) -> Signal<f32, R> { … }
 fn resample(input: Signal<f32, 48.kHz>) -> Signal<f32, 16.kHz> { … }
 
 @stage              // not @fuse — task boundary here
-fn whisper_asr<const R: Hz>(input: Signal<f32, R>, ai: AiEnv) -> Stream<Token<WhisperVocab>, 10.Hz> { … }
+fn whisper_asr<const R: Hz>(input: Signal<f32, R>) -> Stream<Token<WhisperVocab>, 10.Hz> { … }    // reads env.ai
 
-graph voice(env: Env) {
-    let asr_in = mic_input(env.audio) |> denoise |> resample      // fused into one task
-    let tokens = asr_in |> whisper_asr(env.ai)                     // separate task
+graph voice {
+    let asr_in = mic_input() |> denoise |> resample      // fused into one task
+    let tokens = asr_in |> whisper_asr                    // separate task
 }
 ```
 
@@ -580,8 +580,8 @@ fn decode(input: Stream<Bytes, R>) -> Stream<Frame, R> {
 }
 
 scope {
-    let g = graph audio { mic_input(env.audio) |> decode |> play(env.audio) }
-    g.start(env).await()
+    let g = graph audio { mic_input() |> decode |> play }
+    g.start().await()
 } catch (e: Cancelled) {
     env.out("graph shut down cleanly")
 } catch (e: Panic) {
@@ -678,7 +678,7 @@ task scheduler. They are the same. The contract:
   shared task body and is delivered to the graph's enclosing
   scope as a single panic — siblings see one cancellation event,
   not one per fused stage.
-- **A graph's `Handle<Out>`** (from `g.start(env)`) is the
+- **A graph's `Handle<Out>`** (from `g.start()`) is the
   `Handle<T>` from `concurrency.md`. `g.stop()` is semantically
   `h.cancel()` on that handle (per [`concurrency.md` §"Where
   `ctx` comes from"](./concurrency.md)); the graph's root ctx
@@ -693,22 +693,22 @@ task scheduler. They are the same. The contract:
 ### Voice agent (mic → ASR → LLM → TTS → speaker)
 
 ```q64
-graph voice_agent(env: Env) {
-    let pcm:      Signal<PCM<f32>, 48.kHz>   = mic_input(env.audio)
+graph voice_agent {
+    let pcm:      Signal<PCM<f32>, 48.kHz>   = mic_input()
     let denoised: Signal<PCM<f32>, 48.kHz>   = pcm |> denoise(threshold: 0.05)
     let prepped:  Signal<PCM<f32>, 16.kHz>   = denoised |> resample(target: 16.kHz)
     let tokens:   Stream<Token<WhisperVocab>, 20.Hz>
-                                              = prepped |> whisper_asr(env.ai)
+                                              = prepped |> whisper_asr
     let text:     Event<str>                  = tokens |> assemble_utterances()
     let response: Stream<Token<LlamaVocab>, 50.Hz>
-                                              = text |> llama_complete(env.ai)
-    let synth:    Signal<PCM<f32>, 24.kHz>    = response |> tts(env.ai)
+                                              = text |> llama_complete
+    let synth:    Signal<PCM<f32>, 24.kHz>    = response |> tts
     let out:      Signal<PCM<f32>, 48.kHz>    = synth |> resample(target: 48.kHz)
-    let _                                      = out |> play(env.audio)
+    let _                                      = out |> play
 }
 
 scope {
-    let h = voice_agent.start(env)
+    let h = voice_agent.start()
     select {
         _ = h.await()         -> {},
         _ = ctx.cancelled()   -> h.cancel(),
@@ -735,11 +735,11 @@ fn render(count: Signal<i64, 60.Hz>) -> Signal<Frame, 60.Hz> @realtime {
     count.map(|n| render_button(text: "Clicks: {n}"))
 }
 
-graph ui(env: Env) {
+graph ui {
     let clicks = env.ui.button("Click me").clicks()
     let count  = counter(clicks)
     let frames = render(count)
-    let _      = frames |> blit(env.ui)
+    let _      = frames |> blit                          // reads env.ui
 }
 ```
 
@@ -753,10 +753,10 @@ fn iir(input: Signal<f32, 48.kHz>, alpha: f32) -> Signal<f32, 48.kHz> {
     y
 }
 
-graph audio_path(env: Env) {
-    let pcm    = mic_input(env.audio)
+graph audio_path {
+    let pcm    = mic_input()
     let smoothed = pcm |> iir(alpha: 0.9)
-    let _      = smoothed |> play(env.audio)
+    let _      = smoothed |> play
 }
 ```
 
@@ -768,15 +768,15 @@ struct Meter {
     rms: SharedSignal<f32, 100.Hz>,
 }
 
-graph audio_engine(env: Env, meter: ref Meter) {
-    let pcm = mic_input(env.audio)
+graph audio_engine(meter: ref Meter) {
+    let pcm = mic_input()
     meter.rms = pcm |> rms_envelope(window: 10.ms)        // writer (audio thread)
-    let _    = pcm |> play(env.audio)
+    let _    = pcm |> play
 }
 
 scope {
     let meter = Meter.new()
-    spawn { audio_engine.start(env, ref meter).await() }       // audio thread
+    spawn { audio_engine.start(ref meter).await() }            // audio thread
 
     spawn {                                                     // UI thread (reader)
         loop {
@@ -795,13 +795,13 @@ plus one atomic load (~20 µs + 10 ns).
 ### LLM token pipeline with completion
 
 ```q64
-graph chat(env: Env, prompt: str) -> Stream<str, 20.Hz> {
-    let toks: Stream<Token<LlamaVocab>, 20.Hz> = llama_complete(env.ai, prompt)
-    toks |> detokenize(env.ai)
+graph chat(prompt: str) -> Stream<str, 20.Hz> {
+    let toks: Stream<Token<LlamaVocab>, 20.Hz> = llama_complete(prompt)
+    toks |> detokenize
 }
 
 scope {
-    let g = chat.start(env, "explain monads")
+    let g = chat.start("explain monads")
     for_each(g.output) |chunk| {
         env.out.write(chunk)
     }

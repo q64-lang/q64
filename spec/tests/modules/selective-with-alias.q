@@ -4,6 +4,6 @@
 
 import q64.math.{Vec3, dot} as v
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

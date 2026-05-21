@@ -9,12 +9,12 @@ fn render(scene: Signal<Scene, 60.Hz>) -> Signal<Frame, 60.Hz> {
     scene.map(|s| Frame.from(s))
 }
 
-fn main(env: Env) {
+fn main {
     scope {
         let clicks: Event<Point> = env.ui.clicks()
         let g = graph my_app {
             let _ = render(clicks)
         }
-        let _ = g.start(env)
+        let _ = g.start()
     }
 }

@@ -4,6 +4,6 @@
 
 import q64.math.*
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

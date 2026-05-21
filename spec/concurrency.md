@@ -188,11 +188,11 @@ parameter. The convention is C-style: `ctx` is the first
 parameter; it threads through call trees:
 
 ```q64
-fn fetch(ctx: Cancel, env: Env, url: str) -> Result<Response, IoError> @cancel {
+fn fetch(ctx: Cancel, url: str) -> Result<Response, IoError> @cancel {
     var buf: Vec<u8> = Vec.new()
     loop {
         if ctx.cancelled() { panic Cancelled }
-        let chunk = try http.read_chunk(ctx, env, url)
+        let chunk = try http.read_chunk(ctx, url)
         if chunk.is_eof() { break }
         buf.extend(move chunk)
     }
@@ -200,7 +200,7 @@ fn fetch(ctx: Cancel, env: Env, url: str) -> Result<Response, IoError> @cancel {
 }
 
 scope {
-    let h = spawn { fetch(ctx, env, "https://...") }
+    let h = spawn { fetch(ctx, "https://...") }
     sleep(2.s)
     h.cancel()
     h.await()    // panics with Cancelled payload
@@ -252,7 +252,7 @@ code below:
    `ctx` is still cancellable: the runtime injects a shutdown
    path equivalent to `panic Cancelled` at the next channel
    `recv` / `send` on a cancel-aware policy, or at the
-   stage's natural completion. `g.start(env)` returns a
+   stage's natural completion. `g.start()` returns a
    `Handle<Out>` whose ctx is the graph's root; `g.stop()` is
    semantically `h.cancel()` on that handle, which propagates
    to every stage's ctx through the standard scope-cancellation
@@ -291,8 +291,8 @@ Code that must complete (releasing a lock, flushing a buffer)
 opts out of cancellation observation:
 
 ```q64
-fn flush_journal(env: Env, j: ref Journal) @uncancellable {
-    db.write_all(env, j.pending)        // no Cancelled panic even if ctx flips
+fn flush_journal(j: ref Journal) @uncancellable {
+    db.write_all(j.pending)             // no Cancelled panic even if ctx flips
 }
 ```
 
@@ -542,7 +542,7 @@ cleanup-before-unwinding:
 ```q64
 select {
     msg = rx.recv(ctx)   -> handle(move msg),
-    _   = ctx.cancelled() -> { flush(env); panic Cancelled },
+    _   = ctx.cancelled() -> { flush(); panic Cancelled },
 }
 ```
 
@@ -720,7 +720,7 @@ syntax) is the catch-all.
 
 ```q64
 scope {
-    spawn { fetch_with_timeout(ctx, env, url, 30.s) }
+    spawn { fetch_with_timeout(ctx, url, 30.s) }
 } catch (e: Cancelled) {
     env.out("shutting down cleanly")
 } catch (e: RuntimeDenied) {
@@ -770,8 +770,8 @@ There is no `async fn`, no `.await` syntax at I/O call sites, no
 "what color is your function" problem:
 
 ```q64
-fn fetch_user(ctx: Cancel, env: Env, id: UserId) -> User {
-    let resp = http.get(ctx, env.net, url_for(id))     // suspends here
+fn fetch_user(ctx: Cancel, id: UserId) -> User {
+    let resp = http.get(ctx, url_for(id))     // suspends here; reads env.net
     parse_user(resp.body)
 }
 ```
@@ -950,13 +950,12 @@ All codes are emitted using the envelope from
 ```q64
 fn fetch_with_retry(
     ctx: Cancel,
-    env: Env,
     url: str,
     max_attempts: i64,
 ) -> Result<Response, Error> @cancel {
     for attempt in 0..max_attempts {
         if ctx.cancelled() { panic Cancelled }
-        match http.get(ctx, env.net, url) {
+        match http.get(ctx, url) {
             Ok(r)  -> return Ok(r),
             Err(_) -> sleep(ctx, backoff(attempt)),
         }
@@ -965,7 +964,7 @@ fn fetch_with_retry(
 }
 
 scope {
-    let h = spawn { fetch_with_retry(ctx, env, "https://...", 3) }
+    let h = spawn { fetch_with_retry(ctx, "https://...", 3) }
     select {
         r = h.await()         -> use_response(r),
         _ = timeout(10.s)     -> h.cancel(),
@@ -989,7 +988,7 @@ scope {
     spawn {
         loop {
             let f = rx.recv(ctx)
-            encode_and_write(env, move f)
+            encode_and_write(move f)
         }
     }
 }
@@ -1021,16 +1020,16 @@ scope {
 ### Panic recovery at scope boundary
 
 ```q64
-fn boot(env: Env) {
+fn boot {
     scope {
-        spawn { primary_db(env) }
-        spawn { primary_cache(env) }
-        spawn { primary_search(env) }
+        spawn { primary_db() }
+        spawn { primary_cache() }
+        spawn { primary_search() }
     } catch (e: Panic) {
         log.warn("primary startup failed: {e}")
         scope {
-            spawn { fallback_db(env) }
-            spawn { fallback_cache(env) }
+            spawn { fallback_db() }
+            spawn { fallback_cache() }
         }
     }
 }
@@ -1039,14 +1038,14 @@ fn boot(env: Env) {
 ### Real-time audio with shared command channel
 
 ```q64
-fn audio_engine(env: Env) {
+fn audio_engine {
     region pool: Pool<Frame, 64> {
         let (tx_frame, rx_frame) =
             channel<Frame>(policy: RingBuffer, capacity: 64)
         let (tx_cmd, rx_cmd) =
             channel<Command>(policy: LatestValue)
 
-        spawn { capture_loop(ctx, env, tx_frame) }
+        spawn { capture_loop(ctx, tx_frame) }
 
         spawn scope @realtime {
             loop {
@@ -1058,7 +1057,7 @@ fn audio_engine(env: Env) {
             }
         }
 
-        ui_loop(env, tx_cmd)
+        ui_loop(tx_cmd)
     }
 }
 ```

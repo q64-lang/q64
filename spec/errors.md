@@ -73,7 +73,7 @@ in the spec (`Increment`, `Get`, `Io`, `Cancelled`, `Rgb`, …).
 Prefix form. Reads "try this fallible call; if it errs, propagate."
 
 ```q64
-pub fn read_config(env: Env) -> Result<Config, IoError> {
+pub fn read_config -> Result<Config, IoError> {
     let bytes        = try env.fs.read("config.json")
     let cfg: Config  = try bytes.json()
     Ok(cfg)
@@ -387,7 +387,7 @@ pub enum ReadJsonError {
 pub fit ReadJsonError : From<IoError>   { fn from(e: IoError)   -> Self { Io(e)    } }
 pub fit ReadJsonError : From<JsonError> { fn from(e: JsonError) -> Self { Parse(e) } }
 
-pub fn read_json<T>(env: Env, path: str) -> Result<T, ReadJsonError> {
+pub fn read_json<T>(path: str) -> Result<T, ReadJsonError> {
     let bytes  = try env.fs.read(path)        // IoError    -> ReadJsonError via From
     let value: T = try bytes.json()           // JsonError  -> ReadJsonError via From
     Ok(value)
@@ -401,7 +401,7 @@ specific failures.
 ### Inline sum type — anonymous union
 
 ```q64
-pub fn read_json<T>(env: Env, path: str) -> Result<T, IoError | JsonError> {
+pub fn read_json<T>(path: str) -> Result<T, IoError | JsonError> {
     let bytes    = try env.fs.read(path)
     let value: T = try bytes.json()
     Ok(value)
@@ -415,10 +415,10 @@ is local and naming it adds no value.
 ### Application style — `dyn Error`
 
 ```q64
-pub fn run(env: Env) -> Result<(), dyn Error> {
-    let cfg = try read_config(env)
+pub fn run -> Result<(), dyn Error> {
+    let cfg = try read_config()
     let _   = try connect_db(cfg)
-    let _   = try serve(env)
+    let _   = try serve()
     Ok(())
 }
 ```
@@ -558,7 +558,7 @@ pub fit ConfigError : Error {
     }
 }
 
-pub fn load_config(env: Env, path: str) -> Result<Config, ConfigError> {
+pub fn load_config(path: str) -> Result<Config, ConfigError> {
     let bytes        = try env.fs.read(path)
     let cfg: Config  = try bytes.json()
     Ok(cfg)
@@ -568,9 +568,9 @@ pub fn load_config(env: Env, path: str) -> Result<Config, ConfigError> {
 ### Application top-level
 
 ```q64
-fn main(env: Env) {
-    match load_config(env, "config.json") {
-        Ok(cfg) -> serve(env, cfg),
+fn main {
+    match load_config("config.json") {
+        Ok(cfg) -> serve(cfg),
         Err(e)  -> env.exit(1, "{e.fmt()}"),
     }
 }
@@ -594,7 +594,7 @@ pub fit LowPass : Filter<PCM<f32>, @realtime> {
 struct User    { profile: Profile? }
 struct Profile { name: str? }
 
-fn greet(env: Env, user: User?) {
+fn greet(user: User?) {
     match user?.profile?.name {
         Some(n) -> env.out("Hello, {n}!"),
         None    -> env.out("Hello, stranger."),

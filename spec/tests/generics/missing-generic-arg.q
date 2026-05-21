@@ -6,7 +6,7 @@ pub fn buffer<T, const N: i64 = 16>() -> [T; N] {
     [T.default(); N]
 }
 
-fn main(env: Env) {
+fn main {
     let c = buffer()
     env.out("{c.len()}")
 }

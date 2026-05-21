@@ -8,6 +8,6 @@ struct GameState {
     counter: i64,
 }
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

@@ -9,11 +9,11 @@ fn echo(clicks: Event<Point>) -> Event<Point> {
     clicks.pre()
 }
 
-fn main(env: Env) {
+fn main {
     scope {
         let g = graph my_app {
             let _ = echo(env.ui.clicks())
         }
-        let _ = g.start(env)
+        let _ = g.start()
     }
 }

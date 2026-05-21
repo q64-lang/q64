@@ -9,6 +9,6 @@ fn process(user: User?) -> str {
     user.name
 }
 
-fn main(env: Env) {
+fn main {
     env.out(process(None))
 }

@@ -390,7 +390,7 @@ hello/
 ```q64
 //! hello — entry point.
 
-fn main(env: Env) {
+fn main {
     env.out("Hello, q64.")
 }
 ```

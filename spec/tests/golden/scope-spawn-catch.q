@@ -2,24 +2,24 @@
 // SPEC: concurrency.md#panics-across-tasks
 // EXPECTED: ok
 
-fn primary_db(env: Env) { env.out("db up") }
-fn primary_cache(env: Env) { env.out("cache up") }
-fn fallback_db(env: Env) { env.out("fallback db up") }
-fn fallback_cache(env: Env) { env.out("fallback cache up") }
+fn primary_db { env.out("db up") }
+fn primary_cache { env.out("cache up") }
+fn fallback_db { env.out("fallback db up") }
+fn fallback_cache { env.out("fallback cache up") }
 
-fn boot(env: Env) {
+fn boot {
     scope {
-        spawn { primary_db(env) }
-        spawn { primary_cache(env) }
+        spawn { primary_db() }
+        spawn { primary_cache() }
     } catch (e: Panic) {
         env.out("primary startup failed: {e.fmt()}")
         scope {
-            spawn { fallback_db(env) }
-            spawn { fallback_cache(env) }
+            spawn { fallback_db() }
+            spawn { fallback_cache() }
         }
     }
 }
 
-fn main(env: Env) {
-    boot(env)
+fn main {
+    boot()
 }

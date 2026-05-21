@@ -837,7 +837,7 @@ fn render(
     frame = cache.draw(scene)
 }
 
-fn main(env: Env) {
+fn main {
     var cache: RenderCache = RenderCache.new()
     var frame: Frame = Frame.uninit(1920, 1080)
     let scene = load_scene("level1.json")
@@ -854,7 +854,7 @@ beforehand) by consulting the signature.
 ### Optional narrowing — destructure or match-exit
 
 ```q64
-fn greet(env: Env, user: User?) {
+fn greet(user: User?) {
     if let Some(u) = user {
         env.out("Hello, {u.name}!")
     } else {

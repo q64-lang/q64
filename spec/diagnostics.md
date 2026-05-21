@@ -223,8 +223,8 @@ declaration it precedes. Form: `@allow(<code>)` or
 code as written in the envelope (`ENV010`, `CONC040`, etc.).
 
 ```q64
-@allow(ENV010)
-fn helper_that_takes_full_env(env: Env) { … }      // suppresses the lint
+@allow(CONC051)
+fn drain(rx: Receiver<i64, Unbounded>) { … }       // suppresses the Unbounded-channel lint
 ```
 
 Scope of suppression is the **immediately following item** — a

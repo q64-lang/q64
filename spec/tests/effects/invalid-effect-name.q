@@ -6,6 +6,6 @@
 
 pub effect @Logging
 
-fn main(env: Env) {
+fn main {
     env.out("hello")
 }

@@ -5,7 +5,7 @@ when tests are added or a code's owning spec moves. The table is the
 audit surface — `grep ' — $' INDEX.md` lists every code that still has
 no test.
 
-> **Coverage today: 37 / ~155 named codes (≈24%) + 5 golden positives.**
+> **Coverage today: 39 / ~155 named codes (≈25%) + 5 golden positives.**
 > Coverage will grow as the implementation surfaces corner cases; new
 > tests are appended to their subdirectory and the matching row updated
 > here.
@@ -223,8 +223,8 @@ no test.
 
 | Code     | Owner           | Short message                                     | Test                                                     |
 |----------|-----------------|---------------------------------------------------|----------------------------------------------------------|
-| `ENV010` | env.md          | over-broad capability parameter (lint)            | —                                                        |
-| `ENV011` | env.md          | (reserved) ENV010 exemption probe                 | —                                                        |
+| `ENV010` | env.md          | (retired — replaced by ambient capability model)  | —                                                        |
+| `ENV011` | env.md          | (retired — companion to ENV010)                   | —                                                        |
 | `ENV020` | env.md          | `.mock()` outside `@test` context                 | —                                                        |
 | `ENV030` | env.md          | capability denied (runtime)                       | —                                                        |
 | `ENV040` | env.md          | manifest / derived capability mismatch            | —                                                        |
@@ -234,6 +234,8 @@ no test.
 | `ENV052` | env.md          | `main` signature mismatch                         | `env/main-signature-mismatch.q`                          |
 | `ENV053` | env.md          | `with_capabilities` outside any scope             | —                                                        |
 | `ENV054` | env.md          | `with_capabilities` body uses non-blocking guard  | —                                                        |
+| `ENV055` | env.md          | `with_capabilities(use:)` field not on `Env`      | `env/use-field-not-on-env.q`                             |
+| `ENV056` | env.md          | `env` reference from `@pure` function             | `env/ambient-env-in-pure.q`                              |
 
 ## Golden positive tests
 
@@ -243,7 +245,7 @@ keyed to a specific code.
 
 | Test                                       | Exercises                                                                                  |
 |--------------------------------------------|--------------------------------------------------------------------------------------------|
-| `golden/hello-world.q`                     | Minimal `fn main(env: Env)`, string literal, `env.out`.                                    |
+| `golden/hello-world.q`                     | Minimal `fn main`, string literal, ambient `env.out`.                                      |
 | `golden/library-face-fit.q`                | `pub face` + `pub fit` + `pub fn<T: Face>` + array literal + `for` loop + interpolation.   |
 | `golden/scope-spawn-catch.q`               | `scope { spawn … } catch (e: Panic) { … }`, nested scopes.                                 |
 | `golden/graph-pipe-stages.q`               | `@stage`, `@fuse`, `graph`, `|>`, `Signal<T, R>` rate parameter, `Handle.cancel()`.        |
