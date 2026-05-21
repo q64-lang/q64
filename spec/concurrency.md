@@ -208,8 +208,10 @@ scope {
 
 `Cancelled` is the auto-prelude payload type from
 [`errors.md` §"Auto-prelude payload types"](./errors.md); it fits
-`Panic` with `code = some("CONC011")`. Cancellation observation
-unwinds the task — it does not consume a recoverable-error slot in
+`Panic` with `code() = none` — cancellation is a runtime
+control-flow event, not a diagnostic, and the `CONC*` codes are
+reserved for compile-time diagnostics. Cancellation observation
+unwinds the task; it does not consume a recoverable-error slot in
 the function's return type.
 
 `Cancel` is an opaque value of type `Cancel`. `ctx.cancelled()`
@@ -253,8 +255,7 @@ Code that must complete (releasing a lock, flushing a buffer)
 opts out of cancellation observation:
 
 ```q64
-@uncancellable
-fn flush_journal(env: Env, j: ref Journal) {
+fn flush_journal(env: Env, j: ref Journal) @uncancellable {
     db.write_all(env, j.pending)        // no Cancelled panic even if ctx flips
 }
 ```
@@ -349,6 +350,34 @@ pub face Receiver<T, P: Policy = Backpressure> {
 }
 ```
 
+### `for x in rx { … }` loop form
+
+`Receiver<T, P>` does **not** fit the auto-prelude `Iterator` face
+— `Iterator.next() -> Item?` is non-suspending, and `recv` needs
+to suspend (and observe cancellation). The `for x in rx { body }`
+form is a compiler-recognized desugaring, not an `Iterator` fit:
+
+```q64
+for x in rx { body(x) }
+```
+
+desugars to roughly:
+
+```q64
+loop {
+    match rx.try_recv() {
+        Ok(x)                  -> body(x),
+        Err(RecvError::Empty)  -> { let x = rx.recv(ctx); body(x) },
+        Err(RecvError::Closed) -> break,
+    }
+}
+```
+
+Requirements: a `ctx: Cancel` must be in lexical scope (the
+desugaring uses it for the suspending `recv`). A `for x in rx` with
+no `ctx` in scope is `CONC053` ("for-loop over receiver without
+ctx").
+
 - For non-cancel-aware policies (`RingBuffer`, `Unbounded`), `send`
   does not suspend and the `ctx` parameter may be elided —
   `tx.send(move x)` is the canonical form.
@@ -358,8 +387,15 @@ pub face Receiver<T, P: Policy = Backpressure> {
   the caller's effect set.
 - `recv(ctx)` returns `T` directly; it does **not** return a
   `Result`. End-of-stream is detected via `closed()` or by the
-  channel returning from a `for x in rx { … }` loop (per stdlib
-  `Iterator` fit).
+  channel returning from a `for x in rx { … }` loop (the
+  `Receiver<T, P>` fit of `Iterator` uses `try_recv` under the
+  hood and stops the loop on `RecvError::Closed`).
+- Calling `recv(ctx)` when the channel is closed **and** the
+  buffer is empty unwinds the task with `panic Closed` — `Closed`
+  is the auto-prelude `Panic`-fitting payload from
+  [`errors.md` §"Auto-prelude payload types"](./errors.md). A
+  receiver that wants to observe close cleanly tests `closed()`
+  first or iterates with `for x in rx { … }`.
 - `try_recv` returns `Err(RecvError::Empty)` when no value is
   ready and `Err(RecvError::Closed)` when the sender has closed
   and the buffer is empty.
@@ -818,6 +854,7 @@ function-level effect annotations from `effects.md`.
 | `CONC050`| channel policy required                      | `channel<T>(capacity: N)` with no `policy:` argument.                              |
 | `CONC051`| `Unbounded` channel                          | Lint (advisory). `channel<T>(policy: Unbounded)`.                                  |
 | `CONC052`| non-`@send` payload in cross-thread channel  | A channel passed across a thread boundary whose `T` isn't `@send`.                |
+| `CONC053`| `for x in rx` without `ctx` in scope         | The for-loop desugaring needs a `ctx: Cancel` for the suspending `recv` step.     |
 
 All codes are emitted using the envelope from
 [`diagnostics.md`](./diagnostics.md).

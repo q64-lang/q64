@@ -404,13 +404,15 @@ AliasBinding   := "as" Ident
 ReExport       := "pub" "use" SelectiveList "from" ImportPath
                 | "pub" "use" Ident ("as" Ident)? "from" ImportPath
 
-Item           := Visibility? (FnDecl | StructDecl | EnumDecl | TypeDecl | FaceDecl | FitDecl | ConstDecl | ActorDecl | EffectDecl | ReExport)
+Item           := Visibility? (FnDecl | StructDecl | EnumDecl | TypeDecl | FaceDecl | FitDecl | ConstDecl | ActorDecl | EffectDecl | GraphDecl | ReExport)
 Visibility     := "pub"
 ```
 
 `ActorDecl` is specified in [`concurrency.md`](./concurrency.md)
 §Grammar; `EffectDecl` (`pub effect @<name>`) is specified in
-[`effects.md`](./effects.md) §"User-defined effects". Both follow
+[`effects.md`](./effects.md) §"User-defined effects";
+`GraphDecl` (`graph <name>(<params>) { … }`) is specified in
+[`streams.md`](./streams.md) §"`graph` declaration". All follow
 the same visibility model as other top-level items.
 
 The block-`pub` form `Visibility "{" Item* "}"` is intentionally absent.

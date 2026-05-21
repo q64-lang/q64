@@ -54,35 +54,80 @@ sides with one mechanism.
 
 ## The core effect set
 
-The eleven blessed markers. Adding to this set is a language-level
-change.
+The blessed core markers. Adding to this set is a language-level
+change. The set splits into asserts (what the body **won't** do),
+capabilities (what the body **may** do), one observation marker,
+and one type-marker.
+
+### Asserts (negative markers)
+
+| Marker            | Meaning                                                                                       |
+|-------------------|-----------------------------------------------------------------------------------------------|
+| `@pure`           | No mutation, no allocation, no I/O, no suspension, no panic, no trap. The strongest assertion. |
+| `@realtime`       | Bounded execution time, no allocation, no suspension, no panic. Audio-thread safe.            |
+| `@no_alloc`       | No heap allocation (linear or managed).                                                       |
+| `@no_suspend`     | Does not yield to the scheduler; runs to its next natural return.                             |
+| `@no_panic`       | Does not invoke `panic` (`trap` remains permitted).                                           |
+| `@no_trap`        | Does not invoke `trap`. Rare; "this function must complete or unwind."                        |
+| `@uncancellable`  | Body completes without observing cancellation, even if `ctx` is signalled. See §`@cancel` and `@uncancellable`. |
+
+### Capabilities (positive markers)
+
+Each capability marker corresponds 1:1 to a capability face from
+[`env.md` §"`Env` and its fields"](./env.md); the registry-level
+disclosure mapping in [`env.md` §"Capability disclosure"](./env.md)
+and [`qube.json5.md` §Capabilities](./qube.json5.md) is the
+authoritative table.
+
+| Marker         | Meaning                                                                            | Corresponding capability face |
+|----------------|------------------------------------------------------------------------------------|-------------------------------|
+| `@io`          | Catch-all I/O (devices, generic streams). Implied by every other capability below.  | (umbrella; no single face)    |
+| `@network`     | Performs network operations (HTTP, WebSocket, raw sockets). Implies `@io`.          | `Net`                         |
+| `@fs`          | Performs filesystem operations (read, write, list, watch). Implies `@io`.           | `Fs`                          |
+| `@stdio`       | Writes to stdout or stderr. Implies `@io`.                                          | `Stdout`, `Stderr`            |
+| `@audio`       | Performs audio I/O (PCM read/write, worklet operations).                            | `Audio`                       |
+| `@midi`        | Performs MIDI I/O.                                                                  | `Midi`                        |
+| `@ui`          | Reads UI input events; writes frames.                                               | `Ui`                          |
+| `@inference`   | Performs AI model load or inference.                                                | `AiEnv`                       |
+| `@time`        | Reads clock time (monotonic or wall).                                               | `Clock`                       |
+| `@random`      | Reads from the system RNG.                                                          | `Rng`                         |
+
+`@audio`, `@midi`, `@ui`, `@inference`, `@time`, and `@random` do
+**not** imply `@io`: the underlying operations target dedicated
+host surfaces (audio worklet, MIDI port, frame buffer, model
+runtime, clock, RNG) rather than the generic-I/O streams `@io`
+covers. They are peer capabilities. A function that both writes
+to stdout and reads the clock declares `@stdio + @time`.
+
+### Other markers
 
 | Marker            | Kind        | Meaning                                                                                       |
 |-------------------|-------------|-----------------------------------------------------------------------------------------------|
-| `@pure`           | assert      | No mutation, no allocation, no I/O, no suspension, no panic, no trap. The strongest assertion. |
-| `@realtime`       | assert      | Bounded execution time, no allocation, no suspension, no panic. Audio-thread safe.            |
-| `@no_alloc`       | assert      | No heap allocation (linear or managed).                                                       |
-| `@no_suspend`     | assert      | Does not yield to the scheduler; runs to its next natural return.                             |
-| `@no_panic`       | assert      | Does not invoke `panic` (`trap` remains permitted).                                           |
-| `@no_trap`        | assert      | Does not invoke `trap`. Rare; "this function must complete or unwind."                        |
-| `@uncancellable`  | assert      | Body completes without observing cancellation, even if `ctx` is signalled. See §`@cancel` and `@uncancellable`. |
-| `@io`             | capability  | Performs I/O (filesystem, stdout, stderr, devices). Does **not** imply `@network`.            |
-| `@network`        | capability  | Performs network operations. Implies `@io`.                                                   |
 | `@cancel`         | observation | Function observes `ctx.cancelled()` and may unwind via `panic Cancelled`. Requires a `ctx: Cancel` parameter. See §`@cancel` and `@uncancellable`. |
 | `@send`           | type-marker | A value's ownership can transfer across thread boundaries. Derived, not declared. See §`@send`. |
 
 Notes:
 
-- `@pure` is the only assert that forbids everything in the table. It
-  is the "I promise this is a function in the mathematical sense"
-  marker, used by stream stages, face laws, and `@derive` machinery.
+- `@pure` is the only assert that forbids everything in the assert
+  table. It is the "I promise this is a function in the
+  mathematical sense" marker, used by stream stages, face laws,
+  and `@derive` machinery.
 - `@realtime` does **not** subsume `@pure` — a real-time stage may
   mutate its internal `ref self`. Real-time is about *time bounds*,
   not *purity*.
 - `@no_panic` does not forbid `trap`. Audio paths use `trap()` for
   invariant violations (see [`errors.md` §`panic` and `trap`](./errors.md)).
-- `@network` implies `@io` so that callers declaring only `@io` may
-  not silently leak network calls.
+- `@network` / `@fs` / `@stdio` imply `@io` so that callers
+  declaring only `@io` may not silently leak finer-grained
+  capabilities.
+- A few `@realtime`-safe operations exist on otherwise-capability
+  surfaces (per [`env.md` §`@realtime` and capabilities](./env.md)):
+  `env.time.monotonic_ns()`, `env.random.fill_bytes(buf)` with a
+  pre-allocated `buf`, `env.audio.write_pcm(buf)` on a pool-owned
+  `buf`. Those specific methods are typed `@realtime + @time`,
+  `@realtime + @random`, `@realtime + @audio` respectively; the
+  capability marker travels with the call, but `@realtime`'s
+  allocation/suspension ban still holds.
 
 ## Implication graph
 
@@ -97,11 +142,19 @@ expansion.
 | `@no_alloc`       | `@no_panic` (panic allocates the message string)              |
 | `@uncancellable`  | — (forbids `@cancel` callees by intersection)                 |
 | `@network`        | `@io`                                                         |
-| `@send`           | (derived from type composition; see §`@send`)                 |
+| `@fs`             | `@io`                                                         |
+| `@stdio`          | `@io`                                                         |
+| `@audio`          | —                                                             |
+| `@midi`           | —                                                             |
+| `@ui`             | —                                                             |
+| `@inference`      | —                                                             |
+| `@time`           | —                                                             |
+| `@random`         | —                                                             |
 | `@io`             | —                                                             |
 | `@no_suspend`     | —                                                             |
 | `@no_trap`        | —                                                             |
 | `@cancel`         | (does not imply other effects; see §`@cancel` and `@uncancellable`) |
+| `@send`           | (derived from type composition; see §`@send`)                 |
 
 Implications fan out by transitive closure: `@pure` implies
 `@no_alloc`, which in turn implies `@no_panic`. A function declared
@@ -349,8 +402,7 @@ call `@cancel` functions; doing so is `CONC012` (per
 `concurrency.md`) — the marker would be defeated.
 
 ```q64
-@uncancellable
-fn flush_journal(env: Env, j: ref Journal) {
+fn flush_journal(env: Env, j: ref Journal) @uncancellable {
     db.write_all(env, j.pending)        // db.write_all must not be @cancel
 }
 ```
@@ -377,15 +429,26 @@ effects declared").
 #### What "no arbitrary-point observation" means
 
 `@uncancellable` (and therefore `@realtime`) forbids the body
-from *directly* calling `@cancel` functions or
-`ctx.cancelled()` mid-computation. It does **not** forbid the
-implicit cancellation branch of a `select { … }` (per
-[`concurrency.md` §"Implicit cancellation branch"](./concurrency.md)):
-a `select` is itself a natural yield boundary, and observing
-cancellation at that boundary is the audio thread's normal way
-to shut down cleanly. Concretely, an `@realtime` scope's
-`loop { select { … } }` pattern is well-formed; a `@realtime`
-body that calls `ctx.cancelled()` between two `recv`s is `EFF110`.
+from observing cancellation at an **arbitrary** point — but a
+`select { … }` is a structured yield, and observation **at**
+that yield is the audio thread's normal way to shut down
+cleanly. Concretely:
+
+| Where the `@cancel` call appears                              | Inside `@uncancellable` body? |
+|---------------------------------------------------------------|-------------------------------|
+| A bare `ctx.cancelled()` between two operations               | ❌ `EFF110`                    |
+| A bare `recv(ctx)` / `send(ctx, …)` outside a `select`        | ❌ `EFF110`                    |
+| A `recv(ctx)` / `send(ctx, …)` arm of a `select { … }`        | ✅ allowed (select is a yield) |
+| The implicit `ctx.cancelled()` branch of a `select`           | ✅ allowed (per [`concurrency.md` §"Implicit cancellation branch"](./concurrency.md)) |
+| An explicit `_ = ctx.cancelled() -> …` arm of a `select`      | ✅ allowed (overrides the implicit branch for cleanup) |
+
+The carveout is **lexical**, not transitive: a `@realtime` body
+that calls `helper(ctx)` where `helper` itself does
+`ctx.cancelled()` is `EFF110` at the call to `helper` — putting
+`helper(ctx)` inside a `select` arm doesn't launder it. The
+canonical `@realtime` audio loop is therefore
+`loop { select { f = rx.recv(ctx) -> play(move f), … } }`, never
+`loop { let f = rx.recv(ctx); play(move f) }`.
 
 ### Effect set in the call graph
 

@@ -78,6 +78,49 @@ unconstrained at declaration and unified per use-site by the fit (see
 
 For verbose or associated-type-touching bounds, use a `where` clause.
 
+### Implicit face parameters
+
+A parameter whose declared type is a **face name** (with optional
+generic arguments) introduces an anonymous generic parameter
+bounded by that face. The two forms below are equivalent:
+
+```q64
+pub fn fetch_users(n: Net, url: Url) -> Result<[User], Error> @network {
+    try n.get(url).json<[User]>()
+}
+
+// Desugars to:
+pub fn fetch_users<N: Net>(n: N, url: Url) -> Result<[User], Error> @network {
+    try n.get(url).json<[User]>()
+}
+```
+
+Rules:
+
+- The compiler recognises a parameter's declared type as a face
+  name if it resolves to a `face` declaration in scope.
+  Concrete types (structs, enums, kinds) never trigger the
+  desugaring.
+- Each implicit face parameter gets a fresh anonymous name; two
+  parameters of the same face are **two** generic parameters
+  (`fn pair(a: Net, b: Net)` desugars to `fn pair<A: Net, B: Net>(a: A, b: B)`).
+  Use the explicit form if you need the two parameters to share
+  a type.
+- The desugared parameter is monomorphized at the call site like
+  any other generic, with the same binary-size considerations
+  (per §Monomorphization). Rewrite to `dyn Face` if the
+  instantiation count grows past the warning threshold.
+- The desugaring does **not** apply when the face is used inside
+  a compound type (`fn collect(items: [Net])` keeps `[Net]` as a
+  literal element type, which is `TYP200` unless `Net` itself is
+  a concrete type — faces in element position need `dyn Net`).
+
+The shorthand is the canonical form for capability-passing helpers
+per [`env.md` §"Passing convention"](./env.md); the explicit
+`<N: Net>` form is needed only when the same parameter shape has
+to be referenced elsewhere in the signature (return type, second
+parameter, where clause).
+
 ## The `where` clause
 
 ### Placement
@@ -163,6 +206,13 @@ In v0:
   where `R: Hz` — per [`streams.md`](./streams.md)) and similar
   units-of-measure positions. The full unit lattice lands with
   `units.md`; in the meantime, this fixed list is the contract.
+- **Fixed-length arrays of the above** — `[T; N]` where `T` is
+  itself a permitted const-generic type and `N` is a comptime
+  integer. Used at the type level for tensor shapes:
+  `Tensor<T, [N]>` (rank 1), `Tensor<T, [W, H]>` (rank 2),
+  `Tensor<T, [A, B, C]>` (rank 3), etc. Equality on shape arrays
+  is element-wise; concatenation and reshape arithmetic in
+  `q64.math` operate on these shape values.
 
 Not in v0 (deferred):
 
@@ -172,6 +222,10 @@ Not in v0 (deferred):
   const generic.
 - `str` and string-like — comptime allocator and equality semantics
   unsettled.
+- Variable-length arrays (`[T]` without `; N`) as const generics —
+  shapes must commit to a rank at the type level. The runtime-rank
+  case uses `DynTensor<T>` per
+  [`types.md` §"SIMD and Tensor as language types"](./types.md).
 - Custom value types (kinds, enums) — requires a `ConstParamTy`-like
   marker; deferred to a future revision.
 
@@ -205,13 +259,19 @@ argument is omitted at the use site.
 ```q64
 pub struct Vec<T, R: Region = Arena>
 pub struct Map<K: Eq + Hash, V, R: Region = Arena>
-pub fn channel<T, const N: i64 = 16, P: Policy = Backpressure>(
-) -> (Sender<T>, Receiver<T>) { ... }
+pub struct Box<T, R: Region = Arena>
 
-let v: Vec<i64> = Vec.new()                  // R defaults to Arena
+let v: Vec<i64>      = Vec.new()             // R defaults to Arena
 let m: Map<str, i64> = Map.new()             // R defaults to Arena
-let (tx, rx) = channel<Frame>()              // N=16, P=Backpressure
+let b: Box<i64>      = Box.new(42)           // R defaults to Arena
 ```
+
+Region-defaulting is the most common case. Other parameter kinds
+take defaults the same way; per
+[`concurrency.md` §"`channel<T>(…)` construction"](./concurrency.md),
+the channel constructor deliberately does **not** default its
+`policy:` argument — every channel construction states its
+bounded / overwriting / blocking choice (`CONC050`).
 
 ### Rules
 

@@ -296,6 +296,22 @@ graph outer(env: Env) {
 A graph with parameters and a return type acts like a parameterized
 sub-topology.
 
+### Grammar
+
+```
+GraphDecl   := Visibility? "graph" Ident GenericParams?
+                "(" Params? ")" ("->" TypeExpr)? Block
+
+GraphExpr   := "graph" Ident? Block        // anonymous form for `let g = graph { … }`
+```
+
+`GraphDecl` joins the top-level `Item` list in
+[`modules.md`](./modules.md) §Grammar. `GenericParams` and
+`TypeExpr` follow the standard definitions from
+[`generics.md`](./generics.md). The body is a sequence of `let`
+bindings whose RHS is a stage call or a `|>` pipeline; the
+compiler builds the topology by walking those bindings.
+
 ## The `|>` pipe operator
 
 `|>` chains stages by passing the LHS as the first positional
@@ -555,8 +571,8 @@ graph is allowed; only the `@realtime` segment pins.
 The compiler verifies effect compatibility across `|>`:
 
 ```q64
-@stage @realtime
-fn play(pcm: Signal<PCM<f32>, 48.kHz>) { … }
+@stage
+fn play(pcm: Signal<PCM<f32>, 48.kHz>) @realtime { … }
 
 @stage
 fn http_post(env: Env, url: Url, body: Bytes) { … }       // not @realtime
@@ -630,8 +646,8 @@ fn counter(clicks: Event<()>) -> Signal<i64, 60.Hz> {
     clicks.fold(0, |n, _| n + 1)
 }
 
-@stage @realtime @fuse
-fn render(count: Signal<i64, 60.Hz>) -> Signal<Frame, 60.Hz> {
+@stage @fuse
+fn render(count: Signal<i64, 60.Hz>) -> Signal<Frame, 60.Hz> @realtime {
     count.map(|n| render_button(text: "Clicks: {n}"))
 }
 

@@ -481,14 +481,20 @@ struct Node {
 }
 
 fn build_tree() -> ManagedBox<Node> {
-    let root = Managed.box(Node { children: Vec.new(), parent: none })
+    let root  = Managed.box(Node { children: Vec.new(), parent: none })
     let child = Managed.box(Node { children: Vec.new(), parent: some(root) })
     root.children.push(child)
     root
 }
 ```
 
-Cyclic references are fine; the engine collects.
+`child` points back to `root` via `parent`; `root` points to
+`child` via `children`. That's a cycle in the object graph — fine
+under WasmGC, which collects the whole subgraph once no managed
+reference reaches it. A linear-memory allocator couldn't free
+this without a topological owner; the managed heap is the escape
+hatch for graphs the developer doesn't want to discipline by
+hand.
 
 ### Shared counter across tasks
 

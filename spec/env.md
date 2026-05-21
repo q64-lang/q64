@@ -82,18 +82,26 @@ the standard `(self, …)` receiver per
 
 ```q64
 pub face Net {
-    fn get        (self, url: Url) -> Result<Response, IoError> @io @network
-    fn post       (self, url: Url, body: Bytes) -> Result<Response, IoError> @io @network
-    fn ws_connect (self, url: Url) -> Result<WebSocket, IoError> @io @network
+    fn get        (self, url: Url) -> Result<Response, IoError> @network
+    fn post       (self, url: Url, body: Bytes) -> Result<Response, IoError> @network
+    fn ws_connect (self, url: Url) -> Result<WebSocket, IoError> @network
     // …
 }
 
 pub face Fs {
-    fn read  (self, path: str)                -> Result<Bytes, IoError> @io @fs
-    fn write (self, path: str, data: Bytes)   -> Result<(), IoError>    @io @fs
+    fn read  (self, path: str)                -> Result<Bytes, IoError> @fs
+    fn write (self, path: str, data: Bytes)   -> Result<(), IoError>    @fs
     // …
 }
 ```
+
+Effects compose with `+` per
+[`effects.md` §"Effect annotations on functions"](./effects.md); a
+method with two markers writes them as `@a + @b`. `Net.get` lists
+only `@network` because `@network` implies `@io` (per the core
+implication graph) — declaring both would be redundant. `Fs.read`
+lists `@fs` for the same reason; the implication tables in
+[`effects.md`](./effects.md) cover the closures.
 
 The runtime ships exactly one fit per face (browser → `BrowserNet`;
 Wasmtime → `WasmtimeNet`; etc.); the user code never names the
@@ -211,8 +219,10 @@ pub fn write_config<F: Fs>(f: F, path: str, cfg: Config) -> Result<(), IoError> 
 
 `fn fetch_users(n: Net, …)` is shorthand for
 `fn fetch_users<N: Net>(n: N, …)` per
-[`generics.md`](./generics.md): face-typed parameters auto-
-generalize. The compiler dispatches the calls statically.
+[`generics.md` §"Implicit face parameters"](./generics.md):
+face-typed parameters introduce an anonymous generic bound by the
+face. The compiler dispatches the calls statically (monomorphized
+per concrete fit).
 
 `q64 fmt --lint` issues `ENV010` when a function takes
 `env: Env` but uses only one or two sub-capabilities:
@@ -315,22 +325,25 @@ Two records of "what does this qube use" exist:
 
 2. **The compiler-derived set**, computed from the effect graph
    (per [`effects.md`](./effects.md)) and emitted into a Wasm
-   custom section (`q64.capabilities`). Each effect maps to a
-   capability:
+   custom section (`q64.capabilities`). Each core capability
+   effect (per [`effects.md` §"The core effect set"](./effects.md))
+   maps to a capability face:
 
-    | Effect       | Implies capability |
-    |--------------|--------------------|
-    | `@network`   | `Net`              |
-    | `@fs`        | `Fs`               |
-    | `@audio`     | `Audio`            |
-    | `@midi`      | `Midi`             |
-    | `@ui`        | `Ui`               |
-    | `@inference` | `AiEnv`            |
-    | `@time`      | `Clock`            |
-    | `@random`    | `Rng`              |
+    | Effect       | Implies capability  |
+    |--------------|---------------------|
+    | `@network`   | `Net`               |
+    | `@fs`        | `Fs`                |
+    | `@audio`     | `Audio`             |
+    | `@midi`      | `Midi`              |
+    | `@ui`        | `Ui`                |
+    | `@inference` | `AiEnv`             |
+    | `@time`      | `Clock`             |
+    | `@random`    | `Rng`               |
     | `@stdio`     | `Stdout` + `Stderr` |
 
-   Compiler-verified. Always accurate.
+   `@io` is the umbrella; it does not on its own map to a single
+   capability face (every finer-grained capability effect implies
+   it). Compiler-verified. Always accurate.
 
 ### `qube publish` cross-check
 
@@ -379,8 +392,8 @@ Every capability method carries the corresponding effect (per
 
 ```q64
 pub face Net {
-    fn get  (self, url: Url)               -> Result<Response, IoError> @io @network
-    fn post (self, url: Url, body: Bytes)  -> Result<Response, IoError> @io @network
+    fn get  (self, url: Url)               -> Result<Response, IoError> @network
+    fn post (self, url: Url, body: Bytes)  -> Result<Response, IoError> @network
     // …
 }
 ```
