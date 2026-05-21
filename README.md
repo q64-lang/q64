@@ -4,7 +4,10 @@ A stream-first language for Wasm 3.0, with managed and unmanaged memory as
 first-class peers.
 
 This repository is the q64 implementation monorepo. The language design
-discussion lives separately at [`q64-lang/design`](https://github.com/q64-lang/design).
+discussion that preceded the spec is archived in
+[`docs/history/`](./docs/history); the
+[`q64-lang/design`](https://github.com/q64-lang/design) repo is a tombstone
+pointing here.
 
 > **Status: pre-alpha.** Folders are scaffolded; most are not yet implemented.
 
