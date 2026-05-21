@@ -145,7 +145,7 @@ pub fn dot<T>(a: Vec3<T>, b: Vec3<T>) -> T { ... }
 pub struct Vec3<T> { x: T, y: T, z: T }
 pub enum Color { Rgb, Hsv, Lab }
 pub type Hz = f64
-pub face Eq<T> { ... }
+pub face Eq { ... }
 pub fit Vec3<f32> : Eq { ... }
 pub const PI: f64 = 3.14159
 pub use Vec3 from "./vec.q"
