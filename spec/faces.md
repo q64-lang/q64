@@ -6,7 +6,7 @@ q64-native extensions (effect-polymorphism, region-parameterization,
 auto-derive, and laws).
 
 > **Status: draft (v0).** Names settled (`face`, `fit`); core shape
-> settled (hybrid: single-parameter faces use `fit Face for Type`,
+> settled (hybrid: single-parameter faces use `fit Type : Face`,
 > multi-parameter faces use `fit Face<T1, T2>`). Some surface details
 > (`where`-clause grammar, full dyn-safety rules, the auto-derive
 > table) will firm up with implementation.
@@ -32,7 +32,7 @@ pub face Display {
 pub struct Color { r: u8, g: u8, b: u8 }
 
 // 2. fit — bind a type to the face.
-pub fit Display for Color {
+pub fit Color : Display {
     fn fmt(self) -> str {
         "#{self.r:02x}{self.g:02x}{self.b:02x}"
     }
@@ -58,7 +58,7 @@ What's happening:
 
 - **`face Display`** declares that any type fitting it provides a `fmt`
   method returning a `str` with no side effects (`@pure`).
-- **`fit Display for Color`** is the binding. The compiler verifies
+- **`fit Color : Display`** is the binding. The compiler verifies
   that the body matches the face's signature exactly, including the
   `@pure` effect.
 - **`fn print_all<T: Display>`** is generic over any `T` that fits
@@ -153,7 +153,7 @@ Inside the face body, `Self.Item` refers to the associated type. A fit
 supplies the concrete type:
 
 ```q64
-pub fit Iterator for VecIter<T> {
+pub fit VecIter<T> : Iterator {
     type Item = T
     fn next(self: ref Self) -> T? { ... }
 }
@@ -195,25 +195,46 @@ Any `fit Hash<X>` requires that `Eq<X>` is also fit.
 
 ## Fit declaration
 
-`fit` binds a face to one or more types. **The keyword `for` is required
-exactly when the face has one type parameter** — never otherwise. The
-rule is mechanical, not stylistic, and the compiler enforces it.
+`fit` binds a face to one or more types. The form depends on whether
+the face has a single conceptual receiver or several independent type
+parameters:
 
-### Single-parameter faces — use `for`
+- **Single-parameter faces** use `fit Type : Face` — implementer first,
+  face after `:`. Reads as "this type fits this face."
+- **Multi-parameter faces** use `fit Face<T1, T2>` — types are positional
+  in the face's parameter list; no single implementer.
+
+The rule is mechanical, not stylistic, and the compiler enforces it
+based on the face declaration.
+
+### Single-parameter faces — `fit Type : Face`
 
 ```q64
-pub fit Eq for Vec3<f32> {
+pub fit Vec3<f32> : Eq {
     fn eq(a: Vec3<f32>, b: Vec3<f32>) -> bool {
         a.x == b.x && a.y == b.y && a.z == b.z
     }
 }
 
-pub fit Display for Vec3<f32> {
+pub fit Vec3<f32> : Display {
     fn fmt(self) -> str { "Vec3({self.x}, {self.y}, {self.z})" }
 }
 ```
 
-### Multi-parameter faces — no `for`
+When the face also has effect or region parameters (Self plus aux
+params), the aux params go on the face after `:`:
+
+```q64
+pub fit LowPass : Filter<PCM<f32>, @realtime> {
+    fn step(self: ref Self, x: PCM<f32>) -> PCM<f32> @realtime { ... }
+}
+
+pub fit Vec<i64, Arena> : Collection<i64, Arena> {
+    fn push(self: ref Self, r: Arena, x: i64) { ... }
+}
+```
+
+### Multi-parameter faces — `fit Face<T1, T2>`
 
 ```q64
 pub fit Convert<PCM<i16>, PCM<f32>> {
@@ -290,11 +311,11 @@ pub face Filter<T, @e> {
     law preserves_silence: forall self => step(self, T.silence()) == T.silence()
 }
 
-pub fit Filter<PCM<f32>, @realtime> for LowPass {
+pub fit LowPass : Filter<PCM<f32>, @realtime> {
     fn step(self: ref Self, x: PCM<f32>) -> PCM<f32> @realtime { ... }
 }
 
-pub fit Filter<Bytes, @io> for FileSink {
+pub fit FileSink : Filter<Bytes, @io> {
     fn step(self: ref Self, x: Bytes) -> Bytes @io { ... }
 }
 
@@ -334,8 +355,8 @@ pub face Collection<T, R: Region> {
     fn len(self) -> usize
 }
 
-pub fit Collection<i64, Arena> for Vec<i64, Arena> { ... }
-pub fit Collection<i64, Managed> for Vec<i64, Managed> { ... }
+pub fit Vec<i64, Arena> : Collection<i64, Arena> { ... }
+pub fit Vec<i64, Managed> : Collection<i64, Managed> { ... }
 ```
 
 Callers stay generic over the region:
@@ -417,7 +438,7 @@ pub face Monoid<T> {
 }
 ```
 
-For each `fit Monoid for X`, `qube test` runs the three laws against
+For each `fit X : Monoid`, `qube test` runs the three laws against
 randomly generated `X` values. Counter-examples surface as standard
 diagnostic envelopes with `severity: "error"` and `code: "TYP218"`
 (see "Diagnostic codes" below), shrunken to a minimal failing case.
@@ -433,7 +454,7 @@ auto-derived generator wouldn't produce useful test inputs.
 
 ```q64
 @skip_laws
-pub fit Monoid for FloatingPointSum {
+pub fit FloatingPointSum : Monoid {
     // Floating-point addition is not associative — declare the fit
     // but skip property tests that would fail.
 }
@@ -535,8 +556,8 @@ checking is a typecheck concern). Stable numbering, never reused.
 | Code     | Short message                                | When                                                                              |
 |----------|----------------------------------------------|-----------------------------------------------------------------------------------|
 | `TYP200` | type does not fit face                       | Generic instantiation requires a face that the supplied type does not fit.        |
-| `TYP201` | `for` clause required on single-param face   | `fit Face<Type>` for a single-parameter face; use `fit Face for Type`.            |
-| `TYP202` | `for` clause forbidden on multi-param face   | `fit Face for Type` used with a multi-parameter face; use `fit Face<T1, T2>`.     |
+| `TYP201` | wrong fit form for single-param face         | Single-parameter face must use `fit Type : Face` (implementer first).             |
+| `TYP202` | wrong fit form for multi-param face          | Multi-parameter face must use `fit Face<T1, T2>` (no `:`, no implementer prefix). |
 | `TYP203` | overlapping fits                             | Two fits both match the same type combination.                                    |
 | `TYP204` | coherence violation                          | Fit's face and all parameter types are external to this qube.                     |
 | `TYP205` | face arity mismatch                          | Fit supplies a different number of type parameters than the face declares.        |
@@ -589,17 +610,17 @@ FaceDecl    := Visibility? "face" Ident GenericParams? FaceSuperList? "{" FaceIt
 FaceSuperList := ":" FaceRef ("+" FaceRef)*
 FaceItem    := TypeAlias | MethodSig | LawDecl
 TypeAlias   := "type" Ident ("=" TypeExpr)?
-MethodSig   := "fn" Ident "(" Params? ")" (":" TypeExpr)? EffectSpec? MethodBody?
+MethodSig   := "fn" Ident "(" Params? ")" ("->" TypeExpr)? EffectSpec? MethodBody?
 MethodBody  := "{" Stmt* "}"
 LawDecl     := "law" Ident ":" "forall" QuantList "=>" PredicateExpr
 
-FitDecl     := Visibility? "fit" FaceRef FitTarget "{" FitItem* "}"
-FitTarget   := "for" TypeExpr     // single-param face
-             | (empty)             // multi-param face; types live in FaceRef's GenericArgs
+FitDecl     := Visibility? "fit" FitSpec "{" FitItem* "}"
+FitSpec     := TypeExpr ":" FaceRef        // single-param face: Implementer : Face<AuxArgs?>
+             | FaceRef                      // multi-param face: Face<T1, T2>
 FitItem     := TypeAlias | MethodDecl
-MethodDecl  := "fn" Ident "(" Params? ")" (":" TypeExpr)? EffectSpec? MethodBody
+MethodDecl  := "fn" Ident "(" Params? ")" ("->" TypeExpr)? EffectSpec? MethodBody
 
-FaceRef     := Ident GenericArgs?     // e.g. `Eq`, `Convert<Rgb, Hex>`
+FaceRef     := Ident GenericArgs?     // e.g. `Eq`, `Filter<PCM<f32>, @realtime>`, `Convert<Rgb, Hex>`
 Bound       := Ident ":" FaceRef ("+" FaceRef)*
 WhereClause := "where" Bound ("," Bound)*
 
@@ -641,7 +662,7 @@ pub face Eq<T> {
 pub struct Vec3<T> { x: T, y: T, z: T }
 ```
 
-### Conversion (multi-parameter, no `for`)
+### Conversion (multi-parameter, brackets-only)
 
 ```q64
 pub face Convert<From, To> {
@@ -666,7 +687,7 @@ pub face Filter<T, @e> {
     fn step(self: ref Self, x: T) -> T @e
 }
 
-pub fit Filter<PCM<f32>, @realtime> for LowPass {
+pub fit LowPass : Filter<PCM<f32>, @realtime> {
     fn step(self: ref Self, x: PCM<f32>) -> PCM<f32> @realtime { ... }
 }
 
@@ -686,7 +707,7 @@ pub face Iterator {
     fn next(self: ref Self) -> Self.Item?
 }
 
-pub fit Iterator for Range {
+pub fit Range : Iterator {
     type Item = i64
     fn next(self: ref Self) -> i64? { ... }
 }
