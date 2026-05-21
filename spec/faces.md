@@ -760,8 +760,10 @@ pub fn write_to_log(items: [dyn Display]) {
   present. Lands with the coherence work.
 - **Const-evaluated bounds** — `where N == M + 1` for const generics;
   pending the comptime spec.
-- **Blessed stream faces** — `Stage`, `Source`, `Sink`, `RateAware`
-  as auto-prelude faces that `@stage`-annotated functions
-  structurally fit. Referenced by
-  [`streams.md`](./streams.md); the formal face declarations land
-  with the comptime / `@stage`-introspection work.
+- **Blessed stage-classification faces** — `Source`, `Sink`,
+  `RateAware` as auto-prelude faces that `@stage`-annotated
+  functions structurally fit (the graph-shape predicates
+  exposed at comptime). `Graph<Out>` itself is now declared
+  in [`streams.md`](./streams.md) §"The `Graph<Out>` type"; the
+  remaining stage classification faces land with the comptime /
+  `@stage`-introspection work.
