@@ -26,6 +26,7 @@ suite.
 | [`memory.md`](./memory.md)                               | Regions, dual heap, transfers, multi-memory layout, shared / managed annotations |
 | [`concurrency.md`](./concurrency.md)                     | Scopes, tasks, channels, select, actors, cancellation, panics, host translation |
 | [`streams.md`](./streams.md)                             | Signal / Event / Stream, @stage, graph, |>, pre(), fusion, SharedSignal          |
+| [`env.md`](./env.md)                                     | Capability model, Env structure, main signature, with_capabilities, disclosure   |
 
 ## Scope (forthcoming)
 
