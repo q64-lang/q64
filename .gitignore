@@ -3,6 +3,9 @@ zig-out/
 zig-cache/
 .zig-cache/
 
+# Pinned Zig toolchain installed by init.sh
+vendor/zig/
+
 # Node / Astro / web tooling
 node_modules/
 .astro/
