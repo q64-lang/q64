@@ -289,6 +289,37 @@ This is the "two visibility levels" decision realized. There is no
 `pub(qube)` keyword; the qube boundary is defined by what `lib.q`
 re-exports, not by a third level of marker.
 
+### Sub-module reachability
+
+A sub-module (`q64.math.vec`) is reachable from outside its qube
+exactly when **the entry point's re-export chain transitively
+names it** — either as a re-exported sub-namespace
+(`pub use vec from "./vec.q"`) or by re-exporting one or more
+names *from* it (`pub use Vec3 from "./vec.q"`). Re-exporting any
+name from a sub-module also exposes the sub-module's namespace
+path for selective imports of its other re-exportable names:
+
+```q64
+// stdlib/math/src/lib.q
+pub use Vec3, dot, cross from "./vec.q"        // exposes q64.math.vec
+```
+
+From another qube:
+
+```q64
+import q64.math.vec.{Vec3}                     // ✓ vec is exposed (lib.q pulls names from it)
+import q64.math.vec.{Vec3, dot}                // ✓ same
+import q64.math.vec.{private_to_qube}          // ❌ NAM007 — vec is exposed,
+                                               //    but private_to_qube was not re-exported from lib.q
+```
+
+A sub-module from which no name is re-exported is invisible
+across the qube boundary (`NAM007`); a sub-module from which any
+name is re-exported is *navigable* across the boundary, but the
+re-export wall still applies per-name. Selective imports of
+unre-exported names are `NAM007`, never `NAM010` — the missing
+ingredient is the re-export, not the declaration.
+
 ## Resolution algorithm (overview)
 
 For an import `import <path>` in a file at `<file-path>`:

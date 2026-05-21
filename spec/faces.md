@@ -337,6 +337,25 @@ concrete effect markers. They unify per-fit: a fit binds `@e` to a
 concrete effect (`@realtime`, `@io`, etc.), and the face's method
 contract is rewritten with that binding.
 
+**Elaboration.** The substitution is mechanical: each occurrence
+of `@e` (or any other declared effect variable) in the face's
+method signatures is replaced by the concrete effect set the fit
+binds. After substitution, the fit's method body is checked
+against the rewritten signature using the standard propagation
+rules from [`effects.md`](./effects.md) — the substituted
+signature is not polymorphic. Two consequences:
+
+1. A fit binding `@e = @realtime + @no_alloc` produces method
+   signatures with the *closed* set, and the body cannot leak any
+   effect outside it (`EFF110`).
+2. A `dyn Face<…, @e>` requires `@e` substituted at the use site
+   (`TYP207`); the dyn vtable has no place to carry an effect
+   variable.
+
+The substitution happens before propagation; once a fit's
+signatures are rewritten, the rest of the effect checker treats
+them like any other concrete signature.
+
 **Effect bounds compose:**
 
 ```q64
@@ -539,10 +558,26 @@ needed and neither qube has reason to declare the fit themselves.
 
 ### Conflict resolution
 
+Two fits **conflict** when they share the same `(Face, TypeArgs)`
+tuple — same face name with the same complete list of type
+arguments — regardless of method bodies. The compiler does not
+inspect bodies; two identical fits with byte-identical bodies in
+two different qubes still conflict, because picking one is
+arbitrary.
+
 If two qubes both declare conflicting fits and a third qube depends on
-both, the resolver reports `TYP204` with both source locations and asks
-the user to resolve by either yanking one fit or wrapping a type in a
-newtype.
+both, the resolver reports `TYP204` with both source locations.
+There is no automatic precedence rule; the third qube must resolve
+the conflict explicitly, by one of:
+
+1. **Yank one fit at the source** (the published qube's maintainer
+   removes or supersedes its fit).
+2. **Newtype-wrap the type** in the consuming qube — define
+   `pub struct WrappedT(T)` and write the desired
+   `fit WrappedT : Face`; the wrapper sidesteps the conflict.
+3. **Pick one upstream and drop the other** — adjust the
+   `dependencies` map so only one fit-providing qube is in the
+   graph.
 
 Conflicts are diagnosed at build time, not runtime — there is no late
 binding that could surprise.

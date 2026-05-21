@@ -125,7 +125,12 @@ Server validates, in order:
 1. Manifest matches [`qube.json5.schema.json`](./qube.json5.schema.json).
 2. Version is not already published; name is available or owned by
    the token's subject.
-3. Tarball SHA matches the manifest's stated checksum.
+3. **Tarball checksum.** The server computes the SHA-256 of the
+   uploaded tarball and stores it as the version's canonical
+   identifier. The manifest does *not* carry a checksum field; the
+   tarball is content-addressed by the server's computation, which
+   is then returned to the client and recorded in `qube.lock` (per
+   "Resolver protocol" below).
 4. **Effect indexing.** The server runs the effect analyser (the
    same code path `qube audit` uses locally — see
    [`qube-cli.md`](./qube-cli.md) §"Publishing flow") on the
@@ -143,7 +148,7 @@ Server validates, in order:
    `422` with `ENV040`.
 
 On success: `201 Created` with the new version's metadata, including
-the indexed effect set.
+the indexed effect set and the computed SHA-256.
 
 ### Write — yank / unyank
 
@@ -218,14 +223,29 @@ Response:
 
 ```json
 {
-  "declared": ["@io", "@network"],
+  "declared":   ["@io", "@network"],
+  "detected":   ["@io", "@network"],
   "transitive": ["@io", "@network"],
   "by_dependency": {
-    "url-parser@1.2.0": ["@pure"],
-    "http-client@0.4.0": ["@io", "@network"]
+    "url-parser@1.2.0":   ["@pure"],
+    "http-client@0.4.0":  ["@io", "@network"]
   }
 }
 ```
+
+Field semantics:
+
+| Field            | Source                                                                       |
+|------------------|------------------------------------------------------------------------------|
+| `declared`       | The qube's manifest `effects.declared` (per [`qube.json5.md`](./qube.json5.md) §Effects). |
+| `detected`       | The compiler-derived effect set from static analysis on this qube's `pub` surface. Matches `declared` after the publish-time cross-check (`EFF130`). |
+| `transitive`     | The closure of `detected` over every dependency's `detected` set, per the implication graph in [`effects.md`](./effects.md). |
+| `by_dependency`  | The contribution of each direct dependency to `transitive`. Map of `<name>@<version>` → effect list. |
+
+The manifest's `effects.deny` field is **not** surfaced here —
+denial is enforced locally at resolve time, not part of the
+published metadata. (A dependency carrying a denied effect is
+`EFF131`, raised by the resolver before any HTTP call.)
 
 This is the data behind "what does this qube ultimately touch" —
 shown in the registry UI on every qube detail page and in
@@ -249,13 +269,23 @@ schema themselves.
 
 - Compression: `gzip`
 - Layout: a single root directory whose name is `<qube-name>-<version>`,
-  containing `qube.json5` at the root, `src/`, `tests/`, the README,
-  and `LICENSE-*` files. Anything else listed in the manifest's
-  `include` glob.
+  containing `qube.json5` at the root plus the file set described
+  below.
+- Default file set (when `include` is **absent** in the manifest):
+  `qube.json5`, every file under `src/`, every file under `tests/`,
+  the README (whatever path `readme` names, or `README.md` if
+  unset), and every `LICENSE-*` file at the project root.
+- When `include` is **present**, the file set is exactly the union
+  of the default set above and the `include` globs. `include` adds
+  to the default; it never replaces it. (Manifests that need to
+  *remove* a default-included file use `exclude`.)
+- `exclude` is applied last and may drop any file the previous
+  steps would have included, default or not.
 - Maximum unpacked size: TBD (likely 50 MB for v0; raise via owner
   request).
 - SHA-256 of the tarball is the canonical identifier; the registry
-  stores it and `qube.lock` references it.
+  computes it at publish time (per "Write — publish" step 3) and
+  `qube.lock` records it.
 
 ## Notes on hosting
 

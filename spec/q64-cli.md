@@ -33,15 +33,19 @@ subcommand, it is treated as `q64 run <file>`.
 
 ### `q64 show` kinds
 
-| Form                       | Output                                                   |
-|----------------------------|----------------------------------------------------------|
-| `q64 show types <expr>`    | Inferred type of `<expr>`                                |
-| `q64 show effects <fn>`    | Effect set of `<fn>`                                     |
-| `q64 show regions <fn>`    | Regions `<fn>` uses or borrows from                      |
-| `q64 show graph <stage>`   | Stream-graph topology rooted at `<stage>`                |
-| `q64 show layout <type>`   | Memory layout of `<type>`                                |
-| `q64 show send <type>`     | `@send`-derivation explanation                           |
-| `q64 show memories`        | Wasm memory declarations the program produces            |
+| Form                            | Output                                                         |
+|---------------------------------|----------------------------------------------------------------|
+| `q64 show types <expr>`         | Inferred type of `<expr>`                                      |
+| `q64 show effects <fn>`         | Effect set of `<fn>`                                           |
+| `q64 show regions <fn>`         | Regions `<fn>` uses or borrows from                            |
+| `q64 show graph <stage>`        | Stream-graph topology rooted at `<stage>`                      |
+| `q64 show layout <type>`        | Memory layout of `<type>`                                      |
+| `q64 show send <type>`          | `@send`-derivation explanation                                 |
+| `q64 show memories`             | Wasm memory declarations the program produces                  |
+| `q64 show modules`              | Module tree: each file's path, header doc, exported names      |
+| `q64 show modules --prelude`    | Auto-prelude listing — the set of names reachable without an `import`, including the transitive prelude-face-reachable types (per [`modules.md` §"Reachable through a capability face"](./modules.md)) |
+| `q64 show capabilities <qube>`  | Compiler-derived capability set for `<qube>`'s `pub` surface  |
+| `q64 show denials <fn>`         | Call-graph reachability into `with_capabilities(deny: …)` blocks |
 
 Each form takes additional `--qube <path>` or `--module <name>=<path>`
 flags as needed (see "Global options").
@@ -59,9 +63,10 @@ flags as needed (see "Global options").
 | Flag                              | Meaning                                                                   |
 |-----------------------------------|---------------------------------------------------------------------------|
 | `--diagnostics <text\|json>`      | Diagnostic format. Default `text` interactive, `json` when stdout is not a TTY or when run by `qube`. |
-| `--out <path>`                    | Output path for `build` (defaults to `<input>.wasm`)                      |
+| `--out <path>`                    | Output path for `build` (defaults to `<input>.wasm`). One output per invocation. |
 | `--target <name>`                 | Target name to compile for (resolves via the qube manifest if present)    |
-| `--module <name>=<path>`          | Map a module name to a source directory. Repeatable. Set by `qube`.       |
+| `--module <name>=<path>`          | Map a module name to a source directory. Repeatable. Set by `qube`. Paths are always absolute (also for local-path dependencies, which `qube` resolves to filesystem paths before invocation). |
+| `--features <comma-list>`         | Feature flags active in this build, e.g. `--features fft,mp3`. Repeatable; the union of all `--features` flags is the active set. `qube build` derives this from the manifest's `dependencies[].features` and `default-features` per-dependency rules. |
 | `--no-color`                      | Disable ANSI color in text diagnostics                                    |
 | `--quiet` / `-q`                  | Suppress non-error output                                                 |
 | `--verbose` / `-v`                | Verbose logging to stderr                                                 |
@@ -118,16 +123,32 @@ whether to retry, report, or surface to the human.
 The `qube` binary invokes `q64` per source file. Stable contract for that
 boundary:
 
-1. **Always pass `--diagnostics json`.** Text rendering is `qube`'s job.
-2. **Always pass `--module` for every dependency.** `q64` does no
-   dependency discovery itself.
-3. **Parse the entire stderr stream as one or more JSON envelopes.**
+1. **One invocation per top-level source file**, with one `--out`
+   per invocation. `q64` does not batch multiple inputs into a
+   single wasm; `qube` is responsible for sequencing invocations and
+   linking the resulting objects (or letting each invocation emit a
+   self-contained wasm if no cross-file linking is required).
+2. **Always pass `--diagnostics json`.** Text rendering is `qube`'s job.
+3. **Always pass `--module` for every dependency**, including local
+   path dependencies (which `qube` resolves to a filesystem path
+   before passing). `q64` does no dependency discovery itself and
+   never reads `qube.json5`.
+4. **Pass `--features` whenever any dependency declares feature
+   flags**, or whenever the consuming `qube.json5` enables features
+   non-default. The compiler uses this list to gate
+   `@feature("foo")`-annotated items (forthcoming; tracked under
+   the comptime spec).
+5. **Parse the entire stderr stream as one or more JSON envelopes.**
    Each envelope is a single line of JSON terminated by `\n`
    (newline-delimited JSON), so streaming parsers can read them
-   incrementally.
-4. **Treat exit code `70` as "do not retry, report upstream."** Surface
+   incrementally. `q64` flushes stderr after every envelope; a
+   diagnostic emitted in the middle of a long build is visible to
+   the parent without waiting for the build to complete. (This is
+   the only flush guarantee `qube` may rely on for progress
+   reporting.)
+6. **Treat exit code `70` as "do not retry, report upstream."** Surface
    the embedded `report_url` to the user.
-5. **Do not interpret stdout when `--diagnostics json` is set on
+7. **Do not interpret stdout when `--diagnostics json` is set on
    `build`** — it carries only the program's output if `run` was
    invoked. Build mode writes the wasm artifact to `--out` and produces
    no stdout.

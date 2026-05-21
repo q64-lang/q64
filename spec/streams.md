@@ -217,12 +217,15 @@ a property of how the function is used.
 ### Sink stages
 
 A stage with `-> ()` is a sink — it consumes a stream and does
-something terminal (write to a device, send over the network):
+something terminal (write to a device, send over the network).
+Stage signatures follow the smallest-capability convention from
+[`env.md` §"Passing convention"](./env.md): take the
+sub-capability you use, not the whole `Env`.
 
 ```q64
 @stage
-fn play(audio: Signal<PCM<f32>, 48.kHz>) {           // -> () implied
-    env.audio.write(audio)
+fn play(a: Audio, audio: Signal<PCM<f32>, 48.kHz>) {   // -> () implied
+    a.write(audio)
 }
 ```
 
@@ -235,8 +238,8 @@ A stage with no dataflow inputs but a dataflow output is a source:
 
 ```q64
 @stage
-fn mic_input(env: Env) -> Signal<PCM<f32>, 48.kHz> {
-    env.audio.input()
+fn mic_input(a: Audio) -> Signal<PCM<f32>, 48.kHz> {
+    a.input()
 }
 ```
 
@@ -252,13 +255,13 @@ otherwise the type produced at the last `|>`):
 
 ```q64
 graph voice_pipeline(env: Env) {
-    let pcm        = mic_input(env)                       // source
+    let pcm        = mic_input(env.audio)                 // source
     let denoised   = pcm |> denoise(threshold: 0.1)
     let resampled  = denoised |> resample(target: 16.kHz)
     let tokens     = resampled |> whisper_asr(env.ai)
     let response   = tokens |> llama_complete(env.ai)
     let synthed    = response |> tts(env.ai)
-    let _          = synthed |> play(env)                 // sink
+    let _          = synthed |> play(env.audio)           // sink
 }
 // voice_pipeline : Graph<()>
 
@@ -314,9 +317,9 @@ graph subgraph(input: Signal<PCM<f32>, R>) -> Signal<PCM<f32>, R> {
 }
 
 graph outer(env: Env) {
-    let pcm = mic_input(env)
+    let pcm = mic_input(env.audio)
     let clean = pcm |> subgraph
-    let _ = clean |> play(env)
+    let _ = clean |> play(env.audio)
 }
 ```
 
@@ -445,9 +448,9 @@ fn resample(input: Signal<f32, 48.kHz>) -> Signal<f32, 16.kHz> { … }
 @stage              // not @fuse — task boundary here
 fn whisper_asr<const R: Hz>(input: Signal<f32, R>, ai: AiEnv) -> Stream<Token<WhisperVocab>, 10.Hz> { … }
 
-graph voice {
-    let asr_in = mic_input(env) |> denoise |> resample      // fused into one task
-    let tokens = asr_in |> whisper_asr                       // separate task
+graph voice(env: Env) {
+    let asr_in = mic_input(env.audio) |> denoise |> resample      // fused into one task
+    let tokens = asr_in |> whisper_asr(env.ai)                     // separate task
 }
 ```
 
@@ -461,6 +464,12 @@ Effect of `@fuse`:
   observable side effects between.
 - A non-`@fuse` stage always forms a task boundary. Use this for
   scheduling, measurement, or debugging.
+- A panic raised in one stage of a fused group unwinds the
+  shared task body as a single panic — the enclosing scope sees
+  one panic event, not one per stage in the group. Cancellation
+  of siblings (per `concurrency.md` §"Panics across tasks")
+  proceeds the same way it would if the group were a single
+  stage.
 
 ### Why opt-in
 
@@ -487,7 +496,7 @@ scope {
 
     // audio thread (writer):
     spawn @realtime {
-        let pcm = mic_input(env)
+        let pcm = mic_input(env.audio)
         state.level = pcm |> rms_envelope          // continuously updates
     }
 
@@ -571,7 +580,7 @@ fn decode(input: Stream<Bytes, R>) -> Stream<Frame, R> {
 }
 
 scope {
-    let g = graph audio { mic_input(env) |> decode |> play(env) }
+    let g = graph audio { mic_input(env.audio) |> decode |> play(env.audio) }
     g.start(env).await()
 } catch (e: Cancelled) {
     env.out("graph shut down cleanly")
@@ -617,37 +626,67 @@ The compiler verifies effect compatibility across `|>`:
 
 ```q64
 @stage
-fn play(pcm: Signal<PCM<f32>, 48.kHz>) @realtime { … }
+fn play(a: Audio, pcm: Signal<PCM<f32>, 48.kHz>) @realtime { … }
 
 @stage
-fn http_post(env: Env, url: Url, body: Bytes) { … }       // not @realtime
+fn http_post(n: Net, url: Url, body: Bytes) { … }       // not @realtime
 
 scope {
     let g = graph audio {
-        let _ = mic_input(env) |> play |> http_post(env, url"…")   // ← STR060
+        let _ = mic_input(env.audio) |> play(env.audio) |> http_post(env.net, url"…")   // ← STR060
     }
 }
 ```
 
-`STR060`: `@realtime` stage piped into non-`@realtime` stage.
+`STR060`: `@realtime` stage piped into non-`@realtime` stage
+(this example), or `Stream<T, R>` piped into a `@realtime` stage
+(would block on the resulting `Backpressure` channel). Both
+shapes carry the same code; the diagnostic message distinguishes
+them.
 
 ## Stream runtime = task scheduler
 
 Per [`concurrency.md`](./concurrency.md) §"Stream runtime = task
 scheduler", there is no separate "reactive runtime" alongside the
-task scheduler. They are the same. To restate the contract here:
+task scheduler. They are the same. The contract:
 
-- A stage is a task.
-- A `|>` between stages is a `channel<T>(…)` from
-  `concurrency.md` (with a policy derived from the dataflow
-  type: `Backpressure` for `Stream`, `LatestValue` for `Signal`,
-  `RingBuffer` for `Event` with capacity from history bound).
-- Fused stages share a task body (one suspension point per fused
-  group).
-- A graph's `Handle<()>` (from `g.start(env)`) is the
-  `Handle<T>` from `concurrency.md`.
-- A graph's panic propagates via `scope { … } catch { … }`.
-- A graph's cancellation observes the enclosing scope's `ctx`.
+- **A stage is a task.** Stage spawning, ctx propagation, and panic
+  unwinding follow the rules in `concurrency.md` unchanged.
+- **A `|>` between stages is a `channel<T>(…)`** from
+  `concurrency.md`. The channel's policy is **determined by the
+  dataflow type of the LHS**, per this table:
+
+  | LHS dataflow type   | Channel policy    | Capacity                                  |
+  |---------------------|-------------------|-------------------------------------------|
+  | `Stream<T, R>`      | `Backpressure`    | inferred from the consumer's `@stage` budget; default 8 |
+  | `Signal<T, R>`      | `LatestValue`     | single slot (policy property)             |
+  | `Event<T>`          | `RingBuffer`      | the event's declared history bound; default 16 |
+
+  This mapping is normative: a `Signal` piped to a stage always
+  produces a `LatestValue` channel, a `Stream` always a
+  `Backpressure` channel, an `Event` always a `RingBuffer`
+  channel. User code does not name the policy at the `|>` site;
+  it's a property of the dataflow type. A consequence rule
+  composes with [`concurrency.md` §"Effects across
+  concurrency"](./concurrency.md): a `@realtime` stage cannot
+  consume from a `Backpressure` channel (which would block), so
+  piping `Stream<T, R>` into a `@realtime` stage is `STR060`. Use
+  `Signal` or `Event` (non-blocking policies) for `@realtime`
+  inputs.
+- **Fused stages share a task body** (one suspension point per
+  fused group). A panic raised inside a fused group unwinds the
+  shared task body and is delivered to the graph's enclosing
+  scope as a single panic — siblings see one cancellation event,
+  not one per fused stage.
+- **A graph's `Handle<Out>`** (from `g.start(env)`) is the
+  `Handle<T>` from `concurrency.md`. `g.stop()` is semantically
+  `h.cancel()` on that handle (per [`concurrency.md` §"Where
+  `ctx` comes from"](./concurrency.md)); the graph's root ctx
+  propagates to every stage.
+- **A graph's panic propagates via `scope { … } catch { … }`** —
+  same mechanism as any task-internal panic.
+- **A graph's cancellation observes the enclosing scope's `ctx`** —
+  cancelling the scope cancels the graph as a unit.
 
 ## Examples
 
@@ -655,7 +694,7 @@ task scheduler. They are the same. To restate the contract here:
 
 ```q64
 graph voice_agent(env: Env) {
-    let pcm:      Signal<PCM<f32>, 48.kHz>   = mic_input(env)
+    let pcm:      Signal<PCM<f32>, 48.kHz>   = mic_input(env.audio)
     let denoised: Signal<PCM<f32>, 48.kHz>   = pcm |> denoise(threshold: 0.05)
     let prepped:  Signal<PCM<f32>, 16.kHz>   = denoised |> resample(target: 16.kHz)
     let tokens:   Stream<Token<WhisperVocab>, 20.Hz>
@@ -665,7 +704,7 @@ graph voice_agent(env: Env) {
                                               = text |> llama_complete(env.ai)
     let synth:    Signal<PCM<f32>, 24.kHz>    = response |> tts(env.ai)
     let out:      Signal<PCM<f32>, 48.kHz>    = synth |> resample(target: 48.kHz)
-    let _                                      = out |> play(env)
+    let _                                      = out |> play(env.audio)
 }
 
 scope {
@@ -700,7 +739,7 @@ graph ui(env: Env) {
     let clicks = env.ui.button("Click me").clicks()
     let count  = counter(clicks)
     let frames = render(count)
-    let _      = frames |> blit(env)
+    let _      = frames |> blit(env.ui)
 }
 ```
 
@@ -715,9 +754,9 @@ fn iir(input: Signal<f32, 48.kHz>, alpha: f32) -> Signal<f32, 48.kHz> {
 }
 
 graph audio_path(env: Env) {
-    let pcm    = mic_input(env)
+    let pcm    = mic_input(env.audio)
     let smoothed = pcm |> iir(alpha: 0.9)
-    let _      = smoothed |> play(env)
+    let _      = smoothed |> play(env.audio)
 }
 ```
 
@@ -730,9 +769,9 @@ struct Meter {
 }
 
 graph audio_engine(env: Env, meter: ref Meter) {
-    let pcm = mic_input(env)
+    let pcm = mic_input(env.audio)
     meter.rms = pcm |> rms_envelope(window: 10.ms)        // writer (audio thread)
-    let _    = pcm |> play(env)
+    let _    = pcm |> play(env.audio)
 }
 
 scope {
@@ -796,7 +835,7 @@ stable, never reused. `STR070`-`STR099` reserved for expansion.
 | `STR050` | unbroken feedback cycle                        | A graph cycle with no `pre()` to break it.                                          |
 | `STR051` | `pre()` on `Event<T>`                          | Events have no previous-tick notion.                                                |
 | `STR052` | `pre()` outside a stage body                   | `pre()` is only meaningful inside graph evaluation.                                 |
-| `STR060` | `@realtime` stage piped into non-`@realtime`   | Effect compatibility violation across `|>`.                                          |
+| `STR060` | `@realtime` × `|>` effect violation            | Either: `@realtime` stage piped into non-`@realtime` (effect leak), or `Stream<T, R>` piped into a `@realtime` stage (would consume from a `Backpressure` channel and block). |
 | `STR061` | non-`@send` payload crossing thread boundary   | A stage's output is consumed on a different thread; payload isn't `@send`.          |
 | `STR062` | `SharedSignal` with non-`@send` `T`            | The wrapped type must be `@send`.                                                    |
 | `STR063` | multiple writers on `SharedSignal`             | A `SharedSignal<T, R>` may have at most one writer.                                  |
