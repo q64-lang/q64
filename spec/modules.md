@@ -1,0 +1,408 @@
+# Modules and Visibility
+
+How q64 source is organized into modules, how modules import each other,
+and how visibility controls what crosses file and qube boundaries.
+
+> **Status: near-final (v0).** The decisions captured here have been
+> resolved; field-level visibility on structs is deferred to a future
+> traits/types spec and is not covered here.
+
+## Design goals
+
+1. **Greppable symbol provenance.** Given any identifier in a source file,
+   one of three lines reveals where it came from: its own declaration in
+   this file, an `import` statement at the top, or the language's
+   auto-prelude. No fourth channel.
+2. **Two visibility levels.** `pub` or file-private. No `pub(crate)` /
+   `pub(super)` / `pub(qube)` ladder.
+3. **Mechanically refactorable.** Renaming a file, moving a sub-module,
+   or extracting a helper must be a localized edit — never a
+   project-wide hunt for transitive name leaks.
+4. **AI-agent friendly.** An LLM should be able to read a file cold and
+   know its public API in one glance, and read an import line and know
+   exactly which symbols it brings in.
+
+These goals push every decision toward "explicit, named, local."
+
+## Modules and module paths
+
+### Module identity
+
+| On disk                           | Module path           |
+|-----------------------------------|-----------------------|
+| `<qube>/src/lib.q`                | `<qube-name>`         |
+| `<qube>/src/main.q`               | `<qube-name>` (application qubes; no library entry) |
+| `<qube>/src/<name>.q`             | `<qube-name>.<name>`  |
+| `<qube>/src/<dir>/lib.q`          | `<qube-name>.<dir>`   |
+| `<qube>/src/<dir>/<name>.q`       | `<qube-name>.<dir>.<name>` |
+
+Folder = sub-namespace. `lib.q` inside a folder is the entry point when
+the folder is imported by name. A folder without a `lib.q` is still
+navigable to its files but cannot itself be imported.
+
+### Qube name → module path
+
+Qube names in `qube.json5` use kebab-case and optional `org/` prefix
+(`q64/math`, `audio-filters`, `acme/widget`). The matching module path
+uses dots and drops the org slash:
+
+| Qube name           | Module path root   |
+|---------------------|--------------------|
+| `q64/math`          | `q64.math`         |
+| `audio-filters`     | `audio_filters`    |
+| `acme/widget-kit`   | `acme.widget_kit`  |
+
+Dashes in qube names become underscores in module paths (identifiers
+can't contain `-`); the qube manifest validates that the transformation
+is unambiguous.
+
+### Module-header doc comment (optional)
+
+The first lines of a file may contain a `//!` doc comment summarizing
+the module:
+
+```q64
+//! q64.math.vec — Three-dimensional vector arithmetic with units.
+//! exports: Vec3, dot, cross, normalize
+```
+
+This is **informational**, not enforced. The compiler ignores the
+`exports:` line for visibility purposes — only `pub` declarations
+actually control what's exported. The header drives `q64 show modules`
+output, LSP hover/summary panels, and the MCP `q64.show.modules` tool.
+
+## Import grammar
+
+### Three forms
+
+```q64
+import <module-path>                       // namespace import
+import <module-path>.{ <name>, ... }       // selective import
+import <module-path> as <ident>            // aliased namespace
+```
+
+`<module-path>` is one of:
+
+- **Bare dotted** — `q64.math.vec`. Resolves through the current qube's
+  `qube.json5` `dependencies` map (or, for paths beginning with this
+  qube's own name, internally).
+- **Quoted relative** — `"./vec.q"`, `"../shared/util.q"`. Resolves
+  relative to the current file. Cannot escape the current qube
+  (paths that would leave the qube root are a `NAM002` error).
+
+The two path kinds are distinguished by whether the path begins with `"`.
+This is a mechanical syntactic rule with no overlap.
+
+### Naming the bound symbol
+
+| Form                                            | Bound names                                                         |
+|-------------------------------------------------|---------------------------------------------------------------------|
+| `import q64.math.vec`                           | `vec` (last segment of the path) as a namespace                     |
+| `import q64.math.vec.{Vec3, dot}`               | `Vec3` and `dot` directly                                           |
+| `import q64.math.vec as v`                      | `v` as a namespace                                                  |
+| `import "./util.q"`                             | `util` (filename without `.q`) as a namespace                       |
+| `import "./util.q".{helper, Token}`             | `helper` and `Token` directly                                       |
+| `import "./util.q" as u`                        | `u` as a namespace                                                  |
+
+Selective and aliased forms do **not** compose with each other —
+`import x.{a} as y` is a syntax error. Choose one binding mode per
+import line.
+
+### Forbidden
+
+```q64
+import q64.math.*                          // ❌ NAM003 (wildcard forbidden)
+import "./util.q".*                        // ❌ NAM003 (wildcard forbidden)
+import x.{a} as y                          // ❌ NAM004 (selective with alias)
+import "../../../other-qube/src/foo.q"     // ❌ NAM002 (path escapes qube)
+```
+
+Wildcards are forbidden in every form. Every identifier visible in a
+file is either declared in that file, named at an import, or part of
+the language's auto-prelude (`Simd`, `Tensor`, `DynTensor`, `Result`,
+`Option`, and the numeric primitives). `grep <Name>` always finds the
+import line.
+
+### Collisions
+
+If a selective import or a top-level declaration would bind a name
+already in scope, the compiler rejects it as `NAM005`. Use
+aliasing to disambiguate:
+
+```q64
+import "./a.q".{Frame}
+import "./b.q".{Frame}                     // ❌ NAM005 (name collision)
+
+import "./a.q".{Frame}
+import "./b.q" as b                        // ✓ refer to b.Frame
+```
+
+## Visibility
+
+Every item declaration carries an optional `pub` prefix:
+
+```q64
+pub fn dot[T](a: Vec3[T], b: Vec3[T]): T { ... }
+pub struct Vec3[T] { x: T, y: T, z: T }
+pub enum Color { Rgb, Hsv, Lab }
+pub type Hz = f64
+pub trait Eq { ... }
+pub const PI: f64 = 3.14159
+pub use Vec3 from "./vec.q"
+
+fn helper(): i64 { ... }                   // file-private (no pub)
+```
+
+- An item without `pub` is **file-private**. It is not visible to
+  sibling files in the same qube, regardless of how those files import
+  this one.
+- An item with `pub` is visible to any code that imports its containing
+  module by any of the three import forms. Crossing the qube boundary
+  additionally requires a chain of `pub use` re-exports starting at the
+  qube's entry point (`src/lib.q` or `src/main.q`) — see "The re-export
+  wall," below.
+
+### Block `pub` is forbidden
+
+```q64
+pub { fn a() ... fn b() ... }              // ❌ NAM009 (block pub forbidden)
+```
+
+Every public item must start its line with `pub`, so `grep '^pub '`
+enumerates a file's contributions to the public surface.
+
+### Field visibility on structs
+
+Out of scope for this spec. Until the traits/types spec lands, struct
+fields inherit the struct's visibility — fields of a `pub struct` are
+publicly readable. Per-field visibility (`pub` on each field, or an
+explicit `private` marker) is a future addition that will not break
+existing code.
+
+## Re-exports — `pub use`
+
+A re-export brings a name from another module into the current module's
+public surface:
+
+```q64
+pub use Vec3 from "./vec.q"                       // single name
+pub use Vec3, dot, cross from "./vec.q"           // multiple names
+pub use vec from "./vec.q"                        // re-export the whole namespace under its own name
+pub use vec as v3 from "./vec.q"                  // re-export under a different name
+pub use Vec3 from q64.math.vec                    // re-export a name from another qube
+```
+
+A re-exported name is indistinguishable from a direct declaration as
+far as consumers are concerned. There is no "this came via re-export"
+marker in the consumer-visible API.
+
+Re-exports may chain (a re-export of a re-export is fine); cycles in
+re-export chains are a `NAM008` error.
+
+### The re-export wall
+
+A qube's public surface is exactly what is transitively reachable
+through `pub use` chains starting at its entry point (`src/lib.q` for
+libraries, `src/main.q` for applications).
+
+```q64
+// stdlib/math/src/vec.q
+pub fn private_to_qube(): i64 { ... }      // pub, but never re-exported
+
+// stdlib/math/src/lib.q
+pub use Vec3, dot, cross from "./vec.q"    // these three escape
+```
+
+From a caller in another qube:
+
+```q64
+import q64.math.{Vec3, dot, cross}         // ✓ all three are re-exported
+import q64.math.{private_to_qube}          // ❌ NAM006 (private to qube)
+import q64.math.vec.{private_to_qube}      // ❌ NAM007 (sub-module not re-exported from lib.q)
+```
+
+This is the "two visibility levels" decision realized. There is no
+`pub(qube)` keyword; the qube boundary is defined by what `lib.q`
+re-exports, not by a third level of marker.
+
+## Resolution algorithm (overview)
+
+For an import `import <path>` in a file at `<file-path>`:
+
+1. **If `<path>` is quoted relative**, resolve it as a filesystem path
+   relative to `<file-path>`. The resolved file must lie within the
+   current qube's source root.
+2. **If `<path>` is bare dotted**, split off the leading qube name:
+   - If the qube name is the current qube's own name (per
+     `qube.json5`), resolve the rest of the path as
+     `<qube-root>/src/<segments>/...`.
+   - Otherwise, look up the qube name in the current qube's
+     `dependencies` map. The compiler's `--module <name>=<dir>` flag
+     (per [`q64-cli.md`](./q64-cli.md)) provides the resolved
+     directory for each dependency.
+3. **Resolve the trailing segments** by alternating: each segment
+   matches either a `<seg>.q` file in the current directory, or a
+   `<seg>/` directory containing a `lib.q` file.
+4. **Apply the binding mode** (namespace, selective, alias) to the
+   resolved module.
+
+Diagnostic codes for the failure modes are listed in the next section.
+
+## Diagnostic codes
+
+All `NAM*` codes for module resolution errors. Numbers are stable and
+never reused.
+
+| Code     | Short message                          | When                                                                              |
+|----------|----------------------------------------|-----------------------------------------------------------------------------------|
+| `NAM001` | unknown module                         | Module path does not resolve to a known qube or path.                             |
+| `NAM002` | import path escapes qube               | Quoted relative path escapes the current qube root.                               |
+| `NAM003` | wildcard import is forbidden           | `*` appeared in an import specifier.                                              |
+| `NAM004` | selective import combined with alias   | `import x.{a} as y` — pick one binding mode.                                      |
+| `NAM005` | name collision in import scope         | Two imports (or an import and a declaration) bind the same name in this file.     |
+| `NAM006` | name is private to its qube            | Selective import of a name that exists in the source qube but is not re-exported. |
+| `NAM007` | sub-module not re-exported             | Attempt to import a sub-module that is not re-exported from the qube entry.       |
+| `NAM008` | re-export cycle                        | `pub use` chains form a cycle.                                                    |
+| `NAM009` | block `pub` form is forbidden          | `pub { … }` block form encountered; use per-item `pub`.                           |
+| `NAM010` | unknown name in source module          | Selective import named an identifier not declared in the source module.           |
+| `NAM011` | dash in bare module path               | Bare module path contains `-`; use the `_`-normalized form.                       |
+
+All codes are emitted using the standard envelope from
+[`diagnostics.md`](./diagnostics.md), with `severity: "error"`. The
+short message is the diagnostic's `message` field; the code is the
+`code` field; tooling-friendly identifiers (like `wildcard-forbidden`)
+may be surfaced through `repair.id` when an autofix is available.
+
+## Examples
+
+### Minimal application
+
+```
+hello/
+├── qube.json5     (type: "application")
+└── src/main.q
+```
+
+```q64
+//! hello — entry point.
+
+fn main(env: Env) {
+    env.out("Hello, q64.")
+}
+```
+
+No `import`, no `pub`.
+
+### Library qube with sub-modules and facade
+
+```
+stdlib/math/
+├── qube.json5
+└── src/
+    ├── lib.q
+    ├── vec.q
+    ├── mat.q
+    ├── quat.q
+    └── _scalar.q
+```
+
+```q64
+// src/vec.q
+//! q64.math.vec — Three-dimensional vector arithmetic.
+
+import "./_scalar.q"
+
+pub struct Vec3[T] { x: T, y: T, z: T }
+
+pub fn dot[T](a: Vec3[T], b: Vec3[T]): T {
+    a.x*b.x + a.y*b.y + a.z*b.z
+}
+
+fn normalize_in_place(v: ref Vec3[f32]) { ... }   // file-private
+```
+
+```q64
+// src/lib.q
+//! q64.math — Vectors, matrices, quaternions; dimensional units throughout.
+//! exports: Vec3, Mat4, Quat, dot, cross, matmul, inverse, slerp
+
+pub use Vec3, dot, cross from "./vec.q"
+pub use Mat4, matmul, inverse from "./mat.q"
+pub use Quat, slerp from "./quat.q"
+```
+
+### Three import styles from a consumer
+
+```q64
+// Namespace
+import q64.math
+let v: math.Vec3[f32] = ...
+let d = math.dot(v, v)
+
+// Selective
+import q64.math.{Vec3, dot}
+let v: Vec3[f32] = ...
+let d = dot(v, v)
+
+// Alias
+import q64.math as m
+let v: m.Vec3[f32] = ...
+let d = m.dot(v, v)
+```
+
+### Folder sub-module with its own `lib.q`
+
+```
+my-qube/src/
+├── lib.q
+└── audio/
+    ├── lib.q       → my_qube.audio
+    └── filter.q    → my_qube.audio.filter
+```
+
+```q64
+// my-qube/src/audio/lib.q
+pub use Filter, lowpass, highpass from "./filter.q"
+```
+
+```q64
+// Consumer (another qube)
+import my_qube.audio.{Filter, lowpass}
+```
+
+## Grammar (informal)
+
+```
+ImportStmt   := "import" ImportPath ImportBinding?
+ImportPath   := BareDotted | QuotedRelative
+BareDotted   := Ident ( "." Ident )*
+QuotedRelative := '"' RelPath '"'
+ImportBinding  := SelectiveList | AliasBinding
+SelectiveList  := "." "{" Ident ("," Ident)* "}"
+AliasBinding   := "as" Ident
+
+ReExport       := "pub" "use" SelectiveList "from" ImportPath
+                | "pub" "use" Ident ("as" Ident)? "from" ImportPath
+
+Item           := Visibility? (FnDecl | StructDecl | EnumDecl | TypeDecl | TraitDecl | ConstDecl | ReExport)
+Visibility     := "pub"
+```
+
+The block-`pub` form `Visibility "{" Item* "}"` is intentionally absent.
+
+## Related specs
+
+- [`qube.json5.md`](./qube.json5.md) — `dependencies` map drives bare-dotted
+  module resolution.
+- [`q64-cli.md`](./q64-cli.md) — `--module name=path` flag conveys
+  resolved dependency directories to the compiler subprocess.
+- [`diagnostics.md`](./diagnostics.md) — envelope format used for every
+  `NAM*` error listed above.
+
+## Open items deferred to future specs
+
+- **Field visibility on structs** — pending the traits/types spec.
+- **Macros / comptime-generated modules** — pending the comptime spec.
+- **Conditional compilation** (`@target("browser")` style) at the module
+  level — pending the manifest's `targets` semantics being finalized.
+- **Modules generated by `build.q`** — pending the build-escape-hatch spec.

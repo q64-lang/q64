@@ -1,12 +1,25 @@
 # spec
 
-The formal q64 language specification and conformance tests.
+The formal q64 language specification, the public contracts every
+toolchain component agrees on, and (eventually) the conformance test
+suite.
 
-> **Status: not yet implemented.** The spec begins once the language is
-> stable enough to be worth formalizing — likely after the first
-> end-to-end compile works.
+> **Status: draft (v0).** The contracts that unblock parallel
+> development are already written; the formal language semantics
+> follow.
 
-## Scope
+## Current contracts
+
+| File                                                     | Covers                                                            |
+|----------------------------------------------------------|-------------------------------------------------------------------|
+| [`qube.json5.md`](./qube.json5.md) + `.schema.json`      | Manifest file every qube ships at its root                        |
+| [`diagnostics.md`](./diagnostics.md) + `.schema.json`    | JSON envelope every toolchain binary emits on stderr              |
+| [`q64-cli.md`](./q64-cli.md)                             | The `q64` binary's CLI surface and subprocess contract            |
+| [`qube-cli.md`](./qube-cli.md)                           | The `qube` binary's CLI surface and how it invokes `q64`          |
+| [`continuum-api.md`](./continuum-api.md)                 | HTTP API between `qube` and the registry                          |
+| [`modules.md`](./modules.md)                             | Module organization, imports, visibility, re-exports              |
+
+## Scope (forthcoming)
 
 - **Lexical structure** — tokens, literals, comments, identifier rules.
 - **Syntax** — grammar in EBNF or equivalent.
