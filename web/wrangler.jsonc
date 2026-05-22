@@ -1,0 +1,8 @@
+// Cloudflare Pages config. Only `pages_build_output_dir` —
+// adding `name` or `compatibility_date` here makes the Workers
+// Builds pipeline think this is a Worker and run `wrangler deploy`
+// instead of `wrangler pages deploy`.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "pages_build_output_dir": "./dist"
+}
