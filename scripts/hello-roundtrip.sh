@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # scripts/hello-roundtrip.sh
 #
-# End-to-end smoke test for the back-half of the pipeline:
+# End-to-end smoke test:
 #
-#   q64 emit-hello → hello.wasm → q64-wasmtime-host → stdout
+#   examples/hello/hello.q
+#     -> q64 emit       (parse + codegen via Binaryen)
+#     -> hello.wasm
+#     -> q64-wasmtime-host  (runtime adapter)
+#     -> stdout == "Hello, q64."
 #
-# Builds both binaries, runs the codegen, pipes the resulting wasm
-# through the wasmtime runtime adapter, and asserts that stdout
-# matches the expected "Hello, q64.\n".
-#
-# Fails fast on any step. Intended for CI and local verification.
+# This covers parse → AST → codegen → wasm → host. Fails fast on
+# any step. Intended for CI and local verification.
 
 set -euo pipefail
 
@@ -33,12 +34,13 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 wasm="$tmp/hello.wasm"
+src="$REPO_ROOT/examples/hello/hello.q"
 
-echo "==> q64 emit-hello $wasm"
-"$Q64_BIN" emit-hello "$wasm"
+echo "==> q64 emit $src $wasm"
+"$Q64_BIN" emit "$src" "$wasm"
 
 if [[ ! -s "$wasm" ]]; then
-    echo "FAIL: emit-hello produced an empty file" >&2
+    echo "FAIL: emit produced an empty file" >&2
     exit 1
 fi
 

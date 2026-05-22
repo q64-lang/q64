@@ -140,7 +140,232 @@ pub const FnDecl = struct {
 pub const Visibility = struct { cst: *const cst.Node };
 pub const Params = struct { cst: *const cst.Node };
 pub const ReturnType = struct { cst: *const cst.Node };
-pub const Block = struct { cst: *const cst.Node };
+
+/// `Block := "{" Stmt* "}"`. v0 surfaces structured `ExprStmt`s; any
+/// unparsed tokens between statements live as direct token children
+/// and are skipped by the iterator.
+pub const Block = struct {
+    cst: *const cst.Node,
+
+    pub fn cast(node: *const cst.Node) ?Block {
+        if (node.kind == .BLOCK) return .{ .cst = node };
+        return null;
+    }
+
+    pub fn statements(self: Block) StmtIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+pub const Stmt = union(enum) {
+    expr_stmt: ExprStmt,
+
+    pub fn cast(node: *const cst.Node) ?Stmt {
+        return switch (node.kind) {
+            .EXPR_STMT => .{ .expr_stmt = .{ .cst = node } },
+            else => null,
+        };
+    }
+};
+
+pub const StmtIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *StmtIter) ?Stmt {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (Stmt.cast(n)) |s| {
+                    self.i += 1;
+                    return s;
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+pub const ExprStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn expression(self: ExprStmt) ?Expr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Expr.cast(n)) |e| return e,
+            .token => {},
+        };
+        return null;
+    }
+};
+
+/// Sum of v0 expression forms. Adding a new expression kind: add a
+/// CST kind in `cst.zig`, a parse function in `parse.zig`, and a
+/// variant here whose `cast` recognizes the new kind.
+pub const Expr = union(enum) {
+    call: CallExpr,
+    path: PathExpr,
+    string_lit: StringLit,
+    num_lit: NumLit,
+    literal: LiteralExpr,
+
+    pub fn cast(node: *const cst.Node) ?Expr {
+        return switch (node.kind) {
+            .CALL_EXPR => .{ .call = .{ .cst = node } },
+            .PATH_EXPR => .{ .path = .{ .cst = node } },
+            .STR_LITERAL => .{ .string_lit = .{ .cst = node } },
+            .NUM_LITERAL => .{ .num_lit = .{ .cst = node } },
+            .LITERAL_EXPR => .{ .literal = .{ .cst = node } },
+            else => null,
+        };
+    }
+};
+
+pub const CallExpr = struct {
+    cst: *const cst.Node,
+
+    /// The callee expression — the node immediately before the
+    /// CALL_ARGS child.
+    pub fn callee(self: CallExpr) ?Expr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| {
+                if (n.kind == .CALL_ARGS) continue;
+                if (Expr.cast(n)) |e| return e;
+            },
+            .token => {},
+        };
+        return null;
+    }
+
+    pub fn args(self: CallExpr) ArgIter {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (n.kind == .CALL_ARGS) {
+                return .{ .children = n.children };
+            },
+            .token => {},
+        };
+        return .{ .children = &.{} };
+    }
+};
+
+pub const ArgIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *ArgIter) ?Expr {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .CALL_ARG) {
+                    self.i += 1;
+                    for (n.children) |cc| switch (cc) {
+                        .node => |cn| if (Expr.cast(cn)) |e| return e,
+                        .token => {},
+                    };
+                    return null;
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+pub const PathExpr = struct {
+    cst: *const cst.Node,
+
+    /// Joined source text of the path (segments + dots), e.g.
+    /// `"env.out"` for `PATH_EXPR[IDENT("env"), DOT, KW_OUT("out")]`.
+    /// Caller owns the returned slice. Param-mode soft keywords
+    /// (`in`, `out`, `ref`, `move`) appear as path segments via their
+    /// keyword tokens, mirroring `parse.parsePath`.
+    pub fn text(self: PathExpr, allocator: std.mem.Allocator) ![]u8 {
+        var len: usize = 0;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (isPathToken(t.kind)) {
+                len += t.text.len;
+            },
+            .node => {},
+        };
+        const out = try allocator.alloc(u8, len);
+        var i: usize = 0;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (isPathToken(t.kind)) {
+                @memcpy(out[i .. i + t.text.len], t.text);
+                i += t.text.len;
+            },
+            .node => {},
+        };
+        return out;
+    }
+
+    fn isPathToken(k: cst.SyntaxKind) bool {
+        return switch (k) {
+            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE => true,
+            else => false,
+        };
+    }
+};
+
+pub const StringLit = struct {
+    cst: *const cst.Node,
+
+    pub fn rawText(self: StringLit) ?[]const u8 {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .STR_PLAIN or t.kind == .STR_RAW) return t.text,
+            .node => {},
+        };
+        return null;
+    }
+
+    /// Decode the literal — strip the surrounding `"…"` and
+    /// interpret a small set of escape sequences (`\n`, `\t`, `\r`,
+    /// `\\`, `\"`, `\0`). Unknown escapes pass through as-is. v0
+    /// scope; full escape grammar lands with the typed-string spec.
+    pub fn value(self: StringLit, allocator: std.mem.Allocator) !?[]u8 {
+        const raw = self.rawText() orelse return null;
+        if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return null;
+        const body = raw[1 .. raw.len - 1];
+
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+
+        var i: usize = 0;
+        while (i < body.len) : (i += 1) {
+            if (body[i] != '\\' or i + 1 >= body.len) {
+                try out.append(body[i]);
+                continue;
+            }
+            i += 1;
+            switch (body[i]) {
+                'n' => try out.append('\n'),
+                't' => try out.append('\t'),
+                'r' => try out.append('\r'),
+                '\\' => try out.append('\\'),
+                '"' => try out.append('"'),
+                '0' => try out.append(0),
+                else => {
+                    try out.append('\\');
+                    try out.append(body[i]);
+                },
+            }
+        }
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const NumLit = struct {
+    cst: *const cst.Node,
+
+    /// The numeric token's raw text (e.g. `"42"`, `"3.14"`, `"0xFF"`).
+    pub fn rawText(self: NumLit) ?[]const u8 {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .INT_LIT or t.kind == .FLOAT_LIT) return t.text,
+            .node => {},
+        };
+        return null;
+    }
+};
+
+pub const LiteralExpr = struct { cst: *const cst.Node };
 
 // =====================================================================
 // Internal helpers

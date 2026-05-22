@@ -14,6 +14,15 @@ pub fn build(b: *std.Build) void {
     const binaryen_include = b.path("../vendor/binaryen/include");
     const binaryen_lib = b.path("../vendor/binaryen/lib/libbinaryen.a");
 
+    // Named module for the parser package. Codegen + future passes
+    // pull this in via @import("parser"); the umbrella file at
+    // src/parser/lib.zig re-exports each sub-module.
+    const parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/parser/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // -----------------------------------------------------------
     // The binary.
     // -----------------------------------------------------------
@@ -23,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe.root_module.addImport("parser", parser_mod);
     linkBinaryen(exe, binaryen_include, binaryen_lib);
     b.installArtifact(exe);
 
@@ -77,8 +87,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    codegen_tests.root_module.addImport("parser", parser_mod);
     linkBinaryen(codegen_tests, binaryen_include, binaryen_lib);
     test_step.dependOn(&b.addRunArtifact(codegen_tests).step);
+
+    // End-to-end: parse + emit + run via the wasmtime host.
+    // The script builds both binaries on its own — we just expose
+    // it so `zig build hello-roundtrip` is the one-step smoke.
+    const hello_script = b.addSystemCommand(&.{
+        "bash",
+        "../scripts/hello-roundtrip.sh",
+    });
+    const hello_step = b.step("hello-roundtrip", "Run the end-to-end hello-world smoke test");
+    hello_step.dependOn(&hello_script.step);
 }
 
 fn linkBinaryen(

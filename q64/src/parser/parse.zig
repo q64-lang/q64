@@ -264,25 +264,173 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .RETURN_TYPE, children.items);
     }
 
-    /// Collect a balanced `{...}` body. v0: interior tokens land
-    /// directly as children; statement parsing happens in a follow-up
-    /// pass (todo.md).
+    /// Parse a block: `{ Stmt* }`. Statement parsing is best-effort
+    /// in v0 — `ExprStmt` is the only structured form; unknown
+    /// trailing tokens within a statement are collected as raw
+    /// children so the lossless invariant still holds.
     fn parseBlock(self: *Parser) !*const cst.Node {
+        std.debug.assert(self.peek() == .L_BRACE);
         var children = std.ArrayList(cst.Element).init(self.arena);
-        var depth: i32 = 0;
+
+        try children.append(.{ .token = self.advance() }); // L_BRACE
+
         while (!self.isEof()) {
-            const t = self.advance();
-            try children.append(.{ .token = t });
-            switch (t.kind) {
-                .L_BRACE => depth += 1,
-                .R_BRACE => {
-                    depth -= 1;
-                    if (depth == 0) break;
-                },
-                else => {},
+            try self.eatTrivia(&children);
+            // Explicit `;` separators between statements.
+            while (self.peek() == .SEMICOLON) {
+                try children.append(.{ .token = self.advance() });
+                try self.eatTrivia(&children);
             }
+            if (self.peek() == .R_BRACE or self.isEof()) break;
+
+            const stmt = try self.parseStmt();
+            try children.append(.{ .node = stmt });
+        }
+
+        if (self.peek() == .R_BRACE) {
+            try children.append(.{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .BLOCK, children.items);
+    }
+
+    /// Parse a single statement. v0 only structures `ExprStmt`; any
+    /// trailing tokens up to the next newline / semicolon / `}` get
+    /// swept into the EXPR_STMT node so block-level iteration sees
+    /// a clean boundary.
+    fn parseStmt(self: *Parser) !*const cst.Node {
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        const expr = try self.parseExpr();
+        try children.append(.{ .node = expr });
+
+        // Sweep the rest of the statement. NEWLINE / SEMICOLON / `}`
+        // end the statement; trivia and any unparsed tokens get
+        // absorbed so the next stmt starts cleanly.
+        while (!self.isEof()) {
+            const k = self.peek();
+            if (k == .NEWLINE or k == .SEMICOLON or k == .R_BRACE) break;
+            try children.append(.{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .EXPR_STMT, children.items);
+    }
+
+    /// Parse one expression. v0 recognizes:
+    ///   - string literal (`STR_PLAIN`) → `STR_LITERAL`
+    ///   - numeric literal (`INT_LIT` / `FLOAT_LIT`, optional `NUM_SUFFIX`) → `NUM_LITERAL`
+    ///   - path (`IDENT ("." IDENT)*`) → `PATH_EXPR`
+    ///   - path followed by `(args)` → `CALL_EXPR`
+    /// Anything else is wrapped as a degenerate `LITERAL_EXPR` of
+    /// one token so the outer loop keeps progressing.
+    fn parseExpr(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        const k = self.peek();
+        if (k == .STR_PLAIN or k == .STR_PREFIX) return self.parseStringLit();
+        if (k == .INT_LIT or k == .FLOAT_LIT) return self.parseNumLit();
+        if (isPathStart(k)) return self.parsePathOrCall();
+        return self.parseUnknownExpr();
+    }
+
+    /// Tokens that can start a path segment. Beyond plain `IDENT`,
+    /// the param-mode soft keywords (`in`, `out`, `ref`, `move`) are
+    /// accepted: they're only reserved in param positions, and the
+    /// lexer doesn't have that context. Letting them through in
+    /// path / call positions is what makes `env.out(…)` and
+    /// `chan.in()` parse.
+    fn isPathStart(k: cst.SyntaxKind) bool {
+        return switch (k) {
+            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE => true,
+            else => false,
+        };
+    }
+
+    fn parseStringLit(self: *Parser) !*const cst.Node {
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        // Optional STR_PREFIX (e.g. `url"…"`).
+        if (self.peek() == .STR_PREFIX) {
+            try children.append(.{ .token = self.advance() });
+        }
+        if (self.peek() == .STR_PLAIN or self.peek() == .STR_RAW) {
+            try children.append(.{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .STR_LITERAL, children.items);
+    }
+
+    fn parseNumLit(self: *Parser) !*const cst.Node {
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        try children.append(.{ .token = self.advance() }); // INT_LIT / FLOAT_LIT
+        if (self.peek() == .NUM_SUFFIX) {
+            try children.append(.{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .NUM_LITERAL, children.items);
+    }
+
+    fn parsePathOrCall(self: *Parser) !*const cst.Node {
+        const path = try self.parsePath();
+        if (self.peek() != .L_PAREN) return path;
+
+        // Wrap the path + CALL_ARGS in a CALL_EXPR.
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        try children.append(.{ .node = path });
+        const args = try self.parseCallArgs();
+        try children.append(.{ .node = args });
+        return try cst.makeNode(self.arena, .CALL_EXPR, children.items);
+    }
+
+    fn parsePath(self: *Parser) !*const cst.Node {
+        std.debug.assert(isPathStart(self.peek()));
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        try children.append(.{ .token = self.advance() }); // IDENT or soft kw
+        while (self.peek() == .DOT) {
+            // Look one ahead: only continue if `.` is followed by an
+            // identifier-or-soft-keyword.
+            const save = self.pos;
+            const dot = self.advance();
+            if (isPathStart(self.peek())) {
+                try children.append(.{ .token = dot });
+                try children.append(.{ .token = self.advance() });
+                continue;
+            }
+            self.pos = save;
+            break;
+        }
+        return try cst.makeNode(self.arena, .PATH_EXPR, children.items);
+    }
+
+    fn parseCallArgs(self: *Parser) !*const cst.Node {
+        std.debug.assert(self.peek() == .L_PAREN);
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        try children.append(.{ .token = self.advance() }); // L_PAREN
+        try self.eatTrivia(&children);
+
+        while (!self.isEof() and self.peek() != .R_PAREN) {
+            const arg = try self.parseCallArg();
+            try children.append(.{ .node = arg });
+            try self.eatTrivia(&children);
+            if (self.peek() == .COMMA) {
+                try children.append(.{ .token = self.advance() });
+                try self.eatTrivia(&children);
+            }
+        }
+        if (self.peek() == .R_PAREN) {
+            try children.append(.{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .CALL_ARGS, children.items);
+    }
+
+    fn parseCallArg(self: *Parser) !*const cst.Node {
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        const expr = try self.parseExpr();
+        try children.append(.{ .node = expr });
+        return try cst.makeNode(self.arena, .CALL_ARG, children.items);
+    }
+
+    fn parseUnknownExpr(self: *Parser) !*const cst.Node {
+        // Recovery: wrap whatever token we're sitting on as a
+        // degenerate LITERAL_EXPR so the caller still gets *some*
+        // expression node and the parser makes progress.
+        var children = std.ArrayList(cst.Element).init(self.arena);
+        if (!self.isEof()) {
+            try children.append(.{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .LITERAL_EXPR, children.items);
     }
 };
 

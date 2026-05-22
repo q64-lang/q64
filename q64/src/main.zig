@@ -6,8 +6,9 @@
 //! This is the minimum surface the conformance test runner needs.
 
 const std = @import("std");
-const parse = @import("parser/parse.zig");
-const diag = @import("parser/diag.zig");
+const parser = @import("parser");
+const parse = parser.parse;
+const diag = parser.diag;
 const emit = @import("codegen/emit.zig");
 
 pub fn main() !void {
@@ -33,6 +34,11 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "emit")) {
+        try cmdEmit(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "--version")) {
         try std.io.getStdOut().writer().writeAll("q64 0.0.1 (pre-alpha)\n");
         return;
@@ -49,7 +55,8 @@ fn usage() !void {
         \\
         \\Commands:
         \\  check <file> [--diagnostics json]  Parse a single file and emit diagnostics.
-        \\  emit-hello <out.wasm>              Emit the hello-world wasm module via codegen.
+        \\  emit <file.q> <out.wasm>           Compile a q64 source file to wasm via codegen.
+        \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
         \\  --version                          Print the version and exit.
         \\
     );
@@ -126,9 +133,38 @@ fn cmdEmitHello(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const bytes = try emit.emitHelloWasm(allocator);
     defer allocator.free(bytes);
 
-    const file = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch |err| {
+    try writeFile(out_path, bytes);
+}
+
+fn cmdEmit(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len != 2) {
+        try usage();
+        std.process.exit(2);
+    }
+    const src_path = args[0];
+    const out_path = args[1];
+
+    const source = std.fs.cwd().readFileAlloc(allocator, src_path, 16 * 1024 * 1024) catch |err| {
         const w = std.io.getStdErr().writer();
-        try w.print("q64: cannot write {s}: {s}\n", .{ out_path, @errorName(err) });
+        try w.print("q64: cannot read {s}: {s}\n", .{ src_path, @errorName(err) });
+        std.process.exit(2);
+    };
+    defer allocator.free(source);
+
+    const bytes = emit.emitFromSource(allocator, source, src_path) catch |err| {
+        const w = std.io.getStdErr().writer();
+        try w.print("q64: emit failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer allocator.free(bytes);
+
+    try writeFile(out_path, bytes);
+}
+
+fn writeFile(path: []const u8, bytes: []const u8) !void {
+    const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+        const w = std.io.getStdErr().writer();
+        try w.print("q64: cannot write {s}: {s}\n", .{ path, @errorName(err) });
         std.process.exit(2);
     };
     defer file.close();
