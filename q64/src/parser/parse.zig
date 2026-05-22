@@ -55,10 +55,10 @@ pub fn parse(allocator: Allocator, source: []const u8, file: []const u8) !Result
 
     const lex_result = try lex.tokenize(a, source);
 
-    var diags = std.ArrayList(diag.Diagnostic).init(allocator);
-    errdefer diags.deinit();
+    var diags: std.ArrayList(diag.Diagnostic) = .empty;
+    errdefer diags.deinit(allocator);
     for (lex_result.diagnostics) |d| {
-        try diags.append(.{
+        try diags.append(allocator, .{
             .code = d.code,
             .severity = .err,
             .message = diag.messageFor(d.code),
@@ -77,7 +77,7 @@ pub fn parse(allocator: Allocator, source: []const u8, file: []const u8) !Result
     return .{
         .arena = arena,
         .root = root,
-        .diagnostics = try diags.toOwnedSlice(),
+        .diagnostics = try diags.toOwnedSlice(allocator),
     };
 }
 
@@ -110,7 +110,7 @@ const Parser = struct {
     /// this helper is what places it there.
     fn eatTrivia(self: *Parser, out: *std.ArrayList(cst.Element)) !void {
         while (!self.isEof() and self.peek().isTrivia()) {
-            try out.append(.{ .token = self.advance() });
+            try out.append(self.arena, .{ .token = self.advance() });
         }
     }
 
@@ -131,18 +131,18 @@ const Parser = struct {
     // -----------------------------------------------------------------
 
     fn parseSourceFile(self: *Parser) !*const cst.Node {
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
 
         while (!self.isEof()) {
             if (self.atFnItem()) {
                 const fn_node = try self.parseFnDecl();
-                try children.append(.{ .node = fn_node });
+                try children.append(self.arena, .{ .node = fn_node });
                 continue;
             }
             // Anything we don't recognize — trivia, unimplemented
             // items, stray tokens — passes through as a direct
             // token child of SOURCE_FILE. Lossless by construction.
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
 
         return try cst.makeNode(self.arena, .SOURCE_FILE, children.items);
@@ -153,32 +153,32 @@ const Parser = struct {
     // -----------------------------------------------------------------
 
     fn parseFnDecl(self: *Parser) !*const cst.Node {
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
 
         if (self.peek() == .KW_PUB) {
             const vis_node = try self.parseVisibility();
-            try children.append(.{ .node = vis_node });
+            try children.append(self.arena, .{ .node = vis_node });
             try self.eatTrivia(&children);
         }
 
         std.debug.assert(self.peek() == .KW_FN);
-        try children.append(.{ .token = self.advance() }); // KW_FN
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_FN
         try self.eatTrivia(&children);
 
         if (self.peek() == .IDENT) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         try self.eatTrivia(&children);
 
         if (self.peek() == .L_PAREN) {
             const params_node = try self.parseParams();
-            try children.append(.{ .node = params_node });
+            try children.append(self.arena, .{ .node = params_node });
             try self.eatTrivia(&children);
         }
 
         if (self.peek() == .ARROW) {
             const ret_node = try self.parseReturnType();
-            try children.append(.{ .node = ret_node });
+            try children.append(self.arena, .{ .node = ret_node });
             try self.eatTrivia(&children);
         }
 
@@ -186,12 +186,12 @@ const Parser = struct {
         // between the return type and the body's `{` collects here
         // so the lossless invariant holds.
         while (!self.isEof() and self.peek() != .L_BRACE) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
 
         if (self.peek() == .L_BRACE) {
             const block_node = try self.parseBlock();
-            try children.append(.{ .node = block_node });
+            try children.append(self.arena, .{ .node = block_node });
         }
 
         return try cst.makeNode(self.arena, .FN_DECL, children.items);
@@ -210,11 +210,11 @@ const Parser = struct {
     /// `Param` production fills in once todo.md "Parser: items
     /// productions" lands.
     fn parseParams(self: *Parser) !*const cst.Node {
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
         var depth: i32 = 0;
         while (!self.isEof()) {
             const t = self.advance();
-            try children.append(.{ .token = t });
+            try children.append(self.arena, .{ .token = t });
             switch (t.kind) {
                 .L_PAREN => depth += 1,
                 .R_PAREN => {
@@ -234,8 +234,8 @@ const Parser = struct {
     /// `Signal<PCM<f32>, 48.kHz>` parses as a single type.
     fn parseReturnType(self: *Parser) !*const cst.Node {
         std.debug.assert(self.peek() == .ARROW);
-        var children = std.ArrayList(cst.Element).init(self.arena);
-        try children.append(.{ .token = self.advance() }); // ARROW
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // ARROW
 
         var depth: i32 = 0;
         while (!self.isEof()) {
@@ -246,7 +246,7 @@ const Parser = struct {
                 .R_PAREN, .R_BRACK, .R_ANGLE => depth -= 1,
                 else => {},
             }
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
 
         // Shave trailing trivia back into the parser stream so the
@@ -270,25 +270,25 @@ const Parser = struct {
     /// children so the lossless invariant still holds.
     fn parseBlock(self: *Parser) !*const cst.Node {
         std.debug.assert(self.peek() == .L_BRACE);
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
 
-        try children.append(.{ .token = self.advance() }); // L_BRACE
+        try children.append(self.arena, .{ .token = self.advance() }); // L_BRACE
 
         while (!self.isEof()) {
             try self.eatTrivia(&children);
             // Explicit `;` separators between statements.
             while (self.peek() == .SEMICOLON) {
-                try children.append(.{ .token = self.advance() });
+                try children.append(self.arena, .{ .token = self.advance() });
                 try self.eatTrivia(&children);
             }
             if (self.peek() == .R_BRACE or self.isEof()) break;
 
             const stmt = try self.parseStmt();
-            try children.append(.{ .node = stmt });
+            try children.append(self.arena, .{ .node = stmt });
         }
 
         if (self.peek() == .R_BRACE) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .BLOCK, children.items);
     }
@@ -298,9 +298,9 @@ const Parser = struct {
     /// swept into the EXPR_STMT node so block-level iteration sees
     /// a clean boundary.
     fn parseStmt(self: *Parser) !*const cst.Node {
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
         const expr = try self.parseExpr();
-        try children.append(.{ .node = expr });
+        try children.append(self.arena, .{ .node = expr });
 
         // Sweep the rest of the statement. NEWLINE / SEMICOLON / `}`
         // end the statement; trivia and any unparsed tokens get
@@ -308,7 +308,7 @@ const Parser = struct {
         while (!self.isEof()) {
             const k = self.peek();
             if (k == .NEWLINE or k == .SEMICOLON or k == .R_BRACE) break;
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .EXPR_STMT, children.items);
     }
@@ -342,22 +342,22 @@ const Parser = struct {
     }
 
     fn parseStringLit(self: *Parser) !*const cst.Node {
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
         // Optional STR_PREFIX (e.g. `url"…"`).
         if (self.peek() == .STR_PREFIX) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         if (self.peek() == .STR_PLAIN or self.peek() == .STR_RAW) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .STR_LITERAL, children.items);
     }
 
     fn parseNumLit(self: *Parser) !*const cst.Node {
-        var children = std.ArrayList(cst.Element).init(self.arena);
-        try children.append(.{ .token = self.advance() }); // INT_LIT / FLOAT_LIT
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // INT_LIT / FLOAT_LIT
         if (self.peek() == .NUM_SUFFIX) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .NUM_LITERAL, children.items);
     }
@@ -367,25 +367,25 @@ const Parser = struct {
         if (self.peek() != .L_PAREN) return path;
 
         // Wrap the path + CALL_ARGS in a CALL_EXPR.
-        var children = std.ArrayList(cst.Element).init(self.arena);
-        try children.append(.{ .node = path });
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .node = path });
         const args = try self.parseCallArgs();
-        try children.append(.{ .node = args });
+        try children.append(self.arena, .{ .node = args });
         return try cst.makeNode(self.arena, .CALL_EXPR, children.items);
     }
 
     fn parsePath(self: *Parser) !*const cst.Node {
         std.debug.assert(isPathStart(self.peek()));
-        var children = std.ArrayList(cst.Element).init(self.arena);
-        try children.append(.{ .token = self.advance() }); // IDENT or soft kw
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // IDENT or soft kw
         while (self.peek() == .DOT) {
             // Look one ahead: only continue if `.` is followed by an
             // identifier-or-soft-keyword.
             const save = self.pos;
             const dot = self.advance();
             if (isPathStart(self.peek())) {
-                try children.append(.{ .token = dot });
-                try children.append(.{ .token = self.advance() });
+                try children.append(self.arena, .{ .token = dot });
+                try children.append(self.arena, .{ .token = self.advance() });
                 continue;
             }
             self.pos = save;
@@ -396,29 +396,29 @@ const Parser = struct {
 
     fn parseCallArgs(self: *Parser) !*const cst.Node {
         std.debug.assert(self.peek() == .L_PAREN);
-        var children = std.ArrayList(cst.Element).init(self.arena);
-        try children.append(.{ .token = self.advance() }); // L_PAREN
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // L_PAREN
         try self.eatTrivia(&children);
 
         while (!self.isEof() and self.peek() != .R_PAREN) {
             const arg = try self.parseCallArg();
-            try children.append(.{ .node = arg });
+            try children.append(self.arena, .{ .node = arg });
             try self.eatTrivia(&children);
             if (self.peek() == .COMMA) {
-                try children.append(.{ .token = self.advance() });
+                try children.append(self.arena, .{ .token = self.advance() });
                 try self.eatTrivia(&children);
             }
         }
         if (self.peek() == .R_PAREN) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .CALL_ARGS, children.items);
     }
 
     fn parseCallArg(self: *Parser) !*const cst.Node {
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
         const expr = try self.parseExpr();
-        try children.append(.{ .node = expr });
+        try children.append(self.arena, .{ .node = expr });
         return try cst.makeNode(self.arena, .CALL_ARG, children.items);
     }
 
@@ -426,9 +426,9 @@ const Parser = struct {
         // Recovery: wrap whatever token we're sitting on as a
         // degenerate LITERAL_EXPR so the caller still gets *some*
         // expression node and the parser makes progress.
-        var children = std.ArrayList(cst.Element).init(self.arena);
+        var children: std.ArrayList(cst.Element) = .empty;
         if (!self.isEof()) {
-            try children.append(.{ .token = self.advance() });
+            try children.append(self.arena, .{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .LITERAL_EXPR, children.items);
     }
@@ -455,9 +455,9 @@ test "round-trip: serialize(parse(s)) == s" {
         const r = try parse(testing.allocator, src, "test.q");
         defer r.deinit(testing.allocator);
 
-        var out = std.ArrayList(u8).init(testing.allocator);
-        defer out.deinit();
-        try cst.serialize(r.root, &out);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try cst.serialize(r.root, testing.allocator, &out);
 
         try testing.expectEqualStrings(src, out.items);
     }
@@ -558,9 +558,9 @@ test "unimplemented items don't break losslessness or item iteration" {
     const r = try parse(testing.allocator, src, "mixed.q");
     defer r.deinit(testing.allocator);
 
-    var out = std.ArrayList(u8).init(testing.allocator);
-    defer out.deinit();
-    try cst.serialize(r.root, &out);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
     try testing.expectEqualStrings(src, out.items);
 
     const sf = ast.SourceFile.cast(r.root).?;

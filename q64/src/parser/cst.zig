@@ -394,14 +394,14 @@ pub const SerializeError = error{OutOfMemory};
 /// Append every token's text to `out` in order. The result equals
 /// the original source iff the CST was constructed losslessly. Used
 /// by `q64 fmt --check` and by the conformance test runner.
-pub fn serialize(root: *const Node, out: *std.ArrayList(u8)) SerializeError!void {
-    for (root.children) |child| try serializeElement(child, out);
+pub fn serialize(root: *const Node, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) SerializeError!void {
+    for (root.children) |child| try serializeElement(child, allocator, out);
 }
 
-fn serializeElement(elem: Element, out: *std.ArrayList(u8)) SerializeError!void {
+fn serializeElement(elem: Element, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) SerializeError!void {
     switch (elem) {
-        .token => |t| try out.appendSlice(t.text),
-        .node => |n| try serialize(n, out),
+        .token => |t| try out.appendSlice(allocator, t.text),
+        .node => |n| try serialize(n, allocator, out),
     }
 }
 
@@ -501,9 +501,9 @@ test "lossless serialize: token-only tree" {
     };
     const root = try makeNode(a, .SOURCE_FILE, &children);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
-    defer out.deinit();
-    try serialize(root, &out);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try serialize(root, std.testing.allocator, &out);
 
     try std.testing.expectEqualStrings("fn main { }", out.items);
 }
@@ -558,9 +558,9 @@ test "lossless serialize: nested tree preserves all bytes" {
     const root_children = [_]Element{.{ .node = fn_node }};
     const root = try makeNode(a, .SOURCE_FILE, &root_children);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
-    defer out.deinit();
-    try serialize(root, &out);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try serialize(root, std.testing.allocator, &out);
 
     const expected = "fn main {\n    let x = 1\n}";
     try std.testing.expectEqualStrings(expected, out.items);

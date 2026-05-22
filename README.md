@@ -59,26 +59,75 @@ the same way `cargo build` invokes `rustc`.
   islands. The playground loads a wasm build of `q64/` to compile q64 source
   in the browser.
 
+## Quickstart — hello world
+
+From a fresh clone to `Hello, q64.` on stdout:
+
+```bash
+# 1. Install the pinned Zig + Binaryen + wasmtime toolchains into vendor/.
+#    Re-runnable; skips work that's already done.
+./init.sh
+
+# 2. Put the pinned Zig on PATH for this shell.
+. ./vendor/zig/activate
+
+# 3. Build the three binaries the pipeline needs.
+( cd q64               && zig build )    # → q64/zig-out/bin/q64
+( cd qube              && zig build )    # → qube/zig-out/bin/qube
+( cd runtime/wasmtime  && zig build )    # → runtime/wasmtime/zig-out/bin/q64-wasmtime-host
+
+# 4. Run the example.
+( cd examples/hello && ../../qube/zig-out/bin/qube run )
+# → Hello, q64.
+```
+
+The example program in full (`examples/hello/hello.q`):
+
+```
+fn main {
+    env.out("Hello, q64.")
+}
+```
+
+`qube run` discovers `examples/hello/qube.json5`, calls `q64 emit` to
+compile the source to wasm, then runs the wasm through the wasmtime
+host adapter, which provides the `env.out` capability and invokes
+`_start`.
+
+For convenience, add the three binaries to PATH:
+
+```bash
+export PATH="$PWD/qube/zig-out/bin:$PWD/q64/zig-out/bin:$PWD/runtime/wasmtime/zig-out/bin:$PATH"
+cd examples/hello && qube run
+```
+
 ## Building
 
-First, install the pinned Zig toolchain into `vendor/zig/`:
-
-```
-./init.sh
-. ./vendor/zig/activate          # adds vendor/zig to PATH for this shell
-```
-
 `init.sh` is re-runnable and skips work that's already done. Override
-the pinned version with `ZIG_VERSION=… ./init.sh`.
+the pinned versions with `ZIG_VERSION=…`, `WASMTIME_VERSION=…`, or
+`BINARYEN_VERSION=…`.
 
-Then the bootstrap order (still in progress; folders are scaffolded):
+The remaining bootstrap pieces (still in progress; folders are scaffolded):
 
-1. Build `q64/` with `zig build` → produces the `q64` binary.
-2. Build `qube/` with `zig build` → produces the `qube` binary.
-3. From the repo root, `qube build` walks `stdlib/` and compiles each
-   namespace qube to wasm.
-4. `cd web && pnpm install && pnpm dev` runs the site locally; the
-   playground picks up the wasm build of `q64/` from `web/public/`.
+- `qube build` will eventually walk `stdlib/` and compile each namespace
+  qube to wasm. Today only the `examples/hello` qube round-trips.
+- `cd web && pnpm install && pnpm dev` runs the site locally; the
+  playground will pick up a wasm build of `q64/` from `web/public/` once
+  that target is wired.
+
+### Gotchas
+
+- **`build.zig` lives in subprojects, not at the repo root.** Running
+  `zig build` from the repo root fails with "no build.zig file found".
+  `cd` into `q64/`, `qube/`, or `runtime/wasmtime/` first.
+- **Use the pinned Zig, not a system install.** `build.zig` targets the
+  version `init.sh` pins (0.16.0). A different Zig will fail with errors
+  like `no field named 'root_source_file' in struct
+  'Build.ExecutableOptions'`. After `. ./vendor/zig/activate`, verify with
+  `which zig` — it should print `…/vendor/zig/zig`.
+- **`init.sh` builds Binaryen from source** (a few minutes the first time).
+  Parallelism is capped at `nproc - 1` to keep laptops responsive; override
+  with `BINARYEN_JOBS=N ./init.sh`.
 
 ## License
 

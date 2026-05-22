@@ -44,14 +44,15 @@ pub const Result = struct {
 /// the returned `Result` are owned by the caller and must be freed
 /// via `Result.deinit`.
 pub fn tokenize(allocator: Allocator, source: []const u8) !Result {
-    var tokens = std.ArrayList(cst.Token).init(allocator);
-    errdefer tokens.deinit();
-    var diags = std.ArrayList(Diagnostic).init(allocator);
-    errdefer diags.deinit();
+    var tokens: std.ArrayList(cst.Token) = .empty;
+    errdefer tokens.deinit(allocator);
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    errdefer diags.deinit(allocator);
 
     var lex = Lexer{
         .source = source,
         .pos = 0,
+        .allocator = allocator,
         .tokens = &tokens,
         .diags = &diags,
     };
@@ -59,17 +60,18 @@ pub fn tokenize(allocator: Allocator, source: []const u8) !Result {
     while (lex.pos < lex.source.len) try lex.nextToken();
 
     // Final EOF marker.
-    try tokens.append(.{ .kind = .EOF, .text = "", .offset = lex.pos });
+    try tokens.append(allocator, .{ .kind = .EOF, .text = "", .offset = lex.pos });
 
     return .{
-        .tokens = try tokens.toOwnedSlice(),
-        .diagnostics = try diags.toOwnedSlice(),
+        .tokens = try tokens.toOwnedSlice(allocator),
+        .diagnostics = try diags.toOwnedSlice(allocator),
     };
 }
 
 const Lexer = struct {
     source: []const u8,
     pos: u32,
+    allocator: Allocator,
     tokens: *std.ArrayList(cst.Token),
     diags: *std.ArrayList(Diagnostic),
 
@@ -364,7 +366,7 @@ const Lexer = struct {
     }
 
     fn pushAs(self: *Lexer, kind: cst.SyntaxKind, start: u32, end: u32) !void {
-        try self.tokens.append(.{
+        try self.tokens.append(self.allocator, .{
             .kind = kind,
             .text = self.source[start..end],
             .offset = start,
@@ -372,7 +374,7 @@ const Lexer = struct {
     }
 
     fn diag(self: *Lexer, code: []const u8, at: u32) !void {
-        try self.diags.append(.{ .code = code, .offset = at });
+        try self.diags.append(self.allocator, .{ .code = code, .offset = at });
     }
 };
 
@@ -484,12 +486,12 @@ fn expectKinds(source: []const u8, expected: []const cst.SyntaxKind) !void {
 
     // Build a non-trivia view to compare against `expected`. Trivia
     // is verified separately by the lossless test.
-    var got = std.ArrayList(cst.SyntaxKind).init(testing.allocator);
-    defer got.deinit();
+    var got: std.ArrayList(cst.SyntaxKind) = .empty;
+    defer got.deinit(testing.allocator);
     for (r.tokens) |t| {
         if (t.kind == .EOF) continue;
         if (t.kind.isTrivia()) continue;
-        try got.append(t.kind);
+        try got.append(testing.allocator, t.kind);
     }
     try testing.expectEqualSlices(cst.SyntaxKind, expected, got.items);
 }
@@ -499,9 +501,9 @@ fn expectLossless(source: []const u8) !void {
     defer arena.deinit();
     const r = try tokenize(arena.allocator(), source);
 
-    var out = std.ArrayList(u8).init(testing.allocator);
-    defer out.deinit();
-    for (r.tokens) |t| try out.appendSlice(t.text);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    for (r.tokens) |t| try out.appendSlice(testing.allocator, t.text);
 
     try testing.expectEqualStrings(source, out.items);
 }

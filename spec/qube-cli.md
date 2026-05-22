@@ -25,6 +25,7 @@ qube --help    | -h
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |
 | `qube run [--target <name>]`     | Build and run                                                      |
+| `qube web`                       | Build to wasm and serve in a browser via the browser adapter       |
 | `qube test`                      | Run the qube's tests                                               |
 | `qube install`                   | Fetch all dependencies into the local cache                        |
 | `qube lock`                      | Regenerate `qube.lock` from the manifest                           |
@@ -76,8 +77,30 @@ target/
     <qube-name>.graph.json            # stream-graph topology (if any stages)
   release/                     # `--release`
   test/                        # test executables
+  web/                         # `qube web`: wasm + browser adapter shell
+    <qube-name>.wasm
+    host.js
+    index.html
   <target-name>/               # named targets from qube.json5
 ```
+
+## `qube web` (v0)
+
+`qube web` mirrors `qube run` for the browser target. It compiles the
+qube's entry to `target/web/<name>.wasm` via `q64 emit`, copies the
+browser adapter from `runtime/browser/` (override with the
+`Q64_BROWSER_ADAPTER` env var) into the same directory — `host.js`
+verbatim, `index.html` with `{{WASM}}` replaced by the artifact's
+filename — picks a free port in `[4711, 4720]`, spawns
+`python3 -m http.server` against `target/web/`, and opens the default
+browser at `http://localhost:<port>/`. The command stays in the
+foreground until the server exits (Ctrl-C). Exit codes follow the
+table below.
+
+The browser adapter implements the same `env.out :: (ptr: i32, len:
+i32) -> ()` ABI as the Wasmtime host; see `runtime/browser/host.js`.
+A built-in server (replacing `python3`) is deferred.
+
 
 `target/` is `.gitignore`-default, like Cargo's.
 

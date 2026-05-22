@@ -45,14 +45,14 @@ pub const LineIndex = struct {
     allocator: std.mem.Allocator,
 
     pub fn build(allocator: std.mem.Allocator, source: []const u8) !LineIndex {
-        var list = std.ArrayList(u32).init(allocator);
-        defer list.deinit();
-        try list.append(0); // line 1 starts at offset 0
+        var list: std.ArrayList(u32) = .empty;
+        defer list.deinit(allocator);
+        try list.append(allocator, 0); // line 1 starts at offset 0
         var i: u32 = 0;
         while (i < source.len) : (i += 1) {
-            if (source[i] == '\n') try list.append(i + 1);
+            if (source[i] == '\n') try list.append(allocator, i + 1);
         }
-        return .{ .breaks = try list.toOwnedSlice(), .allocator = allocator };
+        return .{ .breaks = try list.toOwnedSlice(allocator), .allocator = allocator };
     }
 
     pub fn deinit(self: LineIndex) void {
@@ -117,7 +117,7 @@ const message_table = [_]MessageEntry{
 /// to `writer`. `ok` is true iff `diagnostics` contains no
 /// error-severity entries.
 pub fn emitJson(
-    writer: anytype,
+    writer: *std.Io.Writer,
     source: []const u8,
     diagnostics: []const Diagnostic,
     allocator: std.mem.Allocator,
@@ -149,7 +149,7 @@ pub fn emitJson(
     try writer.writeByte('\n');
 }
 
-fn writeJsonString(writer: anytype, s: []const u8) !void {
+fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |c| switch (c) {
         '"' => try writer.writeAll("\\\""),
@@ -190,15 +190,15 @@ test "messageFor: known and unknown codes" {
 }
 
 test "emitJson: ok envelope" {
-    var buf = std.ArrayList(u8).init(testing.allocator);
-    defer buf.deinit();
-    try emitJson(buf.writer(), "", &.{}, testing.allocator);
-    try testing.expectEqualStrings("{\"ok\":true,\"diagnostics\":[]}\n", buf.items);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try emitJson(&aw.writer, "", &.{}, testing.allocator);
+    try testing.expectEqualStrings("{\"ok\":true,\"diagnostics\":[]}\n", aw.writer.buffered());
 }
 
 test "emitJson: single LEX010 envelope" {
-    var buf = std.ArrayList(u8).init(testing.allocator);
-    defer buf.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
     const src = "fn main\r{}\n";
     const diags = [_]Diagnostic{.{
         .code = "LEX010",
@@ -207,12 +207,13 @@ test "emitJson: single LEX010 envelope" {
         .file = "stray.q",
         .offset = 7,
     }};
-    try emitJson(buf.writer(), src, &diags, testing.allocator);
+    try emitJson(&aw.writer, src, &diags, testing.allocator);
+    const buf_items = aw.writer.buffered();
     // Spot-check the envelope rather than full byte match.
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"ok\":false") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"code\":\"LEX010\"") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"severity\":\"error\"") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"file\":\"stray.q\"") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"line\":1") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"col\":8") != null);
+    try testing.expect(std.mem.indexOf(u8, buf_items, "\"ok\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, buf_items, "\"code\":\"LEX010\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf_items, "\"severity\":\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf_items, "\"file\":\"stray.q\"") != null);
+    try testing.expect(std.mem.indexOf(u8, buf_items, "\"line\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, buf_items, "\"col\":8") != null);
 }

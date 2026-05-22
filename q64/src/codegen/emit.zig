@@ -168,10 +168,10 @@ fn emitFn(allocator: std.mem.Allocator, fd: ast.FnDecl) ![]u8 {
     const body = fd.body() orelse return Error.NoBody;
 
     // Collect each env.out call's payload bytes ("text" + "\n").
-    var payloads = std.ArrayList([]u8).init(allocator);
+    var payloads: std.ArrayList([]u8) = .empty;
     defer {
         for (payloads.items) |p| allocator.free(p);
-        payloads.deinit();
+        payloads.deinit(allocator);
     }
 
     var stmts = body.statements();
@@ -216,7 +216,7 @@ fn collectEnvOutPayload(
     var payload = try allocator.alloc(u8, value.len + 1);
     @memcpy(payload[0..value.len], value);
     payload[value.len] = '\n';
-    try out_payloads.append(payload);
+    try out_payloads.append(allocator, payload);
 }
 
 fn emitModuleWithPayloads(allocator: std.mem.Allocator, payloads: []const []u8) ![]u8 {
@@ -282,8 +282,8 @@ fn emitModuleWithPayloads(allocator: std.mem.Allocator, payloads: []const []u8) 
     }
 
     // Body: a sequence of `call $env_out(offset, len)`.
-    var call_exprs = try std.ArrayList(c.BinaryenExpressionRef).initCapacity(allocator, payloads.len);
-    defer call_exprs.deinit();
+    var call_exprs: std.ArrayList(c.BinaryenExpressionRef) = try .initCapacity(allocator, payloads.len);
+    defer call_exprs.deinit(allocator);
     for (payloads, 0..) |p, i| {
         const ptr_arg = c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(offsets[i])));
         const len_arg = c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.len)));
@@ -295,7 +295,7 @@ fn emitModuleWithPayloads(allocator: std.mem.Allocator, payloads: []const []u8) 
             cargs.len,
             none_type,
         );
-        try call_exprs.append(call);
+        try call_exprs.append(allocator, call);
     }
 
     const body_expr: c.BinaryenExpressionRef = if (call_exprs.items.len == 1)

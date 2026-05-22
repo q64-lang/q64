@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-ZIG_VERSION="${ZIG_VERSION:-0.14.0}"
+ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
 ZIG_DEST="vendor/zig"
 ZIG_INDEX_URL="https://ziglang.org/download/index.json"
 
@@ -39,7 +39,7 @@ WASMTIME_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/dow
 
 BINARYEN_VERSION="${BINARYEN_VERSION:-129}"
 BINARYEN_DEST="vendor/binaryen"
-BINARYEN_RELEASE_BASE="https://github.com/WebAssembly/binaryen/releases/download"
+BINARYEN_REPO="https://github.com/WebAssembly/binaryen.git"
 
 cd "$(dirname "$0")"
 
@@ -49,8 +49,8 @@ uname_s="$(uname -s)"
 uname_m="$(uname -m)"
 
 case "$uname_s" in
-    Linux)  os="linux"  ;;
-    Darwin) os="macos"  ;;
+    Linux)  os="linux"; shlib_ext="so"    ;;
+    Darwin) os="macos"; shlib_ext="dylib" ;;
     *)
         echo "init.sh: unsupported OS '$uname_s' (need Linux or macOS)" >&2
         exit 1
@@ -71,7 +71,7 @@ ZIG_TRIPLE="${arch}-${os}"
 
 # --- required tools ----------------------------------------------------
 
-for cmd in curl python3 tar; do
+for cmd in curl python3 tar git cmake; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "init.sh: missing required tool: $cmd" >&2
         exit 1
@@ -189,7 +189,7 @@ EOF
 WASMTIME_KNOWN_SHA256_x86_64_linux="95959e7a4cc4bfc12bbe45c9dea82cf45dd5b4321d9163e66343c50728429129"
 
 install_wasmtime() {
-    if [ -f "$WASMTIME_DEST/lib/libwasmtime.so" ] && \
+    if [ -f "$WASMTIME_DEST/lib/libwasmtime.$shlib_ext" ] && \
        [ "$(cat "$WASMTIME_DEST/VERSION" 2>/dev/null)" = "$WASMTIME_VERSION" ]; then
         echo "init.sh: wasmtime $WASMTIME_VERSION already installed at $WASMTIME_DEST"
         return
@@ -245,10 +245,12 @@ install_wasmtime() {
 # Binaryen (Wasm assembler / optimizer; C API for codegen)
 # =====================================================================
 #
-# Binaryen ships a single static archive plus headers per release.
-# The tarball naming is binaryen-version_<N>-<arch>-<os>.tar.gz.
-
-BINARYEN_KNOWN_SHA256_x86_64_linux="50b9fa62b9abea752da92ec57e0c555fee578760cd237c40107957715d2976ba"
+# Built from source so the same artifact shape (static libbinaryen.a +
+# headers) lands on Linux, macOS, and Windows. Upstream's prebuilt
+# tarballs vary per-OS (macOS ships only a dylib; Linux ships .a linked
+# against libstdc++; Windows ships MSVC .lib), which made cross-platform
+# linking a per-OS dance. Building once with cmake -DBUILD_STATIC_LIB=ON
+# yields a single rule in q64/build.zig: linkLibCpp + addObjectFile.
 
 install_binaryen() {
     if [ -f "$BINARYEN_DEST/lib/libbinaryen.a" ] && \
@@ -257,46 +259,60 @@ install_binaryen() {
         return
     fi
 
-    local tarball="binaryen-version_${BINARYEN_VERSION}-${arch}-${os}.tar.gz"
-    local url="${BINARYEN_RELEASE_BASE}/version_${BINARYEN_VERSION}/${tarball}"
+    local src="$tmpdir/binaryen-src"
+    local build="$tmpdir/binaryen-build"
+    local tag="version_${BINARYEN_VERSION}"
 
-    local key="BINARYEN_KNOWN_SHA256_${arch}_${os}"
-    local expected_sha="${BINARYEN_SHA256:-${!key:-}}"
-    if [ -z "$expected_sha" ]; then
-        echo "init.sh: no pinned sha256 for binaryen ${BINARYEN_VERSION} on ${arch}-${os}." >&2
-        echo "        Re-run with BINARYEN_SHA256=<sha> (or =skip to bypass verification)." >&2
-        exit 1
-    fi
+    echo "init.sh: cloning binaryen $tag from $BINARYEN_REPO"
+    git clone --depth 1 --branch "$tag" --recurse-submodules "$BINARYEN_REPO" "$src"
 
-    echo "init.sh: downloading $url"
-    curl -fsSL "$url" -o "$tmpdir/$tarball"
+    echo "init.sh: configuring binaryen (cmake)"
+    cmake -S "$src" -B "$build" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_STATIC_LIB=ON \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_TOOLS=OFF \
+        -DENABLE_WERROR=OFF \
+        >/dev/null
 
-    if [ "$expected_sha" != "skip" ]; then
-        local actual_sha
-        actual_sha="$("${sha256_cmd[@]}" "$tmpdir/$tarball" | awk '{print $1}')"
-        if [ "$actual_sha" != "$expected_sha" ]; then
-            echo "init.sh: binaryen sha256 mismatch:" >&2
-            echo "  expected: $expected_sha" >&2
-            echo "  got:      $actual_sha" >&2
-            exit 1
+    # Cap parallelism. Binaryen's C++ TUs each peak around ~1 GB of RAM
+    # to compile; an unbounded -j spawns one job per core and can swap a
+    # laptop into a freeze. Leave one core free, and let callers override
+    # via BINARYEN_JOBS.
+    local jobs="${BINARYEN_JOBS:-}"
+    if [ -z "$jobs" ]; then
+        local ncpu
+        if command -v nproc >/dev/null 2>&1; then
+            ncpu="$(nproc)"
+        elif command -v sysctl >/dev/null 2>&1; then
+            ncpu="$(sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+        else
+            ncpu=2
         fi
-        echo "init.sh: binaryen sha256 verified ($actual_sha)"
-    else
-        echo "init.sh: skipping binaryen sha256 verification (BINARYEN_SHA256=skip)"
+        jobs=$(( ncpu > 1 ? ncpu - 1 : 1 ))
     fi
 
-    echo "init.sh: extracting to $BINARYEN_DEST"
-    mkdir -p "$(dirname "$BINARYEN_DEST")"
-    tar -xzf "$tmpdir/$tarball" -C "$tmpdir"
+    echo "init.sh: building binaryen with -j$jobs (override with BINARYEN_JOBS)"
+    cmake --build "$build" --target binaryen --config Release -j"$jobs"
 
-    local extracted_dir="$tmpdir/binaryen-version_${BINARYEN_VERSION}"
-    if [ ! -d "$extracted_dir" ]; then
-        echo "init.sh: unexpected tarball layout — no $extracted_dir after extract" >&2
+    # Locate the static archive. cmake's output dir varies a bit by
+    # generator / version, so search rather than hard-code.
+    local archive
+    archive="$(find "$build" -name 'libbinaryen.a' -print -quit)"
+    if [ -z "$archive" ] || [ ! -f "$archive" ]; then
+        echo "init.sh: cmake build did not produce libbinaryen.a under $build" >&2
         exit 1
     fi
 
+    echo "init.sh: installing into $BINARYEN_DEST"
     rm -rf "$BINARYEN_DEST"
-    mv "$extracted_dir" "$BINARYEN_DEST"
+    mkdir -p "$BINARYEN_DEST/include" "$BINARYEN_DEST/lib"
+    cp "$archive" "$BINARYEN_DEST/lib/libbinaryen.a"
+    # Public C API header + its .def dependencies live under src/.
+    cp "$src/src/binaryen-c.h" "$BINARYEN_DEST/include/"
+    if [ -f "$src/src/wasm-delegations.def" ]; then
+        cp "$src/src/wasm-delegations.def" "$BINARYEN_DEST/include/"
+    fi
     echo "$BINARYEN_VERSION" > "$BINARYEN_DEST/VERSION"
 
     echo "init.sh: binaryen $BINARYEN_VERSION installed at $BINARYEN_DEST"

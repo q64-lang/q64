@@ -25,30 +25,35 @@ const c = @cImport({
     @cInclude("wasmtime/wat.h");
 });
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var err_buf: [4096]u8 = undefined;
+    var err_w = std.Io.File.stderr().writer(io, &err_buf);
 
-    if (args.len != 2) {
-        try std.io.getStdErr().writer().writeAll(
-            "usage: q64-wasmtime-host <file.wat|file.wasm>\n",
-        );
+    var it = init.minimal.args.iterate();
+    _ = it.next(); // argv0
+    const path = it.next() orelse {
+        try err_w.interface.writeAll("usage: q64-wasmtime-host <file.wat|file.wasm>\n");
+        try err_w.interface.flush();
+        std.process.exit(2);
+    };
+    if (it.next() != null) {
+        try err_w.interface.writeAll("usage: q64-wasmtime-host <file.wat|file.wasm>\n");
+        try err_w.interface.flush();
         std.process.exit(2);
     }
 
-    const path = args[1];
-    const source = std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| {
-        try std.io.getStdErr().writer().print(
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |e| {
+        try err_w.interface.print(
             "q64-wasmtime-host: cannot read {s}: {s}\n",
-            .{ path, @errorName(err) },
+            .{ path, @errorName(e) },
         );
+        try err_w.interface.flush();
         std.process.exit(2);
     };
-    defer allocator.free(source);
+    defer gpa.free(source);
 
     // -------------------------------------------------------------
     // Engine + store + context.
@@ -67,9 +72,9 @@ pub fn main() !void {
     // -------------------------------------------------------------
     var wasm_bytes: c.wasm_byte_vec_t = undefined;
     if (std.mem.endsWith(u8, path, ".wat")) {
-        const err = c.wasmtime_wat2wasm(@ptrCast(source.ptr), source.len, &wasm_bytes);
-        if (err) |e| {
-            try printErrorAndDelete(e, "wat2wasm");
+        const wat_err = c.wasmtime_wat2wasm(@ptrCast(source.ptr), source.len, &wasm_bytes);
+        if (wat_err) |e| {
+            try printErrorAndDelete(io, e, "wat2wasm");
             std.process.exit(1);
         }
     } else {
@@ -82,14 +87,14 @@ pub fn main() !void {
     // -------------------------------------------------------------
     var module: ?*c.wasmtime_module_t = null;
     {
-        const err = c.wasmtime_module_new(
+        const mod_err = c.wasmtime_module_new(
             engine,
             @ptrCast(wasm_bytes.data),
             wasm_bytes.size,
             &module,
         );
-        if (err) |e| {
-            try printErrorAndDelete(e, "module_new");
+        if (mod_err) |e| {
+            try printErrorAndDelete(io, e, "module_new");
             std.process.exit(1);
         }
     }
@@ -116,7 +121,7 @@ pub fn main() !void {
     defer c.wasm_functype_delete(env_out_type);
 
     {
-        const err = c.wasmtime_linker_define_func(
+        const link_err = c.wasmtime_linker_define_func(
             linker,
             "env",
             "env".len,
@@ -127,8 +132,8 @@ pub fn main() !void {
             null,
             null,
         );
-        if (err) |e| {
-            try printErrorAndDelete(e, "linker_define_func env.out");
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.out");
             std.process.exit(1);
         }
     }
@@ -139,13 +144,13 @@ pub fn main() !void {
     var instance: c.wasmtime_instance_t = undefined;
     var inst_trap: ?*c.wasm_trap_t = null;
     {
-        const err = c.wasmtime_linker_instantiate(linker, context, module, &instance, &inst_trap);
-        if (err) |e| {
-            try printErrorAndDelete(e, "linker_instantiate");
+        const inst_err = c.wasmtime_linker_instantiate(linker, context, module, &instance, &inst_trap);
+        if (inst_err) |e| {
+            try printErrorAndDelete(io, e, "linker_instantiate");
             std.process.exit(1);
         }
         if (inst_trap) |t| {
-            try printTrapAndDelete(t, "instantiate");
+            try printTrapAndDelete(io, t, "instantiate");
             std.process.exit(1);
         }
     }
@@ -155,21 +160,19 @@ pub fn main() !void {
     // -------------------------------------------------------------
     var start_item: c.wasmtime_extern_t = undefined;
     if (!c.wasmtime_instance_export_get(context, &instance, "_start", "_start".len, &start_item)) {
-        try std.io.getStdErr().writer().writeAll(
-            "q64-wasmtime-host: module has no `_start` export\n",
-        );
+        try err_w.interface.writeAll("q64-wasmtime-host: module has no `_start` export\n");
+        try err_w.interface.flush();
         std.process.exit(1);
     }
     if (start_item.kind != c.WASMTIME_EXTERN_FUNC) {
-        try std.io.getStdErr().writer().writeAll(
-            "q64-wasmtime-host: `_start` is not a function\n",
-        );
+        try err_w.interface.writeAll("q64-wasmtime-host: `_start` is not a function\n");
+        try err_w.interface.flush();
         std.process.exit(1);
     }
 
     var call_trap: ?*c.wasm_trap_t = null;
     {
-        const err = c.wasmtime_func_call(
+        const call_err = c.wasmtime_func_call(
             context,
             &start_item.of.func,
             null,
@@ -178,12 +181,12 @@ pub fn main() !void {
             0,
             &call_trap,
         );
-        if (err) |e| {
-            try printErrorAndDelete(e, "func_call _start");
+        if (call_err) |e| {
+            try printErrorAndDelete(io, e, "func_call _start");
             std.process.exit(1);
         }
         if (call_trap) |t| {
-            try printTrapAndDelete(t, "_start");
+            try printTrapAndDelete(io, t, "_start");
             std.process.exit(1);
         }
     }
@@ -192,6 +195,10 @@ pub fn main() !void {
 // =====================================================================
 // env.out host callback
 // =====================================================================
+//
+// Called from C, so we can't accept an `Io` parameter. Reach for the
+// process-wide single-threaded Io. Fine for v0 since the host is
+// strictly single-threaded; revisit when we add concurrency.
 
 fn envOutCallback(
     env_: ?*anyopaque,
@@ -200,7 +207,7 @@ fn envOutCallback(
     nargs: usize,
     results: [*c]c.wasmtime_val_t,
     nresults: usize,
-) callconv(.C) ?*c.wasm_trap_t {
+) callconv(.c) ?*c.wasm_trap_t {
     _ = env_;
     _ = results;
     _ = nresults;
@@ -228,7 +235,11 @@ fn envOutCallback(
     if (ptr + len > data_size) return trap("env.out: out-of-bounds write");
 
     const slice = data[ptr .. ptr + len];
-    std.io.getStdOut().writer().writeAll(slice) catch return trap("env.out: stdout write failed");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    w.interface.writeAll(slice) catch return trap("env.out: stdout write failed");
+    w.interface.flush() catch return trap("env.out: stdout flush failed");
 
     return null;
 }
@@ -241,24 +252,30 @@ fn trap(msg: []const u8) ?*c.wasm_trap_t {
     return c.wasmtime_trap_new(msg.ptr, msg.len);
 }
 
-fn printErrorAndDelete(err: *c.wasmtime_error_t, ctx_label: []const u8) !void {
+fn printErrorAndDelete(io: std.Io, err: *c.wasmtime_error_t, ctx_label: []const u8) !void {
     var msg: c.wasm_byte_vec_t = undefined;
     c.wasmtime_error_message(err, &msg);
     defer c.wasm_byte_vec_delete(&msg);
-    try std.io.getStdErr().writer().print(
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    try w.interface.print(
         "q64-wasmtime-host: {s}: {s}\n",
         .{ ctx_label, msg.data[0..msg.size] },
     );
+    try w.interface.flush();
     c.wasmtime_error_delete(err);
 }
 
-fn printTrapAndDelete(t: *c.wasm_trap_t, ctx_label: []const u8) !void {
+fn printTrapAndDelete(io: std.Io, t: *c.wasm_trap_t, ctx_label: []const u8) !void {
     var msg: c.wasm_byte_vec_t = undefined;
     c.wasm_trap_message(t, &msg);
     defer c.wasm_byte_vec_delete(&msg);
-    try std.io.getStdErr().writer().print(
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    try w.interface.print(
         "q64-wasmtime-host: trap during {s}: {s}\n",
         .{ ctx_label, msg.data[0..msg.size] },
     );
+    try w.interface.flush();
     c.wasm_trap_delete(t);
 }

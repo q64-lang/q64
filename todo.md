@@ -56,6 +56,52 @@ worth being explicit about. Decision needed:
 is (a) for v0, with (b) deferred to a future revision once the
 component-model story stabilizes upstream.
 
+## Host ABI for non-trivial faces — discussion phase
+
+`env.out`'s `(ptr: i32, len: i32) -> ()` works for "bytes to stdout"
+because the host knows the bytes are UTF-8 and that's it. Real faces
+have structure — `env.audio` enumerates devices, reports
+AudioWorklet status, hands off streaming buffers, takes callbacks
+back into the module at audio-thread rate. None of that fits a raw
+ptr+len convention.
+
+We need to pick **one** "fixed form" for typed faces before more
+stdlib code accretes. Options, ranked by how much new toolchain we
+take on:
+
+1. **Hand-specced per-face ABI in `spec/<face>.md`.** Memory layouts
+   for records (`{id, name, channels, sample_rate}`), return-via-
+   out-ptr conventions, error tag bytes, callback function-table
+   slots. Host code (`runtime/wasmtime/`, `runtime/browser/`,
+   `runtime/audio-host/`) implements decoders against the spec.
+   Cheapest now; brittle as faces multiply.
+2. **WIT / Component Model for non-trivial faces.** Keep `(ptr,len)`
+   for `env.out`-class trivia; spec `Audio`, `Net`, `Fs` in WIT and
+   lower through the component model. Standard-flavored, generated
+   host bindings, but commits us to CM tooling and the runtime
+   adapters grow a CM layer.
+3. **Wasm GC reference types.** Pass typed `struct` / `array` refs
+   across the import; no marshaling. q64 already targets Wasm 3.0,
+   but Binaryen's GC support for generated modules isn't mature
+   enough today.
+
+JS-side: regardless of which path, the browser host (`runtime/browser/`)
+needs a glue ESM that users drop into their site — `import { runQ64 }
+from 'q64-browser-host'` style. The shape of that module depends on
+which option above we pick; (1) means hand-written decoders per face,
+(2) means generated bindings, (3) means very thin glue + Wasm GC
+interop.
+
+- [ ] Decide between (1) / (2) / (3). Probably (1) for v0 with a
+      clear migration path to (2). Capture the decision in
+      `spec/faces.md` and link from `spec/audio.md` when that lands.
+- [ ] Spec the audio face wire format as the first concrete
+      instance — drives the abstraction by example.
+- [ ] Sketch the browser-host JS glue API (`runQ64`, capability
+      injection, AudioWorklet bridge) so the debug page in
+      [qube web] can render it.
+- [ ] Cross-link from `env.md` and each face's spec.
+
 ## Other open items
 
 This section grows as we go. Each item should have a checkbox so it's

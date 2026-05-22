@@ -17,3 +17,115 @@
   height: auto;
   border-radius: 1rem;
 }
+
+/* Starlight wraps our hero html in `.hero-html.sl-flex` (display:flex, row).
+   We have an image AND a terminal stacked — switch to column and let the
+   block grow wider than the default 25rem cap. */
+.hero > .hero-html {
+  flex-direction: column;
+  align-items: center;
+  width: min(100%, 32rem) !important;
+}
+
+/* Hero text column: headline + sub + note (all rendered inside the tagline). */
+.hero-headline,
+.hero-sub,
+.hero-note {
+  display: block;
+}
+
+.hero-headline {
+  font-size: clamp(var(--sl-text-xl), calc(0.0625rem + 2.5vw), var(--sl-text-2xl));
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--sl-color-accent);
+  margin-bottom: 0.9rem;
+}
+
+.hero-sub {
+  font-size: clamp(var(--sl-text-base), calc(0.0625rem + 1vw), var(--sl-text-lg));
+  color: var(--sl-color-gray-2);
+  margin-bottom: 0.6rem;
+}
+
+.hero-note {
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-3);
+}
+
+/* Terminal mock under the hero image. Placeholder until CodeMirror lands. */
+.q64-terminal {
+  margin: 1.25rem auto 0;
+  max-width: min(100%, 560px);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  background: #0e0a1a;
+  border: 1px solid var(--sl-color-accent);
+  box-shadow:
+    0 0 0 1px rgba(203, 166, 255, 0.15),
+    0 12px 36px rgba(0, 0, 0, 0.45);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  text-align: left;
+}
+
+.q64-terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  background: linear-gradient(180deg, #1a1330, #120c24);
+  border-bottom: 1px solid rgba(203, 166, 255, 0.35);
+}
+
+.q64-terminal-dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  display: inline-block;
+}
+.q64-terminal-dot--red    { background: #ff5f57; }
+.q64-terminal-dot--yellow { background: #febc2e; }
+.q64-terminal-dot--green  { background: #28c840; }
+
+.q64-terminal-title {
+  margin-left: auto;
+  margin-right: auto;
+  font-size: 0.75rem;
+  color: #b7a6dc;
+  padding-right: 2.1rem; /* offset for the three dots so title stays visually centered */
+}
+
+.q64-terminal-body {
+  margin: 0;
+  padding: 0.9rem 1rem 1rem;
+  background: transparent;
+  color: #e9d8ff;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.q64-terminal-body code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: inherit;
+}
+
+.q64-terminal-prompt {
+  color: #b7a6dc;
+}
+
+/* Light theme: keep the terminal dark (classic terminal look) but tune the
+   frame so it reads against the lighter page background. */
+:root[data-theme='light'] .q64-terminal {
+  border-color: #6d3ec9;
+  box-shadow:
+    0 0 0 1px rgba(109, 62, 201, 0.12),
+    0 10px 24px rgba(42, 31, 61, 0.18);
+}
+:root[data-theme='light'] .q64-terminal-bar {
+  background: linear-gradient(180deg, #221638, #1a1330);
+  border-bottom-color: rgba(203, 166, 255, 0.25);
+}

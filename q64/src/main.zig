@@ -11,46 +11,50 @@ const parse = parser.parse;
 const diag = parser.diag;
 const emit = @import("codegen/emit.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_it = init.minimal.args.iterate();
+    // Skip argv[0].
+    _ = args_it.next();
 
-    if (args.len < 2) {
-        try usage();
+    const sub = args_it.next() orelse {
+        try usage(io);
         std.process.exit(2);
-    }
+    };
 
-    if (std.mem.eql(u8, args[1], "check")) {
-        try cmdCheck(allocator, args[2..]);
+    if (std.mem.eql(u8, sub, "check")) {
+        try cmdCheck(gpa, io, &args_it);
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "emit-hello")) {
-        try cmdEmitHello(allocator, args[2..]);
+    if (std.mem.eql(u8, sub, "emit-hello")) {
+        try cmdEmitHello(gpa, io, &args_it);
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "emit")) {
-        try cmdEmit(allocator, args[2..]);
+    if (std.mem.eql(u8, sub, "emit")) {
+        try cmdEmit(gpa, io, &args_it);
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "--version")) {
-        try std.io.getStdOut().writer().writeAll("q64 0.0.1 (pre-alpha)\n");
+    if (std.mem.eql(u8, sub, "--version")) {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &buf);
+        try w.interface.writeAll("q64 0.0.1 (pre-alpha)\n");
+        try w.interface.flush();
         return;
     }
 
-    try usage();
+    try usage(io);
     std.process.exit(2);
 }
 
-fn usage() !void {
-    const w = std.io.getStdErr().writer();
-    try w.writeAll(
+fn usage(io: std.Io) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    try w.interface.writeAll(
         \\usage: q64 <command> [args]
         \\
         \\Commands:
@@ -60,20 +64,15 @@ fn usage() !void {
         \\  --version                          Print the version and exit.
         \\
     );
+    try w.interface.flush();
 }
 
-fn cmdCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len == 0) {
-        try usage();
-        std.process.exit(2);
-    }
-
+fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
     var file: ?[]const u8 = null;
     var json = false;
-    for (args) |a| {
+    while (args_it.next()) |a| {
         if (std.mem.eql(u8, a, "--diagnostics")) {
             // Next arg should be "json"; flag-style for now.
-            // (No other diagnostics format implemented yet.)
             continue;
         }
         if (std.mem.eql(u8, a, "json")) {
@@ -84,19 +83,21 @@ fn cmdCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const path = file orelse {
-        try usage();
+        try usage(io);
         std.process.exit(2);
     };
 
-    const source = std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| {
-        const w = std.io.getStdErr().writer();
-        try w.print("q64: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+        try w.interface.flush();
         std.process.exit(2);
     };
-    defer allocator.free(source);
+    defer gpa.free(source);
 
-    const result = try parse.parse(allocator, source, path);
-    defer result.deinit(allocator);
+    const result = try parse.parse(gpa, source, path);
+    defer result.deinit(gpa);
 
     var has_error = false;
     for (result.diagnostics) |d| if (d.severity == .err) {
@@ -104,69 +105,89 @@ fn cmdCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
         break;
     };
 
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+
     if (json) {
-        try diag.emitJson(std.io.getStdErr().writer(), source, result.diagnostics, allocator);
+        try diag.emitJson(&w.interface, source, result.diagnostics, gpa);
     } else {
         // Human-readable form. Mirrors the human format described
         // in spec/diagnostics.md §"Rendering".
-        const w = std.io.getStdErr().writer();
         for (result.diagnostics) |d| {
-            const idx = try diag.LineIndex.build(allocator, source);
+            const idx = try diag.LineIndex.build(gpa, source);
             defer idx.deinit();
             const loc = idx.locate(d.offset);
-            try w.print("{s}:{d}:{d}: {s}: {s} [{s}]\n", .{
+            try w.interface.print("{s}:{d}:{d}: {s}: {s} [{s}]\n", .{
                 d.file, loc.line, loc.col, d.severity.toString(), d.message, d.code,
             });
         }
     }
+    try w.interface.flush();
 
     if (has_error) std.process.exit(1);
 }
 
-fn cmdEmitHello(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 1) {
-        try usage();
-        std.process.exit(2);
-    }
-    const out_path = args[0];
-
-    const bytes = try emit.emitHelloWasm(allocator);
-    defer allocator.free(bytes);
-
-    try writeFile(out_path, bytes);
-}
-
-fn cmdEmit(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 2) {
-        try usage();
-        std.process.exit(2);
-    }
-    const src_path = args[0];
-    const out_path = args[1];
-
-    const source = std.fs.cwd().readFileAlloc(allocator, src_path, 16 * 1024 * 1024) catch |err| {
-        const w = std.io.getStdErr().writer();
-        try w.print("q64: cannot read {s}: {s}\n", .{ src_path, @errorName(err) });
+fn cmdEmitHello(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    const out_path = args_it.next() orelse {
+        try usage(io);
         std.process.exit(2);
     };
-    defer allocator.free(source);
+    if (args_it.next() != null) {
+        try usage(io);
+        std.process.exit(2);
+    }
 
-    const bytes = emit.emitFromSource(allocator, source, src_path) catch |err| {
-        const w = std.io.getStdErr().writer();
-        try w.print("q64: emit failed: {s}\n", .{@errorName(err)});
+    const bytes = try emit.emitHelloWasm(gpa);
+    defer gpa.free(bytes);
+
+    try writeFile(io, out_path, bytes);
+}
+
+fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    const src_path = args_it.next() orelse {
+        try usage(io);
+        std.process.exit(2);
+    };
+    const out_path = args_it.next() orelse {
+        try usage(io);
+        std.process.exit(2);
+    };
+    if (args_it.next() != null) {
+        try usage(io);
+        std.process.exit(2);
+    }
+
+    const source = std.Io.Dir.cwd().readFileAlloc(io, src_path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: cannot read {s}: {s}\n", .{ src_path, @errorName(err) });
+        try w.interface.flush();
+        std.process.exit(2);
+    };
+    defer gpa.free(source);
+
+    const bytes = emit.emitFromSource(gpa, source, src_path) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: emit failed: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
         std.process.exit(1);
     };
-    defer allocator.free(bytes);
+    defer gpa.free(bytes);
 
-    try writeFile(out_path, bytes);
+    try writeFile(io, out_path, bytes);
 }
 
-fn writeFile(path: []const u8, bytes: []const u8) !void {
-    const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
-        const w = std.io.getStdErr().writer();
-        try w.print("q64: cannot write {s}: {s}\n", .{ path, @errorName(err) });
+fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = bytes,
+        .flags = .{ .truncate = true },
+    }) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: cannot write {s}: {s}\n", .{ path, @errorName(err) });
+        try w.interface.flush();
         std.process.exit(2);
     };
-    defer file.close();
-    try file.writeAll(bytes);
 }

@@ -325,30 +325,30 @@ pub const StringLit = struct {
         if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return null;
         const body = raw[1 .. raw.len - 1];
 
-        var out = std.ArrayList(u8).init(allocator);
-        errdefer out.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
 
         var i: usize = 0;
         while (i < body.len) : (i += 1) {
             if (body[i] != '\\' or i + 1 >= body.len) {
-                try out.append(body[i]);
+                try out.append(allocator, body[i]);
                 continue;
             }
             i += 1;
             switch (body[i]) {
-                'n' => try out.append('\n'),
-                't' => try out.append('\t'),
-                'r' => try out.append('\r'),
-                '\\' => try out.append('\\'),
-                '"' => try out.append('"'),
-                '0' => try out.append(0),
+                'n' => try out.append(allocator, '\n'),
+                't' => try out.append(allocator, '\t'),
+                'r' => try out.append(allocator, '\r'),
+                '\\' => try out.append(allocator, '\\'),
+                '"' => try out.append(allocator, '"'),
+                '0' => try out.append(allocator, 0),
                 else => {
-                    try out.append('\\');
-                    try out.append(body[i]);
+                    try out.append(allocator, '\\');
+                    try out.append(allocator, body[i]);
                 },
             }
         }
-        return try out.toOwnedSlice();
+        return try out.toOwnedSlice(allocator);
     }
 };
 
