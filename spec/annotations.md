@@ -18,7 +18,7 @@ detailed semantics.
 - **One catalog, many owners.** Every `@`-form belongs to a
   topic spec (`effects.md`, `streams.md`, `memory.md`,
   `faces.md`, `units.md`, `diagnostics.md`, `errors.md`, the
-  forthcoming `test-framework.md`). This file lists them so a
+  `test-framework.md`). This file lists them so a
   reader who finds `@stage` in a code snippet has one place to
   look up "what is this and where is it spec'd."
 - **Casing is meaning.** Lowercase names are compiler-known and
@@ -101,7 +101,7 @@ analysis. Not user-extensible.
 | `@fuse`           | `fn` (with `@stage`)      | Hints fusion across an adjacent `@stage` boundary.                    | [`streams.md`](./streams.md)         |
 | `@shared`         | `struct`                  | Allocates the struct in `mem.shared`; cross-thread visible.           | [`memory.md`](./memory.md)           |
 | `@managed`        | `struct`                  | Allocates the struct in WasmGC memory.                                | [`memory.md`](./memory.md)           |
-| `@test`           | `fn`                      | Registers the function with the test runner.                          | (forthcoming `test-framework.md`)    |
+| `@test`           | `fn`                      | Registers the function with the test runner.                          | [`test-framework.md`](./test-framework.md)    |
 | `@skip_laws`      | `fit`                     | Suppresses the face-law check for this fit. Audit-trail required.     | [`faces.md`](./faces.md)             |
 | `@traced_panic`   | `fn`                      | Captures a stack trace into the panic payload (opt-in; ~few kB cost). | [`errors.md`](./errors.md)           |
 | `@rate`           | `graph` block             | Pins the graph body's ambient stream rate.                            | [`streams.md`](./streams.md)         |
@@ -183,7 +183,7 @@ filled in.
 | `@rate`           | 1         | `graph` block           | [`streams.md`](./streams.md)         |
 | `@shared`         | 1         | `struct`                | [`memory.md`](./memory.md)           |
 | `@managed`        | 1         | `struct`                | [`memory.md`](./memory.md)           |
-| `@test`           | 1         | `fn`                    | (forthcoming `test-framework.md`)    |
+| `@test`           | 1         | `fn`                    | [`test-framework.md`](./test-framework.md)    |
 | `@skip_laws`      | 1         | `fit`                   | [`faces.md`](./faces.md)             |
 | `@traced_panic`   | 1         | `fn`                    | [`errors.md`](./errors.md)           |
 | `@unit`           | 2         | item-introducing        | [`units.md`](./units.md)             |

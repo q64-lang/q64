@@ -192,7 +192,7 @@ section indexes them.
 | Bindings & arrays      | `let`, `var`, `[T]`, `[T; N]`, `ref`                           | [`types.md`](./types.md) §"Bindings", §"Arrays and slices", §"References" |
 | Compound numerics      | `Simd`, `Tensor`, `DynTensor`                                  | [`types.md`](./types.md) §"SIMD and Tensor as language types" |
 | Optionality / errors   | `Option`, `Result`, `T?`, `try`, `panic`, `trap`, `PanicMessage`, `Cancelled`, `Closed`, `RuntimeDenied`, `RangeError` | [`errors.md`](./errors.md) §"Auto-prelude additions" |
-| Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error`, `Panic` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) |
+| Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error`, `Panic` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) + [`test-framework.md`](./test-framework.md) (`Arbitrary` interface) |
 | Collections            | `Vec`, `Map`, `Set`, `Box`, `Bytes`                            | [`memory.md`](./memory.md) §"Region parameters in types" |
 | Regions                | `Region`, `Arena`, `Pool`, `Stack`, `FreeList`, `Managed`, `Interned`, `scope`, `transfer` | [`memory.md`](./memory.md) §"Region kinds"     |
 | Shared memory          | `Atomic`, `Shared`, `ManagedBox`, `Mutex`, `RwLock`, `LockFree`, `Disjoint` | [`memory.md`](./memory.md) §"Shared regions", §"`Shared<T, P>` policies" |

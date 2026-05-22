@@ -25,6 +25,7 @@ suite.
 | [`types.md`](./types.md)                                 | Numeric tower, bool, arb-width ints, parameter modes, optional narrowing |
 | [`units.md`](./units.md)                                 | Unit lattice: blessed unit types, prefixes, dimensional algebra, logarithmic units, `@unit` |
 | [`annotations.md`](./annotations.md)                     | `@`-form catalog: four categories, casing rule, position table, `ANN` diagnostic band |
+| [`test-framework.md`](./test-framework.md)               | `@test`, assertions, capability mocking, property tests, `Arbitrary` face, `TST` diagnostic band |
 | [`memory.md`](./memory.md)                               | Regions, dual heap, transfers, multi-memory layout, shared / managed annotations |
 | [`concurrency.md`](./concurrency.md)                     | Scopes, tasks, channels, select, actors, cancellation, panics, host translation |
 | [`streams.md`](./streams.md)                             | Signal / Event / Stream, @stage, graph, |>, pre(), fusion, SharedSignal          |

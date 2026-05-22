@@ -70,7 +70,7 @@ visible at a glance whether it's been picked up.
       property wrappers). Smallest scope, highest cross-reference value.
 - [x] `spec/units.md` — drain the unit-suffix table out of `types.md`
       into a real lattice spec.
-- [ ] `spec/test-framework.md` — `@test`, fixtures, the `Arbitrary` face
+- [x] `spec/test-framework.md` — `@test`, fixtures, the `Arbitrary` face
       surface. `env.md` and `spec/tests/` both use `@test` but it has no
       spec home.
 - [ ] Pattern grammar completion — close the `(* open *)` markers in
