@@ -67,6 +67,19 @@ visible at a glance whether it's been picked up.
 - [ ] AST views: extend `q64/src/parser/ast.zig` as each item
       production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
       seeded the pattern.
+- [ ] Parser: statement + expression productions inside `Block`.
+      Today blocks carry raw tokens; need `LetStmt`, `ExprStmt`,
+      `MethodExpr` (`env.out("…")`), `PathExpr`, `STR_LITERAL` to
+      structure the hello-world body. Required before codegen can
+      walk it.
+- [x] Runtime: wasmtime host that runs `hello.wat` and prints
+      "Hello, q64.\n" via the `env.out` import
+      (runtime/wasmtime/src/main.zig). v0 byte-level golden for
+      codegen.
+- [ ] Codegen: vendor Binaryen + stub `q64/src/codegen/emit.zig`
+      that produces a `.wasm` byte-equivalent to `hello.wat` from a
+      hand-built AST. Bridges the gap between the parser/AST and
+      the runtime adapter.
 - [ ] Parser: pattern + match arms. Unlocks half the remaining
       `spec/tests/` corpus.
 - [ ] Parser: full expression precedence chain from `grammar.md`.

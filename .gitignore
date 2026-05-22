@@ -3,8 +3,9 @@ zig-out/
 zig-cache/
 .zig-cache/
 
-# Pinned Zig toolchain installed by init.sh
+# Pinned toolchain + runtime libs installed by init.sh
 vendor/zig/
+vendor/wasmtime/
 
 # Node / Astro / web tooling
 node_modules/
@@ -30,3 +31,5 @@ dist/
 *.obj
 /q64/zig-out/
 /q64/.zig-cache/
+/runtime/wasmtime/zig-out/
+/runtime/wasmtime/.zig-cache/
