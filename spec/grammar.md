@@ -451,21 +451,12 @@ AnnotationArg  := Expr                                  (* @derive(Eq, Hash) *)
 AnnotatedItem  := Annotation* Item
 ```
 
-The blessed annotation set, sourced from the relevant specs, is:
-
-| Annotation        | Position                | Owning spec                         |
-|-------------------|-------------------------|-------------------------------------|
-| `@stage`          | `fn`                    | [`streams.md`](./streams.md)         |
-| `@fuse`           | `fn` (with `@stage`)    | [`streams.md`](./streams.md)         |
-| `@shared`         | `struct`                | [`memory.md`](./memory.md)           |
-| `@managed`        | `struct`                | [`memory.md`](./memory.md)           |
-| `@derive(...)`    | `struct` / `enum`       | [`faces.md`](./faces.md)             |
-| `@no_derive(...)` | `struct` / `enum`       | [`faces.md`](./faces.md)             |
-| `@kind`           | `struct`                | (* open; tracked in MIGRATION.md *) |
-| `@test`           | `fn`                    | (* open; test framework *)           |
-| `@skip_laws`      | `fit`                   | [`faces.md`](./faces.md)             |
-| `@allow(CODE)`    | any item or stmt        | [`diagnostics.md`](./diagnostics.md) |
-| `@traced_panic`   | `fn`                    | (* open; per errors.md *)            |
+The blessed annotation set, the four categories
+(compiler-known markers, declaration markers, derive forms,
+property wrappers), the casing convention, the position table,
+and the `ANN` diagnostic band live in
+[`annotations.md`](./annotations.md). This file fixes the
+grammar; `annotations.md` fixes the catalog.
 
 The `@`-name lexical class is shared with effect markers; the position
 disambiguates. An `@`-name on a declaration line is an `Annotation`;
@@ -768,6 +759,7 @@ The codes already defined in other specs are:
 |----------|-------------|------------------------------------------------------------------|
 | `LEX020` | types.md    | unknown string-literal prefix                                    |
 | `LEX021` | types.md    | unexpected character `&` in type position                        |
+| `LEX022` | types.md    | ambiguous string-literal prefix                                  |
 | `PAR040` | generics.md | generic vs less-than ambiguity                                   |
 
 `LEX010` is reserved by this spec for "stray carriage return"
@@ -881,7 +873,7 @@ here so a reader of this spec can see exactly what is **not** pinned.
 4. **Operator overloading on units.** This is a semantic concern, not
    a grammar one; the operator tokens are spelled here, but which
    types may declare fits for them (`Hz + Hz`, `Hz * Seconds`, …)
-   lives with the forthcoming `units.md` spec.
+   lives with [`units.md`](./units.md) §"Dimensional algebra".
 
 Additional grammar-shaped items inherited from other specs:
 

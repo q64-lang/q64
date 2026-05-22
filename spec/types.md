@@ -149,25 +149,13 @@ The suffix form mirrors method-call syntax (`42.i32`); the
 compiler recognizes the right-hand side as either a primitive
 type name, an arbitrary-width int name, or a unit suffix.
 
-**Unit suffixes recognized in v0.** Pending the full `units.md`
-spec, the following suffixes are blessed by the language so other
-specs may use them in examples and signatures. Each evaluates to
-an `f64` value carrying a unit phantom; arithmetic between
-compatible units (`s + s`, `kHz * s` → dimensionless) follows the
-obvious dimensional rules.
-
-| Suffix       | Quantity         | Base unit |
-|--------------|------------------|-----------|
-| `Hz`, `kHz`, `MHz`, `GHz` | frequency | Hz |
-| `ns`, `us`, `ms`, `s`     | duration  | s  |
-| `dB`          | gain (logarithmic) | dB |
-| `B`, `KB`, `MB`, `GB`, `TB` | size (decimal multipliers) | bytes |
-| `KiB`, `MiB`, `GiB`        | size (binary multipliers)  | bytes |
-| `deg`, `rad`               | angle | rad |
-
-The full unit lattice (composition rules, user-defined units,
-prefix interactions) lands with `units.md`. Until then, these
-suffix names are reserved and the listed semantics apply.
+**Unit suffixes.** The blessed unit suffixes (`Hz`, `kHz`, `ms`,
+`KiB`, `dB`, `rad`, …), the prefix system, the dimensional
+algebra, and `@unit` declarations are specified in
+[`units.md`](./units.md). The literal-grammar form (`<number>.IDENT`)
+is the same — a literal followed by a single identifier suffix —
+but which identifiers are blessed and what type they yield is
+the units spec's contract.
 
 Float literals require a dot. `3` is `i64`; `3.0` is `f64`.
 A literal like `42.kHz` is parsed as `42` followed by the
@@ -403,6 +391,51 @@ both interoperate with the interpolation form below.
 
 There is no implicit conversion in either direction.
 
+### Encoding
+
+Both `str` and `String<R>` are **UTF-8**. The byte sequence is
+guaranteed well-formed UTF-8 at construction; the compiler and
+stdlib uphold the invariant.
+
+- **Construction from raw bytes** is explicit and fallible:
+  `str.from_utf8(bytes: [u8]) -> Result<str, Utf8Error>`.
+  Bytes that don't decode produce `Utf8Error`; the slice's
+  contents are otherwise unmodified.
+- **Indexing** uses byte offsets. `s[i]` is the `i`-th byte
+  (`u8`), not the `i`-th code point. Slicing across a code-
+  point boundary is `TYP091` at runtime (a structured
+  diagnostic, not a `trap`).
+- **Iteration** comes in two flavors: `.bytes()` yields `u8`,
+  `.chars()` yields `u32` code points. Grapheme-cluster
+  iteration is stdlib's `q64.text` concern, not the language.
+
+UTF-16 and other encodings are stdlib `q64.text` types
+(`Utf16<R>`, etc.); they convert to/from `str` explicitly.
+
+### Equality and ordering
+
+Both `str` and `String<R>` fit `Eq` and `Ord`:
+
+- **`Eq`** is byte-wise. `"café" == "cafe\u{0301}"` is `false`
+  (composed vs. combining). Unicode normalization is not
+  applied automatically.
+- **`Ord`** is lexicographic on bytes — which, for UTF-8, is
+  the same as lexicographic on code points. Two strings
+  comparing equal under `Ord` compare equal under `Eq`.
+- **Hash** is over the byte sequence.
+
+For locale-sensitive or normalization-aware comparison, use
+`q64.text.collate` (stdlib).
+
+### Comptime construction
+
+A literal — plain, raw, or typed-prefix — is a `comptime`
+expression and lowers at compile time. A `comptime` block may
+concatenate, slice, and compare `str` values; allocating a
+`String<R>` requires a runtime region and is therefore not
+permitted in `comptime` (use `concat!`-style comptime helpers
+from `q64.text` for compile-time string composition).
+
 ## String literals
 
 String literals have three forms. All three either produce a `str`
@@ -423,6 +456,13 @@ let escape:   str = "line one\nline two"          // \n, \t, \\, \", \0, \xHH, \
   `Display` rendering. Use `{{` and `}}` for literal braces.
 - Escape sequences match Rust / Swift: `\n`, `\t`, `\r`, `\0`,
   `\\`, `\"`, `\xHH`, `\u{HHHH}`.
+- **No format specs in v0.** `{value:.3f}`-style format
+  specifications are not supported; the brace body must be a
+  valid `Expr` and the renderer is always `Display::fmt`. For
+  controlled formatting, call a stdlib helper inside the brace
+  (`"{value.to_fixed(3)}"`) or use the `q64.text.format`
+  surface. Adding a format-spec sublanguage is an open item;
+  see §"Open items deferred".
 
 ### Raw form (`r"…"` and `r#"…"#`)
 
@@ -466,6 +506,40 @@ an auto-prelude capability face per
 face". `url"…"` is auto-prelude because `Url` appears in `Net`'s
 signatures. Typed prefixes whose target type lives in a
 non-prelude qube remain opt-in via an explicit `import`.
+
+#### The `StringLit` face
+
+A typed prefix `Foo"…"` resolves to a comptime lowering on the
+target type. The contract:
+
+```q64
+pub face StringLit {
+    type Target
+    fn lower(body: StringLitBody) -> Self::Target @comptime
+}
+```
+
+- `Target` is the resulting type — `Url` for `url"…"`, a
+  regex automaton for `re"…"`, etc.
+- `lower` runs at compile time. It receives a
+  `StringLitBody` handle that exposes the literal's raw text,
+  the list of interpolation expressions and their source spans,
+  and a flag indicating whether the form was raw. Failure to
+  validate the body produces a structured diagnostic at the
+  call site (`LEX020`'s neighborhood; specific codes are
+  per-prefix).
+- The fit's name is matched against the leading identifier on
+  the literal: the prefix `url` on `url"…"` is the lowercase
+  form of the target type `Url`. Specifically, the compiler
+  looks for a `StringLit` fit whose `Target` is a type whose
+  name, lowercased, equals the prefix identifier. A target
+  whose lowercased name collides with another in-scope
+  `StringLit` fit's target is `LEX022` ("ambiguous string-
+  literal prefix").
+
+The full handle API and the comptime evaluation rules land
+with the forthcoming `comptime.md`; the `face StringLit`
+declaration above is the v0 contract.
 
 ### Multi-line and trim rules
 
@@ -803,6 +877,7 @@ own `TYP100–TYP149`, faces own `TYP200–TYP249`, errors own
 | `TYP071` | SIMD lane width mismatch                   | `Simd<f32, 4> + Simd<f32, 8>` or similar.                                          |
 | `TYP080` | suggestion: prefer `if let Some(u)` form   | (Note severity.) `if user.is_some()` followed by `user.method()` without narrowing.|
 | `TYP090` | endianness not specified                   | An external-data read without `_le` / `_be` suffix.                                |
+| `TYP091` | str slice crosses UTF-8 boundary           | `s[i..j]` where `i` or `j` does not sit on a code-point boundary. Runtime diagnostic, not a `trap`. |
 
 All codes are emitted using the standard envelope from
 [`diagnostics.md`](./diagnostics.md).
@@ -817,11 +892,11 @@ fn beats_to_seconds(beats: i64, bpm: i64) -> f64 {
     f64(beats) * 60.0 / f64(bpm)
 }
 
-fn sample_count(duration: Seconds, sr: Hz) -> i64 {
-    // Same-type arithmetic; no cast needed. Units-of-measure spec handles
-    // the Seconds * Hz → samples reduction.
+fn sample_count(duration: Seconds, sr: Hz) -> Samples {
+    // Seconds * Hz is dimensionless per units.md; the cast to Samples
+    // attributes the count as a sample tally.
     let raw: f64 = f64(duration) * f64(sr)
-    i64(raw)
+    Samples(i64(raw))
 }
 ```
 
@@ -907,6 +982,21 @@ fn dispatch(code: OpCode) -> Result<(), RangeError> {
   the prelude; for now, use `if b { 1i64 } else { 0i64 }`.
 - **Conditional flow-typing inside `&&` chains.** Kotlin-style
   smart casts; pending real-world demand evidence.
+- **Byte-string literals** (`b"…"`). A literal form yielding a
+  `Bytes<R>` collection (similar to Rust's `&[u8; N]`).
+  Deferred; pending a decision on whether the literal allocates
+  in the scope arena or produces a `static`-region slice.
+- **Interpolation format specs.** A `{value:fmt}` sublanguage
+  for precision, width, padding, base. Today `{value}` always
+  calls `Display::fmt`. A format-spec design would need a
+  `DisplaySpec` face (or an extra arg to `fmt`); deferred.
+- **Triple-quoted block strings** (`"""…"""`). Reserved syntax;
+  the leading-whitespace trim algorithm lands with the comptime
+  spec.
+- **`StringLit` body handle API.** The `lower` method takes a
+  `StringLitBody` whose surface (raw-text accessor,
+  interpolation list, span access for diagnostics) is sketched
+  but not finalized. Lands with `comptime.md`.
 
 ## Related specs
 
@@ -925,6 +1015,7 @@ fn dispatch(code: OpCode) -> Result<(), RangeError> {
   `TYP040`–`TYP099` codes.
 - [`memory.md`](./memory.md) — region parameters that types may
   take; the dual-heap interaction with `@send`.
-- *Forthcoming*: [`units.md`](./units.md) — the full units lattice
-  (composition, user-defined units). Until it lands, the suffix
-  table in §"Numeric literals and suffixes" is the contract.
+- [`units.md`](./units.md) — the full unit lattice: blessed
+  unit types, the prefix system (SI + IEC binary), dimensional
+  algebra, logarithmic units, `@unit` declarations, and the
+  `UNI` diagnostic band.

@@ -164,7 +164,7 @@ resampling.
 ### Rates as units
 
 Rates compose with the units-of-measure system from
-[`types.md`](./types.md):
+[`units.md`](./units.md):
 
 - `48.kHz`, `60.Hz`, `1.MHz` — standard frequencies.
 - `20.Hz` — discrete-step rates (LLM tokens, sensor polls).

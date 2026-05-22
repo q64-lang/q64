@@ -826,9 +826,6 @@ pub fn write_to_log(items: [dyn Display]) {
 
 ## Open items deferred
 
-- **`Arbitrary` face surface** — what the random-value generator
-  interface looks like, how seeding works, how shrinking is reported.
-  Lands with the test framework spec.
 - **Full dyn-safety predicate** — the exact rule for which methods make
   a face non-dyn-safe; pending the compiler's vtable layout decisions.
 - **Specialization of default methods** — whether a more-specific fit

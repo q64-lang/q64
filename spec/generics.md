@@ -200,15 +200,17 @@ In v0:
 - Arbitrary-width integers (`u3`, `u24`) — opt-in like everywhere
   else; useful for bit-width parameters.
 - **Blessed quantity types** — the unit-tagged scalars from
-  [`types.md` §"Numeric literals and suffixes"](./types.md): `Hz`,
-  `Seconds`, `Db`, `B` / `KB` / `MB` / `GB` / `TB`, `KiB` / `MiB`
-  / `GiB`, `rad`, `deg`. These are `f64`-or-`i64`-backed phantom-
-  tagged values; the const-generic equality used by
-  monomorphization is the equality on their underlying scalar.
-  Used at the type level for dataflow rates (`Signal<f32, R>`
-  where `R: Hz` — per [`streams.md`](./streams.md)) and similar
-  units-of-measure positions. The full unit lattice lands with
-  `units.md`; in the meantime, this fixed list is the contract.
+  [`units.md` §"Blessed unit types"](./units.md): `Hz`,
+  `Seconds`, `ByteCount`, `Samples`, `Db`, `Semitones`, `Cents`,
+  `rad`, `deg`. These are `f64`-or-`i64`-backed phantom-tagged
+  values; the const-generic equality used by monomorphization is
+  the equality on their underlying scalar (so `48.kHz` and
+  `48000.Hz` are the same const-generic argument). Used at the
+  type level for dataflow rates (`Signal<f32, R>` where `R: Hz`
+  — per [`streams.md`](./streams.md)) and similar units-of-
+  measure positions. User-declared units (`@unit` per
+  [`units.md`](./units.md)) inherit const-generic admissibility
+  from their base.
 - **Fixed-length arrays of the above** — `[T; N]` where `T` is
   itself a permitted const-generic type and `N` is a comptime
   integer. Used at the type level for tensor shapes:
