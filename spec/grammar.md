@@ -759,6 +759,7 @@ The codes already defined in other specs are:
 |----------|-------------|------------------------------------------------------------------|
 | `LEX020` | types.md    | unknown string-literal prefix                                    |
 | `LEX021` | types.md    | unexpected character `&` in type position                        |
+| `LEX022` | types.md    | ambiguous string-literal prefix                                  |
 | `PAR040` | generics.md | generic vs less-than ambiguity                                   |
 
 `LEX010` is reserved by this spec for "stray carriage return"
