@@ -1,0 +1,307 @@
+//! Typed AST views over the CST.
+//!
+//! Each view is a thin, allocation-free wrapper around a `*const cst.Node`
+//! that exposes the structured accessors downstream passes (typeck,
+//! codegen, `q64 show`) walk. Views skip trivia, return `?T` for
+//! optional spec positions, and never copy data.
+//!
+//! Construction is `<View>.cast(node)`: a kind check that returns
+//! `null` when the node isn't the right production. Callers
+//! pattern-match on the result.
+//!
+//! See parser/README.md §"AST views" for the design and
+//! spec/grammar.md for the productions each view corresponds to.
+
+const std = @import("std");
+const cst = @import("cst.zig");
+
+// =====================================================================
+// SourceFile
+// =====================================================================
+
+/// `SourceFile := DocComment? ImportStmt* Item*` (spec/grammar.md §"Source files and items").
+pub const SourceFile = struct {
+    cst: *const cst.Node,
+
+    pub fn cast(node: *const cst.Node) ?SourceFile {
+        if (node.kind == .SOURCE_FILE) return .{ .cst = node };
+        return null;
+    }
+
+    pub fn items(self: SourceFile) ItemIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+// =====================================================================
+// Items
+// =====================================================================
+
+/// `Item := Visibility? ItemKind`. v0 only recognizes `FnDecl`; the
+/// other item kinds land in this tagged union as their parser
+/// productions appear.
+pub const Item = union(enum) {
+    fn_decl: FnDecl,
+
+    pub fn cast(node: *const cst.Node) ?Item {
+        return switch (node.kind) {
+            .FN_DECL => .{ .fn_decl = .{ .cst = node } },
+            else => null,
+        };
+    }
+};
+
+pub const ItemIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *ItemIter) ?Item {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (Item.cast(n)) |it| {
+                    self.i += 1;
+                    return it;
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+// =====================================================================
+// FnDecl
+// =====================================================================
+
+/// `FnDecl := "fn" IDENT GenericParams? "(" Params? ")" ("->" TypeExpr)?
+///             EffectSpec? WhereClause? Block` (spec/grammar.md §"Functions").
+///
+/// v0 surfaces the four positions the parser already populates:
+/// visibility, name, params, return type, body. Generic params,
+/// effect spec, and where clause appear as the corresponding
+/// accessors land.
+pub const FnDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn cast(node: *const cst.Node) ?FnDecl {
+        if (node.kind == .FN_DECL) return .{ .cst = node };
+        return null;
+    }
+
+    pub fn visibility(self: FnDecl) ?Visibility {
+        return firstChildNode(self.cst, .VISIBILITY, Visibility);
+    }
+
+    pub fn isPublic(self: FnDecl) bool {
+        return self.visibility() != null;
+    }
+
+    /// The function's name token. `null` for ill-formed input where
+    /// the parser didn't find an `IDENT` after `fn`.
+    pub fn name(self: FnDecl) ?cst.Token {
+        var seen_fn = false;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind == .KW_FN) {
+                    seen_fn = true;
+                    continue;
+                }
+                if (!seen_fn) continue;
+                if (t.kind.isTrivia()) continue;
+                if (t.kind == .IDENT) return t;
+                return null;
+            },
+            .node => {},
+        };
+        return null;
+    }
+
+    pub fn params(self: FnDecl) ?Params {
+        return firstChildNode(self.cst, .PARAMS, Params);
+    }
+
+    pub fn returnType(self: FnDecl) ?ReturnType {
+        return firstChildNode(self.cst, .RETURN_TYPE, ReturnType);
+    }
+
+    pub fn body(self: FnDecl) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+// =====================================================================
+// Leaf views
+//
+// Thin wrappers today; structured accessors land as the corresponding
+// productions get a real parser. Keeping them as named types lets the
+// AST surface evolve without renaming call sites.
+// =====================================================================
+
+pub const Visibility = struct { cst: *const cst.Node };
+pub const Params = struct { cst: *const cst.Node };
+pub const ReturnType = struct { cst: *const cst.Node };
+pub const Block = struct { cst: *const cst.Node };
+
+// =====================================================================
+// Internal helpers
+// =====================================================================
+
+fn firstChildNode(
+    parent: *const cst.Node,
+    kind: cst.SyntaxKind,
+    comptime View: type,
+) ?View {
+    for (parent.children) |c| switch (c) {
+        .node => |n| if (n.kind == kind) return View{ .cst = n },
+        .token => {},
+    };
+    return null;
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
+
+const testing = std.testing;
+
+test "FnDecl.cast: kind check" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const not_fn = try cst.makeNode(a, .SOURCE_FILE, &.{});
+    try testing.expect(FnDecl.cast(not_fn) == null);
+
+    const fn_node = try cst.makeNode(a, .FN_DECL, &.{});
+    try testing.expect(FnDecl.cast(fn_node) != null);
+}
+
+test "FnDecl.name: simple `fn main`" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const children = [_]cst.Element{
+        cst.makeToken(.KW_FN, "fn", 0),
+        cst.makeToken(.WHITESPACE, " ", 2),
+        cst.makeToken(.IDENT, "main", 3),
+    };
+    const node = try cst.makeNode(a, .FN_DECL, &children);
+    const fn_decl = FnDecl.cast(node) orelse return error.TestExpectedNonNull;
+
+    const got = fn_decl.name() orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("main", got.text);
+}
+
+test "FnDecl.name: returns null if first non-trivia after `fn` isn't IDENT" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `fn { ... }` — no name. The parser still wraps this in FN_DECL
+    // for recovery; the view reports the missing name.
+    const children = [_]cst.Element{
+        cst.makeToken(.KW_FN, "fn", 0),
+        cst.makeToken(.WHITESPACE, " ", 2),
+        cst.makeToken(.L_BRACE, "{", 3),
+    };
+    const node = try cst.makeNode(a, .FN_DECL, &children);
+    try testing.expect(FnDecl.cast(node).?.name() == null);
+}
+
+test "FnDecl.isPublic: with and without VISIBILITY child" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const vis_children = [_]cst.Element{cst.makeToken(.KW_PUB, "pub", 0)};
+    const vis_node = try cst.makeNode(a, .VISIBILITY, &vis_children);
+
+    const with_pub = [_]cst.Element{
+        .{ .node = vis_node },
+        cst.makeToken(.WHITESPACE, " ", 3),
+        cst.makeToken(.KW_FN, "fn", 4),
+        cst.makeToken(.WHITESPACE, " ", 6),
+        cst.makeToken(.IDENT, "f", 7),
+    };
+    const with_pub_node = try cst.makeNode(a, .FN_DECL, &with_pub);
+    try testing.expect(FnDecl.cast(with_pub_node).?.isPublic());
+
+    const no_pub = [_]cst.Element{
+        cst.makeToken(.KW_FN, "fn", 0),
+        cst.makeToken(.WHITESPACE, " ", 2),
+        cst.makeToken(.IDENT, "f", 3),
+    };
+    const no_pub_node = try cst.makeNode(a, .FN_DECL, &no_pub);
+    try testing.expect(!FnDecl.cast(no_pub_node).?.isPublic());
+}
+
+test "FnDecl.params / .returnType / .body: present or absent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const params_node = try cst.makeNode(a, .PARAMS, &[_]cst.Element{
+        cst.makeToken(.L_PAREN, "(", 0),
+        cst.makeToken(.R_PAREN, ")", 1),
+    });
+    const block_node = try cst.makeNode(a, .BLOCK, &[_]cst.Element{
+        cst.makeToken(.L_BRACE, "{", 0),
+        cst.makeToken(.R_BRACE, "}", 1),
+    });
+
+    const with_all = [_]cst.Element{
+        cst.makeToken(.KW_FN, "fn", 0),
+        cst.makeToken(.IDENT, "f", 0),
+        .{ .node = params_node },
+        .{ .node = block_node },
+    };
+    const all_node = try cst.makeNode(a, .FN_DECL, &with_all);
+    const fd = FnDecl.cast(all_node).?;
+    try testing.expect(fd.params() != null);
+    try testing.expect(fd.returnType() == null);
+    try testing.expect(fd.body() != null);
+
+    const just_fn = [_]cst.Element{
+        cst.makeToken(.KW_FN, "fn", 0),
+        cst.makeToken(.IDENT, "f", 0),
+    };
+    const just_fn_node = try cst.makeNode(a, .FN_DECL, &just_fn);
+    const fd2 = FnDecl.cast(just_fn_node).?;
+    try testing.expect(fd2.params() == null);
+    try testing.expect(fd2.returnType() == null);
+    try testing.expect(fd2.body() == null);
+}
+
+test "SourceFile.items: iterates FnDecls, skips stray tokens" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fn1 = try cst.makeNode(a, .FN_DECL, &[_]cst.Element{
+        cst.makeToken(.KW_FN, "fn", 0),
+        cst.makeToken(.WHITESPACE, " ", 2),
+        cst.makeToken(.IDENT, "a", 3),
+    });
+    const fn2 = try cst.makeNode(a, .FN_DECL, &[_]cst.Element{
+        cst.makeToken(.KW_FN, "fn", 0),
+        cst.makeToken(.WHITESPACE, " ", 2),
+        cst.makeToken(.IDENT, "b", 3),
+    });
+
+    const root_children = [_]cst.Element{
+        cst.makeToken(.WHITESPACE, "  ", 0),
+        .{ .node = fn1 },
+        cst.makeToken(.NEWLINE, "\n", 2),
+        .{ .node = fn2 },
+    };
+    const root = try cst.makeNode(a, .SOURCE_FILE, &root_children);
+    const sf = SourceFile.cast(root) orelse return error.TestExpectedNonNull;
+
+    var iter = sf.items();
+    const first = iter.next() orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("a", first.fn_decl.name().?.text);
+    const second = iter.next() orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("b", second.fn_decl.name().?.text);
+    try testing.expect(iter.next() == null);
+}

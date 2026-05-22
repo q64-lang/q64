@@ -3,8 +3,12 @@
 Lexer + parser + CST + AST views. Source bytes → lossless concrete
 syntax tree → typed AST views over it.
 
-> **Status: scaffolding in progress.** `cst.zig` and `SyntaxKind`
-> land first; lexer, parser, and AST views follow.
+> **Status: end-to-end pipeline up to `fn` items.** The lexer is
+> complete; the parser recognizes the `Visibility? "fn" IDENT (Params?)
+> ("->" TypeExpr)? Block` shape and passes everything else through
+> the CST losslessly. AST views over `SourceFile` / `FnDecl` exist
+> in `ast.zig`. Remaining item productions (`struct`, `enum`, `face`,
+> `fit`, `const`, `import`) are tracked in `todo.md`.
 
 ## Scope
 
@@ -136,11 +140,11 @@ never allocate.
 
 | File           | Status          | Purpose                                                  |
 |----------------|-----------------|----------------------------------------------------------|
-| `cst.zig`      | scaffolded      | `SyntaxKind`, `Token`, `Node`, `Element`, `serialize()`. |
-| `lex.zig`      | not yet         | Bytes → token stream (trivia preserved).                 |
-| `parse.zig`    | not yet         | Tokens → CST tree.                                       |
-| `ast.zig`      | not yet         | Typed AST views over the CST.                            |
-| `diag.zig`     | not yet         | Diagnostic envelope construction (matches `diagnostics.md`). |
+| `cst.zig`      | done            | `SyntaxKind`, `Token`, `Node`, `Element`, `serialize()`. |
+| `lex.zig`      | done            | Bytes → token stream (trivia preserved).                 |
+| `parse.zig`    | partial         | Recognizes `fn` items; other items pass through tokens.  |
+| `ast.zig`      | partial         | `SourceFile`, `Item`, `FnDecl` views; more land per item.|
+| `diag.zig`     | done            | Diagnostic envelope construction (matches `diagnostics.md`). |
 
 ## External
 

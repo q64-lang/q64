@@ -61,8 +61,29 @@ component-model story stabilizes upstream.
 This section grows as we go. Each item should have a checkbox so it's
 visible at a glance whether it's been picked up.
 
-- [ ] Parser: items productions (`pub`, `fn`, `struct`, `enum`, `face`,
-      `fit`, `import`). Unblocks NAM conformance tests.
+- [ ] Parser: items productions. `pub` + `fn` landed (q64/src/parser/parse.zig);
+      `struct`, `enum`, `face`, `fit`, `const`, `import` still pending.
+      Unblocks NAM conformance tests.
+- [ ] AST views: extend `q64/src/parser/ast.zig` as each item
+      production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
+      seeded the pattern.
+- [ ] Parser: statement + expression productions inside `Block`.
+      Today blocks carry raw tokens; need `LetStmt`, `ExprStmt`,
+      `MethodExpr` (`env.out("…")`), `PathExpr`, `STR_LITERAL` to
+      structure the hello-world body. Required before codegen can
+      walk it.
+- [x] Runtime: wasmtime host that runs `hello.wat` and prints
+      "Hello, q64.\n" via the `env.out` import
+      (runtime/wasmtime/src/main.zig). v0 byte-level golden for
+      codegen.
+- [x] Codegen: vendor Binaryen + `q64/src/codegen/emit.zig` with
+      `emitHelloWasm()` that builds the hello module via the
+      Binaryen C API. End-to-end roundtrip via
+      `scripts/hello-roundtrip.sh`.
+- [ ] Codegen: graduate `emit.zig` from a hardcoded hello fixture
+      to walking an `ast.FnDecl`. Smallest next step: walk an
+      `FnDecl` whose body is `env.out("…")` and produce the same
+      wasm shape.
 - [ ] Parser: pattern + match arms. Unlocks half the remaining
       `spec/tests/` corpus.
 - [ ] Parser: full expression precedence chain from `grammar.md`.
