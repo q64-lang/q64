@@ -80,10 +80,18 @@ visible at a glance whether it's been picked up.
       `emitHelloWasm()` that builds the hello module via the
       Binaryen C API. End-to-end roundtrip via
       `scripts/hello-roundtrip.sh`.
-- [ ] Codegen: graduate `emit.zig` from a hardcoded hello fixture
-      to walking an `ast.FnDecl`. Smallest next step: walk an
-      `FnDecl` whose body is `env.out("…")` and produce the same
-      wasm shape.
+- [x] Codegen: graduate `emit.zig` from a hardcoded hello fixture
+      to walking an `ast.FnDecl`. `emit.emitFromSource` parses a
+      source file, walks `fn main`'s body, and emits a wasm module
+      with N `env.out("…")` calls laid out in linear memory.
+      `examples/hello/hello.q` + `scripts/hello-roundtrip.sh`
+      exercise the full parse → AST → codegen → runtime chain.
+- [ ] Parser: pattern + match arms (next gating item for the
+      typeck / typed-AST work).
+- [ ] Parser: binary expressions (`+`, `-`, comparison, …) and the
+      full precedence chain from `spec/grammar.md`. Current `parseExpr`
+      handles literal / path / call only and falls back to one-token
+      recovery for anything else.
 - [ ] Parser: pattern + match arms. Unlocks half the remaining
       `spec/tests/` corpus.
 - [ ] Parser: full expression precedence chain from `grammar.md`.

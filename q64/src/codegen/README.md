@@ -2,11 +2,12 @@
 
 AST → Wasm 3.0 emission. Uses the Binaryen C API.
 
-> **Status: v0 emit-hello path running.** `emit.zig` builds the
-> byte-equivalent of `runtime/wasmtime/hello.wat` via Binaryen and
-> returns the wasm bytes. End-to-end smoke test in
-> `scripts/hello-roundtrip.sh` runs:
-> `q64 emit-hello → q64-wasmtime-host → "Hello, q64."`
+> **Status: source-driven emission running.** `emit.zig` parses a
+> q64 source file, walks `fn main`, and emits a wasm module with
+> the program's `env.out("…")` calls laid out in linear memory.
+> `q64 emit <file.q> <out.wasm>` then `q64-wasmtime-host out.wasm`
+> prints the program's output. `emit.emitHelloWasm` is kept as a
+> hand-built fixture for regression testing.
 
 ## Scope
 
@@ -32,18 +33,21 @@ AST → Wasm 3.0 emission. Uses the Binaryen C API.
 
 ## Inputs / outputs
 
-- **In (today):** none — `emitHelloWasm` is a hand-built fixture.
+- **In (today):** parsed source via `emitFromSource(allocator,
+  source, file)` — finds `fn main`, walks its body, emits a wasm
+  module. Only `env.out("…")` calls are recognized; everything else
+  is `Error.UnsupportedExpression`.
 - **In (eventually):** fully-checked AST/TIR from `effect/` (the
   last semantic pass).
-- **Out:** `.wasm` bytes (`emit-hello` writes to a file). Future:
-  sidecar `.effects.json` / `.graph.json` for `qube` to consume;
-  diagnostics with `CGN*` and `LNK*` codes.
+- **Out:** `.wasm` bytes. Future: sidecar `.effects.json` /
+  `.graph.json` for `qube` to consume; diagnostics with `CGN*` and
+  `LNK*` codes.
 
 ## Files
 
 | File         | Status          | Purpose                                                   |
 |--------------|-----------------|-----------------------------------------------------------|
-| `emit.zig`   | partial         | Binaryen C-API bindings + `emitHelloWasm` fixture.        |
+| `emit.zig`   | partial         | Binaryen bindings, `emitFromSource`, `emitHelloWasm`.     |
 
 ## External
 
