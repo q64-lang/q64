@@ -29,6 +29,7 @@ pnpm preview      # serve ./dist locally
 ```
 web/
   astro.config.mjs            # Astro + Starlight + sitemap
+  wrangler.jsonc              # CF Pages project + future bindings (R2/KV/D1)
   src/
     content.config.ts         # Starlight content collection
     content/docs/
@@ -76,11 +77,12 @@ pnpm dlx wrangler pages deploy ./dist --project-name=q64-dev
 ```
 
 First-time setup: `wrangler pages project create q64-dev`.
-Don't add a `wrangler.toml`/`wrangler.jsonc` at this project's root —
-in the unified Workers+Pages build pipeline, Cloudflare will see it
-and try to run `wrangler deploy` (Worker mode) in addition to the
-Pages upload, which fails with *"you've run a Workers-specific
-command in a Pages project"*.
+
+If the build pipeline errors with *"you've run a Workers-specific
+command in a Pages project"*, check the dashboard's **Deploy command**
+field under *Settings → Builds & deployments* — leave it empty so
+Cloudflare auto-runs `wrangler pages deploy` (which reads
+`pages_build_output_dir` from `wrangler.jsonc`).
 
 ## Why in-monorepo
 
