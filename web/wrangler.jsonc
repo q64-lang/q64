@@ -1,27 +1,48 @@
-// Cloudflare Pages config for the q64.dev site.
+// Cloudflare Worker config for q64.dev.
 //
-// Picked up by `wrangler pages deploy` (CLI) and the Cloudflare
-// Pages CI/CD pipeline. Custom domains (q64.dev, www.q64.dev)
-// are attached in the Cloudflare dashboard under
-// Pages > Custom domains.
+// Workers + Static Assets model: this Worker serves the Astro static
+// build from ./dist/ via the ASSETS binding, with `run_worker_first`
+// so the Worker fetch handler sees every request (needed for the
+// www.q64.dev -> q64.dev redirect).
 //
-// Bindings (R2, KV, D1, Durable Objects, vars, secrets) for any
-// Pages Functions added under `web/functions/` go in this file —
-// stubs are commented below to make future additions obvious.
+// Scope is intentionally narrow: this Worker serves the *site*.
+// ../continuum (registry API) and ../mcp (MCP server) stay as
+// separate Workers — blast radius isolation. Cross-Worker calls
+// happen via service bindings (commented stubs below).
 //
-// If the build pipeline errors with "you've run a Workers-specific
-// command in a Pages project", check the dashboard's
-// "Deploy command" field under Settings > Builds & deployments —
-// leave it empty so CF auto-runs `wrangler pages deploy`.
+// Picked up by `wrangler deploy` (CLI) and the Workers Builds CI/CD
+// pipeline. Custom domains (q64.dev, www.q64.dev) attach via the
+// routes block below — uncomment after the zone is added in the
+// Cloudflare dashboard.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "q64-web",
+  "main": "src/worker.ts",
   "compatibility_date": "2026-01-01",
-  "pages_build_output_dir": "./dist",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "html_handling": "auto-trailing-slash",
+    "run_worker_first": ["/*"]
+  },
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  // -------- custom domains (uncomment once attached in dashboard) --------
+  // "routes": [
+  //   { "pattern": "q64.dev",     "custom_domain": true },
+  //   { "pattern": "www.q64.dev", "custom_domain": true }
+  // ],
 
   // -------- bindings (uncomment + fill in as needed) --------
 
-  // Plaintext env vars available to Pages Functions.
+  // Plaintext env vars available to the Worker.
   // "vars": {
   //   "CONTINUUM_API": "https://api.q64.dev"
   // },
@@ -41,8 +62,24 @@
   //   { "binding": "CONTINUUM_DB", "database_name": "continuum", "database_id": "<d1-id>" }
   // ],
 
-  // Service bindings — call sibling Workers from Pages Functions.
+  // Durable Objects — per-session compile state for the playground,
+  // multiplayer registry browsing, etc.
+  // "durable_objects": {
+  //   "bindings": [
+  //     { "name": "PLAYGROUND_SESSION", "class_name": "PlaygroundSession" }
+  //   ]
+  // },
+  // "migrations": [
+  //   { "tag": "v1", "new_classes": ["PlaygroundSession"] }
+  // ],
+
+  // Service bindings — call sibling Workers (../continuum, ../mcp)
+  // without crossing the public network. Zero-cost intra-CF.
   // "services": [
   //   { "binding": "CONTINUUM", "service": "continuum" }
-  // ]
+  // ],
+
+  // Workers AI — only if the site itself needs it. API surfaces
+  // belong on continuum, not here.
+  // "ai": { "binding": "AI" }
 }
