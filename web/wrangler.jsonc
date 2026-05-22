@@ -1,8 +1,48 @@
-// Cloudflare Pages config. Only `pages_build_output_dir` —
-// adding `name` or `compatibility_date` here makes the Workers
-// Builds pipeline think this is a Worker and run `wrangler deploy`
-// instead of `wrangler pages deploy`.
+// Cloudflare Pages config for the q64.dev site.
+//
+// Picked up by `wrangler pages deploy` (CLI) and the Cloudflare
+// Pages CI/CD pipeline. Custom domains (q64.dev, www.q64.dev)
+// are attached in the Cloudflare dashboard under
+// Pages > Custom domains.
+//
+// Bindings (R2, KV, D1, Durable Objects, vars, secrets) for any
+// Pages Functions added under `web/functions/` go in this file —
+// stubs are commented below to make future additions obvious.
+//
+// If the build pipeline errors with "you've run a Workers-specific
+// command in a Pages project", check the dashboard's
+// "Deploy command" field under Settings > Builds & deployments —
+// leave it empty so CF auto-runs `wrangler pages deploy`.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "pages_build_output_dir": "./dist"
+  "name": "q64-dev",
+  "compatibility_date": "2026-01-01",
+  "pages_build_output_dir": "./dist",
+
+  // -------- bindings (uncomment + fill in as needed) --------
+
+  // Plaintext env vars available to Pages Functions.
+  // "vars": {
+  //   "CONTINUUM_API": "https://api.q64.dev"
+  // },
+
+  // R2 buckets — qube tarballs, brand assets, etc.
+  // "r2_buckets": [
+  //   { "binding": "QUBE_TARBALLS", "bucket_name": "q64-qubes" }
+  // ],
+
+  // KV namespaces — short-TTL caches, feature flags.
+  // "kv_namespaces": [
+  //   { "binding": "CACHE", "id": "<kv-id>" }
+  // ],
+
+  // D1 databases — registry metadata (pairs with ../continuum).
+  // "d1_databases": [
+  //   { "binding": "CONTINUUM_DB", "database_name": "continuum", "database_id": "<d1-id>" }
+  // ],
+
+  // Service bindings — call sibling Workers from Pages Functions.
+  // "services": [
+  //   { "binding": "CONTINUUM", "service": "continuum" }
+  // ]
 }
