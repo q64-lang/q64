@@ -1,0 +1,3 @@
+# Cloudflare Pages redirects
+# Force the apex domain: www.q64.dev -> q64.dev
+https://www.q64.dev/* https://q64.dev/:splat 301!
