@@ -58,4 +58,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_step.dependOn(&b.addRunArtifact(parse_tests).step);
+
+    const ast_tests = b.addTest(.{
+        .root_source_file = b.path("src/parser/ast.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_step.dependOn(&b.addRunArtifact(ast_tests).step);
 }

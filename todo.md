@@ -61,8 +61,12 @@ component-model story stabilizes upstream.
 This section grows as we go. Each item should have a checkbox so it's
 visible at a glance whether it's been picked up.
 
-- [ ] Parser: items productions (`pub`, `fn`, `struct`, `enum`, `face`,
-      `fit`, `import`). Unblocks NAM conformance tests.
+- [ ] Parser: items productions. `pub` + `fn` landed (q64/src/parser/parse.zig);
+      `struct`, `enum`, `face`, `fit`, `const`, `import` still pending.
+      Unblocks NAM conformance tests.
+- [ ] AST views: extend `q64/src/parser/ast.zig` as each item
+      production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
+      seeded the pattern.
 - [ ] Parser: pattern + match arms. Unlocks half the remaining
       `spec/tests/` corpus.
 - [ ] Parser: full expression precedence chain from `grammar.md`.
