@@ -15,7 +15,7 @@
 // leave it empty so CF auto-runs `wrangler pages deploy`.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "q64-dev",
+  "name": "q64-web",
   "compatibility_date": "2026-01-01",
   "pages_build_output_dir": "./dist",
 

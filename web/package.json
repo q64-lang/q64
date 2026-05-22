@@ -9,7 +9,7 @@
     "preview": "astro preview",
     "check": "astro check",
     "astro": "astro",
-    "deploy": "astro build && wrangler pages deploy ./dist --project-name=q64-dev"
+    "deploy": "astro build && wrangler pages deploy ./dist --project-name=q64-web"
   },
   "dependencies": {
     "@astrojs/sitemap": "^3.2.1",
