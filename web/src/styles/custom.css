@@ -1,0 +1,19 @@
+/* Brand accents — sourced from public/brand/tokens.json5 */
+:root {
+  --sl-color-accent: #CBA6FF;        /* violet — primary brand accent */
+  --sl-color-accent-low: #2a1f3d;
+  --sl-color-accent-high: #e9d8ff;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent: #6d3ec9;
+  --sl-color-accent-low: #ece0ff;
+  --sl-color-accent-high: #2a1f3d;
+}
+
+/* Splash hero image — keep it round-ish and capped */
+.hero img {
+  max-width: min(100%, 420px);
+  height: auto;
+  border-radius: 1rem;
+}

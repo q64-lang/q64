@@ -3,46 +3,94 @@
 The q64.dev site: marketing landing, language docs, registry browser, and
 the in-browser q64 playground.
 
-> **Status: not yet implemented.**
+> **Status: scaffolded.** Landing + docs shell + Cloudflare Pages deploy
+> are wired up. Registry UI and playground are not yet implemented.
 
 ## Stack
 
-- **Astro** — site framework. Static-first with islands for interactive bits.
+- **Astro 5** — site framework. Static-first with islands for interactive bits.
 - **Starlight** — Astro's documentation theme. Runs the docs (sidebar,
-  search, dark mode, prev/next navigation).
+  search, dark mode, prev/next navigation) and the splash landing page.
 - **Cloudflare Pages** — deployment. Pairs with the
   [`../continuum`](../continuum) Workers backend on the same Cloudflare
   account.
 
-## Layout (planned)
+## Develop
+
+```sh
+pnpm install
+pnpm dev          # http://localhost:4321
+pnpm build        # outputs to ./dist
+pnpm preview      # serve ./dist locally
+```
+
+## Layout
 
 ```
 web/
-  astro.config.mjs
+  astro.config.mjs            # Astro + Starlight + sitemap
+  wrangler.jsonc              # Cloudflare Pages project config
   src/
-    pages/
-      index.astro              # marketing landing (not Starlight)
-      playground.astro         # in-browser compiler
-      registry/                # qube browser (talks to continuum)
-    content/
-      docs/                    # Starlight-managed; sourced from ../docs/
+    content.config.ts         # Starlight content collection
+    content/docs/
+      index.mdx               # splash landing (template: splash)
+      welcome.md              # placeholder doc
+    components/
+      Footer.astro            # adds legal/contact line under Starlight footer
+    styles/custom.css         # brand accents (violet)
+    pages/                    # (planned) playground.astro, registry/
   public/
-    q64.wasm                   # built from ../q64/ for the playground
-    brand/                     # logo marks, brand sheet, color palette, mascot
+    _headers                  # CF Pages response headers
+    _redirects                # www.q64.dev -> q64.dev (apex)
+    robots.txt
+    brand/                    # logo marks, brand sheet, mascot, tokens
+      hero.png                # (drop this in — used by the homepage)
 ```
 
-## Brand
+The homepage references `/brand/hero.png`. Drop the hero artwork in
+`public/brand/hero.png` and it picks up automatically; everything else
+about the page renders fine without it.
 
-[`public/brand/`](./public/brand) holds the logo marks, the
-brand sheet, the color palette, and the mascot concept.
-`public/brand/tokens.json5` is the machine-readable source of
-truth for colors and naming — read by `src/styles/` and the q64
-CLI splash. See [`public/brand/README.md`](./public/brand/README.md)
-for the asset inventory and what's missing.
+## Deploy to Cloudflare Pages
+
+The site is a static Astro build, so Cloudflare Pages serves
+`./dist/` directly. Two ways:
+
+### Option 1 — Git integration (recommended)
+
+1. In the Cloudflare dashboard: **Workers & Pages** → **Create** →
+   **Pages** → connect this repo.
+2. Build settings:
+   - **Framework preset**: Astro
+   - **Root directory**: `web`
+   - **Build command**: `pnpm install --frozen-lockfile && pnpm build`
+   - **Build output directory**: `dist`
+   - **Environment variables**: `NODE_VERSION=22`
+3. Under **Custom domains**, add `q64.dev` and `www.q64.dev`. The
+   `_redirects` in this project forces `www` → apex.
+
+### Option 2 — Direct `wrangler` deploy
+
+```sh
+pnpm build
+pnpm dlx wrangler pages deploy ./dist --project-name=q64-dev
+```
+
+`wrangler.jsonc` already declares `pages_build_output_dir: "./dist"`,
+so `wrangler pages deploy` works without extra flags once the project
+exists. First-time setup: `wrangler pages project create q64-dev`.
 
 ## Why in-monorepo
 
-The playground depends on a specific wasm build of [`../q64/`](../q64). A
-language change and its playground update need to ship in one commit, and
-docs updates often follow CLI changes in the same PR. Same-repo lockstep
-is cleaner than cross-repo coordination.
+The playground (planned) depends on a specific wasm build of
+[`../q64/`](../q64). A language change and its playground update need to
+ship in one commit, and docs updates often follow CLI changes in the
+same PR. Same-repo lockstep is cleaner than cross-repo coordination.
+
+## Brand
+
+[`public/brand/`](./public/brand) holds the logo marks, the brand sheet,
+the color palette, and the mascot concept.
+`public/brand/tokens.json5` is the machine-readable source of truth for
+colors and naming. See [`public/brand/README.md`](./public/brand/README.md)
+for the asset inventory and what's still missing.
