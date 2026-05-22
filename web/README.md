@@ -73,10 +73,10 @@ The site is a static Astro build, so Cloudflare Pages serves
 
 ```sh
 pnpm build
-pnpm dlx wrangler pages deploy ./dist --project-name=q64-dev
+pnpm dlx wrangler pages deploy ./dist --project-name=q64-web
 ```
 
-First-time setup: `wrangler pages project create q64-dev`.
+First-time setup: `wrangler pages project create q64-web`.
 
 If the build pipeline errors with *"you've run a Workers-specific
 command in a Pages project"*, check the dashboard's **Deploy command**
