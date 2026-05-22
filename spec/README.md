@@ -23,6 +23,7 @@ suite.
 | [`effects.md`](./effects.md)                             | Effect markers, implication graph, propagation, capability disclosure |
 | [`generics.md`](./generics.md)                           | Type / const / region / effect parameters, bounds, where, defaults, inference |
 | [`types.md`](./types.md)                                 | Numeric tower, bool, arb-width ints, parameter modes, optional narrowing |
+| [`units.md`](./units.md)                                 | Unit lattice: blessed unit types, prefixes, dimensional algebra, logarithmic units, `@unit` |
 | [`memory.md`](./memory.md)                               | Regions, dual heap, transfers, multi-memory layout, shared / managed annotations |
 | [`concurrency.md`](./concurrency.md)                     | Scopes, tasks, channels, select, actors, cancellation, panics, host translation |
 | [`streams.md`](./streams.md)                             | Signal / Event / Stream, @stage, graph, |>, pre(), fusion, SharedSignal          |

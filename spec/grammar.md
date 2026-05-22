@@ -881,7 +881,7 @@ here so a reader of this spec can see exactly what is **not** pinned.
 4. **Operator overloading on units.** This is a semantic concern, not
    a grammar one; the operator tokens are spelled here, but which
    types may declare fits for them (`Hz + Hz`, `Hz * Seconds`, …)
-   lives with the forthcoming `units.md` spec.
+   lives with [`units.md`](./units.md) §"Dimensional algebra".
 
 Additional grammar-shaped items inherited from other specs:
 
