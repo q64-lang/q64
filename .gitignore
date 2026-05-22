@@ -6,6 +6,7 @@ zig-cache/
 # Pinned toolchain + runtime libs installed by init.sh
 vendor/zig/
 vendor/wasmtime/
+vendor/binaryen/
 
 # Node / Astro / web tooling
 node_modules/

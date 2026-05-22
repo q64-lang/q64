@@ -7,6 +7,8 @@
 #   - the wasmtime C API (vendor/wasmtime/) — used by
 #     runtime/wasmtime/ to embed wasm modules and provide q64's
 #     capability-face imports (env.out, …).
+#   - Binaryen (vendor/binaryen/) — used by q64/src/codegen/ to
+#     assemble Wasm modules from the typed AST.
 #
 # Re-runnable; skips work that's already done. Run from the repo root:
 #
@@ -34,6 +36,10 @@ ZIG_INDEX_URL="https://ziglang.org/download/index.json"
 WASMTIME_VERSION="${WASMTIME_VERSION:-45.0.0}"
 WASMTIME_DEST="vendor/wasmtime"
 WASMTIME_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/download"
+
+BINARYEN_VERSION="${BINARYEN_VERSION:-129}"
+BINARYEN_DEST="vendor/binaryen"
+BINARYEN_RELEASE_BASE="https://github.com/WebAssembly/binaryen/releases/download"
 
 cd "$(dirname "$0")"
 
@@ -235,8 +241,70 @@ install_wasmtime() {
     echo "init.sh: wasmtime $WASMTIME_VERSION installed at $WASMTIME_DEST"
 }
 
+# =====================================================================
+# Binaryen (Wasm assembler / optimizer; C API for codegen)
+# =====================================================================
+#
+# Binaryen ships a single static archive plus headers per release.
+# The tarball naming is binaryen-version_<N>-<arch>-<os>.tar.gz.
+
+BINARYEN_KNOWN_SHA256_x86_64_linux="50b9fa62b9abea752da92ec57e0c555fee578760cd237c40107957715d2976ba"
+
+install_binaryen() {
+    if [ -f "$BINARYEN_DEST/lib/libbinaryen.a" ] && \
+       [ "$(cat "$BINARYEN_DEST/VERSION" 2>/dev/null)" = "$BINARYEN_VERSION" ]; then
+        echo "init.sh: binaryen $BINARYEN_VERSION already installed at $BINARYEN_DEST"
+        return
+    fi
+
+    local tarball="binaryen-version_${BINARYEN_VERSION}-${arch}-${os}.tar.gz"
+    local url="${BINARYEN_RELEASE_BASE}/version_${BINARYEN_VERSION}/${tarball}"
+
+    local key="BINARYEN_KNOWN_SHA256_${arch}_${os}"
+    local expected_sha="${BINARYEN_SHA256:-${!key:-}}"
+    if [ -z "$expected_sha" ]; then
+        echo "init.sh: no pinned sha256 for binaryen ${BINARYEN_VERSION} on ${arch}-${os}." >&2
+        echo "        Re-run with BINARYEN_SHA256=<sha> (or =skip to bypass verification)." >&2
+        exit 1
+    fi
+
+    echo "init.sh: downloading $url"
+    curl -fsSL "$url" -o "$tmpdir/$tarball"
+
+    if [ "$expected_sha" != "skip" ]; then
+        local actual_sha
+        actual_sha="$("${sha256_cmd[@]}" "$tmpdir/$tarball" | awk '{print $1}')"
+        if [ "$actual_sha" != "$expected_sha" ]; then
+            echo "init.sh: binaryen sha256 mismatch:" >&2
+            echo "  expected: $expected_sha" >&2
+            echo "  got:      $actual_sha" >&2
+            exit 1
+        fi
+        echo "init.sh: binaryen sha256 verified ($actual_sha)"
+    else
+        echo "init.sh: skipping binaryen sha256 verification (BINARYEN_SHA256=skip)"
+    fi
+
+    echo "init.sh: extracting to $BINARYEN_DEST"
+    mkdir -p "$(dirname "$BINARYEN_DEST")"
+    tar -xzf "$tmpdir/$tarball" -C "$tmpdir"
+
+    local extracted_dir="$tmpdir/binaryen-version_${BINARYEN_VERSION}"
+    if [ ! -d "$extracted_dir" ]; then
+        echo "init.sh: unexpected tarball layout — no $extracted_dir after extract" >&2
+        exit 1
+    fi
+
+    rm -rf "$BINARYEN_DEST"
+    mv "$extracted_dir" "$BINARYEN_DEST"
+    echo "$BINARYEN_VERSION" > "$BINARYEN_DEST/VERSION"
+
+    echo "init.sh: binaryen $BINARYEN_VERSION installed at $BINARYEN_DEST"
+}
+
 install_zig
 install_wasmtime
+install_binaryen
 
 echo
 echo "Add zig to PATH for this shell:"

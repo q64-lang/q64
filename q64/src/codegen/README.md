@@ -2,7 +2,11 @@
 
 AST → Wasm 3.0 emission. Uses the Binaryen C API.
 
-> **Status: not yet implemented.**
+> **Status: v0 emit-hello path running.** `emit.zig` builds the
+> byte-equivalent of `runtime/wasmtime/hello.wat` via Binaryen and
+> returns the wasm bytes. End-to-end smoke test in
+> `scripts/hello-roundtrip.sh` runs:
+> `q64 emit-hello → q64-wasmtime-host → "Hello, q64."`
 
 ## Scope
 
@@ -23,19 +27,31 @@ AST → Wasm 3.0 emission. Uses the Binaryen C API.
 **Does not own:**
 - Type checking, region analysis, effect propagation — already done
   upstream.
-- Host glue — `runtime/<host>/` provides the JS / Zig adapter that
+- Host glue — `runtime/<host>/` provides the Zig adapter that
   imports into the emitted wasm.
 
 ## Inputs / outputs
 
-- **In:** fully-checked AST/TIR from `effect/` (which is the last
-  semantic pass).
-- **Out:** `.wasm` artifact + sidecar `.effects.json` / `.graph.json`
-  for `qube` to consume; diagnostics with `CGN*` and `LNK*` codes.
+- **In (today):** none — `emitHelloWasm` is a hand-built fixture.
+- **In (eventually):** fully-checked AST/TIR from `effect/` (the
+  last semantic pass).
+- **Out:** `.wasm` bytes (`emit-hello` writes to a file). Future:
+  sidecar `.effects.json` / `.graph.json` for `qube` to consume;
+  diagnostics with `CGN*` and `LNK*` codes.
+
+## Files
+
+| File         | Status          | Purpose                                                   |
+|--------------|-----------------|-----------------------------------------------------------|
+| `emit.zig`   | partial         | Binaryen C-API bindings + `emitHelloWasm` fixture.        |
 
 ## External
 
-- **Binaryen** — Wasm 3.0 backend, called via its C API. Vendored in
-  `../../vendor/binaryen/`. Alternative MLIR-Wasm dialect path is
-  noted in [`design.md`](https://github.com/q64-lang/design/blob/main/design.md)
-  §"Compilation Pipeline" but not pursued in v0.
+- **Binaryen** — Wasm 3.0 backend, called via its C API. Vendored
+  at `../../vendor/binaryen/` by `init.sh` (pinned version 129 with
+  sha256 verification). Static-linked into the `q64` binary.
+
+Binaryen ships only a static archive on Linux, built against
+libstdc++ (gcc CI). The build script pulls in `libstdc++.so.6`
+and `libgcc_s.so.1` from the system to satisfy the C++ runtime
+and unwinder symbols.

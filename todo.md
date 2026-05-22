@@ -76,10 +76,14 @@ visible at a glance whether it's been picked up.
       "Hello, q64.\n" via the `env.out` import
       (runtime/wasmtime/src/main.zig). v0 byte-level golden for
       codegen.
-- [ ] Codegen: vendor Binaryen + stub `q64/src/codegen/emit.zig`
-      that produces a `.wasm` byte-equivalent to `hello.wat` from a
-      hand-built AST. Bridges the gap between the parser/AST and
-      the runtime adapter.
+- [x] Codegen: vendor Binaryen + `q64/src/codegen/emit.zig` with
+      `emitHelloWasm()` that builds the hello module via the
+      Binaryen C API. End-to-end roundtrip via
+      `scripts/hello-roundtrip.sh`.
+- [ ] Codegen: graduate `emit.zig` from a hardcoded hello fixture
+      to walking an `ast.FnDecl`. Smallest next step: walk an
+      `FnDecl` whose body is `env.out("…")` and produce the same
+      wasm shape.
 - [ ] Parser: pattern + match arms. Unlocks half the remaining
       `spec/tests/` corpus.
 - [ ] Parser: full expression precedence chain from `grammar.md`.

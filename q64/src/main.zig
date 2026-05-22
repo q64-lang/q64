@@ -8,6 +8,7 @@
 const std = @import("std");
 const parse = @import("parser/parse.zig");
 const diag = @import("parser/diag.zig");
+const emit = @import("codegen/emit.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -27,6 +28,11 @@ pub fn main() !void {
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "emit-hello")) {
+        try cmdEmitHello(allocator, args[2..]);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "--version")) {
         try std.io.getStdOut().writer().writeAll("q64 0.0.1 (pre-alpha)\n");
         return;
@@ -43,6 +49,7 @@ fn usage() !void {
         \\
         \\Commands:
         \\  check <file> [--diagnostics json]  Parse a single file and emit diagnostics.
+        \\  emit-hello <out.wasm>              Emit the hello-world wasm module via codegen.
         \\  --version                          Print the version and exit.
         \\
     );
@@ -107,4 +114,23 @@ fn cmdCheck(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     if (has_error) std.process.exit(1);
+}
+
+fn cmdEmitHello(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len != 1) {
+        try usage();
+        std.process.exit(2);
+    }
+    const out_path = args[0];
+
+    const bytes = try emit.emitHelloWasm(allocator);
+    defer allocator.free(bytes);
+
+    const file = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch |err| {
+        const w = std.io.getStdErr().writer();
+        try w.print("q64: cannot write {s}: {s}\n", .{ out_path, @errorName(err) });
+        std.process.exit(2);
+    };
+    defer file.close();
+    try file.writeAll(bytes);
 }
