@@ -18,8 +18,8 @@ errors uniformly.
   a diagnostic to deliver.
 - When `qube` invokes `q64` as a subprocess, it **forwards `q64`'s
   envelopes verbatim** rather than wrapping them; the consumer
-  parses one stream of `NAM* / TYP* / UNI* / REG* / EFF* / STR* /
-  CONC* / ENV*` envelopes from `q64` plus `qube`'s own `PKG* / REG2*`
+  parses one stream of `NAM* / TYP* / UNI* / ANN* / REG* / EFF* /
+  STR* / CONC* / ENV*` envelopes from `q64` plus `qube`'s own `PKG* / REG2*`
   envelopes (manifest validation, registry, resolver) in the same
   format. `q64` flushes stderr after every envelope so downstream
   parsers can react incrementally; this is the only flush
@@ -130,6 +130,7 @@ reader which subsystem raised it:
 | `NAM`   | Name resolution                                 |
 | `TYP`   | Type checking                                   |
 | `UNI`   | Units of measure                                |
+| `ANN`   | Annotations (`@`-form catalog)                  |
 | `REG`   | Region / lifetime analysis                      |
 | `EFF`   | Effect analysis                                 |
 | `STR`   | Stream graph analysis                           |
@@ -246,10 +247,9 @@ Restrictions:
   actually emit is `FMT062` (warning; redundant-allow).
 
 The full annotation surface (`@allow`, `@test`, `@derive`,
-`@kind`, …) is sketched across the spec files where each is
-used; the unified `annotations.md` spec listed in
-[`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md) will
-formalize the grammar, scoping, and per-annotation rules.
+`@kind`, …) is consolidated in [`annotations.md`](./annotations.md);
+this file owns only `@allow` itself and the `FMT06x` codes for
+its misuse.
 
 ## Compatibility
 

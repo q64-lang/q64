@@ -66,7 +66,7 @@ visible at a glance whether it's been picked up.
 - [ ] Parser: pattern + match arms. Unlocks half the remaining
       `spec/tests/` corpus.
 - [ ] Parser: full expression precedence chain from `grammar.md`.
-- [ ] `spec/annotations.md` — categorize `@`-forms (markers / derive /
+- [x] `spec/annotations.md` — categorize `@`-forms (markers / derive /
       property wrappers). Smallest scope, highest cross-reference value.
 - [x] `spec/units.md` — drain the unit-suffix table out of `types.md`
       into a real lattice spec.

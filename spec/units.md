@@ -304,9 +304,10 @@ The form is `@unit Name : BlessedType`. The declared unit:
 - Cannot inherit from a composite (`@unit Bandwidth :
   Bytes/Seconds`) in v0. A v1 revision may relax this.
 
-`@unit` is a marker per [`effects.md` §"Other markers"](./effects.md);
-its categorization will be picked up by the forthcoming
-`annotations.md` spec.
+`@unit` is a category-2 declaration marker per
+[`annotations.md` §"Annotation categories"](./annotations.md) —
+it introduces a new nominal type rather than annotating an
+existing item.
 
 ## Interaction with `@kind`
 
@@ -433,8 +434,7 @@ let bad                        = lowpass(    // ❌ STR021 from streams.md
 - [`streams.md`](./streams.md) — rates as units in
   `Signal<T, R>` / `Stream<T, R>` and the rate-mismatch
   diagnostics (`STR021`).
-- [`effects.md`](./effects.md) — `@unit` is a marker; the
-  classification of `@`-forms is finalized in the forthcoming
-  `annotations.md`.
+- [`annotations.md`](./annotations.md) — the `@`-form catalog;
+  `@unit` is a category-2 declaration marker.
 - [`diagnostics.md`](./diagnostics.md) — envelope format for the
   `UNI` code band.
