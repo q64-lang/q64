@@ -44,7 +44,7 @@ compose live here.
 |---------------|---------------------------------------------------------------------------------------------------------------|
 | **dimension** | An equivalence class of units that measure the same physical quantity (time, frequency, information, angle). |
 | **base unit** | The canonical representative of a dimension (`s` for time, `Hz` for frequency, `byte` for information).      |
-| **unit type** | A PascalCase Zig-style type name standing for a dimension: `Seconds`, `Hz`, `Bytes`, `rad`.                  |
+| **unit type** | A PascalCase Zig-style type name standing for a dimension: `Seconds`, `Hz`, `ByteCount`, `rad`.              |
 | **suffix**    | The identifier after the dot in `48.kHz`. Names either a unit type, a prefixed unit, or a plain numeric type.|
 | **prefix**    | A scale factor attached to a base unit name (`k` in `kHz`, `Ki` in `KiB`). Decimal or binary.                |
 | **scalar**    | The underlying `f64` or `i64` value carried by a unit-tagged quantity.                                       |
@@ -80,7 +80,7 @@ literal suffix that produces them may differ (`-6.dB` produces a
 |-------------|---------------|-----------------------------------------------------------------------|
 | `Seconds`   | Time          | Backing `f64`. `Duration` is **not** a separate type in v0.           |
 | `Hz`        | Frequency     | Backing `f64`. Inverse of `Seconds`.                                  |
-| `Bytes`     | Information   | Backing `i64`. Integer; fractional bytes are a type error.            |
+| `ByteCount` | Information   | Backing `i64`. Integer count of bytes; fractional bytes are a type error. Distinct from the `Bytes<R>` collection in [`memory.md`](./memory.md), which is the byte-buffer type. |
 | `Samples`   | Sample count  | Backing `i64`. Used by audio and tensor-window code.                  |
 | `rad`       | Angle         | Backing `f64`. Lowercase by convention; matches the SI symbol.        |
 | `deg`       | Angle         | Backing `f64`. Same dimension as `rad`; conversion is implicit (free).|
@@ -111,9 +111,9 @@ table is the resolution policy.
 | `s`                 | `Seconds` | value                                     |
 | `min`               | `Seconds` | value × 60                                |
 | `h`                 | `Seconds` | value × 3600                              |
-| `B`                 | `Bytes` | value                                       |
-| `KB`, `MB`, `GB`, `TB` | `Bytes` | value × 10³ⁿ (decimal multipliers)       |
-| `KiB`, `MiB`, `GiB`, `TiB` | `Bytes` | value × 2¹⁰ⁿ (binary multipliers)    |
+| `B`                 | `ByteCount` | value                                       |
+| `KB`, `MB`, `GB`, `TB` | `ByteCount` | value × 10³ⁿ (decimal multipliers)       |
+| `KiB`, `MiB`, `GiB`, `TiB` | `ByteCount` | value × 2¹⁰ⁿ (binary multipliers)    |
 | `sample`, `samples` | `Samples` | value (both spellings accepted)           |
 | `rad`               | `rad`   | value                                       |
 | `deg`               | `deg`   | value                                       |
@@ -122,7 +122,7 @@ table is the resolution policy.
 | `ct`                | `Cents` | value                                       |
 
 `48.kHz` evaluates to a `Hz` value whose underlying scalar is
-`48000.0`. `1.KiB` evaluates to a `Bytes` value whose scalar is
+`48000.0`. `1.KiB` evaluates to a `ByteCount` value whose scalar is
 `1024`. The const-generic equality used by monomorphization is
 the equality on those scalars: `48.kHz == 48000.Hz` is true,
 including in `Signal<f32, 48.kHz>` vs. `Signal<f32, 48000.Hz>`.
@@ -161,8 +161,8 @@ is `UNI010`.
 | Operation          | Rule                                                                    |
 |--------------------|-------------------------------------------------------------------------|
 | `a + b`, `a - b`   | Same unit type required. Yields the same unit type.                     |
-| `a * b`            | Dimensions multiply. `Hz * Seconds → dimensionless`. `Bytes / Seconds → Bytes/Seconds` (a composite). |
-| `a / b`            | Dimensions subtract. `Bytes / Seconds → Bytes/Seconds`. `Seconds / Seconds → dimensionless`. |
+| `a * b`            | Dimensions multiply. `Hz * Seconds → dimensionless`. `ByteCount / Seconds → ByteCount/Seconds` (a composite). |
+| `a / b`            | Dimensions subtract. `ByteCount / Seconds → ByteCount/Seconds`. `Seconds / Seconds → dimensionless`. |
 | `a * k` (`k` plain)| Scalar multiplication. Yields the same unit as `a`.                     |
 | `-a`               | Yields the same unit as `a`.                                            |
 | `a < b`, `a == b`  | Same unit type required. Yields `bool`.                                 |
@@ -173,7 +173,7 @@ composite unit type. Composite types are spelled with `*` and
 `/` in type position:
 
 ```q64
-let rate: Bytes/Seconds = 1.MB.per.s
+let rate: ByteCount/Seconds = 1.MB.per.s
 let area: Seconds*Seconds = (2.s) * (3.s)
 ```
 
@@ -243,11 +243,11 @@ common path the wrong path would lose more bugs than it caught.
 
 The `per` chainable in stdlib builds composite rate types from a
 literal-tagged base. `1.MB.per.s` parses as the literal `1` with
-suffix `MB` (yielding `Bytes`), followed by `.per.s` — a method
-chain that lifts the `Bytes` value into a `Bytes/Seconds` rate.
+suffix `MB` (yielding `ByteCount`), followed by `.per.s` — a method
+chain that lifts the `ByteCount` value into a `ByteCount/Seconds` rate.
 
 ```q64
-let bandwidth: Bytes/Seconds = 1.MB.per.s
+let bandwidth: ByteCount/Seconds = 1.MB.per.s
 let throughput: Samples/Seconds = 48000.samples.per.s
 ```
 
@@ -255,7 +255,7 @@ The composite type may also be written directly in a signature:
 
 ```q64
 fn open_socket(addr: SocketAddr) -> Result<Socket, NetError>
-    where Socket: Stream<Bytes, Bytes/Seconds>
+    where Socket: Stream<Bytes, ByteCount/Seconds>
 ```
 
 In dataflow positions, the same form participates in stream-rate
@@ -302,7 +302,7 @@ The form is `@unit Name : BlessedType`. The declared unit:
   a `Frames` value uses `Frames(n)` or `n.cast<Frames>()`. The
   suffix table is closed.
 - Cannot inherit from a composite (`@unit Bandwidth :
-  Bytes/Seconds`) in v0. A v1 revision may relax this.
+  ByteCount/Seconds`) in v0. A v1 revision may relax this.
 
 `@unit` is a category-2 declaration marker per
 [`annotations.md` §"Annotation categories"](./annotations.md) —
@@ -341,7 +341,7 @@ Numbers are stable, never reused.
 | `UNI012` | composite unit not declarable                | A `@unit` declaration whose right-hand side is a composite type (v0 restriction). |
 | `UNI020` | invalid logarithmic-unit operation           | `a * b` where both are logarithmic; product of two `Db` values is meaningless.    |
 | `UNI021` | logarithmic unit mixed with plain numeric    | `(-6.dB) + 1` — no implicit interpretation as linear gain.                        |
-| `UNI030` | binary prefix used outside `Bytes`           | `5.KiHz` — binary prefixes are only valid on the `B` base.                        |
+| `UNI030` | binary prefix used outside `ByteCount`       | `5.KiHz` — binary prefixes are only valid on the `B` base.                        |
 | `UNI031` | decimal-byte prefix uses wrong case          | `1.kB` or `1.mb` — the decimal byte family is uppercase (`KB`, `MB`).             |
 | `UNI040` | rate composite missing time unit             | A `Quantity/Quantity` used in a rate position where the denominator must be time. |
 
@@ -359,12 +359,12 @@ let bad           = dur + rate           // ❌ UNI010 — Seconds + Hz
 let samples       = dur * rate           // ✅ dimensionless ≈ 2400.0
 ```
 
-### Bytes, decimal vs. binary
+### Byte counts, decimal vs. binary
 
 ```q64
-let download: Bytes        = 1.GB         // 1_000_000_000
-let memory:   Bytes        = 1.GiB        // 1_073_741_824
-let bandwidth: Bytes/Seconds = download.per.s
+let download: ByteCount        = 1.GB         // 1_000_000_000
+let memory:   ByteCount        = 1.GiB        // 1_073_741_824
+let bandwidth: ByteCount/Seconds = download.per.s
 ```
 
 ### Logarithmic gain
@@ -407,11 +407,12 @@ let bad                        = lowpass(    // ❌ STR021 from streams.md
 - **Submultiple prefixes on bytes** (`mB`, `uB`). Currently not
   meaningful; deferred until a use case arrives.
 - **Composite `@unit` declarations.** `@unit Bandwidth :
-  Bytes/Seconds` would let stdlib name composites. Pending the
-  decision on how composite types render in diagnostics.
-- **Per-unit display policy.** Whether a `Bytes` value prints as
-  `1.GB` or `1000.MB` or `1_000_000_000.B` is a formatter
-  question; `fmt.md` (not yet written) is the eventual home.
+  ByteCount/Seconds` would let stdlib name composites. Pending
+  the decision on how composite types render in diagnostics.
+- **Per-unit display policy.** Whether a `ByteCount` value
+  prints as `1.GB` or `1000.MB` or `1_000_000_000.B` is a
+  formatter question; `fmt.md` (not yet written) is the
+  eventual home.
 - **Unit-aware tensor shapes.** Shape entries that carry a unit
   (`Tensor<f32, [N.samples, C]>`) work today via the const-
   generic machinery; a tighter spec for "shape arithmetic
@@ -420,8 +421,8 @@ let bad                        = lowpass(    // ❌ STR021 from streams.md
   tempo, and the conversion thereof. Music-DSP-flavored;
   belongs in a stdlib spec rather than core.
 - **External-data unit annotations.** Parsing `1MB` (no dot)
-  from a config file into `Bytes`. A `qube.json5` extension, not
-  a language change.
+  from a config file into `ByteCount`. A `qube.json5` extension,
+  not a language change.
 
 ## Related specs
 

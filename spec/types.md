@@ -983,16 +983,9 @@ fn dispatch(code: OpCode) -> Result<(), RangeError> {
 - **Conditional flow-typing inside `&&` chains.** Kotlin-style
   smart casts; pending real-world demand evidence.
 - **Byte-string literals** (`b"…"`). A literal form yielding a
-  byte buffer (similar to Rust's `&[u8; N]`). Deferred until
-  the `Bytes` name collision (see next item) is resolved.
-- **`Bytes` name collision.** The auto-prelude collection
-  `Bytes<R>` (per [`memory.md`](./memory.md) §"Region
-  parameters in types") shares its name with the
-  [`units.md`](./units.md) unit type for the Information
-  dimension. The two coexist syntactically (the collection
-  always carries a region parameter, the unit never does), but
-  the overload is confusing. A rename of one — likely the unit
-  to `ByteCount`, or the collection to `ByteBuf` — is open.
+  `Bytes<R>` collection (similar to Rust's `&[u8; N]`).
+  Deferred; pending a decision on whether the literal allocates
+  in the scope arena or produces a `static`-region slice.
 - **Interpolation format specs.** A `{value:fmt}` sublanguage
   for precision, width, padding, base. Today `{value}` always
   calls `Display::fmt`. A format-spec design would need a

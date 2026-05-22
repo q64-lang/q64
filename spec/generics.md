@@ -201,7 +201,7 @@ In v0:
   else; useful for bit-width parameters.
 - **Blessed quantity types** — the unit-tagged scalars from
   [`units.md` §"Blessed unit types"](./units.md): `Hz`,
-  `Seconds`, `Bytes`, `Samples`, `Db`, `Semitones`, `Cents`,
+  `Seconds`, `ByteCount`, `Samples`, `Db`, `Semitones`, `Cents`,
   `rad`, `deg`. These are `f64`-or-`i64`-backed phantom-tagged
   values; the const-generic equality used by monomorphization is
   the equality on their underlying scalar (so `48.kHz` and
