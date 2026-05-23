@@ -94,6 +94,7 @@ authoritative table.
 | `@random`      | Reads from the system RNG.                                                          | `Rng`                         |
 | `@exit`        | Terminates the program via `env.exit(…)`. Diverges; never returns.                  | `ExitFn`                      |
 | `@envvars`     | Reads process environment variables via `env.envvars`.                              | `EnvVars`                     |
+| `@wire`        | Performs a remote (RPC) call that crosses a process / network boundary. Implies `@io`. | (none — imported remote `world`; see [`rpc.md`](./rpc.md)) |
 
 `@audio`, `@midi`, `@ui`, `@inference`, `@time`, `@random`,
 `@exit`, and `@envvars` do **not** imply `@io`: the underlying
@@ -132,9 +133,13 @@ Notes:
   not *purity*.
 - `@no_panic` does not forbid `trap`. Audio paths use `trap()` for
   invariant violations (see [`errors.md` §`panic` and `trap`](./errors.md)).
-- `@network` / `@fs` / `@stdout` / `@stderr` imply `@io` so that
+- `@network` / `@fs` / `@stdout` / `@stderr` / `@wire` imply `@io` so that
   callers declaring only `@io` may not silently leak finer-grained
-  capabilities.
+  capabilities. `@wire` (a remote RPC call; see [`rpc.md`](./rpc.md)) implies
+  `@io` but **not** `@network` — its transport may be local IPC. A
+  network-backed transport additionally discloses `@network` at the adapter.
+  Because `@wire ⇒ @io`, `@realtime + @wire` is `EFF120` via the existing
+  `@realtime + @io` contradiction; no separate rule is needed.
 - A few `@realtime`-safe operations exist on otherwise-capability
   surfaces (per [`env.md` §`@realtime` and capabilities](./env.md)):
   `env.time.monotonic_ns()`, `env.random.fill_bytes(buf)` with a
@@ -160,6 +165,7 @@ expansion.
 | `@fs`             | `@io`                                                         |
 | `@stdout`         | `@io`                                                         |
 | `@stderr`         | `@io`                                                         |
+| `@wire`           | `@io`                                                         |
 | `@audio`          | —                                                             |
 | `@midi`           | —                                                             |
 | `@ui`             | —                                                             |
@@ -622,6 +628,56 @@ locally before install.
 `qube add <name>` prints the resolved version's effect set before
 writing to the manifest, so the user sees "this dep adds `@network`
 to your transitive set" at decision time rather than at first build.
+
+## Effects and the Component Model
+
+When a qube is emitted as a **component** (opt-in; per
+[`modules.md` §"The qube as a component"](./modules.md)), the effect system
+does double duty: **the capability set the compiler already derives becomes
+the component's import list.** Nothing new is computed — the synthesis
+reuses the propagation closure specified above and in
+[`env.md` §"Inferred capability set"](./env.md).
+
+### The capability table is the import table
+
+Each capability effect maps to the WIT interface a component built from this
+qube imports. This is the same row set as the capabilities table above,
+viewed from the import side; the authoritative WASI-interface specifics live
+in [`env.md` §"Env ↔ WASI Preview 2"](./env.md).
+
+| Effect | WIT import |
+|--------|------------|
+| `@network`   | `wasi:sockets/*` (+ `wasi:http/outgoing-handler` for outbound HTTP) |
+| `@fs`        | `wasi:filesystem/*`                                                 |
+| `@stdout`    | `wasi:cli/stdout`                                                   |
+| `@stderr`    | `wasi:cli/stderr`                                                   |
+| `@time`      | `wasi:clocks/*`                                                     |
+| `@random`    | `wasi:random/random`                                               |
+| `@envvars`   | `wasi:cli/environment`                                             |
+| `@exit`      | `wasi:cli/exit`                                                     |
+| `@audio` / `@midi` / `@ui` / `@inference` | host-specific custom WIT (no WASI P2)         |
+| `@wire`      | the imported remote `world` (the wRPC transport import; see [`rpc.md`](./rpc.md)) |
+
+### Synthesis rule
+
+The component's import list is the closure of capability effects over the
+public surface's call graph — the set `q64 show capabilities` already prints,
+re-emitted as WIT imports (`q64 show world`). q64's compile-time effect
+proof **is** the host-visible import surface: the host sees exactly what the
+type system already proved internally, with no separate declaration to drift.
+
+### Assert effects have no component representation
+
+The asserts and the observation marker produce **no** WIT import or export.
+They govern what the body *refrains from doing*, which never crosses the
+host boundary:
+
+`@pure`, `@no_alloc`, `@no_suspend`, `@no_panic`, `@no_trap`,
+`@uncancellable`, `@realtime`, `@cancel` — none of these appear in the
+synthesized world. (`@realtime` does have a component-side consequence, but
+an *exclusionary* one: a `@realtime` function is implicitly
+`@no_component_lift` and is never a component export — per
+[`modules.md`](./modules.md) — because canonical-ABI lifting allocates.)
 
 ## Diagnostic codes
 

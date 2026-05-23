@@ -1,0 +1,16 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "hello-component",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "hello.q",
+
+  // Emit a component in addition to the core module. The core module
+  // remains the primary artifact; see spec/qube.json5.md §Component.
+  "component": {
+    "emit": true,
+    "world": "hello-component",
+    "worlds": ["wasi:cli/command"],
+  },
+}

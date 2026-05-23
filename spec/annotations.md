@@ -105,6 +105,8 @@ analysis. Not user-extensible.
 | `@skip_laws`      | `fit`                     | Suppresses the face-law check for this fit. Audit-trail required.     | [`faces.md`](./faces.md)             |
 | `@traced_panic`   | `fn`                      | Captures a stack trace into the panic payload (opt-in; ~few kB cost). | [`errors.md`](./errors.md)           |
 | `@rate`           | `graph` block             | Pins the graph body's ambient stream rate.                            | [`streams.md`](./streams.md)         |
+| `@http_handler`   | `pub fn`                  | Marks the function as the HTTP entry point; exported as `wasi:http/incoming-handler` when emitted as a component. | [`env.md`](./env.md)                 |
+| `@no_component_lift` | `pub fn`               | Excludes the function from the component export surface; it stays in the core module. Implicit on every `@realtime` fn. | [`modules.md`](./modules.md)         |
 
 ### Category 2 — Declaration markers (lowercase, type-introducing)
 
@@ -186,6 +188,8 @@ filled in.
 | `@test`           | 1         | `fn`                    | [`test-framework.md`](./test-framework.md)    |
 | `@skip_laws`      | 1         | `fit`                   | [`faces.md`](./faces.md)             |
 | `@traced_panic`   | 1         | `fn`                    | [`errors.md`](./errors.md)           |
+| `@http_handler`   | 1         | `pub fn`                | [`env.md`](./env.md)                 |
+| `@no_component_lift` | 1      | `pub fn`                | [`modules.md`](./modules.md)         |
 | `@unit`           | 2         | item-introducing        | [`units.md`](./units.md)             |
 | `@kind`           | 2         | item-introducing        | (forthcoming `kinds.md`)             |
 | `@derive(...)`    | 3         | `struct` / `enum`       | [`faces.md`](./faces.md)             |

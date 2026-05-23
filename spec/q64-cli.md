@@ -47,6 +47,7 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 show modules --prelude`    | Auto-prelude listing — the set of names reachable without an `import`, including the transitive prelude-face-reachable types (per [`modules.md` §"Reachable through a capability face"](./modules.md)) |
 | `q64 show capabilities <qube>`  | Compiler-derived capability set for `<qube>`'s `pub` surface  |
 | `q64 show denials <fn>`         | Call-graph reachability into `with_capabilities(deny: …)` blocks |
+| `q64 show world <qube>`         | Synthesized WIT world for `<qube>`: exports (public surface) and imports (derived capability set + any imported remote worlds). The component-emission counterpart of `show capabilities`. See [`modules.md` §"The qube as a component"](./modules.md). |
 
 Each form takes additional `--qube <path>` or `--module <name>=<path>`
 flags as needed (see "Global options").
@@ -65,6 +66,7 @@ flags as needed (see "Global options").
 |-----------------------------------|---------------------------------------------------------------------------|
 | `--diagnostics <text\|json>`      | Diagnostic format. Default `text` interactive, `json` when stdout is not a TTY or when run by `qube`. |
 | `--out <path>`                    | Output path for `build` (defaults to `<input>.wasm`). One output per invocation. |
+| `--component`                     | Also wrap the core module in a WebAssembly component (per [`modules.md` §"The qube as a component"](./modules.md)). Writes `<out>.component.wasm` *in addition to* the core `--out` module — the core module is still produced. Set by `qube build --component`. |
 | `--target <name>`                 | Target name to compile for (resolves via the qube manifest if present)    |
 | `--module <name>=<path>`          | Map a module name to a source directory. Repeatable. Set by `qube`. Paths are always absolute (also for local-path dependencies, which `qube` resolves to filesystem paths before invocation). |
 | `--features <comma-list>`         | Feature flags active in this build, e.g. `--features fft,mp3`. Repeatable; the union of all `--features` flags is the active set. `qube build` derives this from the manifest's `dependencies[].features` and `default-features` per-dependency rules. |

@@ -46,7 +46,7 @@ q64 commits to these Wasm 3.0 features unconditionally (per the
 `design.md` "The Bet" frame):
 
 - **Memory64** — 64-bit linear-memory addressing; pointers are `i64`.
-- **Multiple memories** — a module declares several linear memory
+- **Multiple memories** — a core module declares several linear memory
   instances; q64 uses this to segregate region kinds.
 - **WasmGC** — `struct.new`, `array.new`, engine-managed references.
 - **Table64** — 64-bit reference tables.
