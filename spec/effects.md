@@ -611,7 +611,7 @@ to remove it).
 ### In the registry
 
 The registry's qube detail page surfaces three fields, all derived
-from the published tarball at index time:
+from the published archive at index time:
 
 - `effects.declared` — what the manifest lists.
 - `effects.detected` — what static analysis on `pub` surface finds.

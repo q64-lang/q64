@@ -192,13 +192,13 @@
     "include": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "File globs included in the published tarball. Overrides defaults when present."
+      "description": "File globs included in the published archive. Overrides defaults when present."
     },
 
     "exclude": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "File globs excluded from the published tarball. Applied on top of defaults and 'include'."
+      "description": "File globs excluded from the published archive. Applied on top of defaults and 'include'."
     }
   },
 

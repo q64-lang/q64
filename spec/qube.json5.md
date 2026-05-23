@@ -392,8 +392,8 @@ imports, so the dependency is disclosed in `qube audit` like any capability.
 | `include`  | string[] | omitted ⇒ default file set (see below)        | Globs **added to** the default set; never replaces it.                 |
 | `exclude`  | string[] | none                                          | Globs excluded; applied after include resolution. May drop defaults.   |
 
-The default tarball file set (when `include` is omitted) is
-specified in [`continuum-api.md` §Tarball format](./continuum-api.md):
+The default archive file set (when `include` is omitted) is
+specified in [`continuum-api.md` §Archive format](./continuum-api.md):
 `qube.json5`, `src/**`, `tests/**`, `examples/**` (and a top-level
 `example/`), the README, and `LICENSE-*` files at the root. Examples
 ship so an installed qube carries runnable usage guidance for humans

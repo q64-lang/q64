@@ -15,7 +15,7 @@ anonymous; write endpoints require a bearer token.
   and the previous version is kept available for one major-release
   grace period.
 - **Content type:** request and response bodies are JSON unless
-  otherwise noted. Tarballs are `application/gzip` (`.tar.gz`).
+  otherwise noted. Archives are zip (`application/zip`, `.zip`).
 - **Auth:** `Authorization: Bearer <token>` on write endpoints. Tokens
   are scoped (publish-only, owner-only, admin) and rate-limited.
 - **Errors:** every non-2xx response body uses the same
@@ -25,8 +25,8 @@ anonymous; write endpoints require a bearer token.
 - **Pagination:** `?page=<n>&limit=<n>` (1-indexed). Default limit 50,
   max 200. Responses include `next` / `prev` URL hints.
 - **Caching:** read endpoints set `ETag` and respond to
-  `If-None-Match`. Tarball downloads also set `Cache-Control:
-  immutable, max-age=31536000` because tarballs are content-addressed
+  `If-None-Match`. Archive downloads also set `Cache-Control:
+  immutable, max-age=31536000` because archives are content-addressed
   and never replaced.
 - **Rate limits:** signalled via `X-RateLimit-Limit`,
   `X-RateLimit-Remaining`, `X-RateLimit-Reset` headers.
@@ -74,10 +74,10 @@ Returns the full manifest for a specific version plus its effect index,
 declared targets, and dependency graph.
 
 ```
-GET /v1/qubes/{name}/{version}/tarball
+GET /v1/qubes/{name}/{version}/archive
 ```
 
-Returns the `.tar.gz` (immutable, content-addressed). The tarball
+Returns the `.zip` (immutable, content-addressed). The archive
 contains the qube source tree rooted at the included `qube.json5`.
 
 ### Read — index (sparse, Cargo-style)
@@ -117,7 +117,7 @@ Authorization: Bearer <token>
 Content-Type: multipart/form-data
 
   manifest=<qube.json5 body>
-  tarball=<binary tarball>
+  archive=<binary zip>
 ```
 
 Server validates, in order:
@@ -125,16 +125,16 @@ Server validates, in order:
 1. Manifest matches [`qube.json5.schema.json`](./qube.json5.schema.json).
 2. Version is not already published; name is available or owned by
    the token's subject.
-3. **Tarball checksum.** The server computes the SHA-256 of the
-   uploaded tarball and stores it as the version's canonical
+3. **Archive checksum.** The server computes the SHA-256 of the
+   uploaded archive and stores it as the version's canonical
    identifier. The manifest does *not* carry a checksum field; the
-   tarball is content-addressed by the server's computation, which
+   archive is content-addressed by the server's computation, which
    is then returned to the client and recorded in `qube.lock` (per
    "Resolver protocol" below).
 4. **Effect indexing.** The server runs the effect analyser (the
    same code path `qube audit` uses locally — see
    [`qube-cli.md`](./qube-cli.md) §"Publishing flow") on the
-   uploaded tarball, producing the qube's transitive effect set.
+   uploaded archive, producing the qube's transitive effect set.
    The detected set is stored alongside the manifest and surfaced
    via `GET /v1/qubes/{name}/{version}/effects`.
 5. **Effect cross-check.** The manifest's `effects.declared` must
@@ -158,7 +158,7 @@ POST   /v1/qubes/{name}/{version}/unyank # restore
 ```
 
 Yanked versions are still resolvable for existing lockfiles but new
-`qube add` calls skip them. Yanking is not deletion; the tarball
+`qube add` calls skip them. Yanking is not deletion; the archive
 remains downloadable for reproducibility.
 
 ### Write — owner management
@@ -203,7 +203,7 @@ The expected dance for `qube install`:
 2. Run resolution locally (pubgrub-style) producing a flat plan.
 3. For each resolved `(name, version)`:
    - Fetch `GET /v1/qubes/{name}/{version}` for the full manifest.
-   - Fetch `GET /v1/qubes/{name}/{version}/tarball` and extract to
+   - Fetch `GET /v1/qubes/{name}/{version}/archive` and extract to
      `~/.qube/cache/sha256/<digest>/`.
 4. Write `qube.lock` with name, version, source URL, sha256, and the
    effect index per dep.
@@ -286,15 +286,20 @@ and returns either `{ "ok": true }` or a diagnostic envelope describing
 the schema violations. Useful for editors that don't want to bundle the
 schema themselves.
 
-## Tarball format
+## Archive format
 
-- Compression: `gzip`
+- Container: a **zip** archive (`.zip`, `application/zip`); entries are
+  stored with DEFLATE. Chosen over `.tar.gz` for first-class support in
+  the toolchain languages (Zig `std.zip` / a vendored MIT `miniz` for the
+  `qube` CLI; `fflate` on the Workers registry) and native double-click /
+  drag-and-drop extraction on Windows. DEFLATE and the zip format are
+  unencumbered (RFC 1951; no patents), like gzip.
 - Layout: a single root directory whose name is `<qube-name>-<version>`,
   with any `/` in a scoped `org/qube` name replaced by `-` — e.g.
   `q64/webmcp-client` at `0.1.0` packs under `q64-webmcp-client-0.1.0/`.
   The directory holds `qube.json5` at its root plus the file set described
   below. The directory name is presentational only: a qube's canonical
-  identity is its manifest `name` / `version` plus the tarball's SHA-256
+  identity is its manifest `name` / `version` plus the archive's SHA-256
   (below), so the dash-flattening need not be reversible.
 - Default file set (when `include` is **absent** in the manifest):
   `qube.json5`, every file under `src/`, every file under `tests/`,
@@ -311,14 +316,14 @@ schema themselves.
   steps would have included, default or not.
 - Maximum unpacked size: TBD (likely 50 MB for v0; raise via owner
   request).
-- SHA-256 of the tarball is the canonical identifier; the registry
+- SHA-256 of the archive is the canonical identifier; the registry
   computes it at publish time (per "Write — publish" step 3) and
   `qube.lock` records it.
 
 ## Notes on hosting
 
 The reference deployment runs on Cloudflare Workers (handlers), R2
-(tarball storage), D1 (metadata, ownership), and KV (hot
+(archive storage), D1 (metadata, ownership), and KV (hot
 indexes/search caches). The HTTP API surface above is the contract;
 the storage layout is implementation-defined. Re-implementations can
 ship on any stack as long as they honor this spec and the

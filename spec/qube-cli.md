@@ -112,7 +112,7 @@ Resolved dependencies are extracted to a user-global cache:
 
 ```
 ~/.qube/
-  cache/                       # extracted tarballs, content-addressed
+  cache/                       # extracted archives, content-addressed
     sha256/ab/cd/abcdef…/
       qube.json5
       src/...
@@ -244,11 +244,11 @@ Inside `stdlib/` (workspace root with `members: ["math", "anim", ...]`):
 1. Validate `qube.json5` against the schema.
 2. Refuse if `publish: false`, or if version already exists on the
    registry.
-3. Build the include/exclude file list; pack to `.tar.gz`.
+3. Build the include/exclude file list; pack to a `.zip` archive.
 4. Run a clean build against the **release** profile to confirm it
    compiles (errors abort publish).
 5. Authenticate against the registry using `~/.qube/credentials.toml`.
-6. Upload tarball; the registry validates schema, checks ownership,
+6. Upload the archive; the registry validates schema, checks ownership,
    indexes effects.
 7. Cache the published version locally.
 
