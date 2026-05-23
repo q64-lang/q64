@@ -394,10 +394,11 @@ imports, so the dependency is disclosed in `qube audit` like any capability.
 
 The default tarball file set (when `include` is omitted) is
 specified in [`continuum-api.md` §Tarball format](./continuum-api.md):
-`qube.json5`, `src/**`, `tests/**`, the README, and
-`LICENSE-*` files at the root. `include` adds files on top; it
-does not replace the default. To drop a default file, use
-`exclude`.
+`qube.json5`, `src/**`, `tests/**`, `examples/**` (and a top-level
+`example/`), the README, and `LICENSE-*` files at the root. Examples
+ship so an installed qube carries runnable usage guidance for humans
+and coding agents. `include` adds files on top; it does not replace
+the default. To drop a default file, use `exclude`.
 
 ## Versioning policy for the schema
 

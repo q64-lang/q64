@@ -290,12 +290,19 @@ schema themselves.
 
 - Compression: `gzip`
 - Layout: a single root directory whose name is `<qube-name>-<version>`,
-  containing `qube.json5` at the root plus the file set described
-  below.
+  with any `/` in a scoped `org/qube` name replaced by `-` — e.g.
+  `q64/webmcp-client` at `0.1.0` packs under `q64-webmcp-client-0.1.0/`.
+  The directory holds `qube.json5` at its root plus the file set described
+  below. The directory name is presentational only: a qube's canonical
+  identity is its manifest `name` / `version` plus the tarball's SHA-256
+  (below), so the dash-flattening need not be reversible.
 - Default file set (when `include` is **absent** in the manifest):
   `qube.json5`, every file under `src/`, every file under `tests/`,
-  the README (whatever path `readme` names, or `README.md` if
-  unset), and every `LICENSE-*` file at the project root.
+  every file under `examples/` (and a top-level `example/`), the README
+  (whatever path `readme` names, or `README.md` if unset), and every
+  `LICENSE-*` file at the project root. Examples ship by default so an
+  installed qube carries runnable usage guidance for humans and coding
+  agents; a qube with heavy example assets trims them with `exclude`.
 - When `include` is **present**, the file set is exactly the union
   of the default set above and the `include` globs. `include` adds
   to the default; it never replaces it. (Manifests that need to
