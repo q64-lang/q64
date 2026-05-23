@@ -40,21 +40,27 @@ Folder = sub-namespace. `lib.q` inside a folder is the entry point when
 the folder is imported by name. A folder without a `lib.q` is still
 navigable to its files but cannot itself be imported.
 
-### Qube name → module path
+### Qube name = module path
 
-Qube names in `qube.json5` use kebab-case and optional `org/` prefix
-(`q64/math`, `audio-filters`, `acme/widget`). The matching module path
-uses dots and drops the org slash:
+A qube's name **is** its module path — there is no transform. Names are
+reverse-DNS dotted paths whose segments are lowercase identifiers
+(`[a-z][a-z0-9_]*`, snake_case, no dashes), so the string in `qube.json5`,
+in `dependencies`, on the registry URL, and in an `import` are byte-for-byte
+identical:
 
-| Qube name           | Module path root   |
-|---------------------|--------------------|
-| `q64/math`          | `q64.math`         |
-| `audio-filters`     | `audio_filters`    |
-| `acme/widget-kit`   | `acme.widget_kit`  |
+| Qube name (`qube.json5`)   | Import path root           |
+|----------------------------|----------------------------|
+| `dev.q64.webmcp_client`    | `dev.q64.webmcp_client`    |
+| `com.acme.widget_kit`      | `com.acme.widget_kit`      |
 
-Dashes in qube names become underscores in module paths (identifiers
-can't contain `-`); the qube manifest validates that the transformation
-is unambiguous.
+`q64.*` is reserved for the built-in standard library (`q64.math`,
+`q64.net`, `q64.io`, …): it ships with the toolchain, is resolved
+internally, and is never published to the Continuum or listed in
+`dependencies`. Everything published uses a reverse-DNS namespace the
+publisher owns (first-party q64 libraries live under `dev.q64.*`).
+
+Because identifiers can't contain `-`, names can't either (a dash in a
+bare module path is `NAM011`).
 
 ### Module-header doc comment (optional)
 
@@ -437,7 +443,7 @@ never reused.
 | `NAM008` | re-export cycle                        | `pub use` chains form a cycle.                                                    |
 | `NAM009` | block `pub` form is forbidden          | `pub { … }` block form encountered; use per-item `pub`.                           |
 | `NAM010` | unknown name in source module          | Selective import named an identifier not declared in the source module.           |
-| `NAM011` | dash in bare module path               | Bare module path contains `-`; use the `_`-normalized form.                       |
+| `NAM011` | dash in bare module path               | Bare module path contains `-`. Qube/module names use `_`, not `-` (a dash lexes as the minus operator). |
 
 All codes are emitted using the standard envelope from
 [`diagnostics.md`](./diagnostics.md), with `severity: "error"`. The

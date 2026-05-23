@@ -1,0 +1,42 @@
+// Copy to `wrangler.jsonc` and fill in the placeholders.
+// `wrangler.jsonc` is gitignored.
+{
+  "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
+  "name": "q64-continuum-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  "routes": [
+    { "pattern": "qubes.q64.dev", "custom_domain": true }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVES",
+      "bucket_name": "q64-continuum-archives"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "q64-continuum",
+      "database_id": "REPLACE_WITH_D1_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "kv_namespaces": [
+    {
+      "binding": "CACHE",
+      "id": "REPLACE_WITH_KV_ID"
+    }
+  ],
+
+  "vars": {
+    "ENV": "dev",
+    "ADMIN_EMAILS": "***,***"
+  }
+}

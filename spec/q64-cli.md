@@ -81,15 +81,16 @@ compiler. `qube build` invokes:
 
 ```
 q64 build src/main.q
-  --module q64.math=/home/user/.qube/cache/q64-math-0.3.1/src
-  --module q64.audio=/home/user/.qube/cache/q64-audio-0.3.0/src
-  --module q64.net=/home/user/.qube/cache/q64-net-0.3.4/src
+  --module dev.q64.audio=/home/user/.qube/cache/dev.q64.audio-0.3.0/src
+  --module dev.q64.ai=/home/user/.qube/cache/dev.q64.ai-0.3.0/src
+  --module com.openai.whisper=/home/user/.qube/cache/com.openai.whisper-1.0.2/src
   --diagnostics json
   --out target/main.wasm
 ```
 
-The compiler resolves `import q64.math` against the supplied map; it
-never reads `qube.json5` itself.
+The compiler resolves `import dev.q64.audio` against the supplied map; it
+never reads `qube.json5` itself. (Core stdlib `q64.*` is built in and
+needs no `--module`.)
 
 ## Stdin / stdout / stderr conventions
 

@@ -54,13 +54,13 @@ That is a complete, publishable library qube. The default `entry` is
   type:  "application",
   entry: "src/main.q",
 
-  // Dependencies
+  // Dependencies. Keys are full qube names (= module paths). Core stdlib
+  // (`q64.*`, e.g. `q64.net`) is built in and never listed here.
   dependencies: {
-    "q64/audio": "^0.3",
-    "q64/ai":    "^0.3",
-    "q64/net":   "^0.3",
-    "whisper":   { version: "^1.0", features: ["en"] },
-    "local-llm": { path: "../llm" },
+    "dev.q64.audio":      "^0.3",
+    "dev.q64.ai":         "^0.3",
+    "com.openai.whisper": { version: "^1.0", features: ["en"] },
+    "dev.example.llm":    { path: "../llm" },
   },
 
   // Build targets
@@ -102,7 +102,7 @@ That is a complete, publishable library qube. The default `entry` is
 | Field         | Type     | Required | Notes                                                                    |
 |---------------|----------|----------|--------------------------------------------------------------------------|
 | `$schema`     | string   | no       | Schema URL. Recommended at the top of every manifest.                    |
-| `name`        | string   | **yes**  | Kebab-case. Optionally namespaced as `org/qube`. Max 64 chars.           |
+| `name`        | string   | **yes**  | Dotted path; each segment a lowercase identifier `[a-z][a-z0-9_]*` (snake_case, no dashes), `.`-separated. The name **is** the module path (no transform) — see [`modules.md`](./modules.md). Publishable qubes (library/application) must use a reverse-DNS form with ≥2 segments (enforced at publish); a workspace root may use a single-segment label. `q64.*` is reserved for the built-in stdlib. Max 128 chars. e.g. `dev.q64.webmcp_client`, `com.acme.widget`. |
 | `version`     | string   | **yes**  | Semver.                                                                  |
 | `license`     | string   | **yes**  | SPDX expression. Use `"MIT OR Apache-2.0"` for the q64 ecosystem default.|
 | `description` | string   | no       | One-line summary, max 280 chars, shown on the registry.                  |
@@ -428,6 +428,7 @@ versions together until 1.0.
   `q64 show capabilities <qube>` introspection.
 - [`docs/history/design.md`](../docs/history/design.md) — original
   pre-spec design discussion (archived).
-- [`docs/history/stdlib.md`](../docs/history/stdlib.md) — stdlib
-  namespaces that show up in `dependencies` (`q64/math`,
-  `q64/audio`, etc.).
+- [`docs/history/stdlib.md`](../docs/history/stdlib.md) — the
+  built-in `q64.*` stdlib namespaces (`q64.math`, `q64.net`, etc.).
+  These are reserved and shipped with the toolchain, so they never
+  appear in `dependencies`.

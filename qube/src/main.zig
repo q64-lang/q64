@@ -27,8 +27,12 @@ const ExitCode = enum(u8) {
     usage = 2,
     compile = 64,
     input = 65,
+    dependency = 66,
+    registry = 67,
     internal = 70,
 };
+
+const default_registry = "https://qubes.q64.dev";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -68,12 +72,36 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "login")) {
+        cmdLogin(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: login failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "add")) {
+        cmdAdd(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: add failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "publish")) {
+        cmdPublish(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: publish failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     // Documented subcommands that are not implemented yet. Listed
     // explicitly so unknown names still hit the usage fallback.
     const stub_subs = [_][]const u8{
-        "new",     "init",   "add",      "remove",  "build",
-        "test",    "install", "lock",    "publish", "outdated",
-        "audit",   "clean",  "explain",  "fix",     "fmt",
+        "new",     "init",    "remove",  "build",
+        "test",    "install", "lock",    "outdated",
+        "audit",   "clean",   "explain", "fix",     "fmt",
         "workspace",
     };
     for (stub_subs) |s| {
@@ -95,10 +123,13 @@ fn usage(io: std.Io) !void {
         \\Subcommands (v0):
         \\  run                     Build and run the qube in the current directory.
         \\  web                     Build the qube to wasm and serve it in a browser.
+        \\  add <name>[@version]    Resolve a dependency from the Continuum and add it.
+        \\  publish                 Pack this qube and publish it to the Continuum.
+        \\  login                   Authenticate against the Continuum registry.
         \\  --version, -v           Print the version and exit.
         \\  --help, -h              Print this help and exit.
         \\
-        \\Other subcommands from the spec (new, init, build, test, publish,
+        \\Other subcommands from the spec (new, init, build, test,
         \\fix, explain, fmt, workspace, ...) are not implemented yet.
         \\
     );
@@ -572,4 +603,660 @@ fn printStdout(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var w = std.Io.File.stdout().writer(io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
+}
+
+// ---------------------------------------------------------------------------
+// qube login
+// ---------------------------------------------------------------------------
+//
+// v0 design: shell to curl for HTTPS (the same posture as `qube run`'s
+// shell-out to q64). Credentials are taken from flags or env vars; no stdin
+// masking yet. When OAuth lands, this becomes a browser device-flow.
+
+fn cmdLogin(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    // qube login [<email>] [--registry <url>]
+    //   Reads password from stdin (no echo). Email may be positional, an env
+    //   var (QUBE_EMAIL), or — if neither — prompted. Password may also come
+    //   from QUBE_PASSWORD for non-interactive / CI use.
+    var registry: []const u8 = "https://qubes.q64.dev";
+    var email_opt: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--registry")) {
+            registry = args_it.next() orelse {
+                try writeStderr(io, "qube login: --registry needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube login: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (email_opt == null) {
+            email_opt = a;
+        } else {
+            try printStderr(io, "qube login: unexpected extra arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    if (email_opt == null) email_opt = env.get("QUBE_EMAIL");
+
+    var email_owned: ?[]u8 = null;
+    defer if (email_owned) |e| gpa.free(e);
+    const email: []const u8 = if (email_opt) |e| e else blk: {
+        try writeStdout(io, "email: ");
+        const line = try readStdinLineAlloc(gpa, io);
+        email_owned = line;
+        break :blk line;
+    };
+
+    var password_owned: ?[]u8 = null;
+    defer if (password_owned) |p| gpa.free(p);
+    const password: []const u8 = if (env.get("QUBE_PASSWORD")) |p| p else blk: {
+        try writeStdout(io, "password: ");
+        const line = try readPasswordSilent(gpa, io);
+        password_owned = line;
+        try writeStdout(io, "\n");
+        break :blk line;
+    };
+
+    const host = stripScheme(registry);
+    const url = try std.fmt.allocPrint(gpa, "{s}/v1/auth/token", .{registry});
+    defer gpa.free(url);
+
+    // v0: passwords are bypass-only ("***"); no need to JSON-escape yet.
+    const body = try std.fmt.allocPrint(
+        gpa,
+        \\{{"email":"{s}","password":"{s}","description":"qube login"}}
+    ,
+        .{ email, password },
+    );
+    defer gpa.free(body);
+
+    const argv = [_][]const u8{
+        "curl", "-sS",                       "-X",
+        "POST", url,                         "-H",
+        "content-type: application/json",    "-d",
+        body,
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    }) catch |err| {
+        try printStderr(io, "qube login: cannot spawn curl: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    var stdout_buf: [16 * 1024]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &stdout_buf);
+    const response = stdout_reader.interface.allocRemaining(gpa, .limited(64 * 1024)) catch |err| {
+        try printStderr(io, "qube login: cannot read response: {s}\n", .{@errorName(err)});
+        _ = child.wait(io) catch {};
+        return err;
+    };
+    defer gpa.free(response);
+
+    const term = try child.wait(io);
+    if (termCode(term)) |c| {
+        if (c != 0) {
+            try printStderr(io, "qube login: curl exited {d}\n", .{c});
+            std.process.exit(@intFromEnum(ExitCode.runtime_failure));
+        }
+    }
+
+    const TokenResponse = struct {
+        token: []const u8,
+        expires_at: []const u8,
+        user: struct {
+            email: []const u8,
+            username: []const u8,
+        },
+    };
+    const parsed = std.json.parseFromSlice(TokenResponse, gpa, response, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        try printStderr(io, "qube login: server returned unexpected response:\n{s}\n", .{response});
+        return err;
+    };
+    defer parsed.deinit();
+    const t = parsed.value;
+
+    const home = env.get("HOME") orelse {
+        try writeStderr(io, "qube login: HOME not set\n");
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    };
+    const qube_dir = try std.fs.path.join(gpa, &.{ home, ".qube" });
+    defer gpa.free(qube_dir);
+    try std.Io.Dir.cwd().createDirPath(io, qube_dir);
+
+    const cred_path = try std.fs.path.join(gpa, &.{ qube_dir, "credentials.toml" });
+    defer gpa.free(cred_path);
+
+    const toml = try std.fmt.allocPrint(gpa,
+        \\# Continuum registry credentials. Written by `qube login`.
+        \\# Do not check in. The token grants publish access to your qubes.
+        \\
+        \\[registries."{s}"]
+        \\token = "{s}"
+        \\user = "{s}"
+        \\expires_at = "{s}"
+        \\
+    , .{ host, t.token, t.user.email, t.expires_at });
+    defer gpa.free(toml);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cred_path, .data = toml });
+    try printStdout(io, "Logged in as {s}. Token stored in {s}.\n", .{ t.user.email, cred_path });
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for add / publish
+// ---------------------------------------------------------------------------
+
+const Captured = struct { stdout: []u8, code: ?u8 };
+
+/// Spawn `argv`, capture its stdout, inherit stderr, return both. Caller owns
+/// `stdout`. The v0 posture (per spec/qube-cli.md) is to shell out to `curl`,
+/// `zip`, and `unzip` rather than vendor those libraries.
+fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !Captured {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    var buf: [16 * 1024]u8 = undefined;
+    var r = child.stdout.?.reader(io, &buf);
+    const out = try r.interface.allocRemaining(gpa, .limited(8 * 1024 * 1024));
+    const term = try child.wait(io);
+    return .{ .stdout = out, .code = termCode(term) };
+}
+
+const HttpResp = struct {
+    raw: []u8, // owned; free this
+    body: []const u8, // slice into raw
+    status: u16,
+};
+
+/// GET `url`, returning the body and HTTP status. `-w "\n%{http_code}"` appends
+/// the status as a trailing line we split off.
+fn httpGet(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !HttpResp {
+    const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", url };
+    const cap = try runCapture(gpa, io, &argv);
+    const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse {
+        gpa.free(cap.stdout);
+        return error.BadResponse;
+    };
+    const status = std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout[nl + 1 ..], " \r\n"), 10) catch 0;
+    return .{ .raw = cap.stdout, .body = cap.stdout[0..nl], .status = status };
+}
+
+/// GET `url` writing the body to `path`; returns the HTTP status.
+fn httpGetToFile(gpa: std.mem.Allocator, io: std.Io, url: []const u8, path: []const u8) !u16 {
+    const argv = [_][]const u8{ "curl", "-sS", "-o", path, "-w", "%{http_code}", url };
+    const cap = try runCapture(gpa, io, &argv);
+    defer gpa.free(cap.stdout);
+    return std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout, " \r\n"), 10) catch 0;
+}
+
+fn qubeHome(gpa: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
+    if (env.get("QUBE_HOME")) |h| {
+        if (h.len > 0) return gpa.dupe(u8, h);
+    }
+    const home = env.get("HOME") orelse return error.NoHome;
+    return std.fs.path.join(gpa, &.{ home, ".qube" });
+}
+
+/// Read the bearer token for `host` out of `<qube_home>/credentials.toml`.
+/// v0 keeps a single registry, so we take the first `token = "…"` line.
+fn readRegistryToken(gpa: std.mem.Allocator, io: std.Io, qube_home: []const u8) ![]u8 {
+    const path = try std.fs.path.join(gpa, &.{ qube_home, "credentials.toml" });
+    defer gpa.free(path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch
+        return error.NotLoggedIn;
+    defer gpa.free(text);
+    const key = "token = \"";
+    const i = std.mem.indexOf(u8, text, key) orelse return error.NoToken;
+    const start = i + key.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return error.NoToken;
+    return gpa.dupe(u8, text[start..end]);
+}
+
+/// Find a `"key": "value"` string field in raw manifest text. Tolerates the
+/// JSON5 our manifests use because it scans rather than fully parses; it only
+/// recognises double-quoted keys (enough for `name`/`version`).
+fn extractStringField(src: []const u8, quoted_key: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, quoted_key)) |k| {
+        pos = k + quoted_key.len;
+        var j = pos;
+        while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+        if (j >= src.len or src[j] != ':') continue;
+        j += 1;
+        while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+        if (j >= src.len or src[j] != '"') continue;
+        j += 1;
+        const value_start = j;
+        while (j < src.len and src[j] != '"') j += 1;
+        if (j >= src.len) return null;
+        return src[value_start..j];
+    }
+    return null;
+}
+
+fn isLowerAlnumU(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
+}
+
+/// Publishable name: reverse-DNS dotted, ≥2 lowercase identifier segments
+/// (snake_case, no dashes). Mirrors spec/qube.json5.schema.json.
+fn isPublishableName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    var segs: usize = 0;
+    var i: usize = 0;
+    while (i < name.len) {
+        if (!(name[i] >= 'a' and name[i] <= 'z')) return false;
+        i += 1;
+        while (i < name.len and isLowerAlnumU(name[i])) i += 1;
+        segs += 1;
+        if (i < name.len) {
+            if (name[i] != '.') return false;
+            i += 1;
+            if (i >= name.len) return false; // trailing dot
+        }
+    }
+    return segs >= 2;
+}
+
+fn isReservedNamespace(name: []const u8) bool {
+    return std.mem.eql(u8, name, "q64") or std.mem.startsWith(u8, name, "q64.");
+}
+
+fn sha256HexOfFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
+    defer gpa.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hexchars = "0123456789abcdef";
+    const hex = try gpa.alloc(u8, 64);
+    for (digest, 0..) |b, idx| {
+        hex[idx * 2] = hexchars[b >> 4];
+        hex[idx * 2 + 1] = hexchars[b & 0x0f];
+    }
+    return hex;
+}
+
+// ---------------------------------------------------------------------------
+// qube publish
+// ---------------------------------------------------------------------------
+
+const pack_script =
+    \\set -e
+    \\PROJECT="$1"; ROOT="$2"; OUT="$3"
+    \\STAGE="$(mktemp -d)"
+    \\mkdir -p "$STAGE/$ROOT" "$(dirname "$OUT")"
+    \\cd "$PROJECT"
+    \\for item in qube.json5 README.md src tests examples example; do
+    \\  [ -e "$item" ] && cp -R "$item" "$STAGE/$ROOT/" || true
+    \\done
+    \\for lic in LICENSE LICENSE-MIT LICENSE-APACHE; do
+    \\  [ -e "$lic" ] && cp "$lic" "$STAGE/$ROOT/" || true
+    \\done
+    \\cd "$STAGE"
+    \\find . -name .DS_Store -delete 2>/dev/null || true
+    \\rm -f "$OUT"
+    \\zip -rqX "$OUT" "$ROOT"
+    \\rm -rf "$STAGE"
+;
+
+fn cmdPublish(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var registry: []const u8 = default_registry;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--registry")) {
+            registry = args_it.next() orelse {
+                try writeStderr(io, "qube publish: --registry needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else {
+            try printStderr(io, "qube publish: ignoring unrecognised arg in v0: {s}\n", .{a});
+        }
+    }
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const manifest_path = try findManifestUpward(gpa, io, cwd_path) orelse {
+        try writeStderr(io, "qube: no qube.json5 found in this directory or any parent\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(manifest_path);
+    const project_dir = std.fs.path.dirname(manifest_path) orelse ".";
+
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
+    defer gpa.free(raw);
+
+    const name = extractStringField(raw, "\"name\"") orelse {
+        try writeStderr(io, "qube publish: manifest has no \"name\" field\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const version = extractStringField(raw, "\"version\"") orelse {
+        try writeStderr(io, "qube publish: manifest has no \"version\" field\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+
+    if (!isPublishableName(name)) {
+        try printStderr(io, "qube publish: invalid name '{s}': use a reverse-DNS dotted name with >=2 lowercase identifier segments, e.g. dev.q64.webmcp_client\n", .{name});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+    if (isReservedNamespace(name)) {
+        try writeStderr(io, "qube publish: the 'q64.*' namespace is reserved for the built-in standard library\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+    if (std.mem.indexOf(u8, raw, "\"publish\"") != null and std.mem.indexOf(u8, raw, "false") != null) {
+        // Coarse v0 guard: a manifest that sets publish:false is opted out.
+        try writeStderr(io, "qube publish: manifest sets publish: false; refusing\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+
+    // Pack the default file set into target/publish/<name>-<version>.zip.
+    const root = try std.fmt.allocPrint(gpa, "{s}-{s}", .{ name, version });
+    defer gpa.free(root);
+    const out_zip = try std.fs.path.join(gpa, &.{ project_dir, "target", "publish", root });
+    defer gpa.free(out_zip);
+    const out_zip_full = try std.fmt.allocPrint(gpa, "{s}.zip", .{out_zip});
+    defer gpa.free(out_zip_full);
+
+    {
+        const argv = [_][]const u8{ "sh", "-c", pack_script, "sh", project_dir, root, out_zip_full };
+        const term = try spawnInherit(io, &argv);
+        if (termCode(term) != 0) {
+            try writeStderr(io, "qube publish: packing the archive failed\n");
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        }
+    }
+    try printStdout(io, "qube publish: packed {s}\n", .{out_zip_full});
+
+    // Token.
+    const home = try qubeHome(gpa, env);
+    defer gpa.free(home);
+    const token = readRegistryToken(gpa, io, home) catch {
+        try writeStderr(io, "qube publish: no credentials; run `qube login` first\n");
+        std.process.exit(@intFromEnum(ExitCode.registry));
+    };
+    defer gpa.free(token);
+
+    // Upload.
+    const url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}", .{ registry, name });
+    defer gpa.free(url);
+    const auth = try std.fmt.allocPrint(gpa, "authorization: Bearer {s}", .{token});
+    defer gpa.free(auth);
+    const manifest_field = try std.fmt.allocPrint(gpa, "manifest=<{s}", .{manifest_path});
+    defer gpa.free(manifest_field);
+    const archive_field = try std.fmt.allocPrint(gpa, "archive=@{s};type=application/zip", .{out_zip_full});
+    defer gpa.free(archive_field);
+
+    const argv = [_][]const u8{
+        "curl",          "-sS",  "-w", "\n%{http_code}",
+        "-X",            "POST", url,  "-H",
+        auth,            "-F",   manifest_field,
+        "-F",            archive_field,
+    };
+    const cap = try runCapture(gpa, io, &argv);
+    defer gpa.free(cap.stdout);
+    const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse cap.stdout.len;
+    const body = cap.stdout[0..nl];
+    const status = if (nl < cap.stdout.len)
+        std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout[nl + 1 ..], " \r\n"), 10) catch 0
+    else
+        0;
+
+    if (status == 201) {
+        try printStdout(io, "Published {s}@{s}.\n{s}\n", .{ name, version, body });
+        return;
+    }
+    try printStderr(io, "qube publish: registry returned {d}:\n{s}\n", .{ status, body });
+    std.process.exit(@intFromEnum(ExitCode.registry));
+}
+
+// ---------------------------------------------------------------------------
+// qube add
+// ---------------------------------------------------------------------------
+
+const VersionMeta = struct {
+    version: []const u8,
+    archive_sha: []const u8,
+    yanked: bool = false,
+};
+const QubeMeta = struct {
+    name: []const u8,
+    latest: ?[]const u8 = null,
+    versions: []VersionMeta = &.{},
+};
+
+const extract_script =
+    \\set -e
+    \\ZIP="$1"; DEST="$2"
+    \\TMP="$(mktemp -d)"
+    \\unzip -oq "$ZIP" -d "$TMP"
+    \\rm -rf "$DEST"; mkdir -p "$DEST"
+    \\inner="$(ls -d "$TMP"/*/ 2>/dev/null | head -1)"
+    \\if [ -n "$inner" ]; then cp -R "$inner". "$DEST"/; else cp -R "$TMP"/. "$DEST"/; fi
+    \\rm -rf "$TMP"
+;
+
+fn cmdAdd(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var registry: []const u8 = default_registry;
+    var dep_arg: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--registry")) {
+            registry = args_it.next() orelse {
+                try writeStderr(io, "qube add: --registry needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube add: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (dep_arg == null) {
+            dep_arg = a;
+        } else {
+            try printStderr(io, "qube add: unexpected extra arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    const dep = dep_arg orelse {
+        try writeStderr(io, "usage: qube add <name>[@version]\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+
+    var name = dep;
+    var req_version: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, dep, '@')) |at| {
+        name = dep[0..at];
+        req_version = dep[at + 1 ..];
+    }
+    if (!isPublishableName(name)) {
+        try printStderr(io, "qube add: invalid name '{s}'\n", .{name});
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    }
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const manifest_path = try findManifestUpward(gpa, io, cwd_path) orelse {
+        try writeStderr(io, "qube: no qube.json5 found in this directory or any parent\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(manifest_path);
+
+    // Resolve metadata.
+    const meta_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}", .{ registry, name });
+    defer gpa.free(meta_url);
+    const resp = try httpGet(gpa, io, meta_url);
+    defer gpa.free(resp.raw);
+    if (resp.status == 404) {
+        try printStderr(io, "qube add: '{s}' not found on {s}\n", .{ name, registry });
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    }
+    if (resp.status != 200) {
+        try printStderr(io, "qube add: registry returned {d}:\n{s}\n", .{ resp.status, resp.body });
+        std.process.exit(@intFromEnum(ExitCode.registry));
+    }
+
+    const parsed = std.json.parseFromSlice(QubeMeta, gpa, resp.body, .{ .ignore_unknown_fields = true }) catch {
+        try writeStderr(io, "qube add: could not parse registry metadata\n");
+        std.process.exit(@intFromEnum(ExitCode.registry));
+    };
+    defer parsed.deinit();
+    const meta = parsed.value;
+
+    const want = req_version orelse meta.latest orelse {
+        try writeStderr(io, "qube add: registry returned no versions\n");
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    };
+    var chosen: ?VersionMeta = null;
+    for (meta.versions) |v| {
+        if (std.mem.eql(u8, v.version, want)) {
+            chosen = v;
+            break;
+        }
+    }
+    const cv = chosen orelse {
+        try printStderr(io, "qube add: version '{s}' of '{s}' not found\n", .{ want, name });
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    };
+
+    // Download the archive into the cache, verifying the SHA-256.
+    const home = try qubeHome(gpa, env);
+    defer gpa.free(home);
+    const cache_root = try std.fs.path.join(gpa, &.{ home, "cache" });
+    defer gpa.free(cache_root);
+    try std.Io.Dir.cwd().createDirPath(io, cache_root);
+    const tmp_zip = try std.fmt.allocPrint(gpa, "{s}/{s}.part", .{ cache_root, cv.archive_sha });
+    defer gpa.free(tmp_zip);
+
+    const archive_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}/{s}/archive", .{ registry, name, cv.version });
+    defer gpa.free(archive_url);
+    const dl_status = try httpGetToFile(gpa, io, archive_url, tmp_zip);
+    if (dl_status != 200) {
+        try printStderr(io, "qube add: archive download returned {d}\n", .{dl_status});
+        std.process.exit(@intFromEnum(ExitCode.registry));
+    }
+
+    const got_sha = try sha256HexOfFile(gpa, io, tmp_zip);
+    defer gpa.free(got_sha);
+    if (!std.mem.eql(u8, got_sha, cv.archive_sha)) {
+        try printStderr(io, "qube add: archive SHA-256 mismatch\n  expected {s}\n  got      {s}\n", .{ cv.archive_sha, got_sha });
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    }
+
+    // Extract to cache/sha256/<ab>/<cd>/<digest>/ (spec/qube-cli.md).
+    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/sha256/{s}/{s}/{s}", .{ cache_root, cv.archive_sha[0..2], cv.archive_sha[2..4], cv.archive_sha });
+    defer gpa.free(cache_dir);
+    {
+        const argv = [_][]const u8{ "sh", "-c", extract_script, "sh", tmp_zip, cache_dir };
+        const term = try spawnInherit(io, &argv);
+        if (termCode(term) != 0) {
+            try writeStderr(io, "qube add: extracting the archive failed\n");
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        }
+    }
+    std.Io.Dir.cwd().deleteFile(io, tmp_zip) catch {};
+
+    // Insert the dependency into the manifest.
+    try insertDependency(gpa, io, manifest_path, name, cv.version);
+
+    try printStdout(io, "Added {s}@{s}\n  cached at {s}\n", .{ name, cv.version, cache_dir });
+}
+
+/// Add `"<name>": "^<major>.<minor>"` to the manifest's `dependencies` map,
+/// preserving the surrounding JSON5. v0 text-edits rather than reformatting.
+fn insertDependency(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    manifest_path: []const u8,
+    name: []const u8,
+    version: []const u8,
+) !void {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
+    defer gpa.free(raw);
+
+    const quoted = try std.fmt.allocPrint(gpa, "\"{s}\"", .{name});
+    defer gpa.free(quoted);
+    if (std.mem.indexOf(u8, raw, quoted) != null) {
+        try printStdout(io, "qube add: '{s}' is already referenced in the manifest; cache updated, manifest left as-is\n", .{name});
+        return;
+    }
+
+    // Caret spec from major.minor.
+    var spec_buf: [80]u8 = undefined;
+    const ver_spec = blk: {
+        const d1 = std.mem.indexOfScalar(u8, version, '.') orelse break :blk version;
+        const d2 = std.mem.indexOfScalarPos(u8, version, d1 + 1, '.') orelse version.len;
+        break :blk std.fmt.bufPrint(&spec_buf, "{s}", .{version[0..d2]}) catch version;
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    if (std.mem.indexOf(u8, raw, "\"dependencies\"")) |dep_key| {
+        // Insert right after the block's opening brace.
+        const brace = std.mem.indexOfScalarPos(u8, raw, dep_key, '{') orelse return error.MalformedManifest;
+        try out.appendSlice(gpa, raw[0 .. brace + 1]);
+        try out.print(gpa, "\n    \"{s}\": \"^{s}\",", .{ name, ver_spec });
+        try out.appendSlice(gpa, raw[brace + 1 ..]);
+    } else {
+        // No dependencies block: add one before the manifest's closing brace.
+        const close = std.mem.lastIndexOfScalar(u8, raw, '}') orelse return error.MalformedManifest;
+        try out.appendSlice(gpa, raw[0..close]);
+        try out.print(gpa, "  \"dependencies\": {{\n    \"{s}\": \"^{s}\",\n  }},\n", .{ name, ver_spec });
+        try out.appendSlice(gpa, raw[close..]);
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = out.items });
+}
+
+fn stripScheme(url: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, url, "https://")) return url[8..];
+    if (std.mem.startsWith(u8, url, "http://")) return url[7..];
+    return url;
+}
+
+fn readStdinLineAlloc(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    var r = std.Io.File.stdin().reader(io, &buf);
+    // The pinned zig returns a slice into the reader's buffer; copy it out so
+    // the caller owns it. Strip a trailing \r for CRLF terminals.
+    const line = try r.interface.takeDelimiterExclusive('\n');
+    const trimmed = if (line.len > 0 and line[line.len - 1] == '\r')
+        line[0 .. line.len - 1]
+    else
+        line;
+    return gpa.dupe(u8, trimmed);
+}
+
+// POSIX-only: disable terminal echo while reading the password.
+fn readPasswordSilent(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const fd = std.posix.STDIN_FILENO;
+    const old = std.posix.tcgetattr(fd) catch {
+        // Not a TTY (piped input, CI without QUBE_PASSWORD). Read plainly.
+        return try readStdinLineAlloc(gpa, io);
+    };
+    var new = old;
+    new.lflag.ECHO = false;
+    new.lflag.ECHONL = true;
+    std.posix.tcsetattr(fd, .FLUSH, new) catch {};
+    defer std.posix.tcsetattr(fd, .FLUSH, old) catch {};
+    return try readStdinLineAlloc(gpa, io);
 }

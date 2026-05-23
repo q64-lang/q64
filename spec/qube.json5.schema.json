@@ -16,10 +16,10 @@
 
     "name": {
       "type": "string",
-      "pattern": "^([a-z][a-z0-9_-]*/)?[a-z][a-z0-9_-]*$",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$",
       "minLength": 1,
-      "maxLength": 64,
-      "description": "Qube name in kebab-case. Optionally prefixed with an org as 'org/qube'."
+      "maxLength": 128,
+      "description": "Dotted name; each '.'-separated segment is a lowercase identifier [a-z][a-z0-9_]* (snake_case, no dashes). The name is also the module path. Publishable (library/application) qubes must use a reverse-DNS form with at least two segments, e.g. 'dev.q64.webmcp_client', 'com.acme.widget'; this is enforced at publish. 'q64.*' is reserved for the built-in stdlib. A single-segment name is permitted only for an unpublished workspace root."
     },
 
     "version": {

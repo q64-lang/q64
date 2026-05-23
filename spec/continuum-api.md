@@ -10,7 +10,8 @@ anonymous; write endpoints require a bearer token.
 ## Conventions
 
 - **Base URL:** the production registry. Default in `qube` is
-  `https://qubes.q64.dev` (final URL TBD; see open items in the plan).
+  `https://qubes.q64.dev`. The companion user-facing UI is at
+  `https://continuum.q64.dev`.
 - **API prefix:** `/v1`. A breaking change moves the prefix to `/v2`
   and the previous version is kept available for one major-release
   grace period.
@@ -42,8 +43,9 @@ GET /v1/qubes/{name}
 Returns the qube's manifest digest, latest stable version, version
 list, owners, and rendered README.
 
-Path parameter `{name}` is URL-encoded (handles the `org/qube` form
-as `org%2Fqube`).
+Path parameter `{name}` is the qube's dotted name verbatim
+(`dev.q64.webmcp_client`). Dots are URL-safe, so the name is always a
+single, unescaped path segment — no percent-encoding, no scope slash.
 
 ```json
 {
@@ -294,13 +296,13 @@ schema themselves.
   `qube` CLI; `fflate` on the Workers registry) and native double-click /
   drag-and-drop extraction on Windows. DEFLATE and the zip format are
   unencumbered (RFC 1951; no patents), like gzip.
-- Layout: a single root directory whose name is `<qube-name>-<version>`,
-  with any `/` in a scoped `org/qube` name replaced by `-` — e.g.
-  `q64/webmcp-client` at `0.1.0` packs under `q64-webmcp-client-0.1.0/`.
-  The directory holds `qube.json5` at its root plus the file set described
-  below. The directory name is presentational only: a qube's canonical
-  identity is its manifest `name` / `version` plus the archive's SHA-256
-  (below), so the dash-flattening need not be reversible.
+- Layout: a single root directory named `<qube-name>-<version>` — e.g.
+  `dev.q64.webmcp_client` at `0.1.0` packs under
+  `dev.q64.webmcp_client-0.1.0/`. Dotted names are filesystem-safe, so the
+  name appears verbatim (no flattening). The directory holds `qube.json5`
+  at its root plus the file set described below. The directory name is
+  presentational only: a qube's canonical identity is its manifest
+  `name` / `version` plus the archive's SHA-256 (below).
 - Default file set (when `include` is **absent** in the manifest):
   `qube.json5`, every file under `src/`, every file under `tests/`,
   every file under `examples/` (and a top-level `example/`), the README

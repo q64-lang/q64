@@ -1,0 +1,26 @@
+{
+  "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
+  "name": "q64-continuum",
+  "main": "src/index.tsx",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  "routes": [
+    { "pattern": "continuum.q64.dev", "custom_domain": true }
+  ],
+
+  // Service binding into the API Worker. UI Worker calls the API directly
+  // via env.API.fetch(...) — no public-internet hop, no token needed for
+  // server-rendered reads.
+  "services": [
+    {
+      "binding": "API",
+      "service": "q64-continuum-api"
+    }
+  ],
+
+  "vars": {
+    "ENV": "dev"
+  }
+}

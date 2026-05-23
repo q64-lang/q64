@@ -83,14 +83,27 @@ upstream resource-transfer story (not part of WASIp3 async).
 ## Vocabulary
 
 The spec is consistent about a handful of words that easily blur
-together. When in doubt, this table is authoritative:
+together. When in doubt, this table is authoritative.
+
+**Case carries meaning.** Brand names are Capitalized — **Q64**,
+**Qube**, **Continuum** — and appear in headings, marketing, and
+running prose. CLI commands are always monospace lowercase —
+`q64`, `qube` — and only appear in code blocks, command examples,
+and shell output. For the noun **qube** specifically, case is *also*
+semantic: lowercase **qube** is a library; Capitalized **Qube** is a
+deployable artifact (see [`qube.json5.md`](./qube.json5.md)'s
+`type` field). Lowercase plural **qubes** is the generic term
+covering both.
 
 | Word          | Meaning                                                                                            |
 |---------------|----------------------------------------------------------------------------------------------------|
-| **qube**      | The unit of distribution — a directory with a `qube.json5` at its root. What you publish, depend on, and import. |
-| **qube** *(binary)* | The `qube` CLI tool — package and build operations. The repo glossary in [`../README.md`](../README.md) distinguishes the two by context. |
-| **q64**       | The language. Also the name of the language CLI tool (`q64 build`, `q64 fmt`, `q64 lsp`).         |
-| **continuum** | The registry — the q64 package hub. Hosted at `qubes.q64.dev`; the wire contract is [`continuum-api.md`](./continuum-api.md). |
+| **qube**             | A library qube — `type: "library"`, exports a surface, no `main`. Linked into other qubes statically (dynamic linkage later). |
+| **Qube**             | A deployment artifact qube — `type: "application"`, requires a `main`. The runnable unit. |
+| **qubes** *(plural)* | The generic noun, covering both libraries and deployable artifacts. What you browse in the Continuum. |
+| **`qube`** *(CLI)*   | The `qube` CLI tool — package and build operations against the manifest. |
+| **Q64**              | The language. Also the brand wordmark for the product family. |
+| **`q64`** *(CLI)*    | The language CLI tool (`q64 build`, `q64 fmt`, `q64 lsp`).         |
+| **Continuum**        | The registry — where all qubes exist. UI at `continuum.q64.dev`; HTTP API at `qube.q64.dev`. Wire contract: [`continuum-api.md`](./continuum-api.md). |
 | **face**      | A type-class-style polymorphism construct (≈ trait / typeclass / protocol). *Not* a WIT `interface` — see the `interface` row below and [`faces.md`](./faces.md). |
 | **fit**       | A binding of a type to a face (≈ impl). See [`faces.md`](./faces.md).                              |
 | **region**    | An allocator with a lifetime. The single noun for memory ownership in q64. See [`memory.md`](./memory.md). |

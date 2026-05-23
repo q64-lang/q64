@@ -5,6 +5,77 @@ ticked off as they land. Long-form design questions live in
 [`docs/history/MIGRATION.md`](./docs/history/MIGRATION.md); this file is
 for items the next session should be able to pick up and act on.
 
+## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
+
+The registry and the package up/download loop are **done and live**. The
+remaining work to make a qube actually *run* a linked dependency lives almost
+entirely in the compiler. Definition of done: `dev.q64.hello_app` prints
+`0.1.0` by calling `dev.q64.hello_world.version()`.
+
+Reproduce the current wall (test pair lives in `/tmp/q64-demo/`, may not
+survive a reboot — recreate from the snippets below if gone):
+
+```
+QUBE=qube/zig-out/bin/qube ; Q64=q64/zig-out/bin/q64
+cd /tmp/q64-demo/hello_app
+Q64_BIN=$Q64 $QUBE run            # → SyntaxError: qube run still uses strict JSON
+$Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version()}"
+```
+
+### Done this session (for the trail)
+- [x] Registry: JSON5 manifest-read fix + publish-time name validation, deployed
+      to `qubes.q64.dev` (`continuum-api/src/routes/qubes.ts`).
+- [x] Naming → reverse-DNS dotted snake_case (`dev.q64.webmcp_client`); name =
+      module path = URL segment, no transforms; `q64.*` reserved for stdlib.
+      Specced across `qube.json5.md`/`.schema.json`, `modules.md`,
+      `continuum-api.md`, `q64-cli.md`, `qube-cli.md`.
+- [x] `qube login` / `publish` / `add` implemented (`qube/src/main.zig`) and
+      tested live: publish packs+uploads; add resolves → downloads → SHA-256
+      verifies → extracts to `~/.qube/cache/sha256/<ab>/<cd>/<digest>/` → edits
+      the manifest's `dependencies`.
+- [x] Test pair built: `dev.q64.hello_world` (published, live) + `dev.q64.hello_app`.
+
+### The linking ladder (do in order)
+0. [ ] **DO FIRST.** `q64 emit` must **error** on constructs it can't compile,
+       not silently embed them (today `"{version()}"` is emitted verbatim, and
+       `import` lines are ignored). Establishes an honest baseline so every step
+       below fails loudly and progress is measurable. Tiny change in
+       `q64/src/codegen/emit.zig` (`emitFromSource`/`emitFn`): the catch-all
+       arms already return `Error.Unsupported*` — extend them to reject
+       interpolated strings and surface ignored imports, and make `q64 emit`
+       report the error instead of writing a module.
+1. [ ] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
+       `cmdRun`/`cmdWeb` use strict `std.json` → any real manifest with
+       comments/trailing commas fails). **Gate to running anything.**
+2. [ ] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
+       repeatable. Spec: `q64-cli.md:71`.
+3. [ ] Import resolution in codegen (`q64/src/codegen/emit.zig`): resolve
+       `import dev.q64.hello_world.{version}` via the `--module` map to the
+       cached lib's `src/`, per `modules.md` resolution algorithm.
+4. [ ] `qube run`/`build` pass `--module` per dependency (map manifest dep →
+       cache dir; wants the `qube.lock` below).
+5. [ ] Codegen: function defs with return values + cross-module calls
+       (`fn version() -> str`). Blocked on the open parser productions in
+       "Other open items" (struct/import/fn-body, statements, expressions).
+6. [ ] Codegen: string interpolation `"{expr}"` — evaluate, format, concat.
+
+Long pole: 5–6 sit on the parser productions still open below — codegen can't
+walk what the parser doesn't produce. That parser work is the real critical path.
+
+### Deferred package bits (not compiler; pick up anytime)
+- [ ] `qube.lock` — `add` doesn't write one; needed for ladder step 4.
+- [ ] `add` dedup + `--offline` / `--frozen` / `--locked` flags.
+- [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
+- [ ] `qube remove` / `install` / `outdated` still stubs.
+
+### Notes for the next agent
+- Build with the **vendored** zig: `vendor/zig/zig build` (homebrew zig at
+  `/opt/homebrew/bin/zig` has different `std.Io` APIs). The login command had
+  stale `takeDelimiterExclusive`/`readAllAlloc` calls fixed this session to
+  match the pinned zig — watch for the same drift elsewhere.
+- Deploy the registry: `cd continuum-api && CLOUDFLARE_ACCOUNT_ID=*** pnpm run deploy` (needs `wrangler login`, account ***).
+- Registry auth is the dev bypass `***` / `***` (`continuum-api/src/routes/auth.ts`, flagged for deletion when OAuth lands).
+
 ## C bindings
 
 Two distinct questions, both currently "planned, not active."
