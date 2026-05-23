@@ -137,6 +137,46 @@
       "description": "Runtime capabilities this qube reaches (Net, Fs, Audio, Midi, Ui, AiEnv, Clock, Rng, Stdout, Stderr). Cross-checked at `qube publish` against the compiler-derived set from the effect graph; mismatch is ENV040. See spec/env.md."
     },
 
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Opt-in WebAssembly Component Model emission. The default build produces a core module; this requests an additional component wrapper. See spec/qube.json5.md §Component and spec/modules.md.",
+      "properties": {
+        "emit": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, `qube build` also emits target/<host>/<name>.component.wasm wrapping the core module. The core module remains the primary artifact."
+        },
+        "world": {
+          "type": "string",
+          "description": "Name of the synthesized WIT world (exports = public surface, imports = derived capability set). Defaults to the qube name."
+        },
+        "worlds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional standard worlds the component targets, e.g. wasi:cli/command, wasi:http/proxy."
+        }
+      }
+    },
+
+    "rpc": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Qube-to-qube RPC over the synthesized component world (wRPC). Requires component.emit. See spec/rpc.md.",
+      "properties": {
+        "export": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, the component's exports are served over wRPC by the host adapter."
+        },
+        "import": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Maps a remote qube's local binding name to its wRPC address (a wrpc:// URL or continuum-resolved qube name). Calls into an imported remote function carry the @wire effect."
+        }
+      }
+    },
+
     "publish": {
       "type": "boolean",
       "default": true,
@@ -291,7 +331,7 @@
     "EffectMarker": {
       "type": "string",
       "pattern": "^@[a-z][a-z_]*$",
-      "description": "Effect marker. Core set: @realtime, @no_alloc, @no_suspend, @no_panic, @no_trap, @send, @pure, @io, @network, @fs, @stdout, @stderr, @audio, @midi, @ui, @inference, @time, @random, @exit, @envvars, @cancel, @uncancellable. User-defined effects are allowed and follow the same shape."
+      "description": "Effect marker. Core set: @realtime, @no_alloc, @no_suspend, @no_panic, @no_trap, @send, @pure, @io, @network, @fs, @stdout, @stderr, @audio, @midi, @ui, @inference, @time, @random, @exit, @envvars, @wire, @cancel, @uncancellable. User-defined effects are allowed and follow the same shape."
     },
 
     "CapabilityName": {

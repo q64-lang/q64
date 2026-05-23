@@ -251,6 +251,27 @@ This is the data behind "what does this qube ultimately touch" —
 shown in the registry UI on every qube detail page and in
 `qube audit` output.
 
+### RPC endpoint resolution
+
+A qube that serves an RPC world (`rpc.export: true`, per
+[`qube.json5.md` §RPC](./qube.json5.md)) registers a **served world** and an
+**endpoint address** alongside its capability/effect metadata. A consumer's
+`rpc.import` may name a qube instead of a literal `wrpc://…` URL; the
+resolver maps the name to its endpoint here, the same way it resolves a
+dependency version:
+
+```
+GET /v1/qubes/{name}/{version}/world
+```
+
+returns the synthesized WIT world the qube serves and its endpoint
+address(es). Because importing a remote qube adds `@wire` to the consumer's
+effect set (per [`effects.md`](./effects.md) and [`rpc.md`](./rpc.md)), the
+remote dependency is disclosed in `qube audit` like any capability — the
+`@wire` reach and the served world appear at `qube add` time. The endpoint
+itself may be a qubepods deployment (per [`env.md`](./env.md)), whose
+`wasi:http` endpoint doubles as the wRPC server.
+
 ## Schema validation endpoint (optional)
 
 ```

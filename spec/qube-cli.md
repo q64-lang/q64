@@ -44,6 +44,7 @@ qube --help    | -h
 |-----------------------------------|---------------------------------------------------------------------------|
 | `--manifest <path>`               | Path to a specific `qube.json5` (default: nearest ancestor)               |
 | `--target <name>`                 | Target name from the manifest's `targets` map                             |
+| `--component`                     | On `build` / `run`: also emit a component wrapping the core module (overrides `component.emit`). Delegates to `q64 build --component`; writes `target/<host>/<name>.component.wasm` alongside the core module. See [`qube.json5.md` §Component](./qube.json5.md). |
 | `--release` / `--debug`           | Shortcuts for `optimize: speed` / `optimize: debug`                       |
 | `--offline`                       | Refuse network access; fail if cache misses                               |
 | `--frozen`                        | Refuse to update the lockfile; fail if it would change                    |
@@ -72,6 +73,7 @@ Build outputs land under `target/` next to `qube.json5`:
 target/
   debug/                       # default for `qube build`
     <qube-name>.wasm
+    <qube-name>.component.wasm        # only with --component / component.emit; wraps the core module
     <qube-name>.runtime.{js,zig}      # runtime adapter for the chosen target host
     <qube-name>.effects.json          # effect index emitted by q64
     <qube-name>.graph.json            # stream-graph topology (if any stages)

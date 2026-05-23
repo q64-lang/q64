@@ -222,6 +222,95 @@ Wasmtime → `WasmtimeNet`; etc.); user code never names the
 concrete fit. Test code and libraries provide their own fits
 through the override mechanism below.
 
+## Env and the Component Model (WASI Preview 2)
+
+When a qube is emitted as a **component** (opt-in; per
+[`modules.md` §"The qube as a component"](./modules.md) and
+[`README.md` §"Wasm 3.0 is the platform"](./README.md)), each capability
+the program uses becomes a **component import** the host supplies. For the
+capabilities that have a standard WASI counterpart, the import *is* the
+WASI Preview 2 interface — no q64-specific host ABI. The mapping is a
+column-extension of the `Env`-fields table above; the same row keys.
+
+### Env ↔ WASI Preview 2
+
+| `Env` field | Capability face | WASI Preview 2 interface(s) |
+|-------------|-----------------|------------------------------|
+| `env.out`     | `Stdout`   | `wasi:cli/stdout`                                        |
+| `env.err`     | `Stderr`   | `wasi:cli/stderr`                                        |
+| `env.exit`    | `ExitFn`   | `wasi:cli/exit`                                          |
+| `env.args`    | `[str]`    | `wasi:cli/environment` (`get-arguments`)                |
+| `env.envvars` | `EnvVars`  | `wasi:cli/environment` (`get-environment`)              |
+| `env.time`    | `Clock`    | `wasi:clocks/{wall-clock, monotonic-clock}`             |
+| `env.random`  | `Rng`      | `wasi:random/random` (+ `insecure-seed` for non-crypto) |
+| `env.net`     | `Net`      | `wasi:sockets/{tcp, udp, instance-network, ip-name-lookup}` + `wasi:http/outgoing-handler` (outbound HTTP) |
+| `env.fs`      | `Fs`       | `wasi:filesystem/{types, preopens}`                     |
+| `env.audio`   | `Audio`    | **no WASI P2 equivalent** — host-specific custom WIT    |
+| `env.midi`    | `Midi`     | **no WASI P2 equivalent** — host-specific custom WIT    |
+| `env.ui`      | `Ui`       | **no WASI P2 equivalent** — host-specific custom WIT    |
+| `env.ai`      | `AiEnv`    | **no WASI P2 equivalent** — host-specific custom WIT    |
+
+The WASI version is not pinned here; it tracks the active target's `wasi`
+setting (`targets.<name>.wasmtime.wasi`, default `"preview2"` —
+[`qube.json5.md` §Targets](./qube.json5.md)). The four capabilities with no
+WASI interface (`Audio`, `Midi`, `Ui`, `AiEnv`) are imported through custom
+WIT defined per runtime adapter (`runtime/<host>/`); they are q64-ecosystem
+interfaces, not WASI.
+
+### Face method ↔ WIT function mapping
+
+A capability face becomes a component **import**: the host supplies the fit.
+Each face method maps to a WIT function on the corresponding interface, and
+the q64 `self` receiver is realized as an adapter-held WASI **resource
+handle** that q64 user code never sees:
+
+| q64 face method | WIT function |
+|-----------------|--------------|
+| `Fs.read(self, path: str) -> Result<Bytes, IoError>`  | `wasi:filesystem/types.descriptor.read` (handle held by the adapter) |
+| `Fs.write(self, path: str, data: Bytes) -> Result<(), IoError>` | `wasi:filesystem/types.descriptor.write` |
+| `Net.get(self, url: Url) -> Result<Response, IoError>` | `wasi:http/outgoing-handler.handle` (request/response via `wasi:http/types`) |
+| `Stdout.write(self, s: str)`                          | `wasi:cli/stdout.get-stdout` → `wasi:io/streams.output-stream.blocking-write-and-flush` |
+
+The mapping direction is fixed: **capability faces are imports** (the world
+*needs* them from the host); the qube's own public functions are exports
+(§3). WASI **resources** (the open-stream / descriptor handles) are an
+adapter-internal concept — they are deliberately **not** surfaced as q64
+faces or fits (which would blur the [`faces.md`](./faces.md) boundary) and
+are **not** transmissible over RPC (they reference instance-local state; see
+[`rpc.md`](./rpc.md)). q64 user code only ever sees the typed face method.
+
+### HTTP service entry point (`wasi:http`)
+
+A qube can serve HTTP by exporting a handler instead of (or alongside) a
+`main`. The handler is a normal `pub fn` carrying the **`@http_handler`**
+annotation (per [`annotations.md`](./annotations.md)); the name is free:
+
+```q64
+@http_handler
+pub fn handle(req: Request) -> Response @network {
+    Response.ok("Hello, q64.")
+}
+```
+
+When the qube is emitted as a component, the `@http_handler` function is
+exported as `wasi:http/incoming-handler`; the manifest opts in via
+`component.worlds: ["wasi:http/proxy"]` ([`qube.json5.md` §Component](./qube.json5.md)).
+The core module just exports an ordinary function — the component wrapper is
+what makes it an HTTP handler.
+
+`Request` and `Response` here are **`wasi:http`-shaped types** (mapping to
+`wasi:http/types.incoming-request` and `outgoing-response`), distinct from
+the client-side `Response` returned by `Net.get` above: a server request is
+not the same shape as a client response. Both lower per the canonical-ABI
+rules in [`modules.md` §"The qube as a component"](./modules.md).
+
+This is the integration point for **qubepods**, which serves each qube as a
+per-qube HTTPS endpoint: a qube built with `component: { emit: true, worlds:
+["wasi:http/proxy"] }` is a drop-in endpoint runnable under generic
+Component Model HTTP lifting (`wasmtime serve`, componentize-js / jco on
+Cloudflare Workers, or wasmCloud) with no qubepods-specific ABI. The same
+endpoint doubles as a wRPC server (see [`rpc.md`](./rpc.md)).
+
 ## `main` signature
 
 `main` may be declared two ways. Both are valid; the runtime
@@ -460,6 +549,13 @@ The mapping is 1:1 from effect marker to capability face. Every
 capability is reachable through an effect marker on the relevant
 `Env`-field method; no side-channel from call-site reachability.
 
+The one capability effect with **no** `Env` field is `@wire` (per
+[`effects.md`](./effects.md) and [`rpc.md`](./rpc.md)): it is not an
+ambient `env.X` capability but arises from calling an *imported remote
+qube's* function. It still discloses like the others — it appears in the
+derived set, in `qube audit`, and in the component's import list — but its
+"capability" is an imported remote `world`, not an `Env` field.
+
 ### `qube publish` cross-check
 
 The two must match. `qube publish` runs the cross-check; mismatch
@@ -508,6 +604,14 @@ compiler walks for the derived set. Effect propagation rules
 (transitive closure across calls, opaque user effects, `@send`
 derivation) are specified in `effects.md` and apply unchanged to
 both ambient-referenced and explicitly-passed capability values.
+
+The same derived set is what becomes a **component's import list** when a
+qube is emitted as a component: each capability effect maps to the WASI (or
+host-specific) WIT interface it imports. q64's compile-time capability proof
+*is* the host-visible import surface — the synthesis rule and the full
+effect→WIT-import table are specified in
+[`effects.md` §"Effects and the Component Model"](./effects.md), which is
+authoritative; this file is the home of the WASI-interface specifics above.
 
 ### `@realtime` and capabilities
 

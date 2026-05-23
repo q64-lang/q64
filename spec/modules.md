@@ -192,7 +192,7 @@ section indexes them.
 | Bindings & arrays      | `let`, `var`, `[T]`, `[T; N]`, `ref`                           | [`types.md`](./types.md) §"Bindings", §"Arrays and slices", §"References" |
 | Compound numerics      | `Simd`, `Tensor`, `DynTensor`                                  | [`types.md`](./types.md) §"SIMD and Tensor as language types" |
 | Optionality / errors   | `Option`, `Result`, `T?`, `try`, `panic`, `trap`, `PanicMessage`, `Cancelled`, `Closed`, `RuntimeDenied`, `RangeError` | [`errors.md`](./errors.md) §"Auto-prelude additions" |
-| Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error`, `Panic` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) + [`test-framework.md`](./test-framework.md) (`Arbitrary` interface) |
+| Auto-prelude faces     | `Eq`, `Ord`, `Hash`, `Clone`, `Display`, `Debug`, `Iterator`, `Default`, `From`, `Into`, `TryFrom`, `TryInto`, `Arbitrary`, `Error`, `Panic` | [`faces.md`](./faces.md) §"Auto-prelude faces" + [`errors.md`](./errors.md) + [`test-framework.md`](./test-framework.md) (`Arbitrary` face) |
 | Collections            | `Vec`, `Map`, `Set`, `Box`, `Bytes`                            | [`memory.md`](./memory.md) §"Region parameters in types" |
 | Regions                | `Region`, `Arena`, `Pool`, `Stack`, `FreeList`, `Managed`, `Interned`, `scope`, `transfer` | [`memory.md`](./memory.md) §"Region kinds"     |
 | Shared memory          | `Atomic`, `Shared`, `ManagedBox`, `Mutex`, `RwLock`, `LockFree`, `Disjoint` | [`memory.md`](./memory.md) §"Shared regions", §"`Shared<T, P>` policies" |
@@ -328,6 +328,74 @@ name is re-exported is *navigable* across the boundary, but the
 re-export wall still applies per-name. Selective imports of
 unre-exported names are `NAM007`, never `NAM010` — the missing
 ingredient is the re-export, not the declaration.
+
+## The qube as a component (opt-in)
+
+A qube's default build artifact is a **core module** (per
+[`README.md` §"Wasm 3.0 is the platform"](./README.md)). When component
+emission is requested — `qube build --component`, or `component.emit: true`
+in the manifest ([`qube.json5.md` §Component](./qube.json5.md)) — q64 wraps
+that unmodified core module in a WebAssembly **component** whose **WIT
+`world` is synthesized, not authored**:
+
+- **Exports** = the qube's public surface — exactly the names reachable
+  through the re-export wall above. No new visibility concept: the component
+  export set *is* the existing `pub use` surface.
+- **Imports** = the qube's compiler-derived capability set (per
+  [`env.md` §"Inferred capability set"](./env.md) and the effect→WIT-import
+  table in [`effects.md` §"Effects and the Component Model"](./effects.md)).
+
+The core module is always the primary artifact; the component embeds it and
+adds canonical-ABI lifting glue. The default build is unaffected.
+
+### Lowering q64 types to the canonical ABI
+
+A `pub` function may be a component export only if its parameter and return
+types lower to the WIT canonical ABI. The mapping:
+
+| q64 type | WIT type |
+|----------|----------|
+| `i8`…`i64`                 | `s8`…`s64`           |
+| `u8`…`u64`                 | `u8`…`u64`           |
+| `f32`, `f64`               | `f32`, `f64`        |
+| `bool`                     | `bool`              |
+| `str`, `String`            | `string`            |
+| `[T]`                      | `list<T>`           |
+| `Bytes`                    | `list<u8>`          |
+| `Option<T>`                | `option<T>`         |
+| `Result<T, E>`             | `result<T, E>`      |
+| struct                     | `record`            |
+| enum (data-free)           | `enum`              |
+| enum (with payloads)       | `variant`           |
+
+**Unlowerable** — these cannot cross the canonical ABI and a `pub` function
+using one in its signature is rejected when component emission is on (a
+`CMP`-band diagnostic per [`diagnostics.md`](./diagnostics.md)):
+`ref T` (borrows are region-local), region-parameterized types, managed /
+WasmGC references, closures, and faces-as-values. WIT `resource`s are an
+adapter-internal concept and are likewise never part of a q64 export
+signature (see [`env.md`](./env.md)).
+
+### `@no_component_lift`
+
+The `@no_component_lift` annotation (per [`annotations.md`](./annotations.md))
+excludes a `pub` function from the component export surface: it stays
+callable inside the core module but is not lifted across the canonical ABI.
+**Every `@realtime` function is implicitly `@no_component_lift`** — canonical-
+ABI lifting copies/allocates at the boundary, which violates `@realtime`'s
+no-alloc/no-suspend contract (per [`effects.md`](./effects.md) and
+[`env.md` §"`@realtime` and capabilities"](./env.md)). Real-time code thus
+never crosses a component boundary; it is reachable only from within the
+core module.
+
+### The world is also the RPC contract
+
+The same synthesized `world` is the contract q64 uses for qube-to-qube
+**RPC** (see [`rpc.md`](./rpc.md)): a qube that *imports* a remote qube's
+world calls its exports as ordinary functions that carry the `@wire` effect,
+and the canonical-ABI value encoding above doubles as the wire format. An
+imported remote qube therefore appears in this qube's world as an import,
+exactly like a capability. No separate IDL is authored.
 
 ## Resolution algorithm (overview)
 

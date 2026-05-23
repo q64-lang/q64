@@ -138,6 +138,8 @@ reader which subsystem raised it:
 | `CMT`   | Comptime evaluation                             |
 | `CGN`   | Codegen                                         |
 | `LNK`   | Linker / wasm assembly                          |
+| `CMP`   | Component emission (WIT world synthesis, canonical-ABI lowering) |
+| `RPC`   | Remote procedure call (`@wire`, wRPC wire, transports)          |
 | `FMT`   | Formatter                                       |
 | `LSP`   | Language server                                 |
 | `PKG`   | qube — manifest / resolver                      |

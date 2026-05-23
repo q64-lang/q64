@@ -262,6 +262,7 @@ Core effect markers (per [`effects.md`](./effects.md), with
 | `@random`      | Reads from the system RNG.                                    |
 | `@exit`        | Terminates the program via `env.exit(…)`.                     |
 | `@envvars`     | Reads process environment variables.                          |
+| `@wire`        | Performs a remote (RPC) call. Implies `@io`. (Per `rpc.md`.)  |
 | `@cancel`      | Function observes `ctx.cancelled()`. (Per `concurrency.md`.) |
 | `@uncancellable`| Function cannot be interrupted by cancellation.              |
 
@@ -319,6 +320,67 @@ gets one clean fix on each publish attempt.
 User-defined capabilities (introduced by `fit MyAdapter : Net`
 or by user-defined effect markers) are listed by the
 PascalCase name of the underlying face.
+
+### Component
+
+Opt-in WebAssembly Component Model emission. The default build produces a
+**core module**; this block requests an additional **component** wrapper
+(per [`modules.md` §"The qube as a component"](./modules.md) and
+[`README.md` §"Wasm 3.0 is the platform"](./README.md)).
+
+```json5
+component: {
+  emit:   false,        // default — primary artifact stays a core module
+  world:  "my-app",     // synthesized world name; default = qube name
+  worlds: [],           // additional WIT worlds to target, e.g. "wasi:http/proxy"
+  // WASI version is not pinned here; it tracks targets.<name>.wasmtime.wasi
+}
+```
+
+| Field    | Type     | Default       | Notes                                                             |
+|----------|----------|---------------|-------------------------------------------------------------------|
+| `emit`   | bool     | `false`       | When `true`, `qube build` also emits `target/<host>/<name>.component.wasm` alongside the core module. The core module remains the primary artifact. |
+| `world`  | string   | qube name     | Name of the synthesized WIT world (exports = public surface, imports = derived capability set). |
+| `worlds` | string[] | `[]`          | Additional standard worlds the component targets, e.g. `"wasi:cli/command"`, `"wasi:http/proxy"`. |
+
+Equivalent to `component.emit: true` for a one-off build:
+`qube build --component` (which delegates to `q64 build --component`).
+
+An HTTP-serving qube (per [`env.md` §"HTTP service entry point"](./env.md))
+opts in with:
+
+```json5
+component: { emit: true, world: "my-api", worlds: ["wasi:http/proxy"] }
+```
+
+This makes the qube a drop-in **qubepods** endpoint runnable under generic
+Component Model HTTP lifting, with no qubepods-specific ABI.
+
+### RPC
+
+Qube-to-qube remote calls over the synthesized world (full semantics in
+[`rpc.md`](./rpc.md)). Requires `component.emit: true` — RPC rides the
+component's WIT world.
+
+```json5
+rpc: {
+  export: true,                          // expose this qube's world as a wRPC service
+  import: {                              // remote qubes this qube calls
+    "billing": "wrpc://billing.example.com",
+  },
+}
+```
+
+| Field    | Type            | Default | Notes                                                                       |
+|----------|-----------------|---------|-----------------------------------------------------------------------------|
+| `export` | bool            | `false` | When `true`, the component's exports are served over wRPC by the host adapter. |
+| `import` | { name: addr }  | `{}`    | Maps a remote qube's local binding name to its wRPC address (a qubepods endpoint or continuum-resolved address). Calls into an imported remote function carry the `@wire` effect. |
+
+A remote address may be a literal `wrpc://…` URL or a continuum-registered
+qube name resolved at build/deploy time (see
+[`continuum-api.md`](./continuum-api.md)). Importing a remote qube adds
+`@wire` to the caller's effect set and the remote world to the component's
+imports, so the dependency is disclosed in `qube audit` like any capability.
 
 ### Publishing
 

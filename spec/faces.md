@@ -1,7 +1,7 @@
 # Faces and Fits
 
 How q64 expresses type-class-style polymorphism: declaring shared
-interfaces with `face`, binding types to faces with `fit`, and the
+abstractions with `face`, binding types to faces with `fit`, and the
 q64-native extensions (effect-polymorphism, region-parameterization,
 auto-derive, and laws).
 
@@ -89,7 +89,7 @@ three keywords and following the arrows between them.
 
 | Word     | Meaning                                                                     |
 |----------|-----------------------------------------------------------------------------|
-| `face`   | A named interface — methods, associated types, default impls, and laws.      |
+| `face`   | A named type-class abstraction — methods, associated types, default impls, and laws. q64's analog of a trait / protocol; *not* a WIT `interface` (see [`README.md`](./README.md) vocab). |
 | `fit`    | A binding that says "this type (or these types) fit this face."             |
 | **bound**| A constraint on a generic parameter — `T: Eq` reads "`T` must fit `Eq`." |
 | **dyn**  | A type position that erases the concrete type and dispatches at runtime.    |

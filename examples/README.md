@@ -25,3 +25,19 @@ tests for the compiler, the stdlib, and the runtime adapters.
 
 Each example is its own qube with a `qube.json5` declaring its dependencies
 on stdlib namespaces.
+
+## Component / RPC verification slices
+
+These small examples are the verification ladder for the Component Model and
+RPC spec (`spec/modules.md`, `spec/env.md`, `spec/rpc.md`). They reuse the
+hello shape so they can be validated as the toolchain becomes capable of
+component emission.
+
+- **`hello-component/`** — the hello program emitted as a component targeting
+  `wasi:cli/command` (`@stdout` → `wasi:cli/stdout`). Proves core-module
+  embedding and one capability-import lift. *(Slice A.)*
+- **`hello-component-http/`** — an `@http_handler` exporting
+  `wasi:http/incoming-handler`; the qubepods-shaped endpoint. *(Slice B.)*
+- **`rpc-server/`** + **`rpc-client/`** — the server serves its world over
+  wRPC; the client imports it and calls `greet`, the call carrying `@wire`.
+  *(Slice C.)*
