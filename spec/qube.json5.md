@@ -206,8 +206,8 @@ targets: {
       coep: "require-corp",           // default
       "dev-server-port": 5173,
     },
-    wasmtime: { wasi: "preview3" },   // default "preview3" (WASIp3 RC); "preview2" / "preview1" also valid
-    wasmer:   { wasi: "preview2" },   // or "preview3", "preview1", "wasix"
+    wasmtime: { wasi: "preview3" },   // default "preview3" (WASIp3 RC); "preview1" for legacy core-module hosts
+    wasmer:   { wasi: "preview3" },   // or "preview1" (legacy core module), "wasix"
     "audio-host": {
       formats: ["vst3", "au", "aax", "clap"],
     },

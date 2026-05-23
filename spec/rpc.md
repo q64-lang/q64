@@ -151,9 +151,11 @@ A `pub fn` exposed for RPC may return (or take) a `Future<T>` or `Stream<T, R>`
 of otherwise-lowerable value types; these lower to WIT `future<T>` / `stream<T>`
 and travel over wRPC without a polling shim — the same bridge the
 `Signal` / `Event` / `Stream` family uses at the component boundary
-([`streams.md`](./streams.md)). This is available under the `preview3` target
-(the default); the `preview2` fallback target has no native async ABI, so a
-`future<T>` / `stream<T>` in an RPC signature under `preview2` is `RPC012`.
+([`streams.md`](./streams.md)). RPC requires the Component Model, and the only
+Component Model WASI target is `preview3` (the default and sole component
+target — there is no Preview 2 fallback; see [`env.md`](./env.md)), so native
+async is available wherever RPC is. A `future<T>` / `stream<T>` in an RPC
+signature under a non-component target such as `preview1` is `RPC012`.
 
 Because q64 tracks the WASIp3 **release candidate**, the wire encoding for
 `future` / `stream` follows the pinned snapshot (see [`env.md`](./env.md)) and
@@ -175,7 +177,7 @@ All RPC diagnostics use the `RPC` prefix (per
 |----------|--------------------------------------------|-----------------------------------------------------------------------------------|
 | `RPC010` | non-value type in RPC signature            | A `pub fn` exposed for RPC uses an unlowerable type (`ref`, region, managed, closure, face-value, resource) in a parameter or return position. |
 | `RPC011` | `rpc.export` without `component.emit`      | The manifest sets `rpc.export: true` but does not emit a component; RPC rides the component world. |
-| `RPC012` | async RPC type under non-`preview3` target | A `future<T>` / `stream<T>` appears in an RPC signature, but the active target's `wasi` setting is not `preview3`; native async lowering is unavailable. |
+| `RPC012` | async RPC type under non-component target | A `future<T>` / `stream<T>` appears in an RPC signature, but the active target's `wasi` setting is not the Component Model target `preview3` (e.g. `preview1`); native async lowering is unavailable. |
 | `RPC020` | remote world unavailable                   | An imported endpoint could not be reached or served no matching world at build/resolve time. |
 | `RPC021` | remote world version mismatch              | The imported endpoint's world is incompatible with the locally resolved contract. |
 

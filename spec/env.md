@@ -248,10 +248,12 @@ every upstream RC release** until WASI 1.0:
 - The pinned snapshot is recorded in the emitted component's WIT package
   versions and surfaced by `qube audit`, so a component declares exactly which
   RC it was built against.
-- `preview2` remains a selectable **stable fallback** target
-  (`targets.<name>.wasmtime.wasi: "preview2"`). Under `preview2` the native
-  async ABI is unavailable, so `Stream<T, R>` / `Future<T>` cannot cross the
-  component boundary or the wire (see [`rpc.md`](./rpc.md) `RPC012`).
+- There is **no Preview 2 fallback**. q64 commits fully to WASIp3 — Preview 2
+  is not a selectable target. The only frozen ABI floor a consumer gets is the
+  pinned RC snapshot itself; until WASI 1.0 there is no long-term-stable WASI
+  target, and re-pinning is the mechanism for moving forward. (`preview1`
+  remains available for legacy **core-module** hosts that predate the
+  Component Model; it carries no component, no native async, and no RPC.)
 
 ### Env ↔ WASI Preview 3
 

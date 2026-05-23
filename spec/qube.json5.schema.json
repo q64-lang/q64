@@ -304,14 +304,14 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "wasi": { "enum": ["preview1", "preview2", "preview3"], "default": "preview3" }
+            "wasi": { "enum": ["preview1", "preview3"], "default": "preview3" }
           }
         },
         "wasmer": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "wasi":  { "enum": ["preview1", "preview2", "preview3", "wasix"], "default": "preview2" }
+            "wasi":  { "enum": ["preview1", "preview3", "wasix"], "default": "preview3" }
           }
         },
         "audio-host": {

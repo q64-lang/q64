@@ -58,9 +58,10 @@ language and runtime grow into them:
   `Atomics.wait`-shaped q64 primitives.
 - **WASI integration** — `env.fs`, `env.net`, `env.process`,
   `env.clock` wired to WASI Preview 3 (WASIp3 RC, Wasmtime 43+;
-  snapshot `0.3.0-rc-2026-03-15`) components, with Preview 2 as the
-  selectable stable fallback. See [`spec/env.md`](../../spec/env.md)
-  §"Tracking the WASIp3 release candidate".
+  snapshot `0.3.0-rc-2026-03-15`) components. Preview 2 is not
+  supported; `preview1` remains only for legacy core-module hosts.
+  See [`spec/env.md`](../../spec/env.md) §"Tracking the WASIp3
+  release candidate".
 - **Host calls** — BLAS / cBLAS bindings for `q64.math` large-shape
   operations.
 
