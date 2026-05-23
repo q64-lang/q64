@@ -206,8 +206,8 @@ targets: {
       coep: "require-corp",           // default
       "dev-server-port": 5173,
     },
-    wasmtime: { wasi: "preview2" },   // default "preview2"
-    wasmer:   { wasi: "preview2" },   // or "preview1", "wasix"
+    wasmtime: { wasi: "preview3" },   // default "preview3" (WASIp3 RC); "preview2" / "preview1" also valid
+    wasmer:   { wasi: "preview2" },   // or "preview3", "preview1", "wasix"
     "audio-host": {
       formats: ["vst3", "au", "aax", "clap"],
     },
@@ -334,6 +334,7 @@ component: {
   world:  "my-app",     // synthesized world name; default = qube name
   worlds: [],           // additional WIT worlds to target, e.g. "wasi:http/proxy"
   // WASI version is not pinned here; it tracks targets.<name>.wasmtime.wasi
+  // (default "preview3" — the WASIp3 RC snapshot q64 tracks, per env.md).
 }
 ```
 

@@ -1,8 +1,8 @@
 //! hello-component-http — an HTTP handler emitted as a wasi:http component.
 //!
 //! The @http_handler annotation marks an ordinary pub fn as the HTTP entry
-//! point; when emitted as a component it exports wasi:http/incoming-handler.
-//! The function name is free.
+//! point; when emitted as a component it exports wasi:http/handler (the
+//! WASIp3 unified handler). The function name is free.
 //!
 //! Build + run (Slice B of the spec/ verification ladder):
 //!

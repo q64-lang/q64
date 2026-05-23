@@ -13,7 +13,10 @@ Mirrors [`../wasmtime`](../wasmtime) but against the Wasmer C API:
 - **Shared memory**: shared linear memory via Wasmer's threading support.
 - **Synchronization**: native futex / condvar bridging.
 - **WASIX integration**: capability surface using Wasmer's WASIX extensions
-  where they go beyond WASI Preview 2.
+  where they go beyond standard WASI. The q64 baseline is WASI Preview 3
+  (WASIp3 RC); see [`spec/env.md`](../../spec/env.md) §"Tracking the WASIp3
+  release candidate". Until Wasmer ships Preview 3, this adapter's default
+  stays `preview2`.
 
 ## Implementation language
 

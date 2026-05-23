@@ -643,11 +643,12 @@ reuses the propagation closure specified above and in
 Each capability effect maps to the WIT interface a component built from this
 qube imports. This is the same row set as the capabilities table above,
 viewed from the import side; the authoritative WASI-interface specifics live
-in [`env.md` §"Env ↔ WASI Preview 2"](./env.md).
+in [`env.md` §"Env ↔ WASI Preview 3"](./env.md). The imports are the WASIp3
+(WASI 0.3) interfaces q64 tracks; see that section for the snapshot pin.
 
 | Effect | WIT import |
 |--------|------------|
-| `@network`   | `wasi:sockets/*` (+ `wasi:http/outgoing-handler` for outbound HTTP) |
+| `@network`   | `wasi:sockets/*` (+ `wasi:http/handler` for outbound HTTP) |
 | `@fs`        | `wasi:filesystem/*`                                                 |
 | `@stdout`    | `wasi:cli/stdout`                                                   |
 | `@stderr`    | `wasi:cli/stderr`                                                   |

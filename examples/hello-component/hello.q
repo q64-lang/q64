@@ -13,7 +13,7 @@
 //! Proves: core-module embedding + one capability-import lift
 //! (@stdout → wasi:cli/stdout), with the core module still produced.
 //! See spec/modules.md §"The qube as a component" and spec/env.md
-//! §"Env ↔ WASI Preview 2".
+//! §"Env ↔ WASI Preview 3".
 
 fn main {
     env.out("Hello, q64.")

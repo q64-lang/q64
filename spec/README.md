@@ -56,11 +56,19 @@ compiler-derived capability set (per [`env.md`](./env.md) and
 for qube-to-qube **RPC** (see [`rpc.md`](./rpc.md)) — the canonical-ABI value
 encoding doubles as the wire format.
 
-Two abstractions are deliberately **not** bridged to WIT in v0: `faces` /
-`fits` (a type-class system, not WIT `resource`s — see [`faces.md`](./faces.md))
-and the `Signal` / `Event` / `Stream` family (not WIT `stream<T>` / `future<T>`
-— see [`streams.md`](./streams.md)). Sending WIT resources over the wire and
-WASIp3 async RPC are deferred until those upstream specs land.
+q64 targets **WASIp3** (WASI 0.3) as its Component Model baseline. WASIp3 adds
+native `stream<T>` / `future<T>` to the canonical ABI, so the `Signal` /
+`Event` / `Stream` family **does** bridge to WIT — a `Stream<T, R>` lowers to
+WIT `stream<T>` and a `Future<T>` to WIT `future<T>` at the component boundary
+(see [`streams.md`](./streams.md) and [`env.md` §"Env and the Component Model
+(WASI Preview 3)"](./env.md)). WASIp3 is at **release-candidate** status
+upstream; q64 tracks it, pinned to the snapshot the active runtime implements
+and re-pinned on each upstream RC release (see [`env.md`](./env.md)).
+
+One abstraction is still deliberately **not** bridged to WIT: `faces` / `fits`
+(a type-class system, not WIT `resource`s — see [`faces.md`](./faces.md)).
+Sending WIT resources over the wire is also deferred, pending the separate
+upstream resource-transfer story (not part of WASIp3 async).
 
 ## Scope (forthcoming)
 

@@ -37,7 +37,8 @@ component emission.
   `wasi:cli/command` (`@stdout` → `wasi:cli/stdout`). Proves core-module
   embedding and one capability-import lift. *(Slice A.)*
 - **`hello-component-http/`** — an `@http_handler` exporting
-  `wasi:http/incoming-handler`; the qubepods-shaped endpoint. *(Slice B.)*
+  `wasi:http/handler` (the WASIp3 unified handler); the qubepods-shaped
+  endpoint. *(Slice B.)*
 - **`rpc-server/`** + **`rpc-client/`** — the server serves its world over
   wRPC; the client imports it and calls `greet`, the call carrying `@wire`.
   *(Slice C.)*

@@ -105,7 +105,7 @@ analysis. Not user-extensible.
 | `@skip_laws`      | `fit`                     | Suppresses the face-law check for this fit. Audit-trail required.     | [`faces.md`](./faces.md)             |
 | `@traced_panic`   | `fn`                      | Captures a stack trace into the panic payload (opt-in; ~few kB cost). | [`errors.md`](./errors.md)           |
 | `@rate`           | `graph` block             | Pins the graph body's ambient stream rate.                            | [`streams.md`](./streams.md)         |
-| `@http_handler`   | `pub fn`                  | Marks the function as the HTTP entry point; exported as `wasi:http/incoming-handler` when emitted as a component. | [`env.md`](./env.md)                 |
+| `@http_handler`   | `pub fn`                  | Marks the function as the HTTP entry point; exported as `wasi:http/handler` (the WASIp3 unified handler) when emitted as a component. | [`env.md`](./env.md)                 |
 | `@no_component_lift` | `pub fn`               | Excludes the function from the component export surface; it stays in the core module. Implicit on every `@realtime` fn. | [`modules.md`](./modules.md)         |
 
 ### Category 2 — Declaration markers (lowercase, type-introducing)

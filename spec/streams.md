@@ -883,6 +883,11 @@ All codes use the envelope from [`diagnostics.md`](./diagnostics.md).
 - [`faces.md`](./faces.md) — `Stage`, `Source`, `Sink`,
   `RateAware` as blessed faces (additions tracked in faces.md's
   "Open items deferred").
+- [`env.md`](./env.md) — the WASIp3 (WASI 0.3) Component Model
+  mapping. Under the default `preview3` target a `Stream<T, R>`
+  lowers to WIT `stream<T>` and a `Future<T>` to WIT `future<T>`
+  at the component boundary; q64 tracks the WASIp3 RC snapshot
+  pinned there.
 - [`errors.md`](./errors.md) — `Result<T, E>` and `panic` semantics
   that stage error propagation reuses.
 - [`modules.md`](./modules.md) — `Signal`, `Event`, `Stream`,

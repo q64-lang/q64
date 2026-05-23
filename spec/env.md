@@ -222,62 +222,93 @@ Wasmtime → `WasmtimeNet`; etc.); user code never names the
 concrete fit. Test code and libraries provide their own fits
 through the override mechanism below.
 
-## Env and the Component Model (WASI Preview 2)
+## Env and the Component Model (WASI Preview 3)
 
 When a qube is emitted as a **component** (opt-in; per
 [`modules.md` §"The qube as a component"](./modules.md) and
 [`README.md` §"Wasm 3.0 is the platform"](./README.md)), each capability
 the program uses becomes a **component import** the host supplies. For the
 capabilities that have a standard WASI counterpart, the import *is* the
-WASI Preview 2 interface — no q64-specific host ABI. The mapping is a
-column-extension of the `Env`-fields table above; the same row keys.
+WASI Preview 3 (WASI 0.3) interface — no q64-specific host ABI. The mapping is
+a column-extension of the `Env`-fields table above; the same row keys.
 
-### Env ↔ WASI Preview 2
+### Tracking the WASIp3 release candidate
 
-| `Env` field | Capability face | WASI Preview 2 interface(s) |
+q64 targets **WASIp3** (WASI 0.3), whose Component Model promotes `stream<T>`
+and `future<T>` to native canonical-ABI types and retires the Preview 2
+`wasi:io/poll` + `wasi:io/streams` resource ceremony. WASIp3 is at
+**release-candidate** status upstream; q64 commits to the RC and **re-pins on
+every upstream RC release** until WASI 1.0:
+
+- The compiler and runtime adapters pin to a single WASI snapshot — currently
+  **`0.3.0-rc-2026-03-15`**, the snapshot Wasmtime 43 implements. The pin moves
+  forward as new RC snapshots land; interface and type names may shift between
+  snapshots, and a re-pin may be a breaking change for emitted components until
+  WASI 1.0.
+- The pinned snapshot is recorded in the emitted component's WIT package
+  versions and surfaced by `qube audit`, so a component declares exactly which
+  RC it was built against.
+- `preview2` remains a selectable **stable fallback** target
+  (`targets.<name>.wasmtime.wasi: "preview2"`). Under `preview2` the native
+  async ABI is unavailable, so `Stream<T, R>` / `Future<T>` cannot cross the
+  component boundary or the wire (see [`rpc.md`](./rpc.md) `RPC012`).
+
+### Env ↔ WASI Preview 3
+
+| `Env` field | Capability face | WASI Preview 3 interface(s) |
 |-------------|-----------------|------------------------------|
 | `env.out`     | `Stdout`   | `wasi:cli/stdout`                                        |
 | `env.err`     | `Stderr`   | `wasi:cli/stderr`                                        |
 | `env.exit`    | `ExitFn`   | `wasi:cli/exit`                                          |
 | `env.args`    | `[str]`    | `wasi:cli/environment` (`get-arguments`)                |
 | `env.envvars` | `EnvVars`  | `wasi:cli/environment` (`get-environment`)              |
-| `env.time`    | `Clock`    | `wasi:clocks/{wall-clock, monotonic-clock}`             |
+| `env.time`    | `Clock`    | `wasi:clocks/{wall-clock, monotonic-clock}` (`sleep` returns `future<()>`) |
 | `env.random`  | `Rng`      | `wasi:random/random` (+ `insecure-seed` for non-crypto) |
-| `env.net`     | `Net`      | `wasi:sockets/{tcp, udp, instance-network, ip-name-lookup}` + `wasi:http/outgoing-handler` (outbound HTTP) |
+| `env.net`     | `Net`      | `wasi:sockets/{tcp, udp, instance-network, ip-name-lookup}` + `wasi:http/handler` (outbound HTTP, imported) |
 | `env.fs`      | `Fs`       | `wasi:filesystem/{types, preopens}`                     |
-| `env.audio`   | `Audio`    | **no WASI P2 equivalent** — host-specific custom WIT    |
-| `env.midi`    | `Midi`     | **no WASI P2 equivalent** — host-specific custom WIT    |
-| `env.ui`      | `Ui`       | **no WASI P2 equivalent** — host-specific custom WIT    |
-| `env.ai`      | `AiEnv`    | **no WASI P2 equivalent** — host-specific custom WIT    |
+| `env.audio`   | `Audio`    | **no WASI equivalent** — host-specific custom WIT       |
+| `env.midi`    | `Midi`     | **no WASI equivalent** — host-specific custom WIT       |
+| `env.ui`      | `Ui`       | **no WASI equivalent** — host-specific custom WIT       |
+| `env.ai`      | `AiEnv`    | **no WASI equivalent** — host-specific custom WIT       |
 
-The WASI version is not pinned here; it tracks the active target's `wasi`
-setting (`targets.<name>.wasmtime.wasi`, default `"preview2"` —
-[`qube.json5.md` §Targets](./qube.json5.md)). The four capabilities with no
-WASI interface (`Audio`, `Midi`, `Ui`, `AiEnv`) are imported through custom
-WIT defined per runtime adapter (`runtime/<host>/`); they are q64-ecosystem
-interfaces, not WASI.
+The WASI version tracks the active target's `wasi` setting
+(`targets.<name>.wasmtime.wasi`, default `"preview3"` —
+[`qube.json5.md` §Targets](./qube.json5.md)) and the snapshot pin above. The
+four capabilities with no WASI interface (`Audio`, `Midi`, `Ui`, `AiEnv`) are
+imported through custom WIT defined per runtime adapter (`runtime/<host>/`);
+they are q64-ecosystem interfaces, not WASI.
 
 ### Face method ↔ WIT function mapping
 
 A capability face becomes a component **import**: the host supplies the fit.
 Each face method maps to a WIT function on the corresponding interface, and
 the q64 `self` receiver is realized as an adapter-held WASI **resource
-handle** that q64 user code never sees:
+handle** (or, for byte I/O under WASIp3, the native `stream<u8>`) that q64
+user code never sees:
 
 | q64 face method | WIT function |
 |-----------------|--------------|
 | `Fs.read(self, path: str) -> Result<Bytes, IoError>`  | `wasi:filesystem/types.descriptor.read` (handle held by the adapter) |
 | `Fs.write(self, path: str, data: Bytes) -> Result<(), IoError>` | `wasi:filesystem/types.descriptor.write` |
-| `Net.get(self, url: Url) -> Result<Response, IoError>` | `wasi:http/outgoing-handler.handle` (request/response via `wasi:http/types`) |
-| `Stdout.write(self, s: str)`                          | `wasi:cli/stdout.get-stdout` → `wasi:io/streams.output-stream.blocking-write-and-flush` |
+| `Net.get(self, url: Url) -> Result<Response, IoError>` | `wasi:http/handler.handle` (async; request/response via `wasi:http/types`, bodies as `stream<u8>`) |
+| `Stdout.write(self, s: str)`                          | `wasi:cli/stdout.get-stdout` → write to the returned `stream<u8>` |
+
+Under WASIp3, byte I/O is the native canonical-ABI `stream<u8>`: stdout/stderr
+hand back a `stream<u8>` directly, and there is no `wasi:io/streams`
+output-stream resource or `wasi:io/poll` pollable to manage (the Preview 2
+ceremony is gone).
 
 The mapping direction is fixed: **capability faces are imports** (the world
 *needs* them from the host); the qube's own public functions are exports
-(§3). WASI **resources** (the open-stream / descriptor handles) are an
-adapter-internal concept — they are deliberately **not** surfaced as q64
-faces or fits (which would blur the [`faces.md`](./faces.md) boundary) and
-are **not** transmissible over RPC (they reference instance-local state; see
-[`rpc.md`](./rpc.md)). q64 user code only ever sees the typed face method.
+(§3). WASI **resources** that remain in Preview 3 (e.g. the filesystem
+`descriptor`, socket handles) are an adapter-internal concept — they are
+deliberately **not** surfaced as q64 faces or fits (which would blur the
+[`faces.md`](./faces.md) boundary) and are **not** transmissible over RPC (they
+reference instance-local state; see [`rpc.md`](./rpc.md)). `stream<T>` and
+`future<T>`, by contrast, are *values* in Preview 3, not resources, so they do
+cross the boundary and the wire — that is what carries the
+`Signal` / `Event` / `Stream` family ([`streams.md`](./streams.md)). q64 user
+code only ever sees the typed face method.
 
 ### HTTP service entry point (`wasi:http`)
 
@@ -293,16 +324,20 @@ pub fn handle(req: Request) -> Response @network {
 ```
 
 When the qube is emitted as a component, the `@http_handler` function is
-exported as `wasi:http/incoming-handler`; the manifest opts in via
-`component.worlds: ["wasi:http/proxy"]` ([`qube.json5.md` §Component](./qube.json5.md)).
-The core module just exports an ordinary function — the component wrapper is
-what makes it an HTTP handler.
+exported as `wasi:http/handler` — the unified Preview 3 handler interface,
+`handle: async func(request) -> result<response, error-code>`; the manifest
+opts in via `component.worlds: ["wasi:http/proxy"]`
+([`qube.json5.md` §Component](./qube.json5.md)). The core module just exports an
+ordinary function — the component wrapper is what makes it an HTTP handler.
 
-`Request` and `Response` here are **`wasi:http`-shaped types** (mapping to
-`wasi:http/types.incoming-request` and `outgoing-response`), distinct from
-the client-side `Response` returned by `Net.get` above: a server request is
-not the same shape as a client response. Both lower per the canonical-ABI
-rules in [`modules.md` §"The qube as a component"](./modules.md).
+`Request` and `Response` here are **`wasi:http`-shaped types**, mapping to the
+Preview 3 `wasi:http/types.request` and `.response` resources. Preview 3
+collapses Preview 2's split incoming/outgoing request and response resources
+into a single `request` and a single `response` used in both directions, so the
+server-side `Request` / `Response` and the client-side `Response` returned by
+`Net.get` above share their underlying WIT types. Bodies are `stream<u8>`
+(with a trailing `future<result<option<trailers>, error-code>>`). All lower per
+the canonical-ABI rules in [`modules.md` §"The qube as a component"](./modules.md).
 
 This is the integration point for **qubepods**, which serves each qube as a
 per-qube HTTPS endpoint: a qube built with `component: { emit: true, worlds:

@@ -7,9 +7,11 @@ with wire-crossing made visible in the type system.
 
 > **Status: draft (v0).** The shape is settled: the synthesized world is the
 > contract, **wRPC** is the framework, **component-value encoding** is the
-> wire, and the **`@wire`** effect makes remote calls visible. Sending WIT
-> resources over the wire and WASIp3 async RPC (`future<T>` / `stream<T>`)
-> are deferred until those upstream specs land.
+> wire, and the **`@wire`** effect makes remote calls visible. Async RPC —
+> `future<T>` / `stream<T>` over the wire — rides WASIp3's native `future` /
+> `stream` (q64 tracks the WASIp3 RC; see [`env.md`](./env.md)). Sending WIT
+> resources over the wire remains deferred until the upstream resource-transfer
+> story lands.
 
 ## Design goals
 
@@ -142,15 +144,27 @@ doubles as a wRPC server: a qube built `--component` and deployed to qubepods
 is reachable both as `wasi:http` and, when `rpc.export: true`, as a wRPC
 service at the same endpoint.
 
+## Async results and streaming (WASIp3)
+
+Async and streaming RPC ride WASIp3's native canonical-ABI `future` / `stream`.
+A `pub fn` exposed for RPC may return (or take) a `Future<T>` or `Stream<T, R>`
+of otherwise-lowerable value types; these lower to WIT `future<T>` / `stream<T>`
+and travel over wRPC without a polling shim — the same bridge the
+`Signal` / `Event` / `Stream` family uses at the component boundary
+([`streams.md`](./streams.md)). This is available under the `preview3` target
+(the default); the `preview2` fallback target has no native async ABI, so a
+`future<T>` / `stream<T>` in an RPC signature under `preview2` is `RPC012`.
+
+Because q64 tracks the WASIp3 **release candidate**, the wire encoding for
+`future` / `stream` follows the pinned snapshot (see [`env.md`](./env.md)) and
+moves with each upstream RC until WASI 1.0.
+
 ## Deferred
 
 - **Resources over the wire.** v0 keeps resources process-local. Sending a
   handle (with its lifecycle and ownership semantics) across a wire waits for
-  the upstream resource-transfer story to stabilize.
-- **WASIp3 async RPC.** Streaming and async results (`future<T>` /
-  `stream<T>` over the wire) wait for WASIp3 async semantics to land —
-  matching the deferral of the `Signal` / `Event` / `Stream` bridge in
-  [`streams.md`](./streams.md).
+  the upstream resource-transfer story to stabilize. This is independent of
+  WASIp3 async, which is in scope above.
 
 ## Diagnostic codes
 
@@ -161,6 +175,7 @@ All RPC diagnostics use the `RPC` prefix (per
 |----------|--------------------------------------------|-----------------------------------------------------------------------------------|
 | `RPC010` | non-value type in RPC signature            | A `pub fn` exposed for RPC uses an unlowerable type (`ref`, region, managed, closure, face-value, resource) in a parameter or return position. |
 | `RPC011` | `rpc.export` without `component.emit`      | The manifest sets `rpc.export: true` but does not emit a component; RPC rides the component world. |
+| `RPC012` | async RPC type under non-`preview3` target | A `future<T>` / `stream<T>` appears in an RPC signature, but the active target's `wasi` setting is not `preview3`; native async lowering is unavailable. |
 | `RPC020` | remote world unavailable                   | An imported endpoint could not be reached or served no matching world at build/resolve time. |
 | `RPC021` | remote world version mismatch              | The imported endpoint's world is incompatible with the locally resolved contract. |
 
@@ -183,4 +198,4 @@ All codes are emitted using the standard envelope from
 - [`diagnostics.md`](./diagnostics.md) — the `RPC` and `CMP` diagnostic
   bands.
 - [`streams.md`](./streams.md) — the `Signal`/`Event`/`Stream` family, whose
-  WIT-async bridge is deferred alongside WASIp3 async RPC.
+  WIT-async bridge rides the same WASIp3 native `stream<T>` / `future<T>`.
