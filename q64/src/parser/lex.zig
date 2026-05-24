@@ -141,6 +141,15 @@ const Lexer = struct {
         }
         const text = self.source[start..self.pos];
 
+        // Raw string? A bare `r` immediately followed by `"` or `#` opens
+        // a raw string `r"…"` / `r#"…"#` (spec/grammar.md §"String
+        // literals"): no escapes, no interpolation.
+        if (text.len == 1 and text[0] == 'r' and self.pos < self.source.len and
+            (self.source[self.pos] == '"' or self.source[self.pos] == '#'))
+        {
+            return self.lexRawString(start);
+        }
+
         // Typed-prefix string? IDENT directly followed by `"` is
         // STR_PREFIX, not an ordinary identifier. (Typed-raw forms
         // like `urlR"…"` are deferred.)
@@ -150,6 +159,48 @@ const Lexer = struct {
         }
 
         try self.pushAs(classifyIdent(text), start, self.pos);
+    }
+
+    /// Lex a raw string starting at `start` (the `r`). `self.pos` is just
+    /// past the `r`, on the first `#` or `"`. The literal closes at a `"`
+    /// followed by the same number of `#`s as opened it.
+    fn lexRawString(self: *Lexer, start: u32) !void {
+        var hashes: u32 = 0;
+        while (self.pos < self.source.len and self.source[self.pos] == '#') {
+            self.pos += 1;
+            hashes += 1;
+        }
+        if (self.pos >= self.source.len or self.source[self.pos] != '"') {
+            // `r#…` not opening a string after all; flag and recover.
+            try self.diag("LEX040", start);
+            try self.pushAs(.ERROR, start, self.pos);
+            return;
+        }
+        self.pos += 1; // opening quote
+
+        while (self.pos < self.source.len) {
+            if (self.source[self.pos] == '"' and self.closesRawString(hashes)) {
+                self.pos += 1 + hashes; // closing quote + matching hashes
+                try self.pushAs(.STR_RAW, start, self.pos);
+                return;
+            }
+            self.pos += 1;
+        }
+        // EOF before the close.
+        try self.diag("LEX030", start);
+        try self.pushAs(.STR_RAW, start, self.pos);
+    }
+
+    /// At a `"`, does it close a raw string opened with `hashes` `#`s
+    /// (i.e. is it followed by exactly that many `#`)?
+    fn closesRawString(self: *const Lexer, hashes: u32) bool {
+        var j = self.pos + 1;
+        var n: u32 = 0;
+        while (n < hashes) : (n += 1) {
+            if (j >= self.source.len or self.source[j] != '#') return false;
+            j += 1;
+        }
+        return true;
     }
 
     // -----------------------------------------------------------
@@ -555,6 +606,16 @@ test "string literals — plain and typed prefix" {
         "\"line one\\nline two\"",
         &[_]cst.SyntaxKind{.STR_PLAIN},
     );
+}
+
+test "raw string literals" {
+    try expectKinds("r\"no escapes \\n here\"", &[_]cst.SyntaxKind{.STR_RAW});
+    try expectKinds("r#\"has \"quotes\" inside\"#", &[_]cst.SyntaxKind{.STR_RAW});
+    try expectKinds("r##\"with #\"# inside\"##", &[_]cst.SyntaxKind{.STR_RAW});
+    // A bare `r` not opening a string stays an identifier.
+    try expectKinds("let r = 5", &[_]cst.SyntaxKind{ .KW_LET, .IDENT, .EQ, .INT_LIT });
+    try expectLossless("r#\"{\"k\":1}\"#");
+    try expectLossless("let r = r\"raw\"\n");
 }
 
 test "comments — line and doc" {
