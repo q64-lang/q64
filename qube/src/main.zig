@@ -3,8 +3,10 @@
 //!
 //! v0 scope: `qube run`, `qube web`, and `qube --version`. Everything
 //! else prints "not implemented yet" and exits 2. `qube run`
-//! discovers the nearest `qube.json5`, parses minimal fields (strict
-//! JSON for now), shells out to `q64 emit` then `q64-wasmtime-host`.
+//! discovers the nearest `qube.json5`, parses it as JSON5 (comments +
+//! trailing commas), resolves local-path dependencies into
+//! `q64 emit --module` flags, then shells out to `q64 emit` and
+//! `q64-wasmtime-host`.
 //! `qube web` shells out to `q64 emit`, copies the browser adapter
 //! into `target/web/`, serves it via `python3 -m http.server`, and
 //! opens the default browser.
@@ -160,14 +162,140 @@ fn printStderr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 // qube run
 // ---------------------------------------------------------------------------
 
-const Manifest = struct {
-    // TODO: full json5 parsing per spec/qube.json5.md. v0 reads strict
-    // JSON via std.json. Once the parser lands, swap this for it.
-    name: []const u8,
-    version: ?[]const u8 = null,
-    @"type": ?[]const u8 = null,
-    entry: ?[]const u8 = null,
-};
+/// Convert a JSON5 manifest to strict JSON that `std.json` accepts.
+/// v0 handles the features every real `qube.json5` uses: `//` and
+/// `/* */` comments and trailing commas. Single-quoted strings and
+/// unquoted keys (also valid JSON5) are not yet handled — all manifests
+/// in the corpus quote their keys. String contents are preserved
+/// verbatim so a `//` or `,` inside a value is never touched. Caller
+/// owns the returned buffer.
+fn json5ToJson(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
+    // Pass 1: drop comments, copying string literals through untouched.
+    var nocomments: std.ArrayList(u8) = .empty;
+    defer nocomments.deinit(gpa);
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '"') {
+            try nocomments.append(gpa, c);
+            i += 1;
+            while (i < src.len) {
+                const d = src[i];
+                try nocomments.append(gpa, d);
+                i += 1;
+                if (d == '\\' and i < src.len) {
+                    try nocomments.append(gpa, src[i]);
+                    i += 1;
+                    continue;
+                }
+                if (d == '"') break;
+            }
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            i += 2;
+            while (i < src.len and src[i] != '\n') i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
+            i = @min(i + 2, src.len);
+            continue;
+        }
+        try nocomments.append(gpa, c);
+        i += 1;
+    }
+
+    // Pass 2: drop a comma when the next significant byte is `}` or `]`.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const buf = nocomments.items;
+    var j: usize = 0;
+    while (j < buf.len) {
+        const c = buf[j];
+        if (c == '"') {
+            try out.append(gpa, c);
+            j += 1;
+            while (j < buf.len) {
+                const d = buf[j];
+                try out.append(gpa, d);
+                j += 1;
+                if (d == '\\' and j < buf.len) {
+                    try out.append(gpa, buf[j]);
+                    j += 1;
+                    continue;
+                }
+                if (d == '"') break;
+            }
+            continue;
+        }
+        if (c == ',') {
+            var k = j + 1;
+            while (k < buf.len and (buf[k] == ' ' or buf[k] == '\t' or buf[k] == '\n' or buf[k] == '\r')) k += 1;
+            if (k < buf.len and (buf[k] == '}' or buf[k] == ']')) {
+                j += 1; // drop the trailing comma
+                continue;
+            }
+        }
+        try out.append(gpa, c);
+        j += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Read a top-level string field from a parsed manifest object.
+fn manifestString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Resolve the manifest's `dependencies` map into `name=dir` strings for
+/// `q64 emit --module`. v0 resolves local-path dependencies only: the
+/// module's source directory is `<dep-path>/src`, made absolute. A
+/// registry or git dependency (which would need cache/lock resolution)
+/// is reported and rejected rather than silently dropped. Caller owns
+/// each returned string and the list.
+fn resolveModuleSpecs(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_dir: []const u8,
+    root: std.json.ObjectMap,
+) !std.ArrayList([]u8) {
+    var specs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (specs.items) |s| gpa.free(s);
+        specs.deinit(gpa);
+    }
+
+    const deps_v = root.get("dependencies") orelse return specs;
+    const deps = switch (deps_v) {
+        .object => |o| o,
+        else => return specs,
+    };
+
+    var it = deps.iterator();
+    while (it.next()) |entry| {
+        const dep_name = entry.key_ptr.*;
+        const path_val: ?[]const u8 = switch (entry.value_ptr.*) {
+            .object => |o| manifestString(o, "path"),
+            else => null,
+        };
+        const p = path_val orelse {
+            try printStderr(io, "qube: dependency '{s}' is not a local-path dependency; v0 resolves only `path` deps\n", .{dep_name});
+            return error.UnsupportedDependency;
+        };
+        // Module source dir = <dep>/src, absolute and normalized.
+        const dir = try std.fs.path.resolve(gpa, &.{ project_dir, p, "src" });
+        defer gpa.free(dir);
+        const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, dir });
+        try specs.append(gpa, spec);
+    }
+    return specs;
+}
 
 fn cmdRun(
     gpa: std.mem.Allocator,
@@ -198,26 +326,51 @@ fn cmdRun(
     };
     defer gpa.free(manifest_src);
 
-    const parsed = std.json.parseFromSlice(Manifest, gpa, manifest_src, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
+    const json = json5ToJson(gpa, manifest_src) catch |err| {
+        try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(json);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |err| {
         try printStderr(io, "qube: cannot parse {s}: {s}\n", .{ manifest_path, @errorName(err) });
-        try writeStderr(io, "qube: note: v0 accepts strict JSON only; JSON5 features are not yet supported\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
     defer parsed.deinit();
 
-    const m = parsed.value;
-    const is_app = if (m.@"type") |t| std.mem.eql(u8, t, "application") else true;
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try writeStderr(io, "qube: manifest is not a JSON object\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        },
+    };
+
+    const name = manifestString(root, "name") orelse {
+        try writeStderr(io, "qube: manifest has no \"name\"\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const type_str = manifestString(root, "type");
+    const is_app = if (type_str) |t| std.mem.eql(u8, t, "application") else true;
     if (!is_app) {
-        try printStderr(io, "qube: cannot run a {s} qube\n", .{m.@"type".?});
+        try printStderr(io, "qube: cannot run a {s} qube\n", .{type_str.?});
         std.process.exit(@intFromEnum(ExitCode.usage));
     }
 
     // Resolve entry; default per spec is src/main.q for applications.
-    const entry_rel = m.entry orelse "src/main.q";
+    const entry_rel = manifestString(root, "entry") orelse "src/main.q";
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
+
+    // Resolve dependencies → `--module name=dir` specs (ladder step 4).
+    var module_specs = resolveModuleSpecs(gpa, io, project_dir, root) catch |err| {
+        try printStderr(io, "qube: dependency resolution failed: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    };
+    defer {
+        for (module_specs.items) |s| gpa.free(s);
+        module_specs.deinit(gpa);
+    }
 
     // Heuristic repo root: walk up from project_dir until we find a
     // sibling `vendor/zig/` directory. Used to locate the in-tree
@@ -236,15 +389,20 @@ fn cmdRun(
     defer gpa.free(out_dir);
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
 
-    const wasm_name = try std.fmt.allocPrint(gpa, "{s}.wasm", .{m.name});
+    const wasm_name = try std.fmt.allocPrint(gpa, "{s}.wasm", .{name});
     defer gpa.free(wasm_name);
     const wasm_path = try std.fs.path.join(gpa, &.{ out_dir, wasm_name });
     defer gpa.free(wasm_path);
 
-    // 1. q64 emit <entry> <wasm>
+    // 1. q64 emit <entry> <wasm> [--module name=dir ...]
     {
-        const argv = [_][]const u8{ q64_bin, "emit", entry_path, wasm_path };
-        const term = try spawnInherit(io, &argv);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.appendSlice(gpa, &.{ q64_bin, "emit", entry_path, wasm_path });
+        for (module_specs.items) |spec| {
+            try argv.appendSlice(gpa, &.{ "--module", spec });
+        }
+        const term = try spawnInherit(io, argv.items);
         if (termCode(term)) |code| {
             if (code != 0) {
                 // Compile error from q64 is exit 64; pass through any
@@ -392,25 +550,50 @@ fn cmdWeb(
     };
     defer gpa.free(manifest_src);
 
-    const parsed = std.json.parseFromSlice(Manifest, gpa, manifest_src, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| {
+    const json = json5ToJson(gpa, manifest_src) catch |err| {
+        try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(json);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |err| {
         try printStderr(io, "qube: cannot parse {s}: {s}\n", .{ manifest_path, @errorName(err) });
-        try writeStderr(io, "qube: note: v0 accepts strict JSON only; JSON5 features are not yet supported\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
     defer parsed.deinit();
 
-    const m = parsed.value;
-    const is_app = if (m.@"type") |t| std.mem.eql(u8, t, "application") else true;
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try writeStderr(io, "qube: manifest is not a JSON object\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        },
+    };
+
+    const name = manifestString(root, "name") orelse {
+        try writeStderr(io, "qube: manifest has no \"name\"\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const user_version_field = manifestString(root, "version");
+    const type_str = manifestString(root, "type");
+    const is_app = if (type_str) |t| std.mem.eql(u8, t, "application") else true;
     if (!is_app) {
-        try printStderr(io, "qube: cannot serve a {s} qube\n", .{m.@"type".?});
+        try printStderr(io, "qube: cannot serve a {s} qube\n", .{type_str.?});
         std.process.exit(@intFromEnum(ExitCode.usage));
     }
 
-    const entry_rel = m.entry orelse "src/main.q";
+    const entry_rel = manifestString(root, "entry") orelse "src/main.q";
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
+
+    var module_specs = resolveModuleSpecs(gpa, io, project_dir, root) catch |err| {
+        try printStderr(io, "qube: dependency resolution failed: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    };
+    defer {
+        for (module_specs.items) |s| gpa.free(s);
+        module_specs.deinit(gpa);
+    }
 
     const repo_root_opt = findRepoRoot(gpa, io, project_dir) catch null;
     defer if (repo_root_opt) |r| gpa.free(r);
@@ -425,15 +608,20 @@ fn cmdWeb(
     defer gpa.free(web_dir);
     try std.Io.Dir.cwd().createDirPath(io, web_dir);
 
-    const wasm_name = try std.fmt.allocPrint(gpa, "{s}.wasm", .{m.name});
+    const wasm_name = try std.fmt.allocPrint(gpa, "{s}.wasm", .{name});
     defer gpa.free(wasm_name);
     const wasm_path = try std.fs.path.join(gpa, &.{ web_dir, wasm_name });
     defer gpa.free(wasm_path);
 
-    // 1. q64 emit <entry> <wasm>
+    // 1. q64 emit <entry> <wasm> [--module name=dir ...]
     {
-        const argv = [_][]const u8{ q64_bin, "emit", entry_path, wasm_path };
-        const term = try spawnInherit(io, &argv);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.appendSlice(gpa, &.{ q64_bin, "emit", entry_path, wasm_path });
+        for (module_specs.items) |spec| {
+            try argv.appendSlice(gpa, &.{ "--module", spec });
+        }
+        const term = try spawnInherit(io, argv.items);
         if (termCode(term)) |code| {
             if (code != 0) {
                 std.process.exit(if (code == 1) @intFromEnum(ExitCode.compile) else code);
@@ -445,10 +633,10 @@ fn cmdWeb(
 
     // 2. Copy host.js verbatim; template index.html.
     try copyAdapterFile(gpa, io, adapter_dir, web_dir, "host.js", &.{});
-    const user_version = m.version orelse "0.0.0";
+    const user_version = user_version_field orelse "0.0.0";
     const html_subs = [_]Sub{
         .{ .needle = "{{WASM}}", .value = wasm_name },
-        .{ .needle = "{{NAME}}", .value = m.name },
+        .{ .needle = "{{NAME}}", .value = name },
         .{ .needle = "{{USER_VERSION}}", .value = user_version },
         .{ .needle = "{{Q64_VERSION}}", .value = q64_version_string },
         .{ .needle = "{{QUBE_VERSION}}", .value = version_string },

@@ -19,9 +19,11 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIG="$REPO_ROOT/vendor/zig/zig"
 Q64_BIN="$REPO_ROOT/q64/zig-out/bin/q64"
 HOST_BIN="$REPO_ROOT/runtime/wasmtime/zig-out/bin/q64-wasmtime-host"
+QUBE_BIN="$REPO_ROOT/qube/zig-out/bin/qube"
 
 DEMO="$REPO_ROOT/examples/link-demo"
 APP="$DEMO/hello_app/src/main.q"
+APP_DIR="$DEMO/hello_app"
 LIB_SRC="$DEMO/hello_world/src"
 
 if [[ ! -x "$ZIG" ]]; then
@@ -34,6 +36,9 @@ echo "==> building q64"
 
 echo "==> building wasmtime runtime adapter"
 "$ZIG" build --build-file "$REPO_ROOT/runtime/wasmtime/build.zig"
+
+echo "==> building qube"
+"$ZIG" build --build-file "$REPO_ROOT/qube/build.zig"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -66,5 +71,17 @@ if [[ "$actual" != "$expected" ]]; then
     printf "  actual:   %q\n" "$actual" >&2
     exit 1
 fi
+echo "    ok: q64 emit --module -> $actual"
 
-echo "PASS: $actual"
+# Full path: `qube run` reads the JSON5 manifest, resolves the local-path
+# dependency into a --module flag, emits, and runs the host itself.
+echo "==> (cd hello_app && qube run)"
+qube_out="$(cd "$APP_DIR" && Q64_BIN="$Q64_BIN" Q64_HOST="$HOST_BIN" "$QUBE_BIN" run)"
+if [[ "$qube_out" != "$expected" ]]; then
+    echo "FAIL: qube run output mismatch" >&2
+    printf "  expected: %q\n" "$expected" >&2
+    printf "  actual:   %q\n" "$qube_out" >&2
+    exit 1
+fi
+
+echo "PASS: $qube_out"

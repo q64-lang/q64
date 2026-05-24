@@ -8,18 +8,16 @@ for items the next session should be able to pick up and act on.
 ## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
 
 The registry and the package up/download loop are **done and live**. The
-remaining work to make a qube actually *run* a linked dependency lives almost
-entirely in the compiler. Definition of done: `dev.q64.hello_app` prints
-`0.1.0` by calling `dev.q64.hello_world.version()`.
+definition of done — `dev.q64.hello_app` prints `0.1.0` by calling
+`dev.q64.hello_world.version()` — is **met** for the const-foldable case via
+the linking ladder below. The test pair now lives in the repo at
+`examples/link-demo/` (no longer ephemeral in `/tmp`).
 
-Reproduce the current wall (test pair lives in `/tmp/q64-demo/`, may not
-survive a reboot — recreate from the snippets below if gone):
+Verify (builds q64 + host + qube, then exercises both `q64 emit --module`
+and `qube run`):
 
 ```
-QUBE=qube/zig-out/bin/qube ; Q64=q64/zig-out/bin/q64
-cd /tmp/q64-demo/hello_app
-Q64_BIN=$Q64 $QUBE run            # → SyntaxError: qube run still uses strict JSON
-$Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version()}"
+./scripts/link-roundtrip.sh           # → PASS: 0.1.0
 ```
 
 ### Done this session (for the trail)
@@ -42,9 +40,10 @@ $Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version(
        `NotConstExpr`) and imports it can't resolve (`UnknownModule` /
        `NameNotFound` / `UnsupportedImport`). `q64/src/codegen/emit.zig`
        `Resolver` + `renderStringLit`; `cmdEmit` reports + exits non-zero.
-1. [ ] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
-       `cmdRun`/`cmdWeb` use strict `std.json` → any real manifest with
-       comments/trailing commas fails). **Gate to running anything.**
+1. [x] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
+       `json5ToJson` strips `//`+`/* */` comments and trailing commas, then
+       parses with `std.json` into a `Value`). Single-quoted strings /
+       unquoted keys not yet handled (no manifest in the corpus uses them).
 2. [x] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
        repeatable. Reads each module's `src/lib.q` and hands codegen a
        `[]ModuleSource`. Spec: `q64-cli.md:71`.
@@ -52,8 +51,10 @@ $Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version(
        resolves `import dev.q64.hello_world.{version}` via the `--module`
        map. Bare-dotted selective imports only for now; relative + stdlib
        imports error (`UnsupportedImport`).
-4. [ ] `qube run`/`build` pass `--module` per dependency (map manifest dep →
-       path/cache dir; wants the `qube.lock` below).
+4. [x] `qube run`/`web` pass `--module` per dependency (`resolveModuleSpecs`
+       maps each `path` dependency → `<dep>/src` absolute). Local-path deps
+       only; a registry/git dep is reported and rejected (wants the
+       `qube.lock` + cache resolution below).
 5. [~] Cross-module calls land via **compile-time const-folding**: an imported
        function whose body is a constant (`fn version() -> str { "0.1.0" }`) is
        evaluated and its value spliced in. Enough for the DoD. Real wasm
@@ -63,10 +64,11 @@ $Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version(
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.
 
-Done at the compiler level: `q64 emit app/src/main.q --module dev.q64.hello_world=lib/src`
-→ host prints `0.1.0` (the DoD). Durable regression test:
-`scripts/link-roundtrip.sh` + `examples/link-demo/`. Remaining for the *full*
-`qube run` DoD: ladder steps 1 + 4 (qube-side JSON5 + `--module` passing).
+**Definition of done met.** `cd examples/link-demo/hello_app && qube run`
+prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)
+and calling its `version()`. Durable regression test:
+`scripts/link-roundtrip.sh` (covers `q64 emit --module` *and* `qube run`) +
+`examples/link-demo/`.
 
 Long pole still ahead: a real (non-const-folded) cross-module call needs the
 open parser productions below — codegen can't walk what the parser doesn't
