@@ -71,6 +71,9 @@ pub fn parse(allocator: Allocator, source: []const u8, file: []const u8) !Result
         .tokens = lex_result.tokens,
         .pos = 0,
         .arena = a,
+        .gpa = allocator,
+        .file = file,
+        .diags = &diags,
     };
     const root = try parser.parseSourceFile();
 
@@ -109,7 +112,14 @@ pub fn parseExpression(allocator: Allocator, source: []const u8, file: []const u
         });
     }
 
-    var parser = Parser{ .tokens = lex_result.tokens, .pos = 0, .arena = a };
+    var parser = Parser{
+        .tokens = lex_result.tokens,
+        .pos = 0,
+        .arena = a,
+        .gpa = allocator,
+        .file = file,
+        .diags = &diags,
+    };
     while (!parser.isEof() and parser.peek().isTrivia()) _ = parser.advance();
     const root = if (parser.isEof())
         try cst.makeNode(a, .LITERAL_EXPR, &.{})
@@ -131,6 +141,11 @@ const Parser = struct {
     tokens: []const cst.Token,
     pos: usize,
     arena: Allocator,
+    /// Diagnostics emitted during parsing live in the *outer* allocator
+    /// (they outlive the CST arena), so the parser keeps a handle to it.
+    gpa: Allocator,
+    file: []const u8,
+    diags: *std.ArrayList(diag.Diagnostic),
 
     fn peek(self: *const Parser) cst.SyntaxKind {
         if (self.pos >= self.tokens.len) return .EOF;
@@ -145,6 +160,44 @@ const Parser = struct {
         const t = self.tokens[self.pos];
         self.pos += 1;
         return t;
+    }
+
+    fn offsetHere(self: *const Parser) u32 {
+        if (self.pos >= self.tokens.len) return 0;
+        return self.tokens[self.pos].offset;
+    }
+
+    /// Emit a parse-time diagnostic. Used for the syntactic checks the
+    /// parser can resolve without a name-resolution pass (the `NAM00x`
+    /// import/visibility codes from spec/modules.md §"Forbidden").
+    fn emitDiag(self: *Parser, code: []const u8, offset: u32) !void {
+        try self.diags.append(self.gpa, .{
+            .code = code,
+            .severity = .err,
+            .message = diag.messageFor(code),
+            .file = self.file,
+            .offset = offset,
+        });
+    }
+
+    /// Kind of the first non-trivia token after the upcoming `.`, or
+    /// `.EOF` if the cursor isn't on a `.`. Distinguishes `foo.{a}`
+    /// (selective list) and `foo.*` (wildcard) from `foo.bar`.
+    fn kindAfterDot(self: *const Parser) cst.SyntaxKind {
+        var i = self.pos;
+        if (i >= self.tokens.len or self.tokens[i].kind != .DOT) return .EOF;
+        i += 1;
+        while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+        if (i >= self.tokens.len) return .EOF;
+        return self.tokens[i].kind;
+    }
+
+    /// Lookahead used for the block-`pub` check: is the next non-trivia
+    /// token after `pub` an opening brace?
+    fn pubFollowedByBrace(self: *const Parser) bool {
+        var i = self.pos + 1;
+        while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+        return i < self.tokens.len and self.tokens[i].kind == .L_BRACE;
     }
 
     /// Consume any leading trivia tokens into `out`. Trivia at the
@@ -184,6 +237,14 @@ const Parser = struct {
             if (self.atFnItem()) {
                 const fn_node = try self.parseFnDecl();
                 try children.append(self.arena, .{ .node = fn_node });
+                continue;
+            }
+            // Block `pub { … }` is forbidden (spec/modules.md). Flag it,
+            // then let the `pub` and the block pass through so the inner
+            // items still parse and losslessness holds.
+            if (self.peek() == .KW_PUB and self.pubFollowedByBrace()) {
+                try self.emitDiag("NAM009", self.offsetHere());
+                try children.append(self.arena, .{ .token = self.advance() });
                 continue;
             }
             // Anything we don't recognize — trivia, unimplemented
@@ -281,10 +342,31 @@ const Parser = struct {
         }
         try self.eatTrivia(&children);
 
-        // ImportBinding: selective list (`.{...}`) or alias (`as x`).
-        if (self.peek() == .DOT and self.nonTriviaAfterDotIsBrace()) {
+        // A `-` immediately after the path means a dash leaked into a bare
+        // module path (`audio-filters`) — it lexed as the minus operator
+        // (spec/modules.md NAM011). Leave the stray tokens for passthrough.
+        if (self.peek() == .MINUS) {
+            try self.emitDiag("NAM011", self.offsetHere());
+            return try cst.makeNode(self.arena, .IMPORT_STMT, children.items);
+        }
+
+        // ImportBinding: wildcard (`.*`, forbidden), selective list
+        // (`.{...}`), or alias (`as x`).
+        if (self.peek() == .DOT and self.kindAfterDot() == .STAR) {
+            try self.emitDiag("NAM003", self.offsetHere());
+            try children.append(self.arena, .{ .token = self.advance() }); // DOT
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .token = self.advance() }); // STAR
+        } else if (self.peek() == .DOT and self.kindAfterDot() == .L_BRACE) {
             const sel = try self.parseSelectiveList();
             try children.append(self.arena, .{ .node = sel });
+            try self.eatTrivia(&children);
+            // Selective list combined with an alias is forbidden (NAM004).
+            if (self.peek() == .KW_AS) {
+                try self.emitDiag("NAM004", self.offsetHere());
+                const alias = try self.parseAliasBinding();
+                try children.append(self.arena, .{ .node = alias });
+            }
         } else if (self.peek() == .KW_AS) {
             const alias = try self.parseAliasBinding();
             try children.append(self.arena, .{ .node = alias });
@@ -372,11 +454,7 @@ const Parser = struct {
     /// an `{`? Distinguishes a selective list (`foo.{a}`) from a path
     /// continuation (`foo.bar`).
     fn nonTriviaAfterDotIsBrace(self: *const Parser) bool {
-        var i = self.pos;
-        if (i >= self.tokens.len or self.tokens[i].kind != .DOT) return false;
-        i += 1;
-        while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
-        return i < self.tokens.len and self.tokens[i].kind == .L_BRACE;
+        return self.kindAfterDot() == .L_BRACE;
     }
 
     /// Collect everything from the opening `(` to its matching `)`,
@@ -785,6 +863,46 @@ test "parses a quoted relative import path" {
     try testing.expectEqualStrings("./util.q", p);
     var names = im.names();
     try testing.expectEqualStrings("helper", (names.next() orelse return error.TestExpectedName).text);
+}
+
+fn hasDiag(r: Result, code: []const u8) bool {
+    for (r.diagnostics) |d| {
+        if (std.mem.eql(u8, d.code, code)) return true;
+    }
+    return false;
+}
+
+fn expectDiagAndLossless(src: []const u8, code: []const u8) !void {
+    const r = try parse(testing.allocator, src, "t.q");
+    defer r.deinit(testing.allocator);
+    try testing.expect(hasDiag(r, code));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+}
+
+test "NAM003 — wildcard import is forbidden" {
+    try expectDiagAndLossless("import q64.math.*\n\nfn main { env.out(\"hi\") }\n", "NAM003");
+}
+
+test "NAM004 — selective import combined with alias" {
+    try expectDiagAndLossless("import q64.math.{Vec3, dot} as v\n", "NAM004");
+}
+
+test "NAM011 — dash in a bare module path" {
+    try expectDiagAndLossless("import audio-filters.{LowPass}\n", "NAM011");
+}
+
+test "NAM009 — block pub form is forbidden" {
+    try expectDiagAndLossless("pub {\n    fn a -> i64 { 1 }\n}\n", "NAM009");
+}
+
+test "a well-formed import emits no diagnostics" {
+    const r = try parse(testing.allocator, "import q64.math.{Vec3, dot}\n", "ok.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r.diagnostics.len);
 }
 
 test "unimplemented items don't break losslessness or item iteration" {

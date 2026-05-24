@@ -190,9 +190,17 @@ interop.
 This section grows as we go. Each item should have a checkbox so it's
 visible at a glance whether it's been picked up.
 
+- [x] Parser-emitted syntactic NAM diagnostics: `NAM003` (wildcard import),
+      `NAM004` (selective+alias), `NAM009` (block `pub`), `NAM011` (dash in
+      bare path). Conformance 6→10. The semantic NAM codes (`NAM001/002/005…`,
+      need a name-resolution pass) and `LEX020/021`, `PAR040` remain.
 - [ ] Parser: items productions. `pub` + `fn` + `import` landed
       (q64/src/parser/parse.zig); `struct`, `enum`, `face`, `fit`, `const`
-      still pending. Unblocks NAM conformance tests.
+      still pending.
+- [ ] Parser: full expression precedence chain (binary/unary/try/postfix)
+      from `grammar.md` — **next up**. Current `parseExpr` handles literal /
+      path / call only; everything else falls back to one-token recovery.
+      Foundation for statements, patterns, real bodies, and `PAR040`.
 - [ ] AST views: extend `q64/src/parser/ast.zig` as each item
       production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
       and `ImportStmt` seeded the pattern.
