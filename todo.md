@@ -238,15 +238,19 @@ visible at a glance whether it's been picked up.
       with N `env.out("…")` calls laid out in linear memory.
       `examples/hello/hello.q` + `scripts/hello-roundtrip.sh`
       exercise the full parse → AST → codegen → runtime chain.
-- [ ] Parser: pattern + match arms (next gating item for the
-      typeck / typed-AST work).
-- [ ] Parser: binary expressions (`+`, `-`, comparison, …) and the
-      full precedence chain from `spec/grammar.md`. Current `parseExpr`
-      handles literal / path / call only and falls back to one-token
-      recovery for anything else.
-- [ ] Parser: pattern + match arms. Unlocks half the remaining
-      `spec/tests/` corpus.
-- [ ] Parser: full expression precedence chain from `grammar.md`.
+- [x] Parser: pattern grammar (v0 floor). `parsePattern` covers wild /
+      literal / ident / tuple / tuple-struct / record-struct / enum-variant,
+      wired into `match` arms, `let`/`var`, `for` heads, and `if let`.
+      Guards / or-patterns / ranges / deep destructuring still deferred
+      (see "Pattern grammar completion" below). The real
+      `dev.q64.webmcp_client` example app (match on strings + variants,
+      `for`, raw strings, interpolation) now parses with no diagnostics.
+- [x] Parser: lexer raw strings `r"…"` / `r#"…"#` (STR_RAW).
+- [ ] Parser: record/struct **expression** literals (`Point { x: 1 }`,
+      `DemoTools {}`) in expression position. Deferred for the
+      struct-literal-vs-block ambiguity (Rust-style); today they degrade to
+      lossless one-token recovery. Needs the disambiguation rule (likely:
+      no bare record literal in `if`/`while`/`match` scrutinee position).
 - [x] `spec/annotations.md` — categorize `@`-forms (markers / derive /
       property wrappers). Smallest scope, highest cross-reference value.
 - [x] `spec/units.md` — drain the unit-suffix table out of `types.md`

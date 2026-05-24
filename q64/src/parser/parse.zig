@@ -907,6 +907,8 @@ const Parser = struct {
     fn parseLetOrVarStmt(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // let / var
+        try self.eatTrivia(&children);
+        try children.append(self.arena, .{ .node = try self.parsePattern() });
         try self.captureRawUntil(&children, &.{ .COLON, .EQ });
         if (self.peek() == .COLON) {
             try children.append(self.arena, .{ .token = self.advance() });
@@ -960,6 +962,8 @@ const Parser = struct {
         if (self.peek() == .KW_LET) {
             var cl: std.ArrayList(cst.Element) = .empty;
             try cl.append(self.arena, .{ .token = self.advance() }); // let
+            try self.eatTrivia(&cl);
+            try cl.append(self.arena, .{ .node = try self.parsePattern() });
             try self.captureRawUntil(&cl, &.{.EQ});
             if (self.peek() == .EQ) {
                 try cl.append(self.arena, .{ .token = self.advance() });
@@ -1022,6 +1026,8 @@ const Parser = struct {
     fn parseForStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // for
+        try self.eatTrivia(&children);
+        try children.append(self.arena, .{ .node = try self.parsePattern() });
         try self.captureRawUntil(&children, &.{.KW_IN});
         if (self.peek() == .KW_IN) {
             try children.append(self.arena, .{ .token = self.advance() });
@@ -1063,6 +1069,8 @@ const Parser = struct {
     /// `MatchArm := Pattern "->" (Block | Expr)`. Pattern is a raw span.
     fn parseMatchArm(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .node = try self.parsePattern() });
+        // Any remainder before `->` (e.g. a guard `if cond`) is raw for now.
         try self.captureRawUntil(&children, &.{.ARROW});
         if (self.peek() == .ARROW) {
             try children.append(self.arena, .{ .token = self.advance() });
@@ -1105,6 +1113,136 @@ const Parser = struct {
             if (k == .NEWLINE or k == .SEMICOLON or k == .R_BRACE) break;
             try children.append(self.arena, .{ .token = self.advance() });
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Patterns (spec/grammar.md §Patterns, v0 floor)
+    // -----------------------------------------------------------------
+    //
+    // Wild / literal / ident / tuple / tuple-struct / record-struct /
+    // enum-variant. Guards, or-patterns, ranges, and deep destructuring
+    // are deferred (grammar open items); callers capture any post-pattern
+    // remainder raw before the delimiter.
+
+    fn parsePattern(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        switch (self.peek()) {
+            .INT_LIT, .FLOAT_LIT => {
+                var children: std.ArrayList(cst.Element) = .empty;
+                try children.append(self.arena, .{ .token = self.advance() });
+                if (self.peek() == .NUM_SUFFIX) try children.append(self.arena, .{ .token = self.advance() });
+                return try cst.makeNode(self.arena, .LITERAL_PATTERN, children.items);
+            },
+            .STR_PLAIN, .STR_RAW, .KW_TRUE, .KW_FALSE => {
+                var children: std.ArrayList(cst.Element) = .empty;
+                try children.append(self.arena, .{ .token = self.advance() });
+                return try cst.makeNode(self.arena, .LITERAL_PATTERN, children.items);
+            },
+            .STR_PREFIX => {
+                var children: std.ArrayList(cst.Element) = .empty;
+                try children.append(self.arena, .{ .token = self.advance() });
+                if (self.peek() == .STR_PLAIN or self.peek() == .STR_RAW) {
+                    try children.append(self.arena, .{ .token = self.advance() });
+                }
+                return try cst.makeNode(self.arena, .LITERAL_PATTERN, children.items);
+            },
+            .L_PAREN => return self.parseTuplePattern(),
+            .KW_NONE => {
+                var children: std.ArrayList(cst.Element) = .empty;
+                try children.append(self.arena, .{ .token = self.advance() });
+                return try cst.makeNode(self.arena, .ENUM_VARIANT_PATTERN, children.items);
+            },
+            else => {
+                if (isPathStart(self.peek())) return self.parsePathPattern();
+                // Fallback: one token so the caller still gets a node and
+                // the parser makes progress.
+                var children: std.ArrayList(cst.Element) = .empty;
+                if (!self.isEof()) try children.append(self.arena, .{ .token = self.advance() });
+                return try cst.makeNode(self.arena, .IDENT_PATTERN, children.items);
+            },
+        }
+    }
+
+    fn parseTuplePattern(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // (
+        try self.parsePatternListInto(&children, .R_PAREN);
+        if (self.peek() == .R_PAREN) try children.append(self.arena, .{ .token = self.advance() });
+        return try cst.makeNode(self.arena, .TUPLE_PATTERN, children.items);
+    }
+
+    /// Comma-separated patterns up to `close`, appended into `children`.
+    fn parsePatternListInto(self: *Parser, children: *std.ArrayList(cst.Element), close: cst.SyntaxKind) !void {
+        while (!self.isEof()) {
+            try self.eatTrivia(children);
+            if (self.peek() == close or self.peek() == .R_BRACE) break;
+            try children.append(self.arena, .{ .node = try self.parsePattern() });
+            try self.eatTrivia(children);
+            if (self.peek() == .COMMA) try children.append(self.arena, .{ .token = self.advance() });
+        }
+    }
+
+    /// A path-led pattern: bare ident (binding / `_` wildcard), dotted
+    /// enum variant, or a variant/tuple-struct with a `(…)` or `{…}`
+    /// payload.
+    fn parsePathPattern(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        const first = self.advance();
+        try children.append(self.arena, .{ .token = first });
+        var dotted = false;
+        while (self.peek() == .DOT and isPathStart(self.kindAfterDot())) {
+            try children.append(self.arena, .{ .token = self.advance() }); // DOT
+            try children.append(self.arena, .{ .token = self.advance() }); // segment
+            dotted = true;
+        }
+
+        // A `(`/`{` payload may sit after inline whitespace (`Tool { … }`);
+        // a newline ends the pattern. Look past inline trivia only.
+        const save = self.pos;
+        var lead: std.ArrayList(cst.Element) = .empty;
+        try self.eatTrivia(&lead);
+        const crossed_newline = for (lead.items) |e| {
+            if (e.kind() == .NEWLINE) break true;
+        } else false;
+        const payload = self.peek();
+        if (!crossed_newline and payload == .L_PAREN) {
+            try children.appendSlice(self.arena, lead.items);
+            try children.append(self.arena, .{ .token = self.advance() }); // (
+            try self.parsePatternListInto(&children, .R_PAREN);
+            if (self.peek() == .R_PAREN) try children.append(self.arena, .{ .token = self.advance() });
+            return try cst.makeNode(self.arena, .TUPLE_STRUCT_PATTERN, children.items);
+        }
+        if (!crossed_newline and payload == .L_BRACE) {
+            try children.appendSlice(self.arena, lead.items);
+            try children.append(self.arena, .{ .token = self.advance() }); // {
+            while (!self.isEof()) {
+                try self.eatTrivia(&children);
+                if (self.peek() == .R_BRACE) break;
+                try children.append(self.arena, .{ .node = try self.parseFieldPattern() });
+                try self.eatTrivia(&children);
+                if (self.peek() == .COMMA) try children.append(self.arena, .{ .token = self.advance() });
+            }
+            if (self.peek() == .R_BRACE) try children.append(self.arena, .{ .token = self.advance() });
+            return try cst.makeNode(self.arena, .RECORD_STRUCT_PATTERN, children.items);
+        }
+        self.pos = save;
+        if (!dotted and std.mem.eql(u8, first.text, "_")) {
+            return try cst.makeNode(self.arena, .WILD_PATTERN, children.items);
+        }
+        if (!dotted) return try cst.makeNode(self.arena, .IDENT_PATTERN, children.items);
+        return try cst.makeNode(self.arena, .ENUM_VARIANT_PATTERN, children.items);
+    }
+
+    /// `FieldPattern := IDENT (":" Pattern)?`.
+    fn parseFieldPattern(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        if (self.peek() == .IDENT) try children.append(self.arena, .{ .token = self.advance() });
+        try self.eatTrivia(&children);
+        if (self.peek() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parsePattern() });
+        }
+        return try cst.makeNode(self.arena, .FIELD_PATTERN, children.items);
     }
 
     /// Parse one expression. A value expression is a `PipeExpr` per
@@ -1767,6 +1905,45 @@ fn childKindNode(node: *const cst.Node, kind: cst.SyntaxKind) ?*const cst.Node {
         .token => {},
     };
     return null;
+}
+
+fn firstArmPatternKind(src: []const u8) !cst.SyntaxKind {
+    const r = try parse(testing.allocator, src, "p.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    const block = blockOf(sf) orelse return error.TestExpectedBlock;
+    const match = childKindNode(block, .MATCH_STMT) orelse return error.TestExpectedMatch;
+    const arm = childKindNode(match, .MATCH_ARM) orelse return error.TestExpectedArm;
+    const pat = firstChildNode(arm) orelse return error.TestExpectedPattern;
+    return pat.kind;
+}
+
+test "pattern kinds in match arms" {
+    try testing.expectEqual(cst.SyntaxKind.WILD_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        _ -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.LITERAL_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        \"echo\" -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.LITERAL_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        42 -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.IDENT_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        other -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.TUPLE_STRUCT_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        Ok(v) -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.ENUM_VARIANT_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        McpError.Unsupported -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.RECORD_STRUCT_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        Tool { name } -> 0,\n    }\n}\n"));
+}
+
+test "pattern losslessness in let / for / match / if-let" {
+    const sources = [_][]const u8{
+        "fn m {\n    let (a, b) = pair\n}\n",
+        "fn m {\n    let Tool { name, description } = t\n}\n",
+        "fn m {\n    for (k, v) in entries {\n        use(k)\n    }\n}\n",
+        "fn m {\n    if let Some(n) = opt {\n        use(n)\n    }\n}\n",
+        "fn m {\n    match r {\n        Ok(v) -> v,\n        Err(e) -> panic e,\n        _ -> 0,\n    }\n}\n",
+    };
+    for (sources) |src| {
+        const r = try parse(testing.allocator, src, "p.q");
+        defer r.deinit(testing.allocator);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try cst.serialize(r.root, testing.allocator, &out);
+        try testing.expectEqualStrings(src, out.items);
+    }
 }
 
 test "item losslessness across forms" {
