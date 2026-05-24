@@ -197,10 +197,16 @@ visible at a glance whether it's been picked up.
 - [ ] Parser: items productions. `pub` + `fn` + `import` landed
       (q64/src/parser/parse.zig); `struct`, `enum`, `face`, `fit`, `const`
       still pending.
-- [ ] Parser: full expression precedence chain (binary/unary/try/postfix)
-      from `grammar.md` — **next up**. Current `parseExpr` handles literal /
-      path / call only; everything else falls back to one-token recovery.
-      Foundation for statements, patterns, real bodies, and `PAR040`.
+- [x] Parser: full expression precedence chain (binary/unary/try/postfix)
+      from `grammar.md`. `parseBinExpr` (precedence climbing) over
+      `parseUnary`→`parseTryExpr`→`parsePostfix`→`parsePrimary`; postfix
+      call/index/field/method/tuple-field/`?.`; paren/tuple/array primaries.
+      Dotted paths stay one greedy `PATH_EXPR` so `env.out(…)` keeps its
+      `CALL_EXPR[PATH_EXPR, CALL_ARGS]` shape (codegen unchanged).
+      **`PAR040` was attempted here but reverted**: telling a generic call
+      (`PCM<f32>(0.0)`) from a chained comparison (`a < b > c`) needs name
+      resolution — a pure-syntax heuristic false-positives on valid
+      generics. PAR040 is therefore deferred to the name-resolution pass.
 - [ ] AST views: extend `q64/src/parser/ast.zig` as each item
       production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
       and `ImportStmt` seeded the pattern.

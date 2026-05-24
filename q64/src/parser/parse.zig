@@ -565,19 +565,246 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .EXPR_STMT, children.items);
     }
 
-    /// Parse one expression. v0 recognizes:
-    ///   - string literal (`STR_PLAIN`) → `STR_LITERAL`
-    ///   - numeric literal (`INT_LIT` / `FLOAT_LIT`, optional `NUM_SUFFIX`) → `NUM_LITERAL`
-    ///   - path (`IDENT ("." IDENT)*`) → `PATH_EXPR`
-    ///   - path followed by `(args)` → `CALL_EXPR`
-    /// Anything else is wrapped as a degenerate `LITERAL_EXPR` of
-    /// one token so the outer loop keeps progressing.
+    /// Parse one expression. A value expression is a `PipeExpr` per
+    /// spec/grammar.md §Expressions (assignment is statement-level); the
+    /// full precedence chain is `parseBinExpr` (precedence climbing) over
+    /// `parseUnary` → `parseTryExpr` → `parsePostfix` → `parsePrimary`.
+    /// A dotted path is still consumed greedily into one `PATH_EXPR`, so
+    /// `env.out(…)` keeps its `CALL_EXPR[PATH_EXPR, CALL_ARGS]` shape.
     fn parseExpr(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        return self.parseBinExpr(1);
+    }
+
+    /// Left binding power for each binary operator; `null` for tokens
+    /// that don't open a binary expression. Higher binds tighter. Mirrors
+    /// the precedence table in spec/grammar.md §"Operator precedence".
+    fn binBindingPower(k: cst.SyntaxKind) ?u8 {
+        return switch (k) {
+            .PIPE_GT => 1,
+            .PIPE_PIPE => 2,
+            .AMP_AMP => 3,
+            .EQ_EQ, .BANG_EQ, .L_ANGLE, .R_ANGLE, .LT_EQ, .GT_EQ => 4,
+            .PIPE => 5,
+            .CARET => 6,
+            .AMP => 7,
+            .SHL, .SHR => 8,
+            .PLUS, .MINUS => 9,
+            .STAR, .SLASH, .PERCENT => 10,
+            else => null,
+        };
+    }
+
+    /// Precedence-climbing binary-expression parser. Operators at or above
+    /// `min_bp` bind here; tighter operators recurse. Trivia between
+    /// operands and operators is captured so the tree stays lossless; if
+    /// the next significant token isn't an operator we restore the cursor
+    /// and leave that trivia for the caller.
+    fn parseBinExpr(self: *Parser, min_bp: u8) std.mem.Allocator.Error!*const cst.Node {
+        var lhs = try self.parseUnary();
+
+        while (true) {
+            const save = self.pos;
+            var lead_trivia: std.ArrayList(cst.Element) = .empty;
+            try self.eatTrivia(&lead_trivia);
+
+            const k = self.peek();
+            const bp = binBindingPower(k) orelse {
+                self.pos = save;
+                break;
+            };
+            if (bp < min_bp) {
+                self.pos = save;
+                break;
+            }
+
+            var children: std.ArrayList(cst.Element) = .empty;
+            try children.append(self.arena, .{ .node = lhs });
+            try children.appendSlice(self.arena, lead_trivia.items);
+            const op_tok = self.advance();
+            try children.append(self.arena, .{ .token = op_tok });
+            try self.eatTrivia(&children);
+            // Left-associative: the right operand stops at the next
+            // operator of strictly lower binding power.
+            const rhs = try self.parseBinExpr(bp + 1);
+            try children.append(self.arena, .{ .node = rhs });
+
+            const kind: cst.SyntaxKind = if (k == .PIPE_GT) .PIPE_EXPR else .BIN_EXPR;
+            lhs = try cst.makeNode(self.arena, kind, children.items);
+        }
+        return lhs;
+    }
+
+    /// `UnaryExpr := UnaryOp UnaryExpr | TryExpr`.
+    fn parseUnary(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
         const k = self.peek();
-        if (k == .STR_PLAIN or k == .STR_PREFIX) return self.parseStringLit();
+        if (k == .BANG or k == .MINUS or k == .TILDE or k == .KW_REF or k == .KW_MOVE) {
+            var children: std.ArrayList(cst.Element) = .empty;
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            const operand = try self.parseUnary();
+            try children.append(self.arena, .{ .node = operand });
+            return try cst.makeNode(self.arena, .UNARY_EXPR, children.items);
+        }
+        return self.parseTryExpr();
+    }
+
+    /// `TryExpr := "try" CallExpr | CallExpr`; `try` binds tighter than
+    /// any binary operator (spec/grammar.md notes).
+    fn parseTryExpr(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        if (self.peek() == .KW_TRY) {
+            var children: std.ArrayList(cst.Element) = .empty;
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            const operand = try self.parsePostfix();
+            try children.append(self.arena, .{ .node = operand });
+            return try cst.makeNode(self.arena, .TRY_EXPR, children.items);
+        }
+        return self.parsePostfix();
+    }
+
+    /// `Postfix := Primary PostfixOp*`. Postfix operators are adjacent
+    /// (no leading trivia): a call `(…)`, index `[…]`, field/method
+    /// `.name` / `.name(…)`, tuple field `.0`, or `?.name`. A leading
+    /// dotted path is already one `PATH_EXPR` from `parsePrimary`, so the
+    /// `.name` arm here only fires after a call/index base (`f().g`).
+    fn parsePostfix(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var base = try self.parsePrimary();
+        while (true) {
+            switch (self.peek()) {
+                .L_PAREN => {
+                    var children: std.ArrayList(cst.Element) = .empty;
+                    try children.append(self.arena, .{ .node = base });
+                    const args = try self.parseCallArgs();
+                    try children.append(self.arena, .{ .node = args });
+                    base = try cst.makeNode(self.arena, .CALL_EXPR, children.items);
+                },
+                .L_BRACK => {
+                    var children: std.ArrayList(cst.Element) = .empty;
+                    try children.append(self.arena, .{ .node = base });
+                    try children.append(self.arena, .{ .token = self.advance() }); // [
+                    try self.eatTrivia(&children);
+                    const idx = try self.parseExpr();
+                    try children.append(self.arena, .{ .node = idx });
+                    try self.eatTrivia(&children);
+                    if (self.peek() == .R_BRACK) {
+                        try children.append(self.arena, .{ .token = self.advance() });
+                    }
+                    base = try cst.makeNode(self.arena, .INDEX_EXPR, children.items);
+                },
+                .DOT => {
+                    const after = self.kindAfterDot();
+                    if (isPathStart(after)) {
+                        var children: std.ArrayList(cst.Element) = .empty;
+                        try children.append(self.arena, .{ .node = base });
+                        try children.append(self.arena, .{ .token = self.advance() }); // DOT
+                        try self.eatTrivia(&children);
+                        try children.append(self.arena, .{ .token = self.advance() }); // name
+                        if (self.peek() == .L_PAREN) {
+                            const args = try self.parseCallArgs();
+                            try children.append(self.arena, .{ .node = args });
+                            base = try cst.makeNode(self.arena, .METHOD_EXPR, children.items);
+                        } else {
+                            base = try cst.makeNode(self.arena, .FIELD_EXPR, children.items);
+                        }
+                    } else if (after == .INT_LIT) {
+                        var children: std.ArrayList(cst.Element) = .empty;
+                        try children.append(self.arena, .{ .node = base });
+                        try children.append(self.arena, .{ .token = self.advance() }); // DOT
+                        try self.eatTrivia(&children);
+                        try children.append(self.arena, .{ .token = self.advance() }); // INT_LIT
+                        base = try cst.makeNode(self.arena, .TUPLE_FIELD_EXPR, children.items);
+                    } else break;
+                },
+                .QUESTION_DOT => {
+                    var children: std.ArrayList(cst.Element) = .empty;
+                    try children.append(self.arena, .{ .node = base });
+                    try children.append(self.arena, .{ .token = self.advance() }); // ?.
+                    try self.eatTrivia(&children);
+                    if (isPathStart(self.peek())) {
+                        try children.append(self.arena, .{ .token = self.advance() });
+                    }
+                    base = try cst.makeNode(self.arena, .QUESTION_DOT_EXPR, children.items);
+                },
+                else => break,
+            }
+        }
+        return base;
+    }
+
+    /// `Primary` — the leaf forms. Statement-keyword primaries (match /
+    /// if / block / scope / spawn / …) are not yet parsed and fall to
+    /// `parseUnknownExpr` recovery.
+    fn parsePrimary(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        const k = self.peek();
+        if (k == .STR_PLAIN or k == .STR_PREFIX or k == .STR_RAW) return self.parseStringLit();
         if (k == .INT_LIT or k == .FLOAT_LIT) return self.parseNumLit();
-        if (isPathStart(k)) return self.parsePathOrCall();
+        if (k == .KW_TRUE or k == .KW_FALSE or k == .KW_NONE) {
+            var children: std.ArrayList(cst.Element) = .empty;
+            try children.append(self.arena, .{ .token = self.advance() });
+            return try cst.makeNode(self.arena, .LITERAL_EXPR, children.items);
+        }
+        if (k == .L_PAREN) return self.parseParenOrTuple();
+        if (k == .L_BRACK) return self.parseArrayExpr();
+        if (isPathStart(k)) return self.parsePath();
         return self.parseUnknownExpr();
+    }
+
+    /// `(` Expr `)` → `PAREN_EXPR`; `(` Expr (`,` Expr)* `)` →
+    /// `TUPLE_EXPR`; `()` → unit `TUPLE_EXPR`.
+    fn parseParenOrTuple(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // (
+        try self.eatTrivia(&children);
+        if (self.peek() == .R_PAREN) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            return try cst.makeNode(self.arena, .TUPLE_EXPR, children.items);
+        }
+        try children.append(self.arena, .{ .node = try self.parseExpr() });
+        try self.eatTrivia(&children);
+        var is_tuple = false;
+        while (self.peek() == .COMMA) {
+            is_tuple = true;
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            if (self.peek() == .R_PAREN) break; // trailing comma
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .R_PAREN) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, if (is_tuple) .TUPLE_EXPR else .PAREN_EXPR, children.items);
+    }
+
+    /// `[` Expr (`,` Expr)* `]` (list) or `[` Expr `;` Expr `]` (repeat).
+    fn parseArrayExpr(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // [
+        try self.eatTrivia(&children);
+        if (self.peek() == .R_BRACK) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            return try cst.makeNode(self.arena, .ARRAY_EXPR, children.items);
+        }
+        try children.append(self.arena, .{ .node = try self.parseExpr() });
+        try self.eatTrivia(&children);
+        if (self.peek() == .SEMICOLON) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+            try self.eatTrivia(&children);
+        } else {
+            while (self.peek() == .COMMA) {
+                try children.append(self.arena, .{ .token = self.advance() });
+                try self.eatTrivia(&children);
+                if (self.peek() == .R_BRACK) break;
+                try children.append(self.arena, .{ .node = try self.parseExpr() });
+                try self.eatTrivia(&children);
+            }
+        }
+        if (self.peek() == .R_BRACK) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .ARRAY_EXPR, children.items);
     }
 
     /// Tokens that can start a path segment. Beyond plain `IDENT`,
@@ -612,18 +839,6 @@ const Parser = struct {
             try children.append(self.arena, .{ .token = self.advance() });
         }
         return try cst.makeNode(self.arena, .NUM_LITERAL, children.items);
-    }
-
-    fn parsePathOrCall(self: *Parser) !*const cst.Node {
-        const path = try self.parsePath();
-        if (self.peek() != .L_PAREN) return path;
-
-        // Wrap the path + CALL_ARGS in a CALL_EXPR.
-        var children: std.ArrayList(cst.Element) = .empty;
-        try children.append(self.arena, .{ .node = path });
-        const args = try self.parseCallArgs();
-        try children.append(self.arena, .{ .node = args });
-        return try cst.makeNode(self.arena, .CALL_EXPR, children.items);
     }
 
     fn parsePath(self: *Parser) !*const cst.Node {
@@ -897,6 +1112,112 @@ test "NAM011 — dash in a bare module path" {
 
 test "NAM009 — block pub form is forbidden" {
     try expectDiagAndLossless("pub {\n    fn a -> i64 { 1 }\n}\n", "NAM009");
+}
+
+fn binOpKind(node: *const cst.Node) cst.SyntaxKind {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) return t.kind,
+        .node => {},
+    };
+    return .EOF;
+}
+
+fn firstChildNode(node: *const cst.Node) ?*const cst.Node {
+    for (node.children) |c| switch (c) {
+        .node => |n| return n,
+        .token => {},
+    };
+    return null;
+}
+
+fn lastChildNode(node: *const cst.Node) ?*const cst.Node {
+    var r: ?*const cst.Node = null;
+    for (node.children) |c| switch (c) {
+        .node => |n| r = n,
+        .token => {},
+    };
+    return r;
+}
+
+test "expression losslessness across forms" {
+    const sources = [_][]const u8{
+        "fn m { a + b }\n",
+        "fn m { a + b * c - d }\n",
+        "fn m { !flag }\n",
+        "fn m { -x + y }\n",
+        "fn m { a && b || c }\n",
+        "fn m { x == y }\n",
+        "fn m { try foo() }\n",
+        "fn m { obj.field }\n",
+        "fn m { f().g().h }\n",
+        "fn m { xs[0] + xs[1] }\n",
+        "fn m { (a + b) * c }\n",
+        "fn m { [1, 2, 3] }\n",
+        "fn m { [x; 4] }\n",
+        "fn m { a?.b }\n",
+        "fn m { t.0 }\n",
+        "fn m { env.out(\"hi\") }\n",
+        "fn m { foo(a, b + c, d) }\n",
+        "fn m { x |> f(y) }\n",
+        "fn m { 1 + 2 * 3 - 4 / 5 % 6 }\n",
+    };
+    for (sources) |src| {
+        const r = try parse(testing.allocator, src, "e.q");
+        defer r.deinit(testing.allocator);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try cst.serialize(r.root, testing.allocator, &out);
+        try testing.expectEqualStrings(src, out.items);
+    }
+}
+
+test "precedence: `*` binds tighter than `+`" {
+    const r = try parseExpression(testing.allocator, "a + b * c", "e.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(cst.SyntaxKind.BIN_EXPR, r.root.kind);
+    try testing.expectEqual(cst.SyntaxKind.PLUS, binOpKind(r.root));
+    const rhs = lastChildNode(r.root).?;
+    try testing.expectEqual(cst.SyntaxKind.BIN_EXPR, rhs.kind);
+    try testing.expectEqual(cst.SyntaxKind.STAR, binOpKind(rhs));
+}
+
+test "left-associativity: `a - b - c` nests as `(a - b) - c`" {
+    const r = try parseExpression(testing.allocator, "a - b - c", "e.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(cst.SyntaxKind.BIN_EXPR, r.root.kind);
+    try testing.expectEqual(cst.SyntaxKind.MINUS, binOpKind(r.root));
+    const lhs = firstChildNode(r.root).?;
+    try testing.expectEqual(cst.SyntaxKind.BIN_EXPR, lhs.kind);
+}
+
+test "postfix: `env.out(...)` stays CALL_EXPR over a dotted PATH_EXPR" {
+    const r = try parseExpression(testing.allocator, "env.out(\"hi\")", "e.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(cst.SyntaxKind.CALL_EXPR, r.root.kind);
+    const callee = firstChildNode(r.root).?;
+    try testing.expectEqual(cst.SyntaxKind.PATH_EXPR, callee.kind);
+}
+
+test "postfix: method call on a call result is METHOD_EXPR" {
+    const r = try parseExpression(testing.allocator, "f().g()", "e.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(cst.SyntaxKind.METHOD_EXPR, r.root.kind);
+}
+
+test "generic-looking call in expression position is not flagged" {
+    // `PCM<f32>(0.0)` is a generic constructor, not a comparison.
+    // Distinguishing it from `a < b > c` needs name resolution, so the
+    // parser stays quiet here (no PAR040) and parses losslessly. PAR040
+    // is deferred to the name-resolution pass.
+    const src = "fn m { PCM<f32>(0.0) }\n";
+    const r = try parse(testing.allocator, src, "e.q");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!hasDiag(r, "PAR040"));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
 }
 
 test "a well-formed import emits no diagnostics" {
