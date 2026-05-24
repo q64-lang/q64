@@ -41,7 +41,23 @@ pub const Error = error{
     UnsupportedExpression,
     UnsupportedCall,
     BadStringLiteral,
+    // Linking / const-evaluation (ladder steps 0, 3, 5, 6).
+    UnknownModule, // an `import` names a module not supplied via --module (NAM001-ish)
+    NameNotFound, // a selectively-imported name isn't defined in the module (NAM010-ish)
+    UnsupportedImport, // import form codegen can't resolve yet (relative, stdlib)
+    UnsupportedInterpolation, // `{expr}` whose value isn't a compile-time constant
+    NotConstExpr, // an expression codegen cannot evaluate at compile time
     OutOfMemory,
+};
+
+/// A dependency module made available to codegen. `name` is the bare-
+/// dotted module path (`dev.q64.hello_world`); `source` is the text of
+/// that module's entry file (`src/lib.q`). The compiler resolves
+/// `import <name>.{…}` against this set — it never reads `qube.json5`
+/// or touches the filesystem itself (per spec/q64-cli.md §"--module").
+pub const ModuleSource = struct {
+    name: []const u8,
+    source: []const u8,
 };
 
 /// Build the hello-world wasm module and return its bytes. Caller
@@ -147,11 +163,21 @@ pub fn emitFromSource(
     allocator: std.mem.Allocator,
     source: []const u8,
     file: []const u8,
+    modules: []const ModuleSource,
 ) ![]u8 {
     const parse_result = try parse.parse(allocator, source, file);
     defer parse_result.deinit(allocator);
 
     const sf = ast.SourceFile.cast(parse_result.root) orelse return Error.NoMainFunction;
+
+    // Build the link context: resolve every import against `modules`,
+    // and index this file's own functions so a local `version()` works
+    // too. An import codegen can't resolve is an error here, not a
+    // silently-ignored line (ladder step 0).
+    var resolver = Resolver.init(allocator, modules);
+    defer resolver.deinit();
+    try resolver.indexLocalFunctions(sf);
+    try resolver.resolveImports(sf);
 
     var iter = sf.items();
     const main_fn = blk: while (iter.next()) |item| switch (item) {
@@ -161,10 +187,10 @@ pub fn emitFromSource(
         },
     } else return Error.NoMainFunction;
 
-    return emitFn(allocator, main_fn);
+    return emitFn(allocator, &resolver, main_fn);
 }
 
-fn emitFn(allocator: std.mem.Allocator, fd: ast.FnDecl) ![]u8 {
+fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]u8 {
     const body = fd.body() orelse return Error.NoBody;
 
     // Collect each env.out call's payload bytes ("text" + "\n").
@@ -182,7 +208,7 @@ fn emitFn(allocator: std.mem.Allocator, fd: ast.FnDecl) ![]u8 {
                 .call => |cc| cc,
                 else => return Error.UnsupportedExpression,
             };
-            try collectEnvOutPayload(allocator, call, &payloads);
+            try collectEnvOutPayload(allocator, resolver, call, &payloads);
         },
     };
 
@@ -191,6 +217,7 @@ fn emitFn(allocator: std.mem.Allocator, fd: ast.FnDecl) ![]u8 {
 
 fn collectEnvOutPayload(
     allocator: std.mem.Allocator,
+    resolver: *Resolver,
     call: ast.CallExpr,
     out_payloads: *std.ArrayList([]u8),
 ) !void {
@@ -205,11 +232,12 @@ fn collectEnvOutPayload(
 
     var arg_iter = call.args();
     const first = arg_iter.next() orelse return Error.UnsupportedCall;
-    const str_lit = switch (first) {
-        .string_lit => |s| s,
-        else => return Error.UnsupportedCall,
-    };
-    const value = (try str_lit.value(allocator)) orelse return Error.BadStringLiteral;
+
+    // The argument is evaluated to its compile-time string value. For a
+    // plain literal that is just the decoded bytes; for an interpolated
+    // literal (`"{version()}"`) each `{expr}` is const-evaluated and
+    // spliced in (ladder steps 5–6).
+    const value = try resolver.constEvalExpr(first);
     defer allocator.free(value);
 
     // env.out("X") semantically writes "X\n" (spec/env.md §"Capability faces").
@@ -217,6 +245,226 @@ fn collectEnvOutPayload(
     @memcpy(payload[0..value.len], value);
     payload[value.len] = '\n';
     try out_payloads.append(allocator, payload);
+}
+
+// =====================================================================
+// Resolver — imports, symbol table, and compile-time evaluation
+// =====================================================================
+//
+// v0 linking is source-level and constant-folding: an imported function
+// whose body is a compile-time constant (a string/number literal, or an
+// interpolation of such) is evaluated at compile time and its value
+// spliced into the caller. This is exactly enough to make
+// `dev.q64.hello_app` print `0.1.0` by calling
+// `dev.q64.hello_world.version()` (todo.md "Definition of done"), and it
+// fails loudly on anything it cannot evaluate rather than emitting
+// wrong code.
+
+const Resolver = struct {
+    allocator: std.mem.Allocator,
+    modules: []const ModuleSource,
+    /// Parsed dependency modules, kept alive so the `FnDecl` views below
+    /// stay valid for the lifetime of the resolver.
+    parsed: std.ArrayList(parse.Result),
+    /// name → defining function. Keys are slices into a CST that outlives
+    /// the resolver (the caller's parse result or a `parsed` entry).
+    symbols: std.StringHashMapUnmanaged(ast.FnDecl),
+
+    fn init(allocator: std.mem.Allocator, modules: []const ModuleSource) Resolver {
+        return .{
+            .allocator = allocator,
+            .modules = modules,
+            .parsed = .empty,
+            .symbols = .empty,
+        };
+    }
+
+    fn deinit(self: *Resolver) void {
+        for (self.parsed.items) |r| r.deinit(self.allocator);
+        self.parsed.deinit(self.allocator);
+        self.symbols.deinit(self.allocator);
+    }
+
+    /// Index every top-level function in `sf` under its own name, so a
+    /// program that defines and calls a local const function resolves
+    /// without an import.
+    fn indexLocalFunctions(self: *Resolver, sf: ast.SourceFile) !void {
+        var it = sf.items();
+        while (it.next()) |item| switch (item) {
+            .fn_decl => |fd| {
+                const name = fd.name() orelse continue;
+                try self.symbols.put(self.allocator, name.text, fd);
+            },
+        };
+    }
+
+    /// Resolve each import statement against the `--module` set. Binds
+    /// every selectively-imported name to its defining function. Errors
+    /// on unresolvable imports (unknown module, missing name) and on
+    /// import forms not yet supported (relative paths, stdlib).
+    fn resolveImports(self: *Resolver, sf: ast.SourceFile) !void {
+        var imports = sf.imports();
+        while (imports.next()) |im| {
+            if (im.isRelative()) return Error.UnsupportedImport;
+
+            const module_path = (try im.path(self.allocator)) orelse return Error.UnsupportedImport;
+            defer self.allocator.free(module_path);
+
+            const src = self.moduleSource(module_path) orelse return Error.UnknownModule;
+
+            const r = try parse.parse(self.allocator, src, module_path);
+            try self.parsed.append(self.allocator, r);
+            const dep_sf = ast.SourceFile.cast(r.root) orelse return Error.UnknownModule;
+
+            var names = im.names();
+            while (names.next()) |name_tok| {
+                const fd = findPublicFn(dep_sf, name_tok.text) orelse return Error.NameNotFound;
+                try self.symbols.put(self.allocator, name_tok.text, fd);
+            }
+        }
+    }
+
+    fn moduleSource(self: *Resolver, name: []const u8) ?[]const u8 {
+        for (self.modules) |m| {
+            if (std.mem.eql(u8, m.name, name)) return m.source;
+        }
+        return null;
+    }
+
+    fn lookup(self: *Resolver, name: []const u8) ?ast.FnDecl {
+        return self.symbols.get(name);
+    }
+
+    /// Evaluate an expression to its compile-time string value. Caller
+    /// owns the returned bytes.
+    fn constEvalExpr(self: *Resolver, expr: ast.Expr) Error![]u8 {
+        return switch (expr) {
+            .string_lit => |s| self.renderStringLit(s),
+            .num_lit => |n| self.allocator.dupe(u8, n.rawText() orelse return Error.BadStringLiteral),
+            .call => |cc| self.constEvalCall(cc),
+            // A bare identifier or anything else isn't a constant we can
+            // fold in v0.
+            else => Error.NotConstExpr,
+        };
+    }
+
+    fn constEvalCall(self: *Resolver, call: ast.CallExpr) Error![]u8 {
+        const callee = call.callee() orelse return Error.NotConstExpr;
+        const path = switch (callee) {
+            .path => |p| p,
+            else => return Error.NotConstExpr,
+        };
+        const name = try path.text(self.allocator);
+        defer self.allocator.free(name);
+
+        // v0 evaluates only nullary calls: `version()`. Arguments would
+        // require parameter substitution, which isn't supported yet.
+        var args = call.args();
+        if (args.next() != null) return Error.NotConstExpr;
+
+        const fd = self.lookup(name) orelse return Error.NameNotFound;
+        return self.constEvalFn(fd);
+    }
+
+    /// A function is a compile-time constant when its body is a single
+    /// value expression (a tail expression with no preceding statements
+    /// that matter). v0 evaluates that expression.
+    fn constEvalFn(self: *Resolver, fd: ast.FnDecl) Error![]u8 {
+        const body = fd.body() orelse return Error.NoBody;
+        var stmts = body.statements();
+        var last: ?ast.Expr = null;
+        while (stmts.next()) |stmt| switch (stmt) {
+            .expr_stmt => |es| last = es.expression(),
+        };
+        const value_expr = last orelse return Error.NotConstExpr;
+        return self.constEvalExpr(value_expr);
+    }
+
+    /// Decode a string literal, evaluating any `{expr}` interpolations.
+    /// `{{`/`}}` are literal braces; `\{`/`\}` escape a brace. An
+    /// interpolation whose value isn't a compile-time constant is
+    /// `UnsupportedInterpolation`.
+    fn renderStringLit(self: *Resolver, s: ast.StringLit) Error![]u8 {
+        const raw = s.rawText() orelse return Error.BadStringLiteral;
+
+        // Raw string `r"…"` / `r#"…"#`: no escapes, no interpolation.
+        if (raw.len >= 1 and raw[0] == 'r') {
+            const open = std.mem.indexOfScalar(u8, raw, '"') orelse return Error.BadStringLiteral;
+            const close = std.mem.lastIndexOfScalar(u8, raw, '"') orelse return Error.BadStringLiteral;
+            if (close <= open) return Error.BadStringLiteral;
+            return self.allocator.dupe(u8, raw[open + 1 .. close]);
+        }
+
+        if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return Error.BadStringLiteral;
+        const body = raw[1 .. raw.len - 1];
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < body.len) {
+            const ch = body[i];
+            if (ch == '\\' and i + 1 < body.len) {
+                try out.append(self.allocator, decodeEscape(body[i + 1]));
+                i += 2;
+                continue;
+            }
+            if (ch == '{') {
+                if (i + 1 < body.len and body[i + 1] == '{') {
+                    try out.append(self.allocator, '{');
+                    i += 2;
+                    continue;
+                }
+                // Interpolation: take everything up to the matching `}`.
+                const close = std.mem.indexOfScalarPos(u8, body, i + 1, '}') orelse
+                    return Error.UnsupportedInterpolation;
+                const inner = body[i + 1 .. close];
+                const value = try self.constEvalSource(inner);
+                defer self.allocator.free(value);
+                try out.appendSlice(self.allocator, value);
+                i = close + 1;
+                continue;
+            }
+            if (ch == '}' and i + 1 < body.len and body[i + 1] == '}') {
+                try out.append(self.allocator, '}');
+                i += 2;
+                continue;
+            }
+            try out.append(self.allocator, ch);
+            i += 1;
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    /// Parse `source` as a single expression and const-evaluate it.
+    fn constEvalSource(self: *Resolver, source: []const u8) Error![]u8 {
+        const r = try parse.parseExpression(self.allocator, source, "<interp>");
+        defer r.deinit(self.allocator);
+        const expr = ast.Expr.cast(r.root) orelse return Error.UnsupportedInterpolation;
+        return self.constEvalExpr(expr);
+    }
+};
+
+fn decodeEscape(ch: u8) u8 {
+    return switch (ch) {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => 0,
+        else => ch, // \\, \", \{, \} and unknowns pass the char through
+    };
+}
+
+fn findPublicFn(sf: ast.SourceFile, name: []const u8) ?ast.FnDecl {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .fn_decl => |fd| {
+            if (!fd.isPublic()) continue;
+            const fn_name = fd.name() orelse continue;
+            if (std.mem.eql(u8, fn_name.text, name)) return fd;
+        },
+    };
+    return null;
 }
 
 fn emitModuleWithPayloads(allocator: std.mem.Allocator, payloads: []const []u8) ![]u8 {
@@ -365,7 +613,7 @@ test "emitFromSource: parses fn main { env.out(\"Hello, q64.\") } and emits a va
         \\}
         \\
     ;
-    const bytes = try emitFromSource(testing.allocator, src, "hello.q");
+    const bytes = try emitFromSource(testing.allocator, src, "hello.q", &.{});
     defer testing.allocator.free(bytes);
 
     // Valid wasm magic + version.
@@ -388,7 +636,7 @@ test "emitFromSource: supports multiple env.out calls" {
         \\}
         \\
     ;
-    const bytes = try emitFromSource(testing.allocator, src, "two.q");
+    const bytes = try emitFromSource(testing.allocator, src, "two.q", &.{});
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -400,7 +648,7 @@ test "emitFromSource: missing main returns NoMainFunction" {
     const src = "fn helper { env.out(\"x\") }\n";
     try testing.expectError(
         Error.NoMainFunction,
-        emitFromSource(testing.allocator, src, "no-main.q"),
+        emitFromSource(testing.allocator, src, "no-main.q", &.{}),
     );
 }
 
@@ -408,6 +656,88 @@ test "emitFromSource: non-env.out callee returns UnsupportedCall" {
     const src = "fn main { other.write(\"x\") }\n";
     try testing.expectError(
         Error.UnsupportedCall,
-        emitFromSource(testing.allocator, src, "bad.q"),
+        emitFromSource(testing.allocator, src, "bad.q", &.{}),
+    );
+}
+
+// ---------------------------------------------------------------------
+// Linking: imports, const-evaluation, interpolation (ladder 0,3,5,6)
+// ---------------------------------------------------------------------
+
+test "emitFromSource: resolves a cross-module call inside interpolation" {
+    // The definition of done: hello_app prints 0.1.0 by calling
+    // hello_world.version().
+    const lib = "//! dev.q64.hello_world\npub fn version() -> str { \"0.1.0\" }\n";
+    const app =
+        \\import dev.q64.hello_world.{version}
+        \\
+        \\fn main {
+        \\    env.out("{version()}")
+        \\}
+        \\
+    ;
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.hello_world", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    // The folded value lands in the data segment as "0.1.0\n".
+    try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0\n") != null);
+}
+
+test "emitFromSource: literal text around an interpolation is preserved" {
+    const lib = "pub fn version() -> str { \"0.1.0\" }\n";
+    const app = "import dev.q64.hw.{version}\nfn main { env.out(\"v{version()}!\") }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.hw", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "v0.1.0!\n") != null);
+}
+
+test "emitFromSource: a local const function folds without an import" {
+    const app = "fn version { \"9.9.9\" }\nfn main { env.out(\"{version()}\") }\n";
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "9.9.9\n") != null);
+}
+
+test "emitFromSource: doubled braces are literal, not interpolation" {
+    const app = "fn main { env.out(\"{{not interp}}\") }\n";
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "{not interp}\n") != null);
+}
+
+test "emitFromSource: interpolating an unknown name errors (honest baseline)" {
+    const app = "fn main { env.out(\"{mystery()}\") }\n";
+    try testing.expectError(
+        Error.NameNotFound,
+        emitFromSource(testing.allocator, app, "main.q", &.{}),
+    );
+}
+
+test "emitFromSource: an unresolved import errors (honest baseline)" {
+    const app = "import dev.q64.absent.{version}\nfn main { env.out(\"hi\") }\n";
+    try testing.expectError(
+        Error.UnknownModule,
+        emitFromSource(testing.allocator, app, "main.q", &.{}),
+    );
+}
+
+test "emitFromSource: importing a name the module lacks errors" {
+    const lib = "pub fn version() -> str { \"1.0\" }\n";
+    const app = "import dev.q64.hw.{missing}\nfn main { env.out(\"hi\") }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.hw", .source = lib }};
+    try testing.expectError(
+        Error.NameNotFound,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
+}
+
+test "emitFromSource: a relative import is unsupported in v0" {
+    const app = "import \"./util.q\".{helper}\nfn main { env.out(\"hi\") }\n";
+    try testing.expectError(
+        Error.UnsupportedImport,
+        emitFromSource(testing.allocator, app, "main.q", &.{}),
     );
 }

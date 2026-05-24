@@ -8,18 +8,16 @@ for items the next session should be able to pick up and act on.
 ## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
 
 The registry and the package up/download loop are **done and live**. The
-remaining work to make a qube actually *run* a linked dependency lives almost
-entirely in the compiler. Definition of done: `dev.q64.hello_app` prints
-`0.1.0` by calling `dev.q64.hello_world.version()`.
+definition of done — `dev.q64.hello_app` prints `0.1.0` by calling
+`dev.q64.hello_world.version()` — is **met** for the const-foldable case via
+the linking ladder below. The test pair now lives in the repo at
+`examples/link-demo/` (no longer ephemeral in `/tmp`).
 
-Reproduce the current wall (test pair lives in `/tmp/q64-demo/`, may not
-survive a reboot — recreate from the snippets below if gone):
+Verify (builds q64 + host + qube, then exercises both `q64 emit --module`
+and `qube run`):
 
 ```
-QUBE=qube/zig-out/bin/qube ; Q64=q64/zig-out/bin/q64
-cd /tmp/q64-demo/hello_app
-Q64_BIN=$Q64 $QUBE run            # → SyntaxError: qube run still uses strict JSON
-$Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version()}"
+./scripts/link-roundtrip.sh           # → PASS: 0.1.0
 ```
 
 ### Done this session (for the trail)
@@ -36,31 +34,45 @@ $Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version(
 - [x] Test pair built: `dev.q64.hello_world` (published, live) + `dev.q64.hello_app`.
 
 ### The linking ladder (do in order)
-0. [ ] **DO FIRST.** `q64 emit` must **error** on constructs it can't compile,
-       not silently embed them (today `"{version()}"` is emitted verbatim, and
-       `import` lines are ignored). Establishes an honest baseline so every step
-       below fails loudly and progress is measurable. Tiny change in
-       `q64/src/codegen/emit.zig` (`emitFromSource`/`emitFn`): the catch-all
-       arms already return `Error.Unsupported*` — extend them to reject
-       interpolated strings and surface ignored imports, and make `q64 emit`
-       report the error instead of writing a module.
-1. [ ] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
-       `cmdRun`/`cmdWeb` use strict `std.json` → any real manifest with
-       comments/trailing commas fails). **Gate to running anything.**
-2. [ ] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
-       repeatable. Spec: `q64-cli.md:71`.
-3. [ ] Import resolution in codegen (`q64/src/codegen/emit.zig`): resolve
-       `import dev.q64.hello_world.{version}` via the `--module` map to the
-       cached lib's `src/`, per `modules.md` resolution algorithm.
-4. [ ] `qube run`/`build` pass `--module` per dependency (map manifest dep →
-       cache dir; wants the `qube.lock` below).
-5. [ ] Codegen: function defs with return values + cross-module calls
-       (`fn version() -> str`). Blocked on the open parser productions in
-       "Other open items" (struct/import/fn-body, statements, expressions).
-6. [ ] Codegen: string interpolation `"{expr}"` — evaluate, format, concat.
+0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile
+       instead of silently embedding them — string interpolation whose value
+       isn't a compile-time constant (`UnsupportedInterpolation` /
+       `NotConstExpr`) and imports it can't resolve (`UnknownModule` /
+       `NameNotFound` / `UnsupportedImport`). `q64/src/codegen/emit.zig`
+       `Resolver` + `renderStringLit`; `cmdEmit` reports + exits non-zero.
+1. [x] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
+       `json5ToJson` strips `//`+`/* */` comments and trailing commas, then
+       parses with `std.json` into a `Value`). Single-quoted strings /
+       unquoted keys not yet handled (no manifest in the corpus uses them).
+2. [x] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
+       repeatable. Reads each module's `src/lib.q` and hands codegen a
+       `[]ModuleSource`. Spec: `q64-cli.md:71`.
+3. [x] Import resolution in codegen (`q64/src/codegen/emit.zig` `Resolver`):
+       resolves `import dev.q64.hello_world.{version}` via the `--module`
+       map. Bare-dotted selective imports only for now; relative + stdlib
+       imports error (`UnsupportedImport`).
+4. [x] `qube run`/`web` pass `--module` per dependency (`resolveModuleSpecs`
+       maps each `path` dependency → `<dep>/src` absolute). Local-path deps
+       only; a registry/git dep is reported and rejected (wants the
+       `qube.lock` + cache resolution below).
+5. [~] Cross-module calls land via **compile-time const-folding**: an imported
+       function whose body is a constant (`fn version() -> str { "0.1.0" }`) is
+       evaluated and its value spliced in. Enough for the DoD. Real wasm
+       emission of callee functions + a string return ABI is the follow-up
+       (needs the deeper parser/typeck work below).
+6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
+       `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
+       are literal braces. Runtime-valued interpolations error honestly.
 
-Long pole: 5–6 sit on the parser productions still open below — codegen can't
-walk what the parser doesn't produce. That parser work is the real critical path.
+**Definition of done met.** `cd examples/link-demo/hello_app && qube run`
+prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)
+and calling its `version()`. Durable regression test:
+`scripts/link-roundtrip.sh` (covers `q64 emit --module` *and* `qube run`) +
+`examples/link-demo/`.
+
+Long pole still ahead: a real (non-const-folded) cross-module call needs the
+open parser productions below — codegen can't walk what the parser doesn't
+produce. That parser work is the real critical path.
 
 ### Deferred package bits (not compiler; pick up anytime)
 - [ ] `qube.lock` — `add` doesn't write one; needed for ladder step 4.
@@ -178,17 +190,40 @@ interop.
 This section grows as we go. Each item should have a checkbox so it's
 visible at a glance whether it's been picked up.
 
-- [ ] Parser: items productions. `pub` + `fn` landed (q64/src/parser/parse.zig);
-      `struct`, `enum`, `face`, `fit`, `const`, `import` still pending.
-      Unblocks NAM conformance tests.
+- [x] Parser-emitted syntactic NAM diagnostics: `NAM003` (wildcard import),
+      `NAM004` (selective+alias), `NAM009` (block `pub`), `NAM011` (dash in
+      bare path). Conformance 6→10. The semantic NAM codes (`NAM001/002/005…`,
+      need a name-resolution pass) and `LEX020/021`, `PAR040` remain.
+- [x] Parser: items productions. `fn`, `import`, `struct`, `enum`, `type`,
+      `const`, `face`, `fit` all parse now (shared `pub` prefix +
+      `itemKeyword` dispatch). Struct record fields and enum variants are
+      structured; field/variant *types*, generic-param internals, and
+      face/fit method bodies are still raw token spans (pending the
+      type-expression grammar). New item nodes aren't surfaced through
+      `ast.Item` yet (only `FnDecl`), so codegen is unaffected. Real
+      `dev.q64.webmcp_client` library files now parse with no diagnostics.
+- [x] Parser: full expression precedence chain (binary/unary/try/postfix)
+      from `grammar.md`. `parseBinExpr` (precedence climbing) over
+      `parseUnary`→`parseTryExpr`→`parsePostfix`→`parsePrimary`; postfix
+      call/index/field/method/tuple-field/`?.`; paren/tuple/array primaries.
+      Dotted paths stay one greedy `PATH_EXPR` so `env.out(…)` keeps its
+      `CALL_EXPR[PATH_EXPR, CALL_ARGS]` shape (codegen unchanged).
+      **`PAR040` was attempted here but reverted**: telling a generic call
+      (`PCM<f32>(0.0)`) from a chained comparison (`a < b > c`) needs name
+      resolution — a pure-syntax heuristic false-positives on valid
+      generics. PAR040 is therefore deferred to the name-resolution pass.
 - [ ] AST views: extend `q64/src/parser/ast.zig` as each item
       production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
-      seeded the pattern.
-- [ ] Parser: statement + expression productions inside `Block`.
-      Today blocks carry raw tokens; need `LetStmt`, `ExprStmt`,
-      `MethodExpr` (`env.out("…")`), `PathExpr`, `STR_LITERAL` to
-      structure the hello-world body. Required before codegen can
-      walk it.
+      and `ImportStmt` seeded the pattern.
+- [x] Parser: statement productions inside `Block`. `let`/`var`,
+      `return`/`break`/`continue`, `panic`, `if`/`else` (+ `if let`),
+      `while`, `loop`, `for`, `match` (+ arms), and assignment vs
+      expression statements all structure now (`parseStmt` dispatch).
+      Only `EXPR_STMT` is surfaced to `ast.Stmt`, so codegen is
+      unaffected. Still raw spans: let-bindings, for/match patterns,
+      and types (pending the pattern grammar). Not yet structured:
+      `scope`/`select`/`region`/`with_capabilities`/item-`const` (fall
+      to the lossless expr/assign fallback).
 - [x] Runtime: wasmtime host that runs `hello.wat` and prints
       "Hello, q64.\n" via the `env.out` import
       (runtime/wasmtime/src/main.zig). v0 byte-level golden for
@@ -203,15 +238,19 @@ visible at a glance whether it's been picked up.
       with N `env.out("…")` calls laid out in linear memory.
       `examples/hello/hello.q` + `scripts/hello-roundtrip.sh`
       exercise the full parse → AST → codegen → runtime chain.
-- [ ] Parser: pattern + match arms (next gating item for the
-      typeck / typed-AST work).
-- [ ] Parser: binary expressions (`+`, `-`, comparison, …) and the
-      full precedence chain from `spec/grammar.md`. Current `parseExpr`
-      handles literal / path / call only and falls back to one-token
-      recovery for anything else.
-- [ ] Parser: pattern + match arms. Unlocks half the remaining
-      `spec/tests/` corpus.
-- [ ] Parser: full expression precedence chain from `grammar.md`.
+- [x] Parser: pattern grammar (v0 floor). `parsePattern` covers wild /
+      literal / ident / tuple / tuple-struct / record-struct / enum-variant,
+      wired into `match` arms, `let`/`var`, `for` heads, and `if let`.
+      Guards / or-patterns / ranges / deep destructuring still deferred
+      (see "Pattern grammar completion" below). The real
+      `dev.q64.webmcp_client` example app (match on strings + variants,
+      `for`, raw strings, interpolation) now parses with no diagnostics.
+- [x] Parser: lexer raw strings `r"…"` / `r#"…"#` (STR_RAW).
+- [ ] Parser: record/struct **expression** literals (`Point { x: 1 }`,
+      `DemoTools {}`) in expression position. Deferred for the
+      struct-literal-vs-block ambiguity (Rust-style); today they degrade to
+      lossless one-token recovery. Needs the disambiguation rule (likely:
+      no bare record literal in `if`/`while`/`match` scrutinee position).
 - [x] `spec/annotations.md` — categorize `@`-forms (markers / derive /
       property wrappers). Smallest scope, highest cross-reference value.
 - [x] `spec/units.md` — drain the unit-suffix table out of `types.md`

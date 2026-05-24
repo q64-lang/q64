@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.addImport("parser", parser_mod);
-    linkBinaryen(exe_mod, binaryen_include, binaryen_lib);
+    linkBinaryen(exe_mod, target, binaryen_include, binaryen_lib);
 
     const exe = b.addExecutable(.{
         .name = "q64",
@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     codegen_mod.addImport("parser", parser_mod);
-    linkBinaryen(codegen_mod, binaryen_include, binaryen_lib);
+    linkBinaryen(codegen_mod, target, binaryen_include, binaryen_lib);
     const codegen_tests = b.addTest(.{ .root_module = codegen_mod });
     test_step.dependOn(&b.addRunArtifact(codegen_tests).step);
 
@@ -102,11 +102,35 @@ fn addPlainTest(
 // needed.
 fn linkBinaryen(
     mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
     include_path: std.Build.LazyPath,
     lib_path: std.Build.LazyPath,
 ) void {
     mod.link_libc = true;
-    mod.link_libcpp = true;
     mod.addIncludePath(include_path);
     mod.addObjectFile(lib_path);
+
+    // Binaryen is built from source by init.sh using the host C++
+    // toolchain. On Linux that is gcc, so libbinaryen.a carries the GNU
+    // libstdc++ ABI (the `__cxx11` symbols); link the system libstdc++
+    // rather than zig's bundled libc++, which would leave those symbols
+    // undefined. On macOS / Windows the host toolchain and zig's
+    // linkLibCpp agree (Apple libc++ / MSVC), so use the bundled path.
+    if (target.result.os.tag == .linux) {
+        // `linkSystemLibrary("stdc++")` is intercepted by zig and routed
+        // to its bundled libc++ (wrong ABI here). Link the GNU libstdc++
+        // by its absolute path instead. Ask gcc where it lives, since
+        // the linker symlink sits in gcc's own lib directory rather than
+        // on the default search path.
+        const mod_b = mod.owner;
+        // libstdc++.so is a real ELF; libgcc_s.so is a GNU ld script, so
+        // ask for the concrete `.so.1` (it provides `_Unwind_*`).
+        for ([_][]const u8{ "libstdc++.so", "libgcc_s.so.1" }) |lib| {
+            const printed = mod_b.run(&.{ "g++", mod_b.fmt("-print-file-name={s}", .{lib}) });
+            const so_path = std.mem.trim(u8, printed, " \r\n");
+            mod.addObjectFile(.{ .cwd_relative = so_path });
+        }
+    } else {
+        mod.link_libcpp = true;
+    }
 }

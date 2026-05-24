@@ -31,6 +31,10 @@ pub const SourceFile = struct {
     pub fn items(self: SourceFile) ItemIter {
         return .{ .children = self.cst.children };
     }
+
+    pub fn imports(self: SourceFile) ImportIter {
+        return .{ .children = self.cst.children };
+    }
 };
 
 // =====================================================================
@@ -61,6 +65,116 @@ pub const ItemIter = struct {
                 .node => |n| if (Item.cast(n)) |it| {
                     self.i += 1;
                     return it;
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+// =====================================================================
+// ImportStmt
+// =====================================================================
+
+/// `ImportStmt := "import" ImportPath ImportBinding?` (spec/modules.md
+/// §"Import grammar"). Exposes the module path, whether it is a quoted
+/// relative path, and the selectively-imported names.
+pub const ImportStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn cast(node: *const cst.Node) ?ImportStmt {
+        if (node.kind == .IMPORT_STMT) return .{ .cst = node };
+        return null;
+    }
+
+    fn importPath(self: ImportStmt) ?*const cst.Node {
+        return firstChildRawNode(self.cst, .IMPORT_PATH);
+    }
+
+    /// True for `import "./util.q"` forms; false for bare-dotted module
+    /// paths like `import dev.q64.foo`.
+    pub fn isRelative(self: ImportStmt) bool {
+        const p = self.importPath() orelse return false;
+        return firstChildRawNode(p, .QUOTED_RELATIVE) != null;
+    }
+
+    /// The dotted module path text (`dev.q64.hello_world`) for a
+    /// bare-dotted import, or the decoded relative path (`./util.q`)
+    /// for a quoted import. Caller owns the returned slice.
+    pub fn path(self: ImportStmt, allocator: std.mem.Allocator) !?[]u8 {
+        const p = self.importPath() orelse return null;
+        if (firstChildRawNode(p, .BARE_DOTTED)) |bare| {
+            var len: usize = 0;
+            for (bare.children) |c| switch (c) {
+                .token => |t| if (t.kind == .IDENT or t.kind == .DOT) {
+                    len += t.text.len;
+                },
+                .node => {},
+            };
+            const out = try allocator.alloc(u8, len);
+            var i: usize = 0;
+            for (bare.children) |c| switch (c) {
+                .token => |t| if (t.kind == .IDENT or t.kind == .DOT) {
+                    @memcpy(out[i .. i + t.text.len], t.text);
+                    i += t.text.len;
+                },
+                .node => {},
+            };
+            return out;
+        }
+        if (firstChildRawNode(p, .QUOTED_RELATIVE)) |q| {
+            for (q.children) |c| switch (c) {
+                .token => |t| if (t.kind == .STR_PLAIN or t.kind == .STR_RAW) {
+                    // Strip the surrounding quotes; relative paths use no escapes in v0.
+                    if (t.text.len >= 2 and t.text[0] == '"') {
+                        return try allocator.dupe(u8, t.text[1 .. t.text.len - 1]);
+                    }
+                    return try allocator.dupe(u8, t.text);
+                },
+                .node => {},
+            };
+        }
+        return null;
+    }
+
+    /// Iterator over the selectively-imported names (`.{a, b}`). Empty
+    /// for namespace and alias imports.
+    pub fn names(self: ImportStmt) NameIter {
+        const sel = firstChildRawNode(self.cst, .SELECTIVE_LIST) orelse
+            return .{ .children = &.{} };
+        return .{ .children = sel.children };
+    }
+};
+
+pub const NameIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *NameIter) ?cst.Token {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .token => |t| if (t.kind == .IDENT) {
+                    self.i += 1;
+                    return t;
+                },
+                .node => {},
+            }
+        }
+        return null;
+    }
+};
+
+pub const ImportIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *ImportIter) ?ImportStmt {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (ImportStmt.cast(n)) |im| {
+                    self.i += 1;
+                    return im;
                 },
                 .token => {},
             }
@@ -378,6 +492,14 @@ fn firstChildNode(
 ) ?View {
     for (parent.children) |c| switch (c) {
         .node => |n| if (n.kind == kind) return View{ .cst = n },
+        .token => {},
+    };
+    return null;
+}
+
+fn firstChildRawNode(parent: *const cst.Node, kind: cst.SyntaxKind) ?*const cst.Node {
+    for (parent.children) |c| switch (c) {
+        .node => |n| if (n.kind == kind) return n,
         .token => {},
     };
     return null;
