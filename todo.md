@@ -36,31 +36,41 @@ $Q64 emit src/main.q /tmp/x.wasm  # → exit 0 but embeds the LITERAL "{version(
 - [x] Test pair built: `dev.q64.hello_world` (published, live) + `dev.q64.hello_app`.
 
 ### The linking ladder (do in order)
-0. [ ] **DO FIRST.** `q64 emit` must **error** on constructs it can't compile,
-       not silently embed them (today `"{version()}"` is emitted verbatim, and
-       `import` lines are ignored). Establishes an honest baseline so every step
-       below fails loudly and progress is measurable. Tiny change in
-       `q64/src/codegen/emit.zig` (`emitFromSource`/`emitFn`): the catch-all
-       arms already return `Error.Unsupported*` — extend them to reject
-       interpolated strings and surface ignored imports, and make `q64 emit`
-       report the error instead of writing a module.
+0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile
+       instead of silently embedding them — string interpolation whose value
+       isn't a compile-time constant (`UnsupportedInterpolation` /
+       `NotConstExpr`) and imports it can't resolve (`UnknownModule` /
+       `NameNotFound` / `UnsupportedImport`). `q64/src/codegen/emit.zig`
+       `Resolver` + `renderStringLit`; `cmdEmit` reports + exits non-zero.
 1. [ ] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
        `cmdRun`/`cmdWeb` use strict `std.json` → any real manifest with
        comments/trailing commas fails). **Gate to running anything.**
-2. [ ] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
-       repeatable. Spec: `q64-cli.md:71`.
-3. [ ] Import resolution in codegen (`q64/src/codegen/emit.zig`): resolve
-       `import dev.q64.hello_world.{version}` via the `--module` map to the
-       cached lib's `src/`, per `modules.md` resolution algorithm.
+2. [x] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
+       repeatable. Reads each module's `src/lib.q` and hands codegen a
+       `[]ModuleSource`. Spec: `q64-cli.md:71`.
+3. [x] Import resolution in codegen (`q64/src/codegen/emit.zig` `Resolver`):
+       resolves `import dev.q64.hello_world.{version}` via the `--module`
+       map. Bare-dotted selective imports only for now; relative + stdlib
+       imports error (`UnsupportedImport`).
 4. [ ] `qube run`/`build` pass `--module` per dependency (map manifest dep →
-       cache dir; wants the `qube.lock` below).
-5. [ ] Codegen: function defs with return values + cross-module calls
-       (`fn version() -> str`). Blocked on the open parser productions in
-       "Other open items" (struct/import/fn-body, statements, expressions).
-6. [ ] Codegen: string interpolation `"{expr}"` — evaluate, format, concat.
+       path/cache dir; wants the `qube.lock` below).
+5. [~] Cross-module calls land via **compile-time const-folding**: an imported
+       function whose body is a constant (`fn version() -> str { "0.1.0" }`) is
+       evaluated and its value spliced in. Enough for the DoD. Real wasm
+       emission of callee functions + a string return ABI is the follow-up
+       (needs the deeper parser/typeck work below).
+6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
+       `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
+       are literal braces. Runtime-valued interpolations error honestly.
 
-Long pole: 5–6 sit on the parser productions still open below — codegen can't
-walk what the parser doesn't produce. That parser work is the real critical path.
+Done at the compiler level: `q64 emit app/src/main.q --module dev.q64.hello_world=lib/src`
+→ host prints `0.1.0` (the DoD). Durable regression test:
+`scripts/link-roundtrip.sh` + `examples/link-demo/`. Remaining for the *full*
+`qube run` DoD: ladder steps 1 + 4 (qube-side JSON5 + `--module` passing).
+
+Long pole still ahead: a real (non-const-folded) cross-module call needs the
+open parser productions below — codegen can't walk what the parser doesn't
+produce. That parser work is the real critical path.
 
 ### Deferred package bits (not compiler; pick up anytime)
 - [ ] `qube.lock` — `add` doesn't write one; needed for ladder step 4.
@@ -178,12 +188,12 @@ interop.
 This section grows as we go. Each item should have a checkbox so it's
 visible at a glance whether it's been picked up.
 
-- [ ] Parser: items productions. `pub` + `fn` landed (q64/src/parser/parse.zig);
-      `struct`, `enum`, `face`, `fit`, `const`, `import` still pending.
-      Unblocks NAM conformance tests.
+- [ ] Parser: items productions. `pub` + `fn` + `import` landed
+      (q64/src/parser/parse.zig); `struct`, `enum`, `face`, `fit`, `const`
+      still pending. Unblocks NAM conformance tests.
 - [ ] AST views: extend `q64/src/parser/ast.zig` as each item
       production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
-      seeded the pattern.
+      and `ImportStmt` seeded the pattern.
 - [ ] Parser: statement + expression productions inside `Block`.
       Today blocks carry raw tokens; need `LetStmt`, `ExprStmt`,
       `MethodExpr` (`env.out("…")`), `PathExpr`, `STR_LITERAL` to

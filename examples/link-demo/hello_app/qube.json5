@@ -1,0 +1,16 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "dev.q64.hello_app",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "Prints the version of dev.q64.hello_world by linking it.",
+  "type": "application",
+  "entry": "src/main.q",
+
+  // Local-path dependency on the sibling library. `qube` normalises
+  // this to an absolute path and links it via
+  // `q64 emit --module dev.q64.hello_world=<path>/src` (spec/qube-cli.md).
+  "dependencies": {
+    "dev.q64.hello_world": { "path": "../hello_world" },
+  },
+}

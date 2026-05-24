@@ -81,6 +81,48 @@ pub fn parse(allocator: Allocator, source: []const u8, file: []const u8) !Result
     };
 }
 
+/// Parse a single expression from `source`. Used by codegen to evaluate
+/// string-interpolation bodies (`{version()}`) without standing up a
+/// whole file. The returned `Result.root` is the expression node
+/// (castable via `ast.Expr.cast`); losslessness is not a goal here, so
+/// leading trivia is discarded.
+pub fn parseExpression(allocator: Allocator, source: []const u8, file: []const u8) !Result {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+
+    const a = arena.allocator();
+    const lex_result = try lex.tokenize(a, source);
+
+    var diags: std.ArrayList(diag.Diagnostic) = .empty;
+    errdefer diags.deinit(allocator);
+    for (lex_result.diagnostics) |d| {
+        try diags.append(allocator, .{
+            .code = d.code,
+            .severity = .err,
+            .message = diag.messageFor(d.code),
+            .file = file,
+            .offset = d.offset,
+        });
+    }
+
+    var parser = Parser{ .tokens = lex_result.tokens, .pos = 0, .arena = a };
+    while (!parser.isEof() and parser.peek().isTrivia()) _ = parser.advance();
+    const root = if (parser.isEof())
+        try cst.makeNode(a, .LITERAL_EXPR, &.{})
+    else
+        try parser.parseExpr();
+
+    return .{
+        .arena = arena,
+        .root = root,
+        .diagnostics = try diags.toOwnedSlice(allocator),
+    };
+}
+
 // =====================================================================
 // Parser
 // =====================================================================
@@ -134,6 +176,11 @@ const Parser = struct {
         var children: std.ArrayList(cst.Element) = .empty;
 
         while (!self.isEof()) {
+            if (self.peek() == .KW_IMPORT) {
+                const import_node = try self.parseImportStmt();
+                try children.append(self.arena, .{ .node = import_node });
+                continue;
+            }
             if (self.atFnItem()) {
                 const fn_node = try self.parseFnDecl();
                 try children.append(self.arena, .{ .node = fn_node });
@@ -203,6 +250,133 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .VISIBILITY, &[_]cst.Element{
             .{ .token = kw },
         });
+    }
+
+    // -----------------------------------------------------------------
+    // ImportStmt
+    // -----------------------------------------------------------------
+    //
+    // `ImportStmt := "import" ImportPath ImportBinding?` per
+    // spec/modules.md §"Import grammar" and spec/grammar.md §Imports.
+    // The path is either a bare dotted module path (`dev.q64.foo`) or
+    // a quoted relative path (`"./util.q"`); the optional binding is a
+    // selective list (`.{a, b}`) or an alias (`as x`). The pieces the
+    // parser doesn't recognize still pass through as raw tokens so the
+    // lossless invariant holds.
+
+    fn parseImportStmt(self: *Parser) !*const cst.Node {
+        std.debug.assert(self.peek() == .KW_IMPORT);
+        var children: std.ArrayList(cst.Element) = .empty;
+
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_IMPORT
+        try self.eatTrivia(&children);
+
+        // ImportPath: quoted-relative or bare-dotted.
+        if (self.peek() == .STR_PLAIN or self.peek() == .STR_RAW) {
+            const path_node = try self.parseQuotedRelative();
+            try children.append(self.arena, .{ .node = path_node });
+        } else if (self.peek() == .IDENT) {
+            const path_node = try self.parseBareDotted();
+            try children.append(self.arena, .{ .node = path_node });
+        }
+        try self.eatTrivia(&children);
+
+        // ImportBinding: selective list (`.{...}`) or alias (`as x`).
+        if (self.peek() == .DOT and self.nonTriviaAfterDotIsBrace()) {
+            const sel = try self.parseSelectiveList();
+            try children.append(self.arena, .{ .node = sel });
+        } else if (self.peek() == .KW_AS) {
+            const alias = try self.parseAliasBinding();
+            try children.append(self.arena, .{ .node = alias });
+        }
+
+        return try cst.makeNode(self.arena, .IMPORT_STMT, children.items);
+    }
+
+    fn parseQuotedRelative(self: *Parser) !*const cst.Node {
+        const str = self.advance(); // STR_PLAIN / STR_RAW
+        const inner = try cst.makeNode(self.arena, .QUOTED_RELATIVE, &[_]cst.Element{
+            .{ .token = str },
+        });
+        return try cst.makeNode(self.arena, .IMPORT_PATH, &[_]cst.Element{
+            .{ .node = inner },
+        });
+    }
+
+    /// `BareDotted := IDENT ("." IDENT)*`, wrapped in IMPORT_PATH. Stops
+    /// at a `.` that introduces a selective list (`.{`), leaving that dot
+    /// for `parseSelectiveList`.
+    fn parseBareDotted(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // first IDENT
+
+        while (self.peek() == .DOT and !self.nonTriviaAfterDotIsBrace()) {
+            const save = self.pos;
+            const dot = self.advance();
+            // Only continue the path if the dot is followed by an IDENT.
+            if (self.peek() == .IDENT) {
+                try children.append(self.arena, .{ .token = dot });
+                try children.append(self.arena, .{ .token = self.advance() });
+                continue;
+            }
+            self.pos = save;
+            break;
+        }
+
+        const inner = try cst.makeNode(self.arena, .BARE_DOTTED, children.items);
+        return try cst.makeNode(self.arena, .IMPORT_PATH, &[_]cst.Element{
+            .{ .node = inner },
+        });
+    }
+
+    /// `SelectiveList := "." "{" IDENT ("," IDENT)* "}"`.
+    fn parseSelectiveList(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // DOT
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        try self.eatTrivia(&children);
+        while (!self.isEof() and self.peek() != .R_BRACE) {
+            if (self.peek() == .IDENT) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            } else {
+                // Recovery: absorb anything unexpected so we make progress.
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+            try self.eatTrivia(&children);
+            if (self.peek() == .COMMA) {
+                try children.append(self.arena, .{ .token = self.advance() });
+                try self.eatTrivia(&children);
+            }
+        }
+        if (self.peek() == .R_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .SELECTIVE_LIST, children.items);
+    }
+
+    /// `AliasBinding := "as" IDENT`.
+    fn parseAliasBinding(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_AS
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .ALIAS_BINDING, children.items);
+    }
+
+    /// Lookahead: is the token after the upcoming `.` (skipping trivia)
+    /// an `{`? Distinguishes a selective list (`foo.{a}`) from a path
+    /// continuation (`foo.bar`).
+    fn nonTriviaAfterDotIsBrace(self: *const Parser) bool {
+        var i = self.pos;
+        if (i >= self.tokens.len or self.tokens[i].kind != .DOT) return false;
+        i += 1;
+        while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+        return i < self.tokens.len and self.tokens[i].kind == .L_BRACE;
     }
 
     /// Collect everything from the opening `(` to its matching `)`,
@@ -449,6 +623,11 @@ test "round-trip: serialize(parse(s)) == s" {
         "@stage\nfn mic_input -> Signal<PCM<f32>, 48.kHz> {\n    env.audio.input()\n}\n",
         "",
         "fn a {} fn b {}\n",
+        "import dev.q64.hello_world.{version}\n\nfn main { env.out(version()) }\n",
+        "import q64.math\n",
+        "import q64.math as m\n",
+        "import q64.math.{Vec3, dot}\n",
+        "import \"./util.q\".{helper}\n",
     };
 
     for (sources) |src| {
@@ -548,6 +727,64 @@ test "parses two fn items in one file" {
     try testing.expectEqualStrings("a", first.name().?.text);
     try testing.expectEqualStrings("b", second.name().?.text);
     try testing.expect(iter.next() == null);
+}
+
+test "parses a selective import into an IMPORT_STMT with path + names" {
+    const src = "import dev.q64.hello_world.{version, build}\nfn main { 0 }\n";
+    const r = try parse(testing.allocator, src, "imp.q");
+    defer r.deinit(testing.allocator);
+
+    const sf = ast.SourceFile.cast(r.root) orelse return error.TestExpectedSourceFile;
+    var imports = sf.imports();
+    const im = imports.next() orelse return error.TestExpectedImport;
+
+    try testing.expect(!im.isRelative());
+    const p = (try im.path(testing.allocator)) orelse return error.TestExpectedPath;
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("dev.q64.hello_world", p);
+
+    var names = im.names();
+    try testing.expectEqualStrings("version", (names.next() orelse return error.TestExpectedName).text);
+    try testing.expectEqualStrings("build", (names.next() orelse return error.TestExpectedName).text);
+    try testing.expect(names.next() == null);
+    try testing.expect(imports.next() == null);
+
+    // The fn item is still surfaced alongside the import.
+    var items = sf.items();
+    const fd = (items.next() orelse return error.TestExpectedItem).fn_decl;
+    try testing.expectEqualStrings("main", fd.name().?.text);
+}
+
+test "parses namespace and alias imports" {
+    const src = "import q64.math as m\n";
+    const r = try parse(testing.allocator, src, "alias.q");
+    defer r.deinit(testing.allocator);
+
+    const sf = ast.SourceFile.cast(r.root).?;
+    var imports = sf.imports();
+    const im = imports.next() orelse return error.TestExpectedImport;
+    const p = (try im.path(testing.allocator)).?;
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("q64.math", p);
+    // No selective names on an alias import.
+    var names = im.names();
+    try testing.expect(names.next() == null);
+}
+
+test "parses a quoted relative import path" {
+    const src = "import \"./util.q\".{helper}\n";
+    const r = try parse(testing.allocator, src, "rel.q");
+    defer r.deinit(testing.allocator);
+
+    const sf = ast.SourceFile.cast(r.root).?;
+    var imports = sf.imports();
+    const im = imports.next() orelse return error.TestExpectedImport;
+    try testing.expect(im.isRelative());
+    const p = (try im.path(testing.allocator)).?;
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("./util.q", p);
+    var names = im.names();
+    try testing.expectEqualStrings("helper", (names.next() orelse return error.TestExpectedName).text);
 }
 
 test "unimplemented items don't break losslessness or item iteration" {
