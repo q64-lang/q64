@@ -210,11 +210,15 @@ visible at a glance whether it's been picked up.
 - [ ] AST views: extend `q64/src/parser/ast.zig` as each item
       production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
       and `ImportStmt` seeded the pattern.
-- [ ] Parser: statement + expression productions inside `Block`.
-      Today blocks carry raw tokens; need `LetStmt`, `ExprStmt`,
-      `MethodExpr` (`env.out("…")`), `PathExpr`, `STR_LITERAL` to
-      structure the hello-world body. Required before codegen can
-      walk it.
+- [x] Parser: statement productions inside `Block`. `let`/`var`,
+      `return`/`break`/`continue`, `panic`, `if`/`else` (+ `if let`),
+      `while`, `loop`, `for`, `match` (+ arms), and assignment vs
+      expression statements all structure now (`parseStmt` dispatch).
+      Only `EXPR_STMT` is surfaced to `ast.Stmt`, so codegen is
+      unaffected. Still raw spans: let-bindings, for/match patterns,
+      and types (pending the pattern grammar). Not yet structured:
+      `scope`/`select`/`region`/`with_capabilities`/item-`const` (fall
+      to the lossless expr/assign fallback).
 - [x] Runtime: wasmtime host that runs `hello.wat` and prints
       "Hello, q64.\n" via the `env.out` import
       (runtime/wasmtime/src/main.zig). v0 byte-level golden for

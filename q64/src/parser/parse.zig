@@ -545,24 +545,281 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .BLOCK, children.items);
     }
 
-    /// Parse a single statement. v0 only structures `ExprStmt`; any
-    /// trailing tokens up to the next newline / semicolon / `}` get
-    /// swept into the EXPR_STMT node so block-level iteration sees
-    /// a clean boundary.
-    fn parseStmt(self: *Parser) !*const cst.Node {
-        var children: std.ArrayList(cst.Element) = .empty;
-        const expr = try self.parseExpr();
-        try children.append(self.arena, .{ .node = expr });
+    // -----------------------------------------------------------------
+    // Statements
+    // -----------------------------------------------------------------
+    //
+    // Dispatch per spec/grammar.md §Statements. The common forms are
+    // structured here; scope / select / region / with_capabilities and
+    // item-level `const` are not yet handled and fall through to the
+    // expr/assign fallback (still lossless). Patterns and let-bindings
+    // are captured as raw token spans for now — the structured pattern
+    // grammar lands next (todo.md). Only `ExprStmt` is surfaced to the
+    // AST (`ast.Stmt`); the other statement nodes are skipped by
+    // `StmtIter`, so codegen is unaffected.
 
-        // Sweep the rest of the statement. NEWLINE / SEMICOLON / `}`
-        // end the statement; trivia and any unparsed tokens get
-        // absorbed so the next stmt starts cleanly.
+    fn parseStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        return switch (self.peek()) {
+            .KW_LET => self.parseLetOrVarStmt(.LET_STMT),
+            .KW_VAR => self.parseLetOrVarStmt(.VAR_STMT),
+            .KW_RETURN => self.parseReturnLike(.RETURN_STMT),
+            .KW_BREAK => self.parseReturnLike(.BREAK_STMT),
+            .KW_CONTINUE => self.parseBareKeywordStmt(.CONTINUE_STMT),
+            .KW_PANIC => self.parsePanicStmt(),
+            .KW_IF => self.parseIfStmt(),
+            .KW_WHILE => self.parseWhileStmt(),
+            .KW_LOOP => self.parseLoopStmt(),
+            .KW_FOR => self.parseForStmt(),
+            .KW_MATCH => self.parseMatchStmt(),
+            else => self.parseExprOrAssignStmt(),
+        };
+    }
+
+    fn isAssignOp(k: cst.SyntaxKind) bool {
+        return switch (k) {
+            .EQ, .PLUS_EQ, .MINUS_EQ, .STAR_EQ, .SLASH_EQ, .PERCENT_EQ => true,
+            else => false,
+        };
+    }
+
+    /// Append raw tokens until a depth-0 token in `stops` (or a closing
+    /// `}`/newline/EOF). Bracket nesting is tracked so a stop token
+    /// inside `(...)`, `[...]`, `{...}`, or `<...>` is ignored. Used for
+    /// the not-yet-structured spans (let bindings, types, patterns).
+    fn captureRawUntil(self: *Parser, children: *std.ArrayList(cst.Element), stops: []const cst.SyntaxKind) !void {
+        var depth: i32 = 0;
+        while (!self.isEof()) {
+            const k = self.peek();
+            if (depth <= 0) {
+                if (k == .R_BRACE or k == .NEWLINE) return;
+                for (stops) |s| if (k == s) return;
+            }
+            switch (k) {
+                .L_PAREN, .L_BRACK, .L_BRACE, .L_ANGLE => depth += 1,
+                .R_PAREN, .R_BRACK, .R_ANGLE, .R_BRACE => depth -= 1,
+                else => {},
+            }
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+    }
+
+    /// Is there a real token before the end of this statement (newline /
+    /// `;` / `}` / EOF)? Used for the optional expression in
+    /// `return` / `break`.
+    fn nextIsExprOnLine(self: *const Parser) bool {
+        var i = self.pos;
+        while (i < self.tokens.len) : (i += 1) {
+            const k = self.tokens[i].kind;
+            if (k == .NEWLINE or k == .SEMICOLON or k == .R_BRACE or k == .EOF) return false;
+            if (k.isTrivia()) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// `LetStmt`/`VarStmt`: `(let|var) <binding> (":" <type>)? ("=" Expr)?`.
+    /// Binding and type are raw spans pending the pattern grammar.
+    fn parseLetOrVarStmt(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // let / var
+        try self.captureRawUntil(&children, &.{ .COLON, .EQ });
+        if (self.peek() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.captureRawUntil(&children, &.{.EQ});
+        }
+        if (self.peek() == .EQ) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+        }
+        return try cst.makeNode(self.arena, kind, children.items);
+    }
+
+    /// `return`/`break` with an optional trailing expression on the line.
+    fn parseReturnLike(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // keyword
+        if (self.nextIsExprOnLine()) {
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+        }
+        return try cst.makeNode(self.arena, kind, children.items);
+    }
+
+    fn parseBareKeywordStmt(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() });
+        return try cst.makeNode(self.arena, kind, children.items);
+    }
+
+    /// `PanicStmt := "panic" Expr`.
+    fn parsePanicStmt(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // panic
+        if (self.nextIsExprOnLine()) {
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+        }
+        return try cst.makeNode(self.arena, .PANIC_STMT, children.items);
+    }
+
+    /// `IfStmt := "if" IfCond Block ("else" (IfStmt | Block))?`, where
+    /// `IfCond` is an expression or an `if let` binding. The scrutinee
+    /// expression stops at the block's `{` (no record-literal primary,
+    /// so there's no struct-literal-in-condition ambiguity).
+    fn parseIfStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // if
+        try self.eatTrivia(&children);
+
+        if (self.peek() == .KW_LET) {
+            var cl: std.ArrayList(cst.Element) = .empty;
+            try cl.append(self.arena, .{ .token = self.advance() }); // let
+            try self.captureRawUntil(&cl, &.{.EQ});
+            if (self.peek() == .EQ) {
+                try cl.append(self.arena, .{ .token = self.advance() });
+                try self.eatTrivia(&cl);
+                try cl.append(self.arena, .{ .node = try self.parseExpr() });
+            }
+            try children.append(self.arena, .{ .node = try cst.makeNode(self.arena, .IF_COND_LET, cl.items) });
+        } else {
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+        }
+
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+
+        // `else` may sit after the block on the same or a later line.
+        // Look past trivia; if there's no `else`, leave it for the caller.
+        const save = self.pos;
+        var lead: std.ArrayList(cst.Element) = .empty;
+        try self.eatTrivia(&lead);
+        if (self.peek() == .KW_ELSE) {
+            try children.appendSlice(self.arena, lead.items);
+            try children.append(self.arena, .{ .token = self.advance() }); // else
+            try self.eatTrivia(&children);
+            if (self.peek() == .KW_IF) {
+                try children.append(self.arena, .{ .node = try self.parseIfStmt() });
+            } else if (self.peek() == .L_BRACE) {
+                try children.append(self.arena, .{ .node = try self.parseBlock() });
+            }
+        } else {
+            self.pos = save;
+        }
+        return try cst.makeNode(self.arena, .IF_STMT, children.items);
+    }
+
+    fn parseWhileStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // while
+        try self.eatTrivia(&children);
+        try children.append(self.arena, .{ .node = try self.parseExpr() });
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .WHILE_STMT, children.items);
+    }
+
+    fn parseLoopStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // loop
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .LOOP_STMT, children.items);
+    }
+
+    /// `ForStmt := "for" Pattern "in" Expr Block`. Pattern is a raw span.
+    fn parseForStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // for
+        try self.captureRawUntil(&children, &.{.KW_IN});
+        if (self.peek() == .KW_IN) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+            try self.eatTrivia(&children);
+            if (self.peek() == .L_BRACE) {
+                try children.append(self.arena, .{ .node = try self.parseBlock() });
+            }
+        }
+        return try cst.makeNode(self.arena, .FOR_STMT, children.items);
+    }
+
+    /// `MatchStmt := "match" Expr "{" MatchArm ("," MatchArm)* ","? "}"`.
+    fn parseMatchStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // match
+        try self.eatTrivia(&children);
+        try children.append(self.arena, .{ .node = try self.parseExpr() });
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() }); // {
+            while (!self.isEof()) {
+                try self.eatTrivia(&children);
+                if (self.peek() == .R_BRACE) break;
+                try children.append(self.arena, .{ .node = try self.parseMatchArm() });
+                try self.eatTrivia(&children);
+                if (self.peek() == .COMMA) {
+                    try children.append(self.arena, .{ .token = self.advance() });
+                }
+            }
+            if (self.peek() == .R_BRACE) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+        }
+        return try cst.makeNode(self.arena, .MATCH_STMT, children.items);
+    }
+
+    /// `MatchArm := Pattern "->" (Block | Expr)`. Pattern is a raw span.
+    fn parseMatchArm(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.captureRawUntil(&children, &.{.ARROW});
+        if (self.peek() == .ARROW) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            if (self.peek() == .L_BRACE) {
+                try children.append(self.arena, .{ .node = try self.parseBlock() });
+            } else {
+                try children.append(self.arena, .{ .node = try self.parseExpr() });
+            }
+        }
+        return try cst.makeNode(self.arena, .MATCH_ARM, children.items);
+    }
+
+    /// Fallback: an expression statement, or an assignment when an
+    /// assignment operator follows the parsed l-value. Trailing tokens
+    /// up to the statement end are swept in for losslessness/recovery.
+    fn parseExprOrAssignStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .node = try self.parseExpr() });
+
+        const save = self.pos;
+        var lead: std.ArrayList(cst.Element) = .empty;
+        try self.eatTrivia(&lead);
+        if (isAssignOp(self.peek())) {
+            try children.appendSlice(self.arena, lead.items);
+            try children.append(self.arena, .{ .token = self.advance() }); // assign op
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+            try self.sweepToStmtEnd(&children);
+            return try cst.makeNode(self.arena, .ASSIGN_STMT, children.items);
+        }
+        self.pos = save;
+        try self.sweepToStmtEnd(&children);
+        return try cst.makeNode(self.arena, .EXPR_STMT, children.items);
+    }
+
+    fn sweepToStmtEnd(self: *Parser, children: *std.ArrayList(cst.Element)) !void {
         while (!self.isEof()) {
             const k = self.peek();
             if (k == .NEWLINE or k == .SEMICOLON or k == .R_BRACE) break;
             try children.append(self.arena, .{ .token = self.advance() });
         }
-        return try cst.makeNode(self.arena, .EXPR_STMT, children.items);
     }
 
     /// Parse one expression. A value expression is a `PipeExpr` per
@@ -1202,6 +1459,92 @@ test "postfix: method call on a call result is METHOD_EXPR" {
     const r = try parseExpression(testing.allocator, "f().g()", "e.q");
     defer r.deinit(testing.allocator);
     try testing.expectEqual(cst.SyntaxKind.METHOD_EXPR, r.root.kind);
+}
+
+fn blockOf(sf: ast.SourceFile) ?*const cst.Node {
+    var items = sf.items();
+    const fd = (items.next() orelse return null).fn_decl;
+    const body = fd.body() orelse return null;
+    return body.cst;
+}
+
+fn hasChildKind(node: *const cst.Node, kind: cst.SyntaxKind) bool {
+    for (node.children) |c| switch (c) {
+        .node => |n| if (n.kind == kind) return true,
+        .token => {},
+    };
+    return false;
+}
+
+test "statement losslessness across forms" {
+    const sources = [_][]const u8{
+        "fn m {\n    let x = 1\n}\n",
+        "fn m {\n    let x: i64 = 1 + 2\n}\n",
+        "fn m {\n    var count = 0\n    count += 1\n}\n",
+        "fn m {\n    let xs: [i64; 4] = [1, 2, 3, 4]\n}\n",
+        "fn m {\n    return 42\n}\n",
+        "fn m {\n    return\n}\n",
+        "fn m {\n    if a < b {\n        env.out(\"lt\")\n    }\n}\n",
+        "fn m {\n    if a {\n        x()\n    } else {\n        y()\n    }\n}\n",
+        "fn m {\n    if a {\n        p()\n    } else if b {\n        q()\n    }\n}\n",
+        "fn m {\n    while running {\n        tick()\n    }\n}\n",
+        "fn m {\n    loop {\n        step()\n    }\n}\n",
+        "fn m {\n    for tool in tools {\n        env.out(tool)\n    }\n}\n",
+        "fn m {\n    match x {\n        Ok(v) -> use(v),\n        Err(e) -> panic e,\n    }\n}\n",
+        "fn m {\n    obj.field = value\n    arr[0] = 1\n}\n",
+        "fn m {\n    break\n    continue\n}\n",
+        "fn m {\n    env.out(\"a\")\n    env.out(\"b\")\n}\n",
+    };
+    for (sources) |src| {
+        const r = try parse(testing.allocator, src, "s.q");
+        defer r.deinit(testing.allocator);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try cst.serialize(r.root, testing.allocator, &out);
+        try testing.expectEqualStrings(src, out.items);
+    }
+}
+
+test "statement structure: let + if/else inside a body" {
+    const src = "fn m {\n    let x = compute()\n    if x {\n        a()\n    } else {\n        b()\n    }\n}\n";
+    const r = try parse(testing.allocator, src, "s.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    const block = blockOf(sf) orelse return error.TestExpectedBlock;
+    try testing.expect(hasChildKind(block, .LET_STMT));
+    try testing.expect(hasChildKind(block, .IF_STMT));
+}
+
+test "statement structure: match yields arms" {
+    const src = "fn m {\n    match x {\n        A -> 1,\n        B -> 2,\n    }\n}\n";
+    const r = try parse(testing.allocator, src, "s.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    const block = blockOf(sf) orelse return error.TestExpectedBlock;
+    try testing.expect(hasChildKind(block, .MATCH_STMT));
+    // The match node carries MATCH_ARM children.
+    var match_node: ?*const cst.Node = null;
+    for (block.children) |c| switch (c) {
+        .node => |n| if (n.kind == .MATCH_STMT) {
+            match_node = n;
+        },
+        .token => {},
+    };
+    try testing.expect(hasChildKind(match_node.?, .MATCH_ARM));
+}
+
+test "codegen-facing shape unchanged: env.out body is one EXPR_STMT" {
+    const src = "fn main {\n    env.out(\"hi\")\n}\n";
+    const r = try parse(testing.allocator, src, "m.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var items = sf.items();
+    const fd = (items.next() orelse return error.TestExpectedItem).fn_decl;
+    var stmts = fd.body().?.statements();
+    const stmt = stmts.next() orelse return error.TestExpectedStmt;
+    const expr = stmt.expr_stmt.expression() orelse return error.TestExpectedExpr;
+    try testing.expect(expr == .call);
+    try testing.expect(stmts.next() == null);
 }
 
 test "generic-looking call in expression position is not flagged" {
