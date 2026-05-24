@@ -209,16 +209,34 @@ const Parser = struct {
         }
     }
 
-    /// Lookahead: is the next non-trivia run an `fn` item, possibly
-    /// preceded by `pub`?
-    fn atFnItem(self: *const Parser) bool {
+    /// The item keyword introducing the upcoming item, skipping an
+    /// optional leading `pub`. Returns `.EOF` if there's no item keyword
+    /// there (so a stray `pub {` doesn't read as an item).
+    fn itemKeyword(self: *const Parser) cst.SyntaxKind {
         var i = self.pos;
         if (i < self.tokens.len and self.tokens[i].kind == .KW_PUB) {
             i += 1;
             while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
         }
-        if (i >= self.tokens.len) return false;
-        return self.tokens[i].kind == .KW_FN;
+        if (i >= self.tokens.len) return .EOF;
+        const k = self.tokens[i].kind;
+        return if (isItemKeyword(k)) k else .EOF;
+    }
+
+    fn isItemKeyword(k: cst.SyntaxKind) bool {
+        return switch (k) {
+            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_FACE, .KW_FIT => true,
+            else => false,
+        };
+    }
+
+    /// Consume an optional `pub` visibility prefix (plus trailing trivia)
+    /// into `children`. Shared by every item parser.
+    fn consumeVisibility(self: *Parser, children: *std.ArrayList(cst.Element)) !void {
+        if (self.peek() == .KW_PUB) {
+            try children.append(self.arena, .{ .node = try self.parseVisibility() });
+            try self.eatTrivia(children);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -234,9 +252,9 @@ const Parser = struct {
                 try children.append(self.arena, .{ .node = import_node });
                 continue;
             }
-            if (self.atFnItem()) {
-                const fn_node = try self.parseFnDecl();
-                try children.append(self.arena, .{ .node = fn_node });
+            const ik = self.itemKeyword();
+            if (ik != .EOF) {
+                try children.append(self.arena, .{ .node = try self.parseItem(ik) });
                 continue;
             }
             // Block `pub { … }` is forbidden (spec/modules.md). Flag it,
@@ -260,14 +278,25 @@ const Parser = struct {
     // FnDecl
     // -----------------------------------------------------------------
 
+    /// Dispatch to the parser for the item introduced by `kw` (the
+    /// keyword `itemKeyword` already peeked past any `pub`).
+    fn parseItem(self: *Parser, kw: cst.SyntaxKind) std.mem.Allocator.Error!*const cst.Node {
+        return switch (kw) {
+            .KW_FN => self.parseFnDecl(),
+            .KW_STRUCT => self.parseStructDecl(),
+            .KW_ENUM => self.parseEnumDecl(),
+            .KW_TYPE => self.parseTypeDecl(),
+            .KW_CONST => self.parseConstDecl(),
+            .KW_FACE => self.parseFaceOrFit(.FACE_DECL),
+            .KW_FIT => self.parseFaceOrFit(.FIT_DECL),
+            else => unreachable,
+        };
+    }
+
     fn parseFnDecl(self: *Parser) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
 
-        if (self.peek() == .KW_PUB) {
-            const vis_node = try self.parseVisibility();
-            try children.append(self.arena, .{ .node = vis_node });
-            try self.eatTrivia(&children);
-        }
+        try self.consumeVisibility(&children);
 
         std.debug.assert(self.peek() == .KW_FN);
         try children.append(self.arena, .{ .token = self.advance() }); // KW_FN
@@ -311,6 +340,262 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .VISIBILITY, &[_]cst.Element{
             .{ .token = kw },
         });
+    }
+
+    // -----------------------------------------------------------------
+    // Item productions: struct / enum / type / const / face / fit
+    // -----------------------------------------------------------------
+    //
+    // v0 structures the item shell — visibility, keyword, name, generic
+    // params, and body — enough for `SourceFile` iteration and lossless
+    // round-tripping. Field/variant *types*, fit/face method bodies, and
+    // generic-parameter internals are captured as raw token spans for
+    // now; they gain structure alongside the type-expression and pattern
+    // grammars. These nodes are not yet surfaced through `ast.Item`
+    // (only `FnDecl` is), so codegen is unaffected.
+
+    /// Balanced `<…>` generic parameter list, captured raw. `>>` (a
+    /// single `SHR` token) closes two levels so nested args terminate.
+    fn parseGenericParams(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        var depth: i32 = 0;
+        while (!self.isEof()) {
+            const k = self.peek();
+            try children.append(self.arena, .{ .token = self.advance() });
+            switch (k) {
+                .L_ANGLE => depth += 1,
+                .R_ANGLE => depth -= 1,
+                .SHR => depth -= 2,
+                else => {},
+            }
+            if (depth <= 0) break;
+        }
+        return try cst.makeNode(self.arena, .GENERIC_PARAMS, children.items);
+    }
+
+    /// Balanced `{ … }` group captured raw, tagged `kind` (used for face
+    /// / fit bodies whose internals aren't structured yet).
+    fn parseBalancedBraces(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+        std.debug.assert(self.peek() == .L_BRACE);
+        var children: std.ArrayList(cst.Element) = .empty;
+        var depth: i32 = 0;
+        while (!self.isEof()) {
+            const k = self.peek();
+            try children.append(self.arena, .{ .token = self.advance() });
+            if (k == .L_BRACE) depth += 1;
+            if (k == .R_BRACE) {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        return try cst.makeNode(self.arena, kind, children.items);
+    }
+
+    /// Capture the item header (everything up to the body's `{`) as raw
+    /// tokens, tracking `()`/`[]`/`<>` nesting so a `{` inside them isn't
+    /// mistaken for the body.
+    fn captureHeaderUntilBrace(self: *Parser, children: *std.ArrayList(cst.Element)) !void {
+        var depth: i32 = 0;
+        while (!self.isEof()) {
+            const k = self.peek();
+            if (depth <= 0 and (k == .L_BRACE or k == .NEWLINE)) return;
+            switch (k) {
+                .L_PAREN, .L_BRACK, .L_ANGLE => depth += 1,
+                .R_PAREN, .R_BRACK, .R_ANGLE => depth -= 1,
+                .SHR => depth -= 2,
+                else => {},
+            }
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+    }
+
+    /// Optional name + generic params shared by struct/enum/type.
+    fn consumeNameAndGenerics(self: *Parser, children: *std.ArrayList(cst.Element)) !void {
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        try self.eatTrivia(children);
+        if (self.peek() == .L_ANGLE) {
+            try children.append(self.arena, .{ .node = try self.parseGenericParams() });
+            try self.eatTrivia(children);
+        }
+    }
+
+    fn parseStructDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // struct
+        try self.eatTrivia(&children);
+        try self.consumeNameAndGenerics(&children);
+        switch (self.peek()) {
+            .L_BRACE => try children.append(self.arena, .{ .node = try self.parseRecordBody() }),
+            .L_PAREN => try children.append(self.arena, .{ .node = try self.parseBalancedParen(.TUPLE_BODY) }),
+            else => {}, // unit struct
+        }
+        return try cst.makeNode(self.arena, .STRUCT_DECL, children.items);
+    }
+
+    /// `{ Field ("," Field)* ","? }` — `Field := IDENT ":" TypeExpr`,
+    /// the type captured raw until the next `,`/`}`.
+    fn parseRecordBody(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // {
+        while (!self.isEof()) {
+            try self.eatTrivia(&children);
+            if (self.peek() == .R_BRACE) break;
+            try children.append(self.arena, .{ .node = try self.parseField() });
+            try self.eatTrivia(&children);
+            if (self.peek() == .COMMA) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+        }
+        if (self.peek() == .R_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .RECORD_BODY, children.items);
+    }
+
+    fn parseField(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        try self.eatTrivia(&children);
+        if (self.peek() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try self.captureRawUntil(&children, &.{.COMMA});
+        }
+        return try cst.makeNode(self.arena, .FIELD, children.items);
+    }
+
+    /// Balanced `( … )` captured raw, tagged `kind`.
+    fn parseBalancedParen(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+        std.debug.assert(self.peek() == .L_PAREN);
+        var children: std.ArrayList(cst.Element) = .empty;
+        var depth: i32 = 0;
+        while (!self.isEof()) {
+            const k = self.peek();
+            try children.append(self.arena, .{ .token = self.advance() });
+            if (k == .L_PAREN) depth += 1;
+            if (k == .R_PAREN) {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        return try cst.makeNode(self.arena, kind, children.items);
+    }
+
+    fn parseEnumDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // enum
+        try self.eatTrivia(&children);
+        try self.consumeNameAndGenerics(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() }); // {
+            while (!self.isEof()) {
+                try self.eatTrivia(&children);
+                if (self.peek() == .R_BRACE) break;
+                try children.append(self.arena, .{ .node = try self.parseVariant() });
+                try self.eatTrivia(&children);
+                if (self.peek() == .COMMA) {
+                    try children.append(self.arena, .{ .token = self.advance() });
+                }
+            }
+            if (self.peek() == .R_BRACE) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+        }
+        return try cst.makeNode(self.arena, .ENUM_DECL, children.items);
+    }
+
+    /// `Variant := IDENT VariantPayload?` — payload is a raw balanced
+    /// `(…)` (tuple-like) or `{…}` (record-like). A payload may sit after
+    /// inline whitespace (`C { … }`); a newline ends the variant, so the
+    /// lookahead won't grab the next variant's tokens.
+    fn parseVariant(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        const save = self.pos;
+        var lead: std.ArrayList(cst.Element) = .empty;
+        try self.eatTrivia(&lead);
+        const crossed_newline = for (lead.items) |e| {
+            if (e.kind() == .NEWLINE) break true;
+        } else false;
+        const payload_kind: ?cst.SyntaxKind = switch (self.peek()) {
+            .L_PAREN => .L_PAREN,
+            .L_BRACE => .L_BRACE,
+            else => null,
+        };
+        if (payload_kind != null and !crossed_newline) {
+            try children.appendSlice(self.arena, lead.items);
+            if (payload_kind.? == .L_PAREN) {
+                try children.append(self.arena, .{ .node = try self.parseBalancedParen(.VARIANT_PAYLOAD) });
+            } else {
+                try children.append(self.arena, .{ .node = try self.parseBalancedBraces(.VARIANT_PAYLOAD) });
+            }
+        } else {
+            self.pos = save;
+        }
+        return try cst.makeNode(self.arena, .VARIANT, children.items);
+    }
+
+    /// `TypeDecl := "type" IDENT GenericParams? "=" TypeExpr` (the type
+    /// captured raw to end of line).
+    fn parseTypeDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // type
+        try self.eatTrivia(&children);
+        try self.consumeNameAndGenerics(&children);
+        if (self.peek() == .EQ) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try self.captureRawUntil(&children, &.{});
+        }
+        return try cst.makeNode(self.arena, .TYPE_DECL, children.items);
+    }
+
+    /// `ConstDecl := "const" IDENT ":" TypeExpr "=" Expr`.
+    fn parseConstDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // const
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        try self.eatTrivia(&children);
+        if (self.peek() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try self.captureRawUntil(&children, &.{.EQ});
+        }
+        if (self.peek() == .EQ) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+        }
+        return try cst.makeNode(self.arena, .CONST_DECL, children.items);
+    }
+
+    /// `face`/`fit` shell: visibility, keyword, a raw header up to the
+    /// body, and a raw balanced `{ … }` body. Method signatures and fit
+    /// method bodies aren't structured yet.
+    fn parseFaceOrFit(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // face / fit
+        try self.eatTrivia(&children);
+        try self.captureHeaderUntilBrace(&children);
+        const body_kind: cst.SyntaxKind = if (kind == .FACE_DECL) .FACE_BODY else .FIT_BODY;
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBalancedBraces(body_kind) });
+        }
+        return try cst.makeNode(self.arena, kind, children.items);
     }
 
     // -----------------------------------------------------------------
@@ -1474,6 +1759,85 @@ fn hasChildKind(node: *const cst.Node, kind: cst.SyntaxKind) bool {
         .token => {},
     };
     return false;
+}
+
+fn childKindNode(node: *const cst.Node, kind: cst.SyntaxKind) ?*const cst.Node {
+    for (node.children) |c| switch (c) {
+        .node => |n| if (n.kind == kind) return n,
+        .token => {},
+    };
+    return null;
+}
+
+test "item losslessness across forms" {
+    const sources = [_][]const u8{
+        "pub struct Vec3<T> { x: T, y: T, z: T }\n",
+        "struct Empty\n",
+        "pub struct UserId(i64)\n",
+        "pub enum Color { Rgb, Hsv, Lab }\n",
+        "pub enum McpError {\n    Unsupported,\n    ToolNotFound(str),\n    InvalidArguments(str),\n}\n",
+        "pub type Hz = f64\n",
+        "type Pair<A, B> = (A, B)\n",
+        "pub const PI: f64 = 3.14159\n",
+        "pub face Eq {\n    fn eq(self, other: Self) -> bool\n}\n",
+        "pub fit Vec3<f32> : Eq {\n    fn eq(self, other: Self) -> bool { true }\n}\n",
+        "//! header\n\nimport q64.math.{Vec3}\n\npub struct P { x: i64 }\n\nfn main { 0 }\n",
+    };
+    for (sources) |src| {
+        const r = try parse(testing.allocator, src, "i.q");
+        defer r.deinit(testing.allocator);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try cst.serialize(r.root, testing.allocator, &out);
+        try testing.expectEqualStrings(src, out.items);
+    }
+}
+
+test "struct fields are structured" {
+    const src = "pub struct Tool {\n    name: str,\n    description: str,\n}\n";
+    const r = try parse(testing.allocator, src, "t.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    const decl = childKindNode(sf.cst, .STRUCT_DECL) orelse return error.TestExpectedStruct;
+    const body = childKindNode(decl, .RECORD_BODY) orelse return error.TestExpectedBody;
+    var fields: usize = 0;
+    for (body.children) |c| switch (c) {
+        .node => |n| if (n.kind == .FIELD) {
+            fields += 1;
+        },
+        .token => {},
+    };
+    try testing.expectEqual(@as(usize, 2), fields);
+}
+
+test "enum variants are structured" {
+    const src = "pub enum E { A, B(i64), C { x: i64 } }\n";
+    const r = try parse(testing.allocator, src, "e.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    const decl = childKindNode(sf.cst, .ENUM_DECL) orelse return error.TestExpectedEnum;
+    var variants: usize = 0;
+    for (decl.children) |c| switch (c) {
+        .node => |n| if (n.kind == .VARIANT) {
+            variants += 1;
+        },
+        .token => {},
+    };
+    try testing.expectEqual(@as(usize, 3), variants);
+}
+
+test "items are skipped by ItemIter (only fn surfaces) but still parse" {
+    const src = "pub struct P { x: i64 }\npub enum E { A }\nfn main { 0 }\n";
+    const r = try parse(testing.allocator, src, "mix.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var items = sf.items();
+    const fd = (items.next() orelse return error.TestExpectedItem).fn_decl;
+    try testing.expectEqualStrings("main", fd.name().?.text);
+    try testing.expect(items.next() == null);
+    // But the struct/enum nodes exist in the tree.
+    try testing.expect(childKindNode(sf.cst, .STRUCT_DECL) != null);
+    try testing.expect(childKindNode(sf.cst, .ENUM_DECL) != null);
 }
 
 test "statement losslessness across forms" {

@@ -194,9 +194,14 @@ visible at a glance whether it's been picked up.
       `NAM004` (selective+alias), `NAM009` (block `pub`), `NAM011` (dash in
       bare path). Conformance 6→10. The semantic NAM codes (`NAM001/002/005…`,
       need a name-resolution pass) and `LEX020/021`, `PAR040` remain.
-- [ ] Parser: items productions. `pub` + `fn` + `import` landed
-      (q64/src/parser/parse.zig); `struct`, `enum`, `face`, `fit`, `const`
-      still pending.
+- [x] Parser: items productions. `fn`, `import`, `struct`, `enum`, `type`,
+      `const`, `face`, `fit` all parse now (shared `pub` prefix +
+      `itemKeyword` dispatch). Struct record fields and enum variants are
+      structured; field/variant *types*, generic-param internals, and
+      face/fit method bodies are still raw token spans (pending the
+      type-expression grammar). New item nodes aren't surfaced through
+      `ast.Item` yet (only `FnDecl`), so codegen is unaffected. Real
+      `dev.q64.webmcp_client` library files now parse with no diagnostics.
 - [x] Parser: full expression precedence chain (binary/unary/try/postfix)
       from `grammar.md`. `parseBinExpr` (precedence climbing) over
       `parseUnary`→`parseTryExpr`→`parsePostfix`→`parsePrimary`; postfix
