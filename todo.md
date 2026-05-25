@@ -326,11 +326,21 @@ visible at a glance whether it's been picked up.
       `-`/`~`, parentheses, and bindings holding an integer. The decimal
       result renders into interpolation, so `env.out("{(1 + 2) * 3}")` →
       `9` and `let n = 6 * 7; "{n + 1}"` → `43`. Overflow / divide-by-zero
-      aren't const-foldable (`NotConstExpr`). All compile-time — no runtime
-      arithmetic or int→string yet. `link-roundtrip.sh` asserts
-      `{(1+2)*3} {n+1} {1_000+24}` → `9 43 1024`. **Next on this axis:**
-      runtime integer values (typed `i64` params/returns, real wasm
-      arithmetic, a wasm int→string routine).
+      aren't const-foldable (`NotConstExpr`). `link-roundtrip.sh` asserts
+      `{(1+2)*3} {n+1} {1_000+24}` → `9 43 1024`.
+- [x] **Runtime integer functions.** An `i64`-returning function whose body
+      references a parameter (`fn double(n: i64) -> i64 { n + n }`) can't
+      const-fold, so it's emitted for real: `ensureCallee` detects the i64
+      return (via the structured `TypeExpr`), `emitIntExpr` lowers the body
+      to wasm i64 arithmetic, the callee is `(i64×params) -> i64`, and the
+      result is formatted by `__fmt_i64` — a wasm routine (a digit loop +
+      sign handling) that writes decimal into the scope arena and returns
+      `(ptr, len)`. `env.out(double(21))` → `42`, all at runtime. Verified
+      end-to-end across 0 / negatives / multi-digit / multi-param;
+      `link-roundtrip.sh` asserts `double(21)`/`add(1000000,234567)`/`neg(7)`
+      → `42` / `1234567` / `-7`. **Deferred:** i64 `let` bindings (`let x =
+      double(21)`), i64 args that are runtime values, and integers inside
+      string interpolation at runtime.
 - [x] AST views (statements): `ast.Stmt` now surfaces `let`/`var`
       (`LetStmt`: `isVar`/`pattern`/`initializer`) and `return`
       (`ReturnStmt.value`) alongside `expr_stmt`, plus a `Pattern` view

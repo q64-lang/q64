@@ -203,23 +203,28 @@ pub fn emitFromSource(
 //   concat     — a body that builds its result in the scope arena from
 //                `segments` [first..first+count] (const runs + `param`
 //                refs), e.g. `{ "{s}!" }`, and returns it.
-// Each `str` parameter is two i64 wasm params (ptr, len), so param #i
-// lives in locals 2i, 2i+1.
+//   int_fn     — an i64-returning function `fn f(a: i64, …) -> i64 { expr }`
+//                emitted as `(i64×params) -> i64` with `expr` lowered to
+//                real wasm arithmetic (`emitIntExpr`).
+// A `str` parameter is two i64 wasm params (ptr, len); an `i64` parameter
+// is one. `n_params` is the source parameter count either way.
 const Callee = struct {
     name: [:0]const u8,
-    n_str_params: usize,
+    n_params: usize,
     body: union(enum) {
         const_str: struct { off: u32, len: u32 },
         param_ref: usize,
         concat: struct { first: usize, count: usize },
+        int_fn: ast.FnDecl,
     },
 };
 
-// A string argument passed at a call site: either a constant materialized
-// in the static data segment, or a runtime binding passed by its locals.
+// An argument passed at a call site: a string constant (in the data
+// segment), a string runtime binding (its locals), or an integer value.
 const ArgVal = union(enum) {
     constant: struct { off: u32, len: u32 },
     binding: RtBinding,
+    int: i64,
 };
 
 // A runtime `let`/`var` binding holds a string value in two i64 `_start`
@@ -248,6 +253,8 @@ const Segment = union(enum) {
 //   print_binding — write a runtime binding's current (ptr, len).
 //   bind_call     — call an emitted function and store its (ptr, len) into a
 //                   runtime binding's locals (a `let x = f(args)`).
+//   print_int_callee — call an i64-returning function, format the result to
+//                   decimal (`__fmt_i64`), and write it.
 // The print_* actions append env.out's trailing "\n" (a shared byte at nl_off).
 const Action = union(enum) {
     print_const: struct { off: u32, len: u32 },
@@ -255,6 +262,7 @@ const Action = union(enum) {
     print_concat: struct { first: usize, count: usize, nl_off: u32 },
     print_binding: struct { binding: RtBinding, nl_off: u32 },
     bind_call: struct { binding: RtBinding, callee: usize, args_first: usize, args_count: usize },
+    print_int_callee: struct { callee: usize, args_first: usize, args_count: usize, nl_off: u32 },
 };
 
 fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]u8 {
@@ -300,17 +308,30 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                 // function, passing string-literal arguments.
                 .call => |inner| {
                     const idx = try ensureCallee(allocator, resolver, &data, &callees, &segments, inner);
+                    const is_int = switch (callees.items[idx].body) {
+                        .int_fn => true,
+                        else => false,
+                    };
                     const args_first = call_args.items.len;
-                    try extractCallArgs(allocator, resolver, &data, &rt_bindings, &call_args, inner);
+                    try extractCallArgs(allocator, resolver, &data, &rt_bindings, &call_args, inner, is_int);
                     const args_count = call_args.items.len - args_first;
-                    if (args_count != callees.items[idx].n_str_params) return Error.UnsupportedCall;
+                    if (args_count != callees.items[idx].n_params) return Error.UnsupportedCall;
                     const nl = try ensureNewline(allocator, &data, &nl_off);
-                    try actions.append(allocator, .{ .print_callee = .{
-                        .callee = idx,
-                        .args_first = args_first,
-                        .args_count = args_count,
-                        .nl_off = nl,
-                    } });
+                    if (is_int) {
+                        try actions.append(allocator, .{ .print_int_callee = .{
+                            .callee = idx,
+                            .args_first = args_first,
+                            .args_count = args_count,
+                            .nl_off = nl,
+                        } });
+                    } else {
+                        try actions.append(allocator, .{ .print_callee = .{
+                            .callee = idx,
+                            .args_first = args_first,
+                            .args_count = args_count,
+                            .nl_off = nl,
+                        } });
+                    }
                 },
                 // env.out("…") — a string literal, possibly interpolated.
                 .string_lit => |s| {
@@ -400,10 +421,16 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                         else => return err,
                     };
                     const idx = try ensureCallee(allocator, resolver, &data, &callees, &segments, inner);
+                    // v0 runtime bindings hold strings; binding an i64
+                    // result (`let x = double(21)`) isn't supported yet.
+                    switch (callees.items[idx].body) {
+                        .int_fn => return Error.UnsupportedCall,
+                        else => {},
+                    }
                     const args_first = call_args.items.len;
-                    try extractCallArgs(allocator, resolver, &data, &rt_bindings, &call_args, inner);
+                    try extractCallArgs(allocator, resolver, &data, &rt_bindings, &call_args, inner, false);
                     const args_count = call_args.items.len - args_first;
-                    if (args_count != callees.items[idx].n_str_params) return Error.UnsupportedCall;
+                    if (args_count != callees.items[idx].n_params) return Error.UnsupportedCall;
 
                     const rb = RtBinding{ .ptr_local = n_rt * 2, .len_local = n_rt * 2 + 1 };
                     n_rt += 1;
@@ -514,7 +541,7 @@ fn splitInterpolation(
                     if (ca.next() != null) return Error.UnsupportedCall;
                     try flushLit(allocator, &lit, out);
                     const idx = try ensureCallee(allocator, resolver, data, callees, segments, cc);
-                    if (callees.items[idx].n_str_params != 0) return Error.UnsupportedCall;
+                    if (callees.items[idx].n_params != 0) return Error.UnsupportedCall;
                     try out.append(allocator, .{ .call = idx });
                     has_dynamic = true;
                 },
@@ -582,9 +609,10 @@ fn envOutArg(allocator: std.mem.Allocator, call: ast.CallExpr) !ast.Expr {
     return arg_iter.next() orelse return Error.UnsupportedCall;
 }
 
-/// Extract a call's string arguments into `call_args`. A bare reference to
-/// a runtime binding is passed by its locals (a runtime argument); any
-/// other argument is const-evaluated into the static data segment.
+/// Extract a call's arguments into `call_args`. With `int_args`, each
+/// argument is const-evaluated to an `i64`. Otherwise it's a string: a
+/// bare reference to a runtime binding is passed by its locals (a runtime
+/// argument); anything else is const-evaluated into the data segment.
 fn extractCallArgs(
     allocator: std.mem.Allocator,
     resolver: *Resolver,
@@ -592,9 +620,14 @@ fn extractCallArgs(
     rt_bindings: *const std.StringHashMapUnmanaged(RtBinding),
     call_args: *std.ArrayList(ArgVal),
     inner: ast.CallExpr,
+    int_args: bool,
 ) Error!void {
     var ait = inner.args();
     while (ait.next()) |a| {
+        if (int_args) {
+            try call_args.append(allocator, .{ .int = try resolver.constEvalInt(a) });
+            continue;
+        }
         switch (a) {
             .path => |p| {
                 const ptext = try p.text(allocator);
@@ -652,7 +685,17 @@ fn ensureCallee(
         }
     }
 
-    const body: @FieldType(Callee, "body") = if (pnames.items.len == 0) blk: {
+    const body: @FieldType(Callee, "body") = if (try returnsI64(allocator, fd)) blk: {
+        // i64-returning function: emit real arithmetic (`emitIntExpr` at
+        // emission time). v0 requires all parameters to be `i64`.
+        if (fd.params()) |ps| {
+            var it = ps.iter();
+            while (it.next()) |p| {
+                if (!try paramIsI64(allocator, p)) return Error.UnsupportedCall;
+            }
+        }
+        break :blk .{ .int_fn = fd };
+    } else if (pnames.items.len == 0) blk: {
         // Nullary: fold the body to a constant string in the data segment.
         const bytes = try resolver.constEvalFn(fd);
         defer allocator.free(bytes);
@@ -714,7 +757,7 @@ fn ensureCallee(
     errdefer allocator.free(owned);
     try callees.append(allocator, .{
         .name = owned,
-        .n_str_params = pnames.items.len,
+        .n_params = pnames.items.len,
         .body = body,
     });
     return callees.items.len - 1;
@@ -739,6 +782,28 @@ fn indexOfName(names: []const []const u8, name: []const u8) ?usize {
         if (std.mem.eql(u8, n, name)) return i;
     }
     return null;
+}
+
+/// True if `te` is the named path type `name` (e.g. `i64`).
+fn typeNamed(allocator: std.mem.Allocator, te: ast.TypeExpr, name: []const u8) !bool {
+    const p = switch (te) {
+        .path => |x| x,
+        else => return false,
+    };
+    const nm = try p.name(allocator);
+    defer allocator.free(nm);
+    return std.mem.eql(u8, nm, name);
+}
+
+fn returnsI64(allocator: std.mem.Allocator, fd: ast.FnDecl) !bool {
+    const rt = fd.returnType() orelse return false;
+    const te = rt.type_() orelse return false;
+    return typeNamed(allocator, te, "i64");
+}
+
+fn paramIsI64(allocator: std.mem.Allocator, p: ast.Param) !bool {
+    const te = p.type_() orelse return false;
+    return typeNamed(allocator, te, "i64");
 }
 
 // =====================================================================
@@ -1091,8 +1156,142 @@ fn buildArgs(
             argvals[k * 2] = c.BinaryenLocalGet(module, b.ptr_local, i64_type);
             argvals[k * 2 + 1] = c.BinaryenLocalGet(module, b.len_local, i64_type);
         },
+        // String call sites never carry integer args (those go through
+        // print_int_callee, which builds its own operands).
+        .int => unreachable,
     };
     return argvals;
+}
+
+/// Lower an integer-valued expression to a wasm `i64`. A path resolving to
+/// a parameter becomes `local.get`; literals, `+ - * / % & | ^ << >>`,
+/// unary `-`/`~`, and parentheses lower to the matching i64 ops.
+fn emitIntExpr(
+    module: c.BinaryenModuleRef,
+    expr: ast.Expr,
+    param_names: []const []const u8,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+) Error!c.BinaryenExpressionRef {
+    switch (expr) {
+        .num_lit => |n| {
+            const v = try parseIntLit(n.rawText() orelse return Error.NotConstExpr);
+            return c.BinaryenConst(module, c.BinaryenLiteralInt64(v));
+        },
+        .paren => |p| return emitIntExpr(module, p.inner() orelse return Error.NotConstExpr, param_names, i64_type, allocator),
+        .path => |p| {
+            const txt = try p.text(allocator);
+            defer allocator.free(txt);
+            const idx = indexOfName(param_names, txt) orelse return Error.NotConstExpr;
+            return c.BinaryenLocalGet(module, @intCast(idx), i64_type);
+        },
+        .unary => |u| {
+            const x = try emitIntExpr(module, u.operand() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            const op = u.op() orelse return Error.NotConstExpr;
+            return switch (op.kind) {
+                .MINUS => c.BinaryenBinary(module, c.BinaryenSubInt64(), c.BinaryenConst(module, c.BinaryenLiteralInt64(0)), x),
+                .TILDE => c.BinaryenBinary(module, c.BinaryenXorInt64(), x, c.BinaryenConst(module, c.BinaryenLiteralInt64(-1))),
+                else => Error.NotConstExpr,
+            };
+        },
+        .bin => |b| {
+            const l = try emitIntExpr(module, b.lhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            const r = try emitIntExpr(module, b.rhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            const op = b.op() orelse return Error.NotConstExpr;
+            const binop: c.BinaryenOp = switch (op.kind) {
+                .PLUS => c.BinaryenAddInt64(),
+                .MINUS => c.BinaryenSubInt64(),
+                .STAR => c.BinaryenMulInt64(),
+                .SLASH => c.BinaryenDivSInt64(),
+                .PERCENT => c.BinaryenRemSInt64(),
+                .AMP => c.BinaryenAndInt64(),
+                .PIPE => c.BinaryenOrInt64(),
+                .CARET => c.BinaryenXorInt64(),
+                .SHL => c.BinaryenShlInt64(),
+                .SHR => c.BinaryenShrSInt64(),
+                else => return Error.NotConstExpr,
+            };
+            return c.BinaryenBinary(module, binop, l, r);
+        },
+        else => return Error.NotConstExpr,
+    }
+}
+
+/// Emit `__fmt_i64(n: i64) -> (i64, i64)`: format `n` to decimal in the
+/// scope arena, returning (ptr, len). Writes digits backward into a 24-byte
+/// bump allocation, then prepends `-` for negatives.
+fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_type: c.BinaryenType, pair_type: c.BinaryenType) !void {
+    const i32_type = c.BinaryenTypeInt32();
+    const none = c.BinaryenTypeNone();
+    // Locals: 0=n (param), 1=mag, 2=p, 3=end (i64); 4=neg (i32).
+    const N: c.BinaryenIndex = 0;
+    const MAG: c.BinaryenIndex = 1;
+    const P: c.BinaryenIndex = 2;
+    const END: c.BinaryenIndex = 3;
+    const NEG: c.BinaryenIndex = 4;
+    const k = struct {
+        fn i64c(m: c.BinaryenModuleRef, v: i64) c.BinaryenExpressionRef {
+            return c.BinaryenConst(m, c.BinaryenLiteralInt64(v));
+        }
+        fn get(m: c.BinaryenModuleRef, idx: c.BinaryenIndex, t: c.BinaryenType) c.BinaryenExpressionRef {
+            return c.BinaryenLocalGet(m, idx, t);
+        }
+    };
+
+    var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer stmts.deinit(allocator);
+
+    // neg = n < 0
+    try stmts.append(allocator, c.BinaryenLocalSet(module, NEG, c.BinaryenBinary(module, c.BinaryenLtSInt64(), k.get(module, N, i64_type), k.i64c(module, 0))));
+    // mag = neg ? -n : n
+    try stmts.append(allocator, c.BinaryenLocalSet(module, MAG, c.BinaryenSelect(
+        module,
+        k.get(module, NEG, i32_type),
+        c.BinaryenBinary(module, c.BinaryenSubInt64(), k.i64c(module, 0), k.get(module, N, i64_type)),
+        k.get(module, N, i64_type),
+    )));
+    // end = sp + 24; sp = end; p = end
+    try stmts.append(allocator, c.BinaryenLocalSet(module, END, c.BinaryenBinary(module, c.BinaryenAddInt64(), c.BinaryenGlobalGet(module, "sp", i64_type), k.i64c(module, 24))));
+    try stmts.append(allocator, c.BinaryenGlobalSet(module, "sp", k.get(module, END, i64_type)));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, P, k.get(module, END, i64_type)));
+
+    // loop: p--; mem[p] = '0' + mag%10; mag /= 10; repeat while mag != 0.
+    var loop_body: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer loop_body.deinit(allocator);
+    try loop_body.append(allocator, c.BinaryenLocalSet(module, P, c.BinaryenBinary(module, c.BinaryenSubInt64(), k.get(module, P, i64_type), k.i64c(module, 1))));
+    try loop_body.append(allocator, c.BinaryenStore(
+        module,
+        1,
+        0,
+        0,
+        k.get(module, P, i64_type),
+        c.BinaryenBinary(module, c.BinaryenAddInt64(), k.i64c(module, '0'), c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, MAG, i64_type), k.i64c(module, 10))),
+        i64_type,
+        "0",
+    ));
+    try loop_body.append(allocator, c.BinaryenLocalSet(module, MAG, c.BinaryenBinary(module, c.BinaryenDivUInt64(), k.get(module, MAG, i64_type), k.i64c(module, 10))));
+    try loop_body.append(allocator, c.BinaryenBreak(module, "fmt", c.BinaryenBinary(module, c.BinaryenNeInt64(), k.get(module, MAG, i64_type), k.i64c(module, 0)), null));
+    const loop_block = c.BinaryenBlock(module, null, @ptrCast(loop_body.items.ptr), @intCast(loop_body.items.len), none);
+    try stmts.append(allocator, c.BinaryenLoop(module, "fmt", loop_block));
+
+    // if neg: p--; mem[p] = '-'
+    var sign_body = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(module, P, c.BinaryenBinary(module, c.BinaryenSubInt64(), k.get(module, P, i64_type), k.i64c(module, 1))),
+        c.BinaryenStore(module, 1, 0, 0, k.get(module, P, i64_type), k.i64c(module, '-'), i64_type, "0"),
+    };
+    const sign_block = c.BinaryenBlock(module, null, @ptrCast(&sign_body), sign_body.len, none);
+    try stmts.append(allocator, c.BinaryenIf(module, k.get(module, NEG, i32_type), sign_block, null));
+
+    // result = (p, end - p)
+    var ret = [_]c.BinaryenExpressionRef{
+        k.get(module, P, i64_type),
+        c.BinaryenBinary(module, c.BinaryenSubInt64(), k.get(module, END, i64_type), k.get(module, P, i64_type)),
+    };
+    try stmts.append(allocator, c.BinaryenTupleMake(module, @ptrCast(&ret), ret.len));
+
+    const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), pair_type);
+    var var_types = [_]c.BinaryenType{ i64_type, i64_type, i64_type, i32_type };
+    _ = c.BinaryenAddFunction(module, "__fmt_i64", i64_type, pair_type, @ptrCast(&var_types), var_types.len, body);
 }
 
 /// Append the arena-concatenation of `segs` to `exprs`, leaving the result
@@ -1277,9 +1476,14 @@ fn emitModule(
     const tuple_base: c.BinaryenIndex = rt_locals;
     var n_tuples: usize = 0;
     var has_concat = false;
+    var needs_fmt = false;
     for (actions) |a| switch (a) {
-        .print_callee, .bind_call => {
+        .print_callee, .bind_call, .print_int_callee => {
             if (n_tuples < 1) n_tuples = 1;
+            switch (a) {
+                .print_int_callee => needs_fmt = true,
+                else => {},
+            }
         },
         .print_concat => |p| {
             has_concat = true;
@@ -1292,11 +1496,13 @@ fn emitModule(
         },
         .print_const, .print_binding => {},
     };
-    // A callee whose body is an arena concat also needs the `sp` global.
+    // A concat body, or the int formatter (which bump-allocates), needs the
+    // `sp` arena global.
     for (callees) |cl| switch (cl.body) {
         .concat => has_concat = true,
-        .const_str, .param_ref => {},
+        .const_str, .param_ref, .int_fn => {},
     };
+    if (needs_fmt) has_concat = true;
 
     const buf_idx: c.BinaryenIndex = @intCast(rt_locals + n_tuples);
     const off_idx: c.BinaryenIndex = @intCast(rt_locals + n_tuples + 1);
@@ -1322,10 +1528,38 @@ fn emitModule(
     // (ptr, len) of the parameter it names (locals 2·idx, 2·idx+1); a
     // concat body builds its result in the arena and returns (buf, len).
     for (callees) |callee| {
+        // i64-returning functions: `(i64×params) -> i64`, body is real
+        // arithmetic lowered from the source expression.
+        switch (callee.body) {
+            .int_fn => |fd| {
+                var pnames: std.ArrayList([]const u8) = .empty;
+                defer pnames.deinit(allocator);
+                if (fd.params()) |ps| {
+                    var it = ps.iter();
+                    while (it.next()) |p| {
+                        try pnames.append(allocator, (p.name() orelse return Error.UnsupportedCall).text);
+                    }
+                }
+                var iparams: []c.BinaryenType = &.{};
+                var iptype = none_type;
+                if (pnames.items.len > 0) {
+                    iparams = try allocator.alloc(c.BinaryenType, pnames.items.len);
+                    for (iparams) |*x| x.* = i64_type;
+                    iptype = c.BinaryenTypeCreate(iparams.ptr, @intCast(iparams.len));
+                }
+                defer if (iparams.len > 0) allocator.free(iparams);
+                const ve = bodyValueExpr(fd) orelse return Error.UnsupportedCall;
+                const ibody = try emitIntExpr(module, ve, pnames.items, i64_type, allocator);
+                _ = c.BinaryenAddFunction(module, callee.name.ptr, iptype, i64_type, null, 0, ibody);
+                continue;
+            },
+            else => {},
+        }
+
         var params_type = none_type;
         var pbuf: []c.BinaryenType = &.{};
-        if (callee.n_str_params > 0) {
-            pbuf = try allocator.alloc(c.BinaryenType, callee.n_str_params * 2);
+        if (callee.n_params > 0) {
+            pbuf = try allocator.alloc(c.BinaryenType, callee.n_params * 2);
             for (pbuf) |*x| x.* = i64_type;
             params_type = c.BinaryenTypeCreate(pbuf.ptr, @intCast(pbuf.len));
         }
@@ -1350,7 +1584,7 @@ fn emitModule(
                 body_expr = c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
             },
             .concat => |cc| {
-                const np = callee.n_str_params;
+                const np = callee.n_params;
                 var body_exprs: std.ArrayList(c.BinaryenExpressionRef) = .empty;
                 defer body_exprs.deinit(allocator);
                 const loc = ConcatLocals{
@@ -1368,6 +1602,7 @@ fn emitModule(
                 body_expr = c.BinaryenBlock(module, null, @ptrCast(body_exprs.items.ptr), @intCast(body_exprs.items.len), pair_type);
                 n_vt = 3;
             },
+            .int_fn => unreachable, // handled above
         }
         _ = c.BinaryenAddFunction(
             module,
@@ -1379,6 +1614,8 @@ fn emitModule(
             body_expr,
         );
     }
+
+    if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type);
 
     var exprs: std.ArrayList(c.BinaryenExpressionRef) = .empty;
     defer exprs.deinit(allocator);
@@ -1453,6 +1690,33 @@ fn emitModule(
             try exprs.append(allocator, c.BinaryenLocalSet(module, tuple_base, result));
             try exprs.append(allocator, c.BinaryenLocalSet(module, p.binding.ptr_local, c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 0)));
             try exprs.append(allocator, c.BinaryenLocalSet(module, p.binding.len_local, c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 1)));
+        },
+        .print_int_callee => |p| {
+            // Pass each i64 arg, call the function, format the result.
+            const argvals = try allocator.alloc(c.BinaryenExpressionRef, p.args_count);
+            defer allocator.free(argvals);
+            for (0..p.args_count) |kk| {
+                argvals[kk] = c.BinaryenConst(module, c.BinaryenLiteralInt64(call_args[p.args_first + kk].int));
+            }
+            var fmt_args = [_]c.BinaryenExpressionRef{c.BinaryenCall(
+                module,
+                callees[p.callee].name.ptr,
+                if (argvals.len > 0) argvals.ptr else null,
+                @intCast(argvals.len),
+                i64_type,
+            )};
+            const fmt = c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, pair_type);
+            try exprs.append(allocator, c.BinaryenLocalSet(module, tuple_base, fmt));
+            var cargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 0),
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 1),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
+            var nargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(p.nl_off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(1)),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
         },
     };
 
@@ -1780,6 +2044,28 @@ test "emitFromSource: division by zero isn't const-foldable" {
         Error.NotConstExpr,
         emitFromSource(testing.allocator, app, "main.q", &.{}),
     );
+}
+
+test "emitFromSource: a runtime i64 function is called and formatted" {
+    // `double(n) { n + n }` references a parameter, so it can't const-fold:
+    // it's emitted as `(i64) -> i64`, called at runtime, and the result is
+    // formatted by __fmt_i64. The value "42" never appears in the binary.
+    const lib = "pub fn double(n: i64) -> i64 { n + n }\n";
+    const app = "import dev.q64.m.{double}\nfn main { env.out(double(21)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "42") == null);
+}
+
+test "emitFromSource: a multi-parameter i64 function" {
+    const lib = "pub fn add(a: i64, b: i64) -> i64 { a + b }\n";
+    const app = "import dev.q64.m.{add}\nfn main { env.out(add(40, 2)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
 
 test "emitFromSource: a binding can name a const call result, referenced directly" {

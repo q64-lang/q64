@@ -284,4 +284,36 @@ if [[ "$arith_out" != "9 43 1024" ]]; then
 fi
 echo "    ok: const integer arithmetic -> $arith_out"
 
+# Runtime i64 functions: typed params + real wasm arithmetic + int->string
+# (__fmt_i64). double(n) references its parameter, so it can't const-fold.
+echo "==> int fns: q64 emit env.out(double(21)) etc."
+intfn_lib="$tmp/intlib/src"
+mkdir -p "$intfn_lib"
+cat > "$intfn_lib/lib.q" <<'Q64'
+pub fn double(n: i64) -> i64 { n + n }
+pub fn add(a: i64, b: i64) -> i64 { a + b }
+pub fn neg(n: i64) -> i64 { 0 - n }
+Q64
+intfn_app="$tmp/intfn.q"
+intfn_wasm="$tmp/intfn.wasm"
+cat > "$intfn_app" <<'Q64'
+import dev.q64.intlib.{double, add, neg}
+
+fn main {
+    env.out(double(21))
+    env.out(add(1000000, 234567))
+    env.out(neg(7))
+}
+Q64
+"$Q64_BIN" emit "$intfn_app" "$intfn_wasm" --module "dev.q64.intlib=$intfn_lib"
+intfn_out="$("$HOST_BIN" "$intfn_wasm")"
+intfn_expected=$'42\n1234567\n-7'
+if [[ "$intfn_out" != "$intfn_expected" ]]; then
+    echo "FAIL: runtime int-fn output mismatch" >&2
+    printf "  expected: %q\n" "$intfn_expected" >&2
+    printf "  actual:   %q\n" "$intfn_out" >&2
+    exit 1
+fi
+echo "    ok: runtime i64 functions -> 42 / 1234567 / -7"
+
 echo "PASS: $qube_out"
