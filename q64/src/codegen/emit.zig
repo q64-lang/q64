@@ -190,15 +190,43 @@ pub fn emitFromSource(
     return emitFn(allocator, &resolver, main_fn);
 }
 
+// A function codegen emits and calls at runtime (not const-folded). v0
+// callees are nullary and return a string literal; the emitted function
+// has signature `() -> (i32, i32)` and returns `(ptr, len)` pointing into
+// the module's data segment — the v0 string-return ABI.
+const Callee = struct {
+    name: [:0]const u8,
+    data_off: u32,
+    data_len: u32,
+};
+
+// One thing `main` does, in order. `print_const` writes a folded byte
+// payload straight from the data segment; `print_callee` calls an emitted
+// function and writes its returned string, then a newline (env.out's
+// trailing "\n").
+const Action = union(enum) {
+    print_const: struct { off: u32, len: u32 },
+    print_callee: struct { callee: usize, nl_off: u32 },
+};
+
 fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]u8 {
     const body = fd.body() orelse return Error.NoBody;
 
-    // Collect each env.out call's payload bytes ("text" + "\n").
-    var payloads: std.ArrayList([]u8) = .empty;
+    // The module's linear-memory image, the ordered plan for `_start`,
+    // and the set of functions `_start` calls.
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(allocator);
+    var actions: std.ArrayList(Action) = .empty;
+    defer actions.deinit(allocator);
+    var callees: std.ArrayList(Callee) = .empty;
     defer {
-        for (payloads.items) |p| allocator.free(p);
-        payloads.deinit(allocator);
+        for (callees.items) |cl| allocator.free(cl.name);
+        callees.deinit(allocator);
     }
+
+    // A single shared "\n" byte, materialized the first time a real call
+    // needs env.out's trailing newline.
+    var nl_off: ?u32 = null;
 
     var stmts = body.statements();
     while (stmts.next()) |stmt| switch (stmt) {
@@ -208,22 +236,38 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                 .call => |cc| cc,
                 else => return Error.UnsupportedExpression,
             };
-            try collectEnvOutPayload(allocator, resolver, call, &payloads);
+            const arg = try envOutArg(allocator, call);
+            switch (arg) {
+                // env.out(f()) — a real runtime call to an emitted function.
+                .call => |inner| {
+                    const idx = try ensureCallee(allocator, resolver, &data, &callees, inner);
+                    if (nl_off == null) {
+                        nl_off = @intCast(data.items.len);
+                        try data.append(allocator, '\n');
+                    }
+                    try actions.append(allocator, .{ .print_callee = .{ .callee = idx, .nl_off = nl_off.? } });
+                },
+                // env.out("…" / "{…}") — folded to bytes in the data segment.
+                else => {
+                    const value = try resolver.constEvalExpr(arg);
+                    defer allocator.free(value);
+                    const off: u32 = @intCast(data.items.len);
+                    try data.appendSlice(allocator, value);
+                    try data.append(allocator, '\n'); // env.out("X") writes "X\n"
+                    try actions.append(allocator, .{ .print_const = .{ .off = off, .len = @intCast(value.len + 1) } });
+                },
+            }
         },
-        // `main`'s body is a sequence of `env.out("…")` calls in v0;
-        // bindings and early returns aren't lowered yet.
+        // `main` is a sequence of `env.out(...)` calls in v0; bindings and
+        // early returns aren't lowered yet.
         .let_stmt, .return_stmt => return Error.UnsupportedStatement,
     };
 
-    return emitModuleWithPayloads(allocator, payloads.items);
+    return emitModule(allocator, data.items, actions.items, callees.items);
 }
 
-fn collectEnvOutPayload(
-    allocator: std.mem.Allocator,
-    resolver: *Resolver,
-    call: ast.CallExpr,
-    out_payloads: *std.ArrayList([]u8),
-) !void {
+/// The single argument of a well-formed `env.out(arg)` call.
+fn envOutArg(allocator: std.mem.Allocator, call: ast.CallExpr) !ast.Expr {
     const callee_expr = call.callee() orelse return Error.UnsupportedCall;
     const path = switch (callee_expr) {
         .path => |p| p,
@@ -234,20 +278,51 @@ fn collectEnvOutPayload(
     if (!std.mem.eql(u8, path_text, "env.out")) return Error.UnsupportedCall;
 
     var arg_iter = call.args();
-    const first = arg_iter.next() orelse return Error.UnsupportedCall;
+    return arg_iter.next() orelse return Error.UnsupportedCall;
+}
 
-    // The argument is evaluated to its compile-time string value. For a
-    // plain literal that is just the decoded bytes; for an interpolated
-    // literal (`"{version()}"`) each `{expr}` is const-evaluated and
-    // spliced in (ladder steps 5–6).
-    const value = try resolver.constEvalExpr(first);
-    defer allocator.free(value);
+/// Register the function a real `env.out(f())` invokes: resolve `f`,
+/// const-evaluate its returned string into the data segment, and record
+/// the callee so codegen emits it once. Returns the callee index;
+/// deduplicates by name so repeated calls share one emitted function.
+fn ensureCallee(
+    allocator: std.mem.Allocator,
+    resolver: *Resolver,
+    data: *std.ArrayList(u8),
+    callees: *std.ArrayList(Callee),
+    call: ast.CallExpr,
+) !usize {
+    const callee_expr = call.callee() orelse return Error.UnsupportedCall;
+    const path = switch (callee_expr) {
+        .path => |p| p,
+        else => return Error.UnsupportedCall,
+    };
+    const name = try path.text(allocator);
+    defer allocator.free(name);
 
-    // env.out("X") semantically writes "X\n" (spec/env.md §"Capability faces").
-    var payload = try allocator.alloc(u8, value.len + 1);
-    @memcpy(payload[0..value.len], value);
-    payload[value.len] = '\n';
-    try out_payloads.append(allocator, payload);
+    // v0 emits nullary callees only; arguments need parameter passing.
+    var args = call.args();
+    if (args.next() != null) return Error.UnsupportedCall;
+
+    for (callees.items, 0..) |cl, i| {
+        if (std.mem.eql(u8, cl.name, name)) return i;
+    }
+
+    const fd = resolver.lookup(name) orelse return Error.NameNotFound;
+    const bytes = try resolver.constEvalFn(fd);
+    defer allocator.free(bytes);
+
+    const off: u32 = @intCast(data.items.len);
+    try data.appendSlice(allocator, bytes);
+
+    const owned = try allocator.dupeZ(u8, name);
+    errdefer allocator.free(owned);
+    try callees.append(allocator, .{
+        .name = owned,
+        .data_off = off,
+        .data_len = @intCast(bytes.len),
+    });
+    return callees.items.len - 1;
 }
 
 // =====================================================================
@@ -477,43 +552,30 @@ fn findPublicFn(sf: ast.SourceFile, name: []const u8) ?ast.FnDecl {
     return null;
 }
 
-fn emitModuleWithPayloads(allocator: std.mem.Allocator, payloads: []const []u8) ![]u8 {
-    var total: usize = 0;
-    for (payloads) |p| total += p.len;
-
-    const data = try allocator.alloc(u8, total);
-    defer allocator.free(data);
-
-    const offsets = try allocator.alloc(usize, payloads.len);
-    defer allocator.free(offsets);
-
-    {
-        var off: usize = 0;
-        for (payloads, 0..) |p, i| {
-            @memcpy(data[off .. off + p.len], p);
-            offsets[i] = off;
-            off += p.len;
-        }
-    }
-
+fn emitModule(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    actions: []const Action,
+    callees: []const Callee,
+) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
+    // The string-return ABI is a `(i32, i32)` (ptr, len) multi-value
+    // return with a tuple local at the call site — both need Multivalue.
+    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureMultivalue());
+
     const i32_type = c.BinaryenTypeInt32();
     const none_type = c.BinaryenTypeNone();
+    var pair = [_]c.BinaryenType{ i32_type, i32_type };
+    const pair_type = c.BinaryenTypeCreate(&pair, pair.len);
 
     var env_out_params = [_]c.BinaryenType{ i32_type, i32_type };
     const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
-    c.BinaryenAddFunctionImport(
-        module,
-        "env_out",
-        "env",
-        "out",
-        env_out_params_type,
-        none_type,
-    );
+    c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
 
-    if (payloads.len == 0) {
+    // One active data segment at offset 0 holds the whole memory image.
+    if (data.len == 0) {
         c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, false, "0");
     } else {
         var seg_datas = [_][*c]const u8{data.ptr};
@@ -539,35 +601,67 @@ fn emitModuleWithPayloads(allocator: std.mem.Allocator, payloads: []const []u8) 
         );
     }
 
-    // Body: a sequence of `call $env_out(offset, len)`.
-    var call_exprs: std.ArrayList(c.BinaryenExpressionRef) = try .initCapacity(allocator, payloads.len);
-    defer call_exprs.deinit(allocator);
-    for (payloads, 0..) |p, i| {
-        const ptr_arg = c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(offsets[i])));
-        const len_arg = c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.len)));
-        var cargs = [_]c.BinaryenExpressionRef{ ptr_arg, len_arg };
-        const call = c.BinaryenCall(
-            module,
-            "env_out",
-            @ptrCast(&cargs),
-            cargs.len,
-            none_type,
-        );
-        try call_exprs.append(allocator, call);
+    // Emit each callee: `() -> (i32, i32)` returning (data_off, data_len).
+    for (callees) |callee| {
+        var elems = [_]c.BinaryenExpressionRef{
+            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(callee.data_off))),
+            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(callee.data_len))),
+        };
+        const tup = c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
+        _ = c.BinaryenAddFunction(module, callee.name.ptr, none_type, pair_type, null, 0, tup);
     }
 
-    const body_expr: c.BinaryenExpressionRef = if (call_exprs.items.len == 1)
-        call_exprs.items[0]
-    else
-        c.BinaryenBlock(
-            module,
-            null,
-            @ptrCast(call_exprs.items.ptr),
-            @intCast(call_exprs.items.len),
-            none_type,
-        );
+    // `_start` body, built from the action plan. A tuple local (index 0)
+    // holds a callee's (ptr, len) result between the call and the
+    // env.out forwarding; it's only declared when a real call needs it.
+    var need_local = false;
+    for (actions) |a| switch (a) {
+        .print_callee => need_local = true,
+        else => {},
+    };
 
-    _ = c.BinaryenAddFunction(module, "start", none_type, none_type, null, 0, body_expr);
+    var exprs: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer exprs.deinit(allocator);
+
+    for (actions) |action| switch (action) {
+        .print_const => |p| {
+            var cargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.len))),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
+        },
+        .print_callee => |p| {
+            const result = c.BinaryenCall(module, callees[p.callee].name.ptr, null, 0, pair_type);
+            try exprs.append(allocator, c.BinaryenLocalSet(module, 0, result));
+            var cargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, 0, pair_type), 0),
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, 0, pair_type), 1),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
+            var nargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.nl_off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt32(1)),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
+        },
+    };
+
+    const body_expr: c.BinaryenExpressionRef = if (exprs.items.len == 1)
+        exprs.items[0]
+    else
+        c.BinaryenBlock(module, null, @ptrCast(exprs.items.ptr), @intCast(exprs.items.len), none_type);
+
+    var var_types = [_]c.BinaryenType{pair_type};
+    _ = c.BinaryenAddFunction(
+        module,
+        "start",
+        none_type,
+        none_type,
+        if (need_local) @ptrCast(&var_types) else null,
+        if (need_local) var_types.len else 0,
+        body_expr,
+    );
     _ = c.BinaryenAddFunctionExport(module, "start", "_start");
 
     if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
@@ -720,6 +814,37 @@ test "emitFromSource: a const fn bodied with `return` folds" {
     const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "2.0.0\n") != null);
+}
+
+test "emitFromSource: env.out(version()) emits a real (non-folded) call" {
+    // Unlike `env.out("{version()}")` (folded), `env.out(version())`
+    // emits `version` as a real `() -> (i32, i32)` function and calls it
+    // at runtime. Validation here proves the multi-value module is
+    // well-formed (the ABI + Multivalue feature); behavior is covered
+    // end-to-end by scripts/link-roundtrip.sh.
+    const lib = "pub fn version() -> str { \"0.1.0\" }\n";
+    const app =
+        \\import dev.q64.hello_world.{version}
+        \\
+        \\fn main {
+        \\    env.out(version())
+        \\}
+        \\
+    ;
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.hello_world", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0") != null);
+}
+
+test "emitFromSource: env.out of an unknown function errors" {
+    const app = "fn main { env.out(mystery()) }\n";
+    try testing.expectError(
+        Error.NameNotFound,
+        emitFromSource(testing.allocator, app, "main.q", &.{}),
+    );
 }
 
 test "emitFromSource: doubled braces are literal, not interpolation" {

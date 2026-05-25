@@ -55,11 +55,14 @@ and `qube run`):
        maps each `path` dependency → `<dep>/src` absolute). Local-path deps
        only; a registry/git dep is reported and rejected (wants the
        `qube.lock` + cache resolution below).
-5. [~] Cross-module calls land via **compile-time const-folding**: an imported
-       function whose body is a constant (`fn version() -> str { "0.1.0" }`) is
-       evaluated and its value spliced in. Enough for the DoD. Real wasm
-       emission of callee functions + a string return ABI is the follow-up
-       (needs the deeper parser/typeck work below).
+5. [x] Cross-module calls land **for real**: `env.out(version())` now emits
+       `version` as a wasm `() -> (i32, i32)` function returning `(ptr, len)`
+       (the v0 string-return ABI) and calls it at runtime — not folded.
+       `q64/src/codegen/emit.zig` `ensureCallee` + `emitModule` (action plan
+       + Multivalue feature + tuple local). Const-folding remains for
+       interpolation (`"{version()}"`). Confirmed: the real form emits two
+       functions, the folded form one. Interpolated string *concatenation*
+       at runtime (a string builder over linear memory) is the next ABI step.
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.
@@ -70,9 +73,11 @@ and calling its `version()`. Durable regression test:
 `scripts/link-roundtrip.sh` (covers `q64 emit --module` *and* `qube run`) +
 `examples/link-demo/`.
 
-Long pole still ahead: a real (non-const-folded) cross-module call needs the
-open parser productions below — codegen can't walk what the parser doesn't
-produce. That parser work is the real critical path.
+The long pole — a real (non-const-folded) cross-module call — is **done**
+(step 5 above). `scripts/link-roundtrip.sh` now exercises the real call.
+Next on the codegen path: callees with parameters (the AST shape is ready;
+needs argument passing + a memory/stack convention) and runtime string
+concatenation for interpolation.
 
 ### Deferred package bits (not compiler; pick up anytime)
 - [ ] `qube.lock` — `add` doesn't write one; needed for ladder step 4.
@@ -228,10 +233,9 @@ visible at a glance whether it's been picked up.
       yields `Param` views with `mode()` / `name()` / `typeText()`. Inner
       generic commas (`Map<K, V>`) don't split a param. Type stays a raw
       span (shared `joinTokensAfter` helper with `ReturnType.text`) until
-      the type-expression grammar lands. **Next on the codegen critical
-      path:** real (non-const-folded) callee emission + the `(ptr,len)`
-      string-return ABI — codegen now has the param/return shape it needs.
-      Cheap follow-ups when codegen demands them: surface the already-parsed
+      the type-expression grammar lands. Real (non-const-folded) callee
+      emission now consumes this shape (ladder step 5). Cheap AST follow-ups
+      when codegen demands them: surface the already-parsed
       `BIN_EXPR`/`UNARY_EXPR` in `ast.Expr` and the control-flow statements
       in `ast.Stmt` (just `cast` arms).
 - [x] Parser: statement productions inside `Block`. `let`/`var`,

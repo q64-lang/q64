@@ -4,14 +4,16 @@
 # End-to-end smoke test for cross-qube linking (todo.md "linking ladder"):
 #
 #   examples/link-demo/hello_app/src/main.q
-#     -> q64 emit --module dev.q64.hello_world=<lib>/src   (resolve + const-fold version())
+#     -> q64 emit --module dev.q64.hello_world=<lib>/src   (resolve + emit version())
 #     -> app.wasm
 #     -> q64-wasmtime-host                                  (runtime adapter)
 #     -> stdout == "0.1.0"
 #
 # `version()` lives in the dependency dev.q64.hello_world; the app imports
-# it and interpolates the call into a string. This covers parse -> imports
-# -> resolution -> const-eval -> interpolation -> codegen -> host.
+# it and calls it directly (`env.out(version())`). codegen emits `version`
+# as a real `() -> (i32, i32)` function and calls it at runtime — a real,
+# non-const-folded cross-module call. Covers parse -> imports ->
+# resolution -> callee emission -> string-return ABI -> codegen -> host.
 
 set -euo pipefail
 

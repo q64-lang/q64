@@ -16,5 +16,5 @@
 import dev.q64.hello_world.{version}
 
 fn main {
-    env.out("{version()}")
+    env.out(version())
 }
