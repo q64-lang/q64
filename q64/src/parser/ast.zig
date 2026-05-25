@@ -253,25 +253,79 @@ pub const FnDecl = struct {
 
 pub const Visibility = struct { cst: *const cst.Node };
 
-/// `Params := "(" Param,* ")"`. v0 keeps the parenthesized span as raw
-/// tokens — the parser does not yet split it into structured `PARAM`
-/// children, so there is nothing to iterate. `isEmpty` answers the one
-/// question codegen needs today (nullary vs. not); structured param
-/// accessors land when `parseParams` emits `PARAM` nodes.
+/// `Params := "(" Param ("," Param)* ","? ")"`. Iterates the structured
+/// `PARAM` children; commas and trivia are skipped.
 pub const Params = struct {
     cst: *const cst.Node,
 
-    /// True for `()` — no parameter tokens between the parens.
+    /// True for `()` — no `PARAM` children.
     pub fn isEmpty(self: Params) bool {
+        var it = self.iter();
+        return it.next() == null;
+    }
+
+    pub fn iter(self: Params) ParamIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+pub const ParamIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *ParamIter) ?Param {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .PARAM) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// `Param := ParamMode? IDENT ":" TypeExpr` (spec/grammar.md §Functions).
+/// Surfaces the mode, the binding name, and the declared type text; the
+/// type stays a raw span pending the type-expression grammar.
+pub const Param = struct {
+    cst: *const cst.Node,
+
+    /// The parameter mode token (`in` / `ref` / `out` / `move`), or
+    /// `null` for the default (by-value) mode.
+    pub fn mode(self: Param) ?cst.Token {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (n.kind == .PARAM_MODE) {
+                for (n.children) |cc| switch (cc) {
+                    .token => |t| if (!t.kind.isTrivia()) return t,
+                    .node => {},
+                };
+            },
+            .token => {},
+        };
+        return null;
+    }
+
+    /// The parameter's binding name — the first `IDENT` before the `:`.
+    /// `null` for ill-formed input with no name token.
+    pub fn name(self: Param) ?cst.Token {
         for (self.cst.children) |c| switch (c) {
             .token => |t| {
-                if (t.kind == .L_PAREN or t.kind == .R_PAREN) continue;
-                if (t.kind.isTrivia()) continue;
-                return false;
+                if (t.kind == .COLON) return null;
+                if (t.kind == .IDENT) return t;
             },
-            .node => return false,
+            .node => {},
         };
-        return true;
+        return null;
+    }
+
+    /// The declared type as source text (raw span in v0), trivia-trimmed.
+    /// `null` when the parameter has no `: Type` annotation (e.g. a
+    /// receiver `self`). Caller owns the returned slice.
+    pub fn typeText(self: Param, allocator: std.mem.Allocator) !?[]u8 {
+        return joinTokensAfter(allocator, self.cst, .COLON);
     }
 };
 
@@ -287,40 +341,7 @@ pub const ReturnType = struct {
     /// preserved as written. Caller owns the returned slice; `null` when
     /// the node carries no type tokens after the arrow.
     pub fn text(self: ReturnType, allocator: std.mem.Allocator) !?[]u8 {
-        var total: usize = 0;
-        var seen_arrow = false;
-        for (self.cst.children) |c| switch (c) {
-            .token => |t| {
-                if (!seen_arrow) {
-                    if (t.kind == .ARROW) seen_arrow = true;
-                    continue;
-                }
-                total += t.text.len;
-            },
-            .node => {},
-        };
-        if (total == 0) return null;
-
-        const buf = try allocator.alloc(u8, total);
-        var i: usize = 0;
-        seen_arrow = false;
-        for (self.cst.children) |c| switch (c) {
-            .token => |t| {
-                if (!seen_arrow) {
-                    if (t.kind == .ARROW) seen_arrow = true;
-                    continue;
-                }
-                @memcpy(buf[i .. i + t.text.len], t.text);
-                i += t.text.len;
-            },
-            .node => {},
-        };
-
-        const trimmed = std.mem.trim(u8, buf, " \t\r\n");
-        if (trimmed.len == buf.len) return buf;
-        const out = try allocator.dupe(u8, trimmed);
-        allocator.free(buf);
-        return out;
+        return joinTokensAfter(allocator, self.cst, .ARROW);
     }
 };
 
@@ -669,6 +690,53 @@ fn firstChildRawNode(parent: *const cst.Node, kind: cst.SyntaxKind) ?*const cst.
     return null;
 }
 
+/// Join the source text of every token after the first `after`-kind
+/// token in `node`'s direct children, with surrounding trivia trimmed.
+/// Returns `null` if `after` never appears or no tokens follow it.
+/// Caller owns the returned slice. Used to render the raw type spans
+/// that follow `->` (return types) and `:` (param types) until the
+/// type-expression grammar makes them structured.
+fn joinTokensAfter(
+    allocator: std.mem.Allocator,
+    node: *const cst.Node,
+    after: cst.SyntaxKind,
+) !?[]u8 {
+    var seen = false;
+    var total: usize = 0;
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (!seen) {
+                if (t.kind == after) seen = true;
+                continue;
+            }
+            total += t.text.len;
+        },
+        .node => {},
+    };
+    if (!seen or total == 0) return null;
+
+    const buf = try allocator.alloc(u8, total);
+    var i: usize = 0;
+    seen = false;
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (!seen) {
+                if (t.kind == after) seen = true;
+                continue;
+            }
+            @memcpy(buf[i .. i + t.text.len], t.text);
+            i += t.text.len;
+        },
+        .node => {},
+    };
+
+    const trimmed = std.mem.trim(u8, buf, " \t\r\n");
+    if (trimmed.len == buf.len) return buf;
+    const out = try allocator.dupe(u8, trimmed);
+    allocator.free(buf);
+    return out;
+}
+
 // =====================================================================
 // Tests
 // =====================================================================
@@ -961,7 +1029,7 @@ test "Pattern.bindingName: ident binds, wildcard does not" {
     try testing.expect(Pattern.cast(not_pat) == null);
 }
 
-test "Params.isEmpty: bare parens vs. a parameter" {
+test "Params: empty parens, iteration, and Param accessors" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -972,10 +1040,46 @@ test "Params.isEmpty: bare parens vs. a parameter" {
     });
     try testing.expect((Params{ .cst = empty }).isEmpty());
 
-    const one = try cst.makeNode(a, .PARAMS, &[_]cst.Element{
-        cst.makeToken(.L_PAREN, "(", 0),
-        cst.makeToken(.IDENT, "x", 1),
-        cst.makeToken(.R_PAREN, ")", 2),
+    // `(ref count: i32, name: str)`
+    const mode = try cst.makeNode(a, .PARAM_MODE, &[_]cst.Element{
+        cst.makeToken(.KW_REF, "ref", 1),
     });
-    try testing.expect(!(Params{ .cst = one }).isEmpty());
+    const p0 = try cst.makeNode(a, .PARAM, &[_]cst.Element{
+        .{ .node = mode },
+        cst.makeToken(.WHITESPACE, " ", 4),
+        cst.makeToken(.IDENT, "count", 5),
+        cst.makeToken(.COLON, ":", 10),
+        cst.makeToken(.WHITESPACE, " ", 11),
+        cst.makeToken(.IDENT, "i32", 12),
+    });
+    const p1 = try cst.makeNode(a, .PARAM, &[_]cst.Element{
+        cst.makeToken(.IDENT, "name", 17),
+        cst.makeToken(.COLON, ":", 21),
+        cst.makeToken(.WHITESPACE, " ", 22),
+        cst.makeToken(.IDENT, "str", 23),
+    });
+    const params = try cst.makeNode(a, .PARAMS, &[_]cst.Element{
+        cst.makeToken(.L_PAREN, "(", 0),
+        .{ .node = p0 },
+        cst.makeToken(.COMMA, ",", 15),
+        cst.makeToken(.WHITESPACE, " ", 16),
+        .{ .node = p1 },
+        cst.makeToken(.R_PAREN, ")", 26),
+    });
+
+    const pv = Params{ .cst = params };
+    try testing.expect(!pv.isEmpty());
+
+    var it = pv.iter();
+    const first = it.next() orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("ref", first.mode().?.text);
+    try testing.expectEqualStrings("count", first.name().?.text);
+    try testing.expectEqualStrings("i32", (try first.typeText(a)).?);
+
+    const second = it.next() orelse return error.TestExpectedNonNull;
+    try testing.expect(second.mode() == null);
+    try testing.expectEqualStrings("name", second.name().?.text);
+    try testing.expectEqualStrings("str", (try second.typeText(a)).?);
+
+    try testing.expect(it.next() == null);
 }

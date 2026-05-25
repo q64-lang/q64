@@ -222,10 +222,18 @@ visible at a glance whether it's been picked up.
       `Params.isEmpty()`. Codegen can now walk a binding-and-returning
       body; a `return`-bodied const fn (`fn version() -> str { return
       "0.1.0" }`) folds via `constEvalFn`. This is the prerequisite the
-      "long pole" above was waiting on. **Next:** `parseParams`
-      (`parse.zig`) still emits a raw token span — make it emit `PARAM`
-      nodes so params iterate, then real (non-const-folded) callee
-      emission + the `(ptr,len)` string-return ABI.
+      "long pole" above was waiting on.
+- [x] AST views (params): `parseParams` (`parse.zig`) now emits structured
+      `PARAM` nodes (`ParamMode? IDENT ":" TypeExpr`); `ast.Params.iter()`
+      yields `Param` views with `mode()` / `name()` / `typeText()`. Inner
+      generic commas (`Map<K, V>`) don't split a param. Type stays a raw
+      span (shared `joinTokensAfter` helper with `ReturnType.text`) until
+      the type-expression grammar lands. **Next on the codegen critical
+      path:** real (non-const-folded) callee emission + the `(ptr,len)`
+      string-return ABI — codegen now has the param/return shape it needs.
+      Cheap follow-ups when codegen demands them: surface the already-parsed
+      `BIN_EXPR`/`UNARY_EXPR` in `ast.Expr` and the control-flow statements
+      in `ast.Stmt` (just `cast` arms).
 - [x] Parser: statement productions inside `Block`. `let`/`var`,
       `return`/`break`/`continue`, `panic`, `if`/`else` (+ `if let`),
       `while`, `loop`, `for`, `match` (+ arms), and assignment vs

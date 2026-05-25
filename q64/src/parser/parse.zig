@@ -746,22 +746,90 @@ const Parser = struct {
     /// inclusive. v0 carries the contents as raw tokens; the
     /// `Param` production fills in once todo.md "Parser: items
     /// productions" lands.
+    /// `Params := Param ("," Param)* ","?` between the parens
+    /// (spec/grammar.md §Functions). Each `Param` becomes a structured
+    /// `PARAM` child; commas and trivia stay as direct token children so
+    /// the round-trip is lossless.
     fn parseParams(self: *Parser) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
-        var depth: i32 = 0;
+        std.debug.assert(self.peek() == .L_PAREN);
+        try children.append(self.arena, .{ .token = self.advance() }); // (
+
         while (!self.isEof()) {
-            const t = self.advance();
-            try children.append(self.arena, .{ .token = t });
-            switch (t.kind) {
-                .L_PAREN => depth += 1,
-                .R_PAREN => {
-                    depth -= 1;
-                    if (depth == 0) break;
-                },
-                else => {},
+            try self.eatTrivia(&children);
+            if (self.peek() == .R_PAREN) break;
+
+            const before = self.pos;
+            try children.append(self.arena, .{ .node = try self.parseParam() });
+            try self.eatTrivia(&children);
+            if (self.peek() == .COMMA) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            } else if (self.pos == before) {
+                // Defensive: parseParam made no progress on unexpected
+                // input. Consume one token so the loop terminates.
+                if (!self.isEof()) try children.append(self.arena, .{ .token = self.advance() });
             }
         }
+
+        if (self.peek() == .R_PAREN) {
+            try children.append(self.arena, .{ .token = self.advance() }); // )
+        }
         return try cst.makeNode(self.arena, .PARAMS, children.items);
+    }
+
+    /// `Param := ParamMode? IDENT ":" TypeExpr`. The mode (if any) is a
+    /// `PARAM_MODE` node; the type after `:` is a raw token span pending
+    /// the type-expression grammar. Always consumes at least one token
+    /// when the caller guarantees a non-`)` start, so the params loop
+    /// makes progress.
+    fn parseParam(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+
+        if (isParamMode(self.peek())) {
+            const mode = try cst.makeNode(self.arena, .PARAM_MODE, &[_]cst.Element{
+                .{ .token = self.advance() },
+            });
+            try children.append(self.arena, .{ .node = mode });
+            try self.eatTrivia(&children);
+        }
+
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() }); // name
+        }
+        try self.eatTrivia(&children);
+
+        if (self.peek() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() }); // :
+            try self.eatTrivia(&children);
+            // Capture the type as a raw span, stopping at the depth-0
+            // delimiter that ends this param. Inner `(`/`[`/`{`/`<` nest
+            // so a `,` inside `Map<K, V>` doesn't split the param.
+            var depth: i32 = 0;
+            while (!self.isEof()) {
+                const k = self.peek();
+                if (depth == 0 and (k == .COMMA or k == .R_PAREN or k == .NEWLINE)) break;
+                switch (k) {
+                    .L_PAREN, .L_BRACK, .L_BRACE, .L_ANGLE => depth += 1,
+                    .R_PAREN, .R_BRACK, .R_ANGLE, .R_BRACE => depth -= 1,
+                    else => {},
+                }
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+        }
+
+        // Progress guarantee: if nothing matched (unexpected token), take
+        // one token so `parseParams` can't spin.
+        if (children.items.len == 0 and !self.isEof() and
+            self.peek() != .R_PAREN and self.peek() != .COMMA)
+        {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+
+        return try cst.makeNode(self.arena, .PARAM, children.items);
+    }
+
+    fn isParamMode(k: cst.SyntaxKind) bool {
+        return k == .KW_IN or k == .KW_OUT or k == .KW_REF or k == .KW_MOVE;
     }
 
     /// Consume `->` followed by the type expression. The expression
@@ -1673,6 +1741,44 @@ test "parses `fn f(x: i32, y: i32) -> i32 { x + y }` with params + return + body
     try testing.expect(fd.params() != null);
     try testing.expect(fd.returnType() != null);
     try testing.expect(fd.body() != null);
+
+    // Params are structured: two PARAMs, each with a name and a type.
+    var it = fd.params().?.iter();
+    const a = (it.next() orelse return error.TestExpectedNonNull);
+    try testing.expectEqualStrings("x", a.name().?.text);
+    const at = (try a.typeText(testing.allocator)).?;
+    defer testing.allocator.free(at);
+    try testing.expectEqualStrings("i32", at);
+    const b = (it.next() orelse return error.TestExpectedNonNull);
+    try testing.expectEqualStrings("y", b.name().?.text);
+    const bt = (try b.typeText(testing.allocator)).?;
+    defer testing.allocator.free(bt);
+    try testing.expectEqualStrings("i32", bt);
+    try testing.expect(it.next() == null);
+}
+
+test "parses a param mode and a generic param type" {
+    // `ref` is a mode; the `Map<K, V>` type's inner comma must not split
+    // the param.
+    const src = "fn f(ref m: Map<K, V>, x: i32) { 0 }\n";
+    const r = try parse(testing.allocator, src, "modes.q");
+    defer r.deinit(testing.allocator);
+
+    const sf = ast.SourceFile.cast(r.root).?;
+    var items = sf.items();
+    const fd = (items.next() orelse return error.TestExpectedItem).fn_decl;
+
+    var it = fd.params().?.iter();
+    const m = (it.next() orelse return error.TestExpectedNonNull);
+    try testing.expectEqualStrings("ref", m.mode().?.text);
+    try testing.expectEqualStrings("m", m.name().?.text);
+    const mt = (try m.typeText(testing.allocator)).?;
+    defer testing.allocator.free(mt);
+    try testing.expectEqualStrings("Map<K, V>", mt);
+    const x = (it.next() orelse return error.TestExpectedNonNull);
+    try testing.expect(x.mode() == null);
+    try testing.expectEqualStrings("x", x.name().?.text);
+    try testing.expect(it.next() == null);
 }
 
 test "parses nested `<…>` in return type without breaking the block" {
