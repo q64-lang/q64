@@ -196,7 +196,7 @@ pub fn emitFromSource(
 
 // A function codegen emits and calls at runtime (not const-folded). v0
 // callees are nullary and return a string literal; the emitted function
-// has signature `() -> (i32, i32)` and returns `(ptr, len)` pointing into
+// has signature `() -> (i64, i64)` and returns `(ptr, len)` pointing into
 // the module's data segment — the v0 string-return ABI.
 const Callee = struct {
     name: [:0]const u8,
@@ -204,20 +204,33 @@ const Callee = struct {
     data_len: u32,
 };
 
-// One thing `main` does, in order. `print_const` writes a folded byte
-// payload straight from the data segment; `print_callee` calls an emitted
-// function and writes its returned string, then a newline (env.out's
-// trailing "\n").
+// One piece of a runtime-concatenated string (`print_concat`): either a
+// constant run living in the static data segment, or the (ptr, len)
+// returned by calling an emitted function.
+const Segment = union(enum) {
+    const_run: struct { off: u32, len: u32 },
+    call: usize, // index into `callees`
+};
+
+// One thing `main` does, in order.
+//   print_const  — write a folded byte payload straight from the data segment.
+//   print_callee — call an emitted function, write its returned string.
+//   print_concat — build a string in the scope arena from `segments`
+//                  [first..first+count] (const runs + call results copied
+//                  via memory.copy), then write it.
+// All three append env.out's trailing "\n" (a shared byte at `nl_off`).
 const Action = union(enum) {
     print_const: struct { off: u32, len: u32 },
     print_callee: struct { callee: usize, nl_off: u32 },
+    print_concat: struct { first: usize, count: usize, nl_off: u32 },
 };
 
 fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]u8 {
     const body = fd.body() orelse return Error.NoBody;
 
     // The module's linear-memory image, the ordered plan for `_start`,
-    // and the set of functions `_start` calls.
+    // the functions `_start` calls, and the segment store backing
+    // `print_concat` actions.
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(allocator);
     var actions: std.ArrayList(Action) = .empty;
@@ -227,9 +240,11 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
         for (callees.items) |cl| allocator.free(cl.name);
         callees.deinit(allocator);
     }
+    var segments: std.ArrayList(Segment) = .empty;
+    defer segments.deinit(allocator);
 
-    // A single shared "\n" byte, materialized the first time a real call
-    // needs env.out's trailing newline.
+    // A single shared "\n" byte, materialized the first time env.out needs
+    // its trailing newline.
     var nl_off: ?u32 = null;
 
     var stmts = body.statements();
@@ -245,21 +260,54 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                 // env.out(f()) — a real runtime call to an emitted function.
                 .call => |inner| {
                     const idx = try ensureCallee(allocator, resolver, &data, &callees, inner);
-                    if (nl_off == null) {
-                        nl_off = @intCast(data.items.len);
-                        try data.append(allocator, '\n');
+                    const nl = try ensureNewline(allocator, &data, &nl_off);
+                    try actions.append(allocator, .{ .print_callee = .{ .callee = idx, .nl_off = nl } });
+                },
+                // env.out("…") — a string literal, possibly interpolated.
+                .string_lit => |s| {
+                    const raw = s.rawText() orelse return Error.BadStringLiteral;
+
+                    var raws: std.ArrayList(RawSeg) = .empty;
+                    defer {
+                        for (raws.items) |rs| switch (rs) {
+                            .lit => |b| allocator.free(b),
+                            .call => {},
+                        };
+                        raws.deinit(allocator);
                     }
-                    try actions.append(allocator, .{ .print_callee = .{ .callee = idx, .nl_off = nl_off.? } });
+                    const has_call = try splitInterpolation(allocator, resolver, raw, &data, &callees, &raws);
+
+                    if (!has_call) {
+                        // Pure-constant interpolation folds to one payload
+                        // (preserves escapes, `{{`, numeric interpolation).
+                        const value = try resolver.constEvalExpr(arg);
+                        defer allocator.free(value);
+                        const off: u32 = @intCast(data.items.len);
+                        try data.appendSlice(allocator, value);
+                        try data.append(allocator, '\n'); // env.out("X") writes "X\n"
+                        try actions.append(allocator, .{ .print_const = .{ .off = off, .len = @intCast(value.len + 1) } });
+                    } else {
+                        // A call appears in the interpolation: build the
+                        // string at runtime in the scope arena.
+                        const seg_start = segments.items.len;
+                        for (raws.items) |rs| switch (rs) {
+                            .lit => |bytes| {
+                                if (bytes.len == 0) continue;
+                                const off: u32 = @intCast(data.items.len);
+                                try data.appendSlice(allocator, bytes);
+                                try segments.append(allocator, .{ .const_run = .{ .off = off, .len = @intCast(bytes.len) } });
+                            },
+                            .call => |idx| try segments.append(allocator, .{ .call = idx }),
+                        };
+                        const nl = try ensureNewline(allocator, &data, &nl_off);
+                        try actions.append(allocator, .{ .print_concat = .{
+                            .first = seg_start,
+                            .count = segments.items.len - seg_start,
+                            .nl_off = nl,
+                        } });
+                    }
                 },
-                // env.out("…" / "{…}") — folded to bytes in the data segment.
-                else => {
-                    const value = try resolver.constEvalExpr(arg);
-                    defer allocator.free(value);
-                    const off: u32 = @intCast(data.items.len);
-                    try data.appendSlice(allocator, value);
-                    try data.append(allocator, '\n'); // env.out("X") writes "X\n"
-                    try actions.append(allocator, .{ .print_const = .{ .off = off, .len = @intCast(value.len + 1) } });
-                },
+                else => return Error.UnsupportedExpression,
             }
         },
         // `main` is a sequence of `env.out(...)` calls in v0; bindings and
@@ -267,7 +315,109 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
         .let_stmt, .return_stmt => return Error.UnsupportedStatement,
     };
 
-    return emitModule(allocator, data.items, actions.items, callees.items);
+    return emitModule(allocator, data.items, actions.items, callees.items, segments.items);
+}
+
+/// Reserve the shared newline byte env.out appends; idempotent.
+fn ensureNewline(allocator: std.mem.Allocator, data: *std.ArrayList(u8), nl_off: *?u32) !u32 {
+    if (nl_off.*) |off| return off;
+    const off: u32 = @intCast(data.items.len);
+    try data.append(allocator, '\n');
+    nl_off.* = off;
+    return off;
+}
+
+/// A raw concatenation piece produced while splitting an interpolated
+/// literal: a decoded constant run (owned bytes) or a resolved nullary
+/// call (callee index).
+const RawSeg = union(enum) {
+    lit: []u8,
+    call: usize,
+};
+
+/// Split an interpolated string literal into runtime-concatenation
+/// pieces. Constant runs (with escapes, `{{`/`}}`, and non-call
+/// interpolations const-evaluated) accumulate into `lit` pieces; a
+/// `{call()}` interpolation resolves its callee (`ensureCallee`, which
+/// records the callee + its string in `data`) and emits a `call` piece.
+/// Returns whether any call piece was produced — the caller folds when
+/// none was. Caller owns the `.lit` byte slices in `out`.
+fn splitInterpolation(
+    allocator: std.mem.Allocator,
+    resolver: *Resolver,
+    raw: []const u8,
+    data: *std.ArrayList(u8),
+    callees: *std.ArrayList(Callee),
+    out: *std.ArrayList(RawSeg),
+) !bool {
+    // Raw strings (`r"…"`) carry no interpolation — nothing to split.
+    if (raw.len >= 1 and raw[0] == 'r') return false;
+    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return Error.BadStringLiteral;
+    const text = raw[1 .. raw.len - 1];
+
+    var lit: std.ArrayList(u8) = .empty;
+    errdefer lit.deinit(allocator);
+    var has_call = false;
+
+    const flushLit = struct {
+        fn call(a: std.mem.Allocator, buf: *std.ArrayList(u8), dst: *std.ArrayList(RawSeg)) !void {
+            if (buf.items.len == 0) return;
+            const owned = try buf.toOwnedSlice(a);
+            errdefer a.free(owned);
+            try dst.append(a, .{ .lit = owned });
+        }
+    }.call;
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = text[i];
+        if (ch == '\\' and i + 1 < text.len) {
+            try lit.append(allocator, decodeEscape(text[i + 1]));
+            i += 2;
+            continue;
+        }
+        if (ch == '{') {
+            if (i + 1 < text.len and text[i + 1] == '{') {
+                try lit.append(allocator, '{');
+                i += 2;
+                continue;
+            }
+            const close = std.mem.indexOfScalarPos(u8, text, i + 1, '}') orelse
+                return Error.UnsupportedInterpolation;
+            const inner = text[i + 1 .. close];
+
+            // Parse the interpolation. A nullary call becomes a runtime
+            // call piece; anything else const-evaluates into the literal.
+            const r = try parse.parseExpression(allocator, inner, "<interp>");
+            defer r.deinit(allocator);
+            const iexpr = ast.Expr.cast(r.root) orelse return Error.UnsupportedInterpolation;
+            switch (iexpr) {
+                .call => |cc| {
+                    try flushLit(allocator, &lit, out);
+                    const idx = try ensureCallee(allocator, resolver, data, callees, cc);
+                    try out.append(allocator, .{ .call = idx });
+                    has_call = true;
+                },
+                else => {
+                    const value = try resolver.constEvalExpr(iexpr);
+                    defer allocator.free(value);
+                    try lit.appendSlice(allocator, value);
+                },
+            }
+            i = close + 1;
+            continue;
+        }
+        if (ch == '}' and i + 1 < text.len and text[i + 1] == '}') {
+            try lit.append(allocator, '}');
+            i += 2;
+            continue;
+        }
+        try lit.append(allocator, ch);
+        i += 1;
+    }
+    try flushLit(allocator, &lit, out);
+    lit.deinit(allocator);
+    return has_call;
 }
 
 /// The single argument of a well-formed `env.out(arg)` call.
@@ -561,15 +711,21 @@ fn emitModule(
     data: []const u8,
     actions: []const Action,
     callees: []const Callee,
+    segments: []const Segment,
 ) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
     // q64 is 64-bit: Memory64 linear memory with i64 pointers (spec/
     // memory.md §"The platform"). The string-return ABI is a `(i64, i64)`
-    // (ptr, len) multi-value return with a tuple local at the call site —
-    // needs Multivalue + Memory64.
-    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureMultivalue() | c.BinaryenFeatureMemory64());
+    // (ptr, len) multi-value return with a tuple local at the call site
+    // (Multivalue + Memory64); arena concatenation uses memory.copy
+    // (BulkMemory).
+    c.BinaryenModuleSetFeatures(
+        module,
+        c.BinaryenFeatureMultivalue() | c.BinaryenFeatureMemory64() |
+            c.BinaryenFeatureBulkMemory() | c.BinaryenFeatureBulkMemoryOpt(),
+    );
 
     const i64_type = c.BinaryenTypeInt64();
     const none_type = c.BinaryenTypeNone();
@@ -618,14 +774,44 @@ fn emitModule(
         _ = c.BinaryenAddFunction(module, callee.name.ptr, none_type, pair_type, null, 0, tup);
     }
 
-    // `_start` body, built from the action plan. A tuple local (index 0)
-    // holds a callee's (ptr, len) result between the call and the
-    // env.out forwarding; it's only declared when a real call needs it.
-    var need_local = false;
+    // `_start` body, built from the action plan. Local layout:
+    //   indices 0..n_tuples-1 : tuple locals holding callee (ptr, len).
+    //   buf / off / len       : i64 scratch, present only with a concat.
+    var n_tuples: usize = 0;
+    var has_concat = false;
     for (actions) |a| switch (a) {
-        .print_callee => need_local = true,
-        else => {},
+        .print_callee => {
+            if (n_tuples < 1) n_tuples = 1;
+        },
+        .print_concat => |p| {
+            has_concat = true;
+            var calls: usize = 0;
+            for (segments[p.first .. p.first + p.count]) |sg| switch (sg) {
+                .call => calls += 1,
+                .const_run => {},
+            };
+            if (calls > n_tuples) n_tuples = calls;
+        },
+        .print_const => {},
     };
+
+    const buf_idx: c.BinaryenIndex = @intCast(n_tuples);
+    const off_idx: c.BinaryenIndex = @intCast(n_tuples + 1);
+    const len_idx: c.BinaryenIndex = @intCast(n_tuples + 2);
+
+    // The scope arena: a bump pointer (`sp`) starting just past the static
+    // data. Each concat allocates from it; no reclamation in v0 (the
+    // program is a single `_start` run). spec/memory.md §"Region kinds" —
+    // the implicit `scope` Arena.
+    if (has_concat) {
+        _ = c.BinaryenAddGlobal(
+            module,
+            "sp",
+            i64_type,
+            true, // mutable
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(data.len))),
+        );
+    }
 
     var exprs: std.ArrayList(c.BinaryenExpressionRef) = .empty;
     defer exprs.deinit(allocator);
@@ -652,6 +838,101 @@ fn emitModule(
             };
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
         },
+        .print_concat => |p| {
+            const segs = segments[p.first .. p.first + p.count];
+
+            // 1. Call each callee into its own tuple local.
+            {
+                var j: c.BinaryenIndex = 0;
+                for (segs) |sg| switch (sg) {
+                    .call => |ci| {
+                        const result = c.BinaryenCall(module, callees[ci].name.ptr, null, 0, pair_type);
+                        try exprs.append(allocator, c.BinaryenLocalSet(module, j, result));
+                        j += 1;
+                    },
+                    .const_run => {},
+                };
+            }
+
+            // 2. len = (sum of const lengths) + (sum of call lengths).
+            var const_total: u64 = 0;
+            for (segs) |sg| switch (sg) {
+                .const_run => |cr| const_total += cr.len,
+                .call => {},
+            };
+            var total = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(const_total)));
+            {
+                var j: c.BinaryenIndex = 0;
+                for (segs) |sg| switch (sg) {
+                    .call => {
+                        const lenj = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 1);
+                        total = c.BinaryenBinary(module, c.BinaryenAddInt64(), total, lenj);
+                        j += 1;
+                    },
+                    .const_run => {},
+                };
+            }
+            try exprs.append(allocator, c.BinaryenLocalSet(module, len_idx, total));
+
+            // 3. buf = sp; sp += len  (bump-allocate from the arena).
+            try exprs.append(allocator, c.BinaryenLocalSet(module, buf_idx, c.BinaryenGlobalGet(module, "sp", i64_type)));
+            try exprs.append(allocator, c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(
+                module,
+                c.BinaryenAddInt64(),
+                c.BinaryenLocalGet(module, buf_idx, i64_type),
+                c.BinaryenLocalGet(module, len_idx, i64_type),
+            )));
+
+            // 4. off = buf; memory.copy each segment, bumping off.
+            try exprs.append(allocator, c.BinaryenLocalSet(module, off_idx, c.BinaryenLocalGet(module, buf_idx, i64_type)));
+            {
+                var j: c.BinaryenIndex = 0;
+                for (segs) |sg| {
+                    var src: c.BinaryenExpressionRef = undefined;
+                    var ln: c.BinaryenExpressionRef = undefined;
+                    var ln_again: c.BinaryenExpressionRef = undefined;
+                    switch (sg) {
+                        .const_run => |cr| {
+                            src = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.off)));
+                            ln = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
+                            ln_again = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
+                        },
+                        .call => {
+                            src = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 0);
+                            ln = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 1);
+                            ln_again = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 1);
+                            j += 1;
+                        },
+                    }
+                    try exprs.append(allocator, c.BinaryenMemoryCopy(
+                        module,
+                        c.BinaryenLocalGet(module, off_idx, i64_type),
+                        src,
+                        ln,
+                        "0",
+                        "0",
+                    ));
+                    try exprs.append(allocator, c.BinaryenLocalSet(module, off_idx, c.BinaryenBinary(
+                        module,
+                        c.BinaryenAddInt64(),
+                        c.BinaryenLocalGet(module, off_idx, i64_type),
+                        ln_again,
+                    )));
+                }
+            }
+
+            // 5. env.out(buf, len), then the trailing newline.
+            var cargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenLocalGet(module, buf_idx, i64_type),
+                c.BinaryenLocalGet(module, len_idx, i64_type),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
+            var nargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(p.nl_off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(1)),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
+        },
     };
 
     const body_expr: c.BinaryenExpressionRef = if (exprs.items.len == 1)
@@ -659,14 +940,26 @@ fn emitModule(
     else
         c.BinaryenBlock(module, null, @ptrCast(exprs.items.ptr), @intCast(exprs.items.len), none_type);
 
-    var var_types = [_]c.BinaryenType{pair_type};
+    // Declare _start's locals: n_tuples tuple locals + 3 i64 scratch when
+    // a concat is present.
+    const n_scratch: usize = if (has_concat) 3 else 0;
+    const n_vars = n_tuples + n_scratch;
+    const var_types = try allocator.alloc(c.BinaryenType, n_vars);
+    defer allocator.free(var_types);
+    for (0..n_tuples) |k| var_types[k] = pair_type;
+    if (has_concat) {
+        var_types[n_tuples] = i64_type;
+        var_types[n_tuples + 1] = i64_type;
+        var_types[n_tuples + 2] = i64_type;
+    }
+    const vt: [*c]c.BinaryenType = if (n_vars > 0) var_types.ptr else null;
     _ = c.BinaryenAddFunction(
         module,
         "start",
         none_type,
         none_type,
-        if (need_local) @ptrCast(&var_types) else null,
-        if (need_local) var_types.len else 0,
+        vt,
+        @intCast(n_vars),
         body_expr,
     );
     _ = c.BinaryenAddFunctionExport(module, "start", "_start");
@@ -792,20 +1085,30 @@ test "emitFromSource: resolves a cross-module call inside interpolation" {
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
-    // The folded value lands in the data segment as "0.1.0\n".
+    // A lone `{call}` interpolation is a single-segment concat: the
+    // callee's "0.1.0" plus the shared newline are adjacent in the data
+    // segment, assembled in the arena at runtime.
     try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0\n") != null);
 }
 
-test "emitFromSource: literal text around an interpolation is preserved" {
+test "emitFromSource: interpolation with literal text concatenates at runtime" {
+    // `"v{version()}!"` is built in the scope arena from three segments —
+    // the assembled "v0.1.0!" exists only at runtime, so the binary holds
+    // the pieces separately, not the joined string. Behavior is covered
+    // end-to-end by scripts/link-roundtrip.sh.
     const lib = "pub fn version() -> str { \"0.1.0\" }\n";
     const app = "import dev.q64.hw.{version}\nfn main { env.out(\"v{version()}!\") }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.hw", .source = lib }};
     const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
     defer testing.allocator.free(bytes);
-    try testing.expect(std.mem.indexOf(u8, bytes, "v0.1.0!\n") != null);
+
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    // The pieces are present; the joined form is not baked in.
+    try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "v0.1.0!") == null);
 }
 
-test "emitFromSource: a local const function folds without an import" {
+test "emitFromSource: a local function is callable inside interpolation" {
     const app = "fn version { \"9.9.9\" }\nfn main { env.out(\"{version()}\") }\n";
     const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
     defer testing.allocator.free(bytes);
@@ -824,11 +1127,10 @@ test "emitFromSource: a const fn bodied with `return` folds" {
 }
 
 test "emitFromSource: env.out(version()) emits a real (non-folded) call" {
-    // Unlike `env.out("{version()}")` (folded), `env.out(version())`
-    // emits `version` as a real `() -> (i32, i32)` function and calls it
-    // at runtime. Validation here proves the multi-value module is
-    // well-formed (the ABI + Multivalue feature); behavior is covered
-    // end-to-end by scripts/link-roundtrip.sh.
+    // `env.out(version())` emits `version` as a real `() -> (i64, i64)`
+    // function and calls it at runtime. Validation here proves the
+    // multi-value module is well-formed (the ABI + Multivalue feature);
+    // behavior is covered end-to-end by scripts/link-roundtrip.sh.
     const lib = "pub fn version() -> str { \"0.1.0\" }\n";
     const app =
         \\import dev.q64.hello_world.{version}

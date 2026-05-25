@@ -70,11 +70,20 @@ and `qube run`):
        (`runtime/wasmtime/`) enables `wasm_memory64` on the engine config
        and reads i64 args; `hello.wat` updated to `i64`/`(memory … i64 …)`.
        Verified: emitted memory section flags = `0x05` (has-max + 64-bit).
-       **Next:** the implicit `scope` Arena (a bump-pointer global in
-       linear memory) as the first *writable* region — unblocks runtime
-       string building and the return-into-caller's-region ABI
-       (`spec/memory.md` §"Lifetime tracking", REG010). Defer the `Stack`
-       region kind + multi-memory segregation.
+8. [x] **Scope arena + runtime string concatenation.** First *writable*
+       region: a mutable `sp` bump-pointer global starting past the static
+       data (`spec/memory.md` §"Region kinds", the implicit `scope` Arena).
+       Interpolation containing a call (`"q64 v{version()} ok"`) is now
+       built at run time — `emitFn` splits the literal into segments
+       (`splitInterpolation`), `emitModule` lowers a `print_concat`:
+       bump-alloc the total length, `memory.copy` each const run / call
+       result into the buffer, then `env.out` it. Needs BulkMemory(+Opt)
+       for `memory.copy`. Pure-constant interpolation still folds.
+       Verified end-to-end: `scripts/link-roundtrip.sh` now asserts
+       `q64 v0.1.0 ok` (a 3-segment runtime concat). **Next:** callees with
+       parameters (argument passing); the `Stack` region kind (LIFO,
+       freed on return) and multi-memory segregation stay deferred. v0
+       arena has no reclamation (single `_start` run, 1 page).
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.

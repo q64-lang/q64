@@ -86,4 +86,28 @@ if [[ "$qube_out" != "$expected" ]]; then
     exit 1
 fi
 
+# Runtime string concatenation: an interpolation with literal text around a
+# real call (`"q64 v{version()} ok"`) is built in the scope arena at run
+# time (bump alloc + memory.copy), not const-folded. Reuses the demo lib.
+echo "==> concat: q64 emit \"q64 v{version()} ok\""
+concat_app="$tmp/concat.q"
+concat_wasm="$tmp/concat.wasm"
+cat > "$concat_app" <<'Q64'
+import dev.q64.hello_world.{version}
+
+fn main {
+    env.out("q64 v{version()} ok")
+}
+Q64
+"$Q64_BIN" emit "$concat_app" "$concat_wasm" --module "dev.q64.hello_world=$LIB_SRC"
+concat_out="$("$HOST_BIN" "$concat_wasm")"
+concat_expected="q64 v0.1.0 ok"
+if [[ "$concat_out" != "$concat_expected" ]]; then
+    echo "FAIL: concat output mismatch" >&2
+    printf "  expected: %q\n" "$concat_expected" >&2
+    printf "  actual:   %q\n" "$concat_out" >&2
+    exit 1
+fi
+echo "    ok: arena concat -> $concat_out"
+
 echo "PASS: $qube_out"
