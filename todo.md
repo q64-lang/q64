@@ -141,6 +141,22 @@ and `qube run`):
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.
+15. [x] **Control flow — `if`/`else` in i64 functions.** An i64-returning
+       function whose body is an `if`/`else` (or an else-if chain) lowers to a
+       wasm `BinaryenIf` yielding i64; each branch's block contributes its
+       tail value, recursing for nested ifs. Conditions lower via `emitCond`:
+       the comparison operators `== != < <= > >=` become signed i64
+       comparisons, and any other i64 expression is truthiness-tested
+       (`x != 0`). A value `if` must end in an `else` (every path yields a
+       value) or it errors (`UnsupportedCall`). New `emitFn` helpers
+       `emitIntBody`/`emitIntBlock`/`emitIfInt`/`emitCond`. Composes with
+       bindings, runtime args, and interpolation (e.g. `let m = max(10, 4);
+       let c = clamp(m, 7); "max={m}, clamped={c}"`). Verified end-to-end
+       (`link-roundtrip.sh`: `max`/`sign`/`abs`/`clamp` → `9 / -1 / 13 /
+       max=10, clamped=7`) + emit unit tests. **Boundary:** conditions and
+       branches are i64-only (no `bool`/`str` values yet); no loops; in-body
+       `let` bindings inside a callee aren't supported (only the tail
+       statement contributes the value).
 
 **Definition of done met.** `cd examples/link-demo/hello_app && qube run`
 prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)

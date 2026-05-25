@@ -322,4 +322,41 @@ if [[ "$intfn_out" != "$intfn_expected" ]]; then
 fi
 echo "    ok: runtime i64 functions + bindings + interpolation -> ... / hi!: a=42, b=50"
 
+# Control flow: i64 functions that branch with `if`/`else` (incl. else-if
+# chains, comparisons, and truthiness). The body lowers to a wasm `if`; no
+# branch is const-folded. Results feed bindings + interpolation as usual.
+echo "==> control flow: q64 emit if/else int functions"
+cf_lib="$tmp/cflib/src"
+mkdir -p "$cf_lib"
+cat > "$cf_lib/lib.q" <<'Q64'
+pub fn max(a: i64, b: i64) -> i64 { if a > b { a } else { b } }
+pub fn sign(n: i64) -> i64 { if n > 0 { 1 } else if n < 0 { 0 - 1 } else { 0 } }
+pub fn abs(n: i64) -> i64 { if n < 0 { 0 - n } else { n } }
+pub fn clamp(n: i64, hi: i64) -> i64 { if n > hi { hi } else { n } }
+Q64
+cf_app="$tmp/cf.q"
+cf_wasm="$tmp/cf.wasm"
+cat > "$cf_app" <<'Q64'
+import dev.q64.cflib.{max, sign, abs, clamp}
+
+fn main {
+    env.out(max(3, 9))
+    env.out(sign(0 - 7))
+    env.out(abs(0 - 13))
+    let m = max(10, 4)
+    let c = clamp(m, 7)
+    env.out("max={m}, clamped={c}")
+}
+Q64
+"$Q64_BIN" emit "$cf_app" "$cf_wasm" --module "dev.q64.cflib=$cf_lib"
+cf_out="$("$HOST_BIN" "$cf_wasm")"
+cf_expected=$'9\n-1\n13\nmax=10, clamped=7'
+if [[ "$cf_out" != "$cf_expected" ]]; then
+    echo "FAIL: control-flow output mismatch" >&2
+    printf "  expected: %q\n" "$cf_expected" >&2
+    printf "  actual:   %q\n" "$cf_out" >&2
+    exit 1
+fi
+echo "    ok: if/else int functions -> 9 / -1 / 13 / max=10, clamped=7"
+
 echo "PASS: $qube_out"

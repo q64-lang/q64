@@ -1290,6 +1290,105 @@ fn emitIntExpr(
     }
 }
 
+/// Lower an i64-returning function body to a single i64-valued expression.
+/// The body's tail statement provides the value: a plain expression /
+/// `return`, or an `if`/`else` chain whose branches each yield an i64.
+fn emitIntBody(
+    module: c.BinaryenModuleRef,
+    fd: ast.FnDecl,
+    param_names: []const []const u8,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+) Error!c.BinaryenExpressionRef {
+    const body = fd.body() orelse return Error.NoBody;
+    return emitIntBlock(module, body, param_names, i64_type, allocator);
+}
+
+/// The i64 value of a block is its last statement's value: an expression,
+/// a `return`, or a nested `if`/`else`. v0 has no in-body bindings, so
+/// earlier statements don't contribute.
+fn emitIntBlock(
+    module: c.BinaryenModuleRef,
+    block: ast.Block,
+    param_names: []const []const u8,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+) Error!c.BinaryenExpressionRef {
+    var stmts = block.statements();
+    var last: ?ast.Stmt = null;
+    while (stmts.next()) |s| last = s;
+    return switch (last orelse return Error.UnsupportedCall) {
+        .expr_stmt => |es| emitIntExpr(module, es.expression() orelse return Error.UnsupportedCall, param_names, i64_type, allocator),
+        .return_stmt => |rs| emitIntExpr(module, rs.value() orelse return Error.UnsupportedCall, param_names, i64_type, allocator),
+        .if_stmt => |is| emitIfInt(module, is, param_names, i64_type, allocator),
+        else => Error.UnsupportedCall,
+    };
+}
+
+/// Lower an `if`/`else` chain to a `BinaryenIf` yielding an i64. Every path
+/// must produce a value, so the chain has to end in an `else` (a value
+/// `if` with no `else` is rejected).
+fn emitIfInt(
+    module: c.BinaryenModuleRef,
+    ifs: ast.IfStmt,
+    param_names: []const []const u8,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+) Error!c.BinaryenExpressionRef {
+    const cond_expr = ifs.condition() orelse return Error.UnsupportedCall;
+    const cond = try emitCond(module, cond_expr, param_names, i64_type, allocator);
+    const then_val = try emitIntBlock(module, ifs.thenBody() orelse return Error.UnsupportedCall, param_names, i64_type, allocator);
+    const else_val = if (ifs.elseIf()) |eif|
+        try emitIfInt(module, eif, param_names, i64_type, allocator)
+    else if (ifs.elseBody()) |eb|
+        try emitIntBlock(module, eb, param_names, i64_type, allocator)
+    else
+        return Error.UnsupportedCall;
+    return c.BinaryenIf(module, cond, then_val, else_val);
+}
+
+/// Lower a boolean condition to a wasm `i32`. A comparison (`== != < <= >
+/// >=`) becomes the matching signed i64 comparison; any other i64
+/// expression is truthiness-tested (`x != 0`).
+fn emitCond(
+    module: c.BinaryenModuleRef,
+    expr: ast.Expr,
+    param_names: []const []const u8,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+) Error!c.BinaryenExpressionRef {
+    switch (expr) {
+        .paren => |p| return emitCond(module, p.inner() orelse return Error.NotConstExpr, param_names, i64_type, allocator),
+        .bin => |b| {
+            const op = b.op() orelse return Error.NotConstExpr;
+            const cmp: c.BinaryenOp = switch (op.kind) {
+                .EQ_EQ => c.BinaryenEqInt64(),
+                .BANG_EQ => c.BinaryenNeInt64(),
+                .L_ANGLE => c.BinaryenLtSInt64(),
+                .R_ANGLE => c.BinaryenGtSInt64(),
+                .LT_EQ => c.BinaryenLeSInt64(),
+                .GT_EQ => c.BinaryenGeSInt64(),
+                else => return emitTruthy(module, expr, param_names, i64_type, allocator),
+            };
+            const l = try emitIntExpr(module, b.lhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            const r = try emitIntExpr(module, b.rhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            return c.BinaryenBinary(module, cmp, l, r);
+        },
+        else => return emitTruthy(module, expr, param_names, i64_type, allocator),
+    }
+}
+
+fn emitTruthy(
+    module: c.BinaryenModuleRef,
+    expr: ast.Expr,
+    param_names: []const []const u8,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+) Error!c.BinaryenExpressionRef {
+    const v = try emitIntExpr(module, expr, param_names, i64_type, allocator);
+    return c.BinaryenBinary(module, c.BinaryenNeInt64(), v, c.BinaryenConst(module, c.BinaryenLiteralInt64(0)));
+}
+
 /// Emit `__fmt_i64(n: i64) -> (i64, i64)`: format `n` to decimal in the
 /// scope arena, returning (ptr, len). Writes digits backward into a 24-byte
 /// bump allocation, then prepends `-` for negatives.
@@ -1631,8 +1730,7 @@ fn emitModule(
                     iptype = c.BinaryenTypeCreate(iparams.ptr, @intCast(iparams.len));
                 }
                 defer if (iparams.len > 0) allocator.free(iparams);
-                const ve = bodyValueExpr(fd) orelse return Error.UnsupportedCall;
-                const ibody = try emitIntExpr(module, ve, pnames.items, i64_type, allocator);
+                const ibody = try emitIntBody(module, fd, pnames.items, i64_type, allocator);
                 _ = c.BinaryenAddFunction(module, callee.name.ptr, iptype, i64_type, null, 0, ibody);
                 continue;
             },
@@ -2173,6 +2271,38 @@ test "emitFromSource: a multi-parameter i64 function" {
     const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: an i64 function branches on a comparison" {
+    // `max(a, b) { if a > b { a } else { b } }` lowers to a wasm `if`
+    // returning i64; the branch values are parameter reads. Nothing is
+    // const-folded — the result is computed at runtime.
+    const lib = "pub fn max(a: i64, b: i64) -> i64 { if a > b { a } else { b } }\n";
+    const app = "import dev.q64.m.{max}\nfn main { env.out(max(3, 9)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: an else-if chain lowers to nested ifs" {
+    const lib = "pub fn sign(n: i64) -> i64 { if n > 0 { 1 } else if n < 0 { 0 - 1 } else { 0 } }\n";
+    const app = "import dev.q64.m.{sign}\nfn main { env.out(sign(0 - 7)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: a value `if` without an else is rejected" {
+    // Every path of a value-producing `if` must yield an i64.
+    const lib = "pub fn f(n: i64) -> i64 { if n > 0 { 1 } }\n";
+    const app = "import dev.q64.m.{f}\nfn main { env.out(f(1)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.UnsupportedCall,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
 }
 
 test "emitFromSource: an i64 let binding is bound, chained, and printed" {
