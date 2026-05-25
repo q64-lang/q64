@@ -76,6 +76,16 @@ pub fn build(b: *std.Build) void {
     });
     const hello_step = b.step("hello-roundtrip", "Run the end-to-end hello-world smoke test");
     hello_step.dependOn(&hello_script.step);
+
+    // Black-box CLI suite (Bun). Builds the binary, then runs `bun test`
+    // in the sibling ../q64-test against zig-out/bin/q64. Only runs when
+    // invoked explicitly; needs `bun` on PATH.
+    const cli_tests = b.addSystemCommand(&.{ "bun", "test" });
+    cli_tests.setCwd(b.path("../q64-test"));
+    cli_tests.setEnvironmentVariable("Q64_BIN", "../q64/zig-out/bin/q64");
+    cli_tests.step.dependOn(b.getInstallStep());
+    const cli_tests_step = b.step("cli-tests", "Run the q64 CLI black-box suite (bun test)");
+    cli_tests_step.dependOn(&cli_tests.step);
 }
 
 fn addPlainTest(

@@ -25,4 +25,14 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_exe.addArgs(args);
     const run_step = b.step("run", "Run qube with the supplied arguments");
     run_step.dependOn(&run_exe.step);
+
+    // Black-box CLI suite (Bun). Builds the binary, then runs `bun test`
+    // in the sibling ../qube-test against zig-out/bin/qube. Only runs when
+    // invoked explicitly; needs `bun` on PATH.
+    const cli_tests = b.addSystemCommand(&.{ "bun", "test" });
+    cli_tests.setCwd(b.path("../qube-test"));
+    cli_tests.setEnvironmentVariable("QUBE_BIN", "../qube/zig-out/bin/qube");
+    cli_tests.step.dependOn(b.getInstallStep());
+    const cli_tests_step = b.step("cli-tests", "Run the qube CLI black-box suite (bun test)");
+    cli_tests_step.dependOn(&cli_tests.step);
 }
