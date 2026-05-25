@@ -887,15 +887,29 @@ pub const Pattern = struct {
     }
 };
 
-/// Sum of v0 expression forms. Adding a new expression kind: add a
-/// CST kind in `cst.zig`, a parse function in `parse.zig`, and a
-/// variant here whose `cast` recognizes the new kind.
+/// Sum of the expression forms the parser produces. `record`/`range`/
+/// `lambda`/`spawn`/`channel`/`graph` have CST kinds reserved but no
+/// parser productions yet; they join here when those land. Adding a kind:
+/// add a CST kind in `cst.zig`, a parse function in `parse.zig`, and a
+/// variant here whose `cast` recognizes it.
 pub const Expr = union(enum) {
     call: CallExpr,
     path: PathExpr,
     string_lit: StringLit,
     num_lit: NumLit,
     literal: LiteralExpr,
+    bin: BinExpr,
+    pipe: BinExpr,
+    unary: UnaryExpr,
+    @"try": TryExpr,
+    index: IndexExpr,
+    field: FieldExpr,
+    method: MethodExpr,
+    tuple_field: TupleFieldExpr,
+    question_dot: QuestionDotExpr,
+    tuple: TupleExpr,
+    paren: ParenExpr,
+    array: ArrayExpr,
 
     pub fn cast(node: *const cst.Node) ?Expr {
         return switch (node.kind) {
@@ -904,6 +918,18 @@ pub const Expr = union(enum) {
             .STR_LITERAL => .{ .string_lit = .{ .cst = node } },
             .NUM_LITERAL => .{ .num_lit = .{ .cst = node } },
             .LITERAL_EXPR => .{ .literal = .{ .cst = node } },
+            .BIN_EXPR => .{ .bin = .{ .cst = node } },
+            .PIPE_EXPR => .{ .pipe = .{ .cst = node } },
+            .UNARY_EXPR => .{ .unary = .{ .cst = node } },
+            .TRY_EXPR => .{ .@"try" = .{ .cst = node } },
+            .INDEX_EXPR => .{ .index = .{ .cst = node } },
+            .FIELD_EXPR => .{ .field = .{ .cst = node } },
+            .METHOD_EXPR => .{ .method = .{ .cst = node } },
+            .TUPLE_FIELD_EXPR => .{ .tuple_field = .{ .cst = node } },
+            .QUESTION_DOT_EXPR => .{ .question_dot = .{ .cst = node } },
+            .TUPLE_EXPR => .{ .tuple = .{ .cst = node } },
+            .PAREN_EXPR => .{ .paren = .{ .cst = node } },
+            .ARRAY_EXPR => .{ .array = .{ .cst = node } },
             else => null,
         };
     }
@@ -1057,6 +1083,171 @@ pub const NumLit = struct {
 pub const LiteralExpr = struct { cst: *const cst.Node };
 
 // =====================================================================
+// Operator and postfix expressions
+// =====================================================================
+
+/// `BinExpr := Expr BinOp Expr` (also used for the `|>` pipe form, which
+/// has the same shape). `op` is the operator token between the operands.
+pub const BinExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn lhs(self: BinExpr) ?Expr {
+        return nthChildExpr(self.cst, 0);
+    }
+    pub fn rhs(self: BinExpr) ?Expr {
+        return nthChildExpr(self.cst, 1);
+    }
+    pub fn op(self: BinExpr) ?cst.Token {
+        return firstNonTriviaToken(self.cst);
+    }
+};
+
+/// `UnaryExpr := UnaryOp Expr` (`!`, `-`, `~`, `ref`, `move`).
+pub const UnaryExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn op(self: UnaryExpr) ?cst.Token {
+        return firstNonTriviaToken(self.cst);
+    }
+    pub fn operand(self: UnaryExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+};
+
+/// `TryExpr := "try" Expr`.
+pub const TryExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn operand(self: TryExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+};
+
+/// `IndexExpr := Expr "[" Expr "]"`.
+pub const IndexExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn base(self: IndexExpr) ?Expr {
+        return nthChildExpr(self.cst, 0);
+    }
+    pub fn index(self: IndexExpr) ?Expr {
+        return nthChildExpr(self.cst, 1);
+    }
+};
+
+/// `FieldExpr := Expr "." IDENT`.
+pub const FieldExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn base(self: FieldExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    /// The accessed field name (the token after `.`).
+    pub fn field(self: FieldExpr) ?cst.Token {
+        return lastNonTriviaToken(self.cst);
+    }
+};
+
+/// `MethodExpr := Expr "." IDENT "(" Args? ")"`.
+pub const MethodExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn receiver(self: MethodExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    /// The method name (the token between `.` and `(`).
+    pub fn method(self: MethodExpr) ?cst.Token {
+        // The last token before the CALL_ARGS node is the method name.
+        var name: ?cst.Token = null;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (!t.kind.isTrivia() and t.kind != .DOT) {
+                name = t;
+            },
+            .node => |n| if (n.kind == .CALL_ARGS) break,
+        };
+        return name;
+    }
+    pub fn args(self: MethodExpr) ArgIter {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (n.kind == .CALL_ARGS) return .{ .children = n.children },
+            .token => {},
+        };
+        return .{ .children = &.{} };
+    }
+};
+
+/// `TupleFieldExpr := Expr "." INT` (e.g. `pair.0`).
+pub const TupleFieldExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn base(self: TupleFieldExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    /// The tuple-index token (`0`, `1`, …).
+    pub fn index(self: TupleFieldExpr) ?cst.Token {
+        return lastNonTriviaToken(self.cst);
+    }
+};
+
+/// `QuestionDotExpr := Expr "?." IDENT` (Option chaining).
+pub const QuestionDotExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn base(self: QuestionDotExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    pub fn field(self: QuestionDotExpr) ?cst.Token {
+        return lastNonTriviaToken(self.cst);
+    }
+};
+
+/// `TupleExpr := "(" Expr ("," Expr)+ ")"`.
+pub const TupleExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn elements(self: TupleExpr) ExprIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+/// `ParenExpr := "(" Expr ")"`.
+pub const ParenExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn inner(self: ParenExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+};
+
+/// `ArrayExpr := "[" Expr,* "]"` (or `[Expr ";" Count]`).
+pub const ArrayExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn elements(self: ArrayExpr) ExprIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+/// Iterates the `Expr`-shaped child nodes of a node (tuple/array elements).
+pub const ExprIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *ExprIter) ?Expr {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (Expr.cast(n)) |e| {
+                    self.i += 1;
+                    return e;
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+// =====================================================================
 // Internal helpers
 // =====================================================================
 
@@ -1117,6 +1308,25 @@ fn firstChildPattern(parent: *const cst.Node) ?Pattern {
         .token => {},
     };
     return null;
+}
+
+fn firstNonTriviaToken(parent: *const cst.Node) ?cst.Token {
+    for (parent.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) return t,
+        .node => {},
+    };
+    return null;
+}
+
+fn lastNonTriviaToken(parent: *const cst.Node) ?cst.Token {
+    var last: ?cst.Token = null;
+    for (parent.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) {
+            last = t;
+        },
+        .node => {},
+    };
+    return last;
 }
 
 /// Join the source text of every token after the first `after`-kind

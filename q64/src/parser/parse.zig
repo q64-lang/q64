@@ -1990,6 +1990,56 @@ test "postfix: method call on a call result is METHOD_EXPR" {
     try testing.expectEqual(cst.SyntaxKind.METHOD_EXPR, r.root.kind);
 }
 
+test "expression views: bin / unary / try / index / field / method / tuple-field / paren / tuple / array" {
+    const tag = std.meta.activeTag;
+    const Case = struct { src: []const u8, want: std.meta.Tag(ast.Expr) };
+    const cases = [_]Case{
+        .{ .src = "a + b", .want = .bin },
+        .{ .src = "-x", .want = .unary },
+        .{ .src = "try f()", .want = .@"try" },
+        .{ .src = "xs[0]", .want = .index },
+        .{ .src = "f().x", .want = .field },
+        .{ .src = "f().g()", .want = .method },
+        .{ .src = "f().0", .want = .tuple_field },
+        .{ .src = "f()?.x", .want = .question_dot },
+        .{ .src = "(a, b)", .want = .tuple },
+        .{ .src = "(a)", .want = .paren },
+        .{ .src = "[1, 2, 3]", .want = .array },
+    };
+    for (cases) |cse| {
+        const r = try parseExpression(testing.allocator, cse.src, "e.q");
+        defer r.deinit(testing.allocator);
+        const e = ast.Expr.cast(r.root) orelse return error.TestExpectedNonNull;
+        try testing.expectEqual(cse.want, tag(e));
+    }
+
+    // Accessor spot-checks.
+    {
+        const r = try parseExpression(testing.allocator, "a + b", "e.q");
+        defer r.deinit(testing.allocator);
+        const e = ast.Expr.cast(r.root).?;
+        try testing.expectEqual(cst.SyntaxKind.PLUS, e.bin.op().?.kind);
+        try testing.expect(e.bin.lhs() != null);
+        try testing.expect(e.bin.rhs() != null);
+    }
+    {
+        const r = try parseExpression(testing.allocator, "f().x", "e.q");
+        defer r.deinit(testing.allocator);
+        const e = ast.Expr.cast(r.root).?;
+        try testing.expect(e.field.base() != null);
+        try testing.expectEqualStrings("x", e.field.field().?.text);
+    }
+    {
+        const r = try parseExpression(testing.allocator, "[1, 2, 3]", "e.q");
+        defer r.deinit(testing.allocator);
+        const e = ast.Expr.cast(r.root).?;
+        var els = e.array.elements();
+        var n: usize = 0;
+        while (els.next()) |_| n += 1;
+        try testing.expectEqual(@as(usize, 3), n);
+    }
+}
+
 fn blockOf(sf: ast.SourceFile) ?*const cst.Node {
     var items = sf.items();
     const fd = (items.next() orelse return null).fn_decl;

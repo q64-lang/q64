@@ -292,9 +292,23 @@ visible at a glance whether it's been picked up.
       (`PCM<f32>(0.0)`) from a chained comparison (`a < b > c`) needs name
       resolution — a pure-syntax heuristic false-positives on valid
       generics. PAR040 is therefore deferred to the name-resolution pass.
-- [ ] AST views (items): extend `q64/src/parser/ast.zig` as each item
-      production lands (`StructDecl`, `EnumDecl`, `FaceDecl`, …). `FnDecl`
-      and `ImportStmt` seeded the pattern.
+- [x] AST views: **complete** — every CST production the parser emits now
+      has a typed view in `q64/src/parser/ast.zig`.
+      • Items: `ast.Item` exposes `fn`/`struct`/`enum`/`type`/`const`/`face`/
+        `fit` (visibility + name; struct `Field`s, enum `Variant`s, type
+        `aliasedText`, const `value`).
+      • Statements: `ast.Stmt` exposes `expr`/`let`/`return`/`assign`/`if`/
+        `while`/`loop`/`for`/`match`/`break`/`continue`/`panic` (conditions,
+        bodies, patterns, `MatchArm`s, assign target/value/op).
+      • Expressions: `ast.Expr` exposes `bin`/`pipe`/`unary`/`try`/`call`/
+        `index`/`field`/`method`/`tuple_field`/`question_dot`/`tuple`/`paren`/
+        `array`/`path`/literals (operands, operators, args, elements).
+      Codegen's exhaustive `Item`/`Stmt` switches gained `else` arms (it
+      still lowers only the subset it understands). **Remaining gaps are
+      parser-level, not view-level:** the `TypeExpr` grammar (types are raw
+      `text()` spans everywhere), pattern destructuring internals, generic-
+      param/effect/where internals, and the not-yet-parsed expr kinds
+      (`record`/`range`/`lambda`/`spawn`/`channel`/`graph`).
 - [x] AST views (statements): `ast.Stmt` now surfaces `let`/`var`
       (`LetStmt`: `isVar`/`pattern`/`initializer`) and `return`
       (`ReturnStmt.value`) alongside `expr_stmt`, plus a `Pattern` view
