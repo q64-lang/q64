@@ -110,4 +110,29 @@ if [[ "$concat_out" != "$concat_expected" ]]; then
 fi
 echo "    ok: arena concat -> $concat_out"
 
+# String parameters + argument passing: a passthrough `id(s) { s }` takes
+# a str (lowered to two i64 params), and the caller passes a literal.
+echo "==> params: q64 emit env.out(id(\"passed\"))"
+param_lib="$tmp/strlib/src"
+mkdir -p "$param_lib"
+printf 'pub fn id(s: str) -> str { s }\n' > "$param_lib/lib.q"
+param_app="$tmp/param.q"
+param_wasm="$tmp/param.wasm"
+cat > "$param_app" <<'Q64'
+import dev.q64.strlib.{id}
+
+fn main {
+    env.out(id("passed"))
+}
+Q64
+"$Q64_BIN" emit "$param_app" "$param_wasm" --module "dev.q64.strlib=$param_lib"
+param_out="$("$HOST_BIN" "$param_wasm")"
+if [[ "$param_out" != "passed" ]]; then
+    echo "FAIL: param output mismatch" >&2
+    printf "  expected: %q\n" "passed" >&2
+    printf "  actual:   %q\n" "$param_out" >&2
+    exit 1
+fi
+echo "    ok: string param passthrough -> $param_out"
+
 echo "PASS: $qube_out"

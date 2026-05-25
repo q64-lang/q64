@@ -80,10 +80,21 @@ and `qube run`):
        result into the buffer, then `env.out` it. Needs BulkMemory(+Opt)
        for `memory.copy`. Pure-constant interpolation still folds.
        Verified end-to-end: `scripts/link-roundtrip.sh` now asserts
-       `q64 v0.1.0 ok` (a 3-segment runtime concat). **Next:** callees with
-       parameters (argument passing); the `Stack` region kind (LIFO,
-       freed on return) and multi-memory segregation stay deferred. v0
-       arena has no reclamation (single `_start` run, 1 page).
+       `q64 v0.1.0 ok` (a 3-segment runtime concat). v0 arena has no
+       reclamation (single `_start` run, 1 page).
+9. [x] **String parameters + argument passing.** A `str` parameter lowers
+       to two i64 wasm params (ptr, len); callees are emitted as
+       `(i64×2·params) -> (i64, i64)`. v0 bodies are passthrough
+       (`fn id(s: str) -> str { s }` returns the parameter); `ensureCallee`
+       detects the param-ref body, `emitFn` materializes string-literal
+       arguments into the data segment and the `print_callee` call site
+       passes them, with an arg-count check. Verified end-to-end:
+       `link-roundtrip.sh` asserts `env.out(id("passed")) -> passed`.
+       **Next:** parameterized bodies that *transform* their params
+       (e.g. `fn shout(s) { "{s}!" }` — arena concat with a `param`
+       segment, reusing the concat machinery inside the callee). Then
+       multi-arg / non-literal args, nested calls, the `Stack` region
+       kind, and multi-memory segregation.
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.
