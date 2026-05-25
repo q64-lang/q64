@@ -418,8 +418,8 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                 else => return err,
             }
         },
-        // Early `return` from `main` isn't lowered yet.
-        .return_stmt => return Error.UnsupportedStatement,
+        // Early `return` and control-flow statements aren't lowered yet.
+        else => return Error.UnsupportedStatement,
     };
 
     return emitModule(allocator, data.items, actions.items, callees.items, segments.items, call_args.items, n_rt);
@@ -729,7 +729,7 @@ fn bodyValueExpr(fd: ast.FnDecl) ?ast.Expr {
     while (stmts.next()) |stmt| switch (stmt) {
         .expr_stmt => |es| last = es.expression(),
         .return_stmt => |rs| last = rs.value(),
-        .let_stmt => {},
+        else => {},
     };
     return last;
 }
@@ -898,11 +898,10 @@ const Resolver = struct {
             .expr_stmt => |es| last = es.expression(),
             // `return <expr>` names the function's value directly.
             .return_stmt => |rs| last = rs.value(),
-            // `let`/`var` bindings aren't const-folded in v0; the value
-            // is the tail expression. A binding the tail actually
-            // depends on surfaces later as `NotConstExpr` (honest), not
-            // as wrong output.
-            .let_stmt => {},
+            // `let`/`var` and other statements don't contribute the tail
+            // value; a binding the tail depends on surfaces later as
+            // `NotConstExpr` (honest), not as wrong output.
+            else => {},
         };
         const value_expr = last orelse return Error.NotConstExpr;
         return self.constEvalExpr(value_expr);

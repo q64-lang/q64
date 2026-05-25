@@ -581,12 +581,30 @@ pub const Stmt = union(enum) {
     expr_stmt: ExprStmt,
     let_stmt: LetStmt,
     return_stmt: ReturnStmt,
+    assign_stmt: AssignStmt,
+    if_stmt: IfStmt,
+    while_stmt: WhileStmt,
+    loop_stmt: LoopStmt,
+    for_stmt: ForStmt,
+    match_stmt: MatchStmt,
+    break_stmt: BreakStmt,
+    continue_stmt: ContinueStmt,
+    panic_stmt: PanicStmt,
 
     pub fn cast(node: *const cst.Node) ?Stmt {
         return switch (node.kind) {
             .EXPR_STMT => .{ .expr_stmt = .{ .cst = node } },
             .LET_STMT, .VAR_STMT => .{ .let_stmt = .{ .cst = node } },
             .RETURN_STMT => .{ .return_stmt = .{ .cst = node } },
+            .ASSIGN_STMT => .{ .assign_stmt = .{ .cst = node } },
+            .IF_STMT => .{ .if_stmt = .{ .cst = node } },
+            .WHILE_STMT => .{ .while_stmt = .{ .cst = node } },
+            .LOOP_STMT => .{ .loop_stmt = .{ .cst = node } },
+            .FOR_STMT => .{ .for_stmt = .{ .cst = node } },
+            .MATCH_STMT => .{ .match_stmt = .{ .cst = node } },
+            .BREAK_STMT => .{ .break_stmt = .{ .cst = node } },
+            .CONTINUE_STMT => .{ .continue_stmt = .{ .cst = node } },
+            .PANIC_STMT => .{ .panic_stmt = .{ .cst = node } },
             else => null,
         };
     }
@@ -663,11 +681,167 @@ pub const ReturnStmt = struct {
 
     /// The returned expression, or `null` for a bare `return`.
     pub fn value(self: ReturnStmt) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+};
+
+// =====================================================================
+// Control-flow and assignment statements
+//
+// Bodies are `Block`s, conditions/scrutinees are `Expr`s, and for/match
+// patterns reuse `Pattern`. Guards, `if let` condition bindings, and
+// `for`/`match` pattern *internals* beyond a simple binding stay raw
+// spans pending the pattern grammar.
+// =====================================================================
+
+/// `AssignStmt := LValue AssignOp Expr` (spec/grammar.md §Statements).
+pub const AssignStmt = struct {
+    cst: *const cst.Node,
+
+    /// The assignment target (l-value) — the first expression.
+    pub fn target(self: AssignStmt) ?Expr {
+        return nthChildExpr(self.cst, 0);
+    }
+    /// The assigned value — the second expression.
+    pub fn value(self: AssignStmt) ?Expr {
+        return nthChildExpr(self.cst, 1);
+    }
+    /// The assignment operator token (`=`, `+=`, …).
+    pub fn op(self: AssignStmt) ?cst.Token {
         for (self.cst.children) |c| switch (c) {
-            .node => |n| if (Expr.cast(n)) |e| return e,
-            .token => {},
+            .token => |t| switch (t.kind) {
+                .EQ, .PLUS_EQ, .MINUS_EQ, .STAR_EQ, .SLASH_EQ, .PERCENT_EQ => return t,
+                else => {},
+            },
+            .node => {},
         };
         return null;
+    }
+};
+
+/// `IfStmt := "if" (Expr | IfCondLet) Block ("else" (IfStmt | Block))?`.
+pub const IfStmt = struct {
+    cst: *const cst.Node,
+
+    /// The condition expression; `null` for an `if let …` binding form.
+    pub fn condition(self: IfStmt) ?Expr {
+        return nthChildExpr(self.cst, 0);
+    }
+    /// The `then` block.
+    pub fn thenBody(self: IfStmt) ?Block {
+        return nthChildBlock(self.cst, 0);
+    }
+    /// The `else { … }` block, if the else branch is a plain block.
+    pub fn elseBody(self: IfStmt) ?Block {
+        return nthChildBlock(self.cst, 1);
+    }
+    /// The `else if …` branch, if the else branch is another `if`.
+    pub fn elseIf(self: IfStmt) ?IfStmt {
+        return firstChildNode(self.cst, .IF_STMT, IfStmt);
+    }
+};
+
+/// `WhileStmt := "while" Expr Block`.
+pub const WhileStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn condition(self: WhileStmt) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    pub fn body(self: WhileStmt) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+/// `LoopStmt := "loop" Block`.
+pub const LoopStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn body(self: LoopStmt) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+/// `ForStmt := "for" Pattern "in" Expr Block`.
+pub const ForStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn pattern(self: ForStmt) ?Pattern {
+        return firstChildPattern(self.cst);
+    }
+    pub fn iterable(self: ForStmt) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    pub fn body(self: ForStmt) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+/// `MatchStmt := "match" Expr "{" MatchArm,* "}"`.
+pub const MatchStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn scrutinee(self: MatchStmt) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    pub fn arms(self: MatchStmt) MatchArmIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+pub const MatchArmIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *MatchArmIter) ?MatchArm {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .MATCH_ARM) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// `MatchArm := Pattern ("if" Expr)? "->" (Block | Expr)` (guard raw).
+pub const MatchArm = struct {
+    cst: *const cst.Node,
+
+    pub fn pattern(self: MatchArm) ?Pattern {
+        return firstChildPattern(self.cst);
+    }
+    /// The arm body when it is a block (`-> { … }`).
+    pub fn block(self: MatchArm) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+    /// The arm body when it is an expression (`-> expr`).
+    pub fn expression(self: MatchArm) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+};
+
+/// `BreakStmt := "break" Expr?`.
+pub const BreakStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn value(self: BreakStmt) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+};
+
+/// `ContinueStmt := "continue"`.
+pub const ContinueStmt = struct { cst: *const cst.Node };
+
+/// `PanicStmt := "panic" Expr?`.
+pub const PanicStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn value(self: PanicStmt) ?Expr {
+        return firstChildExpr(self.cst);
     }
 };
 
@@ -906,6 +1080,45 @@ fn firstChildRawNode(parent: *const cst.Node, kind: cst.SyntaxKind) ?*const cst.
     return null;
 }
 
+fn firstChildExpr(parent: *const cst.Node) ?Expr {
+    return nthChildExpr(parent, 0);
+}
+
+/// The `n`-th `Expr`-shaped child node (0-based), skipping non-expression
+/// nodes (patterns, blocks, …) and tokens.
+fn nthChildExpr(parent: *const cst.Node, n: usize) ?Expr {
+    var seen: usize = 0;
+    for (parent.children) |c| switch (c) {
+        .node => |node| if (Expr.cast(node)) |e| {
+            if (seen == n) return e;
+            seen += 1;
+        },
+        .token => {},
+    };
+    return null;
+}
+
+/// The `n`-th `BLOCK` child (0-based).
+fn nthChildBlock(parent: *const cst.Node, n: usize) ?Block {
+    var seen: usize = 0;
+    for (parent.children) |c| switch (c) {
+        .node => |node| if (node.kind == .BLOCK) {
+            if (seen == n) return .{ .cst = node };
+            seen += 1;
+        },
+        .token => {},
+    };
+    return null;
+}
+
+fn firstChildPattern(parent: *const cst.Node) ?Pattern {
+    for (parent.children) |c| switch (c) {
+        .node => |n| if (Pattern.cast(n)) |p| return p,
+        .token => {},
+    };
+    return null;
+}
+
 /// Join the source text of every token after the first `after`-kind
 /// token in `node`'s direct children, with surrounding trivia trimmed.
 /// Returns `null` if `after` never appears or no tokens follow it.
@@ -1110,13 +1323,15 @@ test "Stmt.cast: recognizes let/var/return alongside expr" {
     const var_node = try cst.makeNode(a, .VAR_STMT, &.{});
     const ret_node = try cst.makeNode(a, .RETURN_STMT, &.{});
     const expr_node = try cst.makeNode(a, .EXPR_STMT, &.{});
-    const other = try cst.makeNode(a, .IF_STMT, &.{});
+    const if_node = try cst.makeNode(a, .IF_STMT, &.{});
+    const other = try cst.makeNode(a, .BLOCK, &.{}); // not a statement node
 
     const tag = std.meta.activeTag;
     try testing.expectEqual(tag(Stmt.cast(let_node).?), .let_stmt);
     try testing.expectEqual(tag(Stmt.cast(var_node).?), .let_stmt);
     try testing.expectEqual(tag(Stmt.cast(ret_node).?), .return_stmt);
     try testing.expectEqual(tag(Stmt.cast(expr_node).?), .expr_stmt);
+    try testing.expectEqual(tag(Stmt.cast(if_node).?), .if_stmt);
     try testing.expect(Stmt.cast(other) == null);
 }
 

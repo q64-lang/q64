@@ -2184,6 +2184,78 @@ test "item views: struct fields, enum variants, type/const/face/fit names" {
     try testing.expect(it.next() == null);
 }
 
+test "statement views: assign / if-else / while / for / loop / match / panic" {
+    const src =
+        \\fn m {
+        \\    x = 1
+        \\    if a {
+        \\        y()
+        \\    } else {
+        \\        z()
+        \\    }
+        \\    while ok {
+        \\        continue
+        \\    }
+        \\    for t in tools {
+        \\        use(t)
+        \\    }
+        \\    loop {
+        \\        break
+        \\    }
+        \\    match v {
+        \\        A -> p(),
+        \\    }
+        \\    panic "boom"
+        \\}
+        \\
+    ;
+    const r = try parse(testing.allocator, src, "stmts.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    const block = blockOf(sf) orelse return error.TestExpectedItem;
+    var it = (ast.Block{ .cst = block }).statements();
+    const tag = std.meta.activeTag;
+
+    const asn = it.next() orelse return error.TestExpectedItem;
+    try testing.expectEqual(tag(asn), .assign_stmt);
+    try testing.expect(asn.assign_stmt.target() != null);
+    try testing.expect(asn.assign_stmt.value() != null);
+    try testing.expectEqual(cst.SyntaxKind.EQ, asn.assign_stmt.op().?.kind);
+
+    const iff = it.next() orelse return error.TestExpectedItem;
+    try testing.expectEqual(tag(iff), .if_stmt);
+    try testing.expect(iff.if_stmt.condition() != null);
+    try testing.expect(iff.if_stmt.thenBody() != null);
+    try testing.expect(iff.if_stmt.elseBody() != null);
+
+    const whl = it.next() orelse return error.TestExpectedItem;
+    try testing.expectEqual(tag(whl), .while_stmt);
+    try testing.expect(whl.while_stmt.condition() != null);
+    try testing.expect(whl.while_stmt.body() != null);
+
+    const forr = it.next() orelse return error.TestExpectedItem;
+    try testing.expectEqual(tag(forr), .for_stmt);
+    try testing.expectEqualStrings("t", forr.for_stmt.pattern().?.bindingName().?.text);
+    try testing.expect(forr.for_stmt.iterable() != null);
+    try testing.expect(forr.for_stmt.body() != null);
+
+    const lp = it.next() orelse return error.TestExpectedItem;
+    try testing.expectEqual(tag(lp), .loop_stmt);
+    try testing.expect(lp.loop_stmt.body() != null);
+
+    const mt = it.next() orelse return error.TestExpectedItem;
+    try testing.expectEqual(tag(mt), .match_stmt);
+    try testing.expect(mt.match_stmt.scrutinee() != null);
+    var arms = mt.match_stmt.arms();
+    const arm = arms.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("A", arm.pattern().?.bindingName().?.text);
+    try testing.expect(arm.expression() != null);
+
+    const pn = it.next() orelse return error.TestExpectedItem;
+    try testing.expectEqual(tag(pn), .panic_stmt);
+    try testing.expect(pn.panic_stmt.value() != null);
+}
+
 test "statement losslessness across forms" {
     const sources = [_][]const u8{
         "fn m {\n    let x = 1\n}\n",
