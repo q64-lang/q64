@@ -252,8 +252,77 @@ pub const FnDecl = struct {
 // =====================================================================
 
 pub const Visibility = struct { cst: *const cst.Node };
-pub const Params = struct { cst: *const cst.Node };
-pub const ReturnType = struct { cst: *const cst.Node };
+
+/// `Params := "(" Param,* ")"`. v0 keeps the parenthesized span as raw
+/// tokens — the parser does not yet split it into structured `PARAM`
+/// children, so there is nothing to iterate. `isEmpty` answers the one
+/// question codegen needs today (nullary vs. not); structured param
+/// accessors land when `parseParams` emits `PARAM` nodes.
+pub const Params = struct {
+    cst: *const cst.Node,
+
+    /// True for `()` — no parameter tokens between the parens.
+    pub fn isEmpty(self: Params) bool {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind == .L_PAREN or t.kind == .R_PAREN) continue;
+                if (t.kind.isTrivia()) continue;
+                return false;
+            },
+            .node => return false,
+        };
+        return true;
+    }
+};
+
+/// `ReturnType := "->" TypeExpr`. The type expression is a raw token
+/// span in v0 (pending the type grammar); `text` renders it back to
+/// source so codegen / `q64 show` can read the declared type.
+pub const ReturnType = struct {
+    cst: *const cst.Node,
+
+    /// The declared return type as source text — the tokens after `->`
+    /// with surrounding trivia trimmed (`-> str` → `str`,
+    /// `-> Signal<PCM<f32>>` → `Signal<PCM<f32>>`). Internal spacing is
+    /// preserved as written. Caller owns the returned slice; `null` when
+    /// the node carries no type tokens after the arrow.
+    pub fn text(self: ReturnType, allocator: std.mem.Allocator) !?[]u8 {
+        var total: usize = 0;
+        var seen_arrow = false;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| {
+                if (!seen_arrow) {
+                    if (t.kind == .ARROW) seen_arrow = true;
+                    continue;
+                }
+                total += t.text.len;
+            },
+            .node => {},
+        };
+        if (total == 0) return null;
+
+        const buf = try allocator.alloc(u8, total);
+        var i: usize = 0;
+        seen_arrow = false;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| {
+                if (!seen_arrow) {
+                    if (t.kind == .ARROW) seen_arrow = true;
+                    continue;
+                }
+                @memcpy(buf[i .. i + t.text.len], t.text);
+                i += t.text.len;
+            },
+            .node => {},
+        };
+
+        const trimmed = std.mem.trim(u8, buf, " \t\r\n");
+        if (trimmed.len == buf.len) return buf;
+        const out = try allocator.dupe(u8, trimmed);
+        allocator.free(buf);
+        return out;
+    }
+};
 
 /// `Block := "{" Stmt* "}"`. v0 surfaces structured `ExprStmt`s; any
 /// unparsed tokens between statements live as direct token children
@@ -273,10 +342,14 @@ pub const Block = struct {
 
 pub const Stmt = union(enum) {
     expr_stmt: ExprStmt,
+    let_stmt: LetStmt,
+    return_stmt: ReturnStmt,
 
     pub fn cast(node: *const cst.Node) ?Stmt {
         return switch (node.kind) {
             .EXPR_STMT => .{ .expr_stmt = .{ .cst = node } },
+            .LET_STMT, .VAR_STMT => .{ .let_stmt = .{ .cst = node } },
+            .RETURN_STMT => .{ .return_stmt = .{ .cst = node } },
             else => null,
         };
     }
@@ -309,6 +382,97 @@ pub const ExprStmt = struct {
             .token => {},
         };
         return null;
+    }
+};
+
+/// `LetStmt := ("let" | "var") Pattern (":" TypeExpr)? ("=" Expr)?`
+/// (spec/grammar.md §Statements). The binding pattern and initializer
+/// are surfaced; the type annotation stays a raw token span in v0.
+pub const LetStmt = struct {
+    cst: *const cst.Node,
+
+    /// True for `var`, false for `let`. The two share this view since
+    /// they differ only in mutability, which downstream passes read off
+    /// the CST kind.
+    pub fn isVar(self: LetStmt) bool {
+        return self.cst.kind == .VAR_STMT;
+    }
+
+    /// The binding pattern (`x`, `(a, b)`, `Point { x }`). `null` only
+    /// for ill-formed input the parser recovered without a pattern node.
+    pub fn pattern(self: LetStmt) ?Pattern {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Pattern.cast(n)) |p| return p,
+            .token => {},
+        };
+        return null;
+    }
+
+    /// The initializer expression after `=`, if the binding has one.
+    /// The type annotation between the pattern and `=` is a raw token
+    /// span (no node), so the first `Expr`-shaped child is the value.
+    pub fn initializer(self: LetStmt) ?Expr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Expr.cast(n)) |e| return e,
+            .token => {},
+        };
+        return null;
+    }
+};
+
+/// `ReturnStmt := "return" Expr?` (spec/grammar.md §Statements).
+pub const ReturnStmt = struct {
+    cst: *const cst.Node,
+
+    /// The returned expression, or `null` for a bare `return`.
+    pub fn value(self: ReturnStmt) ?Expr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Expr.cast(n)) |e| return e,
+            .token => {},
+        };
+        return null;
+    }
+};
+
+/// A binding/match pattern. The parser emits a family of pattern node
+/// kinds (`IDENT_PATTERN`, `WILD_PATTERN`, `TUPLE_PATTERN`, …) rather
+/// than one `PATTERN` kind; this view wraps any of them and exposes the
+/// accessors codegen consumes today.
+pub const Pattern = struct {
+    cst: *const cst.Node,
+
+    pub fn cast(node: *const cst.Node) ?Pattern {
+        return if (isPatternKind(node.kind)) .{ .cst = node } else null;
+    }
+
+    pub fn kind(self: Pattern) cst.SyntaxKind {
+        return self.cst.kind;
+    }
+
+    /// The bound identifier for a simple `let x` binding
+    /// (`IDENT_PATTERN`). `null` for wildcards and structured patterns
+    /// whose binding shape codegen doesn't consume yet.
+    pub fn bindingName(self: Pattern) ?cst.Token {
+        if (self.cst.kind != .IDENT_PATTERN) return null;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .IDENT) return t,
+            .node => {},
+        };
+        return null;
+    }
+
+    pub fn isPatternKind(k: cst.SyntaxKind) bool {
+        return switch (k) {
+            .WILD_PATTERN,
+            .IDENT_PATTERN,
+            .LITERAL_PATTERN,
+            .ENUM_VARIANT_PATTERN,
+            .TUPLE_PATTERN,
+            .TUPLE_STRUCT_PATTERN,
+            .RECORD_STRUCT_PATTERN,
+            => true,
+            else => false,
+        };
     }
 };
 
@@ -651,4 +815,167 @@ test "SourceFile.items: iterates FnDecls, skips stray tokens" {
     const second = iter.next() orelse return error.TestExpectedNonNull;
     try testing.expectEqualStrings("b", second.fn_decl.name().?.text);
     try testing.expect(iter.next() == null);
+}
+
+test "Stmt.cast: recognizes let/var/return alongside expr" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const let_node = try cst.makeNode(a, .LET_STMT, &.{});
+    const var_node = try cst.makeNode(a, .VAR_STMT, &.{});
+    const ret_node = try cst.makeNode(a, .RETURN_STMT, &.{});
+    const expr_node = try cst.makeNode(a, .EXPR_STMT, &.{});
+    const other = try cst.makeNode(a, .IF_STMT, &.{});
+
+    const tag = std.meta.activeTag;
+    try testing.expectEqual(tag(Stmt.cast(let_node).?), .let_stmt);
+    try testing.expectEqual(tag(Stmt.cast(var_node).?), .let_stmt);
+    try testing.expectEqual(tag(Stmt.cast(ret_node).?), .return_stmt);
+    try testing.expectEqual(tag(Stmt.cast(expr_node).?), .expr_stmt);
+    try testing.expect(Stmt.cast(other) == null);
+}
+
+test "LetStmt: isVar, pattern binding name, initializer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `let x = "hi"`
+    const pat = try cst.makeNode(a, .IDENT_PATTERN, &[_]cst.Element{
+        cst.makeToken(.IDENT, "x", 4),
+    });
+    const init_expr = try cst.makeNode(a, .STR_LITERAL, &[_]cst.Element{
+        cst.makeToken(.STR_PLAIN, "\"hi\"", 8),
+    });
+    const let_node = try cst.makeNode(a, .LET_STMT, &[_]cst.Element{
+        cst.makeToken(.KW_LET, "let", 0),
+        cst.makeToken(.WHITESPACE, " ", 3),
+        .{ .node = pat },
+        cst.makeToken(.WHITESPACE, " ", 5),
+        cst.makeToken(.EQ, "=", 6),
+        cst.makeToken(.WHITESPACE, " ", 7),
+        .{ .node = init_expr },
+    });
+
+    const ls = switch (Stmt.cast(let_node) orelse return error.TestExpectedNonNull) {
+        .let_stmt => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(!ls.isVar());
+
+    const p = ls.pattern() orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("x", p.bindingName().?.text);
+
+    const e = ls.initializer() orelse return error.TestExpectedNonNull;
+    const lit = switch (e) {
+        .string_lit => |s| s,
+        else => return error.TestUnexpectedResult,
+    };
+    const sval = (try lit.value(a)) orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("hi", sval);
+}
+
+test "LetStmt: var binding reports isVar" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const var_node = try cst.makeNode(a, .VAR_STMT, &[_]cst.Element{
+        cst.makeToken(.KW_VAR, "var", 0),
+    });
+    const ls = switch (Stmt.cast(var_node).?) {
+        .let_stmt => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(ls.isVar());
+}
+
+test "ReturnStmt.value: present and bare" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const val = try cst.makeNode(a, .STR_LITERAL, &[_]cst.Element{
+        cst.makeToken(.STR_PLAIN, "\"0.1.0\"", 7),
+    });
+    const ret = try cst.makeNode(a, .RETURN_STMT, &[_]cst.Element{
+        cst.makeToken(.KW_RETURN, "return", 0),
+        cst.makeToken(.WHITESPACE, " ", 6),
+        .{ .node = val },
+    });
+    const rs = switch (Stmt.cast(ret).?) {
+        .return_stmt => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(rs.value() != null);
+
+    const bare = try cst.makeNode(a, .RETURN_STMT, &[_]cst.Element{
+        cst.makeToken(.KW_RETURN, "return", 0),
+    });
+    const rs2 = switch (Stmt.cast(bare).?) {
+        .return_stmt => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(rs2.value() == null);
+}
+
+test "ReturnType.text: strips the arrow and trims trivia" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `-> str`
+    const rt = try cst.makeNode(a, .RETURN_TYPE, &[_]cst.Element{
+        cst.makeToken(.ARROW, "->", 0),
+        cst.makeToken(.WHITESPACE, " ", 2),
+        cst.makeToken(.IDENT, "str", 3),
+    });
+    const txt = (try (ReturnType{ .cst = rt }).text(a)) orelse return error.TestExpectedNonNull;
+    try testing.expectEqualStrings("str", txt);
+
+    // `->` with no type tokens yields null.
+    const empty = try cst.makeNode(a, .RETURN_TYPE, &[_]cst.Element{
+        cst.makeToken(.ARROW, "->", 0),
+    });
+    try testing.expect((try (ReturnType{ .cst = empty }).text(a)) == null);
+}
+
+test "Pattern.bindingName: ident binds, wildcard does not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ident = try cst.makeNode(a, .IDENT_PATTERN, &[_]cst.Element{
+        cst.makeToken(.IDENT, "count", 0),
+    });
+    try testing.expectEqualStrings("count", Pattern.cast(ident).?.bindingName().?.text);
+
+    const wild = try cst.makeNode(a, .WILD_PATTERN, &[_]cst.Element{
+        cst.makeToken(.IDENT, "_", 0),
+    });
+    try testing.expect(Pattern.cast(wild).?.bindingName() == null);
+
+    // A non-pattern node doesn't cast.
+    const not_pat = try cst.makeNode(a, .BLOCK, &.{});
+    try testing.expect(Pattern.cast(not_pat) == null);
+}
+
+test "Params.isEmpty: bare parens vs. a parameter" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const empty = try cst.makeNode(a, .PARAMS, &[_]cst.Element{
+        cst.makeToken(.L_PAREN, "(", 0),
+        cst.makeToken(.R_PAREN, ")", 1),
+    });
+    try testing.expect((Params{ .cst = empty }).isEmpty());
+
+    const one = try cst.makeNode(a, .PARAMS, &[_]cst.Element{
+        cst.makeToken(.L_PAREN, "(", 0),
+        cst.makeToken(.IDENT, "x", 1),
+        cst.makeToken(.R_PAREN, ")", 2),
+    });
+    try testing.expect(!(Params{ .cst = one }).isEmpty());
 }

@@ -210,6 +210,9 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
             };
             try collectEnvOutPayload(allocator, resolver, call, &payloads);
         },
+        // `main`'s body is a sequence of `env.out("…")` calls in v0;
+        // bindings and early returns aren't lowered yet.
+        .let_stmt, .return_stmt => return Error.UnsupportedStatement,
     };
 
     return emitModuleWithPayloads(allocator, payloads.items);
@@ -375,6 +378,13 @@ const Resolver = struct {
         var last: ?ast.Expr = null;
         while (stmts.next()) |stmt| switch (stmt) {
             .expr_stmt => |es| last = es.expression(),
+            // `return <expr>` names the function's value directly.
+            .return_stmt => |rs| last = rs.value(),
+            // `let`/`var` bindings aren't const-folded in v0; the value
+            // is the tail expression. A binding the tail actually
+            // depends on surfaces later as `NotConstExpr` (honest), not
+            // as wrong output.
+            .let_stmt => {},
         };
         const value_expr = last orelse return Error.NotConstExpr;
         return self.constEvalExpr(value_expr);
@@ -699,6 +709,17 @@ test "emitFromSource: a local const function folds without an import" {
     const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "9.9.9\n") != null);
+}
+
+test "emitFromSource: a const fn bodied with `return` folds" {
+    // `return <expr>` now surfaces through ast.Stmt, so the resolver
+    // folds it the same as a tail-expression body.
+    const lib = "pub fn version() -> str { return \"2.0.0\" }\n";
+    const app = "import dev.q64.hw.{version}\nfn main { env.out(\"{version()}\") }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.hw", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "2.0.0\n") != null);
 }
 
 test "emitFromSource: doubled braces are literal, not interpolation" {
