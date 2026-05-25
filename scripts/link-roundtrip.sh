@@ -211,4 +211,29 @@ if [[ "$bind_out" != "$bind_expected" ]]; then
 fi
 echo "    ok: let bindings + interpolation"
 
+# Runtime binding: `let g = shout("hi")` isn't const-foldable, so g binds
+# the call's (ptr, len) into _start locals and is referenced twice.
+echo "==> bindings: q64 emit runtime let g = shout(\"hi\")"
+rt_app="$tmp/rt.q"
+rt_wasm="$tmp/rt.wasm"
+cat > "$rt_app" <<'Q64'
+import dev.q64.strlib.{shout}
+
+fn main {
+    let g = shout("hi")
+    env.out(g)
+    env.out("got: {g} and {g}")
+}
+Q64
+"$Q64_BIN" emit "$rt_app" "$rt_wasm" --module "dev.q64.strlib=$param_lib"
+rt_out="$("$HOST_BIN" "$rt_wasm")"
+rt_expected=$'hi!\ngot: hi! and hi!'
+if [[ "$rt_out" != "$rt_expected" ]]; then
+    echo "FAIL: runtime-binding output mismatch" >&2
+    printf "  expected: %q\n" "$rt_expected" >&2
+    printf "  actual:   %q\n" "$rt_out" >&2
+    exit 1
+fi
+echo "    ok: runtime binding referenced multiple times"
+
 echo "PASS: $qube_out"

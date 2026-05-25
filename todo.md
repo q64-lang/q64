@@ -117,11 +117,19 @@ and `qube run`):
        `constEvalExpr` resolving a `.path` to a bound value; `emitFn`
        records each `let` and folds references. Verified end-to-end
        (`link-roundtrip.sh`: `let name/v` → `Hello, world! (q64 v0.1.0)`).
-       A non-const initializer (e.g. `let g = shout("hi")`) errors with
-       `NotConstExpr`. **Next (the runtime-value unlock):** runtime
-       bindings of non-const results — bind into `_start` locals and
-       reference them at runtime — which then enables runtime arguments,
-       and motivates the `Stack` region kind + multi-memory.
+13. [x] **Runtime `let` bindings — the first genuine non-const values.** When
+       a `let` initializer isn't const-foldable (`let g = shout("hi")`), the
+       binding holds the call's `(ptr, len)` in two `_start` locals (binding
+       locals occupy the front of the frame). References read those locals:
+       `env.out(g)` (a `print_binding` action) and `"{g}"` (a `binding`
+       concat segment), so a binding can be used many times from one
+       evaluation. `_start`'s local layout became
+       `[binding i64s][transient tuples][buf/off/len scratch]`; a `bind_call`
+       action computes the value. Verified end-to-end (`link-roundtrip.sh`:
+       `let g = shout("hi")` → `hi!` / `got: hi! and hi!`). **Boundary:**
+       runtime bindings can be *referenced* but not yet *passed as
+       arguments* (`shout(g)` → `NotConstExpr`); runtime args + the `Stack`
+       region kind + multi-memory are the remaining `spec/memory.md` work.
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.

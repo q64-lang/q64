@@ -218,27 +218,39 @@ const Callee = struct {
 // static data segment.
 const ArgVal = struct { off: u32, len: u32 };
 
+// A runtime `let`/`var` binding holds a string value in two i64 `_start`
+// locals (ptr, len). Binding locals come first in `_start`'s frame, so
+// binding #k uses locals 2k, 2k+1.
+const RtBinding = struct { ptr_local: u32, len_local: u32 };
+
 // One piece of a runtime-concatenated string: a constant run in the static
-// data segment, the (ptr, len) returned by a nullary callee, or the
-// (ptr, len) of str parameter #idx (only inside a callee body).
+// data segment, the (ptr, len) returned by a nullary callee, the (ptr, len)
+// of a str parameter (only inside a callee body), or the (ptr, len) of a
+// runtime binding (only inside `_start`).
 const Segment = union(enum) {
     const_run: struct { off: u32, len: u32 },
     call: usize, // index into `callees`
     param: usize, // str parameter index (locals 2·idx, 2·idx+1)
+    binding: RtBinding, // runtime binding locals
 };
 
 // One thing `main` does, in order.
-//   print_const  — write a folded byte payload straight from the data segment.
-//   print_callee — call an emitted function (passing args[args_first..]),
-//                  write its returned string.
-//   print_concat — build a string in the scope arena from `segments`
-//                  [first..first+count] (const runs + call results copied
-//                  via memory.copy), then write it.
-// All three append env.out's trailing "\n" (a shared byte at `nl_off`).
+//   print_const   — write a folded byte payload straight from the data segment.
+//   print_callee  — call an emitted function (passing args[args_first..]),
+//                   write its returned string.
+//   print_concat  — build a string in the scope arena from `segments`
+//                   [first..first+count] (const runs + call/binding results
+//                   copied via memory.copy), then write it.
+//   print_binding — write a runtime binding's current (ptr, len).
+//   bind_call     — call an emitted function and store its (ptr, len) into a
+//                   runtime binding's locals (a `let x = f(args)`).
+// The print_* actions append env.out's trailing "\n" (a shared byte at nl_off).
 const Action = union(enum) {
     print_const: struct { off: u32, len: u32 },
     print_callee: struct { callee: usize, args_first: usize, args_count: usize, nl_off: u32 },
     print_concat: struct { first: usize, count: usize, nl_off: u32 },
+    print_binding: struct { binding: RtBinding, nl_off: u32 },
+    bind_call: struct { binding: RtBinding, callee: usize, args_first: usize, args_count: usize },
 };
 
 fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]u8 {
@@ -260,6 +272,11 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
     defer segments.deinit(allocator);
     var call_args: std.ArrayList(ArgVal) = .empty;
     defer call_args.deinit(allocator);
+    // Runtime `let` bindings: name → its (ptr, len) `_start` locals. Binding
+    // locals occupy the first 2·N slots of the frame; `n_rt` counts them.
+    var rt_bindings: std.StringHashMapUnmanaged(RtBinding) = .empty;
+    defer rt_bindings.deinit(allocator);
+    var n_rt: u32 = 0;
 
     // A single shared "\n" byte, materialized the first time env.out needs
     // its trailing newline.
@@ -306,13 +323,13 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                     defer {
                         for (raws.items) |rs| switch (rs) {
                             .lit => |b| allocator.free(b),
-                            .call, .param => {},
+                            .call, .param, .binding => {},
                         };
                         raws.deinit(allocator);
                     }
-                    const has_call = try splitInterpolation(allocator, resolver, raw, &data, &callees, &segments, &raws, null);
+                    const has_dyn = try splitInterpolation(allocator, resolver, raw, &data, &callees, &segments, &raws, null, &rt_bindings);
 
-                    if (!has_call) {
+                    if (!has_dyn) {
                         // Pure-constant interpolation folds to one payload
                         // (preserves escapes, `{{`, numeric interpolation).
                         const value = try resolver.constEvalExpr(arg);
@@ -322,7 +339,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                         try data.append(allocator, '\n'); // env.out("X") writes "X\n"
                         try actions.append(allocator, .{ .print_const = .{ .off = off, .len = @intCast(value.len + 1) } });
                     } else {
-                        // A call appears in the interpolation: build the
+                        // A call or runtime binding appears: build the
                         // string at runtime in the scope arena.
                         const seg_start = segments.items.len;
                         for (raws.items) |rs| switch (rs) {
@@ -333,6 +350,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                                 try segments.append(allocator, .{ .const_run = .{ .off = off, .len = @intCast(bytes.len) } });
                             },
                             .call => |idx| try segments.append(allocator, .{ .call = idx }),
+                            .binding => |b| try segments.append(allocator, .{ .binding = b }),
                             // `_start` interpolation (params == null) yields no param pieces.
                             .param => unreachable,
                         };
@@ -344,35 +362,77 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                         } });
                     }
                 },
-                // env.out(x) — a reference to a `let`/`var` binding (or
-                // any const-foldable expression). Fold and print it.
-                .path => {
-                    const value = try resolver.constEvalExpr(arg);
-                    defer allocator.free(value);
-                    const off: u32 = @intCast(data.items.len);
-                    try data.appendSlice(allocator, value);
-                    try data.append(allocator, '\n');
-                    try actions.append(allocator, .{ .print_const = .{ .off = off, .len = @intCast(value.len + 1) } });
+                // env.out(x) — a reference to a binding. A runtime binding
+                // prints its (ptr, len) locals; a const binding folds.
+                .path => |p| {
+                    const ptext = try p.text(allocator);
+                    defer allocator.free(ptext);
+                    if (rt_bindings.get(ptext)) |rb| {
+                        const nl = try ensureNewline(allocator, &data, &nl_off);
+                        try actions.append(allocator, .{ .print_binding = .{ .binding = rb, .nl_off = nl } });
+                    } else {
+                        const value = try resolver.constEvalExpr(arg);
+                        defer allocator.free(value);
+                        const off: u32 = @intCast(data.items.len);
+                        try data.appendSlice(allocator, value);
+                        try data.append(allocator, '\n');
+                        try actions.append(allocator, .{ .print_const = .{ .off = off, .len = @intCast(value.len + 1) } });
+                    }
                 },
                 else => return Error.UnsupportedExpression,
             }
         },
-        // `let`/`var` bind a compile-time string value, usable by later
-        // statements via `env.out(x)` or `"{x}"` interpolation. A non-const
-        // initializer isn't supported yet (runtime bindings are future).
+        // `let`/`var` binds a string value usable by later statements via
+        // `env.out(x)` or `"{x}"`. A const-foldable initializer becomes a
+        // compile-time binding; a runtime call (`let g = f(args)`) binds the
+        // call's (ptr, len) into `_start` locals.
         .let_stmt => |ls| {
             const pat = ls.pattern() orelse return Error.UnsupportedStatement;
             const name_tok = pat.bindingName() orelse return Error.UnsupportedStatement;
             const init_expr = ls.initializer() orelse return Error.UnsupportedStatement;
-            const value = try resolver.constEvalExpr(init_expr);
-            errdefer allocator.free(value);
-            try resolver.bind(name_tok.text, value);
+
+            if (resolver.constEvalExpr(init_expr)) |value| {
+                errdefer allocator.free(value);
+                try resolver.bind(name_tok.text, value);
+            } else |err| switch (err) {
+                // Not const-foldable: a runtime binding. v0 supports a
+                // direct call initializer (`let g = f(args)`).
+                error.NotConstExpr => {
+                    const inner = switch (init_expr) {
+                        .call => |cc| cc,
+                        else => return err,
+                    };
+                    const idx = try ensureCallee(allocator, resolver, &data, &callees, &segments, inner);
+                    const args_first = call_args.items.len;
+                    var ait = inner.args();
+                    while (ait.next()) |a| {
+                        const v = try resolver.constEvalExpr(a);
+                        defer allocator.free(v);
+                        const off: u32 = @intCast(data.items.len);
+                        try data.appendSlice(allocator, v);
+                        try call_args.append(allocator, .{ .off = off, .len = @intCast(v.len) });
+                    }
+                    const args_count = call_args.items.len - args_first;
+                    if (args_count != callees.items[idx].n_str_params) return Error.UnsupportedCall;
+
+                    const rb = RtBinding{ .ptr_local = n_rt * 2, .len_local = n_rt * 2 + 1 };
+                    n_rt += 1;
+                    try rt_bindings.put(allocator, name_tok.text, rb);
+                    try actions.append(allocator, .{ .bind_call = .{
+                        .binding = rb,
+                        .callee = idx,
+                        .args_first = args_first,
+                        .args_count = args_count,
+                    } });
+                },
+                else => return err,
+            }
         },
         // Early `return` from `main` isn't lowered yet.
         .return_stmt => return Error.UnsupportedStatement,
     };
 
-    return emitModule(allocator, data.items, actions.items, callees.items, segments.items, call_args.items);
+    return emitModule(allocator, data.items, actions.items, callees.items, segments.items, call_args.items, n_rt);
 }
 
 /// Reserve the shared newline byte env.out appends; idempotent.
@@ -391,17 +451,18 @@ const RawSeg = union(enum) {
     lit: []u8,
     call: usize,
     param: usize,
+    binding: RtBinding,
 };
 
 /// Split an interpolated string literal into runtime-concatenation pieces.
 /// Constant runs (with escapes, `{{`/`}}`, and non-dynamic interpolations
-/// const-evaluated) accumulate into `lit` pieces. When `params` is
-/// supplied (callee-body context), a `{name}` matching a parameter becomes
-/// a `param` piece. Otherwise (top-level / `_start`) a `{call()}`
-/// interpolation resolves its nullary callee and becomes a `call` piece;
-/// callee bodies may not nest calls in v0. Returns whether any dynamic
-/// (`call`/`param`) piece was produced — the caller folds when none was.
-/// Caller owns the `.lit` byte slices in `out`.
+/// const-evaluated) accumulate into `lit` pieces. A `{name}` matching a
+/// parameter (callee-body context, `params`) becomes a `param` piece;
+/// matching a runtime binding (`_start` context, `rt_bindings`) becomes a
+/// `binding` piece. Otherwise a `{call()}` interpolation resolves its
+/// nullary callee into a `call` piece (callee bodies may not nest calls in
+/// v0). Returns whether any dynamic piece was produced — the caller folds
+/// when none was. Caller owns the `.lit` byte slices in `out`.
 fn splitInterpolation(
     allocator: std.mem.Allocator,
     resolver: *Resolver,
@@ -411,6 +472,7 @@ fn splitInterpolation(
     segments: *std.ArrayList(Segment),
     out: *std.ArrayList(RawSeg),
     params: ?[]const []const u8,
+    rt_bindings: ?*const std.StringHashMapUnmanaged(RtBinding),
 ) Error!bool {
     // Raw strings (`r"…"`) carry no interpolation — nothing to split.
     if (raw.len >= 1 and raw[0] == 'r') return false;
@@ -467,14 +529,23 @@ fn splitInterpolation(
                     has_dynamic = true;
                 },
                 .path => |pp| {
-                    // In a callee body, `{name}` referencing a parameter
-                    // becomes a `param` piece.
+                    const ptext = try pp.text(allocator);
+                    defer allocator.free(ptext);
+                    // `{name}` referencing a parameter (callee body) or a
+                    // runtime binding (`_start`) becomes a dynamic piece.
                     if (params) |pnames| {
-                        const ptext = try pp.text(allocator);
-                        defer allocator.free(ptext);
                         if (indexOfName(pnames, ptext)) |pidx| {
                             try flushLit(allocator, &lit, out);
                             try out.append(allocator, .{ .param = pidx });
+                            has_dynamic = true;
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                    if (rt_bindings) |rb_map| {
+                        if (rb_map.get(ptext)) |rb| {
+                            try flushLit(allocator, &lit, out);
+                            try out.append(allocator, .{ .binding = rb });
                             has_dynamic = true;
                             i = close + 1;
                             continue;
@@ -585,11 +656,11 @@ fn ensureCallee(
                 defer {
                     for (raws.items) |rs| switch (rs) {
                         .lit => |b| allocator.free(b),
-                        .call, .param => {},
+                        .call, .param, .binding => {},
                     };
                     raws.deinit(allocator);
                 }
-                const has_dyn = try splitInterpolation(allocator, resolver, raw, data, callees, segments, &raws, pnames.items);
+                const has_dyn = try splitInterpolation(allocator, resolver, raw, data, callees, segments, &raws, pnames.items, null);
                 if (!has_dyn) {
                     // No parameter used: fold to a constant string.
                     const bytes = try resolver.constEvalExpr(ve);
@@ -608,6 +679,8 @@ fn ensureCallee(
                     },
                     .param => |idx| try segments.append(allocator, .{ .param = idx }),
                     .call => |idx| try segments.append(allocator, .{ .call = idx }),
+                    // Callee bodies (params context) see no runtime bindings.
+                    .binding => unreachable,
                 };
                 break :blk .{ .concat = .{ .first = first, .count = segments.items.len - first } };
             },
@@ -955,6 +1028,10 @@ fn appendConcat(
                 const lenp = c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type);
                 total = c.BinaryenBinary(module, c.BinaryenAddInt64(), total, lenp);
             },
+            .binding => |b| {
+                const lenb = c.BinaryenLocalGet(module, b.len_local, i64_type);
+                total = c.BinaryenBinary(module, c.BinaryenAddInt64(), total, lenb);
+            },
             .const_run => {},
         };
     }
@@ -994,6 +1071,11 @@ fn appendConcat(
                     ln = c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type);
                     ln_again = c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type);
                 },
+                .binding => |b| {
+                    src = c.BinaryenLocalGet(module, b.ptr_local, i64_type);
+                    ln = c.BinaryenLocalGet(module, b.len_local, i64_type);
+                    ln_again = c.BinaryenLocalGet(module, b.len_local, i64_type);
+                },
             }
             try exprs.append(allocator, c.BinaryenMemoryCopy(
                 module,
@@ -1020,6 +1102,7 @@ fn emitModule(
     callees: []const Callee,
     segments: []const Segment,
     call_args: []const ArgVal,
+    n_rt_bindings: u32,
 ) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
@@ -1072,13 +1155,16 @@ fn emitModule(
         );
     }
 
-    // Local layout for `_start` and which functions need the arena:
-    //   indices 0..n_tuples-1 : tuple locals holding callee (ptr, len).
-    //   buf / off / len       : i64 scratch, present only with a concat.
+    // Local layout for `_start`:
+    //   [0 .. 2·nb-1]            : runtime-binding i64 locals (ptr, len).
+    //   [tuple_base .. +nt-1]    : transient tuple locals (call results).
+    //   buf / off / len          : i64 scratch, present only with a concat.
+    const rt_locals: c.BinaryenIndex = @intCast(n_rt_bindings * 2);
+    const tuple_base: c.BinaryenIndex = rt_locals;
     var n_tuples: usize = 0;
     var has_concat = false;
     for (actions) |a| switch (a) {
-        .print_callee => {
+        .print_callee, .bind_call => {
             if (n_tuples < 1) n_tuples = 1;
         },
         .print_concat => |p| {
@@ -1086,11 +1172,11 @@ fn emitModule(
             var calls: usize = 0;
             for (segments[p.first .. p.first + p.count]) |sg| switch (sg) {
                 .call => calls += 1,
-                .const_run, .param => {},
+                .const_run, .param, .binding => {},
             };
             if (calls > n_tuples) n_tuples = calls;
         },
-        .print_const => {},
+        .print_const, .print_binding => {},
     };
     // A callee whose body is an arena concat also needs the `sp` global.
     for (callees) |cl| switch (cl.body) {
@@ -1098,9 +1184,9 @@ fn emitModule(
         .const_str, .param_ref => {},
     };
 
-    const buf_idx: c.BinaryenIndex = @intCast(n_tuples);
-    const off_idx: c.BinaryenIndex = @intCast(n_tuples + 1);
-    const len_idx: c.BinaryenIndex = @intCast(n_tuples + 2);
+    const buf_idx: c.BinaryenIndex = @intCast(rt_locals + n_tuples);
+    const off_idx: c.BinaryenIndex = @intCast(rt_locals + n_tuples + 1);
+    const len_idx: c.BinaryenIndex = @intCast(rt_locals + n_tuples + 2);
 
     // The scope arena: a bump pointer (`sp`) starting just past the static
     // data. Each concat allocates from it; no reclamation in v0 (the
@@ -1207,10 +1293,10 @@ fn emitModule(
                 @intCast(argvals.len),
                 pair_type,
             );
-            try exprs.append(allocator, c.BinaryenLocalSet(module, 0, result));
+            try exprs.append(allocator, c.BinaryenLocalSet(module, tuple_base, result));
             var cargs = [_]c.BinaryenExpressionRef{
-                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, 0, pair_type), 0),
-                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, 0, pair_type), 1),
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 0),
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 1),
             };
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
             var nargs = [_]c.BinaryenExpressionRef{
@@ -1220,7 +1306,7 @@ fn emitModule(
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
         },
         .print_concat => |p| {
-            const loc = ConcatLocals{ .buf = buf_idx, .off = off_idx, .len = len_idx, .tuple_base = 0 };
+            const loc = ConcatLocals{ .buf = buf_idx, .off = off_idx, .len = len_idx, .tuple_base = tuple_base };
             try appendConcat(allocator, module, &exprs, segments[p.first .. p.first + p.count], callees, pair_type, i64_type, loc);
             // Write the assembled string, then the trailing newline.
             var cargs = [_]c.BinaryenExpressionRef{
@@ -1234,6 +1320,37 @@ fn emitModule(
             };
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
         },
+        .print_binding => |p| {
+            var cargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenLocalGet(module, p.binding.ptr_local, i64_type),
+                c.BinaryenLocalGet(module, p.binding.len_local, i64_type),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
+            var nargs = [_]c.BinaryenExpressionRef{
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(p.nl_off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(1)),
+            };
+            try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
+        },
+        .bind_call => |p| {
+            const argvals = try allocator.alloc(c.BinaryenExpressionRef, p.args_count * 2);
+            defer allocator.free(argvals);
+            for (0..p.args_count) |k| {
+                const a = call_args[p.args_first + k];
+                argvals[k * 2] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(a.off)));
+                argvals[k * 2 + 1] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(a.len)));
+            }
+            const result = c.BinaryenCall(
+                module,
+                callees[p.callee].name.ptr,
+                if (argvals.len > 0) argvals.ptr else null,
+                @intCast(argvals.len),
+                pair_type,
+            );
+            try exprs.append(allocator, c.BinaryenLocalSet(module, tuple_base, result));
+            try exprs.append(allocator, c.BinaryenLocalSet(module, p.binding.ptr_local, c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 0)));
+            try exprs.append(allocator, c.BinaryenLocalSet(module, p.binding.len_local, c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, tuple_base, pair_type), 1)));
+        },
     };
 
     const body_expr: c.BinaryenExpressionRef = if (exprs.items.len == 1)
@@ -1241,17 +1358,20 @@ fn emitModule(
     else
         c.BinaryenBlock(module, null, @ptrCast(exprs.items.ptr), @intCast(exprs.items.len), none_type);
 
-    // Declare _start's locals: n_tuples tuple locals + 3 i64 scratch when
-    // a concat is present.
+    // Declare _start's locals, matching the layout above:
+    //   2·nb i64 binding locals, then n_tuples tuple locals, then (with a
+    //   concat) 3 i64 scratch.
+    const nb: usize = n_rt_bindings * 2;
     const n_scratch: usize = if (has_concat) 3 else 0;
-    const n_vars = n_tuples + n_scratch;
+    const n_vars = nb + n_tuples + n_scratch;
     const var_types = try allocator.alloc(c.BinaryenType, n_vars);
     defer allocator.free(var_types);
-    for (0..n_tuples) |k| var_types[k] = pair_type;
+    for (0..nb) |k| var_types[k] = i64_type;
+    for (0..n_tuples) |k| var_types[nb + k] = pair_type;
     if (has_concat) {
-        var_types[n_tuples] = i64_type;
-        var_types[n_tuples + 1] = i64_type;
-        var_types[n_tuples + 2] = i64_type;
+        var_types[nb + n_tuples] = i64_type;
+        var_types[nb + n_tuples + 1] = i64_type;
+        var_types[nb + n_tuples + 2] = i64_type;
     }
     const vt: [*c]c.BinaryenType = if (n_vars > 0) var_types.ptr else null;
     _ = c.BinaryenAddFunction(
@@ -1544,14 +1664,30 @@ test "emitFromSource: a binding can name a const call result, referenced directl
     try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0\n") != null);
 }
 
-test "emitFromSource: a non-const binding initializer errors (runtime bindings are future)" {
+test "emitFromSource: a runtime binding holds a call result, used in interpolation" {
+    // `let g = shout("hi")` isn't const-foldable, so g binds the call's
+    // (ptr, len) into `_start` locals; `"[{g}]"` then concatenates it at
+    // runtime. The assembled string exists only at runtime.
     const lib = "pub fn shout(s: str) -> str { \"{s}!\" }\n";
-    const app = "import dev.q64.s.{shout}\nfn main {\n    let g = shout(\"hi\")\n    env.out(g)\n}\n";
+    const app =
+        \\import dev.q64.s.{shout}
+        \\
+        \\fn main {
+        \\    let g = shout("hi")
+        \\    env.out(g)
+        \\    env.out("[{g}]")
+        \\}
+        \\
+    ;
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    try testing.expectError(
-        Error.NotConstExpr,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
-    );
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "hi") != null);
+    // Neither the call result nor the `[…]`-wrapped form is baked in.
+    try testing.expect(std.mem.indexOf(u8, bytes, "hi!") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "[hi!]") == null);
 }
 
 test "emitFromSource: doubled braces are literal, not interpolation" {
