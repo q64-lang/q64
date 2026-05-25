@@ -344,12 +344,32 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                         } });
                     }
                 },
+                // env.out(x) — a reference to a `let`/`var` binding (or
+                // any const-foldable expression). Fold and print it.
+                .path => {
+                    const value = try resolver.constEvalExpr(arg);
+                    defer allocator.free(value);
+                    const off: u32 = @intCast(data.items.len);
+                    try data.appendSlice(allocator, value);
+                    try data.append(allocator, '\n');
+                    try actions.append(allocator, .{ .print_const = .{ .off = off, .len = @intCast(value.len + 1) } });
+                },
                 else => return Error.UnsupportedExpression,
             }
         },
-        // `main` is a sequence of `env.out(...)` calls in v0; bindings and
-        // early returns aren't lowered yet.
-        .let_stmt, .return_stmt => return Error.UnsupportedStatement,
+        // `let`/`var` bind a compile-time string value, usable by later
+        // statements via `env.out(x)` or `"{x}"` interpolation. A non-const
+        // initializer isn't supported yet (runtime bindings are future).
+        .let_stmt => |ls| {
+            const pat = ls.pattern() orelse return Error.UnsupportedStatement;
+            const name_tok = pat.bindingName() orelse return Error.UnsupportedStatement;
+            const init_expr = ls.initializer() orelse return Error.UnsupportedStatement;
+            const value = try resolver.constEvalExpr(init_expr);
+            errdefer allocator.free(value);
+            try resolver.bind(name_tok.text, value);
+        },
+        // Early `return` from `main` isn't lowered yet.
+        .return_stmt => return Error.UnsupportedStatement,
     };
 
     return emitModule(allocator, data.items, actions.items, callees.items, segments.items, call_args.items);
@@ -648,6 +668,10 @@ const Resolver = struct {
     /// name → defining function. Keys are slices into a CST that outlives
     /// the resolver (the caller's parse result or a `parsed` entry).
     symbols: std.StringHashMapUnmanaged(ast.FnDecl),
+    /// name → bound compile-time value. v0 `let`/`var` bindings hold a
+    /// constant string; the resolver owns the value bytes. Keys are CST
+    /// slices (the binding's identifier).
+    bindings: std.StringHashMapUnmanaged([]u8),
 
     fn init(allocator: std.mem.Allocator, modules: []const ModuleSource) Resolver {
         return .{
@@ -655,6 +679,7 @@ const Resolver = struct {
             .modules = modules,
             .parsed = .empty,
             .symbols = .empty,
+            .bindings = .empty,
         };
     }
 
@@ -662,6 +687,17 @@ const Resolver = struct {
         for (self.parsed.items) |r| r.deinit(self.allocator);
         self.parsed.deinit(self.allocator);
         self.symbols.deinit(self.allocator);
+        var it = self.bindings.valueIterator();
+        while (it.next()) |v| self.allocator.free(v.*);
+        self.bindings.deinit(self.allocator);
+    }
+
+    /// Bind `name` to a compile-time string value, taking ownership of
+    /// `value`. A rebind (e.g. `var` reassignment) frees the prior value.
+    fn bind(self: *Resolver, name: []const u8, value: []u8) !void {
+        const gop = try self.bindings.getOrPut(self.allocator, name);
+        if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+        gop.value_ptr.* = value;
     }
 
     /// Index every top-level function in `sf` under its own name, so a
@@ -721,10 +757,20 @@ const Resolver = struct {
             .string_lit => |s| self.renderStringLit(s),
             .num_lit => |n| self.allocator.dupe(u8, n.rawText() orelse return Error.BadStringLiteral),
             .call => |cc| self.constEvalCall(cc),
-            // A bare identifier or anything else isn't a constant we can
-            // fold in v0.
+            // A bare identifier resolves to a `let`/`var` binding when one
+            // is in scope; otherwise it isn't a constant we can fold.
+            .path => |p| self.lookupBinding(p),
             else => Error.NotConstExpr,
         };
+    }
+
+    /// Resolve a path expression against the binding table. Returns a copy
+    /// of the bound value; `NotConstExpr` if the name isn't bound.
+    fn lookupBinding(self: *Resolver, p: ast.PathExpr) Error![]u8 {
+        const name = try p.text(self.allocator);
+        defer self.allocator.free(name);
+        const v = self.bindings.get(name) orelse return Error.NotConstExpr;
+        return self.allocator.dupe(u8, v);
     }
 
     fn constEvalCall(self: *Resolver, call: ast.CallExpr) Error![]u8 {
@@ -1480,6 +1526,32 @@ test "emitFromSource: a const-foldable call argument composes" {
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
     try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0") != null);
+}
+
+test "emitFromSource: a let binding folds into interpolation" {
+    const app = "fn main {\n    let name = \"world\"\n    env.out(\"Hello, {name}!\")\n}\n";
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "Hello, world!\n") != null);
+}
+
+test "emitFromSource: a binding can name a const call result, referenced directly" {
+    const lib = "pub fn version() -> str { \"0.1.0\" }\n";
+    const app = "import dev.q64.s.{version}\nfn main {\n    let v = version()\n    env.out(v)\n}\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0\n") != null);
+}
+
+test "emitFromSource: a non-const binding initializer errors (runtime bindings are future)" {
+    const lib = "pub fn shout(s: str) -> str { \"{s}!\" }\n";
+    const app = "import dev.q64.s.{shout}\nfn main {\n    let g = shout(\"hi\")\n    env.out(g)\n}\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
+    try testing.expectError(
+        Error.NotConstExpr,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
 }
 
 test "emitFromSource: doubled braces are literal, not interpolation" {

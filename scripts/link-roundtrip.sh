@@ -185,4 +185,30 @@ if [[ "$multi_out" != "$multi_expected" ]]; then
 fi
 echo "    ok: multi-arg + composed call arg"
 
+# Compile-time `let` bindings: a binding names a const value (literal or
+# const call) and is referenced by later statements / interpolation.
+echo "==> bindings: q64 emit let name/v + interpolation"
+bind_app="$tmp/bind.q"
+bind_wasm="$tmp/bind.wasm"
+cat > "$bind_app" <<'Q64'
+import dev.q64.strlib.{vshout}
+
+fn main {
+    let name = "world"
+    let v = vshout()
+    env.out("Hello, {name}! (q64 v{v})")
+    env.out(name)
+}
+Q64
+"$Q64_BIN" emit "$bind_app" "$bind_wasm" --module "dev.q64.strlib=$param_lib"
+bind_out="$("$HOST_BIN" "$bind_wasm")"
+bind_expected=$'Hello, world! (q64 v0.1.0)\nworld'
+if [[ "$bind_out" != "$bind_expected" ]]; then
+    echo "FAIL: let-binding output mismatch" >&2
+    printf "  expected: %q\n" "$bind_expected" >&2
+    printf "  actual:   %q\n" "$bind_out" >&2
+    exit 1
+fi
+echo "    ok: let bindings + interpolation"
+
 echo "PASS: $qube_out"

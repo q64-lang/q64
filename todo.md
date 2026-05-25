@@ -109,6 +109,19 @@ and `qube run`):
        is a non-const string source (e.g. `let` bindings of call results,
        host inputs). After that: the `Stack` region kind (LIFO, freed on
        return) and multi-memory segregation (`spec/memory.md`).
+12. [x] **Compile-time `let` / `var` bindings in `main`.** A binding names a
+       const-foldable value (literal, const call, const interpolation);
+       later statements reference it directly (`env.out(name)`) or in
+       interpolation (`"Hello, {name}!"`), and bindings can reference
+       earlier bindings. Lives in the resolver: a `bindings` table +
+       `constEvalExpr` resolving a `.path` to a bound value; `emitFn`
+       records each `let` and folds references. Verified end-to-end
+       (`link-roundtrip.sh`: `let name/v` → `Hello, world! (q64 v0.1.0)`).
+       A non-const initializer (e.g. `let g = shout("hi")`) errors with
+       `NotConstExpr`. **Next (the runtime-value unlock):** runtime
+       bindings of non-const results — bind into `_start` locals and
+       reference them at runtime — which then enables runtime arguments,
+       and motivates the `Stack` region kind + multi-memory.
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.
