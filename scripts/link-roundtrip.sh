@@ -303,17 +303,19 @@ fn main {
     env.out(double(21))
     env.out(add(1000000, 234567))
     env.out(neg(7))
+    let a = double(21)
+    env.out(add(a, 8))
 }
 Q64
 "$Q64_BIN" emit "$intfn_app" "$intfn_wasm" --module "dev.q64.intlib=$intfn_lib"
 intfn_out="$("$HOST_BIN" "$intfn_wasm")"
-intfn_expected=$'42\n1234567\n-7'
+intfn_expected=$'42\n1234567\n-7\n50'
 if [[ "$intfn_out" != "$intfn_expected" ]]; then
     echo "FAIL: runtime int-fn output mismatch" >&2
     printf "  expected: %q\n" "$intfn_expected" >&2
     printf "  actual:   %q\n" "$intfn_out" >&2
     exit 1
 fi
-echo "    ok: runtime i64 functions -> 42 / 1234567 / -7"
+echo "    ok: runtime i64 functions + bindings -> 42 / 1234567 / -7 / 50"
 
 echo "PASS: $qube_out"

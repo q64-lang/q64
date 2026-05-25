@@ -338,9 +338,19 @@ visible at a glance whether it's been picked up.
       `(ptr, len)`. `env.out(double(21))` → `42`, all at runtime. Verified
       end-to-end across 0 / negatives / multi-digit / multi-param;
       `link-roundtrip.sh` asserts `double(21)`/`add(1000000,234567)`/`neg(7)`
-      → `42` / `1234567` / `-7`. **Deferred:** i64 `let` bindings (`let x =
-      double(21)`), i64 args that are runtime values, and integers inside
-      string interpolation at runtime.
+      → `42` / `1234567` / `-7`.
+- [x] **Runtime i64 bindings + chaining.** `RtBinding` is now a str/int
+      union: a `let x = double(21)` stores the i64 result in a single
+      `_start` local (`bind_int_call`), `env.out(x)` formats it via
+      `__fmt_i64` (`print_int_binding`), and an i64 binding can be passed as
+      an argument to another i64 function (`ArgVal.int_local`), so
+      `let a = double(21); env.out(add(a, 8))` → `50` and calls chain
+      (`add(a, c)`). Binding locals are assigned by a running counter (str
+      takes two, int one). Type mismatches (str arg to an i64 param or vice
+      versa) are rejected. `link-roundtrip.sh` asserts the binding/chaining
+      path → `50`. **Deferred:** interpolating an i64 binding into a string
+      (`"x = {x}"` — needs `__fmt` inside the concat builder; currently
+      `UnsupportedInterpolation`), and `var` reassignment of an i64.
 - [x] AST views (statements): `ast.Stmt` now surfaces `let`/`var`
       (`LetStmt`: `isVar`/`pattern`/`initializer`) and `return`
       (`ReturnStmt.value`) alongside `expr_stmt`, plus a `Pattern` view
