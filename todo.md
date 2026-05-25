@@ -97,8 +97,18 @@ and `qube run`):
        bodies); `Segment` gained a `param` variant, `splitInterpolation`
        became parameter-aware, and the callee emits the concat + returns
        `(buf, len)`. `link-roundtrip.sh` asserts `shout("loud") -> loud!`.
-       **Next:** multi-arg / non-literal args, nested calls inside callee
-       bodies, then the `Stack` region kind and multi-memory segregation.
+11. [x] **Multi-argument functions + composed call arguments** (verified +
+       regression-locked; these fell out of the param work). A callee may
+       take several `str` params (`fn join(a, b) { "{a}-{b}" }` →
+       `join("x","y")` → `x-y`), and a const-foldable call may be passed as
+       an argument (`shout(version())` → `0.1.0!`, the inner call folds to
+       the argument bytes). Covered by emit unit tests + `link-roundtrip.sh`.
+       **Boundary / next:** genuinely *runtime* (non-const) arguments and
+       nested non-const calls aren't supported — they need a runtime
+       (ptr,len) passed at the call site, which has no consumer until there
+       is a non-const string source (e.g. `let` bindings of call results,
+       host inputs). After that: the `Stack` region kind (LIFO, freed on
+       return) and multi-memory segregation (`spec/memory.md`).
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.

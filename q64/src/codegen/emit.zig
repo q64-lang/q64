@@ -1453,6 +1453,35 @@ test "emitFromSource: a parameterized body transforms its argument" {
     try testing.expect(std.mem.indexOf(u8, bytes, "hi!") == null);
 }
 
+test "emitFromSource: a multi-parameter body joins its arguments" {
+    // Two str params (four i64 wasm params); the body interpolates both.
+    const lib = "pub fn join(a: str, b: str) -> str { \"{a}-{b}\" }\n";
+    const app = "import dev.q64.s.{join}\nfn main { env.out(join(\"x\", \"y\")) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "x") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "y") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "-") != null);
+    // "x-y" is assembled in the arena at runtime, not contiguous in data.
+    try testing.expect(std.mem.indexOf(u8, bytes, "x-y") == null);
+}
+
+test "emitFromSource: a const-foldable call argument composes" {
+    // `shout(version())`: version() folds to "0.1.0" (the argument), which
+    // shout then transforms to "0.1.0!" in the arena.
+    const lib = "pub fn version() -> str { \"0.1.0\" }\npub fn shout(s: str) -> str { \"{s}!\" }\n";
+    const app = "import dev.q64.s.{version, shout}\nfn main { env.out(shout(version())) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0") != null);
+}
+
 test "emitFromSource: doubled braces are literal, not interpolation" {
     const app = "fn main { env.out(\"{{not interp}}\") }\n";
     const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});

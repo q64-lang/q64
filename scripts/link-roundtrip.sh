@@ -158,4 +158,31 @@ if [[ "$shout_out" != "loud!" ]]; then
 fi
 echo "    ok: param transform -> $shout_out"
 
+# Multi-argument function + a const-foldable call passed as an argument.
+echo "==> params: q64 emit join(\"a\", \"b\") and shout(version())"
+{
+  printf 'pub fn join(a: str, b: str) -> str { "{a}-{b}" }\n'
+  printf 'pub fn vshout() -> str { "0.1.0" }\n'
+} >> "$param_lib/lib.q"
+multi_app="$tmp/multi.q"
+multi_wasm="$tmp/multi.wasm"
+cat > "$multi_app" <<'Q64'
+import dev.q64.strlib.{join, shout, vshout}
+
+fn main {
+    env.out(join("a", "b"))
+    env.out(shout(vshout()))
+}
+Q64
+"$Q64_BIN" emit "$multi_app" "$multi_wasm" --module "dev.q64.strlib=$param_lib"
+multi_out="$("$HOST_BIN" "$multi_wasm")"
+multi_expected=$'a-b\n0.1.0!'
+if [[ "$multi_out" != "$multi_expected" ]]; then
+    echo "FAIL: multi-arg/compose output mismatch" >&2
+    printf "  expected: %q\n" "$multi_expected" >&2
+    printf "  actual:   %q\n" "$multi_out" >&2
+    exit 1
+fi
+echo "    ok: multi-arg + composed call arg"
+
 echo "PASS: $qube_out"
