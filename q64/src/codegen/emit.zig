@@ -198,14 +198,19 @@ pub fn emitFromSource(
 //   const_str  — a nullary body that folds to a constant string in the
 //                data segment; the function returns that fixed (ptr, len).
 //   param_ref  — a passthrough body `{ s }` that returns the (ptr, len) of
-//                str parameter #idx. Each `str` parameter is two i64 wasm
-//                params (ptr, len), so param #i lives in locals 2i, 2i+1.
+//                str parameter #idx.
+//   concat     — a body that builds its result in the scope arena from
+//                `segments` [first..first+count] (const runs + `param`
+//                refs), e.g. `{ "{s}!" }`, and returns it.
+// Each `str` parameter is two i64 wasm params (ptr, len), so param #i
+// lives in locals 2i, 2i+1.
 const Callee = struct {
     name: [:0]const u8,
     n_str_params: usize,
     body: union(enum) {
         const_str: struct { off: u32, len: u32 },
         param_ref: usize,
+        concat: struct { first: usize, count: usize },
     },
 };
 
@@ -213,12 +218,13 @@ const Callee = struct {
 // static data segment.
 const ArgVal = struct { off: u32, len: u32 };
 
-// One piece of a runtime-concatenated string (`print_concat`): either a
-// constant run living in the static data segment, or the (ptr, len)
-// returned by calling an emitted (nullary) function.
+// One piece of a runtime-concatenated string: a constant run in the static
+// data segment, the (ptr, len) returned by a nullary callee, or the
+// (ptr, len) of str parameter #idx (only inside a callee body).
 const Segment = union(enum) {
     const_run: struct { off: u32, len: u32 },
     call: usize, // index into `callees`
+    param: usize, // str parameter index (locals 2·idx, 2·idx+1)
 };
 
 // One thing `main` does, in order.
@@ -272,7 +278,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                 // env.out(f(args…)) — a real runtime call to an emitted
                 // function, passing string-literal arguments.
                 .call => |inner| {
-                    const idx = try ensureCallee(allocator, resolver, &data, &callees, inner);
+                    const idx = try ensureCallee(allocator, resolver, &data, &callees, &segments, inner);
                     const args_first = call_args.items.len;
                     var ait = inner.args();
                     while (ait.next()) |a| {
@@ -300,11 +306,11 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                     defer {
                         for (raws.items) |rs| switch (rs) {
                             .lit => |b| allocator.free(b),
-                            .call => {},
+                            .call, .param => {},
                         };
                         raws.deinit(allocator);
                     }
-                    const has_call = try splitInterpolation(allocator, resolver, raw, &data, &callees, &raws);
+                    const has_call = try splitInterpolation(allocator, resolver, raw, &data, &callees, &segments, &raws, null);
 
                     if (!has_call) {
                         // Pure-constant interpolation folds to one payload
@@ -327,6 +333,8 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                                 try segments.append(allocator, .{ .const_run = .{ .off = off, .len = @intCast(bytes.len) } });
                             },
                             .call => |idx| try segments.append(allocator, .{ .call = idx }),
+                            // `_start` interpolation (params == null) yields no param pieces.
+                            .param => unreachable,
                         };
                         const nl = try ensureNewline(allocator, &data, &nl_off);
                         try actions.append(allocator, .{ .print_concat = .{
@@ -357,28 +365,33 @@ fn ensureNewline(allocator: std.mem.Allocator, data: *std.ArrayList(u8), nl_off:
 }
 
 /// A raw concatenation piece produced while splitting an interpolated
-/// literal: a decoded constant run (owned bytes) or a resolved nullary
-/// call (callee index).
+/// literal: a decoded constant run (owned bytes), a resolved nullary call
+/// (callee index), or a reference to str parameter #idx.
 const RawSeg = union(enum) {
     lit: []u8,
     call: usize,
+    param: usize,
 };
 
-/// Split an interpolated string literal into runtime-concatenation
-/// pieces. Constant runs (with escapes, `{{`/`}}`, and non-call
-/// interpolations const-evaluated) accumulate into `lit` pieces; a
-/// `{call()}` interpolation resolves its callee (`ensureCallee`, which
-/// records the callee + its string in `data`) and emits a `call` piece.
-/// Returns whether any call piece was produced — the caller folds when
-/// none was. Caller owns the `.lit` byte slices in `out`.
+/// Split an interpolated string literal into runtime-concatenation pieces.
+/// Constant runs (with escapes, `{{`/`}}`, and non-dynamic interpolations
+/// const-evaluated) accumulate into `lit` pieces. When `params` is
+/// supplied (callee-body context), a `{name}` matching a parameter becomes
+/// a `param` piece. Otherwise (top-level / `_start`) a `{call()}`
+/// interpolation resolves its nullary callee and becomes a `call` piece;
+/// callee bodies may not nest calls in v0. Returns whether any dynamic
+/// (`call`/`param`) piece was produced — the caller folds when none was.
+/// Caller owns the `.lit` byte slices in `out`.
 fn splitInterpolation(
     allocator: std.mem.Allocator,
     resolver: *Resolver,
     raw: []const u8,
     data: *std.ArrayList(u8),
     callees: *std.ArrayList(Callee),
+    segments: *std.ArrayList(Segment),
     out: *std.ArrayList(RawSeg),
-) !bool {
+    params: ?[]const []const u8,
+) Error!bool {
     // Raw strings (`r"…"`) carry no interpolation — nothing to split.
     if (raw.len >= 1 and raw[0] == 'r') return false;
     if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return Error.BadStringLiteral;
@@ -386,7 +399,7 @@ fn splitInterpolation(
 
     var lit: std.ArrayList(u8) = .empty;
     errdefer lit.deinit(allocator);
-    var has_call = false;
+    var has_dynamic = false;
 
     const flushLit = struct {
         fn call(a: std.mem.Allocator, buf: *std.ArrayList(u8), dst: *std.ArrayList(RawSeg)) !void {
@@ -422,15 +435,34 @@ fn splitInterpolation(
             const iexpr = ast.Expr.cast(r.root) orelse return Error.UnsupportedInterpolation;
             switch (iexpr) {
                 .call => |cc| {
-                    // v0: interpolated calls are nullary (no argument
-                    // passing inside `{…}` yet).
+                    // v0: callee bodies don't nest calls; calls only
+                    // appear at the top level, and only nullary.
+                    if (params != null) return Error.UnsupportedCall;
                     var ca = cc.args();
                     if (ca.next() != null) return Error.UnsupportedCall;
                     try flushLit(allocator, &lit, out);
-                    const idx = try ensureCallee(allocator, resolver, data, callees, cc);
+                    const idx = try ensureCallee(allocator, resolver, data, callees, segments, cc);
                     if (callees.items[idx].n_str_params != 0) return Error.UnsupportedCall;
                     try out.append(allocator, .{ .call = idx });
-                    has_call = true;
+                    has_dynamic = true;
+                },
+                .path => |pp| {
+                    // In a callee body, `{name}` referencing a parameter
+                    // becomes a `param` piece.
+                    if (params) |pnames| {
+                        const ptext = try pp.text(allocator);
+                        defer allocator.free(ptext);
+                        if (indexOfName(pnames, ptext)) |pidx| {
+                            try flushLit(allocator, &lit, out);
+                            try out.append(allocator, .{ .param = pidx });
+                            has_dynamic = true;
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                    const value = try resolver.constEvalExpr(iexpr);
+                    defer allocator.free(value);
+                    try lit.appendSlice(allocator, value);
                 },
                 else => {
                     const value = try resolver.constEvalExpr(iexpr);
@@ -451,7 +483,7 @@ fn splitInterpolation(
     }
     try flushLit(allocator, &lit, out);
     lit.deinit(allocator);
-    return has_call;
+    return has_dynamic;
 }
 
 /// The single argument of a well-formed `env.out(arg)` call.
@@ -478,8 +510,9 @@ fn ensureCallee(
     resolver: *Resolver,
     data: *std.ArrayList(u8),
     callees: *std.ArrayList(Callee),
+    segments: *std.ArrayList(Segment),
     call: ast.CallExpr,
-) !usize {
+) Error!usize {
     const callee_expr = call.callee() orelse return Error.UnsupportedCall;
     const path = switch (callee_expr) {
         .path => |p| p,
@@ -514,17 +547,52 @@ fn ensureCallee(
         try data.appendSlice(allocator, bytes);
         break :blk .{ .const_str = .{ .off = off, .len = @intCast(bytes.len) } };
     } else blk: {
-        // v0 parameterized body: passthrough `{ s }` — return a parameter
-        // directly. Bodies that transform their parameters land next.
+        // Parameterized body. A bare `{ s }` is a passthrough (return the
+        // parameter directly). A string literal `{ "…{s}…" }` builds its
+        // result in the scope arena from segments (const runs + `param`
+        // refs).
         const ve = bodyValueExpr(fd) orelse return Error.UnsupportedCall;
-        const ppath = switch (ve) {
-            .path => |p| p,
+        switch (ve) {
+            .path => |ppath| {
+                const ptext = try ppath.text(allocator);
+                defer allocator.free(ptext);
+                const idx = indexOfName(pnames.items, ptext) orelse return Error.UnsupportedCall;
+                break :blk .{ .param_ref = idx };
+            },
+            .string_lit => |s| {
+                const raw = s.rawText() orelse return Error.BadStringLiteral;
+                var raws: std.ArrayList(RawSeg) = .empty;
+                defer {
+                    for (raws.items) |rs| switch (rs) {
+                        .lit => |b| allocator.free(b),
+                        .call, .param => {},
+                    };
+                    raws.deinit(allocator);
+                }
+                const has_dyn = try splitInterpolation(allocator, resolver, raw, data, callees, segments, &raws, pnames.items);
+                if (!has_dyn) {
+                    // No parameter used: fold to a constant string.
+                    const bytes = try resolver.constEvalExpr(ve);
+                    defer allocator.free(bytes);
+                    const off: u32 = @intCast(data.items.len);
+                    try data.appendSlice(allocator, bytes);
+                    break :blk .{ .const_str = .{ .off = off, .len = @intCast(bytes.len) } };
+                }
+                const first = segments.items.len;
+                for (raws.items) |rs| switch (rs) {
+                    .lit => |bytes| {
+                        if (bytes.len == 0) continue;
+                        const off: u32 = @intCast(data.items.len);
+                        try data.appendSlice(allocator, bytes);
+                        try segments.append(allocator, .{ .const_run = .{ .off = off, .len = @intCast(bytes.len) } });
+                    },
+                    .param => |idx| try segments.append(allocator, .{ .param = idx }),
+                    .call => |idx| try segments.append(allocator, .{ .call = idx }),
+                };
+                break :blk .{ .concat = .{ .first = first, .count = segments.items.len - first } };
+            },
             else => return Error.UnsupportedCall,
-        };
-        const ptext = try ppath.text(allocator);
-        defer allocator.free(ptext);
-        const idx = indexOfName(pnames.items, ptext) orelse return Error.UnsupportedCall;
-        break :blk .{ .param_ref = idx };
+        }
     };
 
     const owned = try allocator.dupeZ(u8, name);
@@ -785,6 +853,120 @@ fn findPublicFn(sf: ast.SourceFile, name: []const u8) ?ast.FnDecl {
     return null;
 }
 
+// Locals used by an arena concatenation: `buf`/`off`/`len` are i64 scratch;
+// `tuple_base` is the first tuple local for `call` segments.
+const ConcatLocals = struct {
+    buf: c.BinaryenIndex,
+    off: c.BinaryenIndex,
+    len: c.BinaryenIndex,
+    tuple_base: c.BinaryenIndex,
+};
+
+/// Append the arena-concatenation of `segs` to `exprs`, leaving the result
+/// pointer in local `loc.buf` and its length in local `loc.len`.
+/// Bump-allocates from the `sp` global. `call` segments are invoked into
+/// tuple locals from `loc.tuple_base`; `param` segments read parameter
+/// locals (2·idx, 2·idx+1); `const_run` segments come from static data.
+fn appendConcat(
+    allocator: std.mem.Allocator,
+    module: c.BinaryenModuleRef,
+    exprs: *std.ArrayList(c.BinaryenExpressionRef),
+    segs: []const Segment,
+    callees: []const Callee,
+    pair_type: c.BinaryenType,
+    i64_type: c.BinaryenType,
+    loc: ConcatLocals,
+) !void {
+    // 1. Call each `call` segment into its tuple local.
+    {
+        var j: c.BinaryenIndex = 0;
+        for (segs) |sg| switch (sg) {
+            .call => |ci| {
+                const result = c.BinaryenCall(module, callees[ci].name.ptr, null, 0, pair_type);
+                try exprs.append(allocator, c.BinaryenLocalSet(module, loc.tuple_base + j, result));
+                j += 1;
+            },
+            else => {},
+        };
+    }
+
+    // 2. len = const total + dynamic (call / param) lengths.
+    var const_total: u64 = 0;
+    for (segs) |sg| switch (sg) {
+        .const_run => |cr| const_total += cr.len,
+        else => {},
+    };
+    var total = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(const_total)));
+    {
+        var j: c.BinaryenIndex = 0;
+        for (segs) |sg| switch (sg) {
+            .call => {
+                const lenj = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 1);
+                total = c.BinaryenBinary(module, c.BinaryenAddInt64(), total, lenj);
+                j += 1;
+            },
+            .param => |idx| {
+                const lenp = c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type);
+                total = c.BinaryenBinary(module, c.BinaryenAddInt64(), total, lenp);
+            },
+            .const_run => {},
+        };
+    }
+    try exprs.append(allocator, c.BinaryenLocalSet(module, loc.len, total));
+
+    // 3. buf = sp; sp += len  (bump-allocate from the arena).
+    try exprs.append(allocator, c.BinaryenLocalSet(module, loc.buf, c.BinaryenGlobalGet(module, "sp", i64_type)));
+    try exprs.append(allocator, c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(
+        module,
+        c.BinaryenAddInt64(),
+        c.BinaryenLocalGet(module, loc.buf, i64_type),
+        c.BinaryenLocalGet(module, loc.len, i64_type),
+    )));
+
+    // 4. off = buf; memory.copy each segment, bumping off.
+    try exprs.append(allocator, c.BinaryenLocalSet(module, loc.off, c.BinaryenLocalGet(module, loc.buf, i64_type)));
+    {
+        var j: c.BinaryenIndex = 0;
+        for (segs) |sg| {
+            var src: c.BinaryenExpressionRef = undefined;
+            var ln: c.BinaryenExpressionRef = undefined;
+            var ln_again: c.BinaryenExpressionRef = undefined;
+            switch (sg) {
+                .const_run => |cr| {
+                    src = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.off)));
+                    ln = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
+                    ln_again = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
+                },
+                .call => {
+                    src = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 0);
+                    ln = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 1);
+                    ln_again = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 1);
+                    j += 1;
+                },
+                .param => |idx| {
+                    src = c.BinaryenLocalGet(module, @intCast(idx * 2), i64_type);
+                    ln = c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type);
+                    ln_again = c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type);
+                },
+            }
+            try exprs.append(allocator, c.BinaryenMemoryCopy(
+                module,
+                c.BinaryenLocalGet(module, loc.off, i64_type),
+                src,
+                ln,
+                "0",
+                "0",
+            ));
+            try exprs.append(allocator, c.BinaryenLocalSet(module, loc.off, c.BinaryenBinary(
+                module,
+                c.BinaryenAddInt64(),
+                c.BinaryenLocalGet(module, loc.off, i64_type),
+                ln_again,
+            )));
+        }
+    }
+}
+
 fn emitModule(
     allocator: std.mem.Allocator,
     data: []const u8,
@@ -844,34 +1026,7 @@ fn emitModule(
         );
     }
 
-    // Emit each callee as `(i64×2·params) -> (i64, i64)`. A const body
-    // returns its fixed (off, len); a passthrough body returns the
-    // (ptr, len) of the parameter it names (locals 2·idx, 2·idx+1).
-    for (callees) |callee| {
-        var params_type = none_type;
-        var pbuf: []c.BinaryenType = &.{};
-        if (callee.n_str_params > 0) {
-            pbuf = try allocator.alloc(c.BinaryenType, callee.n_str_params * 2);
-            for (pbuf) |*x| x.* = i64_type;
-            params_type = c.BinaryenTypeCreate(pbuf.ptr, @intCast(pbuf.len));
-        }
-        defer if (pbuf.len > 0) allocator.free(pbuf);
-
-        var elems = switch (callee.body) {
-            .const_str => |cs| [_]c.BinaryenExpressionRef{
-                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cs.off))),
-                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cs.len))),
-            },
-            .param_ref => |idx| [_]c.BinaryenExpressionRef{
-                c.BinaryenLocalGet(module, @intCast(idx * 2), i64_type),
-                c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type),
-            },
-        };
-        const tup = c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
-        _ = c.BinaryenAddFunction(module, callee.name.ptr, params_type, pair_type, null, 0, tup);
-    }
-
-    // `_start` body, built from the action plan. Local layout:
+    // Local layout for `_start` and which functions need the arena:
     //   indices 0..n_tuples-1 : tuple locals holding callee (ptr, len).
     //   buf / off / len       : i64 scratch, present only with a concat.
     var n_tuples: usize = 0;
@@ -885,11 +1040,16 @@ fn emitModule(
             var calls: usize = 0;
             for (segments[p.first .. p.first + p.count]) |sg| switch (sg) {
                 .call => calls += 1,
-                .const_run => {},
+                .const_run, .param => {},
             };
             if (calls > n_tuples) n_tuples = calls;
         },
         .print_const => {},
+    };
+    // A callee whose body is an arena concat also needs the `sp` global.
+    for (callees) |cl| switch (cl.body) {
+        .concat => has_concat = true,
+        .const_str, .param_ref => {},
     };
 
     const buf_idx: c.BinaryenIndex = @intCast(n_tuples);
@@ -899,7 +1059,8 @@ fn emitModule(
     // The scope arena: a bump pointer (`sp`) starting just past the static
     // data. Each concat allocates from it; no reclamation in v0 (the
     // program is a single `_start` run). spec/memory.md §"Region kinds" —
-    // the implicit `scope` Arena.
+    // the implicit `scope` Arena. Added before the callees so their concat
+    // bodies can reference it.
     if (has_concat) {
         _ = c.BinaryenAddGlobal(
             module,
@@ -907,6 +1068,69 @@ fn emitModule(
             i64_type,
             true, // mutable
             c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(data.len))),
+        );
+    }
+
+    // Emit each callee as `(i64×2·params) -> (i64, i64)`. A const body
+    // returns its fixed (off, len); a passthrough body returns the
+    // (ptr, len) of the parameter it names (locals 2·idx, 2·idx+1); a
+    // concat body builds its result in the arena and returns (buf, len).
+    for (callees) |callee| {
+        var params_type = none_type;
+        var pbuf: []c.BinaryenType = &.{};
+        if (callee.n_str_params > 0) {
+            pbuf = try allocator.alloc(c.BinaryenType, callee.n_str_params * 2);
+            for (pbuf) |*x| x.* = i64_type;
+            params_type = c.BinaryenTypeCreate(pbuf.ptr, @intCast(pbuf.len));
+        }
+        defer if (pbuf.len > 0) allocator.free(pbuf);
+
+        var body_expr: c.BinaryenExpressionRef = undefined;
+        var n_vt: usize = 0;
+        var scratch3 = [_]c.BinaryenType{ i64_type, i64_type, i64_type };
+        switch (callee.body) {
+            .const_str => |cs| {
+                var elems = [_]c.BinaryenExpressionRef{
+                    c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cs.off))),
+                    c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cs.len))),
+                };
+                body_expr = c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
+            },
+            .param_ref => |idx| {
+                var elems = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalGet(module, @intCast(idx * 2), i64_type),
+                    c.BinaryenLocalGet(module, @intCast(idx * 2 + 1), i64_type),
+                };
+                body_expr = c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
+            },
+            .concat => |cc| {
+                const np = callee.n_str_params;
+                var body_exprs: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer body_exprs.deinit(allocator);
+                const loc = ConcatLocals{
+                    .buf = @intCast(np * 2),
+                    .off = @intCast(np * 2 + 1),
+                    .len = @intCast(np * 2 + 2),
+                    .tuple_base = 0, // callee bodies have no call segments in v0
+                };
+                try appendConcat(allocator, module, &body_exprs, segments[cc.first .. cc.first + cc.count], callees, pair_type, i64_type, loc);
+                var ret_elems = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalGet(module, loc.buf, i64_type),
+                    c.BinaryenLocalGet(module, loc.len, i64_type),
+                };
+                try body_exprs.append(allocator, c.BinaryenTupleMake(module, @ptrCast(&ret_elems), ret_elems.len));
+                body_expr = c.BinaryenBlock(module, null, @ptrCast(body_exprs.items.ptr), @intCast(body_exprs.items.len), pair_type);
+                n_vt = 3;
+            },
+        }
+        _ = c.BinaryenAddFunction(
+            module,
+            callee.name.ptr,
+            params_type,
+            pair_type,
+            if (n_vt > 0) @ptrCast(&scratch3) else null,
+            @intCast(n_vt),
+            body_expr,
         );
     }
 
@@ -950,89 +1174,9 @@ fn emitModule(
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
         },
         .print_concat => |p| {
-            const segs = segments[p.first .. p.first + p.count];
-
-            // 1. Call each callee into its own tuple local.
-            {
-                var j: c.BinaryenIndex = 0;
-                for (segs) |sg| switch (sg) {
-                    .call => |ci| {
-                        const result = c.BinaryenCall(module, callees[ci].name.ptr, null, 0, pair_type);
-                        try exprs.append(allocator, c.BinaryenLocalSet(module, j, result));
-                        j += 1;
-                    },
-                    .const_run => {},
-                };
-            }
-
-            // 2. len = (sum of const lengths) + (sum of call lengths).
-            var const_total: u64 = 0;
-            for (segs) |sg| switch (sg) {
-                .const_run => |cr| const_total += cr.len,
-                .call => {},
-            };
-            var total = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(const_total)));
-            {
-                var j: c.BinaryenIndex = 0;
-                for (segs) |sg| switch (sg) {
-                    .call => {
-                        const lenj = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 1);
-                        total = c.BinaryenBinary(module, c.BinaryenAddInt64(), total, lenj);
-                        j += 1;
-                    },
-                    .const_run => {},
-                };
-            }
-            try exprs.append(allocator, c.BinaryenLocalSet(module, len_idx, total));
-
-            // 3. buf = sp; sp += len  (bump-allocate from the arena).
-            try exprs.append(allocator, c.BinaryenLocalSet(module, buf_idx, c.BinaryenGlobalGet(module, "sp", i64_type)));
-            try exprs.append(allocator, c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(
-                module,
-                c.BinaryenAddInt64(),
-                c.BinaryenLocalGet(module, buf_idx, i64_type),
-                c.BinaryenLocalGet(module, len_idx, i64_type),
-            )));
-
-            // 4. off = buf; memory.copy each segment, bumping off.
-            try exprs.append(allocator, c.BinaryenLocalSet(module, off_idx, c.BinaryenLocalGet(module, buf_idx, i64_type)));
-            {
-                var j: c.BinaryenIndex = 0;
-                for (segs) |sg| {
-                    var src: c.BinaryenExpressionRef = undefined;
-                    var ln: c.BinaryenExpressionRef = undefined;
-                    var ln_again: c.BinaryenExpressionRef = undefined;
-                    switch (sg) {
-                        .const_run => |cr| {
-                            src = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.off)));
-                            ln = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
-                            ln_again = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
-                        },
-                        .call => {
-                            src = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 0);
-                            ln = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 1);
-                            ln_again = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, j, pair_type), 1);
-                            j += 1;
-                        },
-                    }
-                    try exprs.append(allocator, c.BinaryenMemoryCopy(
-                        module,
-                        c.BinaryenLocalGet(module, off_idx, i64_type),
-                        src,
-                        ln,
-                        "0",
-                        "0",
-                    ));
-                    try exprs.append(allocator, c.BinaryenLocalSet(module, off_idx, c.BinaryenBinary(
-                        module,
-                        c.BinaryenAddInt64(),
-                        c.BinaryenLocalGet(module, off_idx, i64_type),
-                        ln_again,
-                    )));
-                }
-            }
-
-            // 5. env.out(buf, len), then the trailing newline.
+            const loc = ConcatLocals{ .buf = buf_idx, .off = off_idx, .len = len_idx, .tuple_base = 0 };
+            try appendConcat(allocator, module, &exprs, segments[p.first .. p.first + p.count], callees, pair_type, i64_type, loc);
+            // Write the assembled string, then the trailing newline.
             var cargs = [_]c.BinaryenExpressionRef{
                 c.BinaryenLocalGet(module, buf_idx, i64_type),
                 c.BinaryenLocalGet(module, len_idx, i64_type),
@@ -1289,6 +1433,24 @@ test "emitFromSource: wrong argument count errors" {
         Error.UnsupportedCall,
         emitFromSource(testing.allocator, app, "main.q", &modules),
     );
+}
+
+test "emitFromSource: a parameterized body transforms its argument" {
+    // `shout(s)` interpolates its parameter (`"{s}!"`); the body is built
+    // in the arena from a param segment + the literal "!". The assembled
+    // "hi!" exists only at runtime; behavior is covered by
+    // scripts/link-roundtrip.sh.
+    const lib = "pub fn shout(s: str) -> str { \"{s}!\" }\n";
+    const app = "import dev.q64.s.{shout}\nfn main { env.out(shout(\"hi\")) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "hi") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "!") != null);
+    // The joined result is assembled at runtime, not baked into the binary.
+    try testing.expect(std.mem.indexOf(u8, bytes, "hi!") == null);
 }
 
 test "emitFromSource: doubled braces are literal, not interpolation" {

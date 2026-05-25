@@ -135,4 +135,27 @@ if [[ "$param_out" != "passed" ]]; then
 fi
 echo "    ok: string param passthrough -> $param_out"
 
+# Parameterized body that transforms its argument: `shout(s) { "{s}!" }`
+# builds its result in the arena from a param segment + the literal "!".
+echo "==> params: q64 emit env.out(shout(\"loud\"))"
+printf 'pub fn shout(s: str) -> str { "{s}!" }\n' >> "$param_lib/lib.q"
+shout_app="$tmp/shout.q"
+shout_wasm="$tmp/shout.wasm"
+cat > "$shout_app" <<'Q64'
+import dev.q64.strlib.{shout}
+
+fn main {
+    env.out(shout("loud"))
+}
+Q64
+"$Q64_BIN" emit "$shout_app" "$shout_wasm" --module "dev.q64.strlib=$param_lib"
+shout_out="$("$HOST_BIN" "$shout_wasm")"
+if [[ "$shout_out" != "loud!" ]]; then
+    echo "FAIL: param-transform output mismatch" >&2
+    printf "  expected: %q\n" "loud!" >&2
+    printf "  actual:   %q\n" "$shout_out" >&2
+    exit 1
+fi
+echo "    ok: param transform -> $shout_out"
+
 echo "PASS: $qube_out"

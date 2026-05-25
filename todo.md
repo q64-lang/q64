@@ -90,11 +90,15 @@ and `qube run`):
        arguments into the data segment and the `print_callee` call site
        passes them, with an arg-count check. Verified end-to-end:
        `link-roundtrip.sh` asserts `env.out(id("passed")) -> passed`.
-       **Next:** parameterized bodies that *transform* their params
-       (e.g. `fn shout(s) { "{s}!" }` — arena concat with a `param`
-       segment, reusing the concat machinery inside the callee). Then
-       multi-arg / non-literal args, nested calls, the `Stack` region
-       kind, and multi-memory segregation.
+10. [x] **Parameterized bodies that transform their arguments.** A callee
+       body that interpolates its parameter (`fn shout(s: str) -> str {
+       "{s}!" }`) is built in the scope arena and returned. Generalized the
+       arena concat into `appendConcat` (used by both `_start` and callee
+       bodies); `Segment` gained a `param` variant, `splitInterpolation`
+       became parameter-aware, and the callee emits the concat + returns
+       `(buf, len)`. `link-roundtrip.sh` asserts `shout("loud") -> loud!`.
+       **Next:** multi-arg / non-literal args, nested calls inside callee
+       bodies, then the `Stack` region kind and multi-memory segregation.
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.
