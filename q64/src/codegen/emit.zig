@@ -856,8 +856,58 @@ const Resolver = struct {
             // A bare identifier resolves to a `let`/`var` binding when one
             // is in scope; otherwise it isn't a constant we can fold.
             .path => |p| self.lookupBinding(p),
+            // A parenthesized expression is transparent.
+            .paren => |p| self.constEvalExpr(p.inner() orelse return Error.NotConstExpr),
+            // Integer arithmetic folds to its decimal value.
+            .bin, .unary => {
+                const v = try self.constEvalInt(expr);
+                return std.fmt.allocPrint(self.allocator, "{d}", .{v});
+            },
             else => Error.NotConstExpr,
         };
+    }
+
+    /// Evaluate an integer-valued expression at compile time. Supports
+    /// integer literals, the arithmetic / bitwise / shift binary operators,
+    /// unary `-`/`~`, parentheses, and bindings holding an integer.
+    fn constEvalInt(self: *Resolver, expr: ast.Expr) Error!i64 {
+        switch (expr) {
+            .num_lit => |n| return parseIntLit(n.rawText() orelse return Error.NotConstExpr),
+            .paren => |p| return self.constEvalInt(p.inner() orelse return Error.NotConstExpr),
+            .path => |p| {
+                const bytes = try self.lookupBinding(p);
+                defer self.allocator.free(bytes);
+                return parseIntLit(bytes);
+            },
+            .unary => |u| {
+                const x = try self.constEvalInt(u.operand() orelse return Error.NotConstExpr);
+                const op = u.op() orelse return Error.NotConstExpr;
+                return switch (op.kind) {
+                    .MINUS => std.math.negate(x) catch return Error.NotConstExpr,
+                    .TILDE => ~x,
+                    else => Error.NotConstExpr, // `!` is boolean
+                };
+            },
+            .bin => |b| {
+                const l = try self.constEvalInt(b.lhs() orelse return Error.NotConstExpr);
+                const r = try self.constEvalInt(b.rhs() orelse return Error.NotConstExpr);
+                const op = b.op() orelse return Error.NotConstExpr;
+                return switch (op.kind) {
+                    .PLUS => std.math.add(i64, l, r) catch Error.NotConstExpr,
+                    .MINUS => std.math.sub(i64, l, r) catch Error.NotConstExpr,
+                    .STAR => std.math.mul(i64, l, r) catch Error.NotConstExpr,
+                    .SLASH => if (r == 0) Error.NotConstExpr else @divTrunc(l, r),
+                    .PERCENT => if (r == 0) Error.NotConstExpr else @rem(l, r),
+                    .AMP => l & r,
+                    .PIPE => l | r,
+                    .CARET => l ^ r,
+                    .SHL => if (r < 0 or r > 63) Error.NotConstExpr else l << @intCast(r),
+                    .SHR => if (r < 0 or r > 63) Error.NotConstExpr else l >> @intCast(r),
+                    else => Error.NotConstExpr, // comparisons / logical aren't integers
+                };
+            },
+            else => return Error.NotConstExpr,
+        }
     }
 
     /// Resolve a path expression against the binding table. Returns a copy
@@ -980,6 +1030,21 @@ fn decodeEscape(ch: u8) u8 {
         '0' => 0,
         else => ch, // \\, \", \{, \} and unknowns pass the char through
     };
+}
+
+/// Parse an integer literal's text to an `i64`. Strips `_` digit
+/// separators and honors `0x`/`0o`/`0b` prefixes. A float, a suffixed
+/// unit literal (`48.kHz`), or anything unparseable is `NotConstExpr`.
+fn parseIntLit(raw: []const u8) Error!i64 {
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    for (raw) |ch| {
+        if (ch == '_') continue;
+        if (n >= buf.len) return Error.NotConstExpr;
+        buf[n] = ch;
+        n += 1;
+    }
+    return std.fmt.parseInt(i64, buf[0..n], 0) catch Error.NotConstExpr;
 }
 
 fn findPublicFn(sf: ast.SourceFile, name: []const u8) ?ast.FnDecl {
@@ -1691,6 +1756,30 @@ test "emitFromSource: a let binding folds into interpolation" {
     const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "Hello, world!\n") != null);
+}
+
+test "emitFromSource: integer arithmetic folds at compile time" {
+    const app = "fn main {\n    env.out(\"{2 + 3}\")\n    env.out(\"{(1 + 2) * 3}\")\n    env.out(\"{-5 + 8}\")\n}\n";
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "5\n") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "9\n") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "3\n") != null);
+}
+
+test "emitFromSource: an integer binding folds in arithmetic" {
+    const app = "fn main {\n    let n = 6 * 7\n    env.out(\"{n + 1}\")\n}\n";
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "43\n") != null);
+}
+
+test "emitFromSource: division by zero isn't const-foldable" {
+    const app = "fn main { env.out(\"{1 / 0}\") }\n";
+    try testing.expectError(
+        Error.NotConstExpr,
+        emitFromSource(testing.allocator, app, "main.q", &.{}),
+    );
 }
 
 test "emitFromSource: a binding can name a const call result, referenced directly" {

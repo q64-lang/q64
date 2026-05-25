@@ -320,6 +320,17 @@ visible at a glance whether it's been picked up.
       fn/dyn/union type structure, pattern destructuring internals,
       generic-param/effect/where internals, and the not-yet-parsed expr
       kinds (`record`/`range`/`lambda`/`spawn`/`channel`/`graph`).
+- [x] **Compile-time integer arithmetic.** The resolver's `constEvalExpr`
+      now folds integer expressions (`constEvalInt`): literals (decimal /
+      `0x` / `0o` / `0b`, `_` separators), `+ - * / % & | ^ << >>`, unary
+      `-`/`~`, parentheses, and bindings holding an integer. The decimal
+      result renders into interpolation, so `env.out("{(1 + 2) * 3}")` →
+      `9` and `let n = 6 * 7; "{n + 1}"` → `43`. Overflow / divide-by-zero
+      aren't const-foldable (`NotConstExpr`). All compile-time — no runtime
+      arithmetic or int→string yet. `link-roundtrip.sh` asserts
+      `{(1+2)*3} {n+1} {1_000+24}` → `9 43 1024`. **Next on this axis:**
+      runtime integer values (typed `i64` params/returns, real wasm
+      arithmetic, a wasm int→string routine).
 - [x] AST views (statements): `ast.Stmt` now surfaces `let`/`var`
       (`LetStmt`: `isVar`/`pattern`/`initializer`) and `return`
       (`ReturnStmt.value`) alongside `expr_stmt`, plus a `Pattern` view

@@ -263,4 +263,25 @@ if [[ "$arg_out" != "$arg_expected" ]]; then
 fi
 echo "    ok: runtime binding passed as an argument"
 
+# Compile-time integer arithmetic: folded in the resolver and rendered to
+# decimal (no runtime arithmetic). No dependency needed.
+echo "==> arith: q64 emit \"{(1 + 2) * 3}\" etc."
+arith_app="$tmp/arith.q"
+arith_wasm="$tmp/arith.wasm"
+cat > "$arith_app" <<'Q64'
+fn main {
+    let n = 6 * 7
+    env.out("{(1 + 2) * 3} {n + 1} {1_000 + 24}")
+}
+Q64
+"$Q64_BIN" emit "$arith_app" "$arith_wasm"
+arith_out="$("$HOST_BIN" "$arith_wasm")"
+if [[ "$arith_out" != "9 43 1024" ]]; then
+    echo "FAIL: arithmetic output mismatch" >&2
+    printf "  expected: %q\n" "9 43 1024" >&2
+    printf "  actual:   %q\n" "$arith_out" >&2
+    exit 1
+fi
+echo "    ok: const integer arithmetic -> $arith_out"
+
 echo "PASS: $qube_out"
