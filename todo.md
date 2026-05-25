@@ -348,9 +348,17 @@ visible at a glance whether it's been picked up.
       (`add(a, c)`). Binding locals are assigned by a running counter (str
       takes two, int one). Type mismatches (str arg to an i64 param or vice
       versa) are rejected. `link-roundtrip.sh` asserts the binding/chaining
-      path → `50`. **Deferred:** interpolating an i64 binding into a string
-      (`"x = {x}"` — needs `__fmt` inside the concat builder; currently
-      `UnsupportedInterpolation`), and `var` reassignment of an i64.
+      path → `50`. **Deferred:** `var` reassignment of an i64.
+- [x] **i64 bindings interpolate into strings.** A new `int_binding` segment
+      (a binding local formatted via `__fmt_i64`) is handled in the concat
+      builder exactly like a `call` segment — it claims a tuple slot, the
+      formatter runs once into the arena, and its `(ptr, len)` feeds both the
+      length sum and the `memory.copy`. So `"a = {a}"` → `a = 42` and a single
+      concat can mix a str binding and an i64 binding (`"{g} a is {a}"` →
+      `hi! a is 42`). `link-roundtrip.sh` asserts `"{g}: a={a}, b={b}"` →
+      `hi!: a=42, b=50`. **Deferred:** interpolating an i64 *call* result
+      (`"{add(a, b)}"`) — the call path still extracts string args, so an i64
+      call in interpolation is `UnsupportedCall`.
 - [x] AST views (statements): `ast.Stmt` now surfaces `let`/`var`
       (`LetStmt`: `isVar`/`pattern`/`initializer`) and `return`
       (`ReturnStmt.value`) alongside `expr_stmt`, plus a `Pattern` view

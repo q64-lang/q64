@@ -293,11 +293,12 @@ cat > "$intfn_lib/lib.q" <<'Q64'
 pub fn double(n: i64) -> i64 { n + n }
 pub fn add(a: i64, b: i64) -> i64 { a + b }
 pub fn neg(n: i64) -> i64 { 0 - n }
+pub fn shout(s: str) -> str { "{s}!" }
 Q64
 intfn_app="$tmp/intfn.q"
 intfn_wasm="$tmp/intfn.wasm"
 cat > "$intfn_app" <<'Q64'
-import dev.q64.intlib.{double, add, neg}
+import dev.q64.intlib.{double, add, neg, shout}
 
 fn main {
     env.out(double(21))
@@ -305,17 +306,20 @@ fn main {
     env.out(neg(7))
     let a = double(21)
     env.out(add(a, 8))
+    let b = add(a, 8)
+    let g = shout("hi")
+    env.out("{g}: a={a}, b={b}")
 }
 Q64
 "$Q64_BIN" emit "$intfn_app" "$intfn_wasm" --module "dev.q64.intlib=$intfn_lib"
 intfn_out="$("$HOST_BIN" "$intfn_wasm")"
-intfn_expected=$'42\n1234567\n-7\n50'
+intfn_expected=$'42\n1234567\n-7\n50\nhi!: a=42, b=50'
 if [[ "$intfn_out" != "$intfn_expected" ]]; then
     echo "FAIL: runtime int-fn output mismatch" >&2
     printf "  expected: %q\n" "$intfn_expected" >&2
     printf "  actual:   %q\n" "$intfn_out" >&2
     exit 1
 fi
-echo "    ok: runtime i64 functions + bindings -> 42 / 1234567 / -7 / 50"
+echo "    ok: runtime i64 functions + bindings + interpolation -> ... / hi!: a=42, b=50"
 
 echo "PASS: $qube_out"

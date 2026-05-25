@@ -246,6 +246,7 @@ const Segment = union(enum) {
     call: usize, // index into `callees`
     param: usize, // str parameter index (locals 2·idx, 2·idx+1)
     binding: RtBinding, // runtime binding locals
+    int_binding: u32, // i64 binding local, formatted via __fmt_i64 into the arena
 };
 
 // One thing `main` does, in order.
@@ -353,7 +354,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                     defer {
                         for (raws.items) |rs| switch (rs) {
                             .lit => |b| allocator.free(b),
-                            .call, .param, .binding => {},
+                            .call, .param, .binding, .int_binding => {},
                         };
                         raws.deinit(allocator);
                     }
@@ -381,6 +382,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                             },
                             .call => |idx| try segments.append(allocator, .{ .call = idx }),
                             .binding => |b| try segments.append(allocator, .{ .binding = b }),
+                            .int_binding => |l| try segments.append(allocator, .{ .int_binding = l }),
                             // `_start` interpolation (params == null) yields no param pieces.
                             .param => unreachable,
                         };
@@ -495,6 +497,7 @@ const RawSeg = union(enum) {
     call: usize,
     param: usize,
     binding: RtBinding,
+    int_binding: u32, // i64 binding local, formatted via __fmt_i64
 };
 
 /// Split an interpolated string literal into runtime-concatenation pieces.
@@ -587,14 +590,11 @@ fn splitInterpolation(
                     }
                     if (rt_bindings) |rb_map| {
                         if (rb_map.get(ptext)) |rb| {
-                            // Interpolating an i64 binding into a string isn't
-                            // lowered yet (needs __fmt inside the concat).
-                            switch (rb) {
-                                .int => return Error.UnsupportedInterpolation,
-                                .str => {},
-                            }
                             try flushLit(allocator, &lit, out);
-                            try out.append(allocator, .{ .binding = rb });
+                            switch (rb) {
+                                .str => try out.append(allocator, .{ .binding = rb }),
+                                .int => |iv| try out.append(allocator, .{ .int_binding = iv.local }),
+                            }
                             has_dynamic = true;
                             i = close + 1;
                             continue;
@@ -773,7 +773,7 @@ fn ensureCallee(
                 defer {
                     for (raws.items) |rs| switch (rs) {
                         .lit => |b| allocator.free(b),
-                        .call, .param, .binding => {},
+                        .call, .param, .binding, .int_binding => {},
                     };
                     raws.deinit(allocator);
                 }
@@ -797,7 +797,7 @@ fn ensureCallee(
                     .param => |idx| try segments.append(allocator, .{ .param = idx }),
                     .call => |idx| try segments.append(allocator, .{ .call = idx }),
                     // Callee bodies (params context) see no runtime bindings.
-                    .binding => unreachable,
+                    .binding, .int_binding => unreachable,
                 };
                 break :blk .{ .concat = .{ .first = first, .count = segments.items.len - first } };
             },
@@ -1391,6 +1391,12 @@ fn appendConcat(
                 try exprs.append(allocator, c.BinaryenLocalSet(module, loc.tuple_base + j, result));
                 j += 1;
             },
+            .int_binding => |l| {
+                var fa = [_]c.BinaryenExpressionRef{c.BinaryenLocalGet(module, l, i64_type)};
+                const result = c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fa), fa.len, pair_type);
+                try exprs.append(allocator, c.BinaryenLocalSet(module, loc.tuple_base + j, result));
+                j += 1;
+            },
             else => {},
         };
     }
@@ -1405,7 +1411,7 @@ fn appendConcat(
     {
         var j: c.BinaryenIndex = 0;
         for (segs) |sg| switch (sg) {
-            .call => {
+            .call, .int_binding => {
                 const lenj = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 1);
                 total = c.BinaryenBinary(module, c.BinaryenAddInt64(), total, lenj);
                 j += 1;
@@ -1446,7 +1452,7 @@ fn appendConcat(
                     ln = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
                     ln_again = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cr.len)));
                 },
-                .call => {
+                .call, .int_binding => {
                     src = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 0);
                     ln = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 1);
                     ln_again = c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, loc.tuple_base + j, pair_type), 1);
@@ -1560,12 +1566,16 @@ fn emitModule(
         },
         .print_concat => |p| {
             has_concat = true;
-            var calls: usize = 0;
+            var slots: usize = 0;
             for (segments[p.first .. p.first + p.count]) |sg| switch (sg) {
-                .call => calls += 1,
+                .call => slots += 1,
+                .int_binding => {
+                    slots += 1;
+                    needs_fmt = true;
+                },
                 .const_run, .param, .binding => {},
             };
-            if (calls > n_tuples) n_tuples = calls;
+            if (slots > n_tuples) n_tuples = slots;
         },
         .print_const, .print_binding, .bind_int_call => {},
     };
@@ -2176,14 +2186,29 @@ test "emitFromSource: an i64 let binding is bound, chained, and printed" {
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
 
-test "emitFromSource: interpolating an i64 binding isn't supported yet" {
+test "emitFromSource: an i64 binding interpolates into a string" {
+    // `"a = {a}"` formats the runtime i64 via __fmt_i64 and concatenates it
+    // into the arena. The const prefix "a = " is in the data; "42" is not.
     const lib = "pub fn double(n: i64) -> i64 { n + n }\n";
     const app = "import dev.q64.m.{double}\nfn main {\n    let a = double(21)\n    env.out(\"a = {a}\")\n}\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    try testing.expectError(
-        Error.UnsupportedInterpolation,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
-    );
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "a = ") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "42") == null);
+}
+
+test "emitFromSource: a string and an i64 binding interpolate together" {
+    // One concat mixing a str binding (g) and an i64 binding (a) — they
+    // share the arena and the tuple-slot space.
+    const lib = "pub fn double(n: i64) -> i64 { n + n }\npub fn shout(s: str) -> str { \"{s}!\" }\n";
+    const app = "import dev.q64.m.{double, shout}\nfn main {\n    let a = double(21)\n    let g = shout(\"hi\")\n    env.out(\"{g} a is {a}\")\n}\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, " a is ") != null);
 }
 
 test "emitFromSource: a binding can name a const call result, referenced directly" {
