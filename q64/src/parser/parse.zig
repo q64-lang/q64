@@ -2109,18 +2109,79 @@ test "enum variants are structured" {
     try testing.expectEqual(@as(usize, 3), variants);
 }
 
-test "items are skipped by ItemIter (only fn surfaces) but still parse" {
+test "ItemIter surfaces struct / enum / fn declarations in order" {
     const src = "pub struct P { x: i64 }\npub enum E { A }\nfn main { 0 }\n";
     const r = try parse(testing.allocator, src, "mix.q");
     defer r.deinit(testing.allocator);
     const sf = ast.SourceFile.cast(r.root).?;
     var items = sf.items();
-    const fd = (items.next() orelse return error.TestExpectedItem).fn_decl;
-    try testing.expectEqualStrings("main", fd.name().?.text);
+
+    const s = items.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("P", s.struct_decl.name().?.text);
+    try testing.expect(s.struct_decl.isPublic());
+
+    const e = items.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("E", e.enum_decl.name().?.text);
+
+    const f = items.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("main", f.fn_decl.name().?.text);
     try testing.expect(items.next() == null);
-    // But the struct/enum nodes exist in the tree.
-    try testing.expect(childKindNode(sf.cst, .STRUCT_DECL) != null);
-    try testing.expect(childKindNode(sf.cst, .ENUM_DECL) != null);
+}
+
+test "item views: struct fields, enum variants, type/const/face/fit names" {
+    const src =
+        \\pub struct Point { x: i64, y: i64 }
+        \\enum Dir { North, South }
+        \\pub type Id = i64
+        \\const MAX: i64 = 99
+        \\face Greeter { fn hi() -> str }
+        \\fit Point : Greeter { fn hi() -> str { "" } }
+        \\fn main { 0 }
+        \\
+    ;
+    const r = try parse(testing.allocator, src, "items.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var it = sf.items();
+
+    const s = (it.next() orelse return error.TestExpectedItem).struct_decl;
+    try testing.expect(s.isPublic());
+    try testing.expectEqualStrings("Point", s.name().?.text);
+    var fields = s.fields();
+    const fx = fields.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("x", fx.name().?.text);
+    const ftx = (try fx.typeText(testing.allocator)).?;
+    defer testing.allocator.free(ftx);
+    try testing.expectEqualStrings("i64", ftx);
+    try testing.expect(fields.next() != null); // y
+    try testing.expect(fields.next() == null);
+
+    const e = (it.next() orelse return error.TestExpectedItem).enum_decl;
+    try testing.expectEqualStrings("Dir", e.name().?.text);
+    var variants = e.variants();
+    try testing.expectEqualStrings("North", (variants.next() orelse return error.TestExpectedItem).name().?.text);
+    try testing.expectEqualStrings("South", (variants.next() orelse return error.TestExpectedItem).name().?.text);
+    try testing.expect(variants.next() == null);
+
+    const t = (it.next() orelse return error.TestExpectedItem).type_decl;
+    try testing.expectEqualStrings("Id", t.name().?.text);
+    const at = (try t.aliasedText(testing.allocator)).?;
+    defer testing.allocator.free(at);
+    try testing.expectEqualStrings("i64", at);
+
+    const cd = (it.next() orelse return error.TestExpectedItem).const_decl;
+    try testing.expectEqualStrings("MAX", cd.name().?.text);
+    try testing.expect(cd.value() != null);
+
+    const fc = (it.next() orelse return error.TestExpectedItem).face_decl;
+    try testing.expectEqualStrings("Greeter", fc.name().?.text);
+
+    const ft = (it.next() orelse return error.TestExpectedItem).fit_decl;
+    try testing.expectEqualStrings("Point", ft.name().?.text);
+
+    const mn = (it.next() orelse return error.TestExpectedItem).fn_decl;
+    try testing.expectEqualStrings("main", mn.name().?.text);
+    try testing.expect(it.next() == null);
 }
 
 test "statement losslessness across forms" {
@@ -2216,10 +2277,7 @@ test "a well-formed import emits no diagnostics" {
     try testing.expectEqual(@as(usize, 0), r.diagnostics.len);
 }
 
-test "unimplemented items don't break losslessness or item iteration" {
-    // `struct` isn't an item production yet; its tokens pass through
-    // SOURCE_FILE directly. The single `fn` item should still be
-    // surfaced by SourceFile.items().
+test "mixed items round-trip losslessly and all surface" {
     const src = "struct Point { x: i32 }\nfn main { 0 }\n";
     const r = try parse(testing.allocator, src, "mixed.q");
     defer r.deinit(testing.allocator);
@@ -2231,6 +2289,8 @@ test "unimplemented items don't break losslessness or item iteration" {
 
     const sf = ast.SourceFile.cast(r.root).?;
     var iter = sf.items();
+    const s = iter.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("Point", s.struct_decl.name().?.text);
     const fd = (iter.next() orelse return error.TestExpectedItem).fn_decl;
     try testing.expectEqualStrings("main", fd.name().?.text);
 }

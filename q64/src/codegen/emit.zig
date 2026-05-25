@@ -189,6 +189,7 @@ pub fn emitFromSource(
             const name = fd.name() orelse continue;
             if (std.mem.eql(u8, name.text, "main")) break :blk fd;
         },
+        else => {},
     } else return Error.NoMainFunction;
 
     return emitFn(allocator, &resolver, main_fn);
@@ -804,6 +805,7 @@ const Resolver = struct {
                 const name = fd.name() orelse continue;
                 try self.symbols.put(self.allocator, name.text, fd);
             },
+            else => {},
         };
     }
 
@@ -989,6 +991,7 @@ fn findPublicFn(sf: ast.SourceFile, name: []const u8) ?ast.FnDecl {
             const fn_name = fd.name() orelse continue;
             if (std.mem.eql(u8, fn_name.text, name)) return fd;
         },
+        else => {},
     };
     return null;
 }

@@ -41,15 +41,28 @@ pub const SourceFile = struct {
 // Items
 // =====================================================================
 
-/// `Item := Visibility? ItemKind`. v0 only recognizes `FnDecl`; the
-/// other item kinds land in this tagged union as their parser
-/// productions appear.
+/// `Item := Visibility? ItemKind` (spec/grammar.md §"Source files and
+/// items"). Every item kind the parser produces is surfaced; leaf
+/// internals that depend on the (unwritten) type-expression grammar —
+/// field/variant/const/alias types — remain raw spans rendered as text.
 pub const Item = union(enum) {
     fn_decl: FnDecl,
+    struct_decl: StructDecl,
+    enum_decl: EnumDecl,
+    type_decl: TypeDecl,
+    const_decl: ConstDecl,
+    face_decl: FaceDecl,
+    fit_decl: FitDecl,
 
     pub fn cast(node: *const cst.Node) ?Item {
         return switch (node.kind) {
             .FN_DECL => .{ .fn_decl = .{ .cst = node } },
+            .STRUCT_DECL => .{ .struct_decl = .{ .cst = node } },
+            .ENUM_DECL => .{ .enum_decl = .{ .cst = node } },
+            .TYPE_DECL => .{ .type_decl = .{ .cst = node } },
+            .CONST_DECL => .{ .const_decl = .{ .cst = node } },
+            .FACE_DECL => .{ .face_decl = .{ .cst = node } },
+            .FIT_DECL => .{ .fit_decl = .{ .cst = node } },
             else => null,
         };
     }
@@ -240,6 +253,209 @@ pub const FnDecl = struct {
 
     pub fn body(self: FnDecl) ?Block {
         return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+// =====================================================================
+// Other item declarations
+//
+// Each shares the item shell: an optional `VISIBILITY` node, the keyword
+// token, the name `IDENT`, and optional `GENERIC_PARAMS`. `itemName`
+// returns the first `IDENT` token child (the name), since visibility and
+// generics are nodes, not direct token children.
+// =====================================================================
+
+fn itemVisibility(node: *const cst.Node) ?Visibility {
+    return firstChildNode(node, .VISIBILITY, Visibility);
+}
+
+fn itemName(node: *const cst.Node) ?cst.Token {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (t.kind == .IDENT) return t,
+        .node => {},
+    };
+    return null;
+}
+
+/// `StructDecl := "struct" IDENT GenericParams? StructBody`
+/// (spec/grammar.md §"Type declarations").
+pub const StructDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: StructDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn isPublic(self: StructDecl) bool {
+        return self.visibility() != null;
+    }
+    pub fn name(self: StructDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+
+    /// Record-struct fields (`struct S { a: T, … }`). Empty for tuple
+    /// structs (`struct S(T, …)`) and unit structs (`struct S`).
+    pub fn fields(self: StructDecl) FieldIter {
+        const body = firstChildRawNode(self.cst, .RECORD_BODY) orelse
+            return .{ .children = &.{} };
+        return .{ .children = body.children };
+    }
+};
+
+pub const FieldIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *FieldIter) ?Field {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .FIELD) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// `Field := IDENT ":" TypeExpr` (the type is a raw span in v0).
+pub const Field = struct {
+    cst: *const cst.Node,
+
+    pub fn name(self: Field) ?cst.Token {
+        return itemName(self.cst);
+    }
+
+    /// The field's declared type as source text (raw span), or `null`
+    /// when absent. Caller owns the returned slice.
+    pub fn typeText(self: Field, allocator: std.mem.Allocator) !?[]u8 {
+        return joinTokensAfter(allocator, self.cst, .COLON);
+    }
+};
+
+/// `EnumDecl := "enum" IDENT GenericParams? "{" Variant,* "}"`.
+pub const EnumDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: EnumDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn isPublic(self: EnumDecl) bool {
+        return self.visibility() != null;
+    }
+    pub fn name(self: EnumDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+
+    pub fn variants(self: EnumDecl) VariantIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+pub const VariantIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *VariantIter) ?Variant {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .VARIANT) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// `Variant := IDENT VariantPayload?` (payload is a raw span in v0).
+pub const Variant = struct {
+    cst: *const cst.Node,
+
+    pub fn name(self: Variant) ?cst.Token {
+        return itemName(self.cst);
+    }
+};
+
+/// `TypeDecl := "type" IDENT GenericParams? "=" TypeExpr`.
+pub const TypeDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: TypeDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn isPublic(self: TypeDecl) bool {
+        return self.visibility() != null;
+    }
+    pub fn name(self: TypeDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+
+    /// The aliased type as source text (raw span after `=`). Caller owns
+    /// the returned slice.
+    pub fn aliasedText(self: TypeDecl, allocator: std.mem.Allocator) !?[]u8 {
+        return joinTokensAfter(allocator, self.cst, .EQ);
+    }
+};
+
+/// `ConstDecl := "const" IDENT ":" TypeExpr "=" Expr`.
+pub const ConstDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: ConstDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn isPublic(self: ConstDecl) bool {
+        return self.visibility() != null;
+    }
+    pub fn name(self: ConstDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+
+    /// The initializer expression after `=`, if present.
+    pub fn value(self: ConstDecl) ?Expr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Expr.cast(n)) |e| return e,
+            .token => {},
+        };
+        return null;
+    }
+};
+
+/// `FaceDecl := "face" IDENT … FaceBody`. The header (super-faces,
+/// generics) and method signatures are raw spans in v0.
+pub const FaceDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: FaceDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn isPublic(self: FaceDecl) bool {
+        return self.visibility() != null;
+    }
+    pub fn name(self: FaceDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+};
+
+/// `FitDecl := "fit" … FitBody`. Header and method bodies are raw spans
+/// in v0.
+pub const FitDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: FitDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn isPublic(self: FitDecl) bool {
+        return self.visibility() != null;
+    }
+
+    /// The first name in the `fit` header (`fit Name : Face` → `Name`).
+    pub fn name(self: FitDecl) ?cst.Token {
+        return itemName(self.cst);
     }
 };
 
