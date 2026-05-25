@@ -31,6 +31,21 @@ describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
     });
     expect(runCli(["run"], { cwd: proj }).exitCode).toBe(2);
   });
+
+  test("internal error (ICE) exits 70 with a Q9xxx internal-severity envelope", () => {
+    const r = runCli(["--version"], { env: { QUBE_FORCE_ICE: "1" } });
+    expect(r.exitCode).toBe(70);
+    expect(r.envelope?.diagnostics?.[0]?.code).toMatch(/^Q9/);
+    expect(r.envelope?.diagnostics?.[0]?.severity).toBe("internal");
+  });
+
+  test("a registry/auth failure during publish exits 67", () => {
+    const proj = makeProject({
+      "qube.json5": '{ "name": "dev.q64.pub", "version": "0.1.0", "license": "MIT", "type": "library" }',
+      "src/lib.q": "pub fn v() -> i64 { 1 }\n",
+    });
+    expect(runCli(["publish"], { cwd: proj, timeout: 15_000 }).exitCode).toBe(67);
+  });
 });
 
 // Test-first: success/compile/dependency/registry codes need the full

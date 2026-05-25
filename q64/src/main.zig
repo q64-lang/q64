@@ -15,6 +15,21 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
+    // Test seam: when Q64_FORCE_ICE is set, route through the internal-error
+    // (ICE) path so the exit-70 + Q9xxx `severity:internal` envelope contract
+    // (spec/q64-cli.md §"Exit codes", spec/diagnostics.md §"ICE convention")
+    // is observable. Never triggered in normal use.
+    if (init.environ_map.get("Q64_FORCE_ICE") != null) {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.writeAll(
+            \\{"ok":false,"diagnostics":[{"code":"Q9001","severity":"internal","kind":"ice","message":"forced internal error (Q64_FORCE_ICE)","repair":{"id":"report-upstream","safety":"n/a","report_url":"https://q64.dev/ice?code=Q9001"}}]}
+        );
+        try w.interface.writeAll("\n");
+        try w.interface.flush();
+        std.process.exit(70);
+    }
+
     var args_it = init.minimal.args.iterate();
     // Skip argv[0].
     _ = args_it.next();

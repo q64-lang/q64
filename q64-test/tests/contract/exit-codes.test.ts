@@ -27,6 +27,13 @@ describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
   test("unreadable input file → non-zero exit", () => {
     expect(runCli(["check", fixture("missing.q"), "--diagnostics", "json"]).exitCode).not.toBe(0);
   });
+
+  test("internal error (ICE) exits 70 with a Q9xxx internal-severity envelope", () => {
+    const r = runCli(["--version"], { env: { Q64_FORCE_ICE: "1" } });
+    expect(r.exitCode).toBe(70);
+    expect(r.envelope?.diagnostics?.[0]?.code).toMatch(/^Q9/);
+    expect(r.envelope?.diagnostics?.[0]?.severity).toBe("internal");
+  });
 });
 
 // Test-first: spec exit codes not reachable through implemented commands.

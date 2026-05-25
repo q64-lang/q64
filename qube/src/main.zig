@@ -16,6 +16,12 @@ const builtin = @import("builtin");
 
 const version_string = "qube 0.0.1 (pre-alpha)";
 
+// Emitted by the QUBE_FORCE_ICE test seam (see main). A single-line diagnostic
+// envelope matching spec/diagnostics.md §"ICE convention".
+const ice_envelope =
+    \\{"ok":false,"diagnostics":[{"code":"Q9001","severity":"internal","kind":"ice","message":"forced internal error (QUBE_FORCE_ICE)","repair":{"id":"report-upstream","safety":"n/a","report_url":"https://q64.dev/ice?code=Q9001"}}]}
+;
+
 // Kept in sync with q64/src/main.zig's `--version` output. The `qube web`
 // debug page surfaces it; a future revision will capture it dynamically
 // via `q64 --version`.
@@ -40,6 +46,15 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const env = init.environ_map;
+
+    // Test seam: when QUBE_FORCE_ICE is set, route through the internal-error
+    // path so the exit-70 + Q9xxx `severity:internal` envelope contract
+    // (spec/qube-cli.md §"Exit codes", spec/diagnostics.md §"ICE convention")
+    // is observable. Never triggered in normal use.
+    if (env.get("QUBE_FORCE_ICE") != null) {
+        try printStderr(io, "{s}\n", .{ice_envelope});
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    }
 
     var args_it = init.minimal.args.iterate();
     _ = args_it.next(); // argv[0]

@@ -35,6 +35,21 @@ describe.skipIf(!binaryAvailable())("qube build", () => {
     expect(existsSync(join(proj, "target/debug/dev.q64.test_app.component.wasm"))).toBe(true);
   });
 
+  test.failing("--debug builds into target/debug (unoptimised), exit 0", () => {
+    const proj = appProject();
+    const r = runCli(["build", "--debug"], { cwd: proj });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(proj, "target/debug/dev.q64.test_app.wasm"))).toBe(true);
+  });
+
+  test.failing("--target <name> selects a named target from the manifest, exit 0", () => {
+    const proj = makeProject({
+      "qube.json5": '{ "name": "dev.q64.test_app", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q", "targets": { "desktop": { "host": "wasmtime" } } }',
+      "src/main.q": "fn main { env.out(\"x\") }\n",
+    });
+    expect(runCli(["build", "--target", "desktop"], { cwd: proj }).exitCode).toBe(0);
+  });
+
   test.failing("a compile error from q64 propagates as exit 64", () => {
     const proj = makeProject({
       "qube.json5": appManifest(),
