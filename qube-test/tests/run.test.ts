@@ -43,7 +43,16 @@ describe.skipIf(!binaryAvailable())("qube run (manifest discovery)", () => {
   });
 });
 
-describe("qube run (full toolchain)", () => {
-  test.todo("a clean application prints its output and exits 0");
-  test.todo("a runtime panic in the program exits 1");
+// Test-first: a full `qube run` needs q64 + a runtime host wired on PATH, which
+// is not the case in v0 (run fails to locate q64). `test.failing` until it is.
+describe.skipIf(!binaryAvailable())("qube run (full toolchain)", () => {
+  test.failing("a clean application prints its output and exits 0", () => {
+    const proj = makeProject({
+      "qube.json5": appManifest(),
+      "src/main.q": "fn main { env.out(\"Hello from qube-test.\") }\n",
+    });
+    const r = runCli(["run"], { cwd: proj });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("Hello from qube-test.");
+  });
 });

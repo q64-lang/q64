@@ -29,9 +29,12 @@ describe.skipIf(!binaryAvailable())("q64 check", () => {
   });
 
   // `check` is parser-only in v0; type-checking diagnostics (TYP*) are not
-  // emitted yet, so type-error.q parses clean today. Flips on with the
-  // type-checker (or once `build` runs full analysis).
-  test.todo("surfaces a type error (TYP042) for type-error.q once type-checking lands");
+  // emitted yet, so type-error.q parses clean today. Test-first: red until the
+  // type-checker lands and surfaces TYP042 (spec/types.md §arithmetic).
+  test.failing("surfaces a type error (TYP042) for type-error.q once type-checking lands", () => {
+    const r = runCli(["check", fixture("type-error.q"), "--diagnostics", "json"]);
+    expect(hasDiagnostic(r.envelope, "TYP042", "error")).toBe(true);
+  });
 
   test("missing file: input error, exit non-zero", () => {
     const r = runCli(["check", fixture("does-not-exist.q"), "--diagnostics", "json"]);

@@ -1,18 +1,30 @@
 /**
  * `qube new <name>` / `qube init` (spec/qube-cli.md §Subcommands). Scaffolds a
- * qube directory with a starter manifest and `src/`. Not implemented in v0
- * (both are stubs that exit 2 — pinned in usage.test.ts); the spec'd
- * scaffolding behavior is encoded here as `.todo`.
+ * qube directory with a starter manifest and `src/`.
+ *
+ * Test-first: not implemented in v0 (both stubs exit 2 — pinned in
+ * usage.test.ts). `test.failing` asserts the scaffolding until it lands.
  */
-import { describe, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
+import { binaryAvailable, makeProject, runCli } from "../src/harness";
 
-describe("qube new", () => {
-  test.todo("creates a new directory with a starter qube.json5 and src/");
-  test.todo("the generated manifest validates against the schema");
-  test.todo("defaults to a library (entry src/lib.q) unless --bin/application is requested");
+describe.skipIf(!binaryAvailable())("qube new", () => {
+  test.failing("creates a new directory with a starter qube.json5 and src/", () => {
+    const parent = makeProject({ ".keep": "" });
+    const r = runCli(["new", "dev.q64.fresh"], { cwd: parent });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(parent, "dev.q64.fresh/qube.json5"))).toBe(true);
+    expect(existsSync(join(parent, "dev.q64.fresh/src"))).toBe(true);
+  });
 });
 
-describe("qube init", () => {
-  test.todo("initialises a qube in the current directory");
-  test.todo("refuses to overwrite an existing qube.json5");
+describe.skipIf(!binaryAvailable())("qube init", () => {
+  test.failing("initialises a qube in the current directory", () => {
+    const dir = makeProject({ ".keep": "" });
+    const r = runCli(["init"], { cwd: dir });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(dir, "qube.json5"))).toBe(true);
+  });
 });

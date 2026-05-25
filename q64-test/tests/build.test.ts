@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { WASM_MAGIC, binaryAvailable, fixture, runCli } from "../src/harness";
+import { WASM_MAGIC, binaryAvailable, fixture, runCli, tmpCopy } from "../src/harness";
 
 let work: string;
 beforeAll(() => {
@@ -43,10 +43,35 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
   });
 });
 
-describe("q64 build (spec surface)", () => {
-  test.todo("build <file> writes <file>.wasm by default");
-  test.todo("--out <path> overrides the output path");
-  test.todo("--component also writes <out>.component.wasm");
-  test.todo("--target <name> resolves via the qube manifest");
-  test.todo("compile error exits 64 (per §Exit codes)");
+// Test-first: the spec's `build` surface (distinct from the v0 `emit` spelling).
+// Not implemented yet, so these are `test.failing` until `build` lands.
+describe.skipIf(!binaryAvailable())("q64 build (spec surface)", () => {
+  test.failing("build <file> writes <file>.wasm by default", () => {
+    const src = tmpCopy("hello.q");
+    const r = runCli(["build", src]);
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(`${src}.wasm`)).toBe(true);
+  });
+
+  test.failing("--out <path> overrides the output path", () => {
+    const out = join(work, "custom.wasm");
+    const r = runCli(["build", fixture("hello.q"), "--out", out]);
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(out)).toBe(true);
+  });
+
+  test.failing("--component also writes <out>.component.wasm", () => {
+    const out = join(work, "comp.wasm");
+    const r = runCli(["build", fixture("hello.q"), "--out", out, "--component"]);
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(`${out}.component.wasm`)).toBe(true);
+  });
+
+  test.failing("--target <name> resolves and builds", () => {
+    expect(runCli(["build", fixture("hello.q"), "--target", "wasmtime", "--out", join(work, "t.wasm")]).exitCode).toBe(0);
+  });
+
+  test.failing("compile error exits 64 (per §Exit codes)", () => {
+    expect(runCli(["build", fixture("parse-error.q"), "--out", join(work, "e.wasm")]).exitCode).toBe(64);
+  });
 });

@@ -64,6 +64,8 @@ export interface RunOptions {
   stdin?: string;
   cwd?: string;
   env?: Record<string, string>;
+  /** Hard cap so a command that blocks (e.g. `qube web` serving) can't hang the suite. */
+  timeout?: number;
 }
 
 /** Run `qube <args>` synchronously and capture its output. */
@@ -73,6 +75,7 @@ export function runCli(args: string[], opts: RunOptions = {}): CliResult {
     stdin: opts.stdin != null ? Buffer.from(opts.stdin) : undefined,
     cwd: opts.cwd,
     env: opts.env ? { ...process.env, ...opts.env } : undefined,
+    timeout: opts.timeout ?? 30_000,
     stdout: "pipe",
     stderr: "pipe",
   });

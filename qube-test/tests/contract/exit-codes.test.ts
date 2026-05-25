@@ -5,7 +5,7 @@
  * Codes reachable on the binary alone run for real; the rest are `.todo`.
  */
 import { describe, expect, test } from "bun:test";
-import { binaryAvailable, makeProject, runCli } from "../../src/harness";
+import { appManifest, binaryAvailable, makeProject, runCli } from "../../src/harness";
 
 describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
   test("no subcommand → usage, exit 2", () => {
@@ -33,11 +33,27 @@ describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
   });
 });
 
-describe("exit codes (spec surface)", () => {
-  test.todo("a clean `run` / `build` exits 0");
-  test.todo("a runtime failure during run/test exits 1");
-  test.todo("a compile error from q64 exits 64");
-  test.todo("a dependency resolution failure (or --offline cache miss) exits 66");
-  test.todo("a registry/network/auth failure exits 67");
-  test.todo("an internal error or ICE propagated from q64 exits 70");
+// Test-first: success/compile/dependency/registry codes need the full
+// toolchain or registry. `test.failing` until those paths land.
+describe.skipIf(!binaryAvailable())("exit codes (spec surface)", () => {
+  test.failing("a clean `build` exits 0", () => {
+    const proj = makeProject({ "qube.json5": appManifest(), "src/main.q": "fn main { env.out(\"x\") }\n" });
+    expect(runCli(["build"], { cwd: proj }).exitCode).toBe(0);
+  });
+
+  test.failing("a compile error from q64 exits 64", () => {
+    const proj = makeProject({
+      "qube.json5": appManifest(),
+      "src/main.q": "import q64.math.*\nfn main { env.out(\"x\") }\n",
+    });
+    expect(runCli(["build"], { cwd: proj }).exitCode).toBe(64);
+  });
+
+  test.failing("a dependency cache miss with --offline exits 66", () => {
+    const proj = makeProject({
+      "qube.json5": '{ "name": "dev.q64.x", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q", "dependencies": { "dev.q64.absent": "^9.9" } }',
+      "src/main.q": "fn main { env.out(\"x\") }\n",
+    });
+    expect(runCli(["build", "--offline"], { cwd: proj, timeout: 15_000 }).exitCode).toBe(66);
+  });
 });

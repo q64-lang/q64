@@ -11,8 +11,9 @@
  * When the binary is absent, binaryAvailable() returns false so spawn-based
  * suites skip rather than fail.
  */
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -65,6 +66,8 @@ export interface RunOptions {
   stdin?: string;
   cwd?: string;
   env?: Record<string, string>;
+  /** Hard cap so a command that blocks (e.g. `q64 lsp` awaiting more input) can't hang the suite. */
+  timeout?: number;
 }
 
 /** Run `q64 <args>` synchronously and capture its output. */
@@ -74,6 +77,7 @@ export function runCli(args: string[], opts: RunOptions = {}): CliResult {
     stdin: opts.stdin != null ? Buffer.from(opts.stdin) : undefined,
     cwd: opts.cwd,
     env: opts.env ? { ...process.env, ...opts.env } : undefined,
+    timeout: opts.timeout ?? 30_000,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -124,3 +128,31 @@ export function hasDiagnostic(
 
 /** First 4 bytes of a WebAssembly module: the `\0asm` magic. */
 export const WASM_MAGIC = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
+
+/**
+ * Copy a fixture into a fresh temp dir and return the destination path, so
+ * commands that write next to their input (build → <file>.wasm, fmt in place)
+ * don't dirty the repo fixtures.
+ */
+export function tmpCopy(fixtureName: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "q64-fx-"));
+  const dest = join(dir, fixtureName);
+  copyFileSync(fixture(fixtureName), dest);
+  return dest;
+}
+
+/** Frame a JSON-RPC object as an LSP message (Content-Length header + body). */
+export function lspFrame(obj: unknown): string {
+  const body = JSON.stringify(obj);
+  return `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+}
+
+/** A minimal LSP `initialize` request, framed and ready to feed on stdin. */
+export function lspInitialize(): string {
+  return lspFrame({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { processId: null, rootUri: null, capabilities: {} },
+  });
+}

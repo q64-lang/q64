@@ -29,10 +29,22 @@ describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
   });
 });
 
-describe("exit codes (spec surface)", () => {
-  test.todo("compile error (any error-severity diagnostic) exits 64");
-  test.todo("input error (file not found / unreadable) exits 65");
-  test.todo("uncaught program panic exits 1");
-  test.todo("`env.exit(N)` exits with code N");
-  test.todo("internal compiler error (ICE) exits 70 with a Q9xxx diagnostic");
+// Test-first: spec exit codes not reachable through implemented commands.
+// `test.failing` until the owning subcommand (run/build) lands.
+describe.skipIf(!binaryAvailable())("exit codes (spec surface)", () => {
+  test.failing("compile error (any error-severity diagnostic) exits 64", () => {
+    expect(runCli(["build", fixture("parse-error.q"), "--out", "/tmp/q64-ec.wasm"]).exitCode).toBe(64);
+  });
+
+  test.failing("input error (file not found) exits 65", () => {
+    expect(runCli(["run", fixture("missing.q")]).exitCode).toBe(65);
+  });
+
+  test.failing("uncaught program panic exits 1", () => {
+    expect(runCli(["run", fixture("panic.q")]).exitCode).toBe(1);
+  });
+
+  test.failing("`env.exit(N)` exits with code N", () => {
+    expect(runCli(["run", fixture("exit.q")]).exitCode).toBe(3);
+  });
 });

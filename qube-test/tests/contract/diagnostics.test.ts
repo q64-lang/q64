@@ -14,9 +14,24 @@ describe.skipIf(!binaryAvailable())("diagnostic framing (implemented paths)", ()
   });
 });
 
-describe("diagnostic framing (spec surface)", () => {
-  test.todo("manifest/resolver errors are PKG-prefixed envelopes under --diagnostics json");
-  test.todo("registry-client errors are REG2-prefixed envelopes");
-  test.todo("q64's envelopes are forwarded verbatim (not re-wrapped) during a build");
-  test.todo("the worst exit code across multiple q64 invocations wins (70 > 64 > 2 > 0)");
+// Test-first: structured PKG/REG2 envelopes and verbatim q64 forwarding require
+// the build/resolver pipeline. `test.failing` until they land.
+describe.skipIf(!binaryAvailable())("diagnostic framing (spec surface)", () => {
+  test.failing("manifest/resolver errors are PKG-prefixed envelopes under --diagnostics json", () => {
+    const proj = makeProject({
+      "qube.json5": '{ "name": "singlename", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q" }',
+      "src/main.q": "fn main { env.out(\"x\") }\n",
+    });
+    const r = runCli(["build", "--diagnostics", "json"], { cwd: proj });
+    expect((r.envelope?.diagnostics ?? []).some((d) => d.code.startsWith("PKG"))).toBe(true);
+  });
+
+  test.failing("q64's envelopes are forwarded verbatim during a build", () => {
+    const proj = makeProject({
+      "qube.json5": '{ "name": "dev.q64.x", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q" }',
+      "src/main.q": "import q64.math.*\nfn main { env.out(\"x\") }\n",
+    });
+    const r = runCli(["build", "--diagnostics", "json"], { cwd: proj });
+    expect((r.envelope?.diagnostics ?? []).some((d) => d.code === "NAM003")).toBe(true);
+  });
 });

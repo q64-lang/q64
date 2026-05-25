@@ -39,11 +39,34 @@ describe.skipIf(!binaryAvailable())("qube.json5 parsing (via qube run)", () => {
   });
 });
 
-describe("qube.json5 validation (spec surface)", () => {
-  test.todo("full JSON5 (unquoted keys, single-quoted strings) parses per spec/qube.json5.md");
-  test.todo("a publishable name must be reverse-DNS with >= 2 segments (PKG diagnostic)");
-  test.todo("a missing required field (version / license) is a PKG diagnostic");
-  test.todo("an unknown `type` value is rejected");
-  test.todo("a dependency object with both `path` and `version` is rejected");
-  test.todo("$schema is validated against the bundled JSON Schema");
+// Test-first: full JSON5 parsing and manifest validation (PKG diagnostics) are
+// not implemented in v0. `test.failing` until they land.
+describe.skipIf(!binaryAvailable())("qube.json5 validation (spec surface)", () => {
+  test.failing("full JSON5 (unquoted keys, single-quoted strings) parses per spec", () => {
+    const proj = makeProject({
+      "qube.json5": "{ name: 'dev.q64.j5', version: '0.1.0', license: 'MIT', type: 'application', entry: 'src/main.q' }",
+      "src/main.q": "fn main { env.out(\"x\") }\n",
+    });
+    const r = runCli(["run"], { cwd: proj });
+    expect(r.exitCode).not.toBe(65);
+    expect(r.stderr).not.toContain("cannot parse");
+  });
+
+  test.failing("a single-segment publishable name is a PKG diagnostic", () => {
+    const proj = makeProject({
+      "qube.json5": '{ "name": "singlename", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q" }',
+      "src/main.q": "fn main { env.out(\"x\") }\n",
+    });
+    const r = runCli(["build"], { cwd: proj });
+    expect((r.envelope?.diagnostics ?? []).some((d) => d.code.startsWith("PKG"))).toBe(true);
+  });
+
+  test.failing("a missing required field (license) is a PKG diagnostic", () => {
+    const proj = makeProject({
+      "qube.json5": '{ "name": "dev.q64.nolic", "version": "0.1.0", "type": "application", "entry": "src/main.q" }',
+      "src/main.q": "fn main { env.out(\"x\") }\n",
+    });
+    const r = runCli(["build"], { cwd: proj });
+    expect((r.envelope?.diagnostics ?? []).some((d) => d.code.startsWith("PKG"))).toBe(true);
+  });
 });

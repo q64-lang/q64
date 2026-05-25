@@ -1,17 +1,45 @@
 /**
  * `qube build [--target <name>]` (spec/qube-cli.md §Subcommands, §"target/
- * layout"). Compiles the qube to wasm, invoking q64 per source file. Not
- * implemented in v0 (stub exits 2 — pinned in usage.test.ts); spec surface
- * encoded as `.todo`.
+ * layout"). Compiles the qube to wasm, invoking q64 per source file.
+ *
+ * Test-first: not implemented in v0 (stub exits 2 — pinned in usage.test.ts).
+ * `test.failing` asserts the artifacts/exit codes until it lands.
  */
-import { describe, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
+import { appManifest, binaryAvailable, makeProject, runCli } from "../src/harness";
 
-describe("qube build", () => {
-  test.todo("writes target/debug/<name>.wasm by default");
-  test.todo("--release writes target/release/<name>.wasm");
-  test.todo("--component also writes target/<host>/<name>.component.wasm");
-  test.todo("--target <name> selects a named target from the manifest");
-  test.todo("emits <name>.effects.json alongside the wasm");
-  test.todo("a compile error from q64 propagates as exit 64");
-  test.todo("from a workspace root, builds every member in dependency order");
+function appProject() {
+  return makeProject({ "qube.json5": appManifest(), "src/main.q": "fn main { env.out(\"x\") }\n" });
+}
+
+describe.skipIf(!binaryAvailable())("qube build", () => {
+  test.failing("writes target/debug/<name>.wasm by default, exit 0", () => {
+    const proj = appProject();
+    const r = runCli(["build"], { cwd: proj });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(proj, "target/debug/dev.q64.test_app.wasm"))).toBe(true);
+  });
+
+  test.failing("--release writes target/release/<name>.wasm", () => {
+    const proj = appProject();
+    const r = runCli(["build", "--release"], { cwd: proj });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(proj, "target/release/dev.q64.test_app.wasm"))).toBe(true);
+  });
+
+  test.failing("--component also writes a <name>.component.wasm", () => {
+    const proj = appProject();
+    runCli(["build", "--component"], { cwd: proj });
+    expect(existsSync(join(proj, "target/debug/dev.q64.test_app.component.wasm"))).toBe(true);
+  });
+
+  test.failing("a compile error from q64 propagates as exit 64", () => {
+    const proj = makeProject({
+      "qube.json5": appManifest(),
+      "src/main.q": "import q64.math.*\nfn main { env.out(\"x\") }\n",
+    });
+    expect(runCli(["build"], { cwd: proj }).exitCode).toBe(64);
+  });
 });
