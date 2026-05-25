@@ -8,13 +8,14 @@
 //!
 //! v0 ABI it implements (spec/env.md §"Capability faces"):
 //!
-//!   env.out :: (ptr: i32, len: i32) -> ()
+//!   env.out :: (ptr: i64, len: i64) -> ()
 //!     Writes `len` bytes from linear memory starting at `ptr` to
 //!     the host's stdout, verbatim. UTF-8 is the producer contract;
-//!     the host does not validate it.
+//!     the host does not validate it. Pointers are i64: q64 targets
+//!     Wasm Memory64 (spec/memory.md).
 //!
 //! The module must export:
-//!   - `memory` — a single linear memory.
+//!   - `memory` — a single 64-bit (Memory64) linear memory.
 //!   - `_start` — a `() -> ()` function the host invokes.
 
 const std = @import("std");
@@ -58,7 +59,12 @@ pub fn main(init: std.process.Init) !void {
     // -------------------------------------------------------------
     // Engine + store + context.
     // -------------------------------------------------------------
-    const engine = c.wasm_engine_new() orelse return error.EngineNewFailed;
+    // q64 emits 64-bit (Memory64) modules; memory64 is off by default in
+    // wasmtime, so enable it on the engine config. `new_with_config`
+    // takes ownership of the config — don't free it here.
+    const config = c.wasm_config_new() orelse return error.ConfigNewFailed;
+    c.wasmtime_config_wasm_memory64_set(config, true);
+    const engine = c.wasm_engine_new_with_config(config) orelse return error.EngineNewFailed;
     defer c.wasm_engine_delete(engine);
 
     const store = c.wasmtime_store_new(engine, null, null) orelse return error.StoreNewFailed;
@@ -107,8 +113,8 @@ pub fn main(init: std.process.Init) !void {
     defer c.wasmtime_linker_delete(linker);
 
     var param_types = [_]?*c.wasm_valtype_t{
-        c.wasm_valtype_new(c.WASM_I32),
-        c.wasm_valtype_new(c.WASM_I32),
+        c.wasm_valtype_new(c.WASM_I64),
+        c.wasm_valtype_new(c.WASM_I64),
     };
     var params_vec: c.wasm_valtype_vec_t = undefined;
     c.wasm_valtype_vec_new(&params_vec, param_types.len, @ptrCast(&param_types));
@@ -212,11 +218,11 @@ fn envOutCallback(
     _ = results;
     _ = nresults;
 
-    if (nargs != 2) return trap("env.out: expected (i32, i32)");
+    if (nargs != 2) return trap("env.out: expected (i64, i64)");
 
-    const ptr_i32 = args[0].of.i32;
-    const len_i32 = args[1].of.i32;
-    if (ptr_i32 < 0 or len_i32 < 0) return trap("env.out: negative ptr/len");
+    const ptr_i64 = args[0].of.i64;
+    const len_i64 = args[1].of.i64;
+    if (ptr_i64 < 0 or len_i64 < 0) return trap("env.out: negative ptr/len");
 
     var memory_item: c.wasmtime_extern_t = undefined;
     if (!c.wasmtime_caller_export_get(caller, "memory", "memory".len, &memory_item)) {
@@ -230,8 +236,8 @@ fn envOutCallback(
     const data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
     const data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
 
-    const ptr: usize = @intCast(ptr_i32);
-    const len: usize = @intCast(len_i32);
+    const ptr: usize = @intCast(ptr_i64);
+    const len: usize = @intCast(len_i64);
     if (ptr + len > data_size) return trap("env.out: out-of-bounds write");
 
     const slice = data[ptr .. ptr + len];

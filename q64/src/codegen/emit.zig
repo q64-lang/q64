@@ -8,12 +8,12 @@
 //! Module shape produced:
 //!
 //!   (module
-//!     (import "env" "out" (func (param i32 i32)))
-//!     (memory (export "memory") 1)
-//!     (data (i32.const 0) "Hello, q64.\n")
+//!     (import "env" "out" (func (param i64 i64)))
+//!     (memory (export "memory") i64 1)
+//!     (data (i64.const 0) "Hello, q64.\n")
 //!     (func (export "_start")
-//!       i32.const 0
-//!       i32.const 12
+//!       i64.const 0
+//!       i64.const 12
 //!       call $env_out))
 //!
 //! The result instantiates against `runtime/wasmtime/q64-wasmtime-host`
@@ -66,11 +66,15 @@ pub fn emitHelloWasm(allocator: std.mem.Allocator) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
-    const i32_type = c.BinaryenTypeInt32();
+    // q64 targets Wasm Memory64 (spec/memory.md): 64-bit linear memory,
+    // i64 pointers, so env.out is (i64, i64) -> ().
+    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureMemory64());
+
+    const i64_type = c.BinaryenTypeInt64();
     const none_type = c.BinaryenTypeNone();
 
-    // env.out :: (i32, i32) -> () — imported from "env"."out".
-    var env_out_params = [_]c.BinaryenType{ i32_type, i32_type };
+    // env.out :: (i64, i64) -> () — imported from "env"."out".
+    var env_out_params = [_]c.BinaryenType{ i64_type, i64_type };
     const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
     c.BinaryenAddFunctionImport(
         module,
@@ -87,7 +91,7 @@ pub fn emitHelloWasm(allocator: std.mem.Allocator) ![]u8 {
     var seg_datas = [_][*c]const u8{payload.ptr};
     var seg_passives = [_]bool{false};
     var seg_offsets = [_]c.BinaryenExpressionRef{
-        c.BinaryenConst(module, c.BinaryenLiteralInt32(0)),
+        c.BinaryenConst(module, c.BinaryenLiteralInt64(0)),
     };
     var seg_sizes = [_]c.BinaryenIndex{@intCast(payload.len)};
 
@@ -103,13 +107,13 @@ pub fn emitHelloWasm(allocator: std.mem.Allocator) ![]u8 {
         @ptrCast(&seg_sizes),
         seg_sizes.len,
         false, // shared
-        false, // memory64
+        true, // memory64
         "0", // internal memory name
     );
 
     // _start body: call env.out(0, payload.len).
-    const ptr_arg = c.BinaryenConst(module, c.BinaryenLiteralInt32(0));
-    const len_arg = c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(payload.len)));
+    const ptr_arg = c.BinaryenConst(module, c.BinaryenLiteralInt64(0));
+    const len_arg = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(payload.len)));
     var call_args = [_]c.BinaryenExpressionRef{ ptr_arg, len_arg };
     const body = c.BinaryenCall(
         module,
@@ -561,27 +565,30 @@ fn emitModule(
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
-    // The string-return ABI is a `(i32, i32)` (ptr, len) multi-value
-    // return with a tuple local at the call site — both need Multivalue.
-    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureMultivalue());
+    // q64 is 64-bit: Memory64 linear memory with i64 pointers (spec/
+    // memory.md §"The platform"). The string-return ABI is a `(i64, i64)`
+    // (ptr, len) multi-value return with a tuple local at the call site —
+    // needs Multivalue + Memory64.
+    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureMultivalue() | c.BinaryenFeatureMemory64());
 
-    const i32_type = c.BinaryenTypeInt32();
+    const i64_type = c.BinaryenTypeInt64();
     const none_type = c.BinaryenTypeNone();
-    var pair = [_]c.BinaryenType{ i32_type, i32_type };
+    var pair = [_]c.BinaryenType{ i64_type, i64_type };
     const pair_type = c.BinaryenTypeCreate(&pair, pair.len);
 
-    var env_out_params = [_]c.BinaryenType{ i32_type, i32_type };
+    var env_out_params = [_]c.BinaryenType{ i64_type, i64_type };
     const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
     c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
 
     // One active data segment at offset 0 holds the whole memory image.
+    // The offset is an i64 const because the memory is 64-bit.
     if (data.len == 0) {
-        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, false, "0");
+        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, true, "0");
     } else {
         var seg_datas = [_][*c]const u8{data.ptr};
         var seg_passives = [_]bool{false};
         var seg_offsets = [_]c.BinaryenExpressionRef{
-            c.BinaryenConst(module, c.BinaryenLiteralInt32(0)),
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(0)),
         };
         var seg_sizes = [_]c.BinaryenIndex{@intCast(data.len)};
         c.BinaryenSetMemory(
@@ -596,16 +603,16 @@ fn emitModule(
             @ptrCast(&seg_sizes),
             seg_sizes.len,
             false,
-            false,
+            true,
             "0",
         );
     }
 
-    // Emit each callee: `() -> (i32, i32)` returning (data_off, data_len).
+    // Emit each callee: `() -> (i64, i64)` returning (data_off, data_len).
     for (callees) |callee| {
         var elems = [_]c.BinaryenExpressionRef{
-            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(callee.data_off))),
-            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(callee.data_len))),
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(callee.data_off))),
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(callee.data_len))),
         };
         const tup = c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
         _ = c.BinaryenAddFunction(module, callee.name.ptr, none_type, pair_type, null, 0, tup);
@@ -626,8 +633,8 @@ fn emitModule(
     for (actions) |action| switch (action) {
         .print_const => |p| {
             var cargs = [_]c.BinaryenExpressionRef{
-                c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.off))),
-                c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.len))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(p.off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(p.len))),
             };
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
         },
@@ -640,8 +647,8 @@ fn emitModule(
             };
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
             var nargs = [_]c.BinaryenExpressionRef{
-                c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(p.nl_off))),
-                c.BinaryenConst(module, c.BinaryenLiteralInt32(1)),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(p.nl_off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(1)),
             };
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
         },

@@ -56,13 +56,25 @@ and `qube run`):
        only; a registry/git dep is reported and rejected (wants the
        `qube.lock` + cache resolution below).
 5. [x] Cross-module calls land **for real**: `env.out(version())` now emits
-       `version` as a wasm `() -> (i32, i32)` function returning `(ptr, len)`
+       `version` as a wasm `() -> (i64, i64)` function returning `(ptr, len)`
        (the v0 string-return ABI) and calls it at runtime — not folded.
        `q64/src/codegen/emit.zig` `ensureCallee` + `emitModule` (action plan
        + Multivalue feature + tuple local). Const-folding remains for
        interpolation (`"{version()}"`). Confirmed: the real form emits two
        functions, the folded form one. Interpolated string *concatenation*
        at runtime (a string builder over linear memory) is the next ABI step.
+7. [x] **Memory64 / 64-bit ABI.** Per `spec/memory.md` (Wasm 3.0, 64-bit
+       mode), codegen now emits a Memory64 linear memory with `i64`
+       pointers; `env.out` is `(i64, i64) -> ()`. `emit.zig` enables the
+       Memory64 feature + i64 consts/segment offsets; the wasmtime host
+       (`runtime/wasmtime/`) enables `wasm_memory64` on the engine config
+       and reads i64 args; `hello.wat` updated to `i64`/`(memory … i64 …)`.
+       Verified: emitted memory section flags = `0x05` (has-max + 64-bit).
+       **Next:** the implicit `scope` Arena (a bump-pointer global in
+       linear memory) as the first *writable* region — unblocks runtime
+       string building and the return-into-caller's-region ABI
+       (`spec/memory.md` §"Lifetime tracking", REG010). Defer the `Stack`
+       region kind + multi-memory segregation.
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.
