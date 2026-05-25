@@ -126,10 +126,18 @@ and `qube run`):
        evaluation. `_start`'s local layout became
        `[binding i64s][transient tuples][buf/off/len scratch]`; a `bind_call`
        action computes the value. Verified end-to-end (`link-roundtrip.sh`:
-       `let g = shout("hi")` → `hi!` / `got: hi! and hi!`). **Boundary:**
-       runtime bindings can be *referenced* but not yet *passed as
-       arguments* (`shout(g)` → `NotConstExpr`); runtime args + the `Stack`
-       region kind + multi-memory are the remaining `spec/memory.md` work.
+       `let g = shout("hi")` → `hi!` / `got: hi! and hi!`).
+14. [x] **Runtime arguments.** A runtime binding can now be *passed* into a
+       call: `ArgVal` became `constant | binding`, `extractCallArgs` detects
+       a bare reference to a runtime binding and passes its locals
+       (`local.get ptr/len`) rather than const-folding. This completes the
+       value flow — `let g = shout("hi"); let w = wrap(g); env.out("{w}")`
+       binds, passes, binds the result, and references it. Verified
+       end-to-end (`link-roundtrip.sh`: `wrap(g)` → `[hi!]` / `nested:
+       [hi!]`). **Boundary:** the argument must be a binding or a const — a
+       *nested* non-const call (`wrap(shout("yo"))`) still errors; bind it
+       first. **Remaining `spec/memory.md` work:** the `Stack` region kind
+       (LIFO, freed on return) and multi-memory segregation.
 6. [x] Codegen: string interpolation `"{expr}"` — `{expr}` is parsed (via
        `parse.parseExpression`), const-evaluated, and concatenated; `{{`/`}}`
        are literal braces. Runtime-valued interpolations error honestly.

@@ -236,4 +236,31 @@ if [[ "$rt_out" != "$rt_expected" ]]; then
 fi
 echo "    ok: runtime binding referenced multiple times"
 
+# Runtime argument: a runtime binding is passed into another call, whose
+# result is bound and referenced — the full bind → pass → bind → use flow.
+echo "==> bindings: q64 emit runtime arg wrap(g)"
+printf 'pub fn wrap(s: str) -> str { "[{s}]" }\n' >> "$param_lib/lib.q"
+arg_app="$tmp/arg.q"
+arg_wasm="$tmp/arg.wasm"
+cat > "$arg_app" <<'Q64'
+import dev.q64.strlib.{shout, wrap}
+
+fn main {
+    let g = shout("hi")
+    env.out(wrap(g))
+    let w = wrap(g)
+    env.out("nested: {w}")
+}
+Q64
+"$Q64_BIN" emit "$arg_app" "$arg_wasm" --module "dev.q64.strlib=$param_lib"
+arg_out="$("$HOST_BIN" "$arg_wasm")"
+arg_expected=$'[hi!]\nnested: [hi!]'
+if [[ "$arg_out" != "$arg_expected" ]]; then
+    echo "FAIL: runtime-argument output mismatch" >&2
+    printf "  expected: %q\n" "$arg_expected" >&2
+    printf "  actual:   %q\n" "$arg_out" >&2
+    exit 1
+fi
+echo "    ok: runtime binding passed as an argument"
+
 echo "PASS: $qube_out"

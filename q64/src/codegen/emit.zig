@@ -214,9 +214,12 @@ const Callee = struct {
     },
 };
 
-// A string-literal argument passed at a call site, materialized in the
-// static data segment.
-const ArgVal = struct { off: u32, len: u32 };
+// A string argument passed at a call site: either a constant materialized
+// in the static data segment, or a runtime binding passed by its locals.
+const ArgVal = union(enum) {
+    constant: struct { off: u32, len: u32 },
+    binding: RtBinding,
+};
 
 // A runtime `let`/`var` binding holds a string value in two i64 `_start`
 // locals (ptr, len). Binding locals come first in `_start`'s frame, so
@@ -297,14 +300,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                 .call => |inner| {
                     const idx = try ensureCallee(allocator, resolver, &data, &callees, &segments, inner);
                     const args_first = call_args.items.len;
-                    var ait = inner.args();
-                    while (ait.next()) |a| {
-                        const v = try resolver.constEvalExpr(a);
-                        defer allocator.free(v);
-                        const off: u32 = @intCast(data.items.len);
-                        try data.appendSlice(allocator, v);
-                        try call_args.append(allocator, .{ .off = off, .len = @intCast(v.len) });
-                    }
+                    try extractCallArgs(allocator, resolver, &data, &rt_bindings, &call_args, inner);
                     const args_count = call_args.items.len - args_first;
                     if (args_count != callees.items[idx].n_str_params) return Error.UnsupportedCall;
                     const nl = try ensureNewline(allocator, &data, &nl_off);
@@ -404,14 +400,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
                     };
                     const idx = try ensureCallee(allocator, resolver, &data, &callees, &segments, inner);
                     const args_first = call_args.items.len;
-                    var ait = inner.args();
-                    while (ait.next()) |a| {
-                        const v = try resolver.constEvalExpr(a);
-                        defer allocator.free(v);
-                        const off: u32 = @intCast(data.items.len);
-                        try data.appendSlice(allocator, v);
-                        try call_args.append(allocator, .{ .off = off, .len = @intCast(v.len) });
-                    }
+                    try extractCallArgs(allocator, resolver, &data, &rt_bindings, &call_args, inner);
                     const args_count = call_args.items.len - args_first;
                     if (args_count != callees.items[idx].n_str_params) return Error.UnsupportedCall;
 
@@ -590,6 +579,38 @@ fn envOutArg(allocator: std.mem.Allocator, call: ast.CallExpr) !ast.Expr {
 
     var arg_iter = call.args();
     return arg_iter.next() orelse return Error.UnsupportedCall;
+}
+
+/// Extract a call's string arguments into `call_args`. A bare reference to
+/// a runtime binding is passed by its locals (a runtime argument); any
+/// other argument is const-evaluated into the static data segment.
+fn extractCallArgs(
+    allocator: std.mem.Allocator,
+    resolver: *Resolver,
+    data: *std.ArrayList(u8),
+    rt_bindings: *const std.StringHashMapUnmanaged(RtBinding),
+    call_args: *std.ArrayList(ArgVal),
+    inner: ast.CallExpr,
+) Error!void {
+    var ait = inner.args();
+    while (ait.next()) |a| {
+        switch (a) {
+            .path => |p| {
+                const ptext = try p.text(allocator);
+                defer allocator.free(ptext);
+                if (rt_bindings.get(ptext)) |rb| {
+                    try call_args.append(allocator, .{ .binding = rb });
+                    continue;
+                }
+            },
+            else => {},
+        }
+        const v = try resolver.constEvalExpr(a);
+        defer allocator.free(v);
+        const off: u32 = @intCast(data.items.len);
+        try data.appendSlice(allocator, v);
+        try call_args.append(allocator, .{ .constant = .{ .off = off, .len = @intCast(v.len) } });
+    }
 }
 
 /// Register the function a real `env.out(f())` invokes: resolve `f`,
@@ -981,6 +1002,32 @@ const ConcatLocals = struct {
     tuple_base: c.BinaryenIndex,
 };
 
+/// Build a call's wasm operands: two i64 per str argument — `(off, len)`
+/// consts for a constant arg, `(local.get ptr, local.get len)` for a
+/// runtime binding. Caller owns the returned slice.
+fn buildArgs(
+    allocator: std.mem.Allocator,
+    module: c.BinaryenModuleRef,
+    call_args: []const ArgVal,
+    first: usize,
+    count: usize,
+    i64_type: c.BinaryenType,
+) ![]c.BinaryenExpressionRef {
+    const argvals = try allocator.alloc(c.BinaryenExpressionRef, count * 2);
+    errdefer allocator.free(argvals);
+    for (0..count) |k| switch (call_args[first + k]) {
+        .constant => |cv| {
+            argvals[k * 2] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cv.off)));
+            argvals[k * 2 + 1] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(cv.len)));
+        },
+        .binding => |b| {
+            argvals[k * 2] = c.BinaryenLocalGet(module, b.ptr_local, i64_type);
+            argvals[k * 2 + 1] = c.BinaryenLocalGet(module, b.len_local, i64_type);
+        },
+    };
+    return argvals;
+}
+
 /// Append the arena-concatenation of `segs` to `exprs`, leaving the result
 /// pointer in local `loc.buf` and its length in local `loc.len`.
 /// Bump-allocates from the `sp` global. `call` segments are invoked into
@@ -1278,14 +1325,8 @@ fn emitModule(
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, none_type));
         },
         .print_callee => |p| {
-            // Pass each str argument as two i64 consts (ptr, len).
-            const argvals = try allocator.alloc(c.BinaryenExpressionRef, p.args_count * 2);
+            const argvals = try buildArgs(allocator, module, call_args, p.args_first, p.args_count, i64_type);
             defer allocator.free(argvals);
-            for (0..p.args_count) |k| {
-                const a = call_args[p.args_first + k];
-                argvals[k * 2] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(a.off)));
-                argvals[k * 2 + 1] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(a.len)));
-            }
             const result = c.BinaryenCall(
                 module,
                 callees[p.callee].name.ptr,
@@ -1333,13 +1374,8 @@ fn emitModule(
             try exprs.append(allocator, c.BinaryenCall(module, "env_out", @ptrCast(&nargs), nargs.len, none_type));
         },
         .bind_call => |p| {
-            const argvals = try allocator.alloc(c.BinaryenExpressionRef, p.args_count * 2);
+            const argvals = try buildArgs(allocator, module, call_args, p.args_first, p.args_count, i64_type);
             defer allocator.free(argvals);
-            for (0..p.args_count) |k| {
-                const a = call_args[p.args_first + k];
-                argvals[k * 2] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(a.off)));
-                argvals[k * 2 + 1] = c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(a.len)));
-            }
             const result = c.BinaryenCall(
                 module,
                 callees[p.callee].name.ptr,
@@ -1688,6 +1724,38 @@ test "emitFromSource: a runtime binding holds a call result, used in interpolati
     // Neither the call result nor the `[…]`-wrapped form is baked in.
     try testing.expect(std.mem.indexOf(u8, bytes, "hi!") == null);
     try testing.expect(std.mem.indexOf(u8, bytes, "[hi!]") == null);
+}
+
+test "emitFromSource: a runtime binding can be passed as an argument" {
+    // `wrap(g)` passes g's (ptr, len) locals as the argument — a runtime
+    // argument, not a const-folded one.
+    const lib = "pub fn shout(s: str) -> str { \"{s}!\" }\npub fn wrap(s: str) -> str { \"[{s}]\" }\n";
+    const app =
+        \\import dev.q64.s.{shout, wrap}
+        \\
+        \\fn main {
+        \\    let g = shout("hi")
+        \\    env.out(wrap(g))
+        \\}
+        \\
+    ;
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "[hi!]") == null); // built at runtime
+}
+
+test "emitFromSource: a nested runtime call argument is unsupported" {
+    // `wrap(shout("yo"))` — the argument is itself a non-const call, not a
+    // binding; bind it first (`let t = shout("yo"); wrap(t)`).
+    const lib = "pub fn shout(s: str) -> str { \"{s}!\" }\npub fn wrap(s: str) -> str { \"[{s}]\" }\n";
+    const app = "import dev.q64.s.{shout, wrap}\nfn main { env.out(wrap(shout(\"yo\"))) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
+    try testing.expectError(
+        Error.NotConstExpr,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
 }
 
 test "emitFromSource: doubled braces are literal, not interpolation" {
