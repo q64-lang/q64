@@ -464,7 +464,7 @@ const Parser = struct {
         if (self.peek() == .COLON) {
             try children.append(self.arena, .{ .token = self.advance() });
             try self.eatTrivia(&children);
-            try self.captureRawUntil(&children, &.{.COMMA});
+            try children.append(self.arena, .{ .node = try self.parseType() });
         }
         return try cst.makeNode(self.arena, .FIELD, children.items);
     }
@@ -554,7 +554,7 @@ const Parser = struct {
         if (self.peek() == .EQ) {
             try children.append(self.arena, .{ .token = self.advance() });
             try self.eatTrivia(&children);
-            try self.captureRawUntil(&children, &.{});
+            try children.append(self.arena, .{ .node = try self.parseType() });
         }
         return try cst.makeNode(self.arena, .TYPE_DECL, children.items);
     }
@@ -572,7 +572,8 @@ const Parser = struct {
         if (self.peek() == .COLON) {
             try children.append(self.arena, .{ .token = self.advance() });
             try self.eatTrivia(&children);
-            try self.captureRawUntil(&children, &.{.EQ});
+            try children.append(self.arena, .{ .node = try self.parseType() });
+            try self.eatTrivia(&children);
         }
         if (self.peek() == .EQ) {
             try children.append(self.arena, .{ .token = self.advance() });
@@ -801,20 +802,7 @@ const Parser = struct {
         if (self.peek() == .COLON) {
             try children.append(self.arena, .{ .token = self.advance() }); // :
             try self.eatTrivia(&children);
-            // Capture the type as a raw span, stopping at the depth-0
-            // delimiter that ends this param. Inner `(`/`[`/`{`/`<` nest
-            // so a `,` inside `Map<K, V>` doesn't split the param.
-            var depth: i32 = 0;
-            while (!self.isEof()) {
-                const k = self.peek();
-                if (depth == 0 and (k == .COMMA or k == .R_PAREN or k == .NEWLINE)) break;
-                switch (k) {
-                    .L_PAREN, .L_BRACK, .L_BRACE, .L_ANGLE => depth += 1,
-                    .R_PAREN, .R_BRACK, .R_ANGLE, .R_BRACE => depth -= 1,
-                    else => {},
-                }
-                try children.append(self.arena, .{ .token = self.advance() });
-            }
+            try children.append(self.arena, .{ .node = try self.parseType() });
         }
 
         // Progress guarantee: if nothing matched (unexpected token), take
@@ -832,20 +820,150 @@ const Parser = struct {
         return k == .KW_IN or k == .KW_OUT or k == .KW_REF or k == .KW_MOVE;
     }
 
-    /// Consume `->` followed by the type expression. The expression
-    /// ends at the body's opening `{`; trailing trivia is shaved
-    /// back into the parent so the return-type span stops at the
-    /// last meaningful token. Bracket depth is tracked so that
-    /// `Signal<PCM<f32>, 48.kHz>` parses as a single type.
+    /// Consume `->` followed by a `TypeExpr`. The type parser stops at
+    /// the body's opening `{` on its own.
     fn parseReturnType(self: *Parser) !*const cst.Node {
         std.debug.assert(self.peek() == .ARROW);
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // ARROW
+        try self.eatTrivia(&children);
+        if (!self.isEof() and self.peek() != .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseType() });
+        }
+        return try cst.makeNode(self.arena, .RETURN_TYPE, children.items);
+    }
 
+    // -----------------------------------------------------------------
+    // Type expressions (spec/grammar.md §"Type expressions", v0 floor)
+    // -----------------------------------------------------------------
+    //
+    // Structured: PathType (dotted name + raw GenericArgs), RefType,
+    // Slice/Array, Tuple, Optional. fn / dyn / union types and anything
+    // unrecognized fall to a raw `TYPE_EXPR` span. Generic arguments stay
+    // a raw balanced `GENERIC_ARGS` span (sidesteps `>>` splitting). The
+    // parser stops at the first token that can't extend the type, leaving
+    // boundary tokens (`,`, `)`, `]`, `{`, `=`, `;`, newline) for callers.
+
+    fn parseType(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var base = try self.parseTypePrimary();
+        // Postfix `?` → OptionalType (stacks: `T??`).
+        while (self.peek() == .QUESTION) {
+            var children: std.ArrayList(cst.Element) = .empty;
+            try children.append(self.arena, .{ .node = base });
+            try children.append(self.arena, .{ .token = self.advance() }); // ?
+            base = try cst.makeNode(self.arena, .OPTIONAL_TYPE, children.items);
+        }
+        return base;
+    }
+
+    fn parseTypePrimary(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        switch (self.peek()) {
+            .KW_REF => {
+                var children: std.ArrayList(cst.Element) = .empty;
+                try children.append(self.arena, .{ .token = self.advance() }); // ref
+                try self.eatTrivia(&children);
+                try children.append(self.arena, .{ .node = try self.parseType() });
+                return try cst.makeNode(self.arena, .REF_TYPE, children.items);
+            },
+            .L_BRACK => return self.parseBracketType(),
+            .L_PAREN => return self.parseTupleType(),
+            .IDENT => return self.parsePathType(),
+            else => return self.parseRawType(),
+        }
+    }
+
+    /// `PathType := IDENT ("." IDENT)* GenericArgs?`. Generic args are a
+    /// raw balanced `<…>` span.
+    fn parsePathType(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // IDENT
+        while (self.peek() == .DOT and self.kindAfterDot() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() }); // DOT
+            try children.append(self.arena, .{ .token = self.advance() }); // segment
+        }
+        if (self.peek() == .L_ANGLE) {
+            try children.append(self.arena, .{ .node = try self.parseGenericArgs() });
+        }
+        return try cst.makeNode(self.arena, .PATH_TYPE, children.items);
+    }
+
+    /// Balanced `<…>` generic-argument list captured raw; `>>` (SHR) closes
+    /// two levels (mirrors `parseGenericParams`).
+    fn parseGenericArgs(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
         var depth: i32 = 0;
         while (!self.isEof()) {
             const k = self.peek();
-            if (depth == 0 and k == .L_BRACE) break;
+            try children.append(self.arena, .{ .token = self.advance() });
+            switch (k) {
+                .L_ANGLE => depth += 1,
+                .R_ANGLE => depth -= 1,
+                .SHR => depth -= 2,
+                else => {},
+            }
+            if (depth <= 0) break;
+        }
+        return try cst.makeNode(self.arena, .GENERIC_ARGS, children.items);
+    }
+
+    /// `[ TypeExpr ]` (slice) or `[ TypeExpr ";" Count ]` (array).
+    fn parseBracketType(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // [
+        try self.eatTrivia(&children);
+        if (self.peek() != .R_BRACK and !self.isEof()) {
+            try children.append(self.arena, .{ .node = try self.parseType() });
+        }
+        try self.eatTrivia(&children);
+        var kind: cst.SyntaxKind = .SLICE_TYPE;
+        if (self.peek() == .SEMICOLON) {
+            kind = .ARRAY_TYPE;
+            try children.append(self.arena, .{ .token = self.advance() }); // ;
+            // Length is a raw token span up to `]`.
+            while (!self.isEof() and self.peek() != .R_BRACK and self.peek() != .NEWLINE) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+        }
+        if (self.peek() == .R_BRACK) {
+            try children.append(self.arena, .{ .token = self.advance() }); // ]
+        }
+        return try cst.makeNode(self.arena, kind, children.items);
+    }
+
+    /// `( TypeExpr ("," TypeExpr)* ")"` — also covers `()` (unit) and a
+    /// parenthesized type (treated as a one-element tuple in v0).
+    fn parseTupleType(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // (
+        while (!self.isEof()) {
+            try self.eatTrivia(&children);
+            if (self.peek() == .R_PAREN) break;
+            const before = self.pos;
+            try children.append(self.arena, .{ .node = try self.parseType() });
+            try self.eatTrivia(&children);
+            if (self.peek() == .COMMA) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            } else if (self.pos == before) {
+                if (!self.isEof()) try children.append(self.arena, .{ .token = self.advance() });
+            }
+        }
+        if (self.peek() == .R_PAREN) {
+            try children.append(self.arena, .{ .token = self.advance() }); // )
+        }
+        return try cst.makeNode(self.arena, .TUPLE_TYPE, children.items);
+    }
+
+    /// Fallback: capture an unstructured type (fn / dyn / union, or
+    /// malformed) as a raw `TYPE_EXPR` span up to a depth-0 boundary.
+    fn parseRawType(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        var depth: i32 = 0;
+        while (!self.isEof()) {
+            const k = self.peek();
+            if (depth <= 0) switch (k) {
+                .COMMA, .R_PAREN, .R_BRACK, .R_ANGLE, .SHR, .L_BRACE, .R_BRACE, .EQ, .SEMICOLON, .NEWLINE => break,
+                else => {},
+            };
             switch (k) {
                 .L_PAREN, .L_BRACK, .L_ANGLE => depth += 1,
                 .R_PAREN, .R_BRACK, .R_ANGLE => depth -= 1,
@@ -853,20 +971,7 @@ const Parser = struct {
             }
             try children.append(self.arena, .{ .token = self.advance() });
         }
-
-        // Shave trailing trivia back into the parser stream so the
-        // return-type ends at its last semantic token. The depth
-        // bookkeeping doesn't need adjustment — trivia carries no
-        // bracket weight.
-        var i: usize = children.items.len;
-        while (i > 0) : (i -= 1) {
-            if (!children.items[i - 1].kind().isTrivia()) break;
-        }
-        const shave = children.items.len - i;
-        self.pos -= shave;
-        children.shrinkRetainingCapacity(i);
-
-        return try cst.makeNode(self.arena, .RETURN_TYPE, children.items);
+        return try cst.makeNode(self.arena, .TYPE_EXPR, children.items);
     }
 
     /// Parse a block: `{ Stmt* }`. Statement parsing is best-effort
@@ -980,7 +1085,9 @@ const Parser = struct {
         try self.captureRawUntil(&children, &.{ .COLON, .EQ });
         if (self.peek() == .COLON) {
             try children.append(self.arena, .{ .token = self.advance() });
-            try self.captureRawUntil(&children, &.{.EQ});
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseType() });
+            try self.eatTrivia(&children);
         }
         if (self.peek() == .EQ) {
             try children.append(self.arena, .{ .token = self.advance() });
@@ -2232,6 +2339,49 @@ test "item views: struct fields, enum variants, type/const/face/fit names" {
     const mn = (it.next() orelse return error.TestExpectedItem).fn_decl;
     try testing.expectEqualStrings("main", mn.name().?.text);
     try testing.expect(it.next() == null);
+}
+
+test "type views: path / generic / slice / array / tuple / optional / ref" {
+    const src = "fn f(a: i64, b: Map<K, V>, c: [u8], d: [i32; 4], e: (A, B), g: T?, h: ref Foo) { 0 }\n";
+    const r = try parse(testing.allocator, src, "types.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var items = sf.items();
+    const fd = (items.next() orelse return error.TestExpectedItem).fn_decl;
+    var ps = (fd.params() orelse return error.TestExpectedItem).iter();
+    const tag = std.meta.activeTag;
+
+    const a = ps.next() orelse return error.TestExpectedItem;
+    const at = a.type_() orelse return error.TestExpectedNonNull;
+    try testing.expectEqual(tag(at), .path);
+    {
+        const nm = try at.path.name(testing.allocator);
+        defer testing.allocator.free(nm);
+        try testing.expectEqualStrings("i64", nm);
+    }
+
+    const b = ps.next() orelse return error.TestExpectedItem;
+    const bt = b.type_() orelse return error.TestExpectedNonNull;
+    try testing.expectEqual(tag(bt), .path);
+    try testing.expect(bt.path.hasGenericArgs());
+    {
+        const nm = try bt.path.name(testing.allocator);
+        defer testing.allocator.free(nm);
+        try testing.expectEqualStrings("Map", nm);
+        const ga = (try bt.path.genericArgsText(testing.allocator)) orelse return error.TestExpectedNonNull;
+        defer testing.allocator.free(ga);
+        try testing.expectEqualStrings("<K, V>", ga);
+    }
+
+    const c = ps.next() orelse return error.TestExpectedItem;
+    const ct = c.type_() orelse return error.TestExpectedNonNull;
+    try testing.expectEqual(tag(ct), .slice);
+    try testing.expectEqual(tag(ct.slice.element() orelse return error.TestExpectedNonNull), .path);
+
+    try testing.expectEqual(tag((ps.next() orelse return error.TestExpectedItem).type_().?), .array);
+    try testing.expectEqual(tag((ps.next() orelse return error.TestExpectedItem).type_().?), .tuple);
+    try testing.expectEqual(tag((ps.next() orelse return error.TestExpectedItem).type_().?), .optional);
+    try testing.expectEqual(tag((ps.next() orelse return error.TestExpectedItem).type_().?), .ref);
 }
 
 test "statement views: assign / if-else / while / for / loop / match / panic" {

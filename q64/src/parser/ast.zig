@@ -327,10 +327,15 @@ pub const Field = struct {
         return itemName(self.cst);
     }
 
-    /// The field's declared type as source text (raw span), or `null`
-    /// when absent. Caller owns the returned slice.
+    /// The field's declared type as source text, or `null` when absent.
+    /// Caller owns the returned slice.
     pub fn typeText(self: Field, allocator: std.mem.Allocator) !?[]u8 {
         return joinTokensAfter(allocator, self.cst, .COLON);
+    }
+
+    /// The structured field type.
+    pub fn type_(self: Field) ?TypeExpr {
+        return firstChildType(self.cst);
     }
 };
 
@@ -398,6 +403,11 @@ pub const TypeDecl = struct {
     /// the returned slice.
     pub fn aliasedText(self: TypeDecl, allocator: std.mem.Allocator) !?[]u8 {
         return joinTokensAfter(allocator, self.cst, .EQ);
+    }
+
+    /// The structured aliased type.
+    pub fn type_(self: TypeDecl) ?TypeExpr {
+        return firstChildType(self.cst);
     }
 };
 
@@ -537,11 +547,16 @@ pub const Param = struct {
         return null;
     }
 
-    /// The declared type as source text (raw span in v0), trivia-trimmed.
-    /// `null` when the parameter has no `: Type` annotation (e.g. a
-    /// receiver `self`). Caller owns the returned slice.
+    /// The declared type as source text, trivia-trimmed. `null` when the
+    /// parameter has no `: Type` annotation (e.g. a receiver `self`).
+    /// Caller owns the returned slice.
     pub fn typeText(self: Param, allocator: std.mem.Allocator) !?[]u8 {
         return joinTokensAfter(allocator, self.cst, .COLON);
+    }
+
+    /// The structured parameter type.
+    pub fn type_(self: Param) ?TypeExpr {
+        return firstChildType(self.cst);
     }
 };
 
@@ -558,6 +573,165 @@ pub const ReturnType = struct {
     /// the node carries no type tokens after the arrow.
     pub fn text(self: ReturnType, allocator: std.mem.Allocator) !?[]u8 {
         return joinTokensAfter(allocator, self.cst, .ARROW);
+    }
+
+    /// The structured return type (`-> Vec<i64>` → a `PathType`).
+    pub fn type_(self: ReturnType) ?TypeExpr {
+        return firstChildType(self.cst);
+    }
+};
+
+// =====================================================================
+// Type expressions (spec/grammar.md §"Type expressions", v0 floor)
+//
+// Structured: path (dotted name + raw generic args), ref, slice, array,
+// tuple, optional. fn / dyn / union types arrive as a `raw` TYPE_EXPR
+// whose `.text()` is the source span. Generic arguments within a path are
+// a raw span (`GenericArgs.text()`).
+// =====================================================================
+
+pub const TypeExpr = union(enum) {
+    path: PathType,
+    ref: RefType,
+    slice: SliceType,
+    array: ArrayType,
+    tuple: TupleType,
+    optional: OptionalType,
+    raw: RawType,
+
+    pub fn cast(node: *const cst.Node) ?TypeExpr {
+        return switch (node.kind) {
+            .PATH_TYPE => .{ .path = .{ .cst = node } },
+            .REF_TYPE => .{ .ref = .{ .cst = node } },
+            .SLICE_TYPE => .{ .slice = .{ .cst = node } },
+            .ARRAY_TYPE => .{ .array = .{ .cst = node } },
+            .TUPLE_TYPE => .{ .tuple = .{ .cst = node } },
+            .OPTIONAL_TYPE => .{ .optional = .{ .cst = node } },
+            .TYPE_EXPR => .{ .raw = .{ .cst = node } },
+            else => null,
+        };
+    }
+
+    pub fn isTypeKind(k: cst.SyntaxKind) bool {
+        return switch (k) {
+            .PATH_TYPE, .REF_TYPE, .SLICE_TYPE, .ARRAY_TYPE, .TUPLE_TYPE, .OPTIONAL_TYPE, .TYPE_EXPR => true,
+            else => false,
+        };
+    }
+
+    /// The full type as source text, trivia-trimmed. Caller owns the slice.
+    pub fn text(self: TypeExpr, allocator: std.mem.Allocator) ![]u8 {
+        return renderNodeText(allocator, self.cstNode());
+    }
+
+    pub fn cstNode(self: TypeExpr) *const cst.Node {
+        return switch (self) {
+            inline else => |v| v.cst,
+        };
+    }
+};
+
+/// `PathType := IDENT ("." IDENT)* GenericArgs?` — `i64`, `Vec<T>`,
+/// `q64.net.Url`.
+pub const PathType = struct {
+    cst: *const cst.Node,
+
+    /// The dotted name preceding any generic arguments (`Vec`, `q64.net.Url`).
+    /// Caller owns the returned slice.
+    pub fn name(self: PathType, allocator: std.mem.Allocator) ![]u8 {
+        var total: usize = 0;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (!t.kind.isTrivia()) {
+                total += t.text.len;
+            },
+            .node => {}, // GENERIC_ARGS — excluded from the name
+        };
+        const buf = try allocator.alloc(u8, total);
+        var i: usize = 0;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (!t.kind.isTrivia()) {
+                @memcpy(buf[i .. i + t.text.len], t.text);
+                i += t.text.len;
+            },
+            .node => {},
+        };
+        return buf;
+    }
+
+    pub fn hasGenericArgs(self: PathType) bool {
+        return firstChildRawNode(self.cst, .GENERIC_ARGS) != null;
+    }
+
+    /// The generic-argument list as source text (`<K, V>`), or `null`.
+    pub fn genericArgsText(self: PathType, allocator: std.mem.Allocator) !?[]u8 {
+        const ga = firstChildRawNode(self.cst, .GENERIC_ARGS) orelse return null;
+        return try renderNodeText(allocator, ga);
+    }
+};
+
+/// `RefType := "ref" TypeExpr`.
+pub const RefType = struct {
+    cst: *const cst.Node,
+    pub fn inner(self: RefType) ?TypeExpr {
+        return firstChildType(self.cst);
+    }
+};
+
+/// `SliceType := "[" TypeExpr "]"`.
+pub const SliceType = struct {
+    cst: *const cst.Node,
+    pub fn element(self: SliceType) ?TypeExpr {
+        return firstChildType(self.cst);
+    }
+};
+
+/// `ArrayType := "[" TypeExpr ";" Count "]"` (count is a raw span).
+pub const ArrayType = struct {
+    cst: *const cst.Node,
+    pub fn element(self: ArrayType) ?TypeExpr {
+        return firstChildType(self.cst);
+    }
+};
+
+/// `TupleType := "(" TypeExpr ("," TypeExpr)* ")"` (also `()`).
+pub const TupleType = struct {
+    cst: *const cst.Node,
+    pub fn elements(self: TupleType) TypeIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+/// `OptionalType := TypeExpr "?"`.
+pub const OptionalType = struct {
+    cst: *const cst.Node,
+    pub fn inner(self: OptionalType) ?TypeExpr {
+        return firstChildType(self.cst);
+    }
+};
+
+/// A type form the v0 parser leaves unstructured (fn / dyn / union).
+pub const RawType = struct {
+    cst: *const cst.Node,
+    pub fn text(self: RawType, allocator: std.mem.Allocator) ![]u8 {
+        return renderNodeText(allocator, self.cst);
+    }
+};
+
+pub const TypeIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *TypeIter) ?TypeExpr {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (TypeExpr.cast(n)) |t| {
+                    self.i += 1;
+                    return t;
+                },
+                .token => {},
+            }
+        }
+        return null;
     }
 };
 
@@ -1310,6 +1484,28 @@ fn firstChildPattern(parent: *const cst.Node) ?Pattern {
     return null;
 }
 
+fn firstChildType(parent: *const cst.Node) ?TypeExpr {
+    for (parent.children) |c| switch (c) {
+        .node => |n| if (TypeExpr.cast(n)) |t| return t,
+        .token => {},
+    };
+    return null;
+}
+
+/// Render all of `node`'s leaf tokens as source text, trivia-trimmed.
+/// Caller owns the slice.
+fn renderNodeText(allocator: std.mem.Allocator, node: *const cst.Node) ![]u8 {
+    const total = nodeTokenLen(node);
+    const buf = try allocator.alloc(u8, total);
+    var i: usize = 0;
+    appendNodeTokens(node, buf, &i);
+    const trimmed = std.mem.trim(u8, buf, " \t\r\n");
+    if (trimmed.len == buf.len) return buf;
+    const out = try allocator.dupe(u8, trimmed);
+    allocator.free(buf);
+    return out;
+}
+
 fn firstNonTriviaToken(parent: *const cst.Node) ?cst.Token {
     for (parent.children) |c| switch (c) {
         .token => |t| if (!t.kind.isTrivia()) return t,
@@ -1350,7 +1546,11 @@ fn joinTokensAfter(
             }
             total += t.text.len;
         },
-        .node => {},
+        // A structured child (e.g. a TypeExpr node after `->`/`:`)
+        // contributes all of its leaf tokens.
+        .node => |n| if (seen) {
+            total += nodeTokenLen(n);
+        },
     };
     if (!seen or total == 0) return null;
 
@@ -1366,7 +1566,7 @@ fn joinTokensAfter(
             @memcpy(buf[i .. i + t.text.len], t.text);
             i += t.text.len;
         },
-        .node => {},
+        .node => |n| if (seen) appendNodeTokens(n, buf, &i),
     };
 
     const trimmed = std.mem.trim(u8, buf, " \t\r\n");
@@ -1374,6 +1574,27 @@ fn joinTokensAfter(
     const out = try allocator.dupe(u8, trimmed);
     allocator.free(buf);
     return out;
+}
+
+/// Total byte length of all leaf tokens under `node` (recursive).
+fn nodeTokenLen(node: *const cst.Node) usize {
+    var total: usize = 0;
+    for (node.children) |c| switch (c) {
+        .token => |t| total += t.text.len,
+        .node => |n| total += nodeTokenLen(n),
+    };
+    return total;
+}
+
+/// Append every leaf token's text under `node` into `buf` at `*i`.
+fn appendNodeTokens(node: *const cst.Node, buf: []u8, i: *usize) void {
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            @memcpy(buf[i.* .. i.* + t.text.len], t.text);
+            i.* += t.text.len;
+        },
+        .node => |n| appendNodeTokens(n, buf, i),
+    };
 }
 
 // =====================================================================

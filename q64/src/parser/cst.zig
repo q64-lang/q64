@@ -219,6 +219,9 @@ pub const SyntaxKind = enum {
     OPTIONAL_TYPE,
     TUPLE_TYPE,
     FACE_REF,
+    /// Fallback wrapper for type forms the v0 parser doesn't structure
+    /// yet (fn / dyn / union types): holds the raw type tokens.
+    TYPE_EXPR,
 
     // Struct / enum bodies
     RECORD_BODY,

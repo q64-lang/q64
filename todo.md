@@ -304,11 +304,22 @@ visible at a glance whether it's been picked up.
         `index`/`field`/`method`/`tuple_field`/`question_dot`/`tuple`/`paren`/
         `array`/`path`/literals (operands, operators, args, elements).
       Codegen's exhaustive `Item`/`Stmt` switches gained `else` arms (it
-      still lowers only the subset it understands). **Remaining gaps are
-      parser-level, not view-level:** the `TypeExpr` grammar (types are raw
-      `text()` spans everywhere), pattern destructuring internals, generic-
-      param/effect/where internals, and the not-yet-parsed expr kinds
-      (`record`/`range`/`lambda`/`spawn`/`channel`/`graph`).
+      still lowers only the subset it understands).
+- [x] **TypeExpr grammar (v0 floor).** Types are no longer raw spans:
+      `parseType` (`parse.zig`) structures path (dotted name + raw
+      `GenericArgs`), `ref`, slice/array, tuple, and optional, with a raw
+      `TYPE_EXPR` fallback for fn/dyn/union. Wired into every type position
+      (return type, params, fields, type/const/let). `ast.TypeExpr` exposes
+      `path`/`ref`/`slice`/`array`/`tuple`/`optional`/`raw` with
+      `PathType.name()` + `genericArgsText()`, element/inner/elements
+      accessors, and `.text()`; `ReturnType`/`Param`/`Field`/`TypeDecl`
+      gained `.type_()`. `.text()`/`typeText()` still work (`joinTokensAfter`
+      now collects tokens recursively through the type node). Codegen is
+      type-agnostic so it's unaffected; roundtrips green.
+      **Deferred (parser-level):** structured generic args (`>>`-splitting),
+      fn/dyn/union type structure, pattern destructuring internals,
+      generic-param/effect/where internals, and the not-yet-parsed expr
+      kinds (`record`/`range`/`lambda`/`spawn`/`channel`/`graph`).
 - [x] AST views (statements): `ast.Stmt` now surfaces `let`/`var`
       (`LetStmt`: `isVar`/`pattern`/`initializer`) and `return`
       (`ReturnStmt.value`) alongside `expr_stmt`, plus a `Pattern` view
