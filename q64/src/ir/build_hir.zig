@@ -26,6 +26,11 @@ pub const ModuleResolver = hir.ModuleResolver;
 
 const BuildError = error{Unsupported} || std.mem.Allocator.Error;
 
+/// A runtime `str` binding in `main`: its `(ptr, len)` live in two `_start`
+/// i64 locals.
+const StrBinding = struct { ptr_idx: u32, len_idx: u32 };
+const RtMap = std.StringHashMapUnmanaged(StrBinding);
+
 const Builder = struct {
     a: std.mem.Allocator,
     resolver: ModuleResolver,
@@ -33,6 +38,10 @@ const Builder = struct {
     funcs: std.ArrayList(hir.Func) = .empty,
     /// function name → FuncId, for dedup + recursion. Keys are arena-owned.
     ids: std.StringHashMapUnmanaged(hir.FuncId) = .empty,
+    /// `main`'s runtime str bindings + the locals backing them (each is two
+    /// i64 locals). Only `main` has these (callees use parameters).
+    main_rt: RtMap = .empty,
+    main_locals: std.ArrayList(hir.Type) = .empty,
 };
 
 /// Try compile-time evaluation, mapping a non-constant result to `null` (so
@@ -79,26 +88,41 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     dummy.* = .{ .block = &.{} };
     try b.funcs.append(b.a, .{ .name = "main", .body = dummy });
 
-    // `main` has no runtime i64 bindings yet (those land later); its
-    // env.out(<i64>) arguments resolve against an empty scope.
+    // `main`'s env.out(<i64>) arguments resolve against an empty i64 scope;
+    // its runtime str bindings live in `b.main_rt` (the `rt` scope below).
     var mscope = Scope{ .a = b.a };
+    const rt = &b.main_rt;
 
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
     var it = body.statements();
     while (it.next()) |stmt| switch (stmt) {
-        // A `let`/`var` that names a compile-time constant becomes an
-        // evaluator binding (no emitted statement). A non-constant
-        // initializer is a runtime binding — deferred to the legacy path.
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
             const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
-            // A `let` initializer may fold a const-bodied call (e.g.
-            // `let v = version()`); a non-constant one is a runtime binding,
-            // deferred to the legacy path.
+            // A `let` initializer that const-folds (incl. a const-bodied call,
+            // e.g. `let v = version()`) becomes a compile-time binding.
             b.eval.fold_calls = true;
-            const value = try tryConst(b, init_expr);
+            const folded = try tryConst(b, init_expr);
             b.eval.fold_calls = false;
-            try b.eval.bind(nm.text, value orelse return error.Unsupported);
+            if (folded) |bytes| {
+                try b.eval.bind(nm.text, bytes);
+                continue;
+            }
+            // Otherwise a runtime str binding (`let g = shout("hi")`): build
+            // the str value and store its (ptr, len) into two new locals.
+            if (init_expr == .string_lit or (try isStrCall(b, init_expr))) {
+                const value = if (init_expr == .string_lit)
+                    try buildConcat(b, init_expr.string_lit, &mscope, false, rt)
+                else
+                    try buildStrExpr(b, init_expr, &mscope, rt);
+                const ptr_idx: u32 = @intCast(b.main_locals.items.len);
+                try b.main_locals.append(b.a, .i64);
+                try b.main_locals.append(b.a, .i64);
+                try b.main_rt.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
+                try stmts.append(b.a, st);
+            } else return error.Unsupported; // runtime i64 binding: later
         },
         .expr_stmt => |es| {
             const expr = es.expression() orelse return error.Unsupported;
@@ -115,12 +139,18 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 const e = try b.a.create(hir.Expr);
                 e.* = .{ .str_const = bytes };
                 st.* = .{ .host_out = e };
+            } else if (arg == .path and rt.get(try pathText(b, arg.path)) != null) {
+                // env.out(g) where g is a runtime str binding.
+                const bnd = rt.get(try pathText(b, arg.path)).?;
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+                st.* = .{ .host_out_str = e };
             } else if (arg == .string_lit) {
                 // A string literal with dynamic interpolation → runtime concat.
-                st.* = .{ .host_out_str = try buildConcat(b, arg.string_lit, &mscope, false) };
+                st.* = .{ .host_out_str = try buildConcat(b, arg.string_lit, &mscope, false, rt) };
             } else if (try isStrCall(b, arg)) {
                 // A real call to a str-returning function.
-                st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope) };
+                st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope, rt) };
             } else {
                 // Otherwise an i64 expression (a call to an i64 function).
                 const e = try buildIntExpr(b, arg, &mscope);
@@ -133,7 +163,11 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
 
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
-    b.funcs.items[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public };
+    b.funcs.items[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public, .locals = try b.main_locals.toOwnedSlice(b.a) };
+}
+
+fn pathText(b: *Builder, p: ast.PathExpr) BuildError![]const u8 {
+    return p.text(b.a);
 }
 
 /// Resolve `name` to a registered i64 function, building it (and anything it
@@ -208,7 +242,7 @@ fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir
     try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = .str, .body = dummy });
 
     const tail = try singleTailExpr(fd) orelse return error.Unsupported;
-    const value = try buildStrExpr(b, tail, &scope);
+    const value = try buildStrExpr(b, tail, &scope, null); // callee bodies have no runtime bindings
     const vstmt = try b.a.create(hir.Stmt);
     vstmt.* = .{ .expr = value };
     const block = try b.a.create(hir.Stmt);
@@ -221,24 +255,27 @@ fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir
 /// Build a `str`-valued expression: a constant string literal (no runtime
 /// interpolation), a passthrough parameter reference, or a call to a str
 /// function (whose arguments are themselves str values).
-fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
+fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) BuildError!*hir.Expr {
     const out = try b.a.create(hir.Expr);
     switch (expr) {
         .string_lit => |sl| {
             // A fully-constant literal folds; one with dynamic interpolation
-            // becomes a runtime concat.
+            // becomes a runtime concat. (Only reached for callee bodies.)
             if (b.eval.renderStringLit(sl)) |bytes| {
                 out.* = .{ .str_const = bytes };
             } else |e| switch (e) {
-                error.NotConst => return buildConcat(b, sl, scope, true),
+                error.NotConst => return buildConcat(b, sl, scope, true, rt),
                 error.OutOfMemory => return error.OutOfMemory,
             }
         },
         .path => |p| {
             const txt = try p.text(b.a);
             defer b.a.free(txt);
-            const loc = scope.find(txt) orelse return error.Unsupported;
-            out.* = .{ .local = loc.idx };
+            if (scope.find(txt)) |loc| {
+                out.* = .{ .local = loc.idx };
+            } else if (rtBinding(rt, txt)) |bnd| {
+                out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+            } else return error.Unsupported;
         },
         .call => |cc| {
             const callee = cc.callee() orelse return error.Unsupported;
@@ -252,20 +289,19 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             if (b.funcs.items[id].ret != .str) return error.Unsupported;
             var args: std.ArrayList(*hir.Expr) = .empty;
             var ait = cc.args();
-            while (ait.next()) |a| try args.append(b.a, try buildStrArg(b, a, scope));
+            while (ait.next()) |a| try args.append(b.a, try buildStrArg(b, a, scope, rt));
             if (args.items.len != b.funcs.items[id].params.len) return error.Unsupported;
             out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
         },
-        else => return error.Unsupported, // interpolation/concat: later
+        else => return error.Unsupported,
     }
     return out;
 }
 
 /// Build a `str` argument at a call site: a compile-time constant (a literal
 /// or a const-bodied call like `vshout()`) folds to a `str_const`; a bare
-/// parameter passes through as a reference. A runtime value (a non-const call,
-/// a runtime binding) isn't supported yet and defers to the legacy path.
-fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
+/// parameter passes through, and a runtime str binding passes by reference.
+fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) BuildError!*hir.Expr {
     b.eval.fold_calls = true;
     const folded = try tryConst(b, arg);
     b.eval.fold_calls = false;
@@ -278,12 +314,19 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
         .path => |p| {
             const txt = try p.text(b.a);
             defer b.a.free(txt);
-            const loc = scope.find(txt) orelse return error.Unsupported;
-            out.* = .{ .local = loc.idx };
+            if (scope.find(txt)) |loc| {
+                out.* = .{ .local = loc.idx };
+            } else if (rtBinding(rt, txt)) |bnd| {
+                out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+            } else return error.Unsupported;
         },
         else => return error.Unsupported,
     }
     return out;
+}
+
+fn rtBinding(rt: ?*const RtMap, name: []const u8) ?StrBinding {
+    return if (rt) |m| m.get(name) else null;
 }
 
 /// Split an interpolated string literal into runtime-concat pieces (mirrors
@@ -292,7 +335,7 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
 /// matching a parameter becomes a `local` piece; `{f()}` (top-level only,
 /// nullary str) becomes a `call` piece. A reference that is neither constant
 /// nor a parameter (a runtime binding) defers to the legacy path.
-fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool) BuildError!*hir.Expr {
+fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, rt: ?*const RtMap) BuildError!*hir.Expr {
     const raw = sl.rawText() orelse return error.Unsupported;
     if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return error.Unsupported;
     const text = raw[1 .. raw.len - 1];
@@ -354,8 +397,13 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool) B
                         const e = try b.a.create(hir.Expr);
                         e.* = .{ .local = loc.idx };
                         try pieces.append(b.a, e);
+                    } else if (rtBinding(rt, ptext)) |bnd| {
+                        try flush(b, &lit, &pieces);
+                        const e = try b.a.create(hir.Expr);
+                        e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+                        try pieces.append(b.a, e);
                     } else {
-                        // A const binding folds into the run; a runtime one defers.
+                        // A const binding folds into the run; otherwise defer.
                         const v = (try tryConst(b, iexpr)) orelse return error.Unsupported;
                         try lit.appendSlice(b.a, v);
                     }
@@ -852,6 +900,22 @@ test "tryBuild: a concat-bodied str function (interpolated param) builds" {
     // shout's body is a concat of its parameter and the literal "!".
     try testing.expect(std.mem.indexOf(u8, dump, "fn shout -> str") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "concat[local#0") != null);
+}
+
+test "tryBuild: a runtime str binding + use in interpolation + arg" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn shout(s: str) -> str { \"{s}!\" }\npub fn wrap(s: str) -> str { \"[{s}]\" }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n let g = shout(\"hi\")\n env.out(g)\n env.out(\"{g}\")\n env.out(wrap(g))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    // main now has two i64 locals backing g's (ptr, len).
+    try testing.expectEqual(@as(usize, 2), mod.funcs[mod.entry.?].locals.len);
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_let [0,1]") != null); // g binds into locals 0,1
+    try testing.expect(std.mem.indexOf(u8, dump, "str_binding[0,1]") != null); // referenced by index
 }
 
 test "tryBuild: a recursive control-flow body builds HIR" {

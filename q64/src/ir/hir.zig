@@ -99,6 +99,9 @@ pub const Stmt = union(enum) {
     ret: ?*Expr,
     let: struct { idx: u32, value: *Expr },
     assign: struct { idx: u32, value: *Expr },
+    /// A runtime `str` binding (`let g = shout("hi")`): store the value's
+    /// `(ptr, len)` into the two locals `ptr_idx`/`len_idx`.
+    str_let: struct { ptr_idx: u32, len_idx: u32, value: *Expr },
     /// `then_`/`else_` are blocks (an `else if` is a block holding one `if_`).
     if_: struct { cond: *Expr, then_: *Stmt, else_: ?*Stmt },
     while_: struct { cond: *Expr, body: *Stmt },
@@ -123,4 +126,6 @@ pub const Expr = union(enum) {
     /// Each piece is a `str` value: a `str_const` run, a `local` parameter, or
     /// a `call`.
     concat: []const *Expr,
+    /// The `str` value of a runtime binding, read from its two locals.
+    str_binding: struct { ptr_idx: u32, len_idx: u32 },
 };

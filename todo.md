@@ -315,7 +315,15 @@ it with `CfgUnsupported`).
         into const-run / param / nullary-call pieces (folding const interps).
         Verified `Q64_IR_STRICT=1`: `"q64 v{version()} ok"`→`q64 v0.1.0 ok`,
         `shout("loud")`→`loud!`, `join("a","b")`→`a-b`, `shout(version())`→`0.1.0!`.
-  - [ ] **P3b-4** runtime str `let`/`var` bindings + runtime args.
+  - [x] **P3b-4** runtime str `let`/`var` bindings + runtime args. MIR `str_bind`
+        (split a str value's (ptr,len) into two locals) + `str_binding` (read
+        them); `emitConcat`/`strOperands` gained a `str_binding` piece/operand.
+        `build_hir` tracks `main`'s runtime str bindings (`main_rt`) + their
+        backing locals (`main_locals`), threaded as an `rt` scope through the str
+        builders so `{g}`, `env.out(g)`, and `wrap(g)` resolve. Fixed: `lower`
+        now carries the entry's `locals` into MIR. Verified `Q64_IR_STRICT=1`:
+        `let g = shout("hi"); env.out(g); "{g} and {g}"; let w = wrap(g); "{w}"`
+        → `hi!` / `got: hi! and hi!` / `nested: [hi!]`.
   - [ ] **P3b-5** i64 bindings + int interpolation in `main`.
   After P3b the whole suite + `link-roundtrip.sh` runs through the IR.
 - [ ] **P4 delete legacy.** Once the router never falls through (verify with

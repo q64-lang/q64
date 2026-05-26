@@ -422,7 +422,8 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
             for (pieces) |p| if (bodyHasOut(p, want_int)) break :blk true;
             break :blk false;
         },
-        .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .br, .br_cont, .@"unreachable" => false,
+        .str_bind => |sb| bodyHasOut(sb.value, want_int),
+        .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -451,6 +452,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.host_out = true;
             scanScratch(h.value, s);
         },
+        .str_bind => |sb| {
+            s.host_out = true; // uses the pair scratch to split (ptr, len)
+            scanScratch(sb.value, s);
+        },
         .block => |items| for (items) |ch| scanScratch(ch, s),
         .local_set => |ls| scanScratch(ls.value, s),
         .bin => |b| {
@@ -470,7 +475,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(w.body, s);
         },
         .loop => |body| scanScratch(body, s),
-        .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .br, .br_cont, .@"unreachable" => {},
+        .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
 
@@ -546,6 +551,23 @@ const Lowerer = struct {
                 return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
             },
             .str_concat => |pieces| return self.emitConcat(pieces),
+            .str_binding => |sb| {
+                var elems = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalGet(module, sb.ptr_idx, self.i64_type),
+                    c.BinaryenLocalGet(module, sb.len_idx, self.i64_type),
+                };
+                return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
+            },
+            .str_bind => |sb| {
+                // Stash the str value in the pair scratch, then split its
+                // (ptr, len) into the binding's two locals.
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(module, self.pair_idx, try self.inst(sb.value)),
+                    c.BinaryenLocalSet(module, sb.ptr_idx, c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 0)),
+                    c.BinaryenLocalSet(module, sb.len_idx, c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1)),
+                };
+                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
+            },
             .ret => |v| return c.BinaryenReturn(module, if (v) |val| try self.inst(val) else null),
             .str_const_val => |sc| {
                 var elems = [_]c.BinaryenExpressionRef{
@@ -687,6 +709,7 @@ const Lowerer = struct {
                 j += 1;
             },
             .str_param => |idx| total = c.BinaryenBinary(m, c.BinaryenAddInt64(), total, c.BinaryenLocalGet(m, idx * 2 + 1, i64t)),
+            .str_binding => |sb| total = c.BinaryenBinary(m, c.BinaryenAddInt64(), total, c.BinaryenLocalGet(m, sb.len_idx, i64t)),
             .str_const_val => {},
             else => return Error.UnsupportedCall,
         };
@@ -713,6 +736,11 @@ const Lowerer = struct {
                     src = c.BinaryenLocalGet(m, idx * 2, i64t);
                     ln = c.BinaryenLocalGet(m, idx * 2 + 1, i64t);
                     ln2 = c.BinaryenLocalGet(m, idx * 2 + 1, i64t);
+                },
+                .str_binding => |sb| {
+                    src = c.BinaryenLocalGet(m, sb.ptr_idx, i64t);
+                    ln = c.BinaryenLocalGet(m, sb.len_idx, i64t);
+                    ln2 = c.BinaryenLocalGet(m, sb.len_idx, i64t);
                 },
                 .call => {
                     src = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 0);
@@ -751,6 +779,10 @@ const Lowerer = struct {
             .str_param => |idx| {
                 try out.append(self.allocator, c.BinaryenLocalGet(self.module, idx * 2, self.i64_type));
                 try out.append(self.allocator, c.BinaryenLocalGet(self.module, idx * 2 + 1, self.i64_type));
+            },
+            .str_binding => |sb| {
+                try out.append(self.allocator, c.BinaryenLocalGet(self.module, sb.ptr_idx, self.i64_type));
+                try out.append(self.allocator, c.BinaryenLocalGet(self.module, sb.len_idx, self.i64_type));
             },
             else => return Error.UnsupportedCall,
         }

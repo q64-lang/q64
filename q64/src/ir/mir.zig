@@ -138,6 +138,10 @@ pub const Op = union(enum) {
     /// backend bump-allocates and `memory.copy`s each piece, yielding the
     /// `(buf, len)` of the assembled string.
     str_concat: []const *Inst,
+    /// Store a `str` value's `(ptr, len)` into a binding's two i64 locals.
+    str_bind: struct { ptr_idx: u32, len_idx: u32, value: *Inst },
+    /// Read a `str` binding's two locals as a `(ptr, len)` value.
+    str_binding: struct { ptr_idx: u32, len_idx: u32 },
     /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
     /// shared newline byte at `nl_off`.
     host_out_str: struct { value: *Inst, nl_off: u32 },

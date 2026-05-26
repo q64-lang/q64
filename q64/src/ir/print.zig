@@ -65,6 +65,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, as.value);
             try app(gpa, out, "\n", .{});
         },
+        .str_let => |sl| {
+            try app(gpa, out, "str_let [{d},{d}] = ", .{ sl.ptr_idx, sl.len_idx });
+            try hirExpr(gpa, out, sl.value);
+            try app(gpa, out, "\n", .{});
+        },
         .if_ => |iff| {
             try app(gpa, out, "if ", .{});
             try hirExpr(gpa, out, iff.cond);
@@ -120,6 +125,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             }
             try app(gpa, out, "]", .{});
         },
+        .str_binding => |sb| try app(gpa, out, "str_binding[{d},{d}]", .{ sb.ptr_idx, sb.len_idx }),
     }
 }
 
@@ -195,6 +201,11 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .str_concat => |pieces| {
             try app(gpa, out, "str_concat\n", .{});
             for (pieces) |p| try mirInst(gpa, out, p, depth + 1);
+        },
+        .str_binding => |sb| try app(gpa, out, "str_binding [{d},{d}]\n", .{ sb.ptr_idx, sb.len_idx }),
+        .str_bind => |sb| {
+            try app(gpa, out, "str_bind [{d},{d}]\n", .{ sb.ptr_idx, sb.len_idx });
+            try mirInst(gpa, out, sb.value, depth + 1);
         },
         .host_out_str => |hs| {
             try app(gpa, out, "host_out_str nl_off={d}\n", .{hs.nl_off});

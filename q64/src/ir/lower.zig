@@ -48,9 +48,12 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     for (h.funcs, 0..) |hf, i| {
         const is_entry = (h.entry != null and h.entry.? == i);
         if (is_entry) {
+            const locals = try a.alloc(mir.ValueType, hf.locals.len);
+            for (hf.locals, 0..) |t, j| locals[j] = mapType(t);
             funcs[i] = .{
                 .name = "start",
                 .ret = .void,
+                .locals = locals,
                 .body = .{ .structured = try lowerEntry(ctx, hf.body) },
                 .linkage = .entry,
             };
@@ -96,6 +99,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             const nl = try ctx.newline();
             return mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, e), .nl_off = nl } });
         },
+        .str_let => |sl| return mk(ctx.a, .void, .{ .str_bind = .{ .ptr_idx = sl.ptr_idx, .len_idx = sl.len_idx, .value = try lowerStrExpr(ctx, sl.value) } }),
         else => unreachable, // main has no value/tail statements
     }
 }
@@ -153,6 +157,7 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             for (pieces, 0..) |p, i| ps[i] = try lowerStrExpr(ctx, p);
             return mk(ctx.a, .str, .{ .str_concat = ps });
         },
+        .str_binding => |sb| return mk(ctx.a, .str, .{ .str_binding = .{ .ptr_idx = sb.ptr_idx, .len_idx = sb.len_idx } }),
         else => return error.Unsupported,
     }
 }
@@ -259,7 +264,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             for (cl.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
             return mk(ctx.a, .i64, .{ .call = .{ .func = cl.func, .args = args } });
         },
-        .str_const, .concat => unreachable, // str values never reach the i64 path
+        .str_const, .concat, .str_binding => unreachable, // str values never reach the i64 path
     }
 }
 
