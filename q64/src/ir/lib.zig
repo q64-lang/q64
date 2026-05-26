@@ -15,8 +15,10 @@
 //!
 //! Wired up in `build.zig` as the `ir` module dependency.
 
+pub const ops = @import("ops.zig");
 pub const hir = @import("hir.zig");
 pub const mir = @import("mir.zig");
+pub const consteval = @import("consteval.zig");
 pub const build_hir = @import("build_hir.zig");
 pub const lower = @import("lower.zig");
 pub const print = @import("print.zig");
@@ -24,8 +26,10 @@ pub const print = @import("print.zig");
 // Pull every submodule's embedded tests into the `ir_tests` target (a plain
 // `pub const … = @import(…)` doesn't make the test runner collect them).
 test {
+    _ = ops;
     _ = hir;
     _ = mir;
+    _ = consteval;
     _ = build_hir;
     _ = lower;
     _ = print;

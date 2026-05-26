@@ -17,8 +17,25 @@
 //! else still flows through the legacy AST→Binaryen path in `codegen/`.
 
 const std = @import("std");
+const parser = @import("parser");
+const ast = parser.ast;
+pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
+
+/// Resolves a function name (imported or file-local) to its AST declaration.
+/// The AST→HIR builder calls this to turn a call site into a `FuncId`; the
+/// codegen router backs it with the existing `Resolver.lookup`, so HIR
+/// construction reuses import resolution without `ir/` depending on codegen.
+/// (Name resolution will move fully into the builder in a later phase.)
+pub const ModuleResolver = struct {
+    ctx: *anyopaque,
+    lookupFn: *const fn (*anyopaque, name: []const u8) ?ast.FnDecl,
+
+    pub fn lookup(self: ModuleResolver, name: []const u8) ?ast.FnDecl {
+        return self.lookupFn(self.ctx, name);
+    }
+};
 
 /// Source-level value types. `str` is abstract here (it only becomes a
 /// `(ptr, len)` pair in MIR).
@@ -52,6 +69,9 @@ pub const Func = struct {
     name: []const u8,
     params: []Param = &.{},
     ret: Type = .void,
+    /// Locals declared beyond the parameters (in-body `let`/`var`), in
+    /// declaration order. Parameters occupy local indices `0..params.len`.
+    locals: []Type = &.{},
     body: *Stmt,
     /// Carried for the future component/WIT lift (exports = the pub surface).
     visibility: Visibility = .private,
@@ -59,19 +79,53 @@ pub const Func = struct {
     // the component/WIT + QubePod stages consume. Empty in v0.
 };
 
-/// High-level statements. Grows per migration phase (let/return/if/while/
-/// loop/break/continue/assign land with their codegen phases).
+/// High-level statements. `block` is shared; the `host_out*` forms appear in
+/// `main`; the rest make up an `i64` function body. Local references use the
+/// resolved index assigned by the builder (parameters first, then in-body
+/// bindings in declaration order). Compound assignment (`+=` …) is desugared
+/// to `assign(idx, bin(op, local(idx), rhs))`.
 pub const Stmt = union(enum) {
     block: []const *Stmt,
-    /// `env.out(expr)` — the `expr` is a `str`-typed value. The trailing
-    /// newline env.out writes is part of its capability contract and is
-    /// materialized during lowering, not here.
+    /// `env.out(expr)` — `expr` is `str`-typed. The trailing newline is the
+    /// capability ABI's, materialized during lowering.
     host_out: *Expr,
+    /// `env.out(expr)` where `expr` is `i64` — formatted to decimal on lowering.
+    host_out_int: *Expr,
+    /// `env.out(expr)` where `expr` is a runtime `str` value (e.g. a call to a
+    /// str-returning function) — its `(ptr, len)` is written, then a newline.
+    host_out_str: *Expr,
+    /// An `i64` expression statement; as a block's tail it is the value.
+    expr: *Expr,
+    ret: ?*Expr,
+    let: struct { idx: u32, value: *Expr },
+    assign: struct { idx: u32, value: *Expr },
+    /// A runtime `str` binding (`let g = shout("hi")`): store the value's
+    /// `(ptr, len)` into the two locals `ptr_idx`/`len_idx`.
+    str_let: struct { ptr_idx: u32, len_idx: u32, value: *Expr },
+    /// `then_`/`else_` are blocks (an `else if` is a block holding one `if_`).
+    if_: struct { cond: *Expr, then_: *Stmt, else_: ?*Stmt },
+    while_: struct { cond: *Expr, body: *Stmt },
+    loop_: *Stmt,
+    brk,
+    cont,
 };
 
 /// High-level expressions. `str` stays abstract; the `(ptr, len)` ABI is a
-/// lowering (MIR) concern. Grows per phase (int_const/concat/call/local/…).
+/// lowering (MIR) concern. Grows per phase (concat/interpolation later).
 pub const Expr = union(enum) {
     /// A fully-resolved constant string value (escapes decoded, no newline).
     str_const: []const u8,
+    int_const: i64,
+    /// A parameter or in-body binding, by resolved local index.
+    local: u32,
+    bin: struct { kind: ops.BinKind, lhs: *Expr, rhs: *Expr },
+    un: struct { kind: ops.UnKind, operand: *Expr },
+    /// A call to another function, resolved to its `FuncId`.
+    call: struct { func: FuncId, args: []const *Expr },
+    /// A runtime string concatenation (interpolation with dynamic pieces).
+    /// Each piece is a `str` value: a `str_const` run, a `local` parameter, or
+    /// a `call`.
+    concat: []const *Expr,
+    /// The `str` value of a runtime binding, read from its two locals.
+    str_binding: struct { ptr_idx: u32, len_idx: u32 },
 };

@@ -20,12 +20,14 @@
 //! the *Binaryen backend's* realization, not baked into MIR).
 
 const std = @import("std");
+pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
 
-/// Wasm-level value types. Note there is no `str`: by MIR a string has
-/// already been lowered to its `(ptr, len)` representation (two i64s).
-pub const ValueType = enum { i64, i32, f64, void };
+/// Wasm-level value types. A `str` is the `(ptr, len)` pair — the backend
+/// realizes it as a two-i64 multivalue (tuple); a str function returns it and
+/// a str parameter is two i64 wasm params.
+pub const ValueType = enum { i64, i32, f64, str, void };
 
 pub const Linkage = enum { entry, local, imported_resolved };
 
@@ -107,11 +109,50 @@ pub const Inst = struct {
     op: Op,
 };
 
-/// The executable op set. Grows per migration phase. v0:
-///   block          — a sequence of (mostly `.void`) instructions.
+/// The executable op set. Grows per migration phase.
+///   block          — a sequence of instructions; `ty` is the tail's type.
 ///   host_out_const — `env.out` of a constant string already in `data`
 ///                    (off/len include env.out's trailing newline).
+///   const_i64/local_get/local_set/bin/un/call/ret — the i64 value + call ops.
+///   host_out_int   — `env.out` of an i64: format to decimal then write,
+///                    followed by the shared newline byte at `nl_off`.
 pub const Op = union(enum) {
     block: []const *Inst,
     host_out_const: struct { off: u32, len: u32 },
+    const_i64: i64,
+    local_get: u32,
+    local_set: struct { idx: u32, value: *Inst },
+    bin: struct { kind: ops.BinKind, lhs: *Inst, rhs: *Inst },
+    un: struct { kind: ops.UnKind, operand: *Inst },
+    call: struct { func: FuncId, args: []const *Inst },
+    ret: ?*Inst,
+    host_out_int: struct { value: *Inst, nl_off: u32 },
+    /// A constant `str` value: the `(ptr, len)` pointing at `off`/`len` in the
+    /// memory image (no trailing newline — it's a value, not a host write).
+    str_const_val: struct { off: u32, len: u32 },
+    /// The `str` value of parameter `#idx` (all-str param lists today, so its
+    /// `(ptr, len)` lives at wasm locals `2·idx`, `2·idx+1`).
+    str_param: u32,
+    /// A `str` value built at runtime in the scope arena by concatenating the
+    /// pieces (each a `str` value: a const run, a parameter, or a call). The
+    /// backend bump-allocates and `memory.copy`s each piece, yielding the
+    /// `(buf, len)` of the assembled string.
+    str_concat: []const *Inst,
+    /// Store a `str` value's `(ptr, len)` into a binding's two i64 locals.
+    str_bind: struct { ptr_idx: u32, len_idx: u32, value: *Inst },
+    /// Read a `str` binding's two locals as a `(ptr, len)` value.
+    str_binding: struct { ptr_idx: u32, len_idx: u32 },
+    /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
+    /// shared newline byte at `nl_off`.
+    host_out_str: struct { value: *Inst, nl_off: u32 },
+    // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
+    // `while_`/`loop` are void and diverge/iterate; the backend expands them
+    // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the
+    // innermost loop's exit/re-enter labels. `cond` is an i32 (0/1).
+    if_: struct { cond: *Inst, then_: *Inst, else_: ?*Inst },
+    while_: struct { cond: *Inst, body: *Inst },
+    loop: *Inst,
+    br, // break → innermost loop exit
+    br_cont, // continue → innermost loop re-enter
+    @"unreachable",
 };

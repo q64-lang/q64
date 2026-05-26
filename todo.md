@@ -268,13 +268,64 @@ it with `CfgUnsupported`).
       back to legacy. Verified: 169/169 unit tests (7 new IR tests),
       `link-roundtrip.sh` green, and `Q64_IR_STRICT=1` runs literals / panics on
       interpolation as designed. ARCHITECTURE.md updated (pipeline + `ir` stage).
-- [ ] **P2 i64 + control flow.** Port `emitInt*` + the callee fixpoint into
-      `build_hir`/`lower` (produce `mir.Inst`); extend `lowerInst`. Flip the i64
-      / if-else / while / loop / recursion tests + roundtrip sections.
-- [ ] **P3 concat / bindings / params / str ABI.** The heart of HIR→MIR: the
-      `(ptr,len)` ABI, the scope-arena concat plan (keep `appendConcat`
-      byte-identical, swap its driver), runtime `let`/`var`. After this the whole
-      suite + `link-roundtrip.sh` runs through the IR.
+- [x] **P2 i64 + control flow.** `build_hir` transcribes i64 functions (params,
+      in-body `let`/`var` with index assignment, compound-assign desugaring) +
+      the callee fixpoint (recursion reserves params before the body so arity
+      checks pass); `lower` ports the `emitIntBlock` tail/control-flow logic
+      (value vs void `if`, `while`→loop, diverging `loop`+`unreachable`) into
+      structured MIR (`if_`/`while_`/`loop`/`br`/`br_cont`/`ret`); the backend
+      `Lowerer` expands those with a label stack + emits multi-function modules,
+      `__fmt_i64`, the arena `sp` global, and the pair scratch local. `lower`
+      returns `Unsupported` for not-yet-handled shapes → router falls back.
+      Verified with `Q64_IR_STRICT=1`: `fact`/`fib`/`gcd`/`sum_to`/`first_factor`/
+      `sum_odd` → `720/55/12/5050/7/25` all through AST→HIR→MIR→Binaryen;
+      170/170 unit tests + link-roundtrip.sh green.
+- [x] **P3a compile-time strings.** `ir/consteval.zig` (ported from the legacy
+      `Resolver`): folds const string interpolation, integer arithmetic, const
+      `let` bindings, and const-bodied nullary calls — the last only in a `let`
+      initializer (`fold_calls`), matching "direct `env.out(f())` is a real
+      call." `build_hir` evaluates `main`'s `let`s into evaluator bindings and
+      folds const `env.out` args to `host_out` (str_const) — reusing P1's data
+      path, no MIR/backend changes. Verified via `Q64_IR_STRICT=1`:
+      `"{(1+2)*3} {n+1} {1_000+24}"`→`9 43 1024` and `let name/v` + interpolation
+      → `Hello, world! (q64 v0.1.0)` route through the IR; 172 tests + roundtrip
+      green.
+- **P3b runtime string ABI** (in progress). The `(ptr,len)` ABI in MIR
+  (`ValueType.str` = a pair; backend realizes it as a two-i64 multivalue).
+  - [x] **P3b-1 str-returning const functions + `env.out(str_call)`.** MIR gains
+        `str_const_val` (→ `TupleMake`) and `host_out_str` (store pair, extract,
+        env.out, newline); a str fn returns `pair_type`; the call-result type
+        comes from the callee's `ret`. `build_hir` registers str functions
+        (`registerStrFunc`, nullary, const-literal body) and routes a str-call
+        `env.out` arg to `host_out_str` (`isStrCall`); `buildIntExpr` now rejects
+        a str callee in an i64 context. Verified `Q64_IR_STRICT=1`: the link-demo
+        `env.out(version())` → `0.1.0` through AST→HIR→MIR→Binaryen.
+  - [x] **P3b-2** str params + passthrough (`id(s){s}`), str-literal/const-call
+        args. MIR `str_param` (→ `TupleMake` of locals `2·idx`,`2·idx+1`); the
+        backend expands a str param into two i64 wasm params and a str argument
+        into two i64 operands (`strOperands`). `build_hir` registers all-str-param
+        str functions; `buildStrArg` folds a const arg (`id(vshout())`) or passes
+        a parameter through. Verified `Q64_IR_STRICT=1`: `id("passed")`→`passed`,
+        `id(vshout())`→`0.1.0`.
+  - [x] **P3b-3** concat / interpolation. MIR `str_concat` ([]piece); the backend
+        `emitConcat` ports the legacy `appendConcat` (call pieces → tuple slots,
+        sum lengths, bump `sp`, `memory.copy` each), yielding `(buf,len)`. Per-
+        function scratch layout (`scanScratch` → tuple slots + buf/off/len) for
+        both entry and callees. `build_hir.buildConcat` splits an interpolation
+        into const-run / param / nullary-call pieces (folding const interps).
+        Verified `Q64_IR_STRICT=1`: `"q64 v{version()} ok"`→`q64 v0.1.0 ok`,
+        `shout("loud")`→`loud!`, `join("a","b")`→`a-b`, `shout(version())`→`0.1.0!`.
+  - [x] **P3b-4** runtime str `let`/`var` bindings + runtime args. MIR `str_bind`
+        (split a str value's (ptr,len) into two locals) + `str_binding` (read
+        them); `emitConcat`/`strOperands` gained a `str_binding` piece/operand.
+        `build_hir` tracks `main`'s runtime str bindings (`main_rt`) + their
+        backing locals (`main_locals`), threaded as an `rt` scope through the str
+        builders so `{g}`, `env.out(g)`, and `wrap(g)` resolve. Fixed: `lower`
+        now carries the entry's `locals` into MIR. Verified `Q64_IR_STRICT=1`:
+        `let g = shout("hi"); env.out(g); "{g} and {g}"; let w = wrap(g); "{w}"`
+        → `hi!` / `got: hi! and hi!` / `nested: [hi!]`.
+  - [ ] **P3b-5** i64 bindings + int interpolation in `main`.
+  After P3b the whole suite + `link-roundtrip.sh` runs through the IR.
 - [ ] **P4 delete legacy.** Once the router never falls through (verify with
       `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
       `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.

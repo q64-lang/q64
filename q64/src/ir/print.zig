@@ -27,9 +27,105 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try app(gpa, out, "block\n", .{});
             for (items) |child| try hirStmt(gpa, out, child, depth + 1);
         },
-        .host_out => |e| switch (e.*) {
-            .str_const => |b| try app(gpa, out, "host_out \"{s}\"\n", .{b}),
+        .host_out => |e| {
+            try app(gpa, out, "host_out ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
         },
+        .host_out_int => |e| {
+            try app(gpa, out, "host_out_int ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
+        .host_out_str => |e| {
+            try app(gpa, out, "host_out_str ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
+        .expr => |e| {
+            try app(gpa, out, "expr ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
+        .ret => |e| {
+            try app(gpa, out, "ret", .{});
+            if (e) |val| {
+                try app(gpa, out, " ", .{});
+                try hirExpr(gpa, out, val);
+            }
+            try app(gpa, out, "\n", .{});
+        },
+        .let => |l| {
+            try app(gpa, out, "let local#{d} = ", .{l.idx});
+            try hirExpr(gpa, out, l.value);
+            try app(gpa, out, "\n", .{});
+        },
+        .assign => |as| {
+            try app(gpa, out, "assign local#{d} = ", .{as.idx});
+            try hirExpr(gpa, out, as.value);
+            try app(gpa, out, "\n", .{});
+        },
+        .str_let => |sl| {
+            try app(gpa, out, "str_let [{d},{d}] = ", .{ sl.ptr_idx, sl.len_idx });
+            try hirExpr(gpa, out, sl.value);
+            try app(gpa, out, "\n", .{});
+        },
+        .if_ => |iff| {
+            try app(gpa, out, "if ", .{});
+            try hirExpr(gpa, out, iff.cond);
+            try app(gpa, out, "\n", .{});
+            try hirStmt(gpa, out, iff.then_, depth + 1);
+            if (iff.else_) |e| try hirStmt(gpa, out, e, depth + 1);
+        },
+        .while_ => |w| {
+            try app(gpa, out, "while ", .{});
+            try hirExpr(gpa, out, w.cond);
+            try app(gpa, out, "\n", .{});
+            try hirStmt(gpa, out, w.body, depth + 1);
+        },
+        .loop_ => |body| {
+            try app(gpa, out, "loop\n", .{});
+            try hirStmt(gpa, out, body, depth + 1);
+        },
+        .brk => try app(gpa, out, "break\n", .{}),
+        .cont => try app(gpa, out, "continue\n", .{}),
+    }
+}
+
+fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
+    switch (e.*) {
+        .str_const => |b| try app(gpa, out, "\"{s}\"", .{b}),
+        .int_const => |v| try app(gpa, out, "{d}", .{v}),
+        .local => |i| try app(gpa, out, "local#{d}", .{i}),
+        .un => |u| {
+            try app(gpa, out, "({s} ", .{@tagName(u.kind)});
+            try hirExpr(gpa, out, u.operand);
+            try app(gpa, out, ")", .{});
+        },
+        .bin => |b| {
+            try app(gpa, out, "(", .{});
+            try hirExpr(gpa, out, b.lhs);
+            try app(gpa, out, " {s} ", .{@tagName(b.kind)});
+            try hirExpr(gpa, out, b.rhs);
+            try app(gpa, out, ")", .{});
+        },
+        .call => |cl| {
+            try app(gpa, out, "call#{d}(", .{cl.func});
+            for (cl.args, 0..) |arg, i| {
+                if (i != 0) try app(gpa, out, ", ", .{});
+                try hirExpr(gpa, out, arg);
+            }
+            try app(gpa, out, ")", .{});
+        },
+        .concat => |pieces| {
+            try app(gpa, out, "concat[", .{});
+            for (pieces, 0..) |p, i| {
+                if (i != 0) try app(gpa, out, ", ", .{});
+                try hirExpr(gpa, out, p);
+            }
+            try app(gpa, out, "]", .{});
+        },
+        .str_binding => |sb| try app(gpa, out, "str_binding[{d},{d}]", .{ sb.ptr_idx, sb.len_idx }),
     }
 }
 
@@ -69,10 +165,70 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
     try indent(gpa, out, depth);
     switch (inst.op) {
         .block => |items| {
-            try app(gpa, out, "block\n", .{});
+            try app(gpa, out, "block : {s}\n", .{@tagName(inst.ty)});
             for (items) |child| try mirInst(gpa, out, child, depth + 1);
         },
         .host_out_const => |hc| try app(gpa, out, "host_out_const off={d} len={d}\n", .{ hc.off, hc.len }),
+        .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
+        .local_get => |i| try app(gpa, out, "local_get {d}\n", .{i}),
+        .local_set => |ls| {
+            try app(gpa, out, "local_set {d}\n", .{ls.idx});
+            try mirInst(gpa, out, ls.value, depth + 1);
+        },
+        .bin => |b| {
+            try app(gpa, out, "bin {s}\n", .{@tagName(b.kind)});
+            try mirInst(gpa, out, b.lhs, depth + 1);
+            try mirInst(gpa, out, b.rhs, depth + 1);
+        },
+        .un => |u| {
+            try app(gpa, out, "un {s}\n", .{@tagName(u.kind)});
+            try mirInst(gpa, out, u.operand, depth + 1);
+        },
+        .call => |cl| {
+            try app(gpa, out, "call #{d}\n", .{cl.func});
+            for (cl.args) |arg| try mirInst(gpa, out, arg, depth + 1);
+        },
+        .ret => |v| {
+            try app(gpa, out, "ret\n", .{});
+            if (v) |val| try mirInst(gpa, out, val, depth + 1);
+        },
+        .host_out_int => |hi| {
+            try app(gpa, out, "host_out_int nl_off={d}\n", .{hi.nl_off});
+            try mirInst(gpa, out, hi.value, depth + 1);
+        },
+        .str_const_val => |sc| try app(gpa, out, "str_const_val off={d} len={d}\n", .{ sc.off, sc.len }),
+        .str_param => |idx| try app(gpa, out, "str_param {d}\n", .{idx}),
+        .str_concat => |pieces| {
+            try app(gpa, out, "str_concat\n", .{});
+            for (pieces) |p| try mirInst(gpa, out, p, depth + 1);
+        },
+        .str_binding => |sb| try app(gpa, out, "str_binding [{d},{d}]\n", .{ sb.ptr_idx, sb.len_idx }),
+        .str_bind => |sb| {
+            try app(gpa, out, "str_bind [{d},{d}]\n", .{ sb.ptr_idx, sb.len_idx });
+            try mirInst(gpa, out, sb.value, depth + 1);
+        },
+        .host_out_str => |hs| {
+            try app(gpa, out, "host_out_str nl_off={d}\n", .{hs.nl_off});
+            try mirInst(gpa, out, hs.value, depth + 1);
+        },
+        .if_ => |iff| {
+            try app(gpa, out, "if : {s}\n", .{@tagName(inst.ty)});
+            try mirInst(gpa, out, iff.cond, depth + 1);
+            try mirInst(gpa, out, iff.then_, depth + 1);
+            if (iff.else_) |e| try mirInst(gpa, out, e, depth + 1);
+        },
+        .while_ => |w| {
+            try app(gpa, out, "while\n", .{});
+            try mirInst(gpa, out, w.cond, depth + 1);
+            try mirInst(gpa, out, w.body, depth + 1);
+        },
+        .loop => |body| {
+            try app(gpa, out, "loop\n", .{});
+            try mirInst(gpa, out, body, depth + 1);
+        },
+        .br => try app(gpa, out, "br\n", .{}),
+        .br_cont => try app(gpa, out, "br_cont\n", .{}),
+        .@"unreachable" => try app(gpa, out, "unreachable\n", .{}),
     }
 }
 
