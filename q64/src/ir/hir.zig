@@ -79,18 +79,29 @@ pub const Func = struct {
     // the component/WIT + QubePod stages consume. Empty in v0.
 };
 
-/// High-level statements. Grows per migration phase (if/while/loop/break/
-/// continue land with the control-flow phase).
+/// High-level statements. `block` is shared; the `host_out*` forms appear in
+/// `main`; the rest make up an `i64` function body. Local references use the
+/// resolved index assigned by the builder (parameters first, then in-body
+/// bindings in declaration order). Compound assignment (`+=` …) is desugared
+/// to `assign(idx, bin(op, local(idx), rhs))`.
 pub const Stmt = union(enum) {
     block: []const *Stmt,
-    /// `env.out(expr)` — `expr` is a `str`-typed value. The trailing newline
-    /// env.out writes is part of its capability contract and is materialized
-    /// during lowering, not here.
+    /// `env.out(expr)` — `expr` is `str`-typed. The trailing newline is the
+    /// capability ABI's, materialized during lowering.
     host_out: *Expr,
     /// `env.out(expr)` where `expr` is `i64` — formatted to decimal on lowering.
     host_out_int: *Expr,
-    /// The tail value of an `i64` function body (`{ … expr }`).
-    value: *Expr,
+    /// An `i64` expression statement; as a block's tail it is the value.
+    expr: *Expr,
+    ret: ?*Expr,
+    let: struct { idx: u32, value: *Expr },
+    assign: struct { idx: u32, value: *Expr },
+    /// `then_`/`else_` are blocks (an `else if` is a block holding one `if_`).
+    if_: struct { cond: *Expr, then_: *Stmt, else_: ?*Stmt },
+    while_: struct { cond: *Expr, body: *Stmt },
+    loop_: *Stmt,
+    brk,
+    cont,
 };
 
 /// High-level expressions. `str` stays abstract; the `(ptr, len)` ABI is a

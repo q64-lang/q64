@@ -13,7 +13,10 @@ const std = @import("std");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
 
-pub const Error = std.mem.Allocator.Error;
+/// `Unsupported` means a valid-but-not-yet-lowerable shape (e.g. a function
+/// body whose tail isn't a value); the codegen router treats it as a signal
+/// to fall back to the legacy emitter.
+pub const Error = error{Unsupported} || std.mem.Allocator.Error;
 
 const Ctx = struct {
     a: std.mem.Allocator,
@@ -34,6 +37,7 @@ const Ctx = struct {
 /// Lower a whole HIR module to MIR. The result owns its own arena.
 pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     var mod = mir.Module.init(gpa);
+    errdefer mod.deinit();
     const a = mod.alloc();
 
     var data: std.ArrayList(u8) = .empty;
@@ -98,9 +102,7 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
     const locals = try ctx.a.alloc(mir.ValueType, hf.locals.len);
     for (hf.locals, 0..) |t, i| locals[i] = mapType(t);
 
-    // v0 callee body is a single `value` tail expression.
-    const tail = singleValue(hf.body) orelse unreachable;
-    const body = try lowerExpr(ctx, tail);
+    const body = try lowerIntBlock(ctx, hf.body, true);
 
     return .{
         .name = try ctx.a.dupeZ(u8, hf.name),
@@ -112,16 +114,88 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
     };
 }
 
-fn singleValue(body: *const hir.Stmt) ?*hir.Expr {
-    const items = switch (body.*) {
-        .block => |b| b,
-        else => return null,
+/// Lower an i64 function block. With `want_value` the block yields an i64 —
+/// its last statement is the tail (an expression, `return`, value-`if`, or a
+/// diverging `loop`); earlier statements are setup. Mirrors the legacy
+/// `emitIntBlock`. Returns `Unsupported` when a tail produces no value.
+fn lowerIntBlock(ctx: Ctx, blk: *const hir.Stmt, want_value: bool) Error!*mir.Inst {
+    const stmts = switch (blk.*) {
+        .block => |s| s,
+        else => return error.Unsupported,
     };
-    if (items.len != 1) return null;
-    return switch (items[0].*) {
-        .value => |e| e,
-        else => null,
+
+    var items: std.ArrayList(*mir.Inst) = .empty;
+    const n = stmts.len;
+    const tail_at: ?usize = if (want_value and n > 0) n - 1 else null;
+
+    for (stmts, 0..) |s, i| {
+        if (tail_at != null and i == tail_at.?) continue;
+        try lowerSetupStmt(ctx, s, &items);
+    }
+
+    if (!want_value) return mk(ctx.a, .void, .{ .block = try items.toOwnedSlice(ctx.a) });
+
+    const tail = if (tail_at) |t| stmts[t] else return error.Unsupported;
+
+    // A diverging `loop` tail: emit it, then `unreachable` so the block types
+    // as i64 (it must exit via `return`).
+    if (tail.* == .loop_) {
+        try items.append(ctx.a, try lowerLoop(ctx, tail.loop_));
+        try items.append(ctx.a, try mk(ctx.a, .void, .@"unreachable"));
+        return mk(ctx.a, .i64, .{ .block = try items.toOwnedSlice(ctx.a) });
+    }
+
+    const tail_val: *mir.Inst = switch (tail.*) {
+        .expr => |e| try lowerExpr(ctx, e),
+        .ret => |e| try lowerExpr(ctx, e orelse return error.Unsupported),
+        .if_ => |iff| try lowerValueIf(ctx, iff),
+        else => return error.Unsupported,
     };
+
+    if (items.items.len == 0) return tail_val;
+    try items.append(ctx.a, tail_val);
+    return mk(ctx.a, .i64, .{ .block = try items.toOwnedSlice(ctx.a) });
+}
+
+fn lowerSetupStmt(ctx: Ctx, s: *const hir.Stmt, items: *std.ArrayList(*mir.Inst)) Error!void {
+    switch (s.*) {
+        .let => |l| try items.append(ctx.a, try mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } })),
+        .assign => |as| try items.append(ctx.a, try mk(ctx.a, .void, .{ .local_set = .{ .idx = as.idx, .value = try lowerExpr(ctx, as.value) } })),
+        .while_ => |w| try items.append(ctx.a, try mk(ctx.a, .void, .{ .while_ = .{ .cond = try lowerCond(ctx, w.cond), .body = try lowerIntBlock(ctx, w.body, false) } })),
+        .loop_ => try items.append(ctx.a, try lowerLoop(ctx, s.loop_)),
+        .if_ => |iff| try items.append(ctx.a, try lowerVoidIf(ctx, iff)),
+        .ret => |e| try items.append(ctx.a, try mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null })),
+        .brk => try items.append(ctx.a, try mk(ctx.a, .void, .br)),
+        .cont => try items.append(ctx.a, try mk(ctx.a, .void, .br_cont)),
+        else => return error.Unsupported, // a non-tail bare expr has no value consumer
+    }
+}
+
+fn lowerLoop(ctx: Ctx, body_blk: *const hir.Stmt) Error!*mir.Inst {
+    return mk(ctx.a, .void, .{ .loop = try lowerIntBlock(ctx, body_blk, false) });
+}
+
+fn lowerValueIf(ctx: Ctx, iff: anytype) Error!*mir.Inst {
+    const cond = try lowerCond(ctx, iff.cond);
+    const then_ = try lowerIntBlock(ctx, iff.then_, true);
+    const else_ = try lowerIntBlock(ctx, iff.else_ orelse return error.Unsupported, true);
+    return mk(ctx.a, .i64, .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } });
+}
+
+fn lowerVoidIf(ctx: Ctx, iff: anytype) Error!*mir.Inst {
+    const cond = try lowerCond(ctx, iff.cond);
+    const then_ = try lowerIntBlock(ctx, iff.then_, false);
+    const else_: ?*mir.Inst = if (iff.else_) |eb| try lowerIntBlock(ctx, eb, false) else null;
+    return mk(ctx.a, .void, .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } });
+}
+
+/// A condition lowers to an i32 (0/1). A comparison already yields i32; any
+/// other i64 expression is truthiness-tested (`x != 0`).
+fn lowerCond(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
+    const inst = try lowerExpr(ctx, e);
+    if (inst.ty == .i32) return inst;
+    const zero = try mk(ctx.a, .i64, .{ .const_i64 = 0 });
+    return mk(ctx.a, .i32, .{ .bin = .{ .kind = .ne, .lhs = inst, .rhs = zero } });
 }
 
 fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {

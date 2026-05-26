@@ -195,13 +195,7 @@ pub fn emitFromSource(
     // diagnostics fire on either path. `Q64_IR_STRICT=1` turns a fallback
     // into a panic, to prove a phase's coverage in CI.
     const mres = ir.hir.ModuleResolver{ .ctx = &resolver, .lookupFn = resolverLookupShim };
-    if (try ir.build_hir.tryBuild(allocator, sf, mres)) |hir_module| {
-        var hmod = hir_module;
-        defer hmod.deinit();
-        var mmod = try ir.lower.lower(allocator, &hmod);
-        defer mmod.deinit();
-        return lowerToWasm(allocator, &mmod);
-    }
+    if (try tryIrEmit(allocator, sf, mres)) |bytes| return bytes;
     if (std.c.getenv("Q64_IR_STRICT") != null) {
         @panic("Q64_IR_STRICT: a construct fell back to the legacy emitter");
     }
@@ -233,6 +227,21 @@ pub fn emitFromSource(
 fn resolverLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
     const r: *Resolver = @ptrCast(@alignCast(ctx));
     return r.lookup(name);
+}
+
+/// Run the Q64 IR path: AST → HIR → MIR → Binaryen. Returns `null` when a
+/// construct isn't representable yet (build_hir bailed, or lowering hit an
+/// `Unsupported` shape) so the caller falls back to the legacy emitter. Other
+/// errors (genuine codegen failures) propagate.
+fn tryIrEmit(allocator: std.mem.Allocator, sf: ast.SourceFile, mres: ir.hir.ModuleResolver) !?[]u8 {
+    var hmod = (try ir.build_hir.tryBuild(allocator, sf, mres)) orelse return null;
+    defer hmod.deinit();
+    var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
+        error.Unsupported => return null,
+        else => |other| return other,
+    };
+    defer mmod.deinit();
+    return try lowerToWasm(allocator, &mmod);
 }
 
 fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
@@ -300,6 +309,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
             .pair_type = pair_type,
             .pair_idx = @intCast(f.locals.len), // pair scratch sits past the i64 locals
         };
+        defer lw.deinit();
 
         switch (f.linkage) {
             .entry => {
@@ -379,7 +389,10 @@ fn bodyHasIntOut(inst: *const ir.mir.Inst) bool {
             break :blk false;
         },
         .ret => |v| if (v) |val| bodyHasIntOut(val) else false,
-        .host_out_const, .const_i64, .local_get => false,
+        .if_ => |iff| bodyHasIntOut(iff.cond) or bodyHasIntOut(iff.then_) or (iff.else_ != null and bodyHasIntOut(iff.else_.?)),
+        .while_ => |w| bodyHasIntOut(w.cond) or bodyHasIntOut(w.body),
+        .loop => |body| bodyHasIntOut(body),
+        .host_out_const, .const_i64, .local_get, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -394,6 +407,17 @@ const Lowerer = struct {
     none_type: c.BinaryenType,
     pair_type: c.BinaryenType,
     pair_idx: c.BinaryenIndex,
+    label_ctr: u32 = 0,
+    loops: std.ArrayList(LoopLabels) = .empty,
+
+    fn deinit(self: *Lowerer) void {
+        self.loops.deinit(self.allocator);
+    }
+
+    fn topLoop(self: *const Lowerer) ?LoopLabels {
+        if (self.loops.items.len == 0) return null;
+        return self.loops.items[self.loops.items.len - 1];
+    }
 
     fn inst(self: *Lowerer, n: *const ir.mir.Inst) Error!c.BinaryenExpressionRef {
         const module = self.module;
@@ -440,6 +464,65 @@ const Lowerer = struct {
                 };
                 return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
             },
+            .if_ => |iff| {
+                const cond = try self.inst(iff.cond);
+                const then_ = try self.inst(iff.then_);
+                const else_ = if (iff.else_) |e| try self.inst(e) else null;
+                return c.BinaryenIf(module, cond, then_, else_);
+            },
+            .while_ => |w| {
+                // block $b { loop $l { br_if $b (eqz cond); <body>; br $l } }
+                var blk_buf: [16]u8 = undefined;
+                var loop_buf: [16]u8 = undefined;
+                const blk_lbl = std.fmt.bufPrintZ(&blk_buf, "Lb{d}", .{self.label_ctr}) catch unreachable;
+                const loop_lbl = std.fmt.bufPrintZ(&loop_buf, "Lc{d}", .{self.label_ctr}) catch unreachable;
+                self.label_ctr += 1;
+
+                const not_cond = c.BinaryenUnary(module, c.BinaryenEqZInt32(), try self.inst(w.cond));
+                try self.loops.append(self.allocator, .{ .brk = blk_lbl, .cont = loop_lbl });
+                const body = try self.inst(w.body);
+                _ = self.loops.pop();
+
+                var loop_items = [_]c.BinaryenExpressionRef{
+                    c.BinaryenBreak(module, blk_lbl.ptr, not_cond, null),
+                    body,
+                    c.BinaryenBreak(module, loop_lbl.ptr, null, null),
+                };
+                const loop_block = c.BinaryenBlock(module, null, @ptrCast(&loop_items), loop_items.len, self.none_type);
+                const loop = c.BinaryenLoop(module, loop_lbl.ptr, loop_block);
+                var outer = [_]c.BinaryenExpressionRef{loop};
+                return c.BinaryenBlock(module, blk_lbl.ptr, @ptrCast(&outer), outer.len, self.none_type);
+            },
+            .loop => |body_inst| {
+                // block $b { loop $l { <body>; br $l } }
+                var blk_buf: [16]u8 = undefined;
+                var loop_buf: [16]u8 = undefined;
+                const blk_lbl = std.fmt.bufPrintZ(&blk_buf, "Lb{d}", .{self.label_ctr}) catch unreachable;
+                const loop_lbl = std.fmt.bufPrintZ(&loop_buf, "Lc{d}", .{self.label_ctr}) catch unreachable;
+                self.label_ctr += 1;
+
+                try self.loops.append(self.allocator, .{ .brk = blk_lbl, .cont = loop_lbl });
+                const body = try self.inst(body_inst);
+                _ = self.loops.pop();
+
+                var loop_items = [_]c.BinaryenExpressionRef{
+                    body,
+                    c.BinaryenBreak(module, loop_lbl.ptr, null, null),
+                };
+                const loop_block = c.BinaryenBlock(module, null, @ptrCast(&loop_items), loop_items.len, self.none_type);
+                const loop = c.BinaryenLoop(module, loop_lbl.ptr, loop_block);
+                var outer = [_]c.BinaryenExpressionRef{loop};
+                return c.BinaryenBlock(module, blk_lbl.ptr, @ptrCast(&outer), outer.len, self.none_type);
+            },
+            .br => {
+                const lbl = self.topLoop() orelse return Error.BreakOutsideLoop;
+                return c.BinaryenBreak(module, lbl.brk.ptr, null, null);
+            },
+            .br_cont => {
+                const lbl = self.topLoop() orelse return Error.BreakOutsideLoop;
+                return c.BinaryenBreak(module, lbl.cont.ptr, null, null);
+            },
+            .@"unreachable" => return c.BinaryenUnreachable(module),
         }
     }
 

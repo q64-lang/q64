@@ -37,11 +37,48 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
-        .value => |e| {
-            try app(gpa, out, "value ", .{});
+        .expr => |e| {
+            try app(gpa, out, "expr ", .{});
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
+        .ret => |e| {
+            try app(gpa, out, "ret", .{});
+            if (e) |val| {
+                try app(gpa, out, " ", .{});
+                try hirExpr(gpa, out, val);
+            }
+            try app(gpa, out, "\n", .{});
+        },
+        .let => |l| {
+            try app(gpa, out, "let local#{d} = ", .{l.idx});
+            try hirExpr(gpa, out, l.value);
+            try app(gpa, out, "\n", .{});
+        },
+        .assign => |as| {
+            try app(gpa, out, "assign local#{d} = ", .{as.idx});
+            try hirExpr(gpa, out, as.value);
+            try app(gpa, out, "\n", .{});
+        },
+        .if_ => |iff| {
+            try app(gpa, out, "if ", .{});
+            try hirExpr(gpa, out, iff.cond);
+            try app(gpa, out, "\n", .{});
+            try hirStmt(gpa, out, iff.then_, depth + 1);
+            if (iff.else_) |e| try hirStmt(gpa, out, e, depth + 1);
+        },
+        .while_ => |w| {
+            try app(gpa, out, "while ", .{});
+            try hirExpr(gpa, out, w.cond);
+            try app(gpa, out, "\n", .{});
+            try hirStmt(gpa, out, w.body, depth + 1);
+        },
+        .loop_ => |body| {
+            try app(gpa, out, "loop\n", .{});
+            try hirStmt(gpa, out, body, depth + 1);
+        },
+        .brk => try app(gpa, out, "break\n", .{}),
+        .cont => try app(gpa, out, "continue\n", .{}),
     }
 }
 
@@ -140,6 +177,24 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "host_out_int nl_off={d}\n", .{hi.nl_off});
             try mirInst(gpa, out, hi.value, depth + 1);
         },
+        .if_ => |iff| {
+            try app(gpa, out, "if : {s}\n", .{@tagName(inst.ty)});
+            try mirInst(gpa, out, iff.cond, depth + 1);
+            try mirInst(gpa, out, iff.then_, depth + 1);
+            if (iff.else_) |e| try mirInst(gpa, out, e, depth + 1);
+        },
+        .while_ => |w| {
+            try app(gpa, out, "while\n", .{});
+            try mirInst(gpa, out, w.cond, depth + 1);
+            try mirInst(gpa, out, w.body, depth + 1);
+        },
+        .loop => |body| {
+            try app(gpa, out, "loop\n", .{});
+            try mirInst(gpa, out, body, depth + 1);
+        },
+        .br => try app(gpa, out, "br\n", .{}),
+        .br_cont => try app(gpa, out, "br_cont\n", .{}),
+        .@"unreachable" => try app(gpa, out, "unreachable\n", .{}),
     }
 }
 

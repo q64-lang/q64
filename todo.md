@@ -268,9 +268,18 @@ it with `CfgUnsupported`).
       back to legacy. Verified: 169/169 unit tests (7 new IR tests),
       `link-roundtrip.sh` green, and `Q64_IR_STRICT=1` runs literals / panics on
       interpolation as designed. ARCHITECTURE.md updated (pipeline + `ir` stage).
-- [ ] **P2 i64 + control flow.** Port `emitInt*` + the callee fixpoint into
-      `build_hir`/`lower` (produce `mir.Inst`); extend `lowerInst`. Flip the i64
-      / if-else / while / loop / recursion tests + roundtrip sections.
+- [x] **P2 i64 + control flow.** `build_hir` transcribes i64 functions (params,
+      in-body `let`/`var` with index assignment, compound-assign desugaring) +
+      the callee fixpoint (recursion reserves params before the body so arity
+      checks pass); `lower` ports the `emitIntBlock` tail/control-flow logic
+      (value vs void `if`, `while`→loop, diverging `loop`+`unreachable`) into
+      structured MIR (`if_`/`while_`/`loop`/`br`/`br_cont`/`ret`); the backend
+      `Lowerer` expands those with a label stack + emits multi-function modules,
+      `__fmt_i64`, the arena `sp` global, and the pair scratch local. `lower`
+      returns `Unsupported` for not-yet-handled shapes → router falls back.
+      Verified with `Q64_IR_STRICT=1`: `fact`/`fib`/`gcd`/`sum_to`/`first_factor`/
+      `sum_odd` → `720/55/12/5050/7/25` all through AST→HIR→MIR→Binaryen;
+      170/170 unit tests + link-roundtrip.sh green.
 - [ ] **P3 concat / bindings / params / str ABI.** The heart of HIR→MIR: the
       `(ptr,len)` ABI, the scope-arena concat plan (keep `appendConcat`
       byte-identical, swap its driver), runtime `let`/`var`. After this the whole

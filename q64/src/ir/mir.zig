@@ -126,4 +126,14 @@ pub const Op = union(enum) {
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
     host_out_int: struct { value: *Inst, nl_off: u32 },
+    // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
+    // `while_`/`loop` are void and diverge/iterate; the backend expands them
+    // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the
+    // innermost loop's exit/re-enter labels. `cond` is an i32 (0/1).
+    if_: struct { cond: *Inst, then_: *Inst, else_: ?*Inst },
+    while_: struct { cond: *Inst, body: *Inst },
+    loop: *Inst,
+    br, // break → innermost loop exit
+    br_cont, // continue → innermost loop re-enter
+    @"unreachable",
 };

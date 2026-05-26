@@ -67,6 +67,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     dummy.* = .{ .block = &.{} };
     try b.funcs.append(b.a, .{ .name = "main", .body = dummy });
 
+    // `main` has no parameters or i64 bindings yet (those land later); its
+    // env.out(<i64>) arguments resolve against an empty scope.
+    var mscope = Scope{ .a = b.a };
+
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
     var it = body.statements();
     while (it.next()) |stmt| {
@@ -92,7 +96,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
             },
             else => {
                 // An i64 expression (typically a call to an i64 function).
-                const e = try buildIntExpr(b, arg, &.{});
+                const e = try buildIntExpr(b, arg, &mscope);
                 st.* = .{ .host_out_int = e };
             },
         }
@@ -105,8 +109,9 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
 }
 
 /// Resolve `name` to a registered i64 function, building it (and anything it
-/// calls) the first time. Returns its FuncId. Reserves the id before building
-/// the body so recursion and forward references resolve.
+/// calls) the first time. Returns its FuncId. The id and the parameter list
+/// are reserved *before* the body is built, so a recursive call inside the
+/// body sees the correct arity (not the placeholder's).
 fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (b.ids.get(name)) |id| return id;
 
@@ -114,65 +119,152 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (!(try returnsI64(b.a, fd))) return error.Unsupported; // i64 callees only, for now
 
     const owned = try b.a.dupe(u8, name);
-    const id: hir.FuncId = @intCast(b.funcs.items.len);
-    try b.ids.put(b.a, owned, id);
 
-    const dummy = try b.a.create(hir.Stmt);
-    dummy.* = .{ .block = &.{} };
-    try b.funcs.append(b.a, .{ .name = owned, .body = dummy });
-
-    b.funcs.items[id] = try buildIntFn(b, fd, owned);
-    return id;
-}
-
-fn buildIntFn(b: *Builder, fd: ast.FnDecl, name: []const u8) BuildError!hir.Func {
-    // Parameters (all i64) occupy local indices 0..n; collect their names so
-    // the body can resolve references.
-    var pnames: std.ArrayList([]const u8) = .empty;
+    // Parameters (all i64) occupy local indices 0..n; seed the body scope.
+    var scope = Scope{ .a = b.a };
     var params: std.ArrayList(hir.Param) = .empty;
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
             if (!(try paramIsI64(b.a, p))) return error.Unsupported;
             const pn = (p.name() orelse return error.Unsupported).text;
-            try pnames.append(b.a, pn);
+            _ = try scope.declare(pn, false);
             try params.append(b.a, .{ .name = pn, .ty = .i64 });
         }
     }
+    scope.n_params = @intCast(params.items.len);
+    const param_slice = try params.toOwnedSlice(b.a);
 
-    // v0 i64 bodies are a single tail expression; anything with in-body
-    // bindings or control flow defers to the legacy path (next phase).
-    const tail = try singleTailExpr(fd) orelse return error.Unsupported;
-    const value = try buildIntExpr(b, tail, pnames.items);
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, owned, id);
 
-    const vstmt = try b.a.create(hir.Stmt);
-    vstmt.* = .{ .value = value };
-    const block = try b.a.create(hir.Stmt);
-    block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    // Reserve with the real params so recursive arg-count checks are correct.
+    try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = .i64, .body = dummy });
 
-    return .{ .name = name, .params = try params.toOwnedSlice(b.a), .ret = .i64, .body = block };
+    const body = try buildIntBlock(b, fd.body() orelse return error.Unsupported, &scope);
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals) |*t| t.* = .i64;
+
+    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .i64, .locals = locals, .body = body };
+    return id;
 }
 
-/// The body of an i64 function as a single tail expression, or `null` if the
-/// body is anything more (bindings, control flow) — deferred for now.
-fn singleTailExpr(fd: ast.FnDecl) BuildError!?ast.Expr {
-    const body = fd.body() orelse return error.Unsupported;
-    var it = body.statements();
-    var first: ?ast.Expr = null;
-    var count: usize = 0;
-    while (it.next()) |stmt| {
-        count += 1;
-        if (count > 1) return null;
-        first = switch (stmt) {
-            .expr_stmt => |es| es.expression(),
-            .return_stmt => |rs| rs.value(),
-            else => return null,
-        };
+/// Name → local-index resolution for an i64 function body. Append-only with
+/// a backward scan (latest declaration wins), mirroring the legacy IntScope:
+/// parameters first, then in-body `let`/`var` in declaration order.
+const Local = struct { name: []const u8, idx: u32, mutable: bool };
+const Scope = struct {
+    a: std.mem.Allocator,
+    locals: std.ArrayList(Local) = .empty,
+    next_idx: u32 = 0,
+    n_params: u32 = 0,
+
+    fn find(self: *const Scope, name: []const u8) ?Local {
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.locals.items[i].name, name)) return self.locals.items[i];
+        }
+        return null;
     }
-    return first;
+    fn declare(self: *Scope, name: []const u8, mutable: bool) BuildError!u32 {
+        const idx = self.next_idx;
+        try self.locals.append(self.a, .{ .name = name, .idx = idx, .mutable = mutable });
+        self.next_idx += 1;
+        return idx;
+    }
+    fn extra(self: *const Scope) u32 {
+        return self.next_idx - self.n_params;
+    }
+};
+
+fn buildIntBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.Stmt {
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    var it = block.statements();
+    while (it.next()) |stmt| try items.append(b.a, try buildIntStmt(b, stmt, scope));
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return out;
 }
 
-fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: []const []const u8) BuildError!*hir.Expr {
+fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt {
+    const out = try b.a.create(hir.Stmt);
+    switch (stmt) {
+        .expr_stmt => |es| out.* = .{ .expr = try buildIntExpr(b, es.expression() orelse return error.Unsupported, scope) },
+        .return_stmt => |rs| {
+            const v: ?*hir.Expr = if (rs.value()) |e| try buildIntExpr(b, e, scope) else null;
+            out.* = .{ .ret = v };
+        },
+        .let_stmt => |ls| {
+            const init_expr = ls.initializer() orelse return error.Unsupported;
+            const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            // Build the initializer before declaring, so it can't see itself.
+            const value = try buildIntExpr(b, init_expr, scope);
+            const idx = try scope.declare(nm.text, ls.isVar());
+            out.* = .{ .let = .{ .idx = idx, .value = value } };
+        },
+        .assign_stmt => |as| {
+            const tgt = as.target() orelse return error.Unsupported;
+            const tpath = switch (tgt) {
+                .path => |p| p,
+                else => return error.Unsupported,
+            };
+            const tname = try tpath.text(b.a);
+            defer b.a.free(tname);
+            const loc = scope.find(tname) orelse return error.Unsupported;
+            if (!loc.mutable) return error.Unsupported; // immutable → legacy reports ImmutableAssign
+            const rhs = try buildIntExpr(b, as.value() orelse return error.Unsupported, scope);
+            const op = as.op() orelse return error.Unsupported;
+            const value = if (op.kind == .EQ) rhs else blk: {
+                const k = compoundOp(op) orelse return error.Unsupported;
+                const lhs = try b.a.create(hir.Expr);
+                lhs.* = .{ .local = loc.idx };
+                const bx = try b.a.create(hir.Expr);
+                bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
+                break :blk bx;
+            };
+            out.* = .{ .assign = .{ .idx = loc.idx, .value = value } };
+        },
+        .if_stmt => |is| return buildIfStmtNode(b, is, scope),
+        .while_stmt => |ws| {
+            const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, scope);
+            const body = try buildIntBlock(b, ws.body() orelse return error.Unsupported, scope);
+            out.* = .{ .while_ = .{ .cond = cond, .body = body } };
+        },
+        .loop_stmt => |lp| out.* = .{ .loop_ = try buildIntBlock(b, lp.body() orelse return error.Unsupported, scope) },
+        .break_stmt => |bs| {
+            if (bs.value() != null) return error.Unsupported; // value-break not supported
+            out.* = .brk;
+        },
+        .continue_stmt => out.* = .cont,
+        else => return error.Unsupported,
+    }
+    return out;
+}
+
+/// Build an `if`/`else(-if)` HIR node. An `else if` becomes an else block
+/// holding a single nested `if_`, so lowering treats the chain uniformly.
+fn buildIfStmtNode(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.Stmt {
+    const cond = try buildIntExpr(b, is.condition() orelse return error.Unsupported, scope);
+    const then_ = try buildIntBlock(b, is.thenBody() orelse return error.Unsupported, scope);
+    const else_: ?*hir.Stmt = if (is.elseIf()) |eif| blk: {
+        const inner = try buildIfStmtNode(b, eif, scope);
+        const wrap = try b.a.create(hir.Stmt);
+        wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+        break :blk wrap;
+    } else if (is.elseBody()) |eb|
+        try buildIntBlock(b, eb, scope)
+    else
+        null;
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
+    return out;
+}
+
+fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
     const out = try b.a.create(hir.Expr);
     switch (expr) {
         .num_lit => |n| out.* = .{ .int_const = try parseIntLit(n.rawText() orelse return error.Unsupported) },
@@ -180,8 +272,8 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: []const []const u8) BuildErr
         .path => |p| {
             const txt = try p.text(b.a);
             defer b.a.free(txt);
-            const idx = scopeIndexOf(scope, txt) orelse return error.Unsupported;
-            out.* = .{ .local = idx };
+            const loc = scope.find(txt) orelse return error.Unsupported;
+            out.* = .{ .local = loc.idx };
         },
         .unary => |u| {
             const kind = unKind(u.op() orelse return error.Unsupported) orelse return error.Unsupported;
@@ -215,9 +307,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: []const []const u8) BuildErr
     return out;
 }
 
-fn scopeIndexOf(scope: []const []const u8, name: []const u8) ?u32 {
-    for (scope, 0..) |n, i| if (std.mem.eql(u8, n, name)) return @intCast(i);
-    return null;
+fn compoundOp(tok: parser.cst.Token) ?ops.BinKind {
+    return switch (tok.kind) {
+        .PLUS_EQ => .add,
+        .MINUS_EQ => .sub,
+        .STAR_EQ => .mul,
+        .SLASH_EQ => .div,
+        .PERCENT_EQ => .rem,
+        else => null,
+    };
 }
 
 fn binKind(tok: parser.cst.Token) ?ops.BinKind {
@@ -465,9 +563,17 @@ test "tryBuild: transitively-called i64 function is registered" {
     try testing.expectEqual(@as(usize, 3), mod.funcs.len); // main + hyp_sq + square
 }
 
-test "tryBuild: a control-flow body defers to legacy (returns null)" {
+test "tryBuild: a recursive control-flow body builds HIR" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
     try tr.addLib("pub fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } }\n");
-    try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(fact(5))\n}\n", tr.resolver())) == null);
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(fact(5))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expectEqual(@as(usize, 2), mod.funcs.len); // main + fact
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "if ") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "call#1") != null); // recursive call to fact
 }
