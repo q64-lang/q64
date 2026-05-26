@@ -18,6 +18,7 @@
 pub const ops = @import("ops.zig");
 pub const hir = @import("hir.zig");
 pub const mir = @import("mir.zig");
+pub const consteval = @import("consteval.zig");
 pub const build_hir = @import("build_hir.zig");
 pub const lower = @import("lower.zig");
 pub const print = @import("print.zig");
@@ -28,6 +29,7 @@ test {
     _ = ops;
     _ = hir;
     _ = mir;
+    _ = consteval;
     _ = build_hir;
     _ = lower;
     _ = print;

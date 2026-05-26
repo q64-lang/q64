@@ -280,10 +280,21 @@ it with `CfgUnsupported`).
       Verified with `Q64_IR_STRICT=1`: `fact`/`fib`/`gcd`/`sum_to`/`first_factor`/
       `sum_odd` → `720/55/12/5050/7/25` all through AST→HIR→MIR→Binaryen;
       170/170 unit tests + link-roundtrip.sh green.
-- [ ] **P3 concat / bindings / params / str ABI.** The heart of HIR→MIR: the
-      `(ptr,len)` ABI, the scope-arena concat plan (keep `appendConcat`
-      byte-identical, swap its driver), runtime `let`/`var`. After this the whole
-      suite + `link-roundtrip.sh` runs through the IR.
+- [x] **P3a compile-time strings.** `ir/consteval.zig` (ported from the legacy
+      `Resolver`): folds const string interpolation, integer arithmetic, const
+      `let` bindings, and const-bodied nullary calls — the last only in a `let`
+      initializer (`fold_calls`), matching "direct `env.out(f())` is a real
+      call." `build_hir` evaluates `main`'s `let`s into evaluator bindings and
+      folds const `env.out` args to `host_out` (str_const) — reusing P1's data
+      path, no MIR/backend changes. Verified via `Q64_IR_STRICT=1`:
+      `"{(1+2)*3} {n+1} {1_000+24}"`→`9 43 1024` and `let name/v` + interpolation
+      → `Hello, world! (q64 v0.1.0)` route through the IR; 172 tests + roundtrip
+      green.
+- [ ] **P3b runtime string ABI.** The heart of HIR→MIR: the `(ptr,len)` ABI, the
+      scope-arena concat plan (keep `appendConcat` byte-identical, swap its
+      driver), str-returning callees (const_str/param_ref/concat), str params,
+      runtime `let`/`var` str bindings + runtime args, and i64 bindings/interp in
+      `main`. After this the whole suite + `link-roundtrip.sh` runs through the IR.
 - [ ] **P4 delete legacy.** Once the router never falls through (verify with
       `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
       `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.

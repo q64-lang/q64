@@ -20,6 +20,7 @@ const parser = @import("parser");
 const ast = parser.ast;
 const hir = @import("hir.zig");
 const ops = @import("ops.zig");
+const consteval = @import("consteval.zig");
 
 pub const ModuleResolver = hir.ModuleResolver;
 
@@ -28,10 +29,20 @@ const BuildError = error{Unsupported} || std.mem.Allocator.Error;
 const Builder = struct {
     a: std.mem.Allocator,
     resolver: ModuleResolver,
+    eval: consteval.Evaluator,
     funcs: std.ArrayList(hir.Func) = .empty,
     /// function name → FuncId, for dedup + recursion. Keys are arena-owned.
     ids: std.StringHashMapUnmanaged(hir.FuncId) = .empty,
 };
+
+/// Try compile-time evaluation, mapping a non-constant result to `null` (so
+/// the caller can pick a runtime lowering). Allocation failure propagates.
+fn tryConst(b: *Builder, expr: ast.Expr) BuildError!?[]const u8 {
+    return b.eval.evalExpr(expr) catch |e| switch (e) {
+        error.NotConst => null,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
 
 /// Build HIR for `sf`'s `fn main` and its reachable i64 functions, or return
 /// `null` if anything uses a construct the IR path does not yet handle.
@@ -41,7 +52,8 @@ pub fn tryBuild(
     resolver: ModuleResolver,
 ) std.mem.Allocator.Error!?hir.Module {
     var mod = hir.Module.init(gpa);
-    var b = Builder{ .a = mod.alloc(), .resolver = resolver };
+    const a = mod.alloc();
+    var b = Builder{ .a = a, .resolver = resolver, .eval = .{ .a = a, .resolver = resolver } };
     buildModule(&b, sf) catch |e| switch (e) {
         error.Unsupported => {
             mod.deinit();
@@ -67,41 +79,51 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     dummy.* = .{ .block = &.{} };
     try b.funcs.append(b.a, .{ .name = "main", .body = dummy });
 
-    // `main` has no parameters or i64 bindings yet (those land later); its
+    // `main` has no runtime i64 bindings yet (those land later); its
     // env.out(<i64>) arguments resolve against an empty scope.
     var mscope = Scope{ .a = b.a };
 
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
     var it = body.statements();
-    while (it.next()) |stmt| {
-        const es = switch (stmt) {
-            .expr_stmt => |x| x,
-            else => return error.Unsupported,
-        };
-        const expr = es.expression() orelse return error.Unsupported;
-        const call = switch (expr) {
-            .call => |cc| cc,
-            else => return error.Unsupported,
-        };
-        if (!isEnvOut(b.a, call)) return error.Unsupported;
-        const arg = firstArg(call) orelse return error.Unsupported;
+    while (it.next()) |stmt| switch (stmt) {
+        // A `let`/`var` that names a compile-time constant becomes an
+        // evaluator binding (no emitted statement). A non-constant
+        // initializer is a runtime binding — deferred to the legacy path.
+        .let_stmt => |ls| {
+            const init_expr = ls.initializer() orelse return error.Unsupported;
+            const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            // A `let` initializer may fold a const-bodied call (e.g.
+            // `let v = version()`); a non-constant one is a runtime binding,
+            // deferred to the legacy path.
+            b.eval.fold_calls = true;
+            const value = try tryConst(b, init_expr);
+            b.eval.fold_calls = false;
+            try b.eval.bind(nm.text, value orelse return error.Unsupported);
+        },
+        .expr_stmt => |es| {
+            const expr = es.expression() orelse return error.Unsupported;
+            const call = switch (expr) {
+                .call => |cc| cc,
+                else => return error.Unsupported,
+            };
+            if (!isEnvOut(b.a, call)) return error.Unsupported;
+            const arg = firstArg(call) orelse return error.Unsupported;
 
-        const st = try b.a.create(hir.Stmt);
-        switch (arg) {
-            .string_lit => |sl| {
-                const bytes = (try renderConstLiteral(b.a, sl)) orelse return error.Unsupported;
+            const st = try b.a.create(hir.Stmt);
+            if (try tryConst(b, arg)) |bytes| {
+                // A constant string/number/interpolation → fold into the data.
                 const e = try b.a.create(hir.Expr);
                 e.* = .{ .str_const = bytes };
                 st.* = .{ .host_out = e };
-            },
-            else => {
-                // An i64 expression (typically a call to an i64 function).
+            } else {
+                // Otherwise an i64 expression (a call to an i64 function).
                 const e = try buildIntExpr(b, arg, &mscope);
                 st.* = .{ .host_out_int = e };
-            },
-        }
-        try stmts.append(b.a, st);
-    }
+            }
+            try stmts.append(b.a, st);
+        },
+        else => return error.Unsupported,
+    };
 
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
@@ -267,7 +289,7 @@ fn buildIfStmtNode(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.S
 fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
     const out = try b.a.create(hir.Expr);
     switch (expr) {
-        .num_lit => |n| out.* = .{ .int_const = try parseIntLit(n.rawText() orelse return error.Unsupported) },
+        .num_lit => |n| out.* = .{ .int_const = consteval.parseIntLit(n.rawText() orelse return error.Unsupported) catch return error.Unsupported },
         .paren => |p| return buildIntExpr(b, p.inner() orelse return error.Unsupported, scope),
         .path => |p| {
             const txt = try p.text(b.a);
@@ -397,77 +419,6 @@ fn typeNamed(a: std.mem.Allocator, te: ast.TypeExpr, name: []const u8) BuildErro
     return std.mem.eql(u8, nm, name);
 }
 
-fn parseIntLit(raw: []const u8) BuildError!i64 {
-    var buf: [64]u8 = undefined;
-    var n: usize = 0;
-    for (raw) |ch| {
-        if (ch == '_') continue;
-        if (n >= buf.len) return error.Unsupported;
-        buf[n] = ch;
-        n += 1;
-    }
-    return std.fmt.parseInt(i64, buf[0..n], 0) catch return error.Unsupported;
-}
-
-/// Decode a string literal to its constant bytes, mirroring the legacy
-/// `Resolver.renderStringLit` for everything except interpolation: a `{` that
-/// isn't `{{` (a dynamic value) returns `null`, deferring the whole function
-/// to the legacy path. A malformed literal also returns `null` so the legacy
-/// path produces the diagnostic.
-fn renderConstLiteral(a: std.mem.Allocator, s: ast.StringLit) std.mem.Allocator.Error!?[]u8 {
-    const raw = s.rawText() orelse return null;
-
-    if (raw.len >= 1 and raw[0] == 'r') {
-        const open = std.mem.indexOfScalar(u8, raw, '"') orelse return null;
-        const close = std.mem.lastIndexOfScalar(u8, raw, '"') orelse return null;
-        if (close <= open) return null;
-        return try a.dupe(u8, raw[open + 1 .. close]);
-    }
-
-    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return null;
-    const inner = raw[1 .. raw.len - 1];
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(a);
-
-    var i: usize = 0;
-    while (i < inner.len) {
-        const ch = inner[i];
-        if (ch == '\\' and i + 1 < inner.len) {
-            try out.append(a, decodeEscape(inner[i + 1]));
-            i += 2;
-            continue;
-        }
-        if (ch == '{') {
-            if (i + 1 < inner.len and inner[i + 1] == '{') {
-                try out.append(a, '{');
-                i += 2;
-                continue;
-            }
-            out.deinit(a);
-            return null; // a real interpolation — dynamic, defer to legacy
-        }
-        if (ch == '}' and i + 1 < inner.len and inner[i + 1] == '}') {
-            try out.append(a, '}');
-            i += 2;
-            continue;
-        }
-        try out.append(a, ch);
-        i += 1;
-    }
-    return try out.toOwnedSlice(a);
-}
-
-fn decodeEscape(ch: u8) u8 {
-    return switch (ch) {
-        'n' => '\n',
-        't' => '\t',
-        'r' => '\r',
-        '0' => 0,
-        else => ch,
-    };
-}
-
 // ---------------------------------------------------------------------
 // Tests (pure Zig — no Binaryen). Run via the `ir_tests` target.
 // ---------------------------------------------------------------------
@@ -532,8 +483,36 @@ test "tryBuild: a main of env.out string literals builds HIR" {
     try testing.expect(std.mem.indexOf(u8, dump, "host_out \"one\"") != null);
 }
 
-test "tryBuild: interpolation defers to legacy (returns null)" {
+test "tryBuild: runtime interpolation defers to legacy (returns null)" {
     try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(\"v{x}\")\n}\n", noLib)) == null);
+}
+
+test "tryBuild: const interpolation + const let bindings fold to host_out" {
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n let n = 6 * 7\n env.out(\"{(1 + 2) * 3} {n + 1}\")\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The whole interpolation folds to one constant string at compile time.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out \"9 43\"") != null);
+}
+
+test "tryBuild: a const-bodied call folds in a let, not in env.out" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn version() -> str { \"0.1.0\" }\n");
+
+    // In a `let` it folds; the binding is a compile-time constant.
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n let v = version()\n env.out(v)\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expectEqual(@as(usize, 1), mod.funcs.len); // just main; version folded away
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out \"0.1.0\"") != null);
+
+    // Directly, `env.out(version())` stays a real call → deferred to legacy.
+    try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(version())\n}\n", tr.resolver())) == null);
 }
 
 test "tryBuild: an i64 function call builds the callee + host_out_int" {
