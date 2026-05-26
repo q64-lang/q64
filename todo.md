@@ -157,6 +157,48 @@ and `qube run`):
        branches are i64-only (no `bool`/`str` values yet); no loops; in-body
        `let` bindings inside a callee aren't supported (only the tail
        statement contributes the value).
+16. [x] **In-function `let`/`var`, `var` reassignment, and `while` loops in
+       i64 functions.** i64 callees can now express iterative algorithms.
+       `emitIntBlock` walks every statement (not just the tail): in-body
+       `let`/`var` declare wasm locals (`emitIntStmt` + a new `IntScope`
+       mapping name → local index + mutability), `assign` reassigns a `var`
+       (`emitAssignInt`: `= += -= *= /= %=`, signed; rejects `let`/params with
+       `ImmutableAssign`), and `while cond { … }` lowers to a test-first
+       `block`/`loop`/`br_if(eqz cond)` with unique labels (`emitWhileInt`,
+       mirroring `__fmt_i64`'s loop). The i64 emitters thread `*IntScope` in
+       place of the flat param-name list; `emitIntBody` returns the body plus
+       the extra-local count so the call site declares the `varTypes`. The
+       tail still yields the value (expr/`return`/`if`); a block ending in a
+       statement with no value errors (`UnsupportedCall`). Verified end-to-end
+       (`link-roundtrip.sh`: `sum_to(10)`/`fact(5)`/`poly(3)`/`sum_to(100)` →
+       `55 / 120 / 12 / sum_to(100)=5050`) + emit unit tests (incl. the two
+       immutable-assign rejections). **Boundary:** still i64-only; no `loop`/
+       `for`/range iteration, no `break`/`continue`, no loops or in-body
+       bindings in `main` (the `_start` body uses the resolver path), and no
+       calls inside `emitIntExpr` (`fn g(n){ f(n)+1 }` stays `NotConstExpr`) —
+       these are the next rung.
+17. [x] **Calls inside i64 functions — composition + recursion.** `emitIntExpr`
+       gained a `.call` arm: it lowers `f(args…)` to a `BinaryenCall` returning
+       i64, with each argument lowered as an i64 expression. So an i64 function
+       can call any i64 function — including itself (`fact`/`fib`/`gcd`) and
+       mutually (`is_even`/`is_odd`) — and compose helpers (`hyp_sq` →
+       `square`). A pre-emission pass (`registerCalls`/`…Block`/`…If`/`…Expr`
+       in `emitFn`, before `emitModule`) walks each i64 callee body and
+       `ensureCallee`s every call site, so transitively-reached functions are
+       registered + emitted; index-based iteration + name dedup makes it a
+       terminating fixpoint, and the captured `FnDecl` is a stable CST pointer.
+       The registered callees ride on `IntScope.callees` so the `.call` arm
+       resolves a target by name (validating it's an `int_fn` and that the arg
+       count matches `n_params`). Self/forward/mutual references resolve by
+       name at module finalization. Verified end-to-end (`link-roundtrip.sh`:
+       `fact(6)`/`fib(10)`/`gcd(48,36)`/`hyp_sq(3,4)` → `720 / 55 / 12 / 25`) +
+       emit unit tests (incl. arg-count and non-i64-callee rejections).
+       **Boundary:** a call resolves only to a function in the symbol table —
+       an imported name or a local function in the same file. Calling a
+       dependency's *non-imported* / private helper still errors
+       (`NameNotFound`); that wants the name-resolution pass. Also still no
+       `loop`/`for`/range, no `break`/`continue`, and no loops or in-body
+       bindings in `main`.
 
 **Definition of done met.** `cd examples/link-demo/hello_app && qube run`
 prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)
