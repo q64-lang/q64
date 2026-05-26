@@ -26,6 +26,7 @@ const std = @import("std");
 const parser = @import("parser");
 const parse = parser.parse;
 const ast = parser.ast;
+const ir = @import("ir");
 
 const c = @cImport({
     @cInclude("binaryen-c.h");
@@ -186,6 +187,23 @@ pub fn emitFromSource(
     try resolver.indexLocalFunctions(sf);
     try resolver.resolveImports(sf);
 
+    // Q64 IR path (AST → HIR → MIR → Binaryen). The migration is incremental:
+    // `build_hir.tryBuild` returns null for any construct it can't yet
+    // represent, and we fall back to the legacy AST→Binaryen emitter below.
+    // Import validation above runs regardless, so the honest-baseline
+    // diagnostics fire on either path. `Q64_IR_STRICT=1` turns a fallback
+    // into a panic, to prove a phase's coverage in CI.
+    if (try ir.build_hir.tryBuild(allocator, sf)) |hir_module| {
+        var hmod = hir_module;
+        defer hmod.deinit();
+        var mmod = try ir.lower.lower(allocator, &hmod);
+        defer mmod.deinit();
+        return lowerToWasm(allocator, &mmod);
+    }
+    if (std.c.getenv("Q64_IR_STRICT") != null) {
+        @panic("Q64_IR_STRICT: a construct fell back to the legacy emitter");
+    }
+
     var iter = sf.items();
     const main_fn = blk: while (iter.next()) |item| switch (item) {
         .fn_decl => |fd| {
@@ -196,6 +214,111 @@ pub fn emitFromSource(
     } else return Error.NoMainFunction;
 
     return emitFn(allocator, &resolver, main_fn);
+}
+
+// =====================================================================
+// MIR → Binaryen backend (the back boundary of the Q64 IR pipeline)
+// =====================================================================
+//
+// The only code that touches the Binaryen C API on the IR path. Consumes a
+// `mir.Module` and emits the wasm binary. v0 lowers the literal env.out path
+// (a `_start` of `host_out_const` ops); later phases extend `lowerInst` and
+// the function/feature setup as MIR grows (str ABI, i64 fns, calls, arena).
+
+fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
+    const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
+    defer c.BinaryenModuleDispose(module);
+
+    // Same Wasm 3.0 feature set as the legacy emitter (Memory64 + the
+    // string-ABI helpers), so the IR path and legacy path agree.
+    c.BinaryenModuleSetFeatures(
+        module,
+        c.BinaryenFeatureMultivalue() | c.BinaryenFeatureMemory64() |
+            c.BinaryenFeatureBulkMemory() | c.BinaryenFeatureBulkMemoryOpt(),
+    );
+
+    const i64_type = c.BinaryenTypeInt64();
+    const none_type = c.BinaryenTypeNone();
+
+    var env_out_params = [_]c.BinaryenType{ i64_type, i64_type };
+    const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
+    c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
+
+    // One active data segment at offset 0 holds the whole memory image.
+    if (m.data.len == 0) {
+        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, true, "0");
+    } else {
+        var seg_datas = [_][*c]const u8{m.data.ptr};
+        var seg_passives = [_]bool{false};
+        var seg_offsets = [_]c.BinaryenExpressionRef{
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(0)),
+        };
+        var seg_sizes = [_]c.BinaryenIndex{@intCast(m.data.len)};
+        c.BinaryenSetMemory(
+            module,
+            1,
+            1,
+            "memory",
+            null,
+            @ptrCast(&seg_datas),
+            @ptrCast(&seg_passives),
+            @ptrCast(&seg_offsets),
+            @ptrCast(&seg_sizes),
+            seg_sizes.len,
+            false,
+            true,
+            "0",
+        );
+    }
+
+    for (m.funcs) |f| {
+        const body = try lowerInst(allocator, module, f.body);
+        switch (f.linkage) {
+            .entry => {
+                _ = c.BinaryenAddFunction(module, f.name.ptr, none_type, none_type, null, 0, body);
+                _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
+            },
+            // Non-entry functions arrive in a later migration phase.
+            .local, .imported_resolved => return Error.UnsupportedCall,
+        }
+    }
+
+    if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
+
+    const result = c.BinaryenModuleAllocateAndWrite(module, null);
+    defer if (result.binary) |b| std.c.free(b);
+    defer if (result.sourceMap) |s| std.c.free(s);
+
+    const binary_ptr = result.binary orelse return Error.SerializeEmpty;
+    if (result.binaryBytes == 0) return Error.SerializeEmpty;
+
+    const src: [*]const u8 = @ptrCast(binary_ptr);
+    const out = try allocator.alloc(u8, result.binaryBytes);
+    @memcpy(out, src[0..result.binaryBytes]);
+    return out;
+}
+
+/// Lower one MIR instruction to a Binaryen expression. Grows per phase.
+fn lowerInst(
+    allocator: std.mem.Allocator,
+    module: c.BinaryenModuleRef,
+    inst: *const ir.mir.Inst,
+) Error!c.BinaryenExpressionRef {
+    switch (inst.op) {
+        .block => |items| {
+            const children = try allocator.alloc(c.BinaryenExpressionRef, items.len);
+            defer allocator.free(children);
+            for (items, 0..) |child, i| children[i] = try lowerInst(allocator, module, child);
+            return c.BinaryenBlock(module, null, @ptrCast(children.ptr), @intCast(children.len), c.BinaryenTypeNone());
+        },
+        .host_out_const => |hc| {
+            var args = [_]c.BinaryenExpressionRef{
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(hc.off))),
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(hc.len))),
+            };
+            return c.BinaryenCall(module, "env_out", @ptrCast(&args), args.len, c.BinaryenTypeNone());
+        },
+    }
 }
 
 // A function codegen emits and calls at runtime (not const-folded).

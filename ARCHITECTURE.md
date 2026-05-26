@@ -73,29 +73,62 @@ refined representation to the next:
             .q source bytes
                  │
           ┌──────▼──────┐
-          │   parser    │  bytes → lossless CST → typed AST views   (LEX*, PAR*)
+          │   parser    │  bytes → lossless CST → typed AST views    (LEX*, PAR*)
           └──────┬──────┘
                  │  AST + source map
           ┌──────▼──────┐
-          │   typeck    │  names, types, generics, comptime         (NAM*, TYP*, CMT*)
+          │  build-hir  │  AST → HIR (Semantic QIR): desugar + resolve
           └──────┬──────┘
-                 │  typed AST
+                 │  HIR / Semantic QIR
           ┌──────▼──────┐
-          │   region    │  region inference + lifetime checking     (REG*)
+          │   typeck    │  names, types, generics, comptime          (NAM*, TYP*, CMT*)
+          │   region    │  region inference + lifetime checking      (REG*)
+          │   effect    │  effects + stream-graph analysis           (EFF*, STR*)
           └──────┬──────┘
-                 │  region-annotated AST
+                 │  fully-annotated HIR (types · regions · effects)
           ┌──────▼──────┐
-          │   effect    │  effects + stream-graph analysis          (EFF*, STR*)
+          │    lower    │  HIR → MIR (Executable QIR): str/region ABI
           └──────┬──────┘
-                 │  fully-checked AST
+                 │  MIR / Executable QIR
           ┌──────▼──────┐
-          │   codegen   │  AST → Wasm 3.0 via Binaryen              (CGN*, LNK*)
+          │   codegen   │  MIR → Wasm 3.0 via Binaryen               (CGN*, LNK*)
           └──────┬──────┘
                  │
-            .wasm module
+            .wasm core module
+                 │  (qube build --component)
+          ┌──────▼──────┐
+          │  component  │  core module + WIT world
+          └──────┬──────┘   (exports = pub surface, imports = effect-derived caps)
+                 │
+       WASM component + WIT metadata  →  QubePod bundle (deploy artifact)
 ```
 
 The stages live under [`q64/src/`](./q64/src), one directory each.
+
+**The Q64 IR is two tiers, both backend-neutral** (the decision that the
+language's semantics never depend on a backend's IR — see
+[`q64/src/ir/`](./q64/src/ir)):
+
+- **HIR / Semantic QIR** — "what the program means." Desugared and
+  name-resolved; the semantic passes (typeck/region/effect) annotate it with
+  types, regions, and effects. It is the source for `q64 show` introspection
+  and for the component/WIT lift (the pub surface + capability set).
+- **MIR / Executable QIR** — "how it executes." ABI-lowered: a `str` is a
+  `(ptr, len)` pair, allocation is explicit region/`alloc` ops, control flow is
+  structured (wasm-shaped). MIR is the single input a backend consumes.
+
+Nothing under `ir/` links Binaryen; only `codegen/` does. That seam is what
+keeps a future second backend (`MIR → LLVM IR → native`) an additive change —
+the same MIR feeds it, with allocation kept abstract (Memory64 + the arena bump
+global are the *Binaryen backend's* realization, not baked into MIR) and the
+`env.*` capability faces lowered per-backend (WASM imports today; a native host
+ABI later).
+
+> **Implementation note.** The two-tier IR is being adopted incrementally: a
+> per-construct router in `codegen/` sends what the IR can already lower through
+> `AST → HIR → MIR → Binaryen` and falls back to the legacy direct
+> `AST → Binaryen` emitter for the rest, so the build stays green at every step.
+> `Q64_IR_STRICT=1` turns a fallback into a hard error, to track coverage.
 
 ### parser — [`q64/src/parser/`](./q64/src/parser/README.md)
 
@@ -170,15 +203,25 @@ effect set is `@realtime`, `@no_alloc`, `@no_suspend`, `@send`, `@pure`, `@io`,
 - Reconciles the qube's declared `effects` (from the manifest) against the
   inferred effects.
 
-It emits an effect-annotated AST and an **effect index** that `qube` later
+It emits effect-annotated HIR and an **effect index** that `qube` later
 hands to the Continuum for capability disclosure. Diagnostics use `EFF*` and
-`STR*`. This is the last semantic pass; its output is the fully-checked AST
-that codegen consumes.
+`STR*`. This is the last semantic pass; its output is the fully-annotated HIR
+that the lowering pass turns into MIR.
+
+### ir — [`q64/src/ir/`](./q64/src/ir)
+
+The two-tier Q64 IR and the passes that build and lower it: `build_hir`
+(AST → HIR), `lower` (HIR → MIR), and text dumpers behind `q64 show hir|mir`.
+Both tiers are **pure Zig with no Binaryen dependency** — the structural
+guarantee that language semantics stay independent of any backend's IR. See
+the two-tier overview above; the codegen-facing contract is MIR.
 
 ### codegen — [`q64/src/codegen/`](./q64/src/codegen/README.md)
 
-The checked AST is lowered to a **Wasm 3.0** binary through the **Binaryen**
-C API (vendored and static-linked into the `q64` binary).
+**MIR** is lowered to a **Wasm 3.0** binary through the **Binaryen**
+C API (vendored and static-linked into the `q64` binary). This is the one
+place that touches Binaryen; a future native backend would consume the same
+MIR through a sibling `MIR → LLVM IR` lowerer.
 
 codegen owns:
 
@@ -412,10 +455,11 @@ compiler — closing the loop back to [the linker](#4-the-linker).
 | Path | Contents |
 |------|----------|
 | [`q64/src/parser/`](./q64/src/parser) | Lexer, CST, AST views, parse diagnostics |
+| [`q64/src/ir/`](./q64/src/ir) | The two-tier Q64 IR — HIR (Semantic QIR), MIR (Executable QIR), and the build/lower passes |
 | [`q64/src/typeck/`](./q64/src/typeck) | Name resolution, type checking, generics, comptime |
 | [`q64/src/region/`](./q64/src/region) | Region inference, lifetime/ownership checking |
 | [`q64/src/effect/`](./q64/src/effect) | Effect inference, stream-graph analysis |
-| [`q64/src/codegen/`](./q64/src/codegen) | AST → Wasm 3.0 via Binaryen; the link step |
+| [`q64/src/codegen/`](./q64/src/codegen) | MIR → Wasm 3.0 via Binaryen; the link step |
 | `q64/src/fmt/`, `q64/src/lsp/`, `q64/src/show/` | Formatter, language server, introspection |
 | [`qube/src/`](./qube/src) | The `qube` build/package tool |
 | [`runtime/`](./runtime) | Host adapters: `wasmtime/`, `wasmer/`, `browser/`, `audio-host/` |

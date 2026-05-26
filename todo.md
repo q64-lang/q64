@@ -245,6 +245,41 @@ concatenation for interpolation.
 - Deploy the registry: `cd continuum-api && CLOUDFLARE_ACCOUNT_ID=*** pnpm run deploy` (needs `wrangler login`, account ***).
 - Registry auth is the dev bypass `***` / `***` (`continuum-api/src/routes/auth.ts`, flagged for deletion when OAuth lands).
 
+## Q64 IR — two-tier backend-neutral IR (HIR/MIR) — ACTIVE
+
+Honoring the decision that semantics must not depend on a backend's IR. We
+lower to our own IR first: **HIR** (Semantic QIR) → **MIR** (Executable QIR) →
+Binaryen/WASM, with a future `MIR → LLVM → native` backend an additive change.
+Full design + phasing in the approved plan
+(`/root/.claude/plans/question-the-important-design-purring-beacon.md`) and
+[`q64/src/ir/README.md`](./q64/src/ir/README.md). Migrates incrementally behind
+a per-construct router in `codegen/emit.zig` (legacy `AST → Binaryen` is the
+fallback); `Q64_IR_STRICT=1` panics on fallback to track coverage.
+
+- [x] **P0 scaffold + P1 literals.** `q64/src/ir/` package: `hir.zig`/`mir.zig`
+      (pure Zig, no Binaryen), `build_hir.zig` (AST→HIR), `lower.zig` (HIR→MIR),
+      `print.zig` (dumps). Wired into `build.zig` (`ir_mod` + `ir_tests`).
+      `emitFromSource` routes `fn main` of `env.out("<const string>")` through
+      `AST→HIR→MIR→Binaryen` (`lowerToWasm`/`lowerInst`); everything else falls
+      back to legacy. Verified: 169/169 unit tests (7 new IR tests),
+      `link-roundtrip.sh` green, and `Q64_IR_STRICT=1` runs literals / panics on
+      interpolation as designed. ARCHITECTURE.md updated (pipeline + `ir` stage).
+- [ ] **P2 i64 + control flow.** Port `emitInt*` + the callee fixpoint into
+      `build_hir`/`lower` (produce `mir.Inst`); extend `lowerInst`. Flip the i64
+      / if-else / while / loop / recursion tests + roundtrip sections.
+- [ ] **P3 concat / bindings / params / str ABI.** The heart of HIR→MIR: the
+      `(ptr,len)` ABI, the scope-arena concat plan (keep `appendConcat`
+      byte-identical, swap its driver), runtime `let`/`var`. After this the whole
+      suite + `link-roundtrip.sh` runs through the IR.
+- [ ] **P4 delete legacy.** Once the router never falls through (verify with
+      `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
+      `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.
+- [ ] **P5 introspection + tail seams.** `q64 show hir|mir`; populate HIR
+      visibility/effect slots for the component/WIT + QubePod bundle stages.
+- [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
+      plus a native host ABI for the `env.*` capability faces (the one piece not
+      inherited from the WASM component model).
+
 ## C bindings
 
 Two distinct questions, both currently "planned, not active."
