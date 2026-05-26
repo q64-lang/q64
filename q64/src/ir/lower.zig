@@ -1,15 +1,13 @@
 //! HIR → MIR lowering (the middle boundary of the Q64 IR).
 //!
 //! Imports `hir`/`mir` only — NEVER the Binaryen C API. Turns the semantic
-//! HIR into the executable MIR: this is where the `str` ABI, the region/
-//! allocator model, interpolation→arena plans, and int→string formatting
-//! become explicit. The MIR it produces is the direct input to a backend.
+//! HIR into the executable MIR: this is where the `str` ABI, the region
+//! model, and int→string formatting become explicit. The MIR it produces is
+//! the direct input to a backend.
 //!
-//! Migration status: v0 lowers the literal `env.out` path — each
-//! `host_out(str_const "X")` becomes the bytes `"X\n"` in the memory image
-//! plus a `host_out_const` op (env.out's trailing newline is added here,
-//! since it is an execution-time detail of the capability ABI). Later phases
-//! lower i64 bodies, calls, and the string-concat arena ops.
+//! Migration status: lowers the literal `env.out` path and i64 functions
+//! (arithmetic + calls) with their `env.out(<i64>)` uses. Control flow and
+//! the string-concat arena ops land in later phases.
 
 const std = @import("std");
 const hir = @import("hir.zig");
@@ -17,25 +15,44 @@ const mir = @import("mir.zig");
 
 pub const Error = std.mem.Allocator.Error;
 
+const Ctx = struct {
+    a: std.mem.Allocator,
+    data: *std.ArrayList(u8),
+    nl_off: *?u32,
+
+    /// The shared trailing-newline byte env.out writes after a formatted
+    /// value; materialized once into the memory image.
+    fn newline(self: Ctx) Error!u32 {
+        if (self.nl_off.*) |off| return off;
+        const off: u32 = @intCast(self.data.items.len);
+        try self.data.append(self.a, '\n');
+        self.nl_off.* = off;
+        return off;
+    }
+};
+
 /// Lower a whole HIR module to MIR. The result owns its own arena.
 pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     var mod = mir.Module.init(gpa);
     const a = mod.alloc();
 
     var data: std.ArrayList(u8) = .empty;
+    var nl_off: ?u32 = null;
+    const ctx = Ctx{ .a = a, .data = &data, .nl_off = &nl_off };
 
     const funcs = try a.alloc(mir.Func, h.funcs.len);
     for (h.funcs, 0..) |hf, i| {
         const is_entry = (h.entry != null and h.entry.? == i);
-        const body = try lowerStmt(a, hf.body, &data);
-        funcs[i] = .{
-            .name = if (is_entry) "start" else try a.dupeZ(u8, hf.name),
-            .ret = .void,
-            // Structured is the only form the lowering produces; the `cfg`
-            // escape hatch on Body is for a future basic-block backend.
-            .body = .{ .structured = body },
-            .linkage = if (is_entry) .entry else .local,
-        };
+        if (is_entry) {
+            funcs[i] = .{
+                .name = "start",
+                .ret = .void,
+                .body = .{ .structured = try lowerEntry(ctx, hf.body) },
+                .linkage = .entry,
+            };
+        } else {
+            funcs[i] = try lowerCallee(ctx, hf);
+        }
     }
 
     mod.funcs = funcs;
@@ -44,26 +61,106 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     return mod;
 }
 
-fn lowerStmt(a: std.mem.Allocator, s: *const hir.Stmt, data: *std.ArrayList(u8)) Error!*mir.Inst {
+fn lowerEntry(ctx: Ctx, body: *const hir.Stmt) Error!*mir.Inst {
+    const items = switch (body.*) {
+        .block => |b| b,
+        else => unreachable, // main is always a block
+    };
+    const out = try ctx.a.alloc(*mir.Inst, items.len);
+    for (items, 0..) |s, i| out[i] = try lowerEntryStmt(ctx, s);
+    return mk(ctx.a, .void, .{ .block = out });
+}
+
+fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
     switch (s.*) {
-        .block => |items| {
-            const out = try a.alloc(*mir.Inst, items.len);
-            for (items, 0..) |child, i| out[i] = try lowerStmt(a, child, data);
-            return mk(a, .void, .{ .block = out });
-        },
         .host_out => |e| {
-            // env.out("X") writes "X\n": fold the value + newline into the
-            // memory image and reference it as a constant.
+            // env.out("X") writes "X\n": fold value + newline into `data`.
             const bytes = switch (e.*) {
                 .str_const => |b| b,
+                else => unreachable,
             };
-            const off: u32 = @intCast(data.items.len);
-            try data.appendSlice(a, bytes);
-            try data.append(a, '\n');
-            const len: u32 = @intCast(bytes.len + 1);
-            return mk(a, .void, .{ .host_out_const = .{ .off = off, .len = len } });
+            const off: u32 = @intCast(ctx.data.items.len);
+            try ctx.data.appendSlice(ctx.a, bytes);
+            try ctx.data.append(ctx.a, '\n');
+            return mk(ctx.a, .void, .{ .host_out_const = .{ .off = off, .len = @intCast(bytes.len + 1) } });
         },
+        .host_out_int => |e| {
+            const nl = try ctx.newline();
+            return mk(ctx.a, .void, .{ .host_out_int = .{ .value = try lowerExpr(ctx, e), .nl_off = nl } });
+        },
+        else => unreachable, // main has no value/tail statements
     }
+}
+
+fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
+    const params = try ctx.a.alloc(mir.ValueType, hf.params.len);
+    for (hf.params, 0..) |p, i| params[i] = mapType(p.ty);
+    const locals = try ctx.a.alloc(mir.ValueType, hf.locals.len);
+    for (hf.locals, 0..) |t, i| locals[i] = mapType(t);
+
+    // v0 callee body is a single `value` tail expression.
+    const tail = singleValue(hf.body) orelse unreachable;
+    const body = try lowerExpr(ctx, tail);
+
+    return .{
+        .name = try ctx.a.dupeZ(u8, hf.name),
+        .params = params,
+        .ret = mapType(hf.ret),
+        .locals = locals,
+        .body = .{ .structured = body },
+        .linkage = .local,
+    };
+}
+
+fn singleValue(body: *const hir.Stmt) ?*hir.Expr {
+    const items = switch (body.*) {
+        .block => |b| b,
+        else => return null,
+    };
+    if (items.len != 1) return null;
+    return switch (items[0].*) {
+        .value => |e| e,
+        else => null,
+    };
+}
+
+fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
+    switch (e.*) {
+        .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
+        .local => |idx| return mk(ctx.a, .i64, .{ .local_get = idx }),
+        .un => |u| return mk(ctx.a, .i64, .{ .un = .{ .kind = u.kind, .operand = try lowerExpr(ctx, u.operand) } }),
+        .bin => |bx| {
+            const ty: mir.ValueType = if (isCmp(bx.kind)) .i32 else .i64;
+            return mk(ctx.a, ty, .{ .bin = .{
+                .kind = bx.kind,
+                .lhs = try lowerExpr(ctx, bx.lhs),
+                .rhs = try lowerExpr(ctx, bx.rhs),
+            } });
+        },
+        .call => |cl| {
+            const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
+            for (cl.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
+            return mk(ctx.a, .i64, .{ .call = .{ .func = cl.func, .args = args } });
+        },
+        .str_const => unreachable, // strings only appear under host_out
+    }
+}
+
+fn isCmp(k: hir.ops.BinKind) bool {
+    return switch (k) {
+        .eq, .ne, .lt, .le, .gt, .ge => true,
+        else => false,
+    };
+}
+
+fn mapType(t: hir.Type) mir.ValueType {
+    return switch (t) {
+        .i64 => .i64,
+        .i32 => .i32,
+        .f64 => .f64,
+        .void => .void,
+        .str => unreachable, // str locals/params land with the string-ABI phase
+    };
 }
 
 fn mk(a: std.mem.Allocator, ty: mir.ValueType, op: mir.Op) Error!*mir.Inst {
@@ -80,24 +177,21 @@ const parser = @import("parser");
 const build_hir = @import("build_hir.zig");
 const print = @import("print.zig");
 
-fn lowerSource(gpa: std.mem.Allocator, source: []const u8) !?mir.Module {
-    const pr = try parser.parse.parse(gpa, source, "<test>");
-    defer pr.deinit(gpa);
-    const sf = parser.ast.SourceFile.cast(pr.root) orelse return null;
-    var h = (try build_hir.tryBuild(gpa, sf)) orelse return null;
-    defer h.deinit();
-    return try lower(gpa, &h);
-}
-
 test "lower: literals fold into the memory image with newlines" {
-    var m = (try lowerSource(testing.allocator, "fn main {\n env.out(\"one\")\n env.out(\"two\")\n}\n")) orelse
-        return error.TestUnexpectedResult;
+    const noLib: hir.ModuleResolver = .{ .ctx = undefined, .lookupFn = struct {
+        fn f(_: *anyopaque, _: []const u8) ?parser.ast.FnDecl {
+            return null;
+        }
+    }.f };
+    const pr = try parser.parse.parse(testing.allocator, "fn main {\n env.out(\"one\")\n env.out(\"two\")\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = (try build_hir.tryBuild(testing.allocator, sf, noLib)).?;
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
     defer m.deinit();
-
-    // "one\n" then "two\n" laid out contiguously at offset 0.
     try testing.expectEqualStrings("one\ntwo\n", m.data);
-    try testing.expect(m.entry != null);
-
     const dump = try print.mirToString(testing.allocator, &m);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_const off=0 len=4") != null);

@@ -1,73 +1,253 @@
 //! AST → HIR builder (front boundary of the Q64 IR).
 //!
 //! Imports `parser` only — NEVER the Binaryen C API. Owns the semantic-but-
-//! not-executable work: name resolution, (eventual) typing, const-folding,
-//! and desugaring. The HIR→MIR `lower` pass takes it from here.
+//! not-executable work: name resolution (via the injected `ModuleResolver`),
+//! shape/typing checks, and desugaring. The HIR→MIR `lower` pass takes over
+//! from here.
 //!
-//! Migration status: `tryBuild` returns `null` for any function shape it
-//! cannot yet represent, so `codegen/emit.zig`'s router falls back to the
-//! legacy AST→Binaryen path. v0 handles `fn main` whose body is a sequence
-//! of `env.out("<constant string>")` calls (no interpolation). Each
-//! migration phase teaches `tryBuild` one more construct and shrinks the
-//! fallback surface, keeping the build green throughout.
+//! Migration status: `tryBuild` returns `null` for any construct it cannot
+//! yet represent (signalled internally by `error.Unsupported`), so the
+//! `codegen/emit.zig` router falls back to the legacy AST→Binaryen path.
+//! Handled today:
+//!   - `fn main` whose statements are `env.out("<const string>")` and
+//!     `env.out(<i64 expression>)`;
+//!   - the transitively-called i64 functions, whose bodies are a single
+//!     arithmetic/call tail expression (no in-body bindings or control flow
+//!     yet — those land in the next phase).
 
 const std = @import("std");
 const parser = @import("parser");
 const ast = parser.ast;
 const hir = @import("hir.zig");
+const ops = @import("ops.zig");
 
-/// Build HIR for `sf`'s `fn main`, or return `null` if the function uses any
-/// construct the IR path does not yet handle (the caller then uses the
-/// legacy emitter). Errors are reserved for allocation failure.
-pub fn tryBuild(gpa: std.mem.Allocator, sf: ast.SourceFile) std.mem.Allocator.Error!?hir.Module {
-    const main_fn = findMain(sf) orelse return null;
-    const body = main_fn.body() orelse return null;
+pub const ModuleResolver = hir.ModuleResolver;
 
+const BuildError = error{Unsupported} || std.mem.Allocator.Error;
+
+const Builder = struct {
+    a: std.mem.Allocator,
+    resolver: ModuleResolver,
+    funcs: std.ArrayList(hir.Func) = .empty,
+    /// function name → FuncId, for dedup + recursion. Keys are arena-owned.
+    ids: std.StringHashMapUnmanaged(hir.FuncId) = .empty,
+};
+
+/// Build HIR for `sf`'s `fn main` and its reachable i64 functions, or return
+/// `null` if anything uses a construct the IR path does not yet handle.
+pub fn tryBuild(
+    gpa: std.mem.Allocator,
+    sf: ast.SourceFile,
+    resolver: ModuleResolver,
+) std.mem.Allocator.Error!?hir.Module {
     var mod = hir.Module.init(gpa);
-    const a = mod.alloc();
-
-    var stmts: std.ArrayList(*hir.Stmt) = .empty;
-    // (no deinit: arena-owned)
-
-    var it = body.statements();
-    const ok = while (it.next()) |stmt| {
-        const es = switch (stmt) {
-            .expr_stmt => |x| x,
-            else => break false,
-        };
-        const expr = es.expression() orelse break false;
-        const call = switch (expr) {
-            .call => |cc| cc,
-            else => break false,
-        };
-        if (!isEnvOut(a, call)) break false;
-        const arg = firstArg(call) orelse break false;
-        const slit = switch (arg) {
-            .string_lit => |sl| sl,
-            else => break false,
-        };
-        const bytes = (try renderConstLiteral(a, slit)) orelse break false;
-
-        const e = try a.create(hir.Expr);
-        e.* = .{ .str_const = bytes };
-        const st = try a.create(hir.Stmt);
-        st.* = .{ .host_out = e };
-        try stmts.append(a, st);
-    } else true;
-
-    if (!ok) {
-        mod.deinit();
-        return null;
-    }
-
-    const block = try a.create(hir.Stmt);
-    block.* = .{ .block = try stmts.toOwnedSlice(a) };
-
-    const fns = try a.alloc(hir.Func, 1);
-    fns[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public };
-    mod.funcs = fns;
+    var b = Builder{ .a = mod.alloc(), .resolver = resolver };
+    buildModule(&b, sf) catch |e| switch (e) {
+        error.Unsupported => {
+            mod.deinit();
+            return null;
+        },
+        error.OutOfMemory => {
+            mod.deinit();
+            return error.OutOfMemory;
+        },
+    };
+    mod.funcs = try b.funcs.toOwnedSlice(b.a);
     mod.entry = 0;
     return mod;
+}
+
+fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    const main_fn = findMain(sf) orelse return error.Unsupported;
+    const body = main_fn.body() orelse return error.Unsupported;
+
+    // Reserve FuncId 0 for the entry so callees discovered while building
+    // main's body get ids 1.. .
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = "main", .body = dummy });
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    var it = body.statements();
+    while (it.next()) |stmt| {
+        const es = switch (stmt) {
+            .expr_stmt => |x| x,
+            else => return error.Unsupported,
+        };
+        const expr = es.expression() orelse return error.Unsupported;
+        const call = switch (expr) {
+            .call => |cc| cc,
+            else => return error.Unsupported,
+        };
+        if (!isEnvOut(b.a, call)) return error.Unsupported;
+        const arg = firstArg(call) orelse return error.Unsupported;
+
+        const st = try b.a.create(hir.Stmt);
+        switch (arg) {
+            .string_lit => |sl| {
+                const bytes = (try renderConstLiteral(b.a, sl)) orelse return error.Unsupported;
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .str_const = bytes };
+                st.* = .{ .host_out = e };
+            },
+            else => {
+                // An i64 expression (typically a call to an i64 function).
+                const e = try buildIntExpr(b, arg, &.{});
+                st.* = .{ .host_out_int = e };
+            },
+        }
+        try stmts.append(b.a, st);
+    }
+
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
+    b.funcs.items[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public };
+}
+
+/// Resolve `name` to a registered i64 function, building it (and anything it
+/// calls) the first time. Returns its FuncId. Reserves the id before building
+/// the body so recursion and forward references resolve.
+fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
+    if (b.ids.get(name)) |id| return id;
+
+    const fd = b.resolver.lookup(name) orelse return error.Unsupported;
+    if (!(try returnsI64(b.a, fd))) return error.Unsupported; // i64 callees only, for now
+
+    const owned = try b.a.dupe(u8, name);
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, owned, id);
+
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = owned, .body = dummy });
+
+    b.funcs.items[id] = try buildIntFn(b, fd, owned);
+    return id;
+}
+
+fn buildIntFn(b: *Builder, fd: ast.FnDecl, name: []const u8) BuildError!hir.Func {
+    // Parameters (all i64) occupy local indices 0..n; collect their names so
+    // the body can resolve references.
+    var pnames: std.ArrayList([]const u8) = .empty;
+    var params: std.ArrayList(hir.Param) = .empty;
+    if (fd.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| {
+            if (!(try paramIsI64(b.a, p))) return error.Unsupported;
+            const pn = (p.name() orelse return error.Unsupported).text;
+            try pnames.append(b.a, pn);
+            try params.append(b.a, .{ .name = pn, .ty = .i64 });
+        }
+    }
+
+    // v0 i64 bodies are a single tail expression; anything with in-body
+    // bindings or control flow defers to the legacy path (next phase).
+    const tail = try singleTailExpr(fd) orelse return error.Unsupported;
+    const value = try buildIntExpr(b, tail, pnames.items);
+
+    const vstmt = try b.a.create(hir.Stmt);
+    vstmt.* = .{ .value = value };
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+
+    return .{ .name = name, .params = try params.toOwnedSlice(b.a), .ret = .i64, .body = block };
+}
+
+/// The body of an i64 function as a single tail expression, or `null` if the
+/// body is anything more (bindings, control flow) — deferred for now.
+fn singleTailExpr(fd: ast.FnDecl) BuildError!?ast.Expr {
+    const body = fd.body() orelse return error.Unsupported;
+    var it = body.statements();
+    var first: ?ast.Expr = null;
+    var count: usize = 0;
+    while (it.next()) |stmt| {
+        count += 1;
+        if (count > 1) return null;
+        first = switch (stmt) {
+            .expr_stmt => |es| es.expression(),
+            .return_stmt => |rs| rs.value(),
+            else => return null,
+        };
+    }
+    return first;
+}
+
+fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: []const []const u8) BuildError!*hir.Expr {
+    const out = try b.a.create(hir.Expr);
+    switch (expr) {
+        .num_lit => |n| out.* = .{ .int_const = try parseIntLit(n.rawText() orelse return error.Unsupported) },
+        .paren => |p| return buildIntExpr(b, p.inner() orelse return error.Unsupported, scope),
+        .path => |p| {
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            const idx = scopeIndexOf(scope, txt) orelse return error.Unsupported;
+            out.* = .{ .local = idx };
+        },
+        .unary => |u| {
+            const kind = unKind(u.op() orelse return error.Unsupported) orelse return error.Unsupported;
+            out.* = .{ .un = .{ .kind = kind, .operand = try buildIntExpr(b, u.operand() orelse return error.Unsupported, scope) } };
+        },
+        .bin => |bx| {
+            const kind = binKind(bx.op() orelse return error.Unsupported) orelse return error.Unsupported;
+            out.* = .{ .bin = .{
+                .kind = kind,
+                .lhs = try buildIntExpr(b, bx.lhs() orelse return error.Unsupported, scope),
+                .rhs = try buildIntExpr(b, bx.rhs() orelse return error.Unsupported, scope),
+            } };
+        },
+        .call => |cc| {
+            const callee = cc.callee() orelse return error.Unsupported;
+            const cpath = switch (callee) {
+                .path => |p| p,
+                else => return error.Unsupported,
+            };
+            const cname = try cpath.text(b.a);
+            defer b.a.free(cname);
+            const id = try registerFunc(b, cname);
+            var args: std.ArrayList(*hir.Expr) = .empty;
+            var ait = cc.args();
+            while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
+            if (args.items.len != b.funcs.items[id].params.len) return error.Unsupported;
+            out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
+        },
+        else => return error.Unsupported,
+    }
+    return out;
+}
+
+fn scopeIndexOf(scope: []const []const u8, name: []const u8) ?u32 {
+    for (scope, 0..) |n, i| if (std.mem.eql(u8, n, name)) return @intCast(i);
+    return null;
+}
+
+fn binKind(tok: parser.cst.Token) ?ops.BinKind {
+    return switch (tok.kind) {
+        .PLUS => .add,
+        .MINUS => .sub,
+        .STAR => .mul,
+        .SLASH => .div,
+        .PERCENT => .rem,
+        .AMP => .bit_and,
+        .PIPE => .bit_or,
+        .CARET => .bit_xor,
+        .SHL => .shl,
+        .SHR => .shr,
+        .EQ_EQ => .eq,
+        .BANG_EQ => .ne,
+        .L_ANGLE => .lt,
+        .LT_EQ => .le,
+        .R_ANGLE => .gt,
+        .GT_EQ => .ge,
+        else => null,
+    };
+}
+
+fn unKind(tok: parser.cst.Token) ?ops.UnKind {
+    return switch (tok.kind) {
+        .MINUS => .neg,
+        .TILDE => .bit_not,
+        else => null,
+    };
 }
 
 fn findMain(sf: ast.SourceFile) ?ast.FnDecl {
@@ -82,7 +262,6 @@ fn findMain(sf: ast.SourceFile) ?ast.FnDecl {
     return null;
 }
 
-/// True when `call`'s callee is exactly the `env.out` capability face.
 fn isEnvOut(a: std.mem.Allocator, call: ast.CallExpr) bool {
     const callee = call.callee() orelse return false;
     const path = switch (callee) {
@@ -99,16 +278,47 @@ fn firstArg(call: ast.CallExpr) ?ast.Expr {
     return args.next();
 }
 
+fn returnsI64(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
+    const rt = fd.returnType() orelse return false;
+    const te = rt.type_() orelse return false;
+    return typeNamed(a, te, "i64");
+}
+
+fn paramIsI64(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
+    const te = p.type_() orelse return false;
+    return typeNamed(a, te, "i64");
+}
+
+fn typeNamed(a: std.mem.Allocator, te: ast.TypeExpr, name: []const u8) BuildError!bool {
+    const p = switch (te) {
+        .path => |x| x,
+        else => return false,
+    };
+    const nm = try p.name(a);
+    defer a.free(nm);
+    return std.mem.eql(u8, nm, name);
+}
+
+fn parseIntLit(raw: []const u8) BuildError!i64 {
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    for (raw) |ch| {
+        if (ch == '_') continue;
+        if (n >= buf.len) return error.Unsupported;
+        buf[n] = ch;
+        n += 1;
+    }
+    return std.fmt.parseInt(i64, buf[0..n], 0) catch return error.Unsupported;
+}
+
 /// Decode a string literal to its constant bytes, mirroring the legacy
-/// `Resolver.renderStringLit` for everything *except* interpolation: a `{`
-/// that isn't `{{` means a dynamic value, so we return `null` to defer the
-/// whole function to the legacy path. Raw strings, escapes, and `{{`/`}}`
-/// literal braces are handled here. Returns `null` on a malformed literal
-/// too, so the legacy path produces the diagnostic.
+/// `Resolver.renderStringLit` for everything except interpolation: a `{` that
+/// isn't `{{` (a dynamic value) returns `null`, deferring the whole function
+/// to the legacy path. A malformed literal also returns `null` so the legacy
+/// path produces the diagnostic.
 fn renderConstLiteral(a: std.mem.Allocator, s: ast.StringLit) std.mem.Allocator.Error!?[]u8 {
     const raw = s.rawText() orelse return null;
 
-    // Raw string `r"…"` / `r#"…"#`: no escapes, no interpolation.
     if (raw.len >= 1 and raw[0] == 'r') {
         const open = std.mem.indexOfScalar(u8, raw, '"') orelse return null;
         const close = std.mem.lastIndexOfScalar(u8, raw, '"') orelse return null;
@@ -136,9 +346,8 @@ fn renderConstLiteral(a: std.mem.Allocator, s: ast.StringLit) std.mem.Allocator.
                 i += 2;
                 continue;
             }
-            // A real interpolation — dynamic value, defer to legacy.
             out.deinit(a);
-            return null;
+            return null; // a real interpolation — dynamic, defer to legacy
         }
         if (ch == '}' and i + 1 < inner.len and inner[i + 1] == '}') {
             try out.append(a, '}');
@@ -157,7 +366,7 @@ fn decodeEscape(ch: u8) u8 {
         't' => '\t',
         'r' => '\r',
         '0' => 0,
-        else => ch, // \\, \", \{, \} and unknowns pass through
+        else => ch,
     };
 }
 
@@ -167,46 +376,98 @@ fn decodeEscape(ch: u8) u8 {
 const testing = std.testing;
 const print = @import("print.zig");
 
-fn buildFromSource(gpa: std.mem.Allocator, source: []const u8) !?hir.Module {
+/// A test ModuleResolver over a set of (name, source) library functions: it
+/// parses each source once and looks up a `pub fn <name>` by scanning items.
+const TestResolver = struct {
+    a: std.mem.Allocator,
+    results: std.ArrayList(parser.parse.Result) = .empty,
+
+    fn deinit(self: *TestResolver) void {
+        for (self.results.items) |r| r.deinit(self.a);
+        self.results.deinit(self.a);
+    }
+
+    fn addLib(self: *TestResolver, src: []const u8) !void {
+        try self.results.append(self.a, try parser.parse.parse(self.a, src, "<lib>"));
+    }
+
+    fn lookup(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
+        const self: *TestResolver = @ptrCast(@alignCast(ctx));
+        for (self.results.items) |r| {
+            const sf = ast.SourceFile.cast(r.root) orelse continue;
+            var it = sf.items();
+            while (it.next()) |item| switch (item) {
+                .fn_decl => |fd| {
+                    const nm = fd.name() orelse continue;
+                    if (std.mem.eql(u8, nm.text, name)) return fd;
+                },
+                else => {},
+            };
+        }
+        return null;
+    }
+
+    fn resolver(self: *TestResolver) ModuleResolver {
+        return .{ .ctx = self, .lookupFn = TestResolver.lookup };
+    }
+};
+
+fn buildFromSource(gpa: std.mem.Allocator, source: []const u8, res: ModuleResolver) !?hir.Module {
     const pr = try parser.parse.parse(gpa, source, "<test>");
     defer pr.deinit(gpa);
     const sf = ast.SourceFile.cast(pr.root) orelse return null;
-    return tryBuild(gpa, sf);
+    return tryBuild(gpa, sf, res);
 }
 
+const noLib: ModuleResolver = .{ .ctx = undefined, .lookupFn = struct {
+    fn f(_: *anyopaque, _: []const u8) ?ast.FnDecl {
+        return null;
+    }
+}.f };
+
 test "tryBuild: a main of env.out string literals builds HIR" {
-    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(\"one\")\n env.out(\"two\")\n}\n")) orelse
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(\"one\")\n}\n", noLib)) orelse
         return error.TestUnexpectedResult;
     defer mod.deinit();
-
-    try testing.expect(mod.entry != null);
-    try testing.expectEqual(@as(usize, 1), mod.funcs.len);
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out \"one\"") != null);
-    try testing.expect(std.mem.indexOf(u8, dump, "host_out \"two\"") != null);
-}
-
-test "tryBuild: escapes are decoded into the constant" {
-    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(\"a\\tb\")\n}\n")) orelse
-        return error.TestUnexpectedResult;
-    defer mod.deinit();
-    const dump = try print.hirToString(testing.allocator, &mod);
-    defer testing.allocator.free(dump);
-    try testing.expect(std.mem.indexOf(u8, dump, "a\tb") != null);
 }
 
 test "tryBuild: interpolation defers to legacy (returns null)" {
-    const r = try buildFromSource(testing.allocator, "fn main {\n env.out(\"v{x}\")\n}\n");
-    try testing.expect(r == null);
+    try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(\"v{x}\")\n}\n", noLib)) == null);
 }
 
-test "tryBuild: a non-env.out call defers to legacy (returns null)" {
-    const r = try buildFromSource(testing.allocator, "fn main {\n other.write(\"x\")\n}\n");
-    try testing.expect(r == null);
+test "tryBuild: an i64 function call builds the callee + host_out_int" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn double(n: i64) -> i64 { n + n }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(double(21))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+
+    try testing.expectEqual(@as(usize, 2), mod.funcs.len); // main + double
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn double -> i64") != null);
 }
 
-test "tryBuild: a non-string argument defers to legacy (returns null)" {
-    const r = try buildFromSource(testing.allocator, "fn main {\n env.out(version())\n}\n");
-    try testing.expect(r == null);
+test "tryBuild: transitively-called i64 function is registered" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn square(n: i64) -> i64 { n * n }\npub fn hyp_sq(a: i64, b: i64) -> i64 { square(a) + square(b) }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(hyp_sq(3, 4))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expectEqual(@as(usize, 3), mod.funcs.len); // main + hyp_sq + square
+}
+
+test "tryBuild: a control-flow body defers to legacy (returns null)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } }\n");
+    try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(fact(5))\n}\n", tr.resolver())) == null);
 }

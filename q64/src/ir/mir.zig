@@ -20,6 +20,7 @@
 //! the *Binaryen backend's* realization, not baked into MIR).
 
 const std = @import("std");
+pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
 
@@ -107,11 +108,22 @@ pub const Inst = struct {
     op: Op,
 };
 
-/// The executable op set. Grows per migration phase. v0:
-///   block          — a sequence of (mostly `.void`) instructions.
+/// The executable op set. Grows per migration phase.
+///   block          — a sequence of instructions; `ty` is the tail's type.
 ///   host_out_const — `env.out` of a constant string already in `data`
 ///                    (off/len include env.out's trailing newline).
+///   const_i64/local_get/local_set/bin/un/call/ret — the i64 value + call ops.
+///   host_out_int   — `env.out` of an i64: format to decimal then write,
+///                    followed by the shared newline byte at `nl_off`.
 pub const Op = union(enum) {
     block: []const *Inst,
     host_out_const: struct { off: u32, len: u32 },
+    const_i64: i64,
+    local_get: u32,
+    local_set: struct { idx: u32, value: *Inst },
+    bin: struct { kind: ops.BinKind, lhs: *Inst, rhs: *Inst },
+    un: struct { kind: ops.UnKind, operand: *Inst },
+    call: struct { func: FuncId, args: []const *Inst },
+    ret: ?*Inst,
+    host_out_int: struct { value: *Inst, nl_off: u32 },
 };

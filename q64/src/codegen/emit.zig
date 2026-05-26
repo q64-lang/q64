@@ -194,7 +194,8 @@ pub fn emitFromSource(
     // Import validation above runs regardless, so the honest-baseline
     // diagnostics fire on either path. `Q64_IR_STRICT=1` turns a fallback
     // into a panic, to prove a phase's coverage in CI.
-    if (try ir.build_hir.tryBuild(allocator, sf)) |hir_module| {
+    const mres = ir.hir.ModuleResolver{ .ctx = &resolver, .lookupFn = resolverLookupShim };
+    if (try ir.build_hir.tryBuild(allocator, sf, mres)) |hir_module| {
         var hmod = hir_module;
         defer hmod.deinit();
         var mmod = try ir.lower.lower(allocator, &hmod);
@@ -226,6 +227,14 @@ pub fn emitFromSource(
 // (a `_start` of `host_out_const` ops); later phases extend `lowerInst` and
 // the function/feature setup as MIR grows (str ABI, i64 fns, calls, arena).
 
+/// Adapts the codegen `Resolver` to the IR builder's `ModuleResolver` so
+/// `build_hir` can resolve call targets to their AST without `ir/` depending
+/// on `codegen/`.
+fn resolverLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
+    const r: *Resolver = @ptrCast(@alignCast(ctx));
+    return r.lookup(name);
+}
+
 fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
@@ -239,7 +248,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
     );
 
     const i64_type = c.BinaryenTypeInt64();
+    const i32_type = c.BinaryenTypeInt32();
     const none_type = c.BinaryenTypeNone();
+    var pair = [_]c.BinaryenType{ i64_type, i64_type };
+    const pair_type = c.BinaryenTypeCreate(&pair, pair.len);
 
     var env_out_params = [_]c.BinaryenType{ i64_type, i64_type };
     const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
@@ -255,38 +267,74 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
             c.BinaryenConst(module, c.BinaryenLiteralInt64(0)),
         };
         var seg_sizes = [_]c.BinaryenIndex{@intCast(m.data.len)};
-        c.BinaryenSetMemory(
-            module,
-            1,
-            1,
-            "memory",
-            null,
-            @ptrCast(&seg_datas),
-            @ptrCast(&seg_passives),
-            @ptrCast(&seg_offsets),
-            @ptrCast(&seg_sizes),
-            seg_sizes.len,
-            false,
-            true,
-            "0",
-        );
+        c.BinaryenSetMemory(module, 1, 1, "memory", null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, true, "0");
+    }
+
+    // Any int-to-string formatting needs the `__fmt_i64` routine and the
+    // scope-arena bump global (`sp`) it writes into.
+    var needs_fmt = false;
+    for (m.funcs) |f| switch (f.body) {
+        .structured => |inst| {
+            if (bodyHasIntOut(inst)) needs_fmt = true;
+        },
+        .cfg => return Error.CfgUnsupported,
+    };
+    if (needs_fmt) {
+        _ = c.BinaryenAddGlobal(module, "sp", i64_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(m.data.len))));
+        try emitFmtI64(module, allocator, i64_type, pair_type);
     }
 
     for (m.funcs) |f| {
-        // Structured is the only body form today; the CFG escape hatch
-        // (mir.Body.cfg) is reserved for a future basic-block backend.
         const structured = switch (f.body) {
             .structured => |inst| inst,
             .cfg => return Error.CfgUnsupported,
         };
-        const body = try lowerInst(allocator, module, structured);
+
+        var lw = Lowerer{
+            .allocator = allocator,
+            .module = module,
+            .funcs = m.funcs,
+            .i64_type = i64_type,
+            .i32_type = i32_type,
+            .none_type = none_type,
+            .pair_type = pair_type,
+            .pair_idx = @intCast(f.locals.len), // pair scratch sits past the i64 locals
+        };
+
         switch (f.linkage) {
             .entry => {
-                _ = c.BinaryenAddFunction(module, f.name.ptr, none_type, none_type, null, 0, body);
+                // varTypes: the entry's i64 locals, plus one pair scratch
+                // local if it formats any integer.
+                const fmt_here = bodyHasIntOut(structured);
+                const nloc = f.locals.len + @as(usize, if (fmt_here) 1 else 0);
+                const vts = try allocator.alloc(c.BinaryenType, nloc);
+                defer allocator.free(vts);
+                for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type);
+                if (fmt_here) vts[f.locals.len] = pair_type;
+                const body = try lw.inst(structured);
+                _ = c.BinaryenAddFunction(module, f.name.ptr, none_type, none_type, if (nloc > 0) @ptrCast(vts.ptr) else null, @intCast(nloc), body);
                 _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
             },
-            // Non-entry functions arrive in a later migration phase.
-            .local, .imported_resolved => return Error.UnsupportedCall,
+            .local, .imported_resolved => {
+                var ptype = none_type;
+                var pbuf: []c.BinaryenType = &.{};
+                if (f.params.len > 0) {
+                    pbuf = try allocator.alloc(c.BinaryenType, f.params.len);
+                    for (pbuf, 0..) |*x, i| x.* = wasmType(f.params[i], i64_type, i32_type, none_type);
+                    ptype = c.BinaryenTypeCreate(pbuf.ptr, @intCast(pbuf.len));
+                }
+                defer if (pbuf.len > 0) allocator.free(pbuf);
+
+                var vts: []c.BinaryenType = &.{};
+                if (f.locals.len > 0) {
+                    vts = try allocator.alloc(c.BinaryenType, f.locals.len);
+                    for (vts, 0..) |*x, i| x.* = wasmType(f.locals[i], i64_type, i32_type, none_type);
+                }
+                defer if (vts.len > 0) allocator.free(vts);
+
+                const body = try lw.inst(structured);
+                _ = c.BinaryenAddFunction(module, f.name.ptr, ptype, wasmType(f.ret, i64_type, i32_type, none_type), if (vts.len > 0) @ptrCast(vts.ptr) else null, @intCast(vts.len), body);
+            },
         }
     }
 
@@ -305,27 +353,124 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
     return out;
 }
 
-/// Lower one MIR instruction to a Binaryen expression. Grows per phase.
-fn lowerInst(
+fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenType, none_type: c.BinaryenType) c.BinaryenType {
+    return switch (t) {
+        .i64 => i64_type,
+        .i32 => i32_type,
+        .f64 => c.BinaryenTypeFloat64(),
+        .void => none_type,
+    };
+}
+
+/// True if any instruction in the tree is a `host_out_int` (so the function
+/// needs the pair scratch local; the module needs `__fmt_i64` + the arena).
+fn bodyHasIntOut(inst: *const ir.mir.Inst) bool {
+    return switch (inst.op) {
+        .host_out_int => true,
+        .block => |items| blk: {
+            for (items) |child| if (bodyHasIntOut(child)) break :blk true;
+            break :blk false;
+        },
+        .local_set => |ls| bodyHasIntOut(ls.value),
+        .bin => |b| bodyHasIntOut(b.lhs) or bodyHasIntOut(b.rhs),
+        .un => |u| bodyHasIntOut(u.operand),
+        .call => |cl| blk: {
+            for (cl.args) |a| if (bodyHasIntOut(a)) break :blk true;
+            break :blk false;
+        },
+        .ret => |v| if (v) |val| bodyHasIntOut(val) else false,
+        .host_out_const, .const_i64, .local_get => false,
+    };
+}
+
+/// Lowers MIR instructions to Binaryen expressions. Carries the per-function
+/// context (the funcs table for call resolution, the pair scratch local).
+const Lowerer = struct {
     allocator: std.mem.Allocator,
     module: c.BinaryenModuleRef,
-    inst: *const ir.mir.Inst,
-) Error!c.BinaryenExpressionRef {
-    switch (inst.op) {
-        .block => |items| {
-            const children = try allocator.alloc(c.BinaryenExpressionRef, items.len);
-            defer allocator.free(children);
-            for (items, 0..) |child, i| children[i] = try lowerInst(allocator, module, child);
-            return c.BinaryenBlock(module, null, @ptrCast(children.ptr), @intCast(children.len), c.BinaryenTypeNone());
-        },
-        .host_out_const => |hc| {
-            var args = [_]c.BinaryenExpressionRef{
-                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(hc.off))),
-                c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(hc.len))),
-            };
-            return c.BinaryenCall(module, "env_out", @ptrCast(&args), args.len, c.BinaryenTypeNone());
-        },
+    funcs: []const ir.mir.Func,
+    i64_type: c.BinaryenType,
+    i32_type: c.BinaryenType,
+    none_type: c.BinaryenType,
+    pair_type: c.BinaryenType,
+    pair_idx: c.BinaryenIndex,
+
+    fn inst(self: *Lowerer, n: *const ir.mir.Inst) Error!c.BinaryenExpressionRef {
+        const module = self.module;
+        switch (n.op) {
+            .block => |items| {
+                const children = try self.allocator.alloc(c.BinaryenExpressionRef, items.len);
+                defer self.allocator.free(children);
+                for (items, 0..) |child, i| children[i] = try self.inst(child);
+                return c.BinaryenBlock(module, null, @ptrCast(children.ptr), @intCast(children.len), wasmType(n.ty, self.i64_type, self.i32_type, self.none_type));
+            },
+            .host_out_const => |hc| return self.envOut(@intCast(hc.off), @intCast(hc.len)),
+            .const_i64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt64(v)),
+            .local_get => |idx| return c.BinaryenLocalGet(module, idx, self.i64_type),
+            .local_set => |ls| return c.BinaryenLocalSet(module, ls.idx, try self.inst(ls.value)),
+            .bin => |b| return c.BinaryenBinary(module, binOp(b.kind), try self.inst(b.lhs), try self.inst(b.rhs)),
+            .un => |u| {
+                const x = try self.inst(u.operand);
+                return switch (u.kind) {
+                    .neg => c.BinaryenBinary(module, c.BinaryenSubInt64(), c.BinaryenConst(module, c.BinaryenLiteralInt64(0)), x),
+                    .bit_not => c.BinaryenBinary(module, c.BinaryenXorInt64(), x, c.BinaryenConst(module, c.BinaryenLiteralInt64(-1))),
+                };
+            },
+            .call => |cl| {
+                const args = try self.allocator.alloc(c.BinaryenExpressionRef, cl.args.len);
+                defer self.allocator.free(args);
+                for (cl.args, 0..) |a, i| args[i] = try self.inst(a);
+                return c.BinaryenCall(module, self.funcs[cl.func].name.ptr, if (args.len > 0) args.ptr else null, @intCast(args.len), self.i64_type);
+            },
+            .ret => |v| return c.BinaryenReturn(module, if (v) |val| try self.inst(val) else null),
+            .host_out_int => |hi| {
+                // fmt = __fmt_i64(value); env.out(fmt.0, fmt.1); env.out(nl, 1).
+                var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(hi.value)};
+                const fmt = c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(module, self.pair_idx, fmt),
+                    blk: {
+                        var cargs = [_]c.BinaryenExpressionRef{
+                            c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 0),
+                            c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
+                        };
+                        break :blk c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, self.none_type);
+                    },
+                    self.envOut(@intCast(hi.nl_off), 1),
+                };
+                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
+            },
+        }
     }
+
+    fn envOut(self: *Lowerer, off: i64, len: i64) c.BinaryenExpressionRef {
+        var args = [_]c.BinaryenExpressionRef{
+            c.BinaryenConst(self.module, c.BinaryenLiteralInt64(off)),
+            c.BinaryenConst(self.module, c.BinaryenLiteralInt64(len)),
+        };
+        return c.BinaryenCall(self.module, "env_out", @ptrCast(&args), args.len, self.none_type);
+    }
+};
+
+fn binOp(kind: ir.ops.BinKind) c.BinaryenOp {
+    return switch (kind) {
+        .add => c.BinaryenAddInt64(),
+        .sub => c.BinaryenSubInt64(),
+        .mul => c.BinaryenMulInt64(),
+        .div => c.BinaryenDivSInt64(),
+        .rem => c.BinaryenRemSInt64(),
+        .bit_and => c.BinaryenAndInt64(),
+        .bit_or => c.BinaryenOrInt64(),
+        .bit_xor => c.BinaryenXorInt64(),
+        .shl => c.BinaryenShlInt64(),
+        .shr => c.BinaryenShrSInt64(),
+        .eq => c.BinaryenEqInt64(),
+        .ne => c.BinaryenNeInt64(),
+        .lt => c.BinaryenLtSInt64(),
+        .le => c.BinaryenLeSInt64(),
+        .gt => c.BinaryenGtSInt64(),
+        .ge => c.BinaryenGeSInt64(),
+    };
 }
 
 // A function codegen emits and calls at runtime (not const-folded).

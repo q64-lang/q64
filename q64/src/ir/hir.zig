@@ -17,8 +17,25 @@
 //! else still flows through the legacy AST→Binaryen path in `codegen/`.
 
 const std = @import("std");
+const parser = @import("parser");
+const ast = parser.ast;
+pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
+
+/// Resolves a function name (imported or file-local) to its AST declaration.
+/// The AST→HIR builder calls this to turn a call site into a `FuncId`; the
+/// codegen router backs it with the existing `Resolver.lookup`, so HIR
+/// construction reuses import resolution without `ir/` depending on codegen.
+/// (Name resolution will move fully into the builder in a later phase.)
+pub const ModuleResolver = struct {
+    ctx: *anyopaque,
+    lookupFn: *const fn (*anyopaque, name: []const u8) ?ast.FnDecl,
+
+    pub fn lookup(self: ModuleResolver, name: []const u8) ?ast.FnDecl {
+        return self.lookupFn(self.ctx, name);
+    }
+};
 
 /// Source-level value types. `str` is abstract here (it only becomes a
 /// `(ptr, len)` pair in MIR).
@@ -52,6 +69,9 @@ pub const Func = struct {
     name: []const u8,
     params: []Param = &.{},
     ret: Type = .void,
+    /// Locals declared beyond the parameters (in-body `let`/`var`), in
+    /// declaration order. Parameters occupy local indices `0..params.len`.
+    locals: []Type = &.{},
     body: *Stmt,
     /// Carried for the future component/WIT lift (exports = the pub surface).
     visibility: Visibility = .private,
@@ -59,19 +79,30 @@ pub const Func = struct {
     // the component/WIT + QubePod stages consume. Empty in v0.
 };
 
-/// High-level statements. Grows per migration phase (let/return/if/while/
-/// loop/break/continue/assign land with their codegen phases).
+/// High-level statements. Grows per migration phase (if/while/loop/break/
+/// continue land with the control-flow phase).
 pub const Stmt = union(enum) {
     block: []const *Stmt,
-    /// `env.out(expr)` — the `expr` is a `str`-typed value. The trailing
-    /// newline env.out writes is part of its capability contract and is
-    /// materialized during lowering, not here.
+    /// `env.out(expr)` — `expr` is a `str`-typed value. The trailing newline
+    /// env.out writes is part of its capability contract and is materialized
+    /// during lowering, not here.
     host_out: *Expr,
+    /// `env.out(expr)` where `expr` is `i64` — formatted to decimal on lowering.
+    host_out_int: *Expr,
+    /// The tail value of an `i64` function body (`{ … expr }`).
+    value: *Expr,
 };
 
 /// High-level expressions. `str` stays abstract; the `(ptr, len)` ABI is a
-/// lowering (MIR) concern. Grows per phase (int_const/concat/call/local/…).
+/// lowering (MIR) concern. Grows per phase (concat/interpolation later).
 pub const Expr = union(enum) {
     /// A fully-resolved constant string value (escapes decoded, no newline).
     str_const: []const u8,
+    int_const: i64,
+    /// A parameter or in-body binding, by resolved local index.
+    local: u32,
+    bin: struct { kind: ops.BinKind, lhs: *Expr, rhs: *Expr },
+    un: struct { kind: ops.UnKind, operand: *Expr },
+    /// A call to another function, resolved to its `FuncId`.
+    call: struct { func: FuncId, args: []const *Expr },
 };
