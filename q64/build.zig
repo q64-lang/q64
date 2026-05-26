@@ -23,6 +23,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Named module for the Q64 IR package (src/ir/lib.zig). The builder
+    // consumes parser AST views; nothing under ir/ links Binaryen, so the
+    // IR stays backend-neutral. Codegen + future passes import it.
+    const ir_mod = b.createModule(.{
+        .root_source_file = b.path("src/ir/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ir_mod.addImport("parser", parser_mod);
+
     // -----------------------------------------------------------
     // The binary.
     // -----------------------------------------------------------
@@ -32,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.addImport("parser", parser_mod);
+    exe_mod.addImport("ir", ir_mod);
     linkBinaryen(exe_mod, target, binaryen_include, binaryen_lib);
 
     const exe = b.addExecutable(.{
@@ -57,12 +68,25 @@ pub fn build(b: *std.Build) void {
     addPlainTest(b, test_step, target, optimize, "src/parser/parse.zig");
     addPlainTest(b, test_step, target, optimize, "src/parser/ast.zig");
 
+    // IR tests are pure Zig (no Binaryen link), but need the `parser`
+    // import, so they can't use addPlainTest. A fresh module rooted at the
+    // umbrella runs every embedded test under ir/.
+    const ir_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/ir/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ir_tests_mod.addImport("parser", parser_mod);
+    const ir_tests = b.addTest(.{ .root_module = ir_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(ir_tests).step);
+
     const codegen_mod = b.createModule(.{
         .root_source_file = b.path("src/codegen/emit.zig"),
         .target = target,
         .optimize = optimize,
     });
     codegen_mod.addImport("parser", parser_mod);
+    codegen_mod.addImport("ir", ir_mod);
     linkBinaryen(codegen_mod, target, binaryen_include, binaryen_lib);
     const codegen_tests = b.addTest(.{ .root_module = codegen_mod });
     test_step.dependOn(&b.addRunArtifact(codegen_tests).step);

@@ -1,0 +1,113 @@
+//! Text dumpers for HIR and MIR — for golden tests and a future
+//! `q64 show hir|mir`. Pure Zig; no Binaryen. The format is for humans and
+//! tests, not a stable serialization.
+
+const std = @import("std");
+const hir = @import("hir.zig");
+const mir = @import("mir.zig");
+
+const Buf = std.ArrayList(u8);
+const Error = std.mem.Allocator.Error;
+
+pub fn hirToString(gpa: std.mem.Allocator, m: *const hir.Module) Error![]u8 {
+    var out: Buf = .empty;
+    errdefer out.deinit(gpa);
+    for (m.funcs, 0..) |f, i| {
+        const marker = if (m.entry != null and m.entry.? == i) " [entry]" else "";
+        try app(gpa, &out, "fn {s} -> {s}{s}\n", .{ f.name, @tagName(f.ret), marker });
+        try hirStmt(gpa, &out, f.body, 1);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) Error!void {
+    try indent(gpa, out, depth);
+    switch (s.*) {
+        .block => |items| {
+            try app(gpa, out, "block\n", .{});
+            for (items) |child| try hirStmt(gpa, out, child, depth + 1);
+        },
+        .host_out => |e| switch (e.*) {
+            .str_const => |b| try app(gpa, out, "host_out \"{s}\"\n", .{b}),
+        },
+    }
+}
+
+pub fn mirToString(gpa: std.mem.Allocator, m: *const mir.Module) Error![]u8 {
+    var out: Buf = .empty;
+    errdefer out.deinit(gpa);
+    try app(gpa, &out, "data.len={d}\n", .{m.data.len});
+    for (m.funcs, 0..) |f, i| {
+        const marker = if (m.entry != null and m.entry.? == i) " [entry]" else "";
+        try app(gpa, &out, "fn {s} -> {s}{s}\n", .{ f.name, @tagName(f.ret), marker });
+        switch (f.body) {
+            .structured => |inst| try mirInst(gpa, &out, inst, 1),
+            .cfg => |cfg| try mirCfg(gpa, &out, cfg, 1),
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn mirCfg(gpa: std.mem.Allocator, out: *Buf, cfg: *const mir.Cfg, depth: usize) Error!void {
+    try indent(gpa, out, depth);
+    try app(gpa, out, "cfg entry=bb{d}\n", .{cfg.entry});
+    for (cfg.blocks, 0..) |bb, id| {
+        try indent(gpa, out, depth);
+        try app(gpa, out, "bb{d}:\n", .{id});
+        for (bb.insts) |inst| try mirInst(gpa, out, inst, depth + 1);
+        try indent(gpa, out, depth + 1);
+        switch (bb.term) {
+            .ret => |v| try app(gpa, out, "ret{s}\n", .{if (v == null) "" else " <val>"}),
+            .br => |t| try app(gpa, out, "br bb{d}\n", .{t}),
+            .cond_br => |cb| try app(gpa, out, "cond_br bb{d} bb{d}\n", .{ cb.then_blk, cb.else_blk }),
+            .@"unreachable" => try app(gpa, out, "unreachable\n", .{}),
+        }
+    }
+}
+
+fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usize) Error!void {
+    try indent(gpa, out, depth);
+    switch (inst.op) {
+        .block => |items| {
+            try app(gpa, out, "block\n", .{});
+            for (items) |child| try mirInst(gpa, out, child, depth + 1);
+        },
+        .host_out_const => |hc| try app(gpa, out, "host_out_const off={d} len={d}\n", .{ hc.off, hc.len }),
+    }
+}
+
+fn indent(gpa: std.mem.Allocator, out: *Buf, depth: usize) Error!void {
+    var n: usize = 0;
+    while (n < depth) : (n += 1) try out.appendSlice(gpa, "  ");
+}
+
+fn app(gpa: std.mem.Allocator, out: *Buf, comptime fmt: []const u8, args: anytype) Error!void {
+    const s = try std.fmt.allocPrint(gpa, fmt, args);
+    defer gpa.free(s);
+    try out.appendSlice(gpa, s);
+}
+
+const testing = std.testing;
+
+test "mir CFG escape hatch: a hand-built basic-block body prints" {
+    // No pass produces CFG bodies yet; this exercises the reserved seam so
+    // the types stay live and the dumper handles both forms.
+    var inst: mir.Inst = .{ .ty = .void, .op = .{ .host_out_const = .{ .off = 0, .len = 4 } } };
+    const bb: mir.BasicBlock = .{ .insts = &.{&inst}, .term = .{ .ret = null } };
+    var cfg: mir.Cfg = .{ .blocks = &.{bb}, .entry = 0 };
+    const func: mir.Func = .{ .name = "start", .body = .{ .cfg = &cfg }, .linkage = .entry };
+    var funcs = [_]mir.Func{func};
+
+    var m = mir.Module.init(testing.allocator);
+    defer m.deinit();
+    m.funcs = &funcs;
+    m.entry = 0;
+    m.data = "test";
+
+    const dump = try mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "cfg entry=bb0") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "bb0:") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_const off=0 len=4") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "ret\n") != null);
+}

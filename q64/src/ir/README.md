@@ -1,0 +1,72 @@
+# q64/src/ir
+
+The two-tier **Q64 IR** and the passes that build and lower it. This is the
+layer that makes good on the architectural decision that *language semantics
+must not depend on a backend's IR*: the compiler lowers to its own IR first,
+and only `codegen/` turns that into Binaryen/WASM.
+
+> **Status: incremental adoption.** A per-construct router in
+> [`codegen/emit.zig`](../codegen/emit.zig) sends the constructs the IR can
+> already lower through `AST → HIR → MIR → Binaryen`, and falls back to the
+> legacy direct `AST → Binaryen` emitter for the rest, so the build stays green
+> at every step. Today the IR path handles `fn main` whose body is
+> `env.out("<constant string>")`; each migration phase teaches it one more
+> construct (see the project plan). `Q64_IR_STRICT=1` turns a fallback into a
+> panic, to prove a phase's coverage.
+
+## The two tiers
+
+| Tier | File | "…" | Holds |
+|------|------|-----|-------|
+| **HIR** — Semantic QIR | [`hir.zig`](./hir.zig) | what the program *means* | name-resolved, desugared; types/regions/effects annotated by the semantic passes; abstract `str`; the pub surface + capability set for the component/WIT lift |
+| **MIR** — Executable QIR | [`mir.zig`](./mir.zig) | how it *executes* | ABI-lowered: `str` = `(ptr, len)`, explicit region/`alloc` ops, structured (wasm-shaped) control flow, the static memory image. The single input a backend consumes |
+
+### Control flow & the CFG escape hatch
+
+MIR control flow is **structured** (`block`/`if`/`loop`/`br`) — it matches the
+WASM target and the existing emitters, so lowering to Binaryen is near-1:1.
+But `mir.Func.body` is form-agnostic:
+
+```
+Body = union { structured: *Inst, cfg: *Cfg }
+```
+
+The `cfg` arm is the explicit escape hatch — a basic-block form (`BasicBlock` +
+`Terminator`) that a future relooper or LLVM/native backend can consume. Both
+forms **reuse the same value `Inst`s**; only the control-flow skeleton differs,
+so adding the CFG form never reshapes the rest of MIR. Nothing produces `cfg`
+today and the WASM backend rejects it (`Error.CfgUnsupported`); the structured↔
+CFG converter would live at this seam.
+
+## Passes
+
+- [`build_hir.zig`](./build_hir.zig) — **AST → HIR**. Imports `parser`; owns
+  desugaring, name resolution, (eventual) typing, and const-folding.
+- [`lower.zig`](./lower.zig) — **HIR → MIR**. Makes the `str` ABI, the region/
+  allocator model, and int→string formatting explicit.
+- [`print.zig`](./print.zig) — text dumps of either tier (golden tests +
+  `q64 show hir|mir`).
+
+## Neutrality invariant
+
+**Nothing under `ir/` imports the Binaryen C API.** The IR is pure data; only
+[`codegen/`](../codegen) links Binaryen and consumes MIR. This is enforced
+structurally — `ir` unit tests build and run with no C++ link — and it is what
+keeps a future second backend (`MIR → LLVM IR → native`) an *additive* change:
+the same MIR feeds it. Allocation stays abstract in MIR (Memory64 + the arena
+bump global are the Binaryen backend's realization, not baked in), and the
+`env.*` capability faces are abstract host calls lowered per-backend (WASM
+component imports today; a native host ABI later).
+
+## Inputs / outputs
+
+- **In:** `ast.SourceFile` from `parser/` (+ the `--module` map, as the IR path
+  grows to resolve imports).
+- **Out:** a `mir.Module` for `codegen/` to lower to Wasm; HIR metadata
+  (visibility, effects) for the component/WIT + QubePod stages.
+
+## Tests
+
+Pure Zig, no Binaryen. Run via the `ir_tests` target inside
+`vendor/zig/zig build --build-file q64/build.zig test`. The umbrella
+[`lib.zig`](./lib.zig) pulls every submodule's embedded tests into that target.

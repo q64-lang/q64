@@ -199,6 +199,25 @@ and `qube run`):
        (`NameNotFound`); that wants the name-resolution pass. Also still no
        `loop`/`for`/range, no `break`/`continue`, and no loops or in-body
        bindings in `main`.
+18. [x] **`break` / `continue` / early `return` / `loop` in i64 functions.**
+       The i64 body emitters now lower the full control-flow set, so loops can
+       exit early and iterate with skips. `IntScope` gained a loop-label stack
+       (`loops` + `topLoop`); `emitWhileInt`/`emitLoopInt` push the (exit,
+       re-enter) labels around the body. `emitIntStmt` gained arms for
+       `break`→`br $exit`, `continue`→`br $reenter`, early `return`→
+       `BinaryenReturn`, a statement-position `if` (`emitVoidIf`, `none`-typed,
+       branches may break/continue/return), and `loop { … }` (`emitLoopInt`:
+       `block $b { loop $l { <body>; br $l } }`). A `loop` as a function's
+       value tail diverges — `emitIntBlock` emits it then an `unreachable` so
+       the block still types i64 (it must exit via `return`). `break`/
+       `continue` outside any loop error (`BreakOutsideLoop`); value-carrying
+       `break x` is rejected for v0. Verified end-to-end (`link-roundtrip.sh`:
+       `first_factor(15)`/`first_factor(49)`/`is_prime(13)`/`is_prime(9)`/
+       `sum_odd(10)`/`count_to_sum(10)` → `3 / 7 / 1 / 0 / 25 /
+       count_to_sum(10)=4`) + emit unit tests (incl. break/continue-outside-
+       loop rejections). **Boundary:** still i64-only; no `for`/range iteration
+       (range expressions don't parse yet — `0..n`), no value-`break`, and no
+       loops or in-body control flow in `main` (the `_start` resolver path).
 
 **Definition of done met.** `cd examples/link-demo/hello_app && qube run`
 prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)
@@ -225,6 +244,45 @@ concatenation for interpolation.
   match the pinned zig — watch for the same drift elsewhere.
 - Deploy the registry: `cd continuum-api && CLOUDFLARE_ACCOUNT_ID=*** pnpm run deploy` (needs `wrangler login`, account ***).
 - Registry auth is the dev bypass `***` / `***` (`continuum-api/src/routes/auth.ts`, flagged for deletion when OAuth lands).
+
+## Q64 IR — two-tier backend-neutral IR (HIR/MIR) — ACTIVE
+
+Honoring the decision that semantics must not depend on a backend's IR. We
+lower to our own IR first: **HIR** (Semantic QIR) → **MIR** (Executable QIR) →
+Binaryen/WASM, with a future `MIR → LLVM → native` backend an additive change.
+Full design + phasing in the approved plan
+(`/root/.claude/plans/question-the-important-design-purring-beacon.md`) and
+[`q64/src/ir/README.md`](./q64/src/ir/README.md). Migrates incrementally behind
+a per-construct router in `codegen/emit.zig` (legacy `AST → Binaryen` is the
+fallback); `Q64_IR_STRICT=1` panics on fallback to track coverage. MIR control
+flow is **structured** (wasm-shaped) with an explicit **CFG escape hatch**:
+`mir.Func.body` is `Body = structured | cfg`, the `cfg` arm (`BasicBlock` +
+`Terminator`) reserved for a future relooper/LLVM backend (WASM backend rejects
+it with `CfgUnsupported`).
+
+- [x] **P0 scaffold + P1 literals.** `q64/src/ir/` package: `hir.zig`/`mir.zig`
+      (pure Zig, no Binaryen), `build_hir.zig` (AST→HIR), `lower.zig` (HIR→MIR),
+      `print.zig` (dumps). Wired into `build.zig` (`ir_mod` + `ir_tests`).
+      `emitFromSource` routes `fn main` of `env.out("<const string>")` through
+      `AST→HIR→MIR→Binaryen` (`lowerToWasm`/`lowerInst`); everything else falls
+      back to legacy. Verified: 169/169 unit tests (7 new IR tests),
+      `link-roundtrip.sh` green, and `Q64_IR_STRICT=1` runs literals / panics on
+      interpolation as designed. ARCHITECTURE.md updated (pipeline + `ir` stage).
+- [ ] **P2 i64 + control flow.** Port `emitInt*` + the callee fixpoint into
+      `build_hir`/`lower` (produce `mir.Inst`); extend `lowerInst`. Flip the i64
+      / if-else / while / loop / recursion tests + roundtrip sections.
+- [ ] **P3 concat / bindings / params / str ABI.** The heart of HIR→MIR: the
+      `(ptr,len)` ABI, the scope-arena concat plan (keep `appendConcat`
+      byte-identical, swap its driver), runtime `let`/`var`. After this the whole
+      suite + `link-roundtrip.sh` runs through the IR.
+- [ ] **P4 delete legacy.** Once the router never falls through (verify with
+      `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
+      `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.
+- [ ] **P5 introspection + tail seams.** `q64 show hir|mir`; populate HIR
+      visibility/effect slots for the component/WIT + QubePod bundle stages.
+- [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
+      plus a native host ABI for the `env.*` capability faces (the one piece not
+      inherited from the WASM component model).
 
 ## C bindings
 
