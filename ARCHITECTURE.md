@@ -11,6 +11,19 @@ doc and the spec disagree, the spec wins (see [`CLAUDE.md`](./CLAUDE.md)).
 > scaffolded but not yet fully implemented. This doc covers the intended
 > architecture rather than auditing what is wired up on any given day.
 
+![Q64 designed architecture: the q64 compiler stages, the qube build driver, and the end-to-end build flow from .q source to a running Wasm module](./img/Q64Design.jpeg)
+
+The diagram above is the one-page map this document walks through. The two
+panels are the two binaries: the **q64 compiler** on the left lowers a single
+`.q` source file to a Wasm 3.0 module through its passes (lossless parser →
+type + comptime → regions + effects → codegen), and the **qube build driver**
+on the right resolves a project — dependency graph, `q64` subprocess
+invocations, optional component wrap, and runtime execution. They meet in the
+middle at the linker: `.q source + --module map → linked Wasm module`. The
+strip along the bottom is the end-to-end build flow — **Source → Parse → Check
+→ Link → Emit → Run** — all carried over a single diagnostic format. Each piece
+is expanded in the sections below.
+
 ## The two-binary split
 
 Q64 ships two command-line tools, and the division of labor mirrors

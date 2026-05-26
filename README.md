@@ -3,6 +3,12 @@
 A stream-first language for Wasm 3.0, with managed and unmanaged memory as
 first-class peers.
 
+![Q64 designed architecture: the q64 compiler and qube build driver turning .q source into a linked Wasm module](./img/Q64Design.jpeg)
+
+*The designed architecture at a glance: `q64` lowers `.q` source to Wasm 3.0;
+`qube` resolves projects, dependencies, components, and runtime execution. See
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full walkthrough.*
+
 This repository is the q64 implementation monorepo. The language design
 discussion that preceded the spec is archived in
 [`docs/history/`](./docs/history); the
@@ -128,6 +134,17 @@ The remaining bootstrap pieces (still in progress; folders are scaffolded):
 - **`init.sh` builds Binaryen from source** (a few minutes the first time).
   Parallelism is capped at `nproc - 1` to keep laptops responsive; override
   with `BINARYEN_JOBS=N ./init.sh`.
+
+## Learn more
+
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — how a `.q` file becomes a running
+  Wasm program: the compiler pipeline, the two-binary split, and the linker
+  (the diagram at the top of this README, explained stage by stage).
+- [`spec/`](./spec) — the formal language and CLI specs. When the spec and the
+  code disagree, the spec wins.
+- [`CLAUDE.md`](./CLAUDE.md) — repo conventions, chiefly the naming/casing
+  rules (`Q64` vs `q64`, `Qube` vs `qube`, the Continuum).
+- [`docs/`](./docs) — language reference and tutorials (rendered by `web/`).
 
 ## License
 
