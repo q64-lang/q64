@@ -183,6 +183,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try mirInst(gpa, out, hi.value, depth + 1);
         },
         .str_const_val => |sc| try app(gpa, out, "str_const_val off={d} len={d}\n", .{ sc.off, sc.len }),
+        .str_param => |idx| try app(gpa, out, "str_param {d}\n", .{idx}),
         .host_out_str => |hs| {
             try app(gpa, out, "host_out_str nl_off={d}\n", .{hs.nl_off});
             try mirInst(gpa, out, hs.value, depth + 1);

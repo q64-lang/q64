@@ -117,7 +117,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 st.* = .{ .host_out = e };
             } else if (try isStrCall(b, arg)) {
                 // A real call to a str-returning function.
-                st.* = .{ .host_out_str = try buildStrExpr(b, arg) };
+                st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope) };
             } else {
                 // Otherwise an i64 expression (a call to an i64 function).
                 const e = try buildIntExpr(b, arg, &mscope);
@@ -178,41 +178,58 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     return id;
 }
 
-/// Register a `str`-returning function. v0 handles a nullary function whose
-/// body is a single tail str expression (a constant string, or a call to
-/// another str function) — parameters / concat bodies land in a later slice.
+/// Register a `str`-returning function. v0 handles an all-str-parameter
+/// function whose body is a single tail str expression (a constant string, a
+/// passthrough parameter ref, or a call to another str function). Concat
+/// bodies and runtime bindings land in a later slice.
 fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
+    var scope = Scope{ .a = b.a };
+    var params: std.ArrayList(hir.Param) = .empty;
     if (fd.params()) |ps| {
         var pit = ps.iter();
-        if (pit.next() != null) return error.Unsupported; // str params: later
+        while (pit.next()) |p| {
+            if (!(try paramIsStr(b.a, p))) return error.Unsupported; // all-str params for now
+            const pn = (p.name() orelse return error.Unsupported).text;
+            _ = try scope.declare(pn, false);
+            try params.append(b.a, .{ .name = pn, .ty = .str });
+        }
     }
+    scope.n_params = @intCast(params.items.len);
+    const param_slice = try params.toOwnedSlice(b.a);
 
     const owned = try b.a.dupe(u8, name);
     const id: hir.FuncId = @intCast(b.funcs.items.len);
     try b.ids.put(b.a, owned, id);
     const dummy = try b.a.create(hir.Stmt);
     dummy.* = .{ .block = &.{} };
-    try b.funcs.append(b.a, .{ .name = owned, .ret = .str, .body = dummy });
+    try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = .str, .body = dummy });
 
     const tail = try singleTailExpr(fd) orelse return error.Unsupported;
-    const value = try buildStrExpr(b, tail);
+    const value = try buildStrExpr(b, tail, &scope);
     const vstmt = try b.a.create(hir.Stmt);
     vstmt.* = .{ .expr = value };
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
 
-    b.funcs.items[id] = .{ .name = owned, .ret = .str, .body = block };
+    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .str, .body = block };
     return id;
 }
 
-/// Build a `str`-valued expression. v0: a constant string literal (no runtime
-/// interpolation) or a call to a nullary str function.
-fn buildStrExpr(b: *Builder, expr: ast.Expr) BuildError!*hir.Expr {
+/// Build a `str`-valued expression: a constant string literal (no runtime
+/// interpolation), a passthrough parameter reference, or a call to a str
+/// function (whose arguments are themselves str values).
+fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
     const out = try b.a.create(hir.Expr);
     switch (expr) {
         .string_lit => |sl| {
             const bytes = b.eval.renderStringLit(sl) catch return error.Unsupported;
             out.* = .{ .str_const = bytes };
+        },
+        .path => |p| {
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            const loc = scope.find(txt) orelse return error.Unsupported;
+            out.* = .{ .local = loc.idx };
         },
         .call => |cc| {
             const callee = cc.callee() orelse return error.Unsupported;
@@ -224,11 +241,38 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr) BuildError!*hir.Expr {
             defer b.a.free(cname);
             const id = try registerFunc(b, cname);
             if (b.funcs.items[id].ret != .str) return error.Unsupported;
+            var args: std.ArrayList(*hir.Expr) = .empty;
             var ait = cc.args();
-            if (ait.next() != null) return error.Unsupported; // str-call args: later
-            out.* = .{ .call = .{ .func = id, .args = &.{} } };
+            while (ait.next()) |a| try args.append(b.a, try buildStrArg(b, a, scope));
+            if (args.items.len != b.funcs.items[id].params.len) return error.Unsupported;
+            out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
         },
-        else => return error.Unsupported, // param ref / concat: later
+        else => return error.Unsupported, // interpolation/concat: later
+    }
+    return out;
+}
+
+/// Build a `str` argument at a call site: a compile-time constant (a literal
+/// or a const-bodied call like `vshout()`) folds to a `str_const`; a bare
+/// parameter passes through as a reference. A runtime value (a non-const call,
+/// a runtime binding) isn't supported yet and defers to the legacy path.
+fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
+    b.eval.fold_calls = true;
+    const folded = try tryConst(b, arg);
+    b.eval.fold_calls = false;
+    const out = try b.a.create(hir.Expr);
+    if (folded) |bytes| {
+        out.* = .{ .str_const = bytes };
+        return out;
+    }
+    switch (arg) {
+        .path => |p| {
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            const loc = scope.find(txt) orelse return error.Unsupported;
+            out.* = .{ .local = loc.idx };
+        },
+        else => return error.Unsupported,
     }
     return out;
 }
@@ -273,6 +317,11 @@ fn isStrCall(b: *Builder, arg: ast.Expr) BuildError!bool {
 fn returnsStr(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
     const rt = fd.returnType() orelse return false;
     const te = rt.type_() orelse return false;
+    return typeNamed(a, te, "str");
+}
+
+fn paramIsStr(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
+    const te = p.type_() orelse return false;
     return typeNamed(a, te, "str");
 }
 
@@ -651,6 +700,22 @@ test "tryBuild: transitively-called i64 function is registered" {
         return error.TestUnexpectedResult;
     defer mod.deinit();
     try testing.expectEqual(@as(usize, 3), mod.funcs.len); // main + hyp_sq + square
+}
+
+test "tryBuild: a str passthrough function + str-literal arg builds HIR" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn id(s: str) -> str { s }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(id(\"passed\"))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expectEqual(@as(usize, 2), mod.funcs.len); // main + id
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn id -> str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "local#0") != null); // passthrough param ref
 }
 
 test "tryBuild: a recursive control-flow body builds HIR" {

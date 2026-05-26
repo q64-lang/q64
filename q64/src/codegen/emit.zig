@@ -326,11 +326,25 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
                 _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
             },
             .local, .imported_resolved => {
+                // A `str` parameter is two i64 wasm params (ptr, len); an i64
+                // parameter is one. Expand the source params accordingly.
+                var pcount: usize = 0;
+                for (f.params) |p| pcount += if (p == .str) 2 else 1;
                 var ptype = none_type;
                 var pbuf: []c.BinaryenType = &.{};
-                if (f.params.len > 0) {
-                    pbuf = try allocator.alloc(c.BinaryenType, f.params.len);
-                    for (pbuf, 0..) |*x, i| x.* = wasmType(f.params[i], i64_type, i32_type, none_type, pair_type);
+                if (pcount > 0) {
+                    pbuf = try allocator.alloc(c.BinaryenType, pcount);
+                    var k: usize = 0;
+                    for (f.params) |p| {
+                        if (p == .str) {
+                            pbuf[k] = i64_type;
+                            pbuf[k + 1] = i64_type;
+                            k += 2;
+                        } else {
+                            pbuf[k] = wasmType(p, i64_type, i32_type, none_type, pair_type);
+                            k += 1;
+                        }
+                    }
                     ptype = c.BinaryenTypeCreate(pbuf.ptr, @intCast(pbuf.len));
                 }
                 defer if (pbuf.len > 0) allocator.free(pbuf);
@@ -394,7 +408,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .if_ => |iff| bodyHasOut(iff.cond, want_int) or bodyHasOut(iff.then_, want_int) or (iff.else_ != null and bodyHasOut(iff.else_.?, want_int)),
         .while_ => |w| bodyHasOut(w.cond, want_int) or bodyHasOut(w.body, want_int),
         .loop => |body| bodyHasOut(body, want_int),
-        .host_out_const, .const_i64, .local_get, .str_const_val, .br, .br_cont, .@"unreachable" => false,
+        .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -443,10 +457,24 @@ const Lowerer = struct {
                 };
             },
             .call => |cl| {
-                const args = try self.allocator.alloc(c.BinaryenExpressionRef, cl.args.len);
-                defer self.allocator.free(args);
-                for (cl.args, 0..) |a, i| args[i] = try self.inst(a);
-                return c.BinaryenCall(module, self.funcs[cl.func].name.ptr, if (args.len > 0) args.ptr else null, @intCast(args.len), self.wty(n.ty));
+                // A `str` argument expands to two i64 operands (ptr, len).
+                var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer operands.deinit(self.allocator);
+                for (cl.args) |a| {
+                    if (a.ty == .str) {
+                        try self.strOperands(a, &operands);
+                    } else {
+                        try operands.append(self.allocator, try self.inst(a));
+                    }
+                }
+                return c.BinaryenCall(module, self.funcs[cl.func].name.ptr, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.wty(n.ty));
+            },
+            .str_param => |idx| {
+                var elems = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalGet(module, idx * 2, self.i64_type),
+                    c.BinaryenLocalGet(module, idx * 2 + 1, self.i64_type),
+                };
+                return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
             },
             .ret => |v| return c.BinaryenReturn(module, if (v) |val| try self.inst(val) else null),
             .str_const_val => |sc| {
@@ -554,6 +582,23 @@ const Lowerer = struct {
 
     fn wty(self: *const Lowerer, t: ir.mir.ValueType) c.BinaryenType {
         return wasmType(t, self.i64_type, self.i32_type, self.none_type, self.pair_type);
+    }
+
+    /// Emit the two i64 operands (ptr, len) for a `str` argument. Only simple
+    /// str values (a constant or a parameter) are passable today; a runtime
+    /// str value as an argument lands with the runtime-binding slice.
+    fn strOperands(self: *Lowerer, arg: *const ir.mir.Inst, out: *std.ArrayList(c.BinaryenExpressionRef)) Error!void {
+        switch (arg.op) {
+            .str_const_val => |sc| {
+                try out.append(self.allocator, c.BinaryenConst(self.module, c.BinaryenLiteralInt64(@intCast(sc.off))));
+                try out.append(self.allocator, c.BinaryenConst(self.module, c.BinaryenLiteralInt64(@intCast(sc.len))));
+            },
+            .str_param => |idx| {
+                try out.append(self.allocator, c.BinaryenLocalGet(self.module, idx * 2, self.i64_type));
+                try out.append(self.allocator, c.BinaryenLocalGet(self.module, idx * 2 + 1, self.i64_type));
+            },
+            else => return Error.UnsupportedCall,
+        }
     }
 };
 

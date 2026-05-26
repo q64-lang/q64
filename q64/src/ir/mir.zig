@@ -130,6 +130,9 @@ pub const Op = union(enum) {
     /// A constant `str` value: the `(ptr, len)` pointing at `off`/`len` in the
     /// memory image (no trailing newline — it's a value, not a host write).
     str_const_val: struct { off: u32, len: u32 },
+    /// The `str` value of parameter `#idx` (all-str param lists today, so its
+    /// `(ptr, len)` lives at wasm locals `2·idx`, `2·idx+1`).
+    str_param: u32,
     /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
     /// shared newline byte at `nl_off`.
     host_out_str: struct { value: *Inst, nl_off: u32 },

@@ -142,6 +142,7 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             try ctx.data.appendSlice(ctx.a, bytes);
             return mk(ctx.a, .str, .{ .str_const_val = .{ .off = off, .len = @intCast(bytes.len) } });
         },
+        .local => |idx| return mk(ctx.a, .str, .{ .str_param = idx }),
         .call => |cl| {
             const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
             for (cl.args, 0..) |arg, i| args[i] = try lowerStrExpr(ctx, arg);

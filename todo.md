@@ -300,7 +300,13 @@ it with `CfgUnsupported`).
         `env.out` arg to `host_out_str` (`isStrCall`); `buildIntExpr` now rejects
         a str callee in an i64 context. Verified `Q64_IR_STRICT=1`: the link-demo
         `env.out(version())` → `0.1.0` through AST→HIR→MIR→Binaryen.
-  - [ ] **P3b-2** str params + passthrough (`id(s){s}`), str-literal args.
+  - [x] **P3b-2** str params + passthrough (`id(s){s}`), str-literal/const-call
+        args. MIR `str_param` (→ `TupleMake` of locals `2·idx`,`2·idx+1`); the
+        backend expands a str param into two i64 wasm params and a str argument
+        into two i64 operands (`strOperands`). `build_hir` registers all-str-param
+        str functions; `buildStrArg` folds a const arg (`id(vshout())`) or passes
+        a parameter through. Verified `Q64_IR_STRICT=1`: `id("passed")`→`passed`,
+        `id(vshout())`→`0.1.0`.
   - [ ] **P3b-3** concat / interpolation (scope-arena `appendConcat`, driven by MIR).
   - [ ] **P3b-4** runtime str `let`/`var` bindings + runtime args.
   - [ ] **P3b-5** i64 bindings + int interpolation in `main`.
