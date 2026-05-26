@@ -22,6 +22,7 @@ qube --help    | -h
 | `qube new <name>`                | Create a new qube directory with a starter manifest and `src/`     |
 | `qube init`                      | Initialize a qube in the current directory                         |
 | `qube pod <new\|init>`           | Scaffold a QubePod deploy manifest (`qubepod.jsonc`)               |
+| `qube pod deploy`                | Pack the bundle (manifest + wasm + assets) and deploy to qubepods |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |
@@ -144,7 +145,26 @@ mirror the QubePod schema: `apiVersion`, `kind` (`"QubePod"`), `project` (a
 | `--api-version <ver>` | `qubepods.dev/v0.1`        | `apiVersion`.                        |
 | `--http-route <r>`    | —                          | Add an `exports.http` block at `r`.  |
 | `--http-interface <id>`| `qubepods:http/handler`   | http export interface.               |
+| `--assets <dir>`      | —                          | Add an `assets` block shipping `<dir>`. |
 | `--dir <path>`        | the name (`new` only)      | Target directory.                    |
+
+### `qube pod deploy`
+
+`qube pod deploy` packs a **bundle zip** from the `qubepod.jsonc` in the
+current directory — the manifest, the component wasm (at its
+`component.wasm` path), and the asset tree named by `assets.directory` —
+into `target/deploy/<name>.zip`, then uploads it to qubepods as a
+multipart `POST <api>/api/deploy` (`environment` + `bundle`). The server
+unzips it, content-addresses the wasm and every asset into the tenant
+store, and materializes the deployment. Files are zipped at the archive
+root (no wrapping folder); an optional single wrapping directory is
+tolerated on the server side.
+
+| Flag             | Default                          | Meaning                              |
+|------------------|----------------------------------|--------------------------------------|
+| `--env <name>`   | `production`                     | Target environment.                  |
+| `--url <origin>` | `https://api-stage.qubepods.com` | API origin.                          |
+| `--token <jwt>`  | `$QUBEPODS_TOKEN`                | Bearer token for the deploy API.     |
 
 ## `qube web` (v0)
 

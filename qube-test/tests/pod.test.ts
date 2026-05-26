@@ -42,6 +42,15 @@ describe.skipIf(!binaryAvailable())("qube pod new (flag-driven)", () => {
     expect(m).toContain('"interface": "qubepods:http/handler"');
   });
 
+  test("--assets adds an assets block", () => {
+    const root = makeProject({ ".keep": "" });
+    const r = runCli(["pod", "new", "resizer", ...REQUIRED, "--assets", "./public"], { cwd: root });
+    expect(r.exitCode).toBe(0);
+    const m = readFileSync(join(root, "resizer", "qubepod.jsonc"), "utf8");
+    expect(m).toContain('"assets"');
+    expect(m).toContain('"directory": "./public"');
+  });
+
   test("missing --wasm is a usage error", () => {
     const root = makeProject({ ".keep": "" });
     const r = runCli(
@@ -79,8 +88,8 @@ describe.skipIf(!binaryAvailable())("qube pod init", () => {
 describe.skipIf(!binaryAvailable())("qube pod (wizard)", () => {
   test("prompts on stdin and writes the answered manifest", () => {
     const root = makeProject({ ".keep": "" });
-    // project, name, wasm, wit.package, wit.world, language, apiVersion, route
-    const stdin = ["media", "thumb", "", "", "", "", "", ""].join("\n") + "\n";
+    // project, name, wasm, wit.package, wit.world, language, apiVersion, route, assets
+    const stdin = ["media", "thumb", "", "", "", "", "", "", ""].join("\n") + "\n";
     const r = runCli(["pod", "init"], { cwd: root, stdin });
     expect(r.exitCode).toBe(0);
     const m = readFileSync(join(root, "qubepod.jsonc"), "utf8");

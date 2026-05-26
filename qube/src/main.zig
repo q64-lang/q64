@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, sub, "pod")) {
-        cmdPod(gpa, io, &args_it) catch |err| {
+        cmdPod(gpa, io, env, &args_it) catch |err| {
             try printStderr(io, "qube: pod failed: {s}\n", .{@errorName(err)});
             std.process.exit(@intFromEnum(ExitCode.internal));
         };
@@ -164,6 +164,7 @@ fn usage(io: std.Io) !void {
         \\  new [name] [flags]      Scaffold a new qube in a new directory (wizard if no flags).
         \\  init [flags]            Scaffold a qube in the current directory (wizard if no flags).
         \\  pod <new|init> [flags]  Scaffold a QubePod deploy manifest (wizard if no flags).
+        \\  pod deploy [flags]      Pack the bundle (manifest+wasm+assets) and deploy to qubepods.
         \\  run                     Build and run the qube in the current directory.
         \\  web                     Build the qube to wasm and serve it in a browser.
         \\  add <name>[@version]    Resolve a dependency from the Continuum and add it.
@@ -1815,6 +1816,7 @@ const PodConfig = struct {
     wit_world: []const u8,
     http_route: ?[]const u8,
     http_interface: []const u8,
+    assets_dir: ?[]const u8,
 };
 
 /// QubePod `project` slug: `[a-z0-9][a-z0-9-]*` (mirrors the zod schema).
@@ -1830,7 +1832,7 @@ fn isSlug(s: []const u8) bool {
 
 fn podHelp(io: std.Io) !void {
     try writeStdout(io,
-        \\usage: qube pod new [name] [flags]   |   qube pod init [flags]
+        \\usage: qube pod <new [name] | init | deploy> [flags]
         \\
         \\Scaffold a QubePod deploy manifest (qubepod.jsonc). With no flags, an
         \\interactive wizard prompts for each field; passing any flag runs
@@ -1848,7 +1850,10 @@ fn podHelp(io: std.Io) !void {
         \\  --api-version <ver>    apiVersion (default qubepods.dev/v0.1).
         \\  --http-route <route>   Add an http export at <route>, e.g. /resize.
         \\  --http-interface <id>  http export interface (default qubepods:http/handler).
+        \\  --assets <dir>         Ship a static asset tree from <dir>, e.g. ./public.
         \\  --dir <path>           Target directory (new only; default: name).
+        \\
+        \\See `qube pod deploy --help` to pack and upload the bundle.
         \\
     );
 }
@@ -1883,6 +1888,12 @@ fn podWizard(gpa: std.mem.Allocator, io: std.Io, name_default: ?[]const u8) !Pod
         break :blk null;
     } else route;
 
+    const assets_raw = try prompt(gpa, io, r, "static assets directory (optional, e.g. ./public)", null);
+    const assets_dir: ?[]const u8 = if (assets_raw.len == 0) blk: {
+        gpa.free(assets_raw);
+        break :blk null;
+    } else assets_raw;
+
     return .{
         .api_version = api_version,
         .project = project,
@@ -1894,6 +1905,7 @@ fn podWizard(gpa: std.mem.Allocator, io: std.Io, name_default: ?[]const u8) !Pod
         .wit_world = wit_world,
         .http_route = http_route,
         .http_interface = default_http_interface,
+        .assets_dir = assets_dir,
     };
 }
 
@@ -1906,6 +1918,7 @@ fn freePodConfig(gpa: std.mem.Allocator, cfg: PodConfig) void {
     gpa.free(cfg.wit_world);
     if (cfg.language) |l| gpa.free(l);
     if (cfg.http_route) |r| gpa.free(r);
+    if (cfg.assets_dir) |d| gpa.free(d);
 }
 
 fn buildPodManifest(gpa: std.mem.Allocator, cfg: PodConfig) ![]u8 {
@@ -1937,6 +1950,14 @@ fn buildPodManifest(gpa: std.mem.Allocator, cfg: PodConfig) ![]u8 {
             try out.appendSlice(gpa, "    },\n  },\n");
         }
     }
+    if (cfg.assets_dir) |d| {
+        if (d.len > 0) {
+            try out.appendSlice(gpa, "\n  \"assets\": {\n");
+            try out.print(gpa, "    \"directory\": \"{s}\",\n", .{d});
+            try out.appendSlice(gpa, "    \"route\": \"/\",\n");
+            try out.appendSlice(gpa, "  },\n");
+        }
+    }
     try out.appendSlice(gpa, "}\n");
     return out.toOwnedSlice(gpa);
 }
@@ -1966,9 +1987,14 @@ fn scaffoldPod(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: PodConf
     try printStdout(io, "Created QubePod manifest for '{s}/{s}' at {s}\n", .{ cfg.project, cfg.name, path });
 }
 
-fn cmdPod(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+fn cmdPod(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
     const subsub = args_it.next() orelse {
-        try writeStderr(io, "usage: qube pod <new|init> [flags]\n");
+        try writeStderr(io, "usage: qube pod <new|init|deploy> [flags]\n");
         std.process.exit(@intFromEnum(ExitCode.usage));
     };
     if (std.mem.eql(u8, subsub, "--help") or std.mem.eql(u8, subsub, "-h")) {
@@ -1977,8 +2003,165 @@ fn cmdPod(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterato
     }
     if (std.mem.eql(u8, subsub, "new")) return scaffoldPodCmd(gpa, io, args_it, false);
     if (std.mem.eql(u8, subsub, "init")) return scaffoldPodCmd(gpa, io, args_it, true);
+    if (std.mem.eql(u8, subsub, "deploy")) return cmdPodDeploy(gpa, io, env, args_it);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
+}
+
+// qube pod deploy  (pack the bundle zip and upload it to qubepods)
+// ---------------------------------------------------------------------------
+
+const default_pods_api = "https://api-stage.qubepods.com";
+
+/// Strip a leading "./" from a manifest-relative path.
+fn stripDotSlash(s: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, s, "./")) s[2..] else s;
+}
+
+// Stage the manifest, the wasm (at its manifest-relative path), and the asset
+// tree, then zip them at the archive root (no wrapping folder). OUT is absolute
+// so the trailing `zip` (run from $STAGE) writes to the right place.
+const pod_pack_script =
+    \\set -e
+    \\PROJECT="$1"; OUT="$2"; WASM="$3"; ASSETS="$4"
+    \\STAGE="$(mktemp -d)"
+    \\mkdir -p "$(dirname "$OUT")"
+    \\cd "$PROJECT"
+    \\cp qubepod.jsonc "$STAGE/qubepod.jsonc"
+    \\mkdir -p "$STAGE/$(dirname "$WASM")"
+    \\cp "$WASM" "$STAGE/$WASM"
+    \\if [ -n "$ASSETS" ] && [ -d "$ASSETS" ]; then
+    \\  mkdir -p "$STAGE/$ASSETS"
+    \\  cp -R "$ASSETS/." "$STAGE/$ASSETS/"
+    \\fi
+    \\cd "$STAGE"
+    \\find . -name .DS_Store -delete 2>/dev/null || true
+    \\rm -f "$OUT"
+    \\zip -rqX "$OUT" .
+    \\rm -rf "$STAGE"
+;
+
+fn podDeployHelp(io: std.Io) !void {
+    try writeStdout(io,
+        \\usage: qube pod deploy [flags]
+        \\
+        \\Pack the QubePod bundle (qubepod.jsonc + the component wasm + the asset
+        \\tree named by assets.directory) into target/deploy/<name>.zip and upload
+        \\it to qubepods. Run from the directory holding qubepod.jsonc.
+        \\
+        \\Flags:
+        \\  --env <name>     Target environment (default: production).
+        \\  --url <origin>   API origin (default: https://api-stage.qubepods.com).
+        \\  --token <jwt>    Bearer token (or set QUBEPODS_TOKEN).
+        \\
+    );
+}
+
+fn cmdPodDeploy(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var api_url: []const u8 = default_pods_api;
+    var environment_name: []const u8 = "production";
+    var token_flag: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try podDeployHelp(io);
+            return;
+        } else if (std.mem.eql(u8, a, "--url")) {
+            api_url = try flagValue(io, args_it, "--url");
+        } else if (std.mem.eql(u8, a, "--env")) {
+            environment_name = try flagValue(io, args_it, "--env");
+        } else if (std.mem.eql(u8, a, "--token")) {
+            token_flag = try flagValue(io, args_it, "--token");
+        } else {
+            try printStderr(io, "qube pod deploy: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+
+    const manifest_path = try std.fs.path.join(gpa, &.{ cwd_path, "qubepod.jsonc" });
+    defer gpa.free(manifest_path);
+    if (!fileExists(io, manifest_path)) {
+        try writeStderr(io, "qube pod deploy: no qubepod.jsonc in this directory\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
+    defer gpa.free(raw);
+
+    const name = extractStringField(raw, "\"name\"") orelse {
+        try writeStderr(io, "qube pod deploy: manifest has no \"name\" field\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const wasm_rel = extractStringField(raw, "\"wasm\"") orelse {
+        try writeStderr(io, "qube pod deploy: manifest has no component.wasm\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    // Optional asset tree: assets.directory is the only "directory" key.
+    const assets_dir_opt = extractStringField(raw, "\"directory\"");
+
+    const wasm_norm = stripDotSlash(wasm_rel);
+    const assets_norm = if (assets_dir_opt) |d| stripDotSlash(d) else "";
+
+    // Token: --token wins, else QUBEPODS_TOKEN (both borrowed; no free).
+    const token = token_flag orelse (env.get("QUBEPODS_TOKEN") orelse {
+        try writeStderr(io, "qube pod deploy: no token; pass --token or set QUBEPODS_TOKEN\n");
+        std.process.exit(@intFromEnum(ExitCode.registry));
+    });
+
+    // Pack target/deploy/<name>.zip (absolute, so the staged `zip` finds it).
+    const out_zip = try std.fs.path.join(gpa, &.{ cwd_path, "target", "deploy", name });
+    defer gpa.free(out_zip);
+    const out_zip_full = try std.fmt.allocPrint(gpa, "{s}.zip", .{out_zip});
+    defer gpa.free(out_zip_full);
+
+    {
+        const argv = [_][]const u8{ "sh", "-c", pod_pack_script, "sh", cwd_path, out_zip_full, wasm_norm, assets_norm };
+        const term = try spawnInherit(io, &argv);
+        if (termCode(term) != 0) {
+            try writeStderr(io, "qube pod deploy: packing the bundle failed\n");
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        }
+    }
+    try printStdout(io, "qube pod deploy: packed {s}\n", .{out_zip_full});
+
+    // Upload the bundle (multipart: environment + bundle zip).
+    const url = try std.fmt.allocPrint(gpa, "{s}/api/deploy", .{api_url});
+    defer gpa.free(url);
+    const auth = try std.fmt.allocPrint(gpa, "authorization: Bearer {s}", .{token});
+    defer gpa.free(auth);
+    const env_field = try std.fmt.allocPrint(gpa, "environment={s}", .{environment_name});
+    defer gpa.free(env_field);
+    const bundle_field = try std.fmt.allocPrint(gpa, "bundle=@{s};type=application/zip", .{out_zip_full});
+    defer gpa.free(bundle_field);
+
+    const argv = [_][]const u8{
+        "curl",     "-sS",      "-w", "\n%{http_code}",
+        "-X",       "POST",     url,  "-H",
+        auth,       "-F",       env_field,
+        "-F",       bundle_field,
+    };
+    const cap = try runCapture(gpa, io, &argv);
+    defer gpa.free(cap.stdout);
+    const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse cap.stdout.len;
+    const body = cap.stdout[0..nl];
+    const status = if (nl < cap.stdout.len)
+        std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout[nl + 1 ..], " \r\n"), 10) catch 0
+    else
+        0;
+
+    if (status == 201) {
+        try printStdout(io, "Deployed {s} to {s}.\n{s}\n", .{ name, environment_name, body });
+        return;
+    }
+    try printStderr(io, "qube pod deploy: api returned {d}:\n{s}\n", .{ status, body });
+    std.process.exit(@intFromEnum(ExitCode.registry));
 }
 
 /// Shared driver for `qube pod new` (in_place=false) and `qube pod init`.
@@ -1993,6 +2176,7 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
     var api_version: []const u8 = default_pod_api_version;
     var http_route: ?[]const u8 = null;
     var http_interface: []const u8 = default_http_interface;
+    var assets_dir: ?[]const u8 = null;
     var dir_arg: ?[]const u8 = null;
     var any_flag = false;
 
@@ -2030,6 +2214,9 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
         } else if (std.mem.eql(u8, a, "--http-interface")) {
             any_flag = true;
             http_interface = try flagValue(io, args_it, "--http-interface");
+        } else if (std.mem.eql(u8, a, "--assets")) {
+            any_flag = true;
+            assets_dir = try flagValue(io, args_it, "--assets");
         } else if (std.mem.eql(u8, a, "--dir")) {
             any_flag = true;
             dir_arg = try flagValue(io, args_it, "--dir");
@@ -2077,6 +2264,7 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
             },
             .http_route = http_route,
             .http_interface = http_interface,
+            .assets_dir = assets_dir,
         };
     } else {
         const default_name: ?[]const u8 = if (in_place) cwd_base else name_arg;
