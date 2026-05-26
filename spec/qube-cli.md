@@ -21,6 +21,7 @@ qube --help    | -h
 |----------------------------------|--------------------------------------------------------------------|
 | `qube new <name>`                | Create a new qube directory with a starter manifest and `src/`     |
 | `qube init`                      | Initialize a qube in the current directory                         |
+| `qube pod <new\|init>`           | Scaffold a QubePod deploy manifest (`qubepod.jsonc`)               |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |
@@ -85,6 +86,65 @@ target/
     index.html
   <target-name>/               # named targets from qube.json5
 ```
+
+## `qube new`, `qube init`, and `qube pod` (v0)
+
+These scaffold new manifests. Every scaffolder supports two modes:
+
+- **Flag-driven** — when *any* flag is passed, the command runs
+  non-interactively and takes all values from flags (and defaults).
+- **Wizard** — when *no* flags are passed, the command prompts for each
+  field on stdin; an empty answer accepts the shown `[default]`.
+
+Generated files are never overwritten: an existing target manifest aborts
+with exit `65` (input).
+
+### `qube new` / `qube init`
+
+`qube new <name>` creates a directory named after the qube (override with
+`--dir`); `qube init` writes into the current directory (defaulting the name
+to the directory's basename). Both emit a `qube.json5`, a starter entry
+(`src/lib.q` for libraries, `src/main.q` for applications; none for a
+workspace), and a `README.md`.
+
+| Flag            | Default              | Meaning                                          |
+|-----------------|----------------------|--------------------------------------------------|
+| `--lib`         | (the default kind)   | Library qube (`type: "library"`).                |
+| `--app`         |                      | Application Qube (`type: "application"`).         |
+| `--workspace`   |                      | Workspace root (`type: "workspace"`).             |
+| `--name <name>` | positional / cwd base| Qube name.                                       |
+| `--version <v>` | `0.1.0`              | Semver.                                          |
+| `--license <s>` | `MIT OR Apache-2.0`  | SPDX expression.                                 |
+| `--description` | —                    | One-line description.                            |
+| `--dir <path>`  | the name (`new` only)| Target directory.                                |
+
+The starter manifest always sets the three required fields (`name`,
+`version`, `license`; see [`qube.json5.md`](./qube.json5.md)) plus `type` and
+`entry`. Names should be reverse-DNS (`dev.q64.audio`); a name that is not
+publishable (fewer than two dotted lowercase segments) still scaffolds but
+prints a note, since publishability is only enforced at `qube publish`.
+
+### `qube pod`
+
+`qube pod new <name>` / `qube pod init` scaffold a QubePod deploy manifest
+(`qubepod.jsonc`) for [qubepods](https://qubepods.com). The mandatory fields
+mirror the QubePod schema: `apiVersion`, `kind` (`"QubePod"`), `project` (a
+`[a-z0-9][a-z0-9-]*` slug), `name`, and a `component` with `wasm` and
+`wit.{package,world}`.
+
+| Flag                  | Default                    | Meaning                              |
+|-----------------------|----------------------------|--------------------------------------|
+| `--project <slug>`    | — (required)               | Project slug, e.g. `image-tools`.    |
+| `--name <name>`       | positional / cwd base      | App/qube name.                       |
+| `--wasm <path>`       | — (required)               | Path to the wasm component.          |
+| `--wit-package <id>`  | — (required)               | WIT package id.                      |
+| `--wit-world <world>` | — (required)               | WIT world name.                      |
+| `--language <lang>`   | —                          | Source language (optional).          |
+| `--version <semver>`  | —                          | Manifest version (optional).         |
+| `--api-version <ver>` | `qubepods.dev/v0.1`        | `apiVersion`.                        |
+| `--http-route <r>`    | —                          | Add an `exports.http` block at `r`.  |
+| `--http-interface <id>`| `qubepods:http/handler`   | http export interface.               |
+| `--dir <path>`        | the name (`new` only)      | Target directory.                    |
 
 ## `qube web` (v0)
 

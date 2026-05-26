@@ -113,13 +113,36 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "new")) {
+        scaffoldQubeCmd(gpa, io, &args_it, false) catch |err| {
+            try printStderr(io, "qube: new failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "init")) {
+        scaffoldQubeCmd(gpa, io, &args_it, true) catch |err| {
+            try printStderr(io, "qube: init failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "pod")) {
+        cmdPod(gpa, io, &args_it) catch |err| {
+            try printStderr(io, "qube: pod failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     // Documented subcommands that are not implemented yet. Listed
     // explicitly so unknown names still hit the usage fallback.
     const stub_subs = [_][]const u8{
-        "new",     "init",    "remove",  "build",
-        "test",    "install", "lock",    "outdated",
-        "audit",   "clean",   "explain", "fix",     "fmt",
-        "workspace",
+        "remove",   "build", "test",      "install",
+        "lock",     "outdated", "audit",  "clean",
+        "explain",  "fix",   "fmt",       "workspace",
     };
     for (stub_subs) |s| {
         if (std.mem.eql(u8, sub, s)) {
@@ -138,6 +161,9 @@ fn usage(io: std.Io) !void {
         \\usage: qube <subcommand> [args]
         \\
         \\Subcommands (v0):
+        \\  new [name] [flags]      Scaffold a new qube in a new directory (wizard if no flags).
+        \\  init [flags]            Scaffold a qube in the current directory (wizard if no flags).
+        \\  pod <new|init> [flags]  Scaffold a QubePod deploy manifest (wizard if no flags).
         \\  run                     Build and run the qube in the current directory.
         \\  web                     Build the qube to wasm and serve it in a browser.
         \\  add <name>[@version]    Resolve a dependency from the Continuum and add it.
@@ -146,7 +172,7 @@ fn usage(io: std.Io) !void {
         \\  --version, -v           Print the version and exit.
         \\  --help, -h              Print this help and exit.
         \\
-        \\Other subcommands from the spec (new, init, build, test,
+        \\Other subcommands from the spec (remove, build, test,
         \\fix, explain, fmt, workspace, ...) are not implemented yet.
         \\
     );
@@ -1462,4 +1488,603 @@ fn readPasswordSilent(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     std.posix.tcsetattr(fd, .FLUSH, new) catch {};
     defer std.posix.tcsetattr(fd, .FLUSH, old) catch {};
     return try readStdinLineAlloc(gpa, io);
+}
+
+// ---------------------------------------------------------------------------
+// Scaffolding shared helpers (qube new/init, qube pod new/init)
+// ---------------------------------------------------------------------------
+//
+// Two generation modes per spec discussion: flag-driven (any `--flag`
+// present → fully non-interactive) and wizard-driven (no flags → prompt on
+// stdin). Generated files are never overwritten; an existing manifest aborts.
+
+const QubeKind = enum { library, application, workspace };
+
+fn kindTypeStr(k: QubeKind) []const u8 {
+    return switch (k) {
+        .library => "library",
+        .application => "application",
+        .workspace => "workspace",
+    };
+}
+
+const QubeConfig = struct {
+    name: []const u8,
+    kind: QubeKind,
+    version: []const u8,
+    license: []const u8,
+    description: ?[]const u8,
+};
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn writeIfAbsent(io: std.Io, path: []const u8, data: []const u8) !void {
+    if (fileExists(io, path)) return;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+}
+
+/// Last dotted segment of a reverse-DNS name (`dev.acme.widget` → `widget`).
+fn lastSegment(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    return name;
+}
+
+/// Read the value following a flag, exiting with a usage error if absent.
+fn flagValue(io: std.Io, args_it: *std.process.Args.Iterator, flag: []const u8) ![]const u8 {
+    return args_it.next() orelse {
+        try printStderr(io, "qube: {s} needs a value\n", .{flag});
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+}
+
+/// Read one line from a persistent stdin reader, stripping a trailing CR.
+/// Returns a freshly-allocated slice, or null on EOF. A single reader must be
+/// reused across a whole wizard: each reader buffers ahead of the delimiter,
+/// so creating one per line would drop the buffered remainder of piped input.
+fn readLine(gpa: std.mem.Allocator, r: *std.Io.Reader) ?[]u8 {
+    // `takeDelimiter` advances *past* the newline (unlike the exclusive form,
+    // which stops before it and would re-yield an empty line forever) and maps
+    // end-of-stream to null, so a final unterminated line is still returned.
+    const maybe = r.takeDelimiter('\n') catch return null;
+    const line = maybe orelse return null;
+    const trimmed = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+    return gpa.dupe(u8, trimmed) catch null;
+}
+
+/// Print `label` (with `default` shown in brackets when non-empty) and read a
+/// line from `r`. Empty input or EOF yields a dupe of `default` (or "" when
+/// null). Caller owns the returned slice.
+fn prompt(gpa: std.mem.Allocator, io: std.Io, r: *std.Io.Reader, label: []const u8, default: ?[]const u8) ![]u8 {
+    if (default) |d| {
+        if (d.len > 0) {
+            try printStdout(io, "{s} [{s}]: ", .{ label, d });
+        } else {
+            try printStdout(io, "{s}: ", .{label});
+        }
+    } else {
+        try printStdout(io, "{s}: ", .{label});
+    }
+    const got = readLine(gpa, r) orelse return gpa.dupe(u8, default orelse "");
+    if (got.len == 0) {
+        gpa.free(got);
+        return gpa.dupe(u8, default orelse "");
+    }
+    return got;
+}
+
+// ---------------------------------------------------------------------------
+// qube new / qube init
+// ---------------------------------------------------------------------------
+
+fn qubeHelp(io: std.Io) !void {
+    try writeStdout(io,
+        \\usage: qube new [name] [flags]   |   qube init [flags]
+        \\
+        \\Scaffold a qube. With no flags, an interactive wizard prompts for each
+        \\field; passing any flag runs non-interactively.
+        \\
+        \\Flags:
+        \\  --lib                  Library qube (default; type: "library", src/lib.q).
+        \\  --app                  Application Qube (type: "application", src/main.q).
+        \\  --workspace            Workspace root (type: "workspace").
+        \\  --name <name>          Qube name. Use reverse-DNS, e.g. dev.q64.my_project.
+        \\  --version <semver>     Version (default 0.1.0).
+        \\  --license <spdx>       SPDX license (default "MIT OR Apache-2.0").
+        \\  --description <text>   One-line description.
+        \\  --dir <path>           Target directory (new only; default: last name segment).
+        \\
+    );
+}
+
+fn promptKind(gpa: std.mem.Allocator, io: std.Io, r: *std.Io.Reader) !QubeKind {
+    const s = try prompt(gpa, io, r, "type (library/application/workspace)", "library");
+    defer gpa.free(s);
+    if (std.mem.eql(u8, s, "application") or std.mem.eql(u8, s, "app")) return .application;
+    if (std.mem.eql(u8, s, "workspace") or std.mem.eql(u8, s, "ws")) return .workspace;
+    return .library;
+}
+
+fn qubeWizard(gpa: std.mem.Allocator, io: std.Io, name_default: ?[]const u8) !QubeConfig {
+    var buf: [4096]u8 = undefined;
+    var fr = std.Io.File.stdin().reader(io, &buf);
+    const r = &fr.interface;
+
+    try writeStdout(io, "Creating a new qube. Press enter to accept the [default].\n");
+    const name = try prompt(gpa, io, r, "name (reverse-DNS, e.g. dev.q64.my_project)", name_default);
+    const kind = try promptKind(gpa, io, r);
+    const version = try prompt(gpa, io, r, "version", "0.1.0");
+    const license = try prompt(gpa, io, r, "license (SPDX)", "MIT OR Apache-2.0");
+    const desc = try prompt(gpa, io, r, "description (optional)", null);
+    const description: ?[]const u8 = if (desc.len == 0) blk: {
+        gpa.free(desc);
+        break :blk null;
+    } else desc;
+    return .{
+        .name = name,
+        .kind = kind,
+        .version = version,
+        .license = license,
+        .description = description,
+    };
+}
+
+fn freeQubeConfig(gpa: std.mem.Allocator, cfg: QubeConfig) void {
+    gpa.free(cfg.name);
+    gpa.free(cfg.version);
+    gpa.free(cfg.license);
+    if (cfg.description) |d| gpa.free(d);
+}
+
+fn buildQubeManifest(gpa: std.mem.Allocator, cfg: QubeConfig) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\n");
+    try out.appendSlice(gpa, "  \"$schema\": \"https://q64.dev/schema/qube.json5\",\n");
+    try out.print(gpa, "  \"name\": \"{s}\",\n", .{cfg.name});
+    try out.print(gpa, "  \"version\": \"{s}\",\n", .{cfg.version});
+    try out.print(gpa, "  \"license\": \"{s}\",\n", .{cfg.license});
+    if (cfg.description) |d| {
+        if (d.len > 0) try out.print(gpa, "  \"description\": \"{s}\",\n", .{d});
+    }
+    try out.print(gpa, "  \"type\": \"{s}\",\n", .{kindTypeStr(cfg.kind)});
+    switch (cfg.kind) {
+        .application => try out.appendSlice(gpa, "  \"entry\": \"src/main.q\",\n"),
+        .library => try out.appendSlice(gpa, "  \"entry\": \"src/lib.q\",\n"),
+        .workspace => try out.appendSlice(gpa, "  \"workspace\": {\n    \"members\": [],\n  },\n"),
+    }
+    try out.appendSlice(gpa, "}\n");
+    return out.toOwnedSlice(gpa);
+}
+
+fn scaffoldQube(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: QubeConfig) !void {
+    if (cfg.name.len == 0) {
+        try writeStderr(io, "qube: a name is required\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    const manifest_path = try std.fs.path.join(gpa, &.{ dir, "qube.json5" });
+    defer gpa.free(manifest_path);
+    if (fileExists(io, manifest_path)) {
+        try printStderr(io, "qube: {s} already exists; refusing to overwrite\n", .{manifest_path});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+
+    const manifest = try buildQubeManifest(gpa, cfg);
+    defer gpa.free(manifest);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
+
+    switch (cfg.kind) {
+        .application => {
+            const src_dir = try std.fs.path.join(gpa, &.{ dir, "src" });
+            defer gpa.free(src_dir);
+            try std.Io.Dir.cwd().createDirPath(io, src_dir);
+            const p = try std.fs.path.join(gpa, &.{ dir, "src", "main.q" });
+            defer gpa.free(p);
+            const body = try std.fmt.allocPrint(gpa, "fn main {{\n    env.out(\"Hello from {s}.\\n\")\n}}\n", .{cfg.name});
+            defer gpa.free(body);
+            try writeIfAbsent(io, p, body);
+        },
+        .library => {
+            const src_dir = try std.fs.path.join(gpa, &.{ dir, "src" });
+            defer gpa.free(src_dir);
+            try std.Io.Dir.cwd().createDirPath(io, src_dir);
+            const p = try std.fs.path.join(gpa, &.{ dir, "src", "lib.q" });
+            defer gpa.free(p);
+            const body = try std.fmt.allocPrint(gpa, "//! {s} - a q64 library qube.\n//! Public functions form the qube's exported surface.\n\npub fn greet(name: str) -> str {{\n    \"Hello, {{name}}.\"\n}}\n", .{cfg.name});
+            defer gpa.free(body);
+            try writeIfAbsent(io, p, body);
+        },
+        .workspace => {},
+    }
+
+    const readme_path = try std.fs.path.join(gpa, &.{ dir, "README.md" });
+    defer gpa.free(readme_path);
+    const readme = try std.fmt.allocPrint(gpa, "# {s}\n\nA q64 {s} qube.\n", .{ cfg.name, kindTypeStr(cfg.kind) });
+    defer gpa.free(readme);
+    try writeIfAbsent(io, readme_path, readme);
+
+    try printStdout(io, "Created {s} qube '{s}' in {s}/\n", .{ kindTypeStr(cfg.kind), cfg.name, dir });
+    if (cfg.kind != .workspace and !isPublishableName(cfg.name)) {
+        try printStderr(io, "note: '{s}' is not a publishable name. Use reverse-DNS with >=2 lowercase segments (e.g. dev.q64.{s}) before `qube publish`.\n", .{ cfg.name, lastSegment(cfg.name) });
+    }
+}
+
+/// Shared driver for `qube new` (in_place=false) and `qube init` (in_place=true).
+fn scaffoldQubeCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator, in_place: bool) !void {
+    var name_arg: ?[]const u8 = null;
+    var kind: QubeKind = .library;
+    var version: []const u8 = "0.1.0";
+    var license: []const u8 = "MIT OR Apache-2.0";
+    var description: ?[]const u8 = null;
+    var dir_arg: ?[]const u8 = null;
+    var any_flag = false;
+
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try qubeHelp(io);
+            return;
+        } else if (std.mem.eql(u8, a, "--lib")) {
+            any_flag = true;
+            kind = .library;
+        } else if (std.mem.eql(u8, a, "--app")) {
+            any_flag = true;
+            kind = .application;
+        } else if (std.mem.eql(u8, a, "--workspace")) {
+            any_flag = true;
+            kind = .workspace;
+        } else if (std.mem.eql(u8, a, "--name")) {
+            any_flag = true;
+            name_arg = try flagValue(io, args_it, "--name");
+        } else if (std.mem.eql(u8, a, "--version")) {
+            any_flag = true;
+            version = try flagValue(io, args_it, "--version");
+        } else if (std.mem.eql(u8, a, "--license")) {
+            any_flag = true;
+            license = try flagValue(io, args_it, "--license");
+        } else if (std.mem.eql(u8, a, "--description")) {
+            any_flag = true;
+            description = try flagValue(io, args_it, "--description");
+        } else if (std.mem.eql(u8, a, "--dir")) {
+            any_flag = true;
+            dir_arg = try flagValue(io, args_it, "--dir");
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (name_arg == null) {
+            name_arg = a;
+        } else {
+            try printStderr(io, "qube: unexpected extra arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    // Default name suggestion for `init`: the current directory's basename.
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const cwd_base = std.fs.path.basename(cwd_path);
+
+    var cfg: QubeConfig = undefined;
+    var owned = false;
+    if (any_flag) {
+        const default_name: ?[]const u8 = if (in_place) cwd_base else null;
+        cfg = .{
+            .name = name_arg orelse default_name orelse {
+                try writeStderr(io, "qube new: a name is required (positional <name> or --name)\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            },
+            .kind = kind,
+            .version = version,
+            .license = license,
+            .description = description,
+        };
+    } else {
+        const default_name: ?[]const u8 = if (in_place) cwd_base else name_arg;
+        cfg = try qubeWizard(gpa, io, default_name);
+        owned = true;
+    }
+
+    const dir = if (in_place) "." else (dir_arg orelse cfg.name);
+    try scaffoldQube(gpa, io, dir, cfg);
+    if (owned) freeQubeConfig(gpa, cfg);
+}
+
+// ---------------------------------------------------------------------------
+// qube pod new / qube pod init  (QubePod deploy manifest, qubepod.jsonc)
+// ---------------------------------------------------------------------------
+//
+// The QubePod manifest schema lives in qubepods/packages/qubepod-schema.
+// Mandatory fields: apiVersion, kind ("QubePod"), project (slug), name, and a
+// component with `wasm` + `wit.{package,world}`. Everything else is optional.
+
+const default_pod_api_version = "qubepods.dev/v0.1";
+const default_http_interface = "qubepods:http/handler";
+
+const PodConfig = struct {
+    api_version: []const u8,
+    project: []const u8,
+    name: []const u8,
+    version: ?[]const u8,
+    language: ?[]const u8,
+    wasm: []const u8,
+    wit_package: []const u8,
+    wit_world: []const u8,
+    http_route: ?[]const u8,
+    http_interface: []const u8,
+};
+
+/// QubePod `project` slug: `[a-z0-9][a-z0-9-]*` (mirrors the zod schema).
+fn isSlug(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const c0 = s[0];
+    if (!((c0 >= 'a' and c0 <= 'z') or (c0 >= '0' and c0 <= '9'))) return false;
+    for (s[1..]) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-')) return false;
+    }
+    return true;
+}
+
+fn podHelp(io: std.Io) !void {
+    try writeStdout(io,
+        \\usage: qube pod new [name] [flags]   |   qube pod init [flags]
+        \\
+        \\Scaffold a QubePod deploy manifest (qubepod.jsonc). With no flags, an
+        \\interactive wizard prompts for each field; passing any flag runs
+        \\non-interactively. Mandatory: --project, --name, --wasm,
+        \\--wit-package, --wit-world.
+        \\
+        \\Flags:
+        \\  --project <slug>       Project slug, e.g. image-tools.        (required)
+        \\  --name <name>          App/qube name.                          (required)
+        \\  --wasm <path>          Path to the wasm component.             (required)
+        \\  --wit-package <id>     WIT package id, e.g. qubepods:app@0.1.0.(required)
+        \\  --wit-world <world>    WIT world name.                         (required)
+        \\  --language <lang>      Source language (optional).
+        \\  --version <semver>     Manifest version (optional).
+        \\  --api-version <ver>    apiVersion (default qubepods.dev/v0.1).
+        \\  --http-route <route>   Add an http export at <route>, e.g. /resize.
+        \\  --http-interface <id>  http export interface (default qubepods:http/handler).
+        \\  --dir <path>           Target directory (new only; default: name).
+        \\
+    );
+}
+
+fn podWizard(gpa: std.mem.Allocator, io: std.Io, name_default: ?[]const u8) !PodConfig {
+    var buf: [4096]u8 = undefined;
+    var fr = std.Io.File.stdin().reader(io, &buf);
+    const r = &fr.interface;
+
+    try writeStdout(io, "Creating a QubePod deploy manifest. Press enter to accept the [default].\n");
+    const project = try prompt(gpa, io, r, "project (slug, e.g. image-tools)", null);
+    const name = try prompt(gpa, io, r, "name (the app/qube name)", name_default);
+
+    const wasm_def = try std.fmt.allocPrint(gpa, "./dist/{s}.wasm", .{name});
+    defer gpa.free(wasm_def);
+    const wasm = try prompt(gpa, io, r, "component.wasm path", wasm_def);
+
+    const witpkg_def = try std.fmt.allocPrint(gpa, "qubepods:{s}@0.1.0", .{name});
+    defer gpa.free(witpkg_def);
+    const wit_package = try prompt(gpa, io, r, "component.wit.package", witpkg_def);
+
+    const wit_world = try prompt(gpa, io, r, "component.wit.world", name);
+    const language_raw = try prompt(gpa, io, r, "component.language (optional)", null);
+    const language: ?[]const u8 = if (language_raw.len == 0) blk: {
+        gpa.free(language_raw);
+        break :blk null;
+    } else language_raw;
+    const api_version = try prompt(gpa, io, r, "apiVersion", default_pod_api_version);
+    const route = try prompt(gpa, io, r, "http route (optional, e.g. /resize)", null);
+    const http_route: ?[]const u8 = if (route.len == 0) blk: {
+        gpa.free(route);
+        break :blk null;
+    } else route;
+
+    return .{
+        .api_version = api_version,
+        .project = project,
+        .name = name,
+        .version = null,
+        .language = language,
+        .wasm = wasm,
+        .wit_package = wit_package,
+        .wit_world = wit_world,
+        .http_route = http_route,
+        .http_interface = default_http_interface,
+    };
+}
+
+fn freePodConfig(gpa: std.mem.Allocator, cfg: PodConfig) void {
+    gpa.free(cfg.api_version);
+    gpa.free(cfg.project);
+    gpa.free(cfg.name);
+    gpa.free(cfg.wasm);
+    gpa.free(cfg.wit_package);
+    gpa.free(cfg.wit_world);
+    if (cfg.language) |l| gpa.free(l);
+    if (cfg.http_route) |r| gpa.free(r);
+}
+
+fn buildPodManifest(gpa: std.mem.Allocator, cfg: PodConfig) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\n");
+    try out.appendSlice(gpa, "  \"$schema\": \"https://schemas.qubepods.com/qubepod.schema.json\",\n");
+    try out.print(gpa, "  \"apiVersion\": \"{s}\",\n", .{cfg.api_version});
+    try out.appendSlice(gpa, "  \"kind\": \"QubePod\",\n\n");
+    try out.print(gpa, "  \"project\": \"{s}\",\n", .{cfg.project});
+    try out.print(gpa, "  \"name\": \"{s}\",\n", .{cfg.name});
+    if (cfg.version) |v| {
+        if (v.len > 0) try out.print(gpa, "  \"version\": \"{s}\",\n", .{v});
+    }
+    try out.appendSlice(gpa, "\n  \"component\": {\n");
+    if (cfg.language) |l| {
+        if (l.len > 0) try out.print(gpa, "    \"language\": \"{s}\",\n", .{l});
+    }
+    try out.print(gpa, "    \"wasm\": \"{s}\",\n", .{cfg.wasm});
+    try out.appendSlice(gpa, "    \"wit\": {\n");
+    try out.print(gpa, "      \"package\": \"{s}\",\n", .{cfg.wit_package});
+    try out.print(gpa, "      \"world\": \"{s}\",\n", .{cfg.wit_world});
+    try out.appendSlice(gpa, "    },\n  },\n");
+    if (cfg.http_route) |r| {
+        if (r.len > 0) {
+            try out.appendSlice(gpa, "\n  \"exports\": {\n    \"http\": {\n");
+            try out.print(gpa, "      \"interface\": \"{s}\",\n", .{cfg.http_interface});
+            try out.print(gpa, "      \"route\": \"{s}\",\n", .{r});
+            try out.appendSlice(gpa, "    },\n  },\n");
+        }
+    }
+    try out.appendSlice(gpa, "}\n");
+    return out.toOwnedSlice(gpa);
+}
+
+fn scaffoldPod(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: PodConfig) !void {
+    if (!isSlug(cfg.project)) {
+        try printStderr(io, "qube pod: project '{s}' must be a slug ([a-z0-9][a-z0-9-]*), e.g. image-tools\n", .{cfg.project});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+    if (cfg.name.len == 0 or cfg.wasm.len == 0 or cfg.wit_package.len == 0 or cfg.wit_world.len == 0) {
+        try writeStderr(io, "qube pod: name, --wasm, --wit-package and --wit-world are all required\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const path = try std.fs.path.join(gpa, &.{ dir, "qubepod.jsonc" });
+    defer gpa.free(path);
+    if (fileExists(io, path)) {
+        try printStderr(io, "qube pod: {s} already exists; refusing to overwrite\n", .{path});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+
+    const text = try buildPodManifest(gpa, cfg);
+    defer gpa.free(text);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
+
+    try printStdout(io, "Created QubePod manifest for '{s}/{s}' at {s}\n", .{ cfg.project, cfg.name, path });
+}
+
+fn cmdPod(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    const subsub = args_it.next() orelse {
+        try writeStderr(io, "usage: qube pod <new|init> [flags]\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+    if (std.mem.eql(u8, subsub, "--help") or std.mem.eql(u8, subsub, "-h")) {
+        try podHelp(io);
+        return;
+    }
+    if (std.mem.eql(u8, subsub, "new")) return scaffoldPodCmd(gpa, io, args_it, false);
+    if (std.mem.eql(u8, subsub, "init")) return scaffoldPodCmd(gpa, io, args_it, true);
+    try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
+    std.process.exit(@intFromEnum(ExitCode.usage));
+}
+
+/// Shared driver for `qube pod new` (in_place=false) and `qube pod init`.
+fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator, in_place: bool) !void {
+    var name_arg: ?[]const u8 = null;
+    var project: ?[]const u8 = null;
+    var wasm: ?[]const u8 = null;
+    var wit_package: ?[]const u8 = null;
+    var wit_world: ?[]const u8 = null;
+    var language: ?[]const u8 = null;
+    var version: ?[]const u8 = null;
+    var api_version: []const u8 = default_pod_api_version;
+    var http_route: ?[]const u8 = null;
+    var http_interface: []const u8 = default_http_interface;
+    var dir_arg: ?[]const u8 = null;
+    var any_flag = false;
+
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try podHelp(io);
+            return;
+        } else if (std.mem.eql(u8, a, "--project")) {
+            any_flag = true;
+            project = try flagValue(io, args_it, "--project");
+        } else if (std.mem.eql(u8, a, "--name")) {
+            any_flag = true;
+            name_arg = try flagValue(io, args_it, "--name");
+        } else if (std.mem.eql(u8, a, "--wasm")) {
+            any_flag = true;
+            wasm = try flagValue(io, args_it, "--wasm");
+        } else if (std.mem.eql(u8, a, "--wit-package")) {
+            any_flag = true;
+            wit_package = try flagValue(io, args_it, "--wit-package");
+        } else if (std.mem.eql(u8, a, "--wit-world")) {
+            any_flag = true;
+            wit_world = try flagValue(io, args_it, "--wit-world");
+        } else if (std.mem.eql(u8, a, "--language")) {
+            any_flag = true;
+            language = try flagValue(io, args_it, "--language");
+        } else if (std.mem.eql(u8, a, "--version")) {
+            any_flag = true;
+            version = try flagValue(io, args_it, "--version");
+        } else if (std.mem.eql(u8, a, "--api-version")) {
+            any_flag = true;
+            api_version = try flagValue(io, args_it, "--api-version");
+        } else if (std.mem.eql(u8, a, "--http-route")) {
+            any_flag = true;
+            http_route = try flagValue(io, args_it, "--http-route");
+        } else if (std.mem.eql(u8, a, "--http-interface")) {
+            any_flag = true;
+            http_interface = try flagValue(io, args_it, "--http-interface");
+        } else if (std.mem.eql(u8, a, "--dir")) {
+            any_flag = true;
+            dir_arg = try flagValue(io, args_it, "--dir");
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube pod: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (name_arg == null) {
+            name_arg = a;
+        } else {
+            try printStderr(io, "qube pod: unexpected extra arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const cwd_base = std.fs.path.basename(cwd_path);
+
+    var cfg: PodConfig = undefined;
+    var owned = false;
+    if (any_flag) {
+        cfg = .{
+            .api_version = api_version,
+            .project = project orelse {
+                try writeStderr(io, "qube pod: --project is required\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            },
+            .name = name_arg orelse (if (in_place) cwd_base else {
+                try writeStderr(io, "qube pod: a name is required (positional <name> or --name)\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            }),
+            .version = version,
+            .language = language,
+            .wasm = wasm orelse {
+                try writeStderr(io, "qube pod: --wasm is required\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            },
+            .wit_package = wit_package orelse {
+                try writeStderr(io, "qube pod: --wit-package is required\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            },
+            .wit_world = wit_world orelse {
+                try writeStderr(io, "qube pod: --wit-world is required\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            },
+            .http_route = http_route,
+            .http_interface = http_interface,
+        };
+    } else {
+        const default_name: ?[]const u8 = if (in_place) cwd_base else name_arg;
+        cfg = try podWizard(gpa, io, default_name);
+        owned = true;
+    }
+
+    const dir = if (in_place) "." else (dir_arg orelse cfg.name);
+    try scaffoldPod(gpa, io, dir, cfg);
+    if (owned) freePodConfig(gpa, cfg);
 }
