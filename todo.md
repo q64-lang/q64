@@ -177,6 +177,28 @@ and `qube run`):
        bindings in `main` (the `_start` body uses the resolver path), and no
        calls inside `emitIntExpr` (`fn g(n){ f(n)+1 }` stays `NotConstExpr`) —
        these are the next rung.
+17. [x] **Calls inside i64 functions — composition + recursion.** `emitIntExpr`
+       gained a `.call` arm: it lowers `f(args…)` to a `BinaryenCall` returning
+       i64, with each argument lowered as an i64 expression. So an i64 function
+       can call any i64 function — including itself (`fact`/`fib`/`gcd`) and
+       mutually (`is_even`/`is_odd`) — and compose helpers (`hyp_sq` →
+       `square`). A pre-emission pass (`registerCalls`/`…Block`/`…If`/`…Expr`
+       in `emitFn`, before `emitModule`) walks each i64 callee body and
+       `ensureCallee`s every call site, so transitively-reached functions are
+       registered + emitted; index-based iteration + name dedup makes it a
+       terminating fixpoint, and the captured `FnDecl` is a stable CST pointer.
+       The registered callees ride on `IntScope.callees` so the `.call` arm
+       resolves a target by name (validating it's an `int_fn` and that the arg
+       count matches `n_params`). Self/forward/mutual references resolve by
+       name at module finalization. Verified end-to-end (`link-roundtrip.sh`:
+       `fact(6)`/`fib(10)`/`gcd(48,36)`/`hyp_sq(3,4)` → `720 / 55 / 12 / 25`) +
+       emit unit tests (incl. arg-count and non-i64-callee rejections).
+       **Boundary:** a call resolves only to a function in the symbol table —
+       an imported name or a local function in the same file. Calling a
+       dependency's *non-imported* / private helper still errors
+       (`NameNotFound`); that wants the name-resolution pass. Also still no
+       `loop`/`for`/range, no `break`/`continue`, and no loops or in-body
+       bindings in `main`.
 
 **Definition of done met.** `cd examples/link-demo/hello_app && qube run`
 prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)

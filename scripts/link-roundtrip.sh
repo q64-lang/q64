@@ -396,4 +396,42 @@ if [[ "$it_out" != "$it_expected" ]]; then
 fi
 echo "    ok: while/var/let int functions -> 55 / 120 / 12 / sum_to(100)=5050"
 
+# ---------------------------------------------------------------------------
+# Recursion + composition: i64 functions calling i64 functions (ladder step
+# 17). fact/fib/gcd recurse; hyp_sq calls square (registered transitively —
+# main never calls square directly, only imports it). emitIntExpr lowers the
+# call to a BinaryenCall resolved by name at module finalization.
+echo "==> recursion: q64 emit i64 functions calling i64 functions"
+rc_lib="$tmp/rclib/src"
+mkdir -p "$rc_lib"
+cat > "$rc_lib/lib.q" <<'Q64'
+pub fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } }
+pub fn fib(n: i64) -> i64 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
+pub fn gcd(a: i64, b: i64) -> i64 { if b == 0 { a } else { gcd(b, a % b) } }
+pub fn square(n: i64) -> i64 { n * n }
+pub fn hyp_sq(a: i64, b: i64) -> i64 { square(a) + square(b) }
+Q64
+rc_app="$tmp/rc.q"
+rc_wasm="$tmp/rc.wasm"
+cat > "$rc_app" <<'Q64'
+import dev.q64.rclib.{fact, fib, gcd, square, hyp_sq}
+
+fn main {
+    env.out(fact(6))
+    env.out(fib(10))
+    env.out(gcd(48, 36))
+    env.out(hyp_sq(3, 4))
+}
+Q64
+"$Q64_BIN" emit "$rc_app" "$rc_wasm" --module "dev.q64.rclib=$rc_lib"
+rc_out="$("$HOST_BIN" "$rc_wasm")"
+rc_expected=$'720\n55\n12\n25'
+if [[ "$rc_out" != "$rc_expected" ]]; then
+    echo "FAIL: recursion output mismatch" >&2
+    printf "  expected: %q\n" "$rc_expected" >&2
+    printf "  actual:   %q\n" "$rc_out" >&2
+    exit 1
+fi
+echo "    ok: recursion + composition -> 720 / 55 / 12 / 25"
+
 echo "PASS: $qube_out"

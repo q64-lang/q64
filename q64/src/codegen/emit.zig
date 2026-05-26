@@ -479,6 +479,18 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
         else => return Error.UnsupportedStatement,
     };
 
+    // Transitively register functions called from i64 function bodies, so
+    // they are emitted and callable. Index-based + `ensureCallee` dedup means
+    // newly-appended callees are themselves scanned; the captured `FnDecl` is
+    // a stable CST pointer, unaffected by the list reallocating.
+    var ci: usize = 0;
+    while (ci < callees.items.len) : (ci += 1) {
+        switch (callees.items[ci].body) {
+            .int_fn => |cfd| try registerCalls(allocator, resolver, &data, &callees, &segments, cfd),
+            else => {},
+        }
+    }
+
     return emitModule(allocator, data.items, actions.items, callees.items, segments.items, call_args.items, n_rt);
 }
 
@@ -698,6 +710,86 @@ fn extractCallArgs(
         const off: u32 = @intCast(data.items.len);
         try data.appendSlice(allocator, v);
         try call_args.append(allocator, .{ .constant = .{ .off = off, .len = @intCast(v.len) } });
+    }
+}
+
+/// Register every function called from an i64 function body (so it is
+/// emitted and callable). Walks the body's statements/expressions for call
+/// sites and `ensureCallee`s each — recursion and forward references resolve
+/// by name at module finalization.
+fn registerCalls(
+    allocator: std.mem.Allocator,
+    resolver: *Resolver,
+    data: *std.ArrayList(u8),
+    callees: *std.ArrayList(Callee),
+    segments: *std.ArrayList(Segment),
+    fd: ast.FnDecl,
+) Error!void {
+    const body = fd.body() orelse return;
+    try registerCallsBlock(allocator, resolver, data, callees, segments, body);
+}
+
+fn registerCallsBlock(
+    allocator: std.mem.Allocator,
+    resolver: *Resolver,
+    data: *std.ArrayList(u8),
+    callees: *std.ArrayList(Callee),
+    segments: *std.ArrayList(Segment),
+    block: ast.Block,
+) Error!void {
+    var it = block.statements();
+    while (it.next()) |s| switch (s) {
+        .expr_stmt => |es| if (es.expression()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e),
+        .return_stmt => |rs| if (rs.value()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e),
+        .let_stmt => |ls| if (ls.initializer()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e),
+        .assign_stmt => |as| if (as.value()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e),
+        .if_stmt => |is| try registerCallsIf(allocator, resolver, data, callees, segments, is),
+        .while_stmt => |ws| {
+            if (ws.condition()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e);
+            if (ws.body()) |b| try registerCallsBlock(allocator, resolver, data, callees, segments, b);
+        },
+        else => {},
+    };
+}
+
+fn registerCallsIf(
+    allocator: std.mem.Allocator,
+    resolver: *Resolver,
+    data: *std.ArrayList(u8),
+    callees: *std.ArrayList(Callee),
+    segments: *std.ArrayList(Segment),
+    is: ast.IfStmt,
+) Error!void {
+    if (is.condition()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e);
+    if (is.thenBody()) |b| try registerCallsBlock(allocator, resolver, data, callees, segments, b);
+    if (is.elseIf()) |eif| {
+        try registerCallsIf(allocator, resolver, data, callees, segments, eif);
+    } else if (is.elseBody()) |b| {
+        try registerCallsBlock(allocator, resolver, data, callees, segments, b);
+    }
+}
+
+fn registerCallsExpr(
+    allocator: std.mem.Allocator,
+    resolver: *Resolver,
+    data: *std.ArrayList(u8),
+    callees: *std.ArrayList(Callee),
+    segments: *std.ArrayList(Segment),
+    expr: ast.Expr,
+) Error!void {
+    switch (expr) {
+        .call => |cc| {
+            _ = try ensureCallee(allocator, resolver, data, callees, segments, cc);
+            var ai = cc.args();
+            while (ai.next()) |arg| try registerCallsExpr(allocator, resolver, data, callees, segments, arg);
+        },
+        .bin => |b| {
+            if (b.lhs()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e);
+            if (b.rhs()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e);
+        },
+        .unary => |u| if (u.operand()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e),
+        .paren => |p| if (p.inner()) |e| try registerCallsExpr(allocator, resolver, data, callees, segments, e),
+        else => {},
     }
 }
 
@@ -1255,6 +1347,9 @@ const IntScope = struct {
     n_params: c.BinaryenIndex = 0,
     next_idx: c.BinaryenIndex = 0,
     label_ctr: u32 = 0,
+    // Registered functions, so an i64 body can call another i64 function
+    // (incl. itself). Populated transitively before emission.
+    callees: []const Callee = &.{},
     allocator: std.mem.Allocator,
 
     fn deinit(self: *IntScope) void {
@@ -1343,6 +1438,34 @@ fn emitIntExpr(
             };
             return c.BinaryenBinary(module, binop, l, r);
         },
+        .call => |cc| {
+            // A call to another i64-returning function (incl. recursion).
+            // The callee was registered before emission, so it's emitted
+            // and callable by name; arguments lower as i64 expressions.
+            const callee_expr = cc.callee() orelse return Error.NotConstExpr;
+            const cpath = switch (callee_expr) {
+                .path => |p| p,
+                else => return Error.NotConstExpr,
+            };
+            const cname = try cpath.text(allocator);
+            defer allocator.free(cname);
+            const target = blk: {
+                for (scope.callees) |cl| {
+                    if (std.mem.eql(u8, cl.name, cname)) break :blk cl;
+                }
+                return Error.NotConstExpr;
+            };
+            switch (target.body) {
+                .int_fn => {},
+                else => return Error.UnsupportedCall, // only i64 callees in i64 exprs
+            }
+            var args: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+            defer args.deinit(allocator);
+            var ai = cc.args();
+            while (ai.next()) |arg| try args.append(allocator, try emitIntExpr(module, arg, scope, i64_type, allocator));
+            if (args.items.len != target.n_params) return Error.UnsupportedCall;
+            return c.BinaryenCall(module, target.name.ptr, @ptrCast(args.items.ptr), @intCast(args.items.len), i64_type);
+        },
         else => return Error.NotConstExpr,
     }
 }
@@ -1355,11 +1478,12 @@ fn emitIntBody(
     module: c.BinaryenModuleRef,
     fd: ast.FnDecl,
     param_names: []const []const u8,
+    callees: []const Callee,
     i64_type: c.BinaryenType,
     allocator: std.mem.Allocator,
 ) Error!IntBodyResult {
     const body = fd.body() orelse return Error.NoBody;
-    var scope = IntScope{ .allocator = allocator };
+    var scope = IntScope{ .allocator = allocator, .callees = callees };
     defer scope.deinit();
     for (param_names) |pn| _ = try scope.declare(pn, false);
     scope.n_params = @intCast(param_names.len);
@@ -1927,7 +2051,7 @@ fn emitModule(
                     iptype = c.BinaryenTypeCreate(iparams.ptr, @intCast(iparams.len));
                 }
                 defer if (iparams.len > 0) allocator.free(iparams);
-                const ires = try emitIntBody(module, fd, pnames.items, i64_type, allocator);
+                const ires = try emitIntBody(module, fd, pnames.items, callees, i64_type, allocator);
                 var ivars: []c.BinaryenType = &.{};
                 if (ires.extra_locals > 0) {
                     ivars = try allocator.alloc(c.BinaryenType, ires.extra_locals);
@@ -2714,6 +2838,55 @@ test "emitFromSource: assigning to a parameter is rejected" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.ImmutableAssign,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
+}
+
+test "emitFromSource: an i64 function recurses (factorial)" {
+    const lib = "pub fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } }\n";
+    const app = "import dev.q64.m.{fact}\nfn main { env.out(fact(6)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: a recursive function with two self-calls (fib)" {
+    const lib = "pub fn fib(n: i64) -> i64 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n";
+    const app = "import dev.q64.m.{fib}\nfn main { env.out(fib(10)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: composition registers a transitively-called function" {
+    // main calls hyp_sq but never square directly; square is discovered and
+    // emitted by the transitive registration pass.
+    const lib = "pub fn square(n: i64) -> i64 { n * n }\npub fn hyp_sq(a: i64, b: i64) -> i64 { square(a) + square(b) }\n";
+    const app = "import dev.q64.m.{square, hyp_sq}\nfn main { env.out(hyp_sq(3, 4)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: a call with the wrong argument count is rejected" {
+    const lib = "pub fn add(a: i64, b: i64) -> i64 { a + b }\npub fn bad(n: i64) -> i64 { add(n) }\n";
+    const app = "import dev.q64.m.{add, bad}\nfn main { env.out(bad(1)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.UnsupportedCall,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
+}
+
+test "emitFromSource: calling a non-i64 function in an i64 expression is rejected" {
+    const lib = "pub fn greet() -> str { \"hi\" }\npub fn bad(n: i64) -> i64 { greet() + n }\n";
+    const app = "import dev.q64.m.{greet, bad}\nfn main { env.out(bad(1)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.UnsupportedCall,
         emitFromSource(testing.allocator, app, "main.q", &modules),
     );
 }
