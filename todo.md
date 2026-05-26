@@ -157,6 +157,26 @@ and `qube run`):
        branches are i64-only (no `bool`/`str` values yet); no loops; in-body
        `let` bindings inside a callee aren't supported (only the tail
        statement contributes the value).
+16. [x] **In-function `let`/`var`, `var` reassignment, and `while` loops in
+       i64 functions.** i64 callees can now express iterative algorithms.
+       `emitIntBlock` walks every statement (not just the tail): in-body
+       `let`/`var` declare wasm locals (`emitIntStmt` + a new `IntScope`
+       mapping name → local index + mutability), `assign` reassigns a `var`
+       (`emitAssignInt`: `= += -= *= /= %=`, signed; rejects `let`/params with
+       `ImmutableAssign`), and `while cond { … }` lowers to a test-first
+       `block`/`loop`/`br_if(eqz cond)` with unique labels (`emitWhileInt`,
+       mirroring `__fmt_i64`'s loop). The i64 emitters thread `*IntScope` in
+       place of the flat param-name list; `emitIntBody` returns the body plus
+       the extra-local count so the call site declares the `varTypes`. The
+       tail still yields the value (expr/`return`/`if`); a block ending in a
+       statement with no value errors (`UnsupportedCall`). Verified end-to-end
+       (`link-roundtrip.sh`: `sum_to(10)`/`fact(5)`/`poly(3)`/`sum_to(100)` →
+       `55 / 120 / 12 / sum_to(100)=5050`) + emit unit tests (incl. the two
+       immutable-assign rejections). **Boundary:** still i64-only; no `loop`/
+       `for`/range iteration, no `break`/`continue`, no loops or in-body
+       bindings in `main` (the `_start` body uses the resolver path), and no
+       calls inside `emitIntExpr` (`fn g(n){ f(n)+1 }` stays `NotConstExpr`) —
+       these are the next rung.
 
 **Definition of done met.** `cd examples/link-demo/hello_app && qube run`
 prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)

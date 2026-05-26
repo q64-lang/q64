@@ -47,6 +47,8 @@ pub const Error = error{
     UnsupportedImport, // import form codegen can't resolve yet (relative, stdlib)
     UnsupportedInterpolation, // `{expr}` whose value isn't a compile-time constant
     NotConstExpr, // an expression codegen cannot evaluate at compile time
+    ImmutableAssign, // assignment to a `let` binding or a parameter
+    UndeclaredName, // assignment target names no in-scope binding
     OutOfMemory,
 };
 
@@ -1236,13 +1238,68 @@ fn buildIntArgs(
     return argvals;
 }
 
+/// A single local slot in an i64 function body: a parameter or an in-body
+/// `let`/`var`. `idx` is the wasm local index — parameters occupy `0..
+/// n_params`, in-body bindings get appended after.
+const IntLocal = struct {
+    name: []const u8, // borrowed from the CST token; outlives codegen
+    idx: c.BinaryenIndex,
+    mutable: bool, // `var` → true; `let` and parameters → false
+};
+
+/// Name → local resolution for an i64 function body, plus the running
+/// local-index and loop-label counters. Threaded by pointer because
+/// declaring a binding appends to it.
+const IntScope = struct {
+    locals: std.ArrayList(IntLocal) = .empty,
+    n_params: c.BinaryenIndex = 0,
+    next_idx: c.BinaryenIndex = 0,
+    label_ctr: u32 = 0,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *IntScope) void {
+        self.locals.deinit(self.allocator);
+    }
+
+    /// Last-declared wins, so an inner binding shadows an earlier one.
+    fn find(self: *const IntScope, name: []const u8) ?IntLocal {
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.locals.items[i].name, name)) return self.locals.items[i];
+        }
+        return null;
+    }
+
+    fn declare(self: *IntScope, name: []const u8, mutable: bool) !c.BinaryenIndex {
+        const idx = self.next_idx;
+        try self.locals.append(self.allocator, .{ .name = name, .idx = idx, .mutable = mutable });
+        self.next_idx += 1;
+        return idx;
+    }
+
+    /// Locals beyond the parameters — the count to declare as `varTypes`.
+    fn extraLocals(self: *const IntScope) usize {
+        return self.next_idx - self.n_params;
+    }
+};
+
+/// Lowered i64 function body: the body expression plus the count of i64
+/// locals declared beyond the parameters, so the caller can attach them to
+/// the wasm function.
+const IntBodyResult = struct {
+    body: c.BinaryenExpressionRef,
+    extra_locals: usize,
+};
+
 /// Lower an integer-valued expression to a wasm `i64`. A path resolving to
-/// a parameter becomes `local.get`; literals, `+ - * / % & | ^ << >>`,
-/// unary `-`/`~`, and parentheses lower to the matching i64 ops.
+/// a parameter or an in-body binding becomes `local.get`; literals, `+ - *
+/// / % & | ^ << >>`, unary `-`/`~`, and parentheses lower to the matching
+/// i64 ops.
 fn emitIntExpr(
     module: c.BinaryenModuleRef,
     expr: ast.Expr,
-    param_names: []const []const u8,
+    scope: *IntScope,
     i64_type: c.BinaryenType,
     allocator: std.mem.Allocator,
 ) Error!c.BinaryenExpressionRef {
@@ -1251,15 +1308,15 @@ fn emitIntExpr(
             const v = try parseIntLit(n.rawText() orelse return Error.NotConstExpr);
             return c.BinaryenConst(module, c.BinaryenLiteralInt64(v));
         },
-        .paren => |p| return emitIntExpr(module, p.inner() orelse return Error.NotConstExpr, param_names, i64_type, allocator),
+        .paren => |p| return emitIntExpr(module, p.inner() orelse return Error.NotConstExpr, scope, i64_type, allocator),
         .path => |p| {
             const txt = try p.text(allocator);
             defer allocator.free(txt);
-            const idx = indexOfName(param_names, txt) orelse return Error.NotConstExpr;
-            return c.BinaryenLocalGet(module, @intCast(idx), i64_type);
+            const loc = scope.find(txt) orelse return Error.NotConstExpr;
+            return c.BinaryenLocalGet(module, loc.idx, i64_type);
         },
         .unary => |u| {
-            const x = try emitIntExpr(module, u.operand() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            const x = try emitIntExpr(module, u.operand() orelse return Error.NotConstExpr, scope, i64_type, allocator);
             const op = u.op() orelse return Error.NotConstExpr;
             return switch (op.kind) {
                 .MINUS => c.BinaryenBinary(module, c.BinaryenSubInt64(), c.BinaryenConst(module, c.BinaryenLiteralInt64(0)), x),
@@ -1268,8 +1325,8 @@ fn emitIntExpr(
             };
         },
         .bin => |b| {
-            const l = try emitIntExpr(module, b.lhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
-            const r = try emitIntExpr(module, b.rhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            const l = try emitIntExpr(module, b.lhs() orelse return Error.NotConstExpr, scope, i64_type, allocator);
+            const r = try emitIntExpr(module, b.rhs() orelse return Error.NotConstExpr, scope, i64_type, allocator);
             const op = b.op() orelse return Error.NotConstExpr;
             const binop: c.BinaryenOp = switch (op.kind) {
                 .PLUS => c.BinaryenAddInt64(),
@@ -1290,39 +1347,179 @@ fn emitIntExpr(
     }
 }
 
-/// Lower an i64-returning function body to a single i64-valued expression.
-/// The body's tail statement provides the value: a plain expression /
-/// `return`, or an `if`/`else` chain whose branches each yield an i64.
+/// Lower an i64-returning function body. Parameters are pre-declared at
+/// locals `0..n_params`; in-body `let`/`var` bindings and loop state get
+/// appended. Returns the body expression and the count of extra locals to
+/// declare on the wasm function.
 fn emitIntBody(
     module: c.BinaryenModuleRef,
     fd: ast.FnDecl,
     param_names: []const []const u8,
     i64_type: c.BinaryenType,
     allocator: std.mem.Allocator,
-) Error!c.BinaryenExpressionRef {
+) Error!IntBodyResult {
     const body = fd.body() orelse return Error.NoBody;
-    return emitIntBlock(module, body, param_names, i64_type, allocator);
+    var scope = IntScope{ .allocator = allocator };
+    defer scope.deinit();
+    for (param_names) |pn| _ = try scope.declare(pn, false);
+    scope.n_params = @intCast(param_names.len);
+    const expr = try emitIntBlock(module, body, &scope, i64_type, allocator, true);
+    return .{ .body = expr, .extra_locals = scope.extraLocals() };
 }
 
-/// The i64 value of a block is its last statement's value: an expression,
-/// a `return`, or a nested `if`/`else`. v0 has no in-body bindings, so
-/// earlier statements don't contribute.
+/// Lower a block. With `want_value`, the block yields an i64 — its last
+/// statement is the tail value (an expression, `return`, or `if`/`else`)
+/// and earlier statements are setup. Without it, the block is a `none`-
+/// typed statement sequence (a loop body). Non-tail `let`/`var`, `assign`,
+/// and `while` lower to setup; `local.set` and loops are `none`-typed, so a
+/// value block needs no `drop` — only its last child is the i64 value.
 fn emitIntBlock(
     module: c.BinaryenModuleRef,
     block: ast.Block,
-    param_names: []const []const u8,
+    scope: *IntScope,
     i64_type: c.BinaryenType,
     allocator: std.mem.Allocator,
+    want_value: bool,
 ) Error!c.BinaryenExpressionRef {
-    var stmts = block.statements();
-    var last: ?ast.Stmt = null;
-    while (stmts.next()) |s| last = s;
-    return switch (last orelse return Error.UnsupportedCall) {
-        .expr_stmt => |es| emitIntExpr(module, es.expression() orelse return Error.UnsupportedCall, param_names, i64_type, allocator),
-        .return_stmt => |rs| emitIntExpr(module, rs.value() orelse return Error.UnsupportedCall, param_names, i64_type, allocator),
-        .if_stmt => |is| emitIfInt(module, is, param_names, i64_type, allocator),
-        else => Error.UnsupportedCall,
+    const none = c.BinaryenTypeNone();
+
+    var stmts_list: std.ArrayList(ast.Stmt) = .empty;
+    defer stmts_list.deinit(allocator);
+    var it = block.statements();
+    while (it.next()) |s| try stmts_list.append(allocator, s);
+
+    var items: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer items.deinit(allocator);
+
+    const n = stmts_list.items.len;
+    const tail_at: ?usize = if (want_value and n > 0) n - 1 else null;
+
+    for (stmts_list.items, 0..) |s, i| {
+        if (tail_at != null and i == tail_at.?) continue;
+        try emitIntStmt(module, s, scope, i64_type, allocator, &items);
+    }
+
+    if (!want_value) {
+        return c.BinaryenBlock(module, null, @ptrCast(items.items.ptr), @intCast(items.items.len), none);
+    }
+
+    // A value block's tail must produce an i64; a block ending in a
+    // `while`/`assign`/`let` (or an empty body) has no value.
+    const tail = if (tail_at) |t| stmts_list.items[t] else return Error.UnsupportedCall;
+    const tail_val: c.BinaryenExpressionRef = switch (tail) {
+        .expr_stmt => |es| try emitIntExpr(module, es.expression() orelse return Error.UnsupportedCall, scope, i64_type, allocator),
+        .return_stmt => |rs| try emitIntExpr(module, rs.value() orelse return Error.UnsupportedCall, scope, i64_type, allocator),
+        .if_stmt => |is| try emitIfInt(module, is, scope, i64_type, allocator),
+        else => return Error.UnsupportedCall,
     };
+
+    if (items.items.len == 0) return tail_val;
+    try items.append(allocator, tail_val);
+    return c.BinaryenBlock(module, null, @ptrCast(items.items.ptr), @intCast(items.items.len), i64_type);
+}
+
+/// Lower a setup (non-tail) statement of an i64 body into `items`: an
+/// in-body `let`/`var` declares a local and sets it; `assign` reassigns a
+/// `var`; `while` lowers a loop. Anything else has no consumer in an i64
+/// body yet.
+fn emitIntStmt(
+    module: c.BinaryenModuleRef,
+    s: ast.Stmt,
+    scope: *IntScope,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(c.BinaryenExpressionRef),
+) Error!void {
+    switch (s) {
+        .let_stmt => |ls| {
+            const init_expr = ls.initializer() orelse return Error.UnsupportedStatement;
+            const name_tok = (ls.pattern() orelse return Error.UnsupportedStatement).bindingName() orelse return Error.UnsupportedStatement;
+            // Lower the initializer before declaring, so its names resolve
+            // against the outer scope (and the binding can't see itself).
+            const val = try emitIntExpr(module, init_expr, scope, i64_type, allocator);
+            const idx = try scope.declare(name_tok.text, ls.isVar());
+            try items.append(allocator, c.BinaryenLocalSet(module, idx, val));
+        },
+        .assign_stmt => |as| try emitAssignInt(module, as, scope, i64_type, allocator, items),
+        .while_stmt => |ws| try emitWhileInt(module, ws, scope, i64_type, allocator, items),
+        else => return Error.UnsupportedStatement,
+    }
+}
+
+/// Lower `target OP value` to a `local.set`. `=` sets directly; the
+/// compound forms read-modify-write. The target must be a `var` local;
+/// `let` bindings and parameters are immutable.
+fn emitAssignInt(
+    module: c.BinaryenModuleRef,
+    as: ast.AssignStmt,
+    scope: *IntScope,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(c.BinaryenExpressionRef),
+) Error!void {
+    const tgt = as.target() orelse return Error.UnsupportedStatement;
+    const name = switch (tgt) {
+        .path => |p| try p.text(allocator),
+        else => return Error.UnsupportedStatement, // only simple l-values in v0
+    };
+    defer allocator.free(name);
+
+    const loc = scope.find(name) orelse return Error.UndeclaredName;
+    if (!loc.mutable) return Error.ImmutableAssign;
+
+    const rhs = try emitIntExpr(module, as.value() orelse return Error.UnsupportedStatement, scope, i64_type, allocator);
+    const op = as.op() orelse return Error.UnsupportedStatement;
+    const new_val: c.BinaryenExpressionRef = switch (op.kind) {
+        .EQ => rhs,
+        .PLUS_EQ => c.BinaryenBinary(module, c.BinaryenAddInt64(), c.BinaryenLocalGet(module, loc.idx, i64_type), rhs),
+        .MINUS_EQ => c.BinaryenBinary(module, c.BinaryenSubInt64(), c.BinaryenLocalGet(module, loc.idx, i64_type), rhs),
+        .STAR_EQ => c.BinaryenBinary(module, c.BinaryenMulInt64(), c.BinaryenLocalGet(module, loc.idx, i64_type), rhs),
+        .SLASH_EQ => c.BinaryenBinary(module, c.BinaryenDivSInt64(), c.BinaryenLocalGet(module, loc.idx, i64_type), rhs),
+        .PERCENT_EQ => c.BinaryenBinary(module, c.BinaryenRemSInt64(), c.BinaryenLocalGet(module, loc.idx, i64_type), rhs),
+        else => return Error.UnsupportedStatement,
+    };
+    try items.append(allocator, c.BinaryenLocalSet(module, loc.idx, new_val));
+}
+
+/// Lower `while cond { body }` to a test-first wasm loop:
+///
+///     block $b { loop $l { br_if $b (eqz cond); <body>; br $l } }
+///
+/// The exit-if-false break sits at the loop top so a zero-trip `while`
+/// works; the body runs as a `none`-typed sequence and branches back. Each
+/// loop gets unique labels from the scope counter (loops may nest).
+fn emitWhileInt(
+    module: c.BinaryenModuleRef,
+    ws: ast.WhileStmt,
+    scope: *IntScope,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(c.BinaryenExpressionRef),
+) Error!void {
+    const none = c.BinaryenTypeNone();
+
+    var blk_buf: [16]u8 = undefined;
+    var loop_buf: [16]u8 = undefined;
+    const blk_lbl = std.fmt.bufPrintZ(&blk_buf, "Lb{d}", .{scope.label_ctr}) catch unreachable;
+    const loop_lbl = std.fmt.bufPrintZ(&loop_buf, "Lc{d}", .{scope.label_ctr}) catch unreachable;
+    scope.label_ctr += 1;
+
+    const cond_expr = ws.condition() orelse return Error.UnsupportedStatement;
+    const cond = try emitCond(module, cond_expr, scope, i64_type, allocator);
+    const not_cond = c.BinaryenUnary(module, c.BinaryenEqZInt32(), cond);
+
+    var loop_items: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer loop_items.deinit(allocator);
+    try loop_items.append(allocator, c.BinaryenBreak(module, blk_lbl.ptr, not_cond, null));
+    const body_block = try emitIntBlock(module, ws.body() orelse return Error.UnsupportedStatement, scope, i64_type, allocator, false);
+    try loop_items.append(allocator, body_block);
+    try loop_items.append(allocator, c.BinaryenBreak(module, loop_lbl.ptr, null, null));
+
+    const loop_block = c.BinaryenBlock(module, null, @ptrCast(loop_items.items.ptr), @intCast(loop_items.items.len), none);
+    const loop = c.BinaryenLoop(module, loop_lbl.ptr, loop_block);
+    var outer = [_]c.BinaryenExpressionRef{loop};
+    const wrapped = c.BinaryenBlock(module, blk_lbl.ptr, @ptrCast(&outer), outer.len, none);
+    try items.append(allocator, wrapped);
 }
 
 /// Lower an `if`/`else` chain to a `BinaryenIf` yielding an i64. Every path
@@ -1331,17 +1528,17 @@ fn emitIntBlock(
 fn emitIfInt(
     module: c.BinaryenModuleRef,
     ifs: ast.IfStmt,
-    param_names: []const []const u8,
+    scope: *IntScope,
     i64_type: c.BinaryenType,
     allocator: std.mem.Allocator,
 ) Error!c.BinaryenExpressionRef {
     const cond_expr = ifs.condition() orelse return Error.UnsupportedCall;
-    const cond = try emitCond(module, cond_expr, param_names, i64_type, allocator);
-    const then_val = try emitIntBlock(module, ifs.thenBody() orelse return Error.UnsupportedCall, param_names, i64_type, allocator);
+    const cond = try emitCond(module, cond_expr, scope, i64_type, allocator);
+    const then_val = try emitIntBlock(module, ifs.thenBody() orelse return Error.UnsupportedCall, scope, i64_type, allocator, true);
     const else_val = if (ifs.elseIf()) |eif|
-        try emitIfInt(module, eif, param_names, i64_type, allocator)
+        try emitIfInt(module, eif, scope, i64_type, allocator)
     else if (ifs.elseBody()) |eb|
-        try emitIntBlock(module, eb, param_names, i64_type, allocator)
+        try emitIntBlock(module, eb, scope, i64_type, allocator, true)
     else
         return Error.UnsupportedCall;
     return c.BinaryenIf(module, cond, then_val, else_val);
@@ -1353,12 +1550,12 @@ fn emitIfInt(
 fn emitCond(
     module: c.BinaryenModuleRef,
     expr: ast.Expr,
-    param_names: []const []const u8,
+    scope: *IntScope,
     i64_type: c.BinaryenType,
     allocator: std.mem.Allocator,
 ) Error!c.BinaryenExpressionRef {
     switch (expr) {
-        .paren => |p| return emitCond(module, p.inner() orelse return Error.NotConstExpr, param_names, i64_type, allocator),
+        .paren => |p| return emitCond(module, p.inner() orelse return Error.NotConstExpr, scope, i64_type, allocator),
         .bin => |b| {
             const op = b.op() orelse return Error.NotConstExpr;
             const cmp: c.BinaryenOp = switch (op.kind) {
@@ -1368,24 +1565,24 @@ fn emitCond(
                 .R_ANGLE => c.BinaryenGtSInt64(),
                 .LT_EQ => c.BinaryenLeSInt64(),
                 .GT_EQ => c.BinaryenGeSInt64(),
-                else => return emitTruthy(module, expr, param_names, i64_type, allocator),
+                else => return emitTruthy(module, expr, scope, i64_type, allocator),
             };
-            const l = try emitIntExpr(module, b.lhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
-            const r = try emitIntExpr(module, b.rhs() orelse return Error.NotConstExpr, param_names, i64_type, allocator);
+            const l = try emitIntExpr(module, b.lhs() orelse return Error.NotConstExpr, scope, i64_type, allocator);
+            const r = try emitIntExpr(module, b.rhs() orelse return Error.NotConstExpr, scope, i64_type, allocator);
             return c.BinaryenBinary(module, cmp, l, r);
         },
-        else => return emitTruthy(module, expr, param_names, i64_type, allocator),
+        else => return emitTruthy(module, expr, scope, i64_type, allocator),
     }
 }
 
 fn emitTruthy(
     module: c.BinaryenModuleRef,
     expr: ast.Expr,
-    param_names: []const []const u8,
+    scope: *IntScope,
     i64_type: c.BinaryenType,
     allocator: std.mem.Allocator,
 ) Error!c.BinaryenExpressionRef {
-    const v = try emitIntExpr(module, expr, param_names, i64_type, allocator);
+    const v = try emitIntExpr(module, expr, scope, i64_type, allocator);
     return c.BinaryenBinary(module, c.BinaryenNeInt64(), v, c.BinaryenConst(module, c.BinaryenLiteralInt64(0)));
 }
 
@@ -1730,8 +1927,22 @@ fn emitModule(
                     iptype = c.BinaryenTypeCreate(iparams.ptr, @intCast(iparams.len));
                 }
                 defer if (iparams.len > 0) allocator.free(iparams);
-                const ibody = try emitIntBody(module, fd, pnames.items, i64_type, allocator);
-                _ = c.BinaryenAddFunction(module, callee.name.ptr, iptype, i64_type, null, 0, ibody);
+                const ires = try emitIntBody(module, fd, pnames.items, i64_type, allocator);
+                var ivars: []c.BinaryenType = &.{};
+                if (ires.extra_locals > 0) {
+                    ivars = try allocator.alloc(c.BinaryenType, ires.extra_locals);
+                    for (ivars) |*x| x.* = i64_type;
+                }
+                defer if (ivars.len > 0) allocator.free(ivars);
+                _ = c.BinaryenAddFunction(
+                    module,
+                    callee.name.ptr,
+                    iptype,
+                    i64_type,
+                    if (ivars.len > 0) @ptrCast(ivars.ptr) else null,
+                    @intCast(ivars.len),
+                    ires.body,
+                );
                 continue;
             },
             else => {},
@@ -2446,5 +2657,63 @@ test "emitFromSource: a relative import is unsupported in v0" {
     try testing.expectError(
         Error.UnsupportedImport,
         emitFromSource(testing.allocator, app, "main.q", &.{}),
+    );
+}
+
+test "emitFromSource: a while loop sums with var accumulators" {
+    // `var s`/`var i`, a while guarded by a comparison, reassignment each
+    // iteration. The result (55) is computed at runtime, not folded.
+    const lib = "pub fn sum_to(n: i64) -> i64 { var s = 0; var i = 1; while i <= n { s = s + i; i = i + 1 } s }\n";
+    const app = "import dev.q64.m.{sum_to}\nfn main { env.out(sum_to(10)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: a while loop multiplies (factorial)" {
+    const lib = "pub fn fact(n: i64) -> i64 { var r = 1; var i = 2; while i <= n { r = r * i; i = i + 1 } r }\n";
+    const app = "import dev.q64.m.{fact}\nfn main { env.out(fact(5)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: in-body let bindings feed the tail value" {
+    const lib = "pub fn poly(n: i64) -> i64 { let a = n + 1; let b = a * 2; a + b }\n";
+    const app = "import dev.q64.m.{poly}\nfn main { env.out(poly(3)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: compound assignment to a var" {
+    const lib = "pub fn acc(n: i64) -> i64 { var s = 0; var i = 0; while i < n { s += i; i += 1 } s }\n";
+    const app = "import dev.q64.m.{acc}\nfn main { env.out(acc(4)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: assigning to a let binding is rejected" {
+    const lib = "pub fn f(n: i64) -> i64 { let a = n; a = a + 1; a }\n";
+    const app = "import dev.q64.m.{f}\nfn main { env.out(f(1)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.ImmutableAssign,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
+}
+
+test "emitFromSource: assigning to a parameter is rejected" {
+    const lib = "pub fn f(n: i64) -> i64 { n = n + 1; n }\n";
+    const app = "import dev.q64.m.{f}\nfn main { env.out(f(1)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.ImmutableAssign,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
     );
 }

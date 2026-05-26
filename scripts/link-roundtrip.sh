@@ -359,4 +359,41 @@ if [[ "$cf_out" != "$cf_expected" ]]; then
 fi
 echo "    ok: if/else int functions -> 9 / -1 / 13 / max=10, clamped=7"
 
+# ---------------------------------------------------------------------------
+# Iteration: i64 functions with in-body let/var bindings + var reassignment +
+# while loops (ladder step 16). sum_to/fact compute iteratively at runtime;
+# poly chains immutable lets into the tail value. The result of a loop also
+# feeds an int binding + interpolation in main.
+echo "==> iteration: q64 emit while loops + var + in-body let"
+it_lib="$tmp/itlib/src"
+mkdir -p "$it_lib"
+cat > "$it_lib/lib.q" <<'Q64'
+pub fn sum_to(n: i64) -> i64 { var s = 0; var i = 1; while i <= n { s = s + i; i = i + 1 } s }
+pub fn fact(n: i64) -> i64 { var r = 1; var i = 2; while i <= n { r = r * i; i = i + 1 } r }
+pub fn poly(n: i64) -> i64 { let a = n + 1; let b = a * 2; a + b }
+Q64
+it_app="$tmp/it.q"
+it_wasm="$tmp/it.wasm"
+cat > "$it_app" <<'Q64'
+import dev.q64.itlib.{sum_to, fact, poly}
+
+fn main {
+    env.out(sum_to(10))
+    env.out(fact(5))
+    env.out(poly(3))
+    let s = sum_to(100)
+    env.out("sum_to(100)={s}")
+}
+Q64
+"$Q64_BIN" emit "$it_app" "$it_wasm" --module "dev.q64.itlib=$it_lib"
+it_out="$("$HOST_BIN" "$it_wasm")"
+it_expected=$'55\n120\n12\nsum_to(100)=5050'
+if [[ "$it_out" != "$it_expected" ]]; then
+    echo "FAIL: iteration output mismatch" >&2
+    printf "  expected: %q\n" "$it_expected" >&2
+    printf "  actual:   %q\n" "$it_out" >&2
+    exit 1
+fi
+echo "    ok: while/var/let int functions -> 55 / 120 / 12 / sum_to(100)=5050"
+
 echo "PASS: $qube_out"
