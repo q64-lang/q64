@@ -199,6 +199,25 @@ and `qube run`):
        (`NameNotFound`); that wants the name-resolution pass. Also still no
        `loop`/`for`/range, no `break`/`continue`, and no loops or in-body
        bindings in `main`.
+18. [x] **`break` / `continue` / early `return` / `loop` in i64 functions.**
+       The i64 body emitters now lower the full control-flow set, so loops can
+       exit early and iterate with skips. `IntScope` gained a loop-label stack
+       (`loops` + `topLoop`); `emitWhileInt`/`emitLoopInt` push the (exit,
+       re-enter) labels around the body. `emitIntStmt` gained arms for
+       `break`→`br $exit`, `continue`→`br $reenter`, early `return`→
+       `BinaryenReturn`, a statement-position `if` (`emitVoidIf`, `none`-typed,
+       branches may break/continue/return), and `loop { … }` (`emitLoopInt`:
+       `block $b { loop $l { <body>; br $l } }`). A `loop` as a function's
+       value tail diverges — `emitIntBlock` emits it then an `unreachable` so
+       the block still types i64 (it must exit via `return`). `break`/
+       `continue` outside any loop error (`BreakOutsideLoop`); value-carrying
+       `break x` is rejected for v0. Verified end-to-end (`link-roundtrip.sh`:
+       `first_factor(15)`/`first_factor(49)`/`is_prime(13)`/`is_prime(9)`/
+       `sum_odd(10)`/`count_to_sum(10)` → `3 / 7 / 1 / 0 / 25 /
+       count_to_sum(10)=4`) + emit unit tests (incl. break/continue-outside-
+       loop rejections). **Boundary:** still i64-only; no `for`/range iteration
+       (range expressions don't parse yet — `0..n`), no value-`break`, and no
+       loops or in-body control flow in `main` (the `_start` resolver path).
 
 **Definition of done met.** `cd examples/link-demo/hello_app && qube run`
 prints `0.1.0` by linking `dev.q64.hello_world` (a local-path dependency)

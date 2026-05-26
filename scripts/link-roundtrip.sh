@@ -434,4 +434,44 @@ if [[ "$rc_out" != "$rc_expected" ]]; then
 fi
 echo "    ok: recursion + composition -> 720 / 55 / 12 / 25"
 
+# ---------------------------------------------------------------------------
+# Control flow: break / continue / early return / loop (ladder step 18).
+# first_factor uses `loop` + early `return`; count_to_sum uses `while` + a
+# guarded `break`; sum_odd uses `continue` to skip; is_prime combines an
+# early-return guard with an inner-loop `return`. All compute at runtime.
+echo "==> control flow: q64 emit break / continue / return / loop"
+flow_lib="$tmp/flowlib/src"
+mkdir -p "$flow_lib"
+cat > "$flow_lib/lib.q" <<'Q64'
+pub fn first_factor(n: i64) -> i64 { var i = 2; loop { if n % i == 0 { return i } i = i + 1 } }
+pub fn count_to_sum(limit: i64) -> i64 { var s = 0; var i = 0; while i < 1000 { i = i + 1; s = s + i; if s >= limit { break } } i }
+pub fn sum_odd(n: i64) -> i64 { var s = 0; var i = 0; while i < n { i = i + 1; if i % 2 == 0 { continue } s = s + i } s }
+pub fn is_prime(n: i64) -> i64 { if n < 2 { return 0 } var i = 2; while i * i <= n { if n % i == 0 { return 0 } i = i + 1 } 1 }
+Q64
+flow_app="$tmp/flow.q"
+flow_wasm="$tmp/flow.wasm"
+cat > "$flow_app" <<'Q64'
+import dev.q64.flowlib.{first_factor, count_to_sum, sum_odd, is_prime}
+
+fn main {
+    env.out(first_factor(15))
+    env.out(first_factor(49))
+    env.out(is_prime(13))
+    env.out(is_prime(9))
+    env.out(sum_odd(10))
+    let c = count_to_sum(10)
+    env.out("count_to_sum(10)={c}")
+}
+Q64
+"$Q64_BIN" emit "$flow_app" "$flow_wasm" --module "dev.q64.flowlib=$flow_lib"
+flow_out="$("$HOST_BIN" "$flow_wasm")"
+flow_expected=$'3\n7\n1\n0\n25\ncount_to_sum(10)=4'
+if [[ "$flow_out" != "$flow_expected" ]]; then
+    echo "FAIL: control-flow output mismatch" >&2
+    printf "  expected: %q\n" "$flow_expected" >&2
+    printf "  actual:   %q\n" "$flow_out" >&2
+    exit 1
+fi
+echo "    ok: break/continue/return/loop -> 3 / 7 / 1 / 0 / 25 / count_to_sum(10)=4"
+
 echo "PASS: $qube_out"

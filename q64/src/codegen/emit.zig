@@ -49,6 +49,7 @@ pub const Error = error{
     NotConstExpr, // an expression codegen cannot evaluate at compile time
     ImmutableAssign, // assignment to a `let` binding or a parameter
     UndeclaredName, // assignment target names no in-scope binding
+    BreakOutsideLoop, // `break`/`continue` with no enclosing loop
     OutOfMemory,
 };
 
@@ -1339,6 +1340,11 @@ const IntLocal = struct {
     mutable: bool, // `var` → true; `let` and parameters → false
 };
 
+/// The wasm labels for one enclosing loop: `brk` exits it (the outer
+/// `block`), `cont` re-enters it (the `loop`). `break`/`continue` target
+/// the innermost — the top of `IntScope.loops`.
+const LoopLabels = struct { brk: [:0]const u8, cont: [:0]const u8 };
+
 /// Name → local resolution for an i64 function body, plus the running
 /// local-index and loop-label counters. Threaded by pointer because
 /// declaring a binding appends to it.
@@ -1347,6 +1353,10 @@ const IntScope = struct {
     n_params: c.BinaryenIndex = 0,
     next_idx: c.BinaryenIndex = 0,
     label_ctr: u32 = 0,
+    // Stack of enclosing loops; `break`/`continue` read the top. The label
+    // strings point into the emitting frame's stack buffers, which outlive
+    // body emission (Binaryen interns the names into the module).
+    loops: std.ArrayList(LoopLabels) = .empty,
     // Registered functions, so an i64 body can call another i64 function
     // (incl. itself). Populated transitively before emission.
     callees: []const Callee = &.{},
@@ -1354,6 +1364,13 @@ const IntScope = struct {
 
     fn deinit(self: *IntScope) void {
         self.locals.deinit(self.allocator);
+        self.loops.deinit(self.allocator);
+    }
+
+    /// The innermost enclosing loop, or null outside any loop.
+    fn topLoop(self: *const IntScope) ?LoopLabels {
+        if (self.loops.items.len == 0) return null;
+        return self.loops.items[self.loops.items.len - 1];
     }
 
     /// Last-declared wins, so an inner binding shadows an earlier one.
@@ -1530,6 +1547,16 @@ fn emitIntBlock(
     // A value block's tail must produce an i64; a block ending in a
     // `while`/`assign`/`let` (or an empty body) has no value.
     const tail = if (tail_at) |t| stmts_list.items[t] else return Error.UnsupportedCall;
+
+    // A `loop` tail diverges — it never falls through, exiting only via an
+    // inner `return`. Emit it as a statement and mark the fall-through path
+    // unreachable so the block still types as i64.
+    if (tail == .loop_stmt) {
+        try emitLoopInt(module, tail.loop_stmt, scope, i64_type, allocator, &items);
+        try items.append(allocator, c.BinaryenUnreachable(module));
+        return c.BinaryenBlock(module, null, @ptrCast(items.items.ptr), @intCast(items.items.len), i64_type);
+    }
+
     const tail_val: c.BinaryenExpressionRef = switch (tail) {
         .expr_stmt => |es| try emitIntExpr(module, es.expression() orelse return Error.UnsupportedCall, scope, i64_type, allocator),
         .return_stmt => |rs| try emitIntExpr(module, rs.value() orelse return Error.UnsupportedCall, scope, i64_type, allocator),
@@ -1544,8 +1571,9 @@ fn emitIntBlock(
 
 /// Lower a setup (non-tail) statement of an i64 body into `items`: an
 /// in-body `let`/`var` declares a local and sets it; `assign` reassigns a
-/// `var`; `while` lowers a loop. Anything else has no consumer in an i64
-/// body yet.
+/// `var`; `while`/`loop` lower loops; an `if` lowers as control flow;
+/// `return` exits early; `break`/`continue` target the innermost loop.
+/// Anything else has no consumer in an i64 body yet.
 fn emitIntStmt(
     module: c.BinaryenModuleRef,
     s: ast.Stmt,
@@ -1566,6 +1594,26 @@ fn emitIntStmt(
         },
         .assign_stmt => |as| try emitAssignInt(module, as, scope, i64_type, allocator, items),
         .while_stmt => |ws| try emitWhileInt(module, ws, scope, i64_type, allocator, items),
+        .loop_stmt => |lp| try emitLoopInt(module, lp, scope, i64_type, allocator, items),
+        // An `if` in statement position is control flow, not a value: its
+        // branches are `none`-typed and may break/continue/return/assign.
+        .if_stmt => |is| try items.append(allocator, try emitVoidIf(module, is, scope, i64_type, allocator)),
+        // Early `return` from anywhere in the body (typically inside a loop
+        // or branch). The tail `return` is handled in emitIntBlock instead.
+        .return_stmt => |rs| {
+            const val = try emitIntExpr(module, rs.value() orelse return Error.UnsupportedStatement, scope, i64_type, allocator);
+            try items.append(allocator, c.BinaryenReturn(module, val));
+        },
+        .break_stmt => |bs| {
+            // Value-carrying `break` (`break x`) isn't supported in v0.
+            if (bs.value() != null) return Error.UnsupportedStatement;
+            const lbl = scope.topLoop() orelse return Error.BreakOutsideLoop;
+            try items.append(allocator, c.BinaryenBreak(module, lbl.brk.ptr, null, null));
+        },
+        .continue_stmt => {
+            const lbl = scope.topLoop() orelse return Error.BreakOutsideLoop;
+            try items.append(allocator, c.BinaryenBreak(module, lbl.cont.ptr, null, null));
+        },
         else => return Error.UnsupportedStatement,
     }
 }
@@ -1629,13 +1677,17 @@ fn emitWhileInt(
     scope.label_ctr += 1;
 
     const cond_expr = ws.condition() orelse return Error.UnsupportedStatement;
+    const body = ws.body() orelse return Error.UnsupportedStatement;
     const cond = try emitCond(module, cond_expr, scope, i64_type, allocator);
     const not_cond = c.BinaryenUnary(module, c.BinaryenEqZInt32(), cond);
 
     var loop_items: std.ArrayList(c.BinaryenExpressionRef) = .empty;
     defer loop_items.deinit(allocator);
     try loop_items.append(allocator, c.BinaryenBreak(module, blk_lbl.ptr, not_cond, null));
-    const body_block = try emitIntBlock(module, ws.body() orelse return Error.UnsupportedStatement, scope, i64_type, allocator, false);
+    // `continue` re-enters the loop ($loop_lbl), which re-tests the guard.
+    try scope.loops.append(allocator, .{ .brk = blk_lbl, .cont = loop_lbl });
+    const body_block = try emitIntBlock(module, body, scope, i64_type, allocator, false);
+    _ = scope.loops.pop();
     try loop_items.append(allocator, body_block);
     try loop_items.append(allocator, c.BinaryenBreak(module, loop_lbl.ptr, null, null));
 
@@ -1644,6 +1696,68 @@ fn emitWhileInt(
     var outer = [_]c.BinaryenExpressionRef{loop};
     const wrapped = c.BinaryenBlock(module, blk_lbl.ptr, @ptrCast(&outer), outer.len, none);
     try items.append(allocator, wrapped);
+}
+
+/// Lower `loop { body }` to an exit-block-wrapped infinite loop:
+///
+///     block $b { loop $l { <body>; br $l } }
+///
+/// `break` targets $b, `continue` targets $l. The loop has no fall-through
+/// exit — it terminates only via `break` or `return`. As a function's value
+/// tail it must `return`; emitIntBlock appends an `unreachable` after it.
+fn emitLoopInt(
+    module: c.BinaryenModuleRef,
+    lp: ast.LoopStmt,
+    scope: *IntScope,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(c.BinaryenExpressionRef),
+) Error!void {
+    const none = c.BinaryenTypeNone();
+
+    var blk_buf: [16]u8 = undefined;
+    var loop_buf: [16]u8 = undefined;
+    const blk_lbl = std.fmt.bufPrintZ(&blk_buf, "Lb{d}", .{scope.label_ctr}) catch unreachable;
+    const loop_lbl = std.fmt.bufPrintZ(&loop_buf, "Lc{d}", .{scope.label_ctr}) catch unreachable;
+    scope.label_ctr += 1;
+
+    const body = lp.body() orelse return Error.UnsupportedStatement;
+    try scope.loops.append(allocator, .{ .brk = blk_lbl, .cont = loop_lbl });
+    const body_block = try emitIntBlock(module, body, scope, i64_type, allocator, false);
+    _ = scope.loops.pop();
+
+    var loop_items = [_]c.BinaryenExpressionRef{
+        body_block,
+        c.BinaryenBreak(module, loop_lbl.ptr, null, null),
+    };
+    const loop_block = c.BinaryenBlock(module, null, @ptrCast(&loop_items), loop_items.len, none);
+    const loop = c.BinaryenLoop(module, loop_lbl.ptr, loop_block);
+    var outer = [_]c.BinaryenExpressionRef{loop};
+    const wrapped = c.BinaryenBlock(module, blk_lbl.ptr, @ptrCast(&outer), outer.len, none);
+    try items.append(allocator, wrapped);
+}
+
+/// Lower an `if`/`else(-if)` in statement position to a `none`-typed
+/// `BinaryenIf`: the branches are statement blocks (they may break,
+/// continue, return, or assign), and a missing `else` leaves `ifFalse`
+/// null. Distinct from emitIfInt, which lowers a *value* `if`.
+fn emitVoidIf(
+    module: c.BinaryenModuleRef,
+    ifs: ast.IfStmt,
+    scope: *IntScope,
+    i64_type: c.BinaryenType,
+    allocator: std.mem.Allocator,
+) Error!c.BinaryenExpressionRef {
+    const cond_expr = ifs.condition() orelse return Error.UnsupportedStatement;
+    const cond = try emitCond(module, cond_expr, scope, i64_type, allocator);
+    const then_block = try emitIntBlock(module, ifs.thenBody() orelse return Error.UnsupportedStatement, scope, i64_type, allocator, false);
+    const else_block: c.BinaryenExpressionRef = if (ifs.elseIf()) |eif|
+        try emitVoidIf(module, eif, scope, i64_type, allocator)
+    else if (ifs.elseBody()) |eb|
+        try emitIntBlock(module, eb, scope, i64_type, allocator, false)
+    else
+        null;
+    return c.BinaryenIf(module, cond, then_block, else_block);
 }
 
 /// Lower an `if`/`else` chain to a `BinaryenIf` yielding an i64. Every path
@@ -2887,6 +3001,66 @@ test "emitFromSource: calling a non-i64 function in an i64 expression is rejecte
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.UnsupportedCall,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
+}
+
+// ---------------------------------------------------------------------
+// Control flow: break / continue / early return / loop (ladder step 18)
+// ---------------------------------------------------------------------
+
+test "emitFromSource: a loop with an early return finds the first factor" {
+    const lib = "pub fn first_factor(n: i64) -> i64 { var i = 2; loop { if n % i == 0 { return i } i = i + 1 } }\n";
+    const app = "import dev.q64.m.{first_factor}\nfn main { env.out(first_factor(15)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: break exits a while loop early" {
+    const lib = "pub fn count_to_sum(limit: i64) -> i64 { var s = 0; var i = 0; while i < 1000 { i = i + 1; s = s + i; if s >= limit { break } } i }\n";
+    const app = "import dev.q64.m.{count_to_sum}\nfn main { env.out(count_to_sum(10)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: continue skips an iteration" {
+    const lib = "pub fn sum_odd(n: i64) -> i64 { var s = 0; var i = 0; while i < n { i = i + 1; if i % 2 == 0 { continue } s = s + i } s }\n";
+    const app = "import dev.q64.m.{sum_odd}\nfn main { env.out(sum_odd(10)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: an early-return guard and an inner-loop return (is_prime)" {
+    const lib = "pub fn is_prime(n: i64) -> i64 { if n < 2 { return 0 } var i = 2; while i * i <= n { if n % i == 0 { return 0 } i = i + 1 } 1 }\n";
+    const app = "import dev.q64.m.{is_prime}\nfn main { env.out(is_prime(13)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "emitFromSource: break outside a loop is rejected" {
+    const lib = "pub fn bad(n: i64) -> i64 { break; n }\n";
+    const app = "import dev.q64.m.{bad}\nfn main { env.out(bad(1)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.BreakOutsideLoop,
+        emitFromSource(testing.allocator, app, "main.q", &modules),
+    );
+}
+
+test "emitFromSource: continue outside a loop is rejected" {
+    const lib = "pub fn bad(n: i64) -> i64 { continue; n }\n";
+    const app = "import dev.q64.m.{bad}\nfn main { env.out(bad(1)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.BreakOutsideLoop,
         emitFromSource(testing.allocator, app, "main.q", &modules),
     );
 }
