@@ -115,6 +115,9 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 const e = try b.a.create(hir.Expr);
                 e.* = .{ .str_const = bytes };
                 st.* = .{ .host_out = e };
+            } else if (arg == .string_lit) {
+                // A string literal with dynamic interpolation → runtime concat.
+                st.* = .{ .host_out_str = try buildConcat(b, arg.string_lit, &mscope, false) };
             } else if (try isStrCall(b, arg)) {
                 // A real call to a str-returning function.
                 st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope) };
@@ -222,8 +225,14 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
     const out = try b.a.create(hir.Expr);
     switch (expr) {
         .string_lit => |sl| {
-            const bytes = b.eval.renderStringLit(sl) catch return error.Unsupported;
-            out.* = .{ .str_const = bytes };
+            // A fully-constant literal folds; one with dynamic interpolation
+            // becomes a runtime concat.
+            if (b.eval.renderStringLit(sl)) |bytes| {
+                out.* = .{ .str_const = bytes };
+            } else |e| switch (e) {
+                error.NotConst => return buildConcat(b, sl, scope, true),
+                error.OutOfMemory => return error.OutOfMemory,
+            }
         },
         .path => |p| {
             const txt = try p.text(b.a);
@@ -274,6 +283,103 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
         },
         else => return error.Unsupported,
     }
+    return out;
+}
+
+/// Split an interpolated string literal into runtime-concat pieces (mirrors
+/// the legacy `splitInterpolation`). Constant runs (escapes, `{{`/`}}`, and
+/// const-foldable interpolations) accumulate into `str_const` pieces; `{name}`
+/// matching a parameter becomes a `local` piece; `{f()}` (top-level only,
+/// nullary str) becomes a `call` piece. A reference that is neither constant
+/// nor a parameter (a runtime binding) defers to the legacy path.
+fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool) BuildError!*hir.Expr {
+    const raw = sl.rawText() orelse return error.Unsupported;
+    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return error.Unsupported;
+    const text = raw[1 .. raw.len - 1];
+
+    var pieces: std.ArrayList(*hir.Expr) = .empty;
+    var lit: std.ArrayList(u8) = .empty;
+
+    const flush = struct {
+        fn call(bld: *Builder, buf: *std.ArrayList(u8), dst: *std.ArrayList(*hir.Expr)) BuildError!void {
+            if (buf.items.len == 0) return;
+            const e = try bld.a.create(hir.Expr);
+            e.* = .{ .str_const = try buf.toOwnedSlice(bld.a) };
+            try dst.append(bld.a, e);
+        }
+    }.call;
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = text[i];
+        if (ch == '\\' and i + 1 < text.len) {
+            try lit.append(b.a, consteval.decodeEscape(text[i + 1]));
+            i += 2;
+            continue;
+        }
+        if (ch == '{') {
+            if (i + 1 < text.len and text[i + 1] == '{') {
+                try lit.append(b.a, '{');
+                i += 2;
+                continue;
+            }
+            const close = std.mem.indexOfScalarPos(u8, text, i + 1, '}') orelse return error.Unsupported;
+            const inner = text[i + 1 .. close];
+            const r = parser.parse.parseExpression(b.a, inner, "<interp>") catch return error.Unsupported;
+            const iexpr = ast.Expr.cast(r.root) orelse return error.Unsupported;
+            switch (iexpr) {
+                .call => |cc| {
+                    if (in_callee) return error.Unsupported; // callee bodies don't nest calls (v0)
+                    var ca = cc.args();
+                    if (ca.next() != null) return error.Unsupported; // nullary only
+                    const callee = cc.callee() orelse return error.Unsupported;
+                    const cpath = switch (callee) {
+                        .path => |p| p,
+                        else => return error.Unsupported,
+                    };
+                    const cname = try cpath.text(b.a);
+                    defer b.a.free(cname);
+                    const id = try registerFunc(b, cname);
+                    if (b.funcs.items[id].ret != .str) return error.Unsupported;
+                    try flush(b, &lit, &pieces);
+                    const e = try b.a.create(hir.Expr);
+                    e.* = .{ .call = .{ .func = id, .args = &.{} } };
+                    try pieces.append(b.a, e);
+                },
+                .path => |pp| {
+                    const ptext = try pp.text(b.a);
+                    defer b.a.free(ptext);
+                    if (scope.find(ptext)) |loc| {
+                        try flush(b, &lit, &pieces);
+                        const e = try b.a.create(hir.Expr);
+                        e.* = .{ .local = loc.idx };
+                        try pieces.append(b.a, e);
+                    } else {
+                        // A const binding folds into the run; a runtime one defers.
+                        const v = (try tryConst(b, iexpr)) orelse return error.Unsupported;
+                        try lit.appendSlice(b.a, v);
+                    }
+                },
+                else => {
+                    const v = (try tryConst(b, iexpr)) orelse return error.Unsupported;
+                    try lit.appendSlice(b.a, v);
+                },
+            }
+            i = close + 1;
+            continue;
+        }
+        if (ch == '}' and i + 1 < text.len and text[i + 1] == '}') {
+            try lit.append(b.a, '}');
+            i += 2;
+            continue;
+        }
+        try lit.append(b.a, ch);
+        i += 1;
+    }
+    try flush(b, &lit, &pieces);
+
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .concat = try pieces.toOwnedSlice(b.a) };
     return out;
 }
 
@@ -716,6 +822,36 @@ test "tryBuild: a str passthrough function + str-literal arg builds HIR" {
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn id -> str") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "local#0") != null); // passthrough param ref
+}
+
+test "tryBuild: interpolation with a call builds a concat" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn version() -> str { \"0.1.0\" }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(\"v{version()} ok\")\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // A concat of: const "v", the version() call, const " ok".
+    try testing.expect(std.mem.indexOf(u8, dump, "concat[") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "call#") != null);
+}
+
+test "tryBuild: a concat-bodied str function (interpolated param) builds" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn shout(s: str) -> str { \"{s}!\" }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(shout(\"loud\"))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // shout's body is a concat of its parameter and the literal "!".
+    try testing.expect(std.mem.indexOf(u8, dump, "fn shout -> str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "concat[local#0") != null);
 }
 
 test "tryBuild: a recursive control-flow body builds HIR" {

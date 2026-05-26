@@ -307,7 +307,14 @@ it with `CfgUnsupported`).
         str functions; `buildStrArg` folds a const arg (`id(vshout())`) or passes
         a parameter through. Verified `Q64_IR_STRICT=1`: `id("passed")`→`passed`,
         `id(vshout())`→`0.1.0`.
-  - [ ] **P3b-3** concat / interpolation (scope-arena `appendConcat`, driven by MIR).
+  - [x] **P3b-3** concat / interpolation. MIR `str_concat` ([]piece); the backend
+        `emitConcat` ports the legacy `appendConcat` (call pieces → tuple slots,
+        sum lengths, bump `sp`, `memory.copy` each), yielding `(buf,len)`. Per-
+        function scratch layout (`scanScratch` → tuple slots + buf/off/len) for
+        both entry and callees. `build_hir.buildConcat` splits an interpolation
+        into const-run / param / nullary-call pieces (folding const interps).
+        Verified `Q64_IR_STRICT=1`: `"q64 v{version()} ok"`→`q64 v0.1.0 ok`,
+        `shout("loud")`→`loud!`, `join("a","b")`→`a-b`, `shout(version())`→`0.1.0!`.
   - [ ] **P3b-4** runtime str `let`/`var` bindings + runtime args.
   - [ ] **P3b-5** i64 bindings + int interpolation in `main`.
   After P3b the whole suite + `link-roundtrip.sh` runs through the IR.

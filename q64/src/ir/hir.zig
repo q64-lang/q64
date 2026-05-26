@@ -119,4 +119,8 @@ pub const Expr = union(enum) {
     un: struct { kind: ops.UnKind, operand: *Expr },
     /// A call to another function, resolved to its `FuncId`.
     call: struct { func: FuncId, args: []const *Expr },
+    /// A runtime string concatenation (interpolation with dynamic pieces).
+    /// Each piece is a `str` value: a `str_const` run, a `local` parameter, or
+    /// a `call`.
+    concat: []const *Expr,
 };

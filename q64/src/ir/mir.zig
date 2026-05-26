@@ -133,6 +133,11 @@ pub const Op = union(enum) {
     /// The `str` value of parameter `#idx` (all-str param lists today, so its
     /// `(ptr, len)` lives at wasm locals `2·idx`, `2·idx+1`).
     str_param: u32,
+    /// A `str` value built at runtime in the scope arena by concatenating the
+    /// pieces (each a `str` value: a const run, a parameter, or a call). The
+    /// backend bump-allocates and `memory.copy`s each piece, yielding the
+    /// `(buf, len)` of the assembled string.
+    str_concat: []const *Inst,
     /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
     /// shared newline byte at `nl_off`.
     host_out_str: struct { value: *Inst, nl_off: u32 },

@@ -148,6 +148,11 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             for (cl.args, 0..) |arg, i| args[i] = try lowerStrExpr(ctx, arg);
             return mk(ctx.a, .str, .{ .call = .{ .func = cl.func, .args = args } });
         },
+        .concat => |pieces| {
+            const ps = try ctx.a.alloc(*mir.Inst, pieces.len);
+            for (pieces, 0..) |p, i| ps[i] = try lowerStrExpr(ctx, p);
+            return mk(ctx.a, .str, .{ .str_concat = ps });
+        },
         else => return error.Unsupported,
     }
 }
@@ -254,7 +259,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             for (cl.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
             return mk(ctx.a, .i64, .{ .call = .{ .func = cl.func, .args = args } });
         },
-        .str_const => unreachable, // strings only appear under host_out
+        .str_const, .concat => unreachable, // str values never reach the i64 path
     }
 }
 

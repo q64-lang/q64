@@ -112,6 +112,14 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             }
             try app(gpa, out, ")", .{});
         },
+        .concat => |pieces| {
+            try app(gpa, out, "concat[", .{});
+            for (pieces, 0..) |p, i| {
+                if (i != 0) try app(gpa, out, ", ", .{});
+                try hirExpr(gpa, out, p);
+            }
+            try app(gpa, out, "]", .{});
+        },
     }
 }
 
@@ -184,6 +192,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         },
         .str_const_val => |sc| try app(gpa, out, "str_const_val off={d} len={d}\n", .{ sc.off, sc.len }),
         .str_param => |idx| try app(gpa, out, "str_param {d}\n", .{idx}),
+        .str_concat => |pieces| {
+            try app(gpa, out, "str_concat\n", .{});
+            for (pieces) |p| try mirInst(gpa, out, p, depth + 1);
+        },
         .host_out_str => |hs| {
             try app(gpa, out, "host_out_str nl_off={d}\n", .{hs.nl_off});
             try mirInst(gpa, out, hs.value, depth + 1);
