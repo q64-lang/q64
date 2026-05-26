@@ -24,9 +24,10 @@ pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
 
-/// Wasm-level value types. Note there is no `str`: by MIR a string has
-/// already been lowered to its `(ptr, len)` representation (two i64s).
-pub const ValueType = enum { i64, i32, f64, void };
+/// Wasm-level value types. A `str` is the `(ptr, len)` pair — the backend
+/// realizes it as a two-i64 multivalue (tuple); a str function returns it and
+/// a str parameter is two i64 wasm params.
+pub const ValueType = enum { i64, i32, f64, str, void };
 
 pub const Linkage = enum { entry, local, imported_resolved };
 
@@ -126,6 +127,12 @@ pub const Op = union(enum) {
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
     host_out_int: struct { value: *Inst, nl_off: u32 },
+    /// A constant `str` value: the `(ptr, len)` pointing at `off`/`len` in the
+    /// memory image (no trailing newline — it's a value, not a host write).
+    str_const_val: struct { off: u32, len: u32 },
+    /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
+    /// shared newline byte at `nl_off`.
+    host_out_str: struct { value: *Inst, nl_off: u32 },
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the

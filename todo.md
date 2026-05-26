@@ -290,11 +290,21 @@ it with `CfgUnsupported`).
       `"{(1+2)*3} {n+1} {1_000+24}"`→`9 43 1024` and `let name/v` + interpolation
       → `Hello, world! (q64 v0.1.0)` route through the IR; 172 tests + roundtrip
       green.
-- [ ] **P3b runtime string ABI.** The heart of HIR→MIR: the `(ptr,len)` ABI, the
-      scope-arena concat plan (keep `appendConcat` byte-identical, swap its
-      driver), str-returning callees (const_str/param_ref/concat), str params,
-      runtime `let`/`var` str bindings + runtime args, and i64 bindings/interp in
-      `main`. After this the whole suite + `link-roundtrip.sh` runs through the IR.
+- **P3b runtime string ABI** (in progress). The `(ptr,len)` ABI in MIR
+  (`ValueType.str` = a pair; backend realizes it as a two-i64 multivalue).
+  - [x] **P3b-1 str-returning const functions + `env.out(str_call)`.** MIR gains
+        `str_const_val` (→ `TupleMake`) and `host_out_str` (store pair, extract,
+        env.out, newline); a str fn returns `pair_type`; the call-result type
+        comes from the callee's `ret`. `build_hir` registers str functions
+        (`registerStrFunc`, nullary, const-literal body) and routes a str-call
+        `env.out` arg to `host_out_str` (`isStrCall`); `buildIntExpr` now rejects
+        a str callee in an i64 context. Verified `Q64_IR_STRICT=1`: the link-demo
+        `env.out(version())` → `0.1.0` through AST→HIR→MIR→Binaryen.
+  - [ ] **P3b-2** str params + passthrough (`id(s){s}`), str-literal args.
+  - [ ] **P3b-3** concat / interpolation (scope-arena `appendConcat`, driven by MIR).
+  - [ ] **P3b-4** runtime str `let`/`var` bindings + runtime args.
+  - [ ] **P3b-5** i64 bindings + int interpolation in `main`.
+  After P3b the whole suite + `link-roundtrip.sh` runs through the IR.
 - [ ] **P4 delete legacy.** Once the router never falls through (verify with
       `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
       `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.

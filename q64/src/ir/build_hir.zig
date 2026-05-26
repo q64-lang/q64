@@ -115,6 +115,9 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 const e = try b.a.create(hir.Expr);
                 e.* = .{ .str_const = bytes };
                 st.* = .{ .host_out = e };
+            } else if (try isStrCall(b, arg)) {
+                // A real call to a str-returning function.
+                st.* = .{ .host_out_str = try buildStrExpr(b, arg) };
             } else {
                 // Otherwise an i64 expression (a call to an i64 function).
                 const e = try buildIntExpr(b, arg, &mscope);
@@ -138,7 +141,8 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (b.ids.get(name)) |id| return id;
 
     const fd = b.resolver.lookup(name) orelse return error.Unsupported;
-    if (!(try returnsI64(b.a, fd))) return error.Unsupported; // i64 callees only, for now
+    if (try returnsStr(b.a, fd)) return registerStrFunc(b, name, fd);
+    if (!(try returnsI64(b.a, fd))) return error.Unsupported;
 
     const owned = try b.a.dupe(u8, name);
 
@@ -172,6 +176,104 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
 
     b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .i64, .locals = locals, .body = body };
     return id;
+}
+
+/// Register a `str`-returning function. v0 handles a nullary function whose
+/// body is a single tail str expression (a constant string, or a call to
+/// another str function) — parameters / concat bodies land in a later slice.
+fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
+    if (fd.params()) |ps| {
+        var pit = ps.iter();
+        if (pit.next() != null) return error.Unsupported; // str params: later
+    }
+
+    const owned = try b.a.dupe(u8, name);
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, owned, id);
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = owned, .ret = .str, .body = dummy });
+
+    const tail = try singleTailExpr(fd) orelse return error.Unsupported;
+    const value = try buildStrExpr(b, tail);
+    const vstmt = try b.a.create(hir.Stmt);
+    vstmt.* = .{ .expr = value };
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+
+    b.funcs.items[id] = .{ .name = owned, .ret = .str, .body = block };
+    return id;
+}
+
+/// Build a `str`-valued expression. v0: a constant string literal (no runtime
+/// interpolation) or a call to a nullary str function.
+fn buildStrExpr(b: *Builder, expr: ast.Expr) BuildError!*hir.Expr {
+    const out = try b.a.create(hir.Expr);
+    switch (expr) {
+        .string_lit => |sl| {
+            const bytes = b.eval.renderStringLit(sl) catch return error.Unsupported;
+            out.* = .{ .str_const = bytes };
+        },
+        .call => |cc| {
+            const callee = cc.callee() orelse return error.Unsupported;
+            const cpath = switch (callee) {
+                .path => |p| p,
+                else => return error.Unsupported,
+            };
+            const cname = try cpath.text(b.a);
+            defer b.a.free(cname);
+            const id = try registerFunc(b, cname);
+            if (b.funcs.items[id].ret != .str) return error.Unsupported;
+            var ait = cc.args();
+            if (ait.next() != null) return error.Unsupported; // str-call args: later
+            out.* = .{ .call = .{ .func = id, .args = &.{} } };
+        },
+        else => return error.Unsupported, // param ref / concat: later
+    }
+    return out;
+}
+
+/// A function body that is a single tail expression (one statement), or
+/// `null` if it has more (bindings / control flow).
+fn singleTailExpr(fd: ast.FnDecl) BuildError!?ast.Expr {
+    const body = fd.body() orelse return error.Unsupported;
+    var it = body.statements();
+    var first: ?ast.Expr = null;
+    var count: usize = 0;
+    while (it.next()) |stmt| {
+        count += 1;
+        if (count > 1) return null;
+        first = switch (stmt) {
+            .expr_stmt => |es| es.expression(),
+            .return_stmt => |rs| rs.value(),
+            else => return null,
+        };
+    }
+    return first;
+}
+
+/// True if `arg` is a call to a `str`-returning function (so `main` should
+/// emit a `host_out_str` rather than trying an i64 lowering).
+fn isStrCall(b: *Builder, arg: ast.Expr) BuildError!bool {
+    const call = switch (arg) {
+        .call => |cc| cc,
+        else => return false,
+    };
+    const callee = call.callee() orelse return false;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return false,
+    };
+    const cname = try cpath.text(b.a);
+    defer b.a.free(cname);
+    const fd = b.resolver.lookup(cname) orelse return false;
+    return returnsStr(b.a, fd);
+}
+
+fn returnsStr(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
+    const rt = fd.returnType() orelse return false;
+    const te = rt.type_() orelse return false;
+    return typeNamed(a, te, "str");
 }
 
 /// Name → local-index resolution for an i64 function body. Append-only with
@@ -318,6 +420,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
             const id = try registerFunc(b, cname);
+            if (b.funcs.items[id].ret != .i64) return error.Unsupported; // only i64 callees in an i64 expr
             var args: std.ArrayList(*hir.Expr) = .empty;
             var ait = cc.args();
             while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
@@ -511,8 +614,16 @@ test "tryBuild: a const-bodied call folds in a let, not in env.out" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out \"0.1.0\"") != null);
 
-    // Directly, `env.out(version())` stays a real call → deferred to legacy.
-    try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(version())\n}\n", tr.resolver())) == null);
+    // Directly, `env.out(version())` is a real (non-folded) call: version is
+    // emitted as a str function and its result is written at runtime.
+    var direct = (try buildFromSource(testing.allocator, "fn main {\n env.out(version())\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer direct.deinit();
+    try testing.expectEqual(@as(usize, 2), direct.funcs.len); // main + version
+    const d = try print.hirToString(testing.allocator, &direct);
+    defer testing.allocator.free(d);
+    try testing.expect(std.mem.indexOf(u8, d, "host_out_str") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "fn version -> str") != null);
 }
 
 test "tryBuild: an i64 function call builds the callee + host_out_int" {

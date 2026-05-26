@@ -284,7 +284,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
     var needs_fmt = false;
     for (m.funcs) |f| switch (f.body) {
         .structured => |inst| {
-            if (bodyHasIntOut(inst)) needs_fmt = true;
+            if (bodyHasOut(inst, true)) needs_fmt = true;
         },
         .cfg => return Error.CfgUnsupported,
     };
@@ -314,13 +314,13 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
         switch (f.linkage) {
             .entry => {
                 // varTypes: the entry's i64 locals, plus one pair scratch
-                // local if it formats any integer.
-                const fmt_here = bodyHasIntOut(structured);
-                const nloc = f.locals.len + @as(usize, if (fmt_here) 1 else 0);
+                // local if it formats an int or writes a runtime str value.
+                const needs_pair = bodyHasOut(structured, true) or bodyHasOut(structured, false);
+                const nloc = f.locals.len + @as(usize, if (needs_pair) 1 else 0);
                 const vts = try allocator.alloc(c.BinaryenType, nloc);
                 defer allocator.free(vts);
-                for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type);
-                if (fmt_here) vts[f.locals.len] = pair_type;
+                for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type);
+                if (needs_pair) vts[f.locals.len] = pair_type;
                 const body = try lw.inst(structured);
                 _ = c.BinaryenAddFunction(module, f.name.ptr, none_type, none_type, if (nloc > 0) @ptrCast(vts.ptr) else null, @intCast(nloc), body);
                 _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
@@ -330,7 +330,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
                 var pbuf: []c.BinaryenType = &.{};
                 if (f.params.len > 0) {
                     pbuf = try allocator.alloc(c.BinaryenType, f.params.len);
-                    for (pbuf, 0..) |*x, i| x.* = wasmType(f.params[i], i64_type, i32_type, none_type);
+                    for (pbuf, 0..) |*x, i| x.* = wasmType(f.params[i], i64_type, i32_type, none_type, pair_type);
                     ptype = c.BinaryenTypeCreate(pbuf.ptr, @intCast(pbuf.len));
                 }
                 defer if (pbuf.len > 0) allocator.free(pbuf);
@@ -338,12 +338,12 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
                 var vts: []c.BinaryenType = &.{};
                 if (f.locals.len > 0) {
                     vts = try allocator.alloc(c.BinaryenType, f.locals.len);
-                    for (vts, 0..) |*x, i| x.* = wasmType(f.locals[i], i64_type, i32_type, none_type);
+                    for (vts, 0..) |*x, i| x.* = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type);
                 }
                 defer if (vts.len > 0) allocator.free(vts);
 
                 const body = try lw.inst(structured);
-                _ = c.BinaryenAddFunction(module, f.name.ptr, ptype, wasmType(f.ret, i64_type, i32_type, none_type), if (vts.len > 0) @ptrCast(vts.ptr) else null, @intCast(vts.len), body);
+                _ = c.BinaryenAddFunction(module, f.name.ptr, ptype, wasmType(f.ret, i64_type, i32_type, none_type, pair_type), if (vts.len > 0) @ptrCast(vts.ptr) else null, @intCast(vts.len), body);
             },
         }
     }
@@ -363,36 +363,38 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
     return out;
 }
 
-fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenType, none_type: c.BinaryenType) c.BinaryenType {
+fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenType, none_type: c.BinaryenType, pair_type: c.BinaryenType) c.BinaryenType {
     return switch (t) {
         .i64 => i64_type,
         .i32 => i32_type,
         .f64 => c.BinaryenTypeFloat64(),
+        .str => pair_type, // a (ptr, len) multivalue
         .void => none_type,
     };
 }
 
-/// True if any instruction in the tree is a `host_out_int` (so the function
-/// needs the pair scratch local; the module needs `__fmt_i64` + the arena).
-fn bodyHasIntOut(inst: *const ir.mir.Inst) bool {
+/// Whether the tree contains an `env.out` of an i64 / a str value. An int-out
+/// needs `__fmt_i64` + the arena; either needs the entry's pair scratch local.
+fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
     return switch (inst.op) {
-        .host_out_int => true,
+        .host_out_int => |h| want_int or bodyHasOut(h.value, want_int),
+        .host_out_str => |h| !want_int or bodyHasOut(h.value, want_int),
         .block => |items| blk: {
-            for (items) |child| if (bodyHasIntOut(child)) break :blk true;
+            for (items) |child| if (bodyHasOut(child, want_int)) break :blk true;
             break :blk false;
         },
-        .local_set => |ls| bodyHasIntOut(ls.value),
-        .bin => |b| bodyHasIntOut(b.lhs) or bodyHasIntOut(b.rhs),
-        .un => |u| bodyHasIntOut(u.operand),
+        .local_set => |ls| bodyHasOut(ls.value, want_int),
+        .bin => |b| bodyHasOut(b.lhs, want_int) or bodyHasOut(b.rhs, want_int),
+        .un => |u| bodyHasOut(u.operand, want_int),
         .call => |cl| blk: {
-            for (cl.args) |a| if (bodyHasIntOut(a)) break :blk true;
+            for (cl.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
             break :blk false;
         },
-        .ret => |v| if (v) |val| bodyHasIntOut(val) else false,
-        .if_ => |iff| bodyHasIntOut(iff.cond) or bodyHasIntOut(iff.then_) or (iff.else_ != null and bodyHasIntOut(iff.else_.?)),
-        .while_ => |w| bodyHasIntOut(w.cond) or bodyHasIntOut(w.body),
-        .loop => |body| bodyHasIntOut(body),
-        .host_out_const, .const_i64, .local_get, .br, .br_cont, .@"unreachable" => false,
+        .ret => |v| if (v) |val| bodyHasOut(val, want_int) else false,
+        .if_ => |iff| bodyHasOut(iff.cond, want_int) or bodyHasOut(iff.then_, want_int) or (iff.else_ != null and bodyHasOut(iff.else_.?, want_int)),
+        .while_ => |w| bodyHasOut(w.cond, want_int) or bodyHasOut(w.body, want_int),
+        .loop => |body| bodyHasOut(body, want_int),
+        .host_out_const, .const_i64, .local_get, .str_const_val, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -426,7 +428,7 @@ const Lowerer = struct {
                 const children = try self.allocator.alloc(c.BinaryenExpressionRef, items.len);
                 defer self.allocator.free(children);
                 for (items, 0..) |child, i| children[i] = try self.inst(child);
-                return c.BinaryenBlock(module, null, @ptrCast(children.ptr), @intCast(children.len), wasmType(n.ty, self.i64_type, self.i32_type, self.none_type));
+                return c.BinaryenBlock(module, null, @ptrCast(children.ptr), @intCast(children.len), self.wty(n.ty));
             },
             .host_out_const => |hc| return self.envOut(@intCast(hc.off), @intCast(hc.len)),
             .const_i64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt64(v)),
@@ -444,26 +446,23 @@ const Lowerer = struct {
                 const args = try self.allocator.alloc(c.BinaryenExpressionRef, cl.args.len);
                 defer self.allocator.free(args);
                 for (cl.args, 0..) |a, i| args[i] = try self.inst(a);
-                return c.BinaryenCall(module, self.funcs[cl.func].name.ptr, if (args.len > 0) args.ptr else null, @intCast(args.len), self.i64_type);
+                return c.BinaryenCall(module, self.funcs[cl.func].name.ptr, if (args.len > 0) args.ptr else null, @intCast(args.len), self.wty(n.ty));
             },
             .ret => |v| return c.BinaryenReturn(module, if (v) |val| try self.inst(val) else null),
+            .str_const_val => |sc| {
+                var elems = [_]c.BinaryenExpressionRef{
+                    c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(sc.off))),
+                    c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(sc.len))),
+                };
+                return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
+            },
             .host_out_int => |hi| {
-                // fmt = __fmt_i64(value); env.out(fmt.0, fmt.1); env.out(nl, 1).
+                // __fmt_i64(value) → (ptr, len), then write it + the newline.
                 var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(hi.value)};
                 const fmt = c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
-                var seq = [_]c.BinaryenExpressionRef{
-                    c.BinaryenLocalSet(module, self.pair_idx, fmt),
-                    blk: {
-                        var cargs = [_]c.BinaryenExpressionRef{
-                            c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 0),
-                            c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
-                        };
-                        break :blk c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, self.none_type);
-                    },
-                    self.envOut(@intCast(hi.nl_off), 1),
-                };
-                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
+                return self.hostOutPair(fmt, @intCast(hi.nl_off));
             },
+            .host_out_str => |hs| return self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)),
             .if_ => |iff| {
                 const cond = try self.inst(iff.cond);
                 const then_ = try self.inst(iff.then_);
@@ -532,6 +531,29 @@ const Lowerer = struct {
             c.BinaryenConst(self.module, c.BinaryenLiteralInt64(len)),
         };
         return c.BinaryenCall(self.module, "env_out", @ptrCast(&args), args.len, self.none_type);
+    }
+
+    /// Write a `(ptr, len)` pair value to env.out, then the newline byte:
+    /// stash the pair in the scratch local, extract both halves, env.out them,
+    /// then env.out(nl, 1).
+    fn hostOutPair(self: *Lowerer, pair: c.BinaryenExpressionRef, nl_off: i64) c.BinaryenExpressionRef {
+        const module = self.module;
+        var seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenLocalSet(module, self.pair_idx, pair),
+            blk: {
+                var cargs = [_]c.BinaryenExpressionRef{
+                    c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 0),
+                    c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
+                };
+                break :blk c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, self.none_type);
+            },
+            self.envOut(nl_off, 1),
+        };
+        return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
+    }
+
+    fn wty(self: *const Lowerer, t: ir.mir.ValueType) c.BinaryenType {
+        return wasmType(t, self.i64_type, self.i32_type, self.none_type, self.pair_type);
     }
 };
 

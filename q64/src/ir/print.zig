@@ -37,6 +37,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
+        .host_out_str => |e| {
+            try app(gpa, out, "host_out_str ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
         .expr => |e| {
             try app(gpa, out, "expr ", .{});
             try hirExpr(gpa, out, e);
@@ -176,6 +181,11 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .host_out_int => |hi| {
             try app(gpa, out, "host_out_int nl_off={d}\n", .{hi.nl_off});
             try mirInst(gpa, out, hi.value, depth + 1);
+        },
+        .str_const_val => |sc| try app(gpa, out, "str_const_val off={d} len={d}\n", .{ sc.off, sc.len }),
+        .host_out_str => |hs| {
+            try app(gpa, out, "host_out_str nl_off={d}\n", .{hs.nl_off});
+            try mirInst(gpa, out, hs.value, depth + 1);
         },
         .if_ => |iff| {
             try app(gpa, out, "if : {s}\n", .{@tagName(inst.ty)});

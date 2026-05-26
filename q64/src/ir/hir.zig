@@ -91,6 +91,9 @@ pub const Stmt = union(enum) {
     host_out: *Expr,
     /// `env.out(expr)` where `expr` is `i64` — formatted to decimal on lowering.
     host_out_int: *Expr,
+    /// `env.out(expr)` where `expr` is a runtime `str` value (e.g. a call to a
+    /// str-returning function) — its `(ptr, len)` is written, then a newline.
+    host_out_str: *Expr,
     /// An `i64` expression statement; as a block's tail it is the value.
     expr: *Expr,
     ret: ?*Expr,

@@ -92,6 +92,10 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             const nl = try ctx.newline();
             return mk(ctx.a, .void, .{ .host_out_int = .{ .value = try lowerExpr(ctx, e), .nl_off = nl } });
         },
+        .host_out_str => |e| {
+            const nl = try ctx.newline();
+            return mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, e), .nl_off = nl } });
+        },
         else => unreachable, // main has no value/tail statements
     }
 }
@@ -102,7 +106,10 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
     const locals = try ctx.a.alloc(mir.ValueType, hf.locals.len);
     for (hf.locals, 0..) |t, i| locals[i] = mapType(t);
 
-    const body = try lowerIntBlock(ctx, hf.body, true);
+    const body = switch (hf.ret) {
+        .str => try lowerStrExpr(ctx, singleTail(hf.body) orelse return error.Unsupported),
+        else => try lowerIntBlock(ctx, hf.body, true),
+    };
 
     return .{
         .name = try ctx.a.dupeZ(u8, hf.name),
@@ -112,6 +119,36 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
         .body = .{ .structured = body },
         .linkage = .local,
     };
+}
+
+/// The single tail expression of a one-statement body block.
+fn singleTail(body: *const hir.Stmt) ?*hir.Expr {
+    const items = switch (body.*) {
+        .block => |b| b,
+        else => return null,
+    };
+    if (items.len != 1) return null;
+    return switch (items[0].*) {
+        .expr => |e| e,
+        else => null,
+    };
+}
+
+/// Lower a `str`-valued expression to a `str`-typed MIR instruction.
+fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
+    switch (e.*) {
+        .str_const => |bytes| {
+            const off: u32 = @intCast(ctx.data.items.len);
+            try ctx.data.appendSlice(ctx.a, bytes);
+            return mk(ctx.a, .str, .{ .str_const_val = .{ .off = off, .len = @intCast(bytes.len) } });
+        },
+        .call => |cl| {
+            const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
+            for (cl.args, 0..) |arg, i| args[i] = try lowerStrExpr(ctx, arg);
+            return mk(ctx.a, .str, .{ .call = .{ .func = cl.func, .args = args } });
+        },
+        else => return error.Unsupported,
+    }
 }
 
 /// Lower an i64 function block. With `want_value` the block yields an i64 —
@@ -232,8 +269,8 @@ fn mapType(t: hir.Type) mir.ValueType {
         .i64 => .i64,
         .i32 => .i32,
         .f64 => .f64,
+        .str => .str,
         .void => .void,
-        .str => unreachable, // str locals/params land with the string-ABI phase
     };
 }
 
