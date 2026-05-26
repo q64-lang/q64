@@ -31,7 +31,9 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
         funcs[i] = .{
             .name = if (is_entry) "start" else try a.dupeZ(u8, hf.name),
             .ret = .void,
-            .body = body,
+            // Structured is the only form the lowering produces; the `cfg`
+            // escape hatch on Body is for a future basic-block backend.
+            .body = .{ .structured = body },
             .linkage = if (is_entry) .entry else .local,
         };
     }

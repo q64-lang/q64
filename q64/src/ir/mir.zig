@@ -7,8 +7,11 @@
 //! direct input to a backend — `MIR → Binaryen → WASM` today; a future
 //! `MIR → LLVM IR → native` backend would consume the very same module.
 //!
-//! Control flow is structured (block/if/loop/br), matching the WASM target;
-//! a CFG/SSA form is a backend-internal concern (see the project plan).
+//! Control flow is structured (block/if/loop/br), matching the WASM target.
+//! A `Func.body` is form-agnostic (`Body = structured | cfg`): the `cfg` arm
+//! is an explicit escape hatch for a future basic-block backend (relooper /
+//! LLVM), reusing the same value `Inst`s and swapping only the control-flow
+//! skeleton. Structured is the only form produced today.
 //!
 //! Status: v0 covers the literal `env.out` path. The `Op` union grows one
 //! arm per migration phase (i64 arithmetic + control flow, then calls, then
@@ -52,8 +55,49 @@ pub const Func = struct {
     params: []const ValueType = &.{},
     ret: ValueType = .void,
     locals: []const ValueType = &.{},
-    body: *Inst,
+    body: Body,
     linkage: Linkage = .local,
+};
+
+/// A function body in one of two interchangeable forms. **Structured is the
+/// only form produced today** (and the one the WASM/Binaryen backend wants —
+/// see the structured-control-flow note in the project plan). `cfg` is the
+/// explicit *escape hatch*: a backend that prefers a basic-block CFG (an LLVM
+/// / native backend, or a future optimizer pass) consumes `cfg` instead, and
+/// a structured↔CFG converter lives at this seam. Crucially, both forms reuse
+/// the same value/effect `Inst`s — only the *control-flow skeleton* differs —
+/// so adding the CFG form never reshapes the rest of MIR. Nothing emits `cfg`
+/// yet; the WASM backend rejects it (`Error.CfgUnsupported`).
+pub const Body = union(enum) {
+    structured: *Inst,
+    cfg: *Cfg,
+};
+
+// --- The CFG escape hatch -------------------------------------------------
+//
+// Reserved for a future basic-block backend (relooper / LLVM). Defined now so
+// the `Body` seam is real and `Func`'s shape is final; no pass produces a Cfg
+// yet. The straight-line ops inside a block are the same value/effect `Inst`s
+// the structured form uses; only the branching (the `Terminator`) is distinct.
+
+pub const BlockId = u32;
+
+pub const Cfg = struct {
+    blocks: []const BasicBlock,
+    entry: BlockId = 0,
+};
+
+pub const BasicBlock = struct {
+    /// Straight-line value/effect instructions (no control flow).
+    insts: []const *Inst,
+    term: Terminator,
+};
+
+pub const Terminator = union(enum) {
+    ret: ?*Inst,
+    br: BlockId,
+    cond_br: struct { cond: *Inst, then_blk: BlockId, else_blk: BlockId },
+    @"unreachable",
 };
 
 /// A structured instruction node. `ty` is its result type (`.void` for

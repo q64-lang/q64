@@ -254,7 +254,11 @@ Full design + phasing in the approved plan
 (`/root/.claude/plans/question-the-important-design-purring-beacon.md`) and
 [`q64/src/ir/README.md`](./q64/src/ir/README.md). Migrates incrementally behind
 a per-construct router in `codegen/emit.zig` (legacy `AST → Binaryen` is the
-fallback); `Q64_IR_STRICT=1` panics on fallback to track coverage.
+fallback); `Q64_IR_STRICT=1` panics on fallback to track coverage. MIR control
+flow is **structured** (wasm-shaped) with an explicit **CFG escape hatch**:
+`mir.Func.body` is `Body = structured | cfg`, the `cfg` arm (`BasicBlock` +
+`Terminator`) reserved for a future relooper/LLVM backend (WASM backend rejects
+it with `CfgUnsupported`).
 
 - [x] **P0 scaffold + P1 literals.** `q64/src/ir/` package: `hir.zig`/`mir.zig`
       (pure Zig, no Binaryen), `build_hir.zig` (AST→HIR), `lower.zig` (HIR→MIR),

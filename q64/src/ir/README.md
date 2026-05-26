@@ -21,6 +21,23 @@ and only `codegen/` turns that into Binaryen/WASM.
 | **HIR** — Semantic QIR | [`hir.zig`](./hir.zig) | what the program *means* | name-resolved, desugared; types/regions/effects annotated by the semantic passes; abstract `str`; the pub surface + capability set for the component/WIT lift |
 | **MIR** — Executable QIR | [`mir.zig`](./mir.zig) | how it *executes* | ABI-lowered: `str` = `(ptr, len)`, explicit region/`alloc` ops, structured (wasm-shaped) control flow, the static memory image. The single input a backend consumes |
 
+### Control flow & the CFG escape hatch
+
+MIR control flow is **structured** (`block`/`if`/`loop`/`br`) — it matches the
+WASM target and the existing emitters, so lowering to Binaryen is near-1:1.
+But `mir.Func.body` is form-agnostic:
+
+```
+Body = union { structured: *Inst, cfg: *Cfg }
+```
+
+The `cfg` arm is the explicit escape hatch — a basic-block form (`BasicBlock` +
+`Terminator`) that a future relooper or LLVM/native backend can consume. Both
+forms **reuse the same value `Inst`s**; only the control-flow skeleton differs,
+so adding the CFG form never reshapes the rest of MIR. Nothing produces `cfg`
+today and the WASM backend rejects it (`Error.CfgUnsupported`); the structured↔
+CFG converter would live at this seam.
+
 ## Passes
 
 - [`build_hir.zig`](./build_hir.zig) — **AST → HIR**. Imports `parser`; owns

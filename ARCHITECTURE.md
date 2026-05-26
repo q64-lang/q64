@@ -115,7 +115,11 @@ language's semantics never depend on a backend's IR — see
   and for the component/WIT lift (the pub surface + capability set).
 - **MIR / Executable QIR** — "how it executes." ABI-lowered: a `str` is a
   `(ptr, len)` pair, allocation is explicit region/`alloc` ops, control flow is
-  structured (wasm-shaped). MIR is the single input a backend consumes.
+  structured (wasm-shaped). MIR is the single input a backend consumes. A
+  function body is form-agnostic (`mir.Body = structured | cfg`): structured is
+  the only form produced today; the `cfg` arm is an explicit **escape hatch** —
+  a basic-block form a future relooper/LLVM backend can consume, reusing the
+  same value instructions and swapping only the control-flow skeleton.
 
 Nothing under `ir/` links Binaryen; only `codegen/` does. That seam is what
 keeps a future second backend (`MIR → LLVM IR → native`) an additive change —

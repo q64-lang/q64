@@ -51,6 +51,7 @@ pub const Error = error{
     ImmutableAssign, // assignment to a `let` binding or a parameter
     UndeclaredName, // assignment target names no in-scope binding
     BreakOutsideLoop, // `break`/`continue` with no enclosing loop
+    CfgUnsupported, // a MIR func body in CFG form — the WASM backend only takes structured
     OutOfMemory,
 };
 
@@ -272,7 +273,13 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
     }
 
     for (m.funcs) |f| {
-        const body = try lowerInst(allocator, module, f.body);
+        // Structured is the only body form today; the CFG escape hatch
+        // (mir.Body.cfg) is reserved for a future basic-block backend.
+        const structured = switch (f.body) {
+            .structured => |inst| inst,
+            .cfg => return Error.CfgUnsupported,
+        };
+        const body = try lowerInst(allocator, module, structured);
         switch (f.linkage) {
             .entry => {
                 _ = c.BinaryenAddFunction(module, f.name.ptr, none_type, none_type, null, 0, body);
