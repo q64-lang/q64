@@ -84,6 +84,7 @@ authoritative table.
 | `@io`          | Catch-all I/O (devices, generic streams). Implied by every other capability below.  | (umbrella; no single face)    |
 | `@network`     | Performs network operations (HTTP, WebSocket, raw sockets). Implies `@io`.          | `Net`                         |
 | `@fs`          | Performs filesystem operations (read, write, list, watch). Implies `@io`.           | `Fs`                          |
+| `@kv`          | Performs key-value store operations (get, set, delete, list, atomics). Implies `@io`. | `KeyValue`                  |
 | `@stdout`      | Writes to stdout. Implies `@io`.                                                    | `Stdout`                      |
 | `@stderr`      | Writes to stderr. Implies `@io`.                                                    | `Stderr`                      |
 | `@audio`       | Performs audio I/O (PCM read/write, worklet operations).                            | `Audio`                       |
@@ -133,7 +134,7 @@ Notes:
   not *purity*.
 - `@no_panic` does not forbid `trap`. Audio paths use `trap()` for
   invariant violations (see [`errors.md` §`panic` and `trap`](./errors.md)).
-- `@network` / `@fs` / `@stdout` / `@stderr` / `@wire` imply `@io` so that
+- `@network` / `@fs` / `@kv` / `@stdout` / `@stderr` / `@wire` imply `@io` so that
   callers declaring only `@io` may not silently leak finer-grained
   capabilities. `@wire` (a remote RPC call; see [`rpc.md`](./rpc.md)) implies
   `@io` but **not** `@network` — its transport may be local IPC. A
@@ -163,6 +164,7 @@ expansion.
 | `@uncancellable`  | — (forbids `@cancel` callees by intersection)                 |
 | `@network`        | `@io`                                                         |
 | `@fs`             | `@io`                                                         |
+| `@kv`             | `@io`                                                         |
 | `@stdout`         | `@io`                                                         |
 | `@stderr`         | `@io`                                                         |
 | `@wire`           | `@io`                                                         |
