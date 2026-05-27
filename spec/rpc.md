@@ -161,6 +161,48 @@ Because q64 tracks the WASIp3 **release candidate**, the wire encoding for
 `future` / `stream` follows the pinned snapshot (see [`env.md`](./env.md)) and
 moves with each upstream RC until WASI 1.0.
 
+## Remote channels
+
+A **remote channel** is the local channel of
+[`concurrency.md` §Channels](./concurrency.md) with its two halves on opposite
+sides of a wire. `Channel<Tx, Rx>` is a bidirectional endpoint: it **sends**
+`Tx` and **receives** `Rx`; the peer holds the dual `Channel<Rx, Tx>`. It is
+**sugar over a pair of WASIp3 streams** — an outbound `stream<Tx>` and an
+inbound `stream<Rx>` — so it adds **no new wire-resource** (see §Deferred) and
+rides the same canonical-ABI lowering as any streamed RPC value.
+
+The endpoint reuses the `Sender` / `Receiver` surface from `concurrency.md`, so
+local and remote channels are used identically — the only difference is that
+remote `send` / `recv` carry `@wire`:
+
+```q64
+pub face Channel<Tx, Rx> {
+    fn send  (self, ctx: Cancel, move x: Tx)  -> Result<(), SendError<Tx>> @wire + @cancel  // → stream<Tx>
+    fn recv  (self, ctx: Cancel)              -> Result<Rx, RecvError>      @wire + @cancel  // ← stream<Rx>
+    fn close (self)                                                                          // close both directions
+}
+// Iterable on its Rx side: `for msg in chan { … }`; usable in `select`.
+```
+
+- **Backpressure is the wire's.** WebTransport (browser) / QUIC (native) stream
+  flow control realizes `Backpressure` end to end: a slow reader pauses the
+  writer's `stream<T>`, with no unbounded application buffering.
+- **Messages are value types.** `Tx` and `Rx` obey the §"Wire encoding" rule; a
+  non-lowerable message type is `RPC010`.
+- **Establishment** mirrors §Model. The **exporter** receives the server end
+  through a channel entry point ([`env.md` §"Channel entry point"](./env.md));
+  the **importer** opens the client (dual) end with `connect`, deriving the
+  channel type from the imported export's signature:
+
+```q64
+// importer: rpc.import = { "agent": "wrpc://my-agent.qubepods.app" }
+let agent: Channel<str, str> = connect<agent.chat>(ctx)   // @wire
+```
+
+The canonical use case — a text stream between a user (frontend qube) and an
+agent (backend qube) — is worked end to end in
+[`env.md` §"Channel entry point"](./env.md).
+
 ## Deferred
 
 - **Resources over the wire.** v0 keeps resources process-local. Sending a

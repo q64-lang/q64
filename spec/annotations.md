@@ -106,6 +106,7 @@ analysis. Not user-extensible.
 | `@traced_panic`   | `fn`                      | Captures a stack trace into the panic payload (opt-in; ~few kB cost). | [`errors.md`](./errors.md)           |
 | `@rate`           | `graph` block             | Pins the graph body's ambient stream rate.                            | [`streams.md`](./streams.md)         |
 | `@http_handler`   | `pub fn`                  | Marks the function as the HTTP entry point; exported as `wasi:http/handler` (the WASIp3 unified handler) when emitted as a component. | [`env.md`](./env.md)                 |
+| `@channel_handler` | `pub fn`                 | Marks the function as a bidirectional-stream entry point; receives a remote `Channel<Tx, Rx>` and is exported as a paired-`stream` wRPC world when emitted as a component. | [`rpc.md`](./rpc.md)                 |
 | `@no_component_lift` | `pub fn`               | Excludes the function from the component export surface; it stays in the core module. Implicit on every `@realtime` fn. | [`modules.md`](./modules.md)         |
 
 ### Category 2 — Declaration markers (lowercase, type-introducing)
@@ -189,6 +190,7 @@ filled in.
 | `@skip_laws`      | 1         | `fit`                   | [`faces.md`](./faces.md)             |
 | `@traced_panic`   | 1         | `fn`                    | [`errors.md`](./errors.md)           |
 | `@http_handler`   | 1         | `pub fn`                | [`env.md`](./env.md)                 |
+| `@channel_handler` | 1        | `pub fn`                | [`rpc.md`](./rpc.md)                 |
 | `@no_component_lift` | 1      | `pub fn`                | [`modules.md`](./modules.md)         |
 | `@unit`           | 2         | item-introducing        | [`units.md`](./units.md)             |
 | `@kind`           | 2         | item-introducing        | (forthcoming `kinds.md`)             |

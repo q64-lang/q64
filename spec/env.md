@@ -383,6 +383,53 @@ Component Model HTTP lifting (`wasmtime serve`, componentize-js / jco on
 Cloudflare Workers, or wasmCloud) with no qubepods-specific ABI. The same
 endpoint doubles as a wRPC server (see [`rpc.md`](./rpc.md)).
 
+### Channel entry point (`@channel_handler`)
+
+A qube can serve a **long-lived bidirectional stream** instead of a run-once
+`main` or a request/response `handle`. A `pub fn` carrying **`@channel_handler`**
+(per [`annotations.md`](./annotations.md)) receives a remote `Channel<Tx, Rx>`
+([`rpc.md` §"Remote channels"](./rpc.md)) as its session: it reads inbound
+messages and sends outbound ones until either side closes. The name is free.
+
+The motivating case is an **agent**: a text stream between a user (the frontend
+qube) and an agent (the backend qube). `Tx` is what the agent sends (assistant
+text); `Rx` is what it receives (user text):
+
+```q64
+// Backend agent qube, deployed to qubepods; rpc.export: true.
+@channel_handler
+pub fn chat(session: Channel<str, str>) @wire + @inference {
+    for user_line in session {                       // inbound user text (Rx)
+        let toks = env.ai.complete(user_line)        // Stream<str> of model tokens
+        for_each(toks) |tok| { session.send(tok) }   // stream the reply back (Tx)
+    }                                                // loop ends when the user closes
+}
+```
+
+```q64
+// Frontend qube (browser); rpc.import = { "agent": "wrpc://…qubepods.app" }.
+// It holds the dual end — Channel<str, str>: send user text, receive agent text.
+fn main -> Result<(), Error> @wire {
+    let agent = connect<agent.chat>()                // over WebTransport
+    spawn {
+        for tok in agent { env.ui.append(tok) }      // render streamed agent text
+    }
+    for line in env.ui.lines() {
+        agent.send(line)                             // send each user line
+    }
+    Ok(())
+}
+```
+
+When emitted as a component, the `@channel_handler` export lowers to a wRPC
+world whose signature is the paired `stream<Tx>` / `stream<Rx>`
+([`rpc.md` §"Remote channels"](./rpc.md)); on qubepods it is served at the same
+per-qube endpoint as `wasi:http`, so one deployed agent qube is reachable as an
+HTTP page **and** a streaming channel. Browser↔qubepods rides WebTransport; the
+frontend never manages sockets. The `@inference` on `chat` is the same
+`env.ai` capability disclosed everywhere else — the agent's model use shows up
+in its derived capability set.
+
 ## `main` signature
 
 `main` may be declared two ways. Both are valid; the runtime
