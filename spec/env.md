@@ -154,6 +154,7 @@ shipped by the runtime are:
 | `env.random`  | `Rng`           | `@random`      | Cryptographically secure randomness.                           |
 | `env.net`     | `Net`           | `@network`     | HTTP, WebSocket, raw sockets. See `q64.net`.                   |
 | `env.fs`      | `Fs`            | `@fs`          | Filesystem read / write / list / watch. See `q64.fs`.          |
+| `env.kv`      | `KeyValue`      | `@kv`          | Key-value store: get / set / delete / list / atomics. See `q64.kv`. |
 | `env.audio`   | `Audio`         | `@audio`       | PCM input/output, audio worklets. See `q64.audio`.             |
 | `env.midi`    | `Midi`          | `@midi`        | MIDI input/output. See `q64.midi`.                             |
 | `env.ai`      | `AiEnv`         | `@inference`   | Model loading, inference, vocabularies. See `q64.ai`.          |
@@ -184,6 +185,27 @@ pub face Fs {
     fn read  (self, path: str)                -> Result<Bytes, IoError> @fs
     fn write (self, path: str, data: Bytes)   -> Result<(), IoError>    @fs
 }
+```
+
+A key-value store is the same shape. `env.kv` is already an **opened
+bucket**: the WASI `store.open(identifier)` step is performed by the host,
+which pins the bucket to the qube's identity (on qubepods: `org/project/app`),
+so user code never names a namespace and a qube cannot reach another tenant's
+keys. Keys are `str`; values are `Bytes`.
+
+```q64
+pub face KeyValue {
+    fn get       (self, key: str)               -> Result<Option<Bytes>, IoError> @kv
+    fn set       (self, key: str, value: Bytes)  -> Result<(), IoError>           @kv
+    fn delete    (self, key: str)                -> Result<(), IoError>           @kv
+    fn exists    (self, key: str)                -> Result<bool, IoError>         @kv
+    fn list      (self, cursor: Option<str>)     -> Result<KvPage, IoError>       @kv
+    fn increment (self, key: str, delta: i64)    -> Result<i64, IoError>          @kv
+    fn cas       (self, key: str, expected: Option<Bytes>, value: Bytes)
+                                                 -> Result<bool, IoError>         @kv
+}
+
+pub struct KvPage { keys: [str], cursor: Option<str> }   // cursor None = listing complete
 ```
 
 Effects compose with `+` per
@@ -268,6 +290,7 @@ every upstream RC release** until WASI 1.0:
 | `env.random`  | `Rng`      | `wasi:random/random` (+ `insecure-seed` for non-crypto) |
 | `env.net`     | `Net`      | `wasi:sockets/{tcp, udp, instance-network, ip-name-lookup}` + `wasi:http/handler` (outbound HTTP, imported) |
 | `env.fs`      | `Fs`       | `wasi:filesystem/{types, preopens}`                     |
+| `env.kv`      | `KeyValue` | `wasi:keyvalue/{store, atomics}` (separate WASI proposal — see note) |
 | `env.audio`   | `Audio`    | **no WASI equivalent** — host-specific custom WIT       |
 | `env.midi`    | `Midi`     | **no WASI equivalent** — host-specific custom WIT       |
 | `env.ui`      | `Ui`       | **no WASI equivalent** — host-specific custom WIT       |
@@ -279,6 +302,15 @@ The WASI version tracks the active target's `wasi` setting
 four capabilities with no WASI interface (`Audio`, `Midi`, `Ui`, `AiEnv`) are
 imported through custom WIT defined per runtime adapter (`runtime/<host>/`);
 they are q64-ecosystem interfaces, not WASI.
+
+`env.kv` is a third case: it maps to the **`wasi:keyvalue`** proposal
+(`store` + `atomics`) — real WASI (unlike the four above), but a separate
+WASI-CG package versioned **independently** of the pinned `wasip3` core
+snapshot. Its own version pin is recorded in the emitted component and
+surfaced by `qube audit`. The `store.open(identifier)` step is the host's,
+not the qube's: the runtime hands `env.kv` already bound to a bucket pinned
+to the qube's identity, which is how capability-scoped multi-tenancy works
+without the qube ever naming a namespace (qubepods pins it to `org/project/app`).
 
 ### Face method ↔ WIT function mapping
 
@@ -294,6 +326,9 @@ user code never sees:
 | `Fs.write(self, path: str, data: Bytes) -> Result<(), IoError>` | `wasi:filesystem/types.descriptor.write` |
 | `Net.get(self, url: Url) -> Result<Response, IoError>` | `wasi:http/handler.handle` (async; request/response via `wasi:http/types`, bodies as `stream<u8>`) |
 | `Stdout.write(self, s: str)`                          | `wasi:cli/stdout.get-stdout` → write to the returned `stream<u8>` |
+| `KeyValue.get(self, key: str) -> Result<Option<Bytes>, IoError>` | `wasi:keyvalue/store.bucket.get` (bucket handle held by the adapter) |
+| `KeyValue.set(self, key: str, value: Bytes) -> Result<(), IoError>` | `wasi:keyvalue/store.bucket.set` |
+| `KeyValue.increment(self, key: str, delta: i64) -> Result<i64, IoError>` | `wasi:keyvalue/atomics.increment` |
 
 Under WASIp3, byte I/O is the native canonical-ABI `stream<u8>`: stdout/stderr
 hand back a `stream<u8>` directly, and there is no `wasi:io/streams`
@@ -347,6 +382,65 @@ per-qube HTTPS endpoint: a qube built with `component: { emit: true, worlds:
 Component Model HTTP lifting (`wasmtime serve`, componentize-js / jco on
 Cloudflare Workers, or wasmCloud) with no qubepods-specific ABI. The same
 endpoint doubles as a wRPC server (see [`rpc.md`](./rpc.md)).
+
+### Channel entry point (`@channel_handler`)
+
+A qube can serve a **long-lived bidirectional stream** instead of a run-once
+`main` or a request/response `handle`. A `pub fn` carrying **`@channel_handler`**
+(per [`annotations.md`](./annotations.md)) receives a remote `Channel<Tx, Rx>`
+([`rpc.md` §"Remote channels"](./rpc.md)) as its session: it reads inbound
+messages and sends outbound ones until either side closes. The name is free.
+
+The motivating case is an **agent**: a text stream between a user (the frontend
+qube) and an agent (the backend qube). `Tx` is what the agent sends (assistant
+text); `Rx` is what it receives (user text):
+
+```q64
+// Backend agent qube, deployed to qubepods; rpc.export: true.
+@channel_handler
+pub fn chat(session: Channel<str, str>) @wire + @inference {
+    for user_line in session {                       // inbound user text (Rx)
+        let toks = env.ai.complete(user_line)        // Stream<str> of model tokens
+        for_each(toks) |tok| { session.send(tok) }   // stream the reply back (Tx)
+    }                                                // loop ends when the user closes
+}
+```
+
+```q64
+// Frontend qube (browser); rpc.import = { "agent": "wrpc://…qubepods.app" }.
+// It holds the dual end — Channel<str, str>: send user text, receive agent text.
+fn main -> Result<(), Error> @wire {
+    let agent = connect<agent.chat>()                // over WebTransport
+    spawn {
+        for tok in agent { env.ui.append(tok) }      // render streamed agent text
+    }
+    for line in env.ui.lines() {
+        agent.send(line)                             // send each user line
+    }
+    Ok(())
+}
+```
+
+When emitted as a component, the `@channel_handler` export lowers to a wRPC
+world whose signature is the paired `stream<Tx>` / `stream<Rx>`
+([`rpc.md` §"Remote channels"](./rpc.md)); on qubepods it is served at the same
+per-qube endpoint as `wasi:http`, so one deployed agent qube is reachable as an
+HTTP page **and** a streaming channel. Browser↔qubepods rides WebTransport; the
+frontend never manages sockets. The `@inference` on `chat` is the same
+`env.ai` capability disclosed everywhere else — the agent's model use shows up
+in its derived capability set.
+
+**Generative UI.** The streamed messages need not be plain text — the agent can
+emit **HTML on the fly** (the channel's `Tx` is just markup, or later a typed
+UI-update message), and the client renders each update live. Because that HTML
+is model-generated, and therefore untrusted, the client renders it in a
+**sandboxed surface** — a no-`allow-scripts` iframe — so the agent can paint the
+UI (a form to capture input, a table of `env.kv` values, a chart) without being
+able to run script in the user's page. The trust boundary is the renderer, not
+the source: static asset, stateless qube, and live agent all go through the same
+sandbox. On qubepods this is already concrete — the per-project test page
+renders a backend's HTML response in exactly such an iframe, so a qube (or a
+streaming agent) paints its own UI while the host stays in control.
 
 ## `main` signature
 
@@ -570,6 +664,7 @@ Two records of "what does this qube use" exist:
 |--------------|---------------------|
 | `@network`   | `Net`               |
 | `@fs`        | `Fs`                |
+| `@kv`        | `KeyValue`          |
 | `@audio`     | `Audio`             |
 | `@midi`      | `Midi`              |
 | `@ui`        | `Ui`                |
@@ -917,9 +1012,9 @@ OK fetcher@0.1.0 — capabilities verified [Net, Fs, Stdout]
   the synthesized capability parameters; `q64 show capabilities
   <qube>`, `q64 show denials <fn>`, the exit-code table for
   `main` Form 1.
-- [`modules.md`](./modules.md) — `Env`, `Net`, `Fs`, `Audio`,
-  `Midi`, `AiEnv`, `Ui`, `Clock`, `Rng`, `Stdout`, `Stderr`,
-  `ExitFn`, `with_capabilities` are auto-prelude. `env` is the
+- [`modules.md`](./modules.md) — `Env`, `Net`, `Fs`, `KeyValue`,
+  `KvPage`, `Audio`, `Midi`, `AiEnv`, `Ui`, `Clock`, `Rng`,
+  `Stdout`, `Stderr`, `ExitFn`, `with_capabilities` are auto-prelude. `env` is the
   ambient binding the runtime provides at program entry; it
   does not appear in the auto-prelude name list but is
   resolvable from every function body.
