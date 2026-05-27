@@ -430,6 +430,18 @@ frontend never manages sockets. The `@inference` on `chat` is the same
 `env.ai` capability disclosed everywhere else — the agent's model use shows up
 in its derived capability set.
 
+**Generative UI.** The streamed messages need not be plain text — the agent can
+emit **HTML on the fly** (the channel's `Tx` is just markup, or later a typed
+UI-update message), and the client renders each update live. Because that HTML
+is model-generated, and therefore untrusted, the client renders it in a
+**sandboxed surface** — a no-`allow-scripts` iframe — so the agent can paint the
+UI (a form to capture input, a table of `env.kv` values, a chart) without being
+able to run script in the user's page. The trust boundary is the renderer, not
+the source: static asset, stateless qube, and live agent all go through the same
+sandbox. On qubepods this is already concrete — the per-project test page
+renders a backend's HTML response in exactly such an iframe, so a qube (or a
+streaming agent) paints its own UI while the host stays in control.
+
 ## `main` signature
 
 `main` may be declared two ways. Both are valid; the runtime
