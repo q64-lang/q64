@@ -42,6 +42,10 @@ export const NAMESPACES = [
   "gfx",
   "video",
   "fs",
+  "layout",
+  "view",
+  "event",
+  "reactive",
 ] as const;
 
 export function qubeAvailable(): boolean {

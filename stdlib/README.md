@@ -8,16 +8,20 @@ The q64 standard library. A qube workspace; one qube per top-level namespace.
 
 ## Layout
 
-| Qube                                          | Surface                                                                            |
-|-----------------------------------------------|------------------------------------------------------------------------------------|
-| [`math/`](./math)   → `q64.math`              | `Vec`, `Mat`, `Quat`; linear algebra; FFT                                          |
-| [`anim/`](./anim)   → `q64.anim`              | `Transform`, `Keyframe`, `Curve`, `Bone`, skinning, IK                             |
-| [`ai/`](./ai)       → `q64.ai`                | `Vocab`, `Token<V, Repr>`, `Model<InV, OutV>`, sampling, decoding                  |
-| [`net/`](./net)     → `q64.net`               | `Url`, `Net`, `Request`, `Response`, HTTP, WebSocket                               |
-| [`audio/`](./audio) → `q64.audio`             | PCM streams, audio I/O, DSP                                                        |
-| [`gfx/`](./gfx)     → `q64.gfx`               | Graphics types, GPU bridging                                                       |
-| [`video/`](./video) → `q64.video`             | Video frame types, codec interfaces                                                |
-| [`fs/`](./fs)       → `q64.fs`                | Filesystem access via the `env.fs` capability                                      |
+| Qube                                              | Surface                                                                            |
+|---------------------------------------------------|------------------------------------------------------------------------------------|
+| [`math/`](./math)         → `q64.math`            | `Vec`, `Mat`, `Quat`; linear algebra; FFT                                          |
+| [`anim/`](./anim)         → `q64.anim`            | `Transform`, `Keyframe`, `Curve`, `Bone`, skinning, IK                             |
+| [`ai/`](./ai)             → `q64.ai`              | `Vocab`, `Token<V, Repr>`, `Model<InV, OutV>`, sampling, decoding                  |
+| [`net/`](./net)           → `q64.net`             | `Url`, `Net`, `Request`, `Response`, HTTP, WebSocket                               |
+| [`audio/`](./audio)       → `q64.audio`           | PCM streams, audio I/O, DSP                                                        |
+| [`gfx/`](./gfx)           → `q64.gfx`             | Graphics types, GPU bridging                                                       |
+| [`video/`](./video)       → `q64.video`           | Video frame types, codec interfaces                                                |
+| [`fs/`](./fs)             → `q64.fs`              | Filesystem access via the `env.fs` capability                                      |
+| [`layout/`](./layout)     → `q64.layout`          | `Rect`, `Constraint`, `IntrinsicSize`, `LayoutTree<N>`, `Solver`, `Diagnostics`    |
+| [`view/`](./view)         → `q64.view`            | `View`, `Container`, `Text`, `Image`, `Stack`, `Grid`, `Input`, `Button`, `Style`, `Renderer` |
+| [`event/`](./event)       → `q64.event`           | `Tap`, `Drag`, `Pinch`, `KeyPress`, `EventStream<T>`, `Gesture<T>`                 |
+| [`reactive/`](./reactive) → `q64.reactive`        | `Signal<T>`, `Memo<T>`, `Watch`                                                    |
 
 ## Language
 
