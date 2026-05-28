@@ -17,6 +17,7 @@ links the appropriate adapter for the target declared in `qube.json5`.
 | [`wasmtime/`](./wasmtime)                   | Wasmtime (server-side native)                   |
 | [`wasmer/`](./wasmer)                       | Wasmer (server-side native)                     |
 | [`audio-host/`](./audio-host)               | VST3 / AU / AAX audio plugin hosts              |
+| [`jsi/`](./jsi)                             | JSI-hosted shells — React Native and similar    |
 
 ## What each adapter does
 
@@ -30,6 +31,8 @@ the adapter encapsulates everything the user shouldn't see:
   shared linear memory wiring, WASI integration.
 - **Audio-host**: real-time-safe scheduling on the host's audio thread,
   lock-free FIFOs for parameter changes, parameter automation marshaling.
+- **JSI**: JSI bridge, WebSocket forwarding for wRPC, view-tree op
+  marshaling to a host-side renderer, input-as-streams lifting.
 
 What user code *does* see — `scope`, `spawn`, `channel<T>`, `select`,
 `Shared<T>`, `atomic<T>`, `actor`, `Signal<T>`, `Event<T>`, `Stream<T>` —
