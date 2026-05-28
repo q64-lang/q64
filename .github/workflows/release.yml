@@ -13,6 +13,16 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # PRs only run the `build` job (the `release` job's `if:` gates publishing
+  # to main + tags). This lets us validate init.sh + the Zig builds + the
+  # matrix on a PR without cutting a real release. Path-filtered so doc-only
+  # PRs don't burn CI minutes on a 5-minute Binaryen build.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'init.sh'
+      - 'q64/**'
+      - 'qube/**'
   workflow_dispatch:
 
 # Least-privilege default for a public repo: the build job runs read-only
