@@ -38,14 +38,17 @@ concurrency:
 
 jobs:
   build:
+    # Matrix is intentionally one entry: Cloudflare Containers (the consumer
+    # of these binaries via the qubepods builder container) schedule on
+    # x86_64 only today. Add `arch: arm64, runner: ubuntu-24.04-arm` back
+    # here (and pin WASMTIME_KNOWN_SHA256_aarch64_linux in init.sh) when CF
+    # arm64 containers ship or another consumer needs them.
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -116,12 +119,10 @@ jobs:
           set -euo pipefail
           mkdir -p release
           cp artifacts/q64-linux-amd64   release/
-          cp artifacts/q64-linux-arm64   release/
           cp artifacts/qube-linux-amd64  release/
-          cp artifacts/qube-linux-arm64  release/
 
-          # One combined SHA256SUMS over all four binaries.
-          ( cd release && sha256sum q64-linux-amd64 q64-linux-arm64 qube-linux-amd64 qube-linux-arm64 > SHA256SUMS )
+          # One combined SHA256SUMS over the published binaries.
+          ( cd release && sha256sum q64-linux-amd64 qube-linux-amd64 > SHA256SUMS )
 
           # Resolve release name + whether this is a prerelease.
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
@@ -149,12 +150,10 @@ jobs:
             "builtAt": "${built_at}",
             "binaries": {
               "q64": {
-                "linux-amd64": { "url": "${base_url}/q64-linux-amd64",  "sha256": "$(sha q64-linux-amd64)" },
-                "linux-arm64": { "url": "${base_url}/q64-linux-arm64",  "sha256": "$(sha q64-linux-arm64)" }
+                "linux-amd64": { "url": "${base_url}/q64-linux-amd64",  "sha256": "$(sha q64-linux-amd64)" }
               },
               "qube": {
-                "linux-amd64": { "url": "${base_url}/qube-linux-amd64", "sha256": "$(sha qube-linux-amd64)" },
-                "linux-arm64": { "url": "${base_url}/qube-linux-arm64", "sha256": "$(sha qube-linux-arm64)" }
+                "linux-amd64": { "url": "${base_url}/qube-linux-amd64", "sha256": "$(sha qube-linux-amd64)" }
               }
             }
           }
@@ -189,8 +188,6 @@ jobs:
             --notes "$notes" \
             $([ "${{ steps.assemble.outputs.prerelease }}" = "true" ] && echo --prerelease) \
             release/q64-linux-amd64 \
-            release/q64-linux-arm64 \
             release/qube-linux-amd64 \
-            release/qube-linux-arm64 \
             release/SHA256SUMS \
             release/manifest.json
