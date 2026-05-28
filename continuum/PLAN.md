@@ -34,7 +34,7 @@ captured here; open decisions flagged. Authoritative naming rules live in
 
 - **Publish:** OAuth (GitHub + Google). CLI uses a long-lived token issued post-OAuth.
 - **Download:** anonymous (npm/crates.io model).
-- **Admin:** email allowlist via `ADMIN_EMAILS` env. v0 defaults: `***`, `***`.
+- **Admin:** email allowlist via `ADMIN_EMAILS` env (comma-separated). Set per-deploy; no default ships in the example config.
 - **Identity redundancy at approval time:** verified primary OAuth email **plus** one of {linked second OAuth provider, WebAuthn passkey, GitHub identity binding}.
 
 ## Approval model (locked)
