@@ -31,7 +31,7 @@ with wire-crossing made visible in the type system.
    never serialized; only value types cross the wire.
 5. **Transport-agnostic.** wRPC abstracts the transport; each runtime
    adapter provides one (WebTransport in the browser, QUIC/TCP on native
-   hosts).
+   hosts, WebSocket on JSI shells).
 
 ## Vocabulary
 
@@ -40,7 +40,7 @@ with wire-crossing made visible in the type system.
 | **wRPC**   | The WIT-native RPC framework q64 targets. Dispatches against a `world`; transport-agnostic. |
 | **`@wire`** | The effect a remote call carries (per [`effects.md`](./effects.md)). Positive (capability-style); propagates up; implies `@io`. |
 | **remote world** | A remote qube's synthesized `world`, imported by a caller and invoked over wRPC. |
-| **transport** | The byte-moving layer beneath wRPC, supplied by the runtime adapter (WebTransport / QUIC / TCP / local IPC). |
+| **transport** | The byte-moving layer beneath wRPC, supplied by the runtime adapter (WebTransport / QUIC / TCP / WebSocket / local IPC). |
 | **endpoint** | The address (a `wrpc://…` URL or continuum-resolved qube name) at which a remote world is served. |
 
 ## Model
@@ -121,6 +121,7 @@ sees only typed calls.
 |------|-----------|
 | Browser (`runtime/browser`)   | **WebTransport** (HTTP/3 streams + datagrams) |
 | Wasmtime / Wasmer (native)    | **QUIC** preferred, **TCP** fallback          |
+| JSI (`runtime/jsi`)           | **WebSocket** (forwarded through the JS-side JSI bridge) |
 | (any)                         | local IPC for in-process / same-host calls    |
 
 The adapter owns connection setup, multiplexing, and reconnection. A
@@ -186,7 +187,13 @@ pub face Channel<Tx, Rx> {
 
 - **Backpressure is the wire's.** WebTransport (browser) / QUIC (native) stream
   flow control realizes `Backpressure` end to end: a slow reader pauses the
-  writer's `stream<T>`, with no unbounded application buffering.
+  writer's `stream<T>`, with no unbounded application buffering. The JSI
+  WebSocket transport rides a single TCP flow-control signal across the
+  socket, so all multiplexed `stream<T>` channels share one backpressure
+  budget — a slow reader on one logical stream applies backpressure to every
+  other stream on the same connection. This is correctness-preserving but
+  coarser; latency-sensitive channels should be opened on separate
+  WebSocket connections where this matters.
 - **Messages are value types.** `Tx` and `Rx` obey the §"Wire encoding" rule; a
   non-lowerable message type is `RPC010`.
 - **Establishment** mirrors §Model. The **exporter** receives the server end
