@@ -896,7 +896,7 @@ fn cmdLogin(
     const url = try std.fmt.allocPrint(gpa, "{s}/v1/auth/token", .{registry});
     defer gpa.free(url);
 
-    // v0: passwords are bypass-only ("***"); no need to JSON-escape yet.
+    // v0: passwords are bypass-only; no need to JSON-escape yet.
     const body = try std.fmt.allocPrint(
         gpa,
         \\{{"email":"{s}","password":"{s}","description":"qube login"}}

@@ -5,10 +5,9 @@ import { issueToken } from "../lib/tokens.ts";
 
 // =============================================================================
 // BYPASS — DELETE WHEN OAUTH LANDS.
-// Single hardcoded credential pair until GitHub/Google OAuth apps are wired.
-// =============================================================================
-const BYPASS_EMAIL = "***";
-const BYPASS_PASSWORD = "***";
+// Single credential pair until GitHub/Google OAuth apps are wired. Bypass is
+// disabled unless BOTH env vars are set per-deploy -- there are no defaults
+// in the source, so a fresh public-repo deploy ships with bypass off.
 // =============================================================================
 
 export const auth = new Hono<{ Bindings: Env }>();
@@ -18,6 +17,12 @@ export const auth = new Hono<{ Bindings: Env }>();
 // Returns: { token, id, expires_at, user: { id, username, email } }
 // Token is shown once; the CLI stores it locally in ~/.qube/credentials.toml.
 auth.post("/token", async (c) => {
+  const bypassEmail = (c.env.BYPASS_EMAIL ?? "").trim().toLowerCase();
+  const bypassPassword = c.env.BYPASS_PASSWORD ?? "";
+  if (!bypassEmail || !bypassPassword) {
+    return c.json({ code: "AUT503", message: "auth bypass not configured" }, 503);
+  }
+
   let body: { email?: string; password?: string; description?: string };
   try {
     body = await c.req.json();
@@ -27,7 +32,7 @@ auth.post("/token", async (c) => {
   const email = (body.email ?? "").trim().toLowerCase();
   const password = body.password ?? "";
 
-  if (email !== BYPASS_EMAIL || password !== BYPASS_PASSWORD) {
+  if (email !== bypassEmail || password !== bypassPassword) {
     return c.json({ code: "AUT401", message: "invalid credentials" }, 401);
   }
 

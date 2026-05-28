@@ -37,6 +37,7 @@
 
   "vars": {
     "ENV": "dev",
-    "ADMIN_EMAILS": "***,***"
+    // Comma-separated allowlist; set per-deploy in your own wrangler.jsonc.
+    "ADMIN_EMAILS": ""
   }
 }
