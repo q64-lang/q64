@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://q64.dev/sitemap-index.xml

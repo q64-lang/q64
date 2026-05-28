@@ -1,0 +1,343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://q64.dev/schema/qube.json5",
+  "title": "Qube manifest",
+  "description": "Manifest schema for q64 qubes (qube.json5). Status: draft (v0).",
+  "type": "object",
+  "required": ["name", "version", "license"],
+  "additionalProperties": false,
+
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri",
+      "description": "Reference to this schema. Recommended at the top of every manifest for free editor tooling."
+    },
+
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Dotted name; each '.'-separated segment is a lowercase identifier [a-z][a-z0-9_]* (snake_case, no dashes). The name is also the module path. Publishable (library/application) qubes must use a reverse-DNS form with at least two segments, e.g. 'dev.q64.webmcp_client', 'com.acme.widget'; this is enforced at publish. 'q64.*' is reserved for the built-in stdlib. A single-segment name is permitted only for an unpublished workspace root."
+    },
+
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
+      "description": "Semantic version (https://semver.org)."
+    },
+
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SPDX license expression (e.g. 'MIT', 'Apache-2.0', 'MIT OR Apache-2.0')."
+    },
+
+    "description": {
+      "type": "string",
+      "maxLength": 280,
+      "description": "Short one-line summary shown on the registry."
+    },
+
+    "authors": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Authors as 'Name <email>' or just 'Name'."
+    },
+
+    "repository": { "type": "string", "format": "uri" },
+    "homepage":   { "type": "string", "format": "uri" },
+    "documentation": { "type": "string", "format": "uri" },
+
+    "readme": {
+      "type": "string",
+      "description": "Path (relative to qube.json5) to a README rendered on the registry. Defaults to 'README.md' if present."
+    },
+
+    "keywords": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$", "maxLength": 32 },
+      "maxItems": 8,
+      "description": "Short keywords for registry search."
+    },
+
+    "categories": {
+      "type": "array",
+      "items": { "type": "string" },
+      "maxItems": 5,
+      "description": "Registry categories. Closed vocabulary published by the registry."
+    },
+
+    "type": {
+      "enum": ["library", "application", "workspace"],
+      "description": "Qube kind. 'library' is the default for 'src/lib.q', 'application' for 'src/main.q', 'workspace' for multi-qube roots."
+    },
+
+    "entry": {
+      "type": "string",
+      "description": "Path to the main .q source file. Defaults to 'src/lib.q' (library) or 'src/main.q' (application)."
+    },
+
+    "build": {
+      "type": "string",
+      "description": "Optional path to a 'build.q' escape hatch for computed configuration."
+    },
+
+    "dependencies":       { "$ref": "#/$defs/DepMap" },
+    "dev-dependencies":   { "$ref": "#/$defs/DepMap" },
+    "build-dependencies": { "$ref": "#/$defs/DepMap" },
+
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Only valid when 'type' is 'workspace'.",
+      "properties": {
+        "members": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns for member qube directories."
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+
+    "targets": {
+      "type": "object",
+      "description": "Named build targets. Each key is a user-chosen target name; the value is a TargetConfig.",
+      "patternProperties": {
+        "^[a-z][a-z0-9_-]*$": { "$ref": "#/$defs/TargetConfig" }
+      },
+      "additionalProperties": false
+    },
+
+    "effects": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "declared": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EffectMarker" },
+          "description": "Effects this qube uses, declared explicitly. Computed by the compiler from source; declaring them here documents intent and catches drift."
+        },
+        "deny": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EffectMarker" },
+          "description": "Effects this qube refuses to pull in transitively. Build fails if any dependency requires a denied effect."
+        }
+      }
+    },
+
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CapabilityName" },
+      "description": "Runtime capabilities this qube reaches (Net, Fs, Audio, Midi, Ui, AiEnv, Clock, Rng, Stdout, Stderr). Cross-checked at `qube publish` against the compiler-derived set from the effect graph; mismatch is ENV040. See spec/env.md."
+    },
+
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Opt-in WebAssembly Component Model emission. The default build produces a core module; this requests an additional component wrapper. See spec/qube.json5.md §Component and spec/modules.md.",
+      "properties": {
+        "emit": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, `qube build` also emits target/<host>/<name>.component.wasm wrapping the core module. The core module remains the primary artifact."
+        },
+        "world": {
+          "type": "string",
+          "description": "Name of the synthesized WIT world (exports = public surface, imports = derived capability set). Defaults to the qube name."
+        },
+        "worlds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional standard worlds the component targets, e.g. wasi:cli/command, wasi:http/proxy."
+        }
+      }
+    },
+
+    "rpc": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Qube-to-qube RPC over the synthesized component world (wRPC). Requires component.emit. See spec/rpc.md.",
+      "properties": {
+        "export": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, the component's exports are served over wRPC by the host adapter."
+        },
+        "import": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Maps a remote qube's local binding name to its wRPC address (a wrpc:// URL or continuum-resolved qube name). Calls into an imported remote function carry the @wire effect."
+        }
+      }
+    },
+
+    "publish": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether this qube can be published. Set false to prevent accidental upload (private, internal)."
+    },
+
+    "registry": {
+      "type": "string",
+      "format": "uri",
+      "description": "Registry URL. Defaults to the continuum production URL configured by the qube CLI."
+    },
+
+    "include": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "File globs included in the published archive. Overrides defaults when present."
+    },
+
+    "exclude": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "File globs excluded from the published archive. Applied on top of defaults and 'include'."
+    }
+  },
+
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "workspace" } }, "required": ["type"] },
+      "then": { "required": ["workspace"] }
+    }
+  ],
+
+  "$defs": {
+    "DepMap": {
+      "type": "object",
+      "description": "Map of dependency name to version specifier.",
+      "patternProperties": {
+        "^([a-z][a-z0-9_-]*/)?[a-z][a-z0-9_-]*$": { "$ref": "#/$defs/VersionSpec" }
+      },
+      "additionalProperties": false
+    },
+
+    "VersionSpec": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Semver range, e.g. '^1.2.3', '~0.5', '>=2.0 <3.0'."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version":  { "type": "string", "description": "Semver range (omit when 'path' or 'git' is set)." },
+            "registry": { "type": "string", "format": "uri", "description": "Override registry for this dependency." },
+            "path":     { "type": "string", "description": "Path to a local qube (for workspace / dev)." },
+            "git":      { "type": "string", "format": "uri", "description": "Git URL." },
+            "branch":   { "type": "string" },
+            "tag":      { "type": "string" },
+            "rev":      { "type": "string" },
+            "features": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Feature flags to enable on the dependency."
+            },
+            "default-features": { "type": "boolean", "default": true },
+            "optional": { "type": "boolean", "default": false }
+          },
+          "oneOf": [
+            { "required": ["version"] },
+            { "required": ["path"] },
+            { "required": ["git"] }
+          ]
+        }
+      ]
+    },
+
+    "TargetConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host"],
+      "properties": {
+        "host": {
+          "enum": ["browser", "wasmtime", "wasmer", "audio-host", "custom"],
+          "description": "Target host. Determines which runtime adapter ships alongside the wasm output."
+        },
+        "optimize": {
+          "enum": ["debug", "size", "speed"],
+          "default": "speed"
+        },
+        "wasm": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Wasm 3.0 feature toggles. All default true; setting false produces a build error if any source uses the disabled feature.",
+          "properties": {
+            "memory64":       { "type": "boolean", "default": true },
+            "multi-memory":   { "type": "boolean", "default": true },
+            "table64":        { "type": "boolean", "default": true },
+            "gc":             { "type": "boolean", "default": true },
+            "threads":        { "type": "boolean", "default": true },
+            "stack-switching":{ "type": "boolean", "default": true },
+            "simd":           { "type": "boolean", "default": true }
+          }
+        },
+        "browser": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Browser-host-only configuration.",
+          "properties": {
+            "coop": {
+              "type": "string",
+              "enum": ["same-origin", "same-origin-allow-popups", "unsafe-none"],
+              "default": "same-origin",
+              "description": "Cross-Origin-Opener-Policy header for the dev server."
+            },
+            "coep": {
+              "type": "string",
+              "enum": ["require-corp", "credentialless", "unsafe-none"],
+              "default": "require-corp",
+              "description": "Cross-Origin-Embedder-Policy header for the dev server."
+            },
+            "dev-server-port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "wasmtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "wasi": { "enum": ["preview1", "preview3"], "default": "preview3" }
+          }
+        },
+        "wasmer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "wasi":  { "enum": ["preview1", "preview3", "wasix"], "default": "preview3" }
+          }
+        },
+        "audio-host": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "formats": {
+              "type": "array",
+              "items": { "enum": ["vst3", "au", "aax", "clap"] },
+              "minItems": 1
+            }
+          }
+        }
+      }
+    },
+
+    "EffectMarker": {
+      "type": "string",
+      "pattern": "^@[a-z][a-z_]*$",
+      "description": "Effect marker. Core set: @realtime, @no_alloc, @no_suspend, @no_panic, @no_trap, @send, @pure, @io, @network, @fs, @stdout, @stderr, @audio, @midi, @ui, @inference, @time, @random, @exit, @envvars, @wire, @cancel, @uncancellable. User-defined effects are allowed and follow the same shape."
+    },
+
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Za-z0-9]*$",
+      "description": "Capability face name (PascalCase). Core set: Net, Fs, Audio, Midi, Ui, AiEnv, Clock, Rng, Stdout, Stderr, ExitFn, EnvVars. User-defined capabilities (e.g. an MQTT adapter) follow the same shape."
+    }
+  }
+}

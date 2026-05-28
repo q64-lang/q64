@@ -1,0 +1,10 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "testspace",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "workspace",
+  "workspace": {
+    "members": ["alpha", "beta"],
+  },
+}

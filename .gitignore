@@ -1,0 +1,36 @@
+# Zig
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Pinned toolchain + runtime libs installed by init.sh
+vendor/zig/
+vendor/wasmtime/
+vendor/binaryen/
+
+# Node / Astro / web tooling
+node_modules/
+.astro/
+dist/
+.cache/
+.wrangler/
+.dev.vars
+.env
+.env.local
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Build outputs
+*.wasm
+!stdlib/**/*.wasm
+*.o
+*.obj
+/q64/zig-out/
+/q64/.zig-cache/
+/runtime/wasmtime/zig-out/
+/runtime/wasmtime/.zig-cache/

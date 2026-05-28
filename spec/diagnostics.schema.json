@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://q64.dev/schema/diagnostics.json",
+  "title": "Diagnostic envelope",
+  "description": "Structured diagnostic format emitted by q64 toolchain binaries. Status: draft (v0).",
+  "type": "object",
+  "required": ["ok", "diagnostics"],
+  "additionalProperties": false,
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "description": "True when no 'error'-severity diagnostic is present."
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Diagnostic" }
+    }
+  },
+
+  "$defs": {
+    "Diagnostic": {
+      "type": "object",
+      "required": ["code", "severity", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z]{2,4}\\d{3,4}$",
+          "description": "Subsystem prefix + numeric suffix; e.g. TYP041, Q9001."
+        },
+        "severity": {
+          "enum": ["error", "warning", "note", "help", "internal"]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "description": "Subclass within a code namespace; e.g. 'ice' for Q9xxx."
+        },
+        "location": { "$ref": "#/$defs/Location" },
+        "labels": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Label" }
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "repair": { "$ref": "#/$defs/Repair" },
+        "context": {
+          "type": "object",
+          "description": "Tool version / build / platform info; standard on 'internal' severity.",
+          "additionalProperties": true,
+          "properties": {
+            "tool":     { "type": "string" },
+            "version":  { "type": "string" },
+            "build":    { "type": "string" },
+            "platform": { "type": "string" }
+          }
+        },
+        "trace": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Tool-internal call trace; standard on 'internal' severity."
+        }
+      }
+    },
+
+    "Location": {
+      "type": "object",
+      "required": ["file", "line", "col"],
+      "additionalProperties": false,
+      "properties": {
+        "file":     { "type": "string", "minLength": 1 },
+        "line":     { "type": "integer", "minimum": 1 },
+        "col":      { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "end_col":  { "type": "integer", "minimum": 1 }
+      }
+    },
+
+    "Label": {
+      "type": "object",
+      "required": ["location", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "location": { "$ref": "#/$defs/Location" },
+        "message":  { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "Repair": {
+      "type": "object",
+      "required": ["id", "safety"],
+      "additionalProperties": false,
+      "properties": {
+        "id":         { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "safety":     { "enum": ["safe", "unsafe", "n/a"] },
+        "edits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["location", "replacement"],
+            "additionalProperties": false,
+            "properties": {
+              "location":    { "$ref": "#/$defs/Location" },
+              "replacement": { "type": "string" }
+            }
+          }
+        },
+        "report_url": { "type": "string", "format": "uri" }
+      }
+    }
+  }
+}

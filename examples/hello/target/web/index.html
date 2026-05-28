@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>q64 test — hello</title>
+    <style>
+        body  { font-family: system-ui, sans-serif; margin: 2rem; max-width: 48rem; }
+        h1    { margin-bottom: 0.25rem; }
+        .meta { color: #666; font-size: 0.875rem; margin-bottom: 1.5rem; }
+        .meta code { background: #f4f4f4; padding: 0.05rem 0.3rem; border-radius: 3px; }
+        pre   { background: #f4f4f4; padding: 1rem; border-radius: 6px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>q64 test</h1>
+    <div class="meta">
+        qube <code>hello</code> v0.0.0
+        &middot; compiler q64 0.0.1 (pre-alpha)
+        &middot; cli qube 0.0.1 (pre-alpha)
+    </div>
+    <pre id="out"></pre>
+    <script type="module">
+        import { runWasm } from "./host.js";
+        const out = document.getElementById("out");
+        try {
+            await runWasm("./hello.wasm", (text) => { out.textContent += text; });
+        } catch (e) {
+            out.textContent = `error: ${e.message ?? e}`;
+        }
+    </script>
+</body>
+</html>

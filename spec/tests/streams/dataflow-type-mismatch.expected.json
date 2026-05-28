@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "STR020", "severity": "error" }
+  ]
+}

@@ -1,0 +1,6 @@
+# Copy to .dev.vars for `wrangler dev`. Do not commit .dev.vars.
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+SESSION_SECRET=
