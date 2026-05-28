@@ -123,9 +123,14 @@ pub const Expr = union(enum) {
     /// A call to another function, resolved to its `FuncId`.
     call: struct { func: FuncId, args: []const *Expr },
     /// A runtime string concatenation (interpolation with dynamic pieces).
-    /// Each piece is a `str` value: a `str_const` run, a `local` parameter, or
-    /// a `call`.
+    /// Each piece is a `str` value: a `str_const` run, a `local` parameter, a
+    /// `call`, an `fmt_int` of an i64, or a `str_binding`.
     concat: []const *Expr,
     /// The `str` value of a runtime binding, read from its two locals.
     str_binding: struct { ptr_idx: u32, len_idx: u32 },
+    /// The decimal `str` of an i64 value (the high-level form of `__fmt_i64`).
+    /// Used as a concat piece when an i64 binding appears in interpolation, and
+    /// as the value of an `env.out(<i64>)` would be — but `host_out_int` is the
+    /// shorter path for the latter, so `fmt_int` only appears inside `concat`.
+    fmt_int: *Expr,
 };

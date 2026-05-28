@@ -423,6 +423,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
             break :blk false;
         },
         .str_bind => |sb| bodyHasOut(sb.value, want_int),
+        .fmt_int_to_str => |inner| want_int or bodyHasOut(inner, want_int),
         .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -437,13 +438,16 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
     switch (inst.op) {
         .str_concat => |pieces| {
             s.has_concat = true;
-            var calls: u32 = 0;
+            // A `call` and an `fmt_int_to_str` piece each return a (ptr, len)
+            // tuple that needs one tuple slot at the concat's call site.
+            var tuples: u32 = 0;
             for (pieces) |p| {
-                if (p.op == .call) calls += 1;
+                if (p.op == .call or p.op == .fmt_int_to_str) tuples += 1;
                 scanScratch(p, s);
             }
-            if (calls > s.max_tuples) s.max_tuples = calls;
+            if (tuples > s.max_tuples) s.max_tuples = tuples;
         },
+        .fmt_int_to_str => |inner| scanScratch(inner, s),
         .host_out_int => |h| {
             s.host_out = true;
             scanScratch(h.value, s);
@@ -583,6 +587,12 @@ const Lowerer = struct {
                 return self.hostOutPair(fmt, @intCast(hi.nl_off));
             },
             .host_out_str => |hs| return self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)),
+            .fmt_int_to_str => |inner| {
+                // __fmt_i64(value) → (ptr, len). The (pair) result is the str
+                // value; the caller consumes it just like any str-typed inst.
+                var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(inner)};
+                return c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
+            },
             .if_ => |iff| {
                 const cond = try self.inst(iff.cond);
                 const then_ = try self.inst(iff.then_);
@@ -688,11 +698,16 @@ const Lowerer = struct {
             }
         };
 
-        // 1. Evaluate each call piece into its tuple slot.
+        // 1. Evaluate each tuple-returning piece (call / fmt_int_to_str) into
+        // its tuple slot. (str_param, str_binding, str_const_val don't need a
+        // slot — they're computed inline below.)
         var j: c.BinaryenIndex = 0;
-        for (pieces) |p| if (p.op == .call) {
-            try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx + j, try self.inst(p)));
-            j += 1;
+        for (pieces) |p| switch (p.op) {
+            .call, .fmt_int_to_str => {
+                try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx + j, try self.inst(p)));
+                j += 1;
+            },
+            else => {},
         };
 
         // 2. len = constant total + each dynamic piece's length.
@@ -704,7 +719,7 @@ const Lowerer = struct {
         var total = k.cst(m, @intCast(const_total));
         j = 0;
         for (pieces) |p| switch (p.op) {
-            .call => {
+            .call, .fmt_int_to_str => {
                 total = c.BinaryenBinary(m, c.BinaryenAddInt64(), total, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1));
                 j += 1;
             },
@@ -742,7 +757,7 @@ const Lowerer = struct {
                     ln = c.BinaryenLocalGet(m, sb.len_idx, i64t);
                     ln2 = c.BinaryenLocalGet(m, sb.len_idx, i64t);
                 },
-                .call => {
+                .call, .fmt_int_to_str => {
                     src = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 0);
                     ln = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1);
                     ln2 = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1);

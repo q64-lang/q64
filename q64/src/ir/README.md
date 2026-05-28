@@ -9,10 +9,13 @@ and only `codegen/` turns that into Binaryen/WASM.
 > [`codegen/emit.zig`](../codegen/emit.zig) sends the constructs the IR can
 > already lower through `AST → HIR → MIR → Binaryen`, and falls back to the
 > legacy direct `AST → Binaryen` emitter for the rest, so the build stays green
-> at every step. Today the IR path handles `fn main` whose body is
-> `env.out("<constant string>")`; each migration phase teaches it one more
-> construct (see the project plan). `Q64_IR_STRICT=1` turns a fallback into a
-> panic, to prove a phase's coverage.
+> at every step. Today the IR path handles `fn main` with `env.out(…)` of
+> constants, runtime str values (calls + bindings + interpolation), and i64
+> values (calls + bindings + interpolation), plus the i64 functions (with
+> arithmetic, control flow, and recursion) and str functions (const/pass-
+> through/concat bodies) it transitively calls; each migration phase teaches
+> it one more construct (see the project plan). `Q64_IR_STRICT=1` turns a
+> fallback into a panic, to prove a phase's coverage.
 
 ## The two tiers
 
