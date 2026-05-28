@@ -242,7 +242,7 @@ concatenation for interpolation.
   `/opt/homebrew/bin/zig` has different `std.Io` APIs). The login command had
   stale `takeDelimiterExclusive`/`readAllAlloc` calls fixed this session to
   match the pinned zig — watch for the same drift elsewhere.
-- Deploy the registry: `cd continuum-api && CLOUDFLARE_ACCOUNT_ID=*** pnpm run deploy` (needs `wrangler login`, account ***).
+- Deploy the registry: `cd continuum-api && CLOUDFLARE_ACCOUNT_ID=<your-account-id> pnpm run deploy` (needs `wrangler login`).
 - Registry auth is a pre-OAuth dev bypass at `POST /v1/auth/token`; credentials are set per-deploy via `BYPASS_EMAIL` + `BYPASS_PASSWORD` env vars (bypass returns 503 if either is unset). Route lives in `continuum-api/src/routes/auth.ts`; delete when OAuth lands.
 
 ## Q64 IR — two-tier backend-neutral IR (HIR/MIR) — ACTIVE
