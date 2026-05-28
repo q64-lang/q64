@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "ENV055", "severity": "error" }
+  ]
+}

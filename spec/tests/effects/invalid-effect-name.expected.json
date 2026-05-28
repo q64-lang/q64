@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "EFF141", "severity": "error" }
+  ]
+}

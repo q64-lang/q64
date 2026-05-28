@@ -1,0 +1,66 @@
+// Brand tokens for q64. Machine-readable companion to brand-sheet.png.
+// Whenever the sheet is updated, this file gets regenerated.
+//
+// Consumed by web/src/styles/ (CSS custom properties), q64-cli
+// splash output, and any downstream brand-aware tooling.
+
+{
+  name: "q64",
+  tagline: {
+    primary: "COMPILE. RUN. EVERYWHERE.",
+    subline: "A modern toolchain for WebAssembly and beyond.",
+  },
+
+  palette: {
+    // Deep-space neutrals (darkest → lightest)
+    bg_0:        "#0B0B0F", // page background
+    bg_1:        "#111117", // panel background
+    bg_2:        "#1E1E26", // raised surface
+    bg_3:        "#2B2B36", // hover / border
+
+    // Foreground
+    fg:          "#FFFFFF", // headlines, primary text on dark
+
+    // Accents
+    cyan:        "#B9F0FF", // links, code highlights
+    violet:      "#CBA6FF", // primary brand accent — the "Q glow"
+    teal:        "#7CF5D4", // packages glyph, success states
+    amber:       "#FFD36E", // build glyph, warnings, callouts
+  },
+
+  // Semantic mapping over the palette — what the colors *mean*
+  semantic: {
+    primary:     "violet",
+    secondary:   "cyan",
+    success:     "teal",
+    warning:     "amber",
+    surface:     "bg_1",
+    surface_alt: "bg_2",
+    text:        "fg",
+    text_muted:  "bg_3",
+  },
+
+  // Icon set (from the brand sheet's ICON SET row)
+  icons: {
+    compiler: { glyph: "hex-arrows",  color: "violet" },
+    runtime:  { glyph: "planet-ring", color: "violet" },
+    packages: { glyph: "cube-iso",    color: "teal"   },
+    build:    { glyph: "starburst",   color: "violet" },
+  },
+
+  // Mascot
+  mascot: {
+    name: "Omniscient Observer",
+    inspiration: "Q (Star Trek: TNG)",
+    description: "Hooded figure with a glowing Q-marked head, hands outstretched against a particle field. Stylized: not a literal Q character.",
+    tagline_voice: "An omniscient observer. Beyond time, beyond systems. Here to empower builders.",
+  },
+
+  // Logo-mark constraints
+  marks: {
+    construction: "A capital Q with a hexagonal / tesseract projection inscribed inside the counterform.",
+    backgrounds_allowed: ["deep-space", "white-surface", "violet-tint"],
+    minimum_size_px: 24,
+    clear_space_factor: 0.5,  // multiples of the Q's cap-height around the mark
+  },
+}

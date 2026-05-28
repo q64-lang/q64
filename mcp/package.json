@@ -1,0 +1,16 @@
+{
+  "name": "q64-mcp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260523.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.94.0"
+  }
+}
