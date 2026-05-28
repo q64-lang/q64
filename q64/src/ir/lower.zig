@@ -100,6 +100,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             return mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, e), .nl_off = nl } });
         },
         .str_let => |sl| return mk(ctx.a, .void, .{ .str_bind = .{ .ptr_idx = sl.ptr_idx, .len_idx = sl.len_idx, .value = try lowerStrExpr(ctx, sl.value) } }),
+        .let => |l| return mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } }),
         else => unreachable, // main has no value/tail statements
     }
 }
@@ -158,6 +159,7 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             return mk(ctx.a, .str, .{ .str_concat = ps });
         },
         .str_binding => |sb| return mk(ctx.a, .str, .{ .str_binding = .{ .ptr_idx = sb.ptr_idx, .len_idx = sb.len_idx } }),
+        .fmt_int => |inner| return mk(ctx.a, .str, .{ .fmt_int_to_str = try lowerExpr(ctx, inner) }),
         else => return error.Unsupported,
     }
 }
@@ -264,7 +266,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             for (cl.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
             return mk(ctx.a, .i64, .{ .call = .{ .func = cl.func, .args = args } });
         },
-        .str_const, .concat, .str_binding => unreachable, // str values never reach the i64 path
+        .str_const, .concat, .str_binding, .fmt_int => unreachable, // str values never reach the i64 path
     }
 }
 
@@ -318,4 +320,78 @@ test "lower: literals fold into the memory image with newlines" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_const off=0 len=4") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_const off=4 len=4") != null);
+}
+
+const TestResolver = struct {
+    a: std.mem.Allocator,
+    results: std.ArrayList(parser.parse.Result) = .empty,
+
+    fn deinit(self: *TestResolver) void {
+        for (self.results.items) |r| r.deinit(self.a);
+        self.results.deinit(self.a);
+    }
+    fn addLib(self: *TestResolver, src: []const u8) !void {
+        try self.results.append(self.a, try parser.parse.parse(self.a, src, "<lib>"));
+    }
+    fn lookup(ctx: *anyopaque, name: []const u8) ?parser.ast.FnDecl {
+        const self: *TestResolver = @ptrCast(@alignCast(ctx));
+        for (self.results.items) |r| {
+            const sf = parser.ast.SourceFile.cast(r.root) orelse continue;
+            var it = sf.items();
+            while (it.next()) |item| switch (item) {
+                .fn_decl => |fd| {
+                    const nm = fd.name() orelse continue;
+                    if (std.mem.eql(u8, nm.text, name)) return fd;
+                },
+                else => {},
+            };
+        }
+        return null;
+    }
+    fn resolver(self: *TestResolver) hir.ModuleResolver {
+        return .{ .ctx = self, .lookupFn = TestResolver.lookup };
+    }
+};
+
+test "lower: an i64 binding in main becomes a local_set in _start" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn double(n: i64) -> i64 { n + n }\n");
+
+    const pr = try parser.parse.parse(testing.allocator,
+        "fn main {\n let a = double(21)\n env.out(a)\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())).?;
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    // The entry has a `local_set 0` from the call's result, then a host_out_int.
+    try testing.expect(std.mem.indexOf(u8, dump, "local_set 0") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null);
+}
+
+test "lower: i64 binding interpolation lowers to fmt_int_to_str inside str_concat" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn double(n: i64) -> i64 { n + n }\n");
+
+    const pr = try parser.parse.parse(testing.allocator,
+        "fn main {\n let a = double(21)\n env.out(\"a={a}\")\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())).?;
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_concat") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_int_to_str") != null);
+    // The fmt_int_to_str wraps a local_get of the binding's local (idx 0).
+    try testing.expect(std.mem.indexOf(u8, dump, "local_get 0") != null);
 }

@@ -9,11 +9,14 @@
 //! yet represent (signalled internally by `error.Unsupported`), so the
 //! `codegen/emit.zig` router falls back to the legacy AST→Binaryen path.
 //! Handled today:
-//!   - `fn main` whose statements are `env.out("<const string>")` and
-//!     `env.out(<i64 expression>)`;
-//!   - the transitively-called i64 functions, whose bodies are a single
-//!     arithmetic/call tail expression (no in-body bindings or control flow
-//!     yet — those land in the next phase).
+//!   - `fn main` whose statements are `env.out(<expr>)` and runtime `let`
+//!     bindings (str and i64), with interpolation in literals mixing const
+//!     runs, str bindings, str-returning calls, and i64 bindings (formatted
+//!     by `__fmt_i64` via `fmt_int`);
+//!   - the transitively-called i64 functions (arithmetic, control flow,
+//!     in-body bindings, recursion);
+//!   - the transitively-called str functions (const-string, passthrough,
+//!     and concat bodies built from str parameters).
 
 const std = @import("std");
 const parser = @import("parser");
@@ -122,7 +125,21 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
                 try stmts.append(b.a, st);
-            } else return error.Unsupported; // runtime i64 binding: later
+            } else {
+                // A runtime i64 binding (`let a = double(21)`, `let b = a + 1`).
+                // Build the initializer first so it can't see its own name,
+                // then allocate a single i64 local and register in mscope so
+                // later i64 expressions can resolve it. The local index is the
+                // current size of `main_locals` (str bindings take two slots
+                // each, i64 bindings take one — the same shared index space).
+                mscope.next_idx = @intCast(b.main_locals.items.len);
+                const value = try buildIntExpr(b, init_expr, &mscope);
+                const idx = try mscope.declare(nm.text, ls.isVar(), .i64);
+                try b.main_locals.append(b.a, .i64);
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .let = .{ .idx = idx, .value = value } };
+                try stmts.append(b.a, st);
+            }
         },
         .expr_stmt => |es| {
             const expr = es.expression() orelse return error.Unsupported;
@@ -191,7 +208,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         while (pit.next()) |p| {
             if (!(try paramIsI64(b.a, p))) return error.Unsupported;
             const pn = (p.name() orelse return error.Unsupported).text;
-            _ = try scope.declare(pn, false);
+            _ = try scope.declare(pn, false, .i64);
             try params.append(b.a, .{ .name = pn, .ty = .i64 });
         }
     }
@@ -227,7 +244,7 @@ fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir
         while (pit.next()) |p| {
             if (!(try paramIsStr(b.a, p))) return error.Unsupported; // all-str params for now
             const pn = (p.name() orelse return error.Unsupported).text;
-            _ = try scope.declare(pn, false);
+            _ = try scope.declare(pn, false, .str);
             try params.append(b.a, .{ .name = pn, .ty = .str });
         }
     }
@@ -272,6 +289,7 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             const txt = try p.text(b.a);
             defer b.a.free(txt);
             if (scope.find(txt)) |loc| {
+                if (loc.ty != .str) return error.Unsupported; // an i64 local in a str position
                 out.* = .{ .local = loc.idx };
             } else if (rtBinding(rt, txt)) |bnd| {
                 out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
@@ -298,6 +316,8 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
     return out;
 }
 
+
+
 /// Build a `str` argument at a call site: a compile-time constant (a literal
 /// or a const-bodied call like `vshout()`) folds to a `str_const`; a bare
 /// parameter passes through, and a runtime str binding passes by reference.
@@ -315,6 +335,7 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) Bui
             const txt = try p.text(b.a);
             defer b.a.free(txt);
             if (scope.find(txt)) |loc| {
+                if (loc.ty != .str) return error.Unsupported; // an i64 local in a str arg slot
                 out.* = .{ .local = loc.idx };
             } else if (rtBinding(rt, txt)) |bnd| {
                 out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
@@ -394,9 +415,17 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                     defer b.a.free(ptext);
                     if (scope.find(ptext)) |loc| {
                         try flush(b, &lit, &pieces);
-                        const e = try b.a.create(hir.Expr);
-                        e.* = .{ .local = loc.idx };
-                        try pieces.append(b.a, e);
+                        const piece = try b.a.create(hir.Expr);
+                        // A str local (callee param) passes through as-is; an
+                        // i64 local interpolates as its decimal text.
+                        if (loc.ty == .str) {
+                            piece.* = .{ .local = loc.idx };
+                        } else {
+                            const inner = try b.a.create(hir.Expr);
+                            inner.* = .{ .local = loc.idx };
+                            piece.* = .{ .fmt_int = inner };
+                        }
+                        try pieces.append(b.a, piece);
                     } else if (rtBinding(rt, ptext)) |bnd| {
                         try flush(b, &lit, &pieces);
                         const e = try b.a.create(hir.Expr);
@@ -479,10 +508,12 @@ fn paramIsStr(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
     return typeNamed(a, te, "str");
 }
 
-/// Name → local-index resolution for an i64 function body. Append-only with
-/// a backward scan (latest declaration wins), mirroring the legacy IntScope:
-/// parameters first, then in-body `let`/`var` in declaration order.
-const Local = struct { name: []const u8, idx: u32, mutable: bool };
+/// Name → local-index resolution for a function body. Append-only with a
+/// backward scan (latest declaration wins), mirroring the legacy IntScope:
+/// parameters first, then in-body `let`/`var` in declaration order. `ty`
+/// distinguishes an i64 local (a callee i64 parameter / `let`, or one of
+/// main's i64 bindings) from a `str` local (a callee str parameter).
+const Local = struct { name: []const u8, idx: u32, mutable: bool, ty: hir.Type = .i64 };
 const Scope = struct {
     a: std.mem.Allocator,
     locals: std.ArrayList(Local) = .empty,
@@ -497,9 +528,9 @@ const Scope = struct {
         }
         return null;
     }
-    fn declare(self: *Scope, name: []const u8, mutable: bool) BuildError!u32 {
+    fn declare(self: *Scope, name: []const u8, mutable: bool, ty: hir.Type) BuildError!u32 {
         const idx = self.next_idx;
-        try self.locals.append(self.a, .{ .name = name, .idx = idx, .mutable = mutable });
+        try self.locals.append(self.a, .{ .name = name, .idx = idx, .mutable = mutable, .ty = ty });
         self.next_idx += 1;
         return idx;
     }
@@ -530,7 +561,7 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
             // Build the initializer before declaring, so it can't see itself.
             const value = try buildIntExpr(b, init_expr, scope);
-            const idx = try scope.declare(nm.text, ls.isVar());
+            const idx = try scope.declare(nm.text, ls.isVar(), .i64);
             out.* = .{ .let = .{ .idx = idx, .value = value } };
         },
         .assign_stmt => |as| {
@@ -600,6 +631,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             const txt = try p.text(b.a);
             defer b.a.free(txt);
             const loc = scope.find(txt) orelse return error.Unsupported;
+            if (loc.ty != .i64) return error.Unsupported; // a str local in an i64 context
             out.* = .{ .local = loc.idx };
         },
         .unary => |u| {
@@ -916,6 +948,47 @@ test "tryBuild: a runtime str binding + use in interpolation + arg" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "str_let [0,1]") != null); // g binds into locals 0,1
     try testing.expect(std.mem.indexOf(u8, dump, "str_binding[0,1]") != null); // referenced by index
+}
+
+test "tryBuild: a runtime i64 binding + reuse as arg + interpolation builds HIR" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn double(n: i64) -> i64 { n + n }\npub fn add(a: i64, b: i64) -> i64 { a + b }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n let a = double(21)\n env.out(add(a, 8))\n let b = add(a, 8)\n env.out(\"a={a}, b={b}\")\n}\n",
+        tr.resolver())) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    // Two i64 binding locals back a and b.
+    try testing.expectEqual(@as(usize, 2), mod.funcs[mod.entry.?].locals.len);
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `let local#0 = call(double, [21])`, then the int call references it.
+    try testing.expect(std.mem.indexOf(u8, dump, "let local#0 = call#") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int call#") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "let local#1 = call#") != null);
+    // Interpolation: each i64 binding becomes an `fmt_int(local#N)` concat piece.
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_int(local#0)") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_int(local#1)") != null);
+}
+
+test "tryBuild: a str binding and i64 binding share main's local space" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn shout(s: str) -> str { \"{s}!\" }\npub fn double(n: i64) -> i64 { n + n }\n");
+
+    // g claims locals 0,1 (str binding = ptr,len); a then claims local 2.
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n let g = shout(\"hi\")\n let a = double(21)\n env.out(\"{g}/{a}\")\n}\n",
+        tr.resolver())) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expectEqual(@as(usize, 3), mod.funcs[mod.entry.?].locals.len);
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_let [0,1]") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "let local#2 = call#") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_binding[0,1]") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_int(local#2)") != null);
 }
 
 test "tryBuild: a recursive control-flow body builds HIR" {

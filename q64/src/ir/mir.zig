@@ -145,6 +145,10 @@ pub const Op = union(enum) {
     /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
     /// shared newline byte at `nl_off`.
     host_out_str: struct { value: *Inst, nl_off: u32 },
+    /// The decimal `str` value of an i64 — formats `value` via `__fmt_i64` and
+    /// yields its `(ptr, len)`. Used as a piece inside `str_concat` when an
+    /// i64 binding (or any i64 expression) appears in interpolation.
+    fmt_int_to_str: *Inst,
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the
