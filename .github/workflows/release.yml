@@ -1,0 +1,186 @@
+# Builds the `q64` and `qube` binaries for linux/{amd64,arm64} and publishes
+# them as GitHub Releases on this repo. The qubepods builder container reads
+# `manifest.json` from a release to discover the binary URLs + sha256s.
+#
+# Triggers:
+#   - tag `v*`           -> stable release at that tag
+#   - push to `main`     -> rolling prerelease `nightly` (overwritten each push)
+#   - workflow_dispatch  -> on-demand build (does not publish unless ref is main or a tag)
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+# Least-privilege default for a public repo: the build job runs read-only
+# (it doesn't need to push, tag, or release), and only the release job
+# elevates to `contents: write`. No PAT, no action secrets -- the ambient
+# GITHUB_TOKEN is per-run and scoped to this repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # vendor/ is populated by ./init.sh: Zig toolchain, wasmtime C API,
+      # and a from-source Binaryen static lib. Binaryen is the slow step
+      # (~3-5 min). Key includes init.sh so a version bump invalidates.
+      - name: Cache vendored toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/zig
+            vendor/wasmtime
+            vendor/binaryen
+          key: vendor-${{ matrix.arch }}-${{ hashFiles('init.sh') }}
+
+      - name: init.sh (Zig + wasmtime + Binaryen)
+        run: ./init.sh
+
+      - name: Build q64 (ReleaseFast)
+        working-directory: q64
+        run: ../vendor/zig/zig build -Doptimize=ReleaseFast
+
+      - name: Build qube (ReleaseFast)
+        working-directory: qube
+        run: ../vendor/zig/zig build -Doptimize=ReleaseFast
+
+      # Stage binaries under a per-arch dir so the release job can merge
+      # the matrix outputs by simply downloading every artifact.
+      - name: Stage binaries
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp q64/zig-out/bin/q64   "out/q64-linux-${{ matrix.arch }}"
+          cp qube/zig-out/bin/qube "out/qube-linux-${{ matrix.arch }}"
+          ( cd out && sha256sum "q64-linux-${{ matrix.arch }}" "qube-linux-${{ matrix.arch }}" > "SHA256SUMS-${{ matrix.arch }}" )
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    # Only publish from main or a tag; manual dispatch on a feature branch
+    # builds + uploads workflow artifacts but does not cut a release.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Assemble release dir
+        id: assemble
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp artifacts/q64-linux-amd64   release/
+          cp artifacts/q64-linux-arm64   release/
+          cp artifacts/qube-linux-amd64  release/
+          cp artifacts/qube-linux-arm64  release/
+
+          # One combined SHA256SUMS over all four binaries.
+          ( cd release && sha256sum q64-linux-amd64 q64-linux-arm64 qube-linux-amd64 qube-linux-arm64 > SHA256SUMS )
+
+          # Resolve release name + whether this is a prerelease.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            prerelease=false
+          else
+            tag="nightly"
+            prerelease=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+          commit="${GITHUB_SHA}"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+
+          sha() { awk -v f="$1" '$2==f{print $1}' release/SHA256SUMS; }
+
+          # manifest.json: the contract the qubepods builder container
+          # reads on cold start to pick (and verify) the right binaries.
+          cat > release/manifest.json <<EOF
+          {
+            "version": "${tag}",
+            "commit": "${commit}",
+            "builtAt": "${built_at}",
+            "binaries": {
+              "q64": {
+                "linux-amd64": { "url": "${base_url}/q64-linux-amd64",  "sha256": "$(sha q64-linux-amd64)" },
+                "linux-arm64": { "url": "${base_url}/q64-linux-arm64",  "sha256": "$(sha q64-linux-arm64)" }
+              },
+              "qube": {
+                "linux-amd64": { "url": "${base_url}/qube-linux-amd64", "sha256": "$(sha qube-linux-amd64)" },
+                "linux-arm64": { "url": "${base_url}/qube-linux-arm64", "sha256": "$(sha qube-linux-arm64)" }
+              }
+            }
+          }
+          EOF
+
+          ls -la release
+          cat release/manifest.json
+
+      # `nightly` is a moving target. Delete the old release + retag so the
+      # download URLs stay stable across pushes. Tag releases (vX.Y.Z) are
+      # immutable -- the create step below will fail if the tag already has
+      # a release, which is the behaviour we want.
+      - name: Replace prior nightly
+        if: steps.assemble.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release delete nightly --yes --cleanup-tag || true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes="q64 + qube linux binaries built from ${GITHUB_SHA}.
+
+          Consumed by the qubepods builder container via \`manifest.json\`."
+          gh release create "${{ steps.assemble.outputs.tag }}" \
+            --target "${GITHUB_SHA}" \
+            --title "${{ steps.assemble.outputs.tag }}" \
+            --notes "$notes" \
+            $([ "${{ steps.assemble.outputs.prerelease }}" = "true" ] && echo --prerelease) \
+            release/q64-linux-amd64 \
+            release/q64-linux-arm64 \
+            release/qube-linux-amd64 \
+            release/qube-linux-arm64 \
+            release/SHA256SUMS \
+            release/manifest.json
