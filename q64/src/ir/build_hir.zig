@@ -421,9 +421,9 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                         if (loc.ty == .str) {
                             piece.* = .{ .local = loc.idx };
                         } else {
-                            const inner = try b.a.create(hir.Expr);
-                            inner.* = .{ .local = loc.idx };
-                            piece.* = .{ .fmt_int = inner };
+                            const lref = try b.a.create(hir.Expr);
+                            lref.* = .{ .local = loc.idx };
+                            piece.* = .{ .fmt_int = lref };
                         }
                         try pieces.append(b.a, piece);
                     } else if (rtBinding(rt, ptext)) |bnd| {
