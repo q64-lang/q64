@@ -104,9 +104,74 @@ emitting to wasm — exactly the Svelte/Solid-compiler sweet spot. It can do at
   same reactive semantics and the same `Renderer` mutation protocol — local diffs
   originate in the wasm, remote diffs from the qubepods backend over the gate socket.
 
-**Open (defaulted, refinable):** how `@state` names its store/scope — default is per-user,
-keyed by field name in the qube's default store; `@state shared …` for a per-qube global;
-`@state(db "table") …` to name the store. This doesn't change the surface distinction.
+## State scopes & twins (decision)
+
+Two **orthogonal** axes — keep them separate in the syntax:
+
+- **Synced?** — the `@` sigil. `state` = pure/local; `@state` = synced/persisted (carries
+  the `@kv`/`@db` effect → manifest/AI-visibility). *Do not stack `@` for scope* (`@@`
+  conflates the axes and doesn't generalize past two scopes).
+- **Scope** — a *qualifier* on `@state` (default `user`):
+
+```
+state        draftText = ""        // local: this device, ephemeral (wasm local)
+@state       unreadCount = 0       // user twin: this user, synced across their devices
+@state(app)  feed = []             // app twin: one singleton shared by everyone (news feed)
+@state(room r) messages = []       // room twin: shared within room r
+```
+
+**How it lowers — a graph of twins (actors), the developer just uses the name:**
+
+| Scope | Backing instance | Read = | Write = |
+|---|---|---|---|
+| local | wasm global/cell | direct | direct |
+| `user` | per-user instance (DO), persisted | subscribe | command → diff fan-out |
+| `app` | one singleton instance (DO) | subscribe | command → diff fan-out |
+| `room r` | per-room instance (DO) | subscribe | command → diff fan-out |
+
+A twin = an actor backed by a **Durable Object**, and **the scope *is* the DO address**:
+the scope *kind* selects the DO **namespace** (a declared DO binding/class —
+`USER_TWIN` / `APP_TWIN` / `ROOM_TWIN`, or one `TWIN` namespace), and the scope's *id*
+selects the **instance** within it (`namespace.idFromName(id)`):
+
+| Scope | DO namespace | DO instance id |
+|---|---|---|
+| `user` | user-twin NS | the user id |
+| `app` | app NS | a fixed singleton (`"app"` / the qube id) |
+| `room r` | room NS | `r` |
+
+This extends the addressing qubepods already uses — the gate routes the
+account/project/app/env tuple to a per-deployment container DO; a twin is the same idea,
+keyed by scope id. The DO holds state + a subscriber set, serializes writes (DO
+single-thread = the consistency boundary), and pushes **state diffs** to subscribers using
+the *same* `mutate` protocol as local reactivity. **Reading a scoped name
+in `draw` subscribes the view; writing it fans a diff out to all subscribers.** No sockets/
+DOs/fetch in source — the scope qualifier + compiler/runtime route it.
+
+**Cross-scope access is a capability, not ambient.** A qube reaching another twin (a user
+twin reading the app feed) declares it as an `imports` capability → effect-tracked →
+disclosed in the manifest/QAD (agent-discoverable). A `draw` may compose several
+subscriptions (local `state` + user `@state` + `@state(app)`); a diff from any updates it.
+
+**External events (webhooks/sensors/cron) are just another writer.** An `exports.http`
+(or `@on_http("/hooks/…")`) handler mutates the scoped name; same command → diff → fan-out:
+
+```
+@on_http("/hooks/news")
+fn news(req: Request) { feed.prepend(Post.from(req)) }   // → diff pushed to every view
+```
+
+```
+external (webhooks/sensors/cron) ─┐
+                                  ▼
+   views ──subscribe──▶ user twins ──subscribe──▶ app/room twins
+     ▲  intents ───────────┘  commands ────────────┘
+     └───────────── state diffs pushed back ◀───────────────┘
+```
+
+**Open (defaulted, refinable):** the per-store naming under a scope — default keyed by field
+name in the scope's store; `@state(db "table") …` to name a backing table. This doesn't
+change the surface distinction.
 
 ## Rendering substrate: WebGPU-only (decision)
 
