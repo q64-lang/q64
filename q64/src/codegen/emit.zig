@@ -251,14 +251,36 @@ fn resolverLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
 /// `Unsupported` shape) so the caller falls back to the legacy emitter. Other
 /// errors (genuine codegen failures) propagate.
 fn tryIrEmit(allocator: std.mem.Allocator, sf: ast.SourceFile, mres: ir.hir.ModuleResolver, addr: AddressSpace) !?[]u8 {
-    var hmod = (try ir.build_hir.tryBuild(allocator, sf, mres)) orelse return null;
-    defer hmod.deinit();
-    var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
-        error.Unsupported => return null,
-        else => |other| return other,
+    switch (try ir.build_hir.tryBuild(allocator, sf, mres)) {
+        // Not yet representable: fall back to legacy (or, under strict, panic).
+        .unsupported => return null,
+        // A definite semantic error the IR path detected — report the honest
+        // diagnostic directly; never fall back.
+        .rejected => |r| return mapReject(r),
+        .module => |m| {
+            var hmod = m;
+            defer hmod.deinit();
+            var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
+                error.Unsupported => return null,
+                else => |other| return other,
+            };
+            defer mmod.deinit();
+            return try lowerToWasm(allocator, &mmod, addr);
+        },
+    }
+}
+
+/// Map an IR-detected semantic error to its honest-baseline diagnostic code —
+/// the same codes the legacy emitter raised, so callers see identical errors
+/// whether the IR or (for now) the legacy path produced them.
+fn mapReject(r: ir.hir.Reject) Error {
+    return switch (r) {
+        .no_main => Error.NoMainFunction,
+        .unsupported_call => Error.UnsupportedCall,
+        .name_not_found => Error.NameNotFound,
+        .not_const => Error.NotConstExpr,
+        .immutable_assign => Error.ImmutableAssign,
     };
-    defer mmod.deinit();
-    return try lowerToWasm(allocator, &mmod, addr);
 }
 
 fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace) ![]u8 {
