@@ -54,6 +54,7 @@ pub const Item = union(enum) {
     state_decl: StateDecl,
     face_decl: FaceDecl,
     fit_decl: FitDecl,
+    screen_decl: ScreenDecl,
 
     pub fn cast(node: *const cst.Node) ?Item {
         return switch (node.kind) {
@@ -65,6 +66,7 @@ pub const Item = union(enum) {
             .STATE_DECL => .{ .state_decl = .{ .cst = node } },
             .FACE_DECL => .{ .face_decl = .{ .cst = node } },
             .FIT_DECL => .{ .fit_decl = .{ .cst = node } },
+            .SCREEN_DECL => .{ .screen_decl = .{ .cst = node } },
             else => null,
         };
     }
@@ -457,6 +459,83 @@ pub const StateDecl = struct {
         return null;
     }
 };
+
+/// `ScreenDecl := "screen" IDENT? "{" (StateDecl | DrawBlock | OnHandler)* "}"`
+/// — the QView frontend DSL (spec/reactivity.md, agent-ui.md). Groups reactive
+/// `state`, a declarative `draw` block, and `on <event>` handlers. The shell is
+/// structured; codegen lowers it to the `qview.*` mutation ops (a follow-up).
+pub const ScreenDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: ScreenDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    /// The optional screen name (`screen login { … }`).
+    pub fn name(self: ScreenDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+    /// The `state` / `@state` declarations, in order.
+    pub fn states(self: ScreenDecl) ChildIter(StateDecl, .STATE_DECL) {
+        return .{ .children = self.cst.children };
+    }
+    /// The `draw { … }` block, if present (a screen has at most one).
+    pub fn draw(self: ScreenDecl) ?DrawBlock {
+        return firstChildNode(self.cst, .DRAW_BLOCK, DrawBlock);
+    }
+    /// The `on <event>(…) { … }` handlers, in order.
+    pub fn handlers(self: ScreenDecl) ChildIter(OnHandler, .ON_HANDLER) {
+        return .{ .children = self.cst.children };
+    }
+};
+
+/// `DrawBlock := "draw" Block` — the declarative view body. Its statements are
+/// widget calls (e.g. `text(40, 56, 0)`, `button(1, …)`).
+pub const DrawBlock = struct {
+    cst: *const cst.Node,
+
+    pub fn body(self: DrawBlock) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+/// `OnHandler := "on" IDENT Params? Block` — an event handler bound to an
+/// event name (`on press(id: i64) { … }`).
+pub const OnHandler = struct {
+    cst: *const cst.Node,
+
+    /// The event name token (`press`, `drag`, …).
+    pub fn event(self: OnHandler) ?cst.Token {
+        return itemName(self.cst);
+    }
+    pub fn params(self: OnHandler) ?Params {
+        return firstChildNode(self.cst, .PARAMS, Params);
+    }
+    pub fn body(self: OnHandler) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+/// A typed iterator over a parent's direct child nodes of one CST `kind`,
+/// wrapping each as `View`. (`View` must have a `cst: *const cst.Node` field.)
+pub fn ChildIter(comptime View: type, comptime kind: cst.SyntaxKind) type {
+    return struct {
+        children: []const cst.Element,
+        i: usize = 0,
+
+        pub fn next(self: *@This()) ?View {
+            while (self.i < self.children.len) : (self.i += 1) {
+                switch (self.children[self.i]) {
+                    .node => |n| if (n.kind == kind) {
+                        self.i += 1;
+                        return .{ .cst = n };
+                    },
+                    .token => {},
+                }
+            }
+            return null;
+        }
+    };
+}
 
 /// `FaceDecl := "face" IDENT … FaceBody`. The header (super-faces,
 /// generics) and method signatures are raw spans in v0.

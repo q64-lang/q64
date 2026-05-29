@@ -225,7 +225,7 @@ const Parser = struct {
 
     fn isItemKeyword(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT => true,
+            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN => true,
             else => false,
         };
     }
@@ -290,8 +290,86 @@ const Parser = struct {
             .KW_STATE => self.parseStateDecl(),
             .KW_FACE => self.parseFaceOrFit(.FACE_DECL),
             .KW_FIT => self.parseFaceOrFit(.FIT_DECL),
+            .KW_SCREEN => self.parseScreenDecl(),
             else => unreachable,
         };
+    }
+
+    // -----------------------------------------------------------------
+    // ScreenDecl — the QView frontend DSL (spec/reactivity.md, agent-ui.md)
+    // -----------------------------------------------------------------
+    //
+    //   ScreenDecl  := "pub"? "screen" IDENT? "{" ScreenMember* "}"
+    //   ScreenMember := StateDecl | DrawBlock | OnHandler
+    //   DrawBlock   := "draw" Block
+    //   OnHandler   := "on" IDENT Params? Block
+    //
+    // A `screen` groups reactive `state`, a declarative `draw` block of widget
+    // calls, and `on <event>` handlers — the view is written once in `draw` and
+    // a handler just mutates state (the compiler re-emits the view). Widget
+    // calls inside `draw` and statements inside `on` reuse the ordinary block /
+    // expression grammar, so this production is the shell; codegen lowers it to
+    // the `qview.*` mutation ops (a follow-up). Unrecognized tokens inside the
+    // body pass through as direct children, preserving the lossless invariant.
+    fn parseScreenDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_SCREEN
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() }); // {
+            while (!self.isEof() and self.peek() != .R_BRACE) {
+                if (self.peek().isTrivia()) {
+                    try children.append(self.arena, .{ .token = self.advance() });
+                    continue;
+                }
+                switch (self.peek()) {
+                    .KW_STATE => try children.append(self.arena, .{ .node = try self.parseStateDecl() }),
+                    .KW_DRAW => try children.append(self.arena, .{ .node = try self.parseDrawBlock() }),
+                    .KW_ON => try children.append(self.arena, .{ .node = try self.parseOnHandler() }),
+                    // Recovery: anything else passes through losslessly.
+                    else => try children.append(self.arena, .{ .token = self.advance() }),
+                }
+            }
+            if (self.peek() == .R_BRACE) {
+                try children.append(self.arena, .{ .token = self.advance() }); // }
+            }
+        }
+        return try cst.makeNode(self.arena, .SCREEN_DECL, children.items);
+    }
+
+    /// `DrawBlock := "draw" Block` — the declarative view body (widget calls).
+    fn parseDrawBlock(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_DRAW
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .DRAW_BLOCK, children.items);
+    }
+
+    /// `OnHandler := "on" IDENT Params? Block` — an event handler (`on press(id) { … }`).
+    fn parseOnHandler(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_ON
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() }); // event name
+        }
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_PAREN) {
+            try children.append(self.arena, .{ .node = try self.parseParams() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .ON_HANDLER, children.items);
     }
 
     fn parseFnDecl(self: *Parser) !*const cst.Node {
@@ -1803,6 +1881,8 @@ test "round-trip: serialize(parse(s)) == s" {
         "import q64.math as m\n",
         "import q64.math.{Vec3, dot}\n",
         "import \"./util.q\".{helper}\n",
+        "screen counter {\n    state count: i64 = 0\n\n    draw {\n        number(40, 120, count)\n        button(1, 40, 180, 280, 72, 1)\n    }\n\n    on press(id: i64) {\n        count = count + 1\n    }\n}\n",
+        "screen {\n    draw { text(0, 0, 0) }\n}\n",
     };
 
     for (sources) |src| {
@@ -1815,6 +1895,56 @@ test "round-trip: serialize(parse(s)) == s" {
 
         try testing.expectEqualStrings(src, out.items);
     }
+}
+
+test "screen DSL: a screen decl structures state / draw / on members" {
+    const src =
+        \\screen counter {
+        \\    state count: i64 = 0
+        \\    draw {
+        \\        number(40, 120, count)
+        \\        button(1, 40, 180, 280, 72, 1)
+        \\    }
+        \\    on press(id: i64) {
+        \\        count = count + 1
+        \\    }
+        \\}
+        \\
+    ;
+    const r = try parse(testing.allocator, src, "screen.q");
+    defer r.deinit(testing.allocator);
+
+    const sf = ast.SourceFile.cast(r.root).?;
+    var items = sf.items();
+    const item = items.next() orelse return error.TestExpectedItem;
+    const screen = switch (item) {
+        .screen_decl => |s| s,
+        else => return error.TestExpectedScreen,
+    };
+    try testing.expect(items.next() == null); // exactly one top-level item
+
+    // Name.
+    try testing.expectEqualStrings("counter", (screen.name() orelse return error.TestNoName).text);
+
+    // One `state` member, named `count`.
+    var states = screen.states();
+    const st = states.next() orelse return error.TestNoState;
+    try testing.expectEqualStrings("count", (st.name() orelse return error.TestNoStateName).text);
+    try testing.expect(states.next() == null);
+
+    // The `draw` block holds the widget calls as statements.
+    const draw = screen.draw() orelse return error.TestNoDraw;
+    var draw_stmts = (draw.body() orelse return error.TestNoDrawBody).statements();
+    try testing.expect(draw_stmts.next() != null); // number(...)
+    try testing.expect(draw_stmts.next() != null); // button(...)
+
+    // One `on press(id)` handler with a param and a body.
+    var handlers = screen.handlers();
+    const h = handlers.next() orelse return error.TestNoHandler;
+    try testing.expectEqualStrings("press", (h.event() orelse return error.TestNoEvent).text);
+    try testing.expect(h.params() != null);
+    try testing.expect(h.body() != null);
+    try testing.expect(handlers.next() == null);
 }
 
 test "stray carriage return produces LEX010 in parse result" {
