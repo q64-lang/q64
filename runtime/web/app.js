@@ -17,7 +17,11 @@ const log = (m) => { const el = document.getElementById('log'); if (el) el.textC
 let scene = [];
 let buttons = []; // {bid,x,y,w,h} in CSS px, for hit-testing
 let pressedBid = null;
-let hostTaps = 0; // host-side tap count (wasm-driven counter is W2b)
+// Click counter — CLIENT (host) state for now ("first we can use local state").
+// The wasm lays out the number widget via qview.number; the host fills the live
+// value here. Moving this into the wasm (exported render(n) / module global) is
+// the next step (W2b proper).
+let count = 0;
 
 // ---- WebGPU setup ----
 let device, ctx, format, solidPipe, texPipe, sampler, uniformBuf, uniformBind;
@@ -146,7 +150,9 @@ function render() {
       const lbl = getLabel(c.id);
       drawRect(pass, c.x, c.y, lbl.w, lbl.h, [0.9, 0.95, 1.0, 1], lbl.view);
     } else if (c.op === 'number') {
-      const lbl = labelTexture(String(c.n)); // dynamic; not cached
+      // The wasm lays out the number widget (qview.number); the live value is
+      // client `state` for now (see W2b note). Draw the host counter here.
+      const lbl = labelTexture('taps: ' + count); // dynamic; not cached
       drawRect(pass, c.x, c.y, lbl.w, lbl.h, [0.62, 0.83, 0.95, 1], lbl.view);
     }
   }
@@ -200,16 +206,15 @@ async function main() {
     const hit = buttons.find((b) => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
     if (!hit) return;
     pressedBid = hit.bid;
-    hostTaps++;
-    // Genuine wasm callback when present (W2b); otherwise re-run _start so the
-    // press is wasm-rendered. The host tap count is shown labeled until the
-    // wasm owns the counter.
+    count++; // client-side `state` for now
+    // Prefer a genuine wasm callback when present (W2b); else re-run _start so
+    // the wasm re-lays-out the scene and the host fills the live count.
     if (typeof instance.exports.on_press === 'function') {
       runFrame(instance.exports.on_press, hit.bid);
     } else {
       runFrame(instance.exports._start);
     }
-    log(`tap on button #${hit.bid} (host taps: ${hostTaps}; wasm-driven counter = W2b)`);
+    log(`tap → count ${count} (client-side state; wasm draws the layout — wasm-owned state = next)`);
     setTimeout(() => { pressedBid = null; render(); }, 120);
   });
 
