@@ -24,7 +24,7 @@ let pressedBid = null;
 let count = 0;
 
 // ---- WebGPU setup ----
-let device, ctx, format, solidPipe, texPipe, sampler, uniformBuf, uniformBind;
+let device, ctx, format, primPipe, sampler, uniformBuf;
 const labelTex = new Map(); // id -> {tex, view, w, h}
 
 async function initGPU(canvas) {
@@ -40,37 +40,60 @@ async function initGPU(canvas) {
   uniformBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
-  // A unit quad (0..1) instanced per draw via a rect uniform pushed as vertex data.
+  // Widgets are drawn PROCEDURALLY in the shader via a signed-distance field
+  // (rounded-rect) — crisp corners, border, analytic AA, resolution-independent
+  // (stays sharp under scale/3D). Glyphs are the one textured case (an atlas).
+  // One pipeline; per-draw Prim uniform = rect + fill + border + params.
   const wgsl = /* wgsl */`
     struct VP { size: vec2f, _pad: vec2f };
     @group(0) @binding(0) var<uniform> vp: VP;
-    struct Rect { xywh: vec4f, color: vec4f };
-    @group(0) @binding(1) var<uniform> r: Rect;
-
-    struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
-    @vertex fn vmain(@builtin(vertex_index) vi: u32) -> VOut {
-      var corners = array<vec2f,6>(vec2f(0,0),vec2f(1,0),vec2f(0,1),vec2f(0,1),vec2f(1,0),vec2f(1,1));
-      let c = corners[vi];
-      let px = r.xywh.xy + c * r.xywh.zw;           // pixel-space position
-      let clip = vec2f(px.x / vp.size.x * 2.0 - 1.0, 1.0 - px.y / vp.size.y * 2.0);
-      var o: VOut; o.pos = vec4f(clip, 0.0, 1.0); o.uv = c; return o;
-    }
+    // rect: x,y,w,h (device px). fill,border: rgba. params: radius, borderW, mode(0=sdf,1=glyph), _
+    struct Prim { rect: vec4f, fill: vec4f, border: vec4f, params: vec4f };
+    @group(0) @binding(1) var<uniform> p: Prim;
     @group(0) @binding(2) var samp: sampler;
     @group(0) @binding(3) var tex: texture_2d<f32>;
-    @fragment fn fsolid() -> @location(0) vec4f { return r.color; }
-    // Label glyphs are white-on-transparent in the source texture; tint by the
-    // requested color, alpha = glyph coverage (straight-alpha blended).
-    @fragment fn ftex(@location(0) uv: vec2f) -> @location(0) vec4f {
-      let a = textureSample(tex, samp, uv).a;
-      return vec4f(r.color.rgb, r.color.a * a);
+
+    struct VOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) px: vec2f };
+    @vertex fn vmain(@builtin(vertex_index) vi: u32) -> VOut {
+      var cs = array<vec2f,6>(vec2f(0,0),vec2f(1,0),vec2f(0,1),vec2f(0,1),vec2f(1,0),vec2f(1,1));
+      let corner = cs[vi];
+      let isGlyph = p.params.z > 0.5;
+      let pad = select(3.0, 0.0, isGlyph);          // SDF quads get a few px of AA room
+      let origin = p.rect.xy - vec2f(pad, pad);
+      let size = p.rect.zw + vec2f(pad * 2.0, pad * 2.0);
+      let px = origin + corner * size;
+      let clip = vec2f(px.x / vp.size.x * 2.0 - 1.0, 1.0 - px.y / vp.size.y * 2.0);
+      var o: VOut; o.pos = vec4f(clip, 0.0, 1.0); o.uv = corner; o.px = px; return o;
+    }
+    fn sdRoundBox(pt: vec2f, b: vec2f, r: f32) -> f32 {
+      let q = abs(pt) - b + vec2f(r, r);
+      return min(max(q.x, q.y), 0.0) + length(max(q, vec2f(0.0, 0.0))) - r;
+    }
+    @fragment fn fmain(in: VOut) -> @location(0) vec4f {
+      if (p.params.z > 0.5) {                        // textured glyph: tint by fill, alpha = coverage
+        let a = textureSample(tex, samp, in.uv).a;
+        return vec4f(p.fill.rgb, p.fill.a * a);
+      }
+      let half = p.rect.zw * 0.5;
+      let center = p.rect.xy + half;
+      let d = sdRoundBox(in.px - center, half, p.params.x);
+      let aa = max(fwidth(d), 0.0001);
+      let cov = 1.0 - smoothstep(0.0, aa, d);        // outer edge AA
+      let band = smoothstep(0.0, aa, d + p.params.y); // within borderW of the edge -> border
+      let col = mix(p.fill, p.border, clamp(band, 0.0, 1.0));
+      return vec4f(col.rgb, col.a * cov);
     }`;
   const mod = device.createShaderModule({ code: wgsl });
+  // Surface WGSL compile errors to the page instead of a silent blank canvas.
+  if (mod.getCompilationInfo) {
+    const info = await mod.getCompilationInfo();
+    const errs = info.messages.filter((m) => m.type === 'error');
+    if (errs.length) throw new Error('shader: ' + errs.map((m) => m.message).join('; '));
+  }
 
-  // A 1x1 white texture so the solid pipeline can share the bind group layout.
+  // A 1x1 white texture so SDF draws can share the (texture-carrying) bind group.
   whiteTex = device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
   device.queue.writeTexture({ texture: whiteTex }, new Uint8Array([255, 255, 255, 255]), {}, [1, 1]);
-
-  rectBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
   const layout = device.createBindGroupLayout({
     entries: [
@@ -81,13 +104,17 @@ async function initGPU(canvas) {
     ],
   });
   const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
-  const common = { layout: pl, vertex: { module: mod, entryPoint: 'vmain' }, primitive: { topology: 'triangle-list' } };
-  solidPipe = device.createRenderPipeline({ ...common, fragment: { module: mod, entryPoint: 'fsolid', targets: [{ format }] } });
-  texPipe = device.createRenderPipeline({ ...common, fragment: { module: mod, entryPoint: 'ftex', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } } }] } });
+  const blend = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
+  primPipe = device.createRenderPipeline({
+    layout: pl,
+    vertex: { module: mod, entryPoint: 'vmain' },
+    fragment: { module: mod, entryPoint: 'fmain', targets: [{ format, blend }] },
+    primitive: { topology: 'triangle-list' },
+  });
   bgLayout = layout;
 }
 
-let whiteTex, rectBuf, bgLayout;
+let whiteTex, bgLayout;
 
 // Rasterize a label string to a GPUTexture via OffscreenCanvas 2D (glyph raster
 // only; WebGPU does the compositing).
@@ -115,12 +142,19 @@ function getLabel(id) {
   return labelTex.get(id);
 }
 
-function drawRect(pass, x, y, w, h, color, texView) {
-  // A fresh uniform buffer per draw — a shared buffer mutated between draws in
-  // one pass would make every draw see the final write (queue writes precede
-  // command execution). A handful of rects per frame, so this is fine.
-  const buf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(buf, 0, new Float32Array([x * DPR, y * DPR, w * DPR, h * DPR, ...color]));
+// Draw one primitive. opts: { radius, border, borderColor, texView } (all px in CSS units).
+// texView present => glyph mode; else a rounded-rect SDF (radius/border).
+function drawPrim(pass, x, y, w, h, fill, opts = {}) {
+  const texView = opts.texView ?? null;
+  const bcol = opts.borderColor ?? [0, 0, 0, 0];
+  const params = [(opts.radius ?? 0) * DPR, (opts.border ?? 0) * DPR, texView ? 1 : 0, 0];
+  // Fresh uniform per draw — a shared buffer mutated between draws in one pass
+  // would make every draw see the final write. A handful of prims per frame.
+  const buf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(buf, 0, new Float32Array([
+    x * DPR, y * DPR, w * DPR, h * DPR,
+    ...fill, ...bcol, ...params,
+  ]));
   const bg = device.createBindGroup({
     layout: bgLayout,
     entries: [
@@ -130,7 +164,7 @@ function drawRect(pass, x, y, w, h, color, texView) {
       { binding: 3, resource: texView ?? whiteTex.createView() },
     ],
   });
-  pass.setPipeline(texView ? texPipe : solidPipe);
+  pass.setPipeline(primPipe);
   pass.setBindGroup(0, bg);
   pass.draw(6);
 }
@@ -143,17 +177,21 @@ function render() {
   for (const c of scene) {
     if (c.op === 'button') {
       const pressed = c.bid === pressedBid;
-      drawRect(pass, c.x, c.y, c.w, c.h, pressed ? [0.20, 0.55, 0.75, 1] : [0.37, 0.83, 1.0, 1]); // fill
+      // The button is a procedural rounded-rect SDF: crisp corners + 2px border,
+      // analytic AA, resolution-independent. No texture.
+      drawPrim(pass, c.x, c.y, c.w, c.h, pressed ? [0.20, 0.55, 0.75, 1] : [0.37, 0.83, 1.0, 1], {
+        radius: 16, border: 2, borderColor: [0.16, 0.45, 0.62, 1],
+      });
       const lbl = getLabel(c.id);
-      drawRect(pass, c.x + (c.w - lbl.w) / 2, c.y + (c.h - lbl.h) / 2, lbl.w, lbl.h, [0.03, 0.05, 0.08, 1], lbl.view); // label (dark on cyan)
+      drawPrim(pass, c.x + (c.w - lbl.w) / 2, c.y + (c.h - lbl.h) / 2, lbl.w, lbl.h, [0.03, 0.05, 0.08, 1], { texView: lbl.view });
     } else if (c.op === 'text') {
       const lbl = getLabel(c.id);
-      drawRect(pass, c.x, c.y, lbl.w, lbl.h, [0.9, 0.95, 1.0, 1], lbl.view);
+      drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.9, 0.95, 1.0, 1], { texView: lbl.view });
     } else if (c.op === 'number') {
       // The wasm lays out the number widget (qview.number); the live value is
       // client `state` for now (see W2b note). Draw the host counter here.
       const lbl = labelTexture('taps: ' + count); // dynamic; not cached
-      drawRect(pass, c.x, c.y, lbl.w, lbl.h, [0.62, 0.83, 0.95, 1], lbl.view);
+      drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.62, 0.83, 0.95, 1], { texView: lbl.view });
     }
   }
   pass.end();
