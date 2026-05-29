@@ -153,32 +153,43 @@ function edt(seed, w, h) {
 }
 
 // Rasterize a string, then build a single-channel SDF (r8) so the glyph shader
-// can resolve it crisply at any scale (resolution-independent — the point of
-// shader text). NOTE: this is single-channel SDF; true multi-channel MSDF
-// (sharper corners, needs glyph outlines) is a later refinement.
+// can resolve it crisply at any scale. We SUPERSAMPLE the raster (SS×) before the
+// EDT and downsample the resulting field, so the SDF encodes a smooth silhouette
+// (no facets under zoom) at the stored resolution. NOTE: single-channel SDF;
+// true multi-channel MSDF (corner-perfect, needs glyph outlines) is the next step.
 function sdfTexture(text) {
-  const fontPx = Math.round(30 * DPR);
-  const spread = Math.round(8 * DPR);          // SDF range in px (= the pad)
+  const SS = 3;                                  // supersample factor
+  const fontPx = Math.round(30 * DPR) * SS;
+  const spread = Math.round(8 * DPR) * SS;       // SDF range in hi-res px
   const oc = new OffscreenCanvas(8, 8);
   let g = oc.getContext('2d');
   g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
-  const w = Math.ceil(g.measureText(text).width) + spread * 2;
-  const h = fontPx + spread * 2;
-  oc.width = w; oc.height = h;
+  const hw = Math.ceil(g.measureText(text).width) + spread * 2;
+  const hh = fontPx + spread * 2;
+  oc.width = hw; oc.height = hh;
   g = oc.getContext('2d');
-  g.clearRect(0, 0, w, h);
+  g.clearRect(0, 0, hw, hh);
   g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
   g.fillStyle = '#fff'; g.textBaseline = 'top';
   g.fillText(text, spread, spread);
-  const a = g.getImageData(0, 0, w, h).data;
-  const inside = new Uint8Array(w * h), outside = new Uint8Array(w * h);
-  for (let i = 0; i < w * h; i++) { const on = a[i * 4 + 3] > 127 ? 1 : 0; inside[i] = on; outside[i] = on ? 0 : 1; }
-  const dOut = edt(inside, w, h);   // for OUTSIDE cells: dist to nearest inside pixel
-  const dIn = edt(outside, w, h);   // for INSIDE cells: dist to nearest outside pixel
+  const a = g.getImageData(0, 0, hw, hh).data;
+  const inside = new Uint8Array(hw * hh), outside = new Uint8Array(hw * hh);
+  for (let i = 0; i < hw * hh; i++) { const on = a[i * 4 + 3] > 127 ? 1 : 0; inside[i] = on; outside[i] = on ? 0 : 1; }
+  const dOut = edt(inside, hw, hh);   // OUTSIDE cells: dist to nearest inside pixel
+  const dIn = edt(outside, hw, hh);   // INSIDE cells: dist to nearest outside pixel
+  const sdfHi = new Float32Array(hw * hh);
+  for (let i = 0; i < hw * hh; i++) {
+    const sd = inside[i] ? dIn[i] : -dOut[i];                  // +inside, -outside, 0 at edge
+    sdfHi[i] = Math.max(0, Math.min(1, 0.5 + sd / (2 * spread)));
+  }
+  // Downsample the SDF field by SS to the stored texture (averaging distances is
+  // valid — the field is ~linear — and yields a smooth low-res SDF).
+  const w = Math.floor(hw / SS), h = Math.floor(hh / SS);
   const bytes = new Uint8Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const sd = inside[i] ? dIn[i] : -dOut[i];                 // +inside, -outside, 0 at edge
-    bytes[i] = Math.max(0, Math.min(255, Math.round((0.5 + sd / (2 * spread)) * 255)));
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let acc = 0;
+    for (let sy = 0; sy < SS; sy++) for (let sx = 0; sx < SS; sx++) acc += sdfHi[(y * SS + sy) * hw + (x * SS + sx)];
+    bytes[y * w + x] = Math.max(0, Math.min(255, Math.round((acc / (SS * SS)) * 255)));
   }
   const tex = device.createTexture({ size: [w, h], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
   device.queue.writeTexture({ texture: tex }, bytes, { bytesPerRow: w }, [w, h]);
