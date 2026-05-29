@@ -74,6 +74,36 @@ describe.skipIf(!binaryAvailable())("qube pod new (flag-driven)", () => {
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr).toContain("already exists");
   });
+
+  test("--addr emits a component.variants map (per-address-space builds)", () => {
+    const root = makeProject({ ".keep": "" });
+    const r = runCli(["pod", "new", "resizer", ...REQUIRED, "--addr", "wasm32,wasm64"], { cwd: root });
+    expect(r.exitCode).toBe(0);
+    const m = readFileSync(join(root, "resizer", "qubepod.jsonc"), "utf8");
+    expect(m).toContain('"variants"');
+    // Per-variant paths derive from --wasm by inserting .<addr> before .wasm.
+    expect(m).toContain('"wasm32": { "wasm": "./dist/r.wasm32.wasm" }');
+    expect(m).toContain('"wasm64": { "wasm": "./dist/r.wasm64.wasm" }');
+    // The single legacy component.wasm is not emitted alongside variants.
+    expect(m).not.toContain('"wasm": "./dist/r.wasm"');
+  });
+
+  test("--addr wasm32 emits a single-variant map", () => {
+    const root = makeProject({ ".keep": "" });
+    const r = runCli(["pod", "new", "resizer", ...REQUIRED, "--addr", "wasm32"], { cwd: root });
+    expect(r.exitCode).toBe(0);
+    const m = readFileSync(join(root, "resizer", "qubepod.jsonc"), "utf8");
+    expect(m).toContain('"variants"');
+    expect(m).toContain('"wasm32": { "wasm": "./dist/r.wasm32.wasm" }');
+    expect(m).not.toContain('"wasm64"');
+  });
+
+  test("an unknown --addr value is rejected", () => {
+    const root = makeProject({ ".keep": "" });
+    const r = runCli(["pod", "new", "resizer", ...REQUIRED, "--addr", "wasm128"], { cwd: root });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("wasm32 or wasm64");
+  });
 });
 
 describe.skipIf(!binaryAvailable())("qube pod init", () => {
@@ -88,8 +118,8 @@ describe.skipIf(!binaryAvailable())("qube pod init", () => {
 describe.skipIf(!binaryAvailable())("qube pod (wizard)", () => {
   test("prompts on stdin and writes the answered manifest", () => {
     const root = makeProject({ ".keep": "" });
-    // project, name, wasm, wit.package, wit.world, language, apiVersion, route, assets
-    const stdin = ["media", "thumb", "", "", "", "", "", "", ""].join("\n") + "\n";
+    // project, name, wasm, wit.package, wit.world, addr, language, apiVersion, route, assets
+    const stdin = ["media", "thumb", "", "", "", "", "", "", "", ""].join("\n") + "\n";
     const r = runCli(["pod", "init"], { cwd: root, stdin });
     expect(r.exitCode).toBe(0);
     const m = readFileSync(join(root, "qubepod.jsonc"), "utf8");

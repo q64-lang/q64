@@ -141,14 +141,18 @@ prints a note, since publishability is only enforced at `qube publish`.
 `qube pod new <name>` / `qube pod init` scaffold a QubePod deploy manifest
 (`qubepod.jsonc`) for [qubepods](https://qubepods.com). The mandatory fields
 mirror the QubePod schema: `apiVersion`, `kind` (`"QubePod"`), `project` (a
-`[a-z0-9][a-z0-9-]*` slug), `name`, and a `component` with `wasm` and
-`wit.{package,world}`.
+`[a-z0-9][a-z0-9-]*` slug), `name`, and a `component` with `wit.{package,world}`
+plus its wasm. By default the component is a single legacy `wasm`; passing
+`--addr` instead emits a `component.variants` map — one wasm build per address
+space (`wasm32` / `wasm64`), the recommended shape for a qube that must reach
+WebKit. See [`memory.md` §"The platform"](./memory.md).
 
 | Flag                  | Default                    | Meaning                              |
 |-----------------------|----------------------------|--------------------------------------|
 | `--project <slug>`    | — (required)               | Project slug, e.g. `image-tools`.    |
 | `--name <name>`       | positional / cwd base      | App/qube name.                       |
-| `--wasm <path>`       | — (required)               | Path to the wasm component.          |
+| `--wasm <path>`       | — (required)               | Path to the wasm component (the base path when `--addr` is set). |
+| `--addr <list>`       | —                          | Address spaces to ship (`wasm32`/`wasm64`, comma-separated): emit a `component.variants` map instead of a single `wasm`. Each variant's path derives from `--wasm` by inserting `.<addr>` before `.wasm` (`./x.wasm` → `./x.wasm32.wasm`). |
 | `--wit-package <id>`  | — (required)               | WIT package id.                      |
 | `--wit-world <world>` | — (required)               | WIT world name.                      |
 | `--language <lang>`   | —                          | Source language (optional).          |
@@ -162,8 +166,9 @@ mirror the QubePod schema: `apiVersion`, `kind` (`"QubePod"`), `project` (a
 ### `qube pod deploy`
 
 `qube pod deploy` packs a **bundle zip** from the `qubepod.jsonc` in the
-current directory — the manifest, the component wasm (at its
-`component.wasm` path), and the asset tree named by `assets.directory` —
+current directory — the manifest, every component wasm (the single
+`component.wasm`, or each `component.variants.<addr>.wasm` for a
+dual-address-space qube), and the asset tree named by `assets.directory` —
 into `target/deploy/<name>.zip`, then uploads it to qubepods as a
 multipart `POST <api>/api/deploy` (`environment` + `bundle`). The server
 unzips it, content-addresses the wasm and every asset into the tenant

@@ -617,9 +617,16 @@ Implementation (not started — large, touches the whole CLI + backend):
 - [ ] **`q64` CLI: `--addr <wasm32|wasm64>`**, required; diagnostic when
       neither `--addr` nor a target-resolved `addressSpace` is given (new
       diagnostic code for "no address space selected").
-- [ ] **`qube` CLI:** `addressSpace` required per target; build invokes `q64`
-      once per address space; outputs under `target/<profile>/<addr>/`;
+- [ ] **`qube` CLI (build):** `addressSpace` required per target; build invokes
+      `q64` once per address space; outputs under `target/<profile>/<addr>/`;
       `--addr` override; flag wasm64 builds as not-runnable-on-WebKit.
+- [x] **`qube pod` CLI (deploy manifest):** `qube pod new`/`init` take
+      `--addr <wasm32|wasm64>[,…]` and emit a `component.variants` map (per-addr
+      paths derived from `--wasm`); legacy single-`wasm` is unchanged when
+      `--addr` is omitted. `qube pod deploy` packs **every** declared variant
+      into the bundle zip. Mirrors qubepods' `component.variants` schema; the
+      generated manifest round-trips through `@qubepods/qubepod-schema`.
+      (`qube/src/main.zig`, tests in `qube-test/tests/pod.test.ts`.)
 - [ ] **Multi-memory layout under wasm32** — confirm the `mem.*` segregation
       (stack/arena/heap/shared/large/rodata) holds with `i32` addressing and
       the 4 GiB-per-memory cap.
