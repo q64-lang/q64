@@ -282,6 +282,23 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
                 .rhs = try lowerExpr(ctx, bx.rhs),
             } });
         },
+        .logical => |lg| {
+            // Short-circuit via a value `if_` (i32 0/1): `a && b` is
+            // `if a { b } else { 0 }`; `a || b` is `if a { 1 } else { b }`.
+            // Both operands are truthiness-tested so `b` need not be a 0/1.
+            const lhs = try lowerCond(ctx, lg.lhs);
+            const rhs = try lowerCond(ctx, lg.rhs);
+            const lit = switch (lg.op) {
+                .and_ => @as(i32, 0), // the false short-circuit result
+                .or_ => @as(i32, 1), // the true short-circuit result
+            };
+            const konst = try mk(ctx.a, .i32, .{ .const_i32 = lit });
+            const branches = switch (lg.op) {
+                .and_ => .{ rhs, konst }, // then = rhs, else = 0
+                .or_ => .{ konst, rhs }, // then = 1,   else = rhs
+            };
+            return mk(ctx.a, .i32, .{ .if_ = .{ .cond = lhs, .then_ = branches[0], .else_ = branches[1] } });
+        },
         .call => |cl| {
             const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
             for (cl.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
@@ -451,4 +468,29 @@ test "lower: `!` in an if-condition lowers to a `un not` over the comparison" {
     // `un not` result type), so there is no extra `!= 0` truthiness wrap.
     try testing.expect(std.mem.indexOf(u8, dump, "un not") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "bin eq") != null);
+}
+
+test "lower: `&&` lowers to a short-circuit `if_` with a const_i32 false leaf" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn both(a: i64, b: i64) -> i64 { if a > 0 && b > 0 { 1 } else { 0 } }\n");
+
+    const pr = try parser.parse.parse(testing.allocator,
+        "fn main {\n env.out(both(1, 1))\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    // The `&&` becomes a value `if : i32` whose else-leaf is the false 0/1
+    // constant — there is no backend binary op for it.
+    try testing.expect(std.mem.indexOf(u8, dump, "if : i32") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "const_i32 0") != null);
 }

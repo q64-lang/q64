@@ -29,3 +29,10 @@ pub const BinKind = enum {
 /// it is truthiness on its operand (`x == 0 ? 1 : 0`), so it accepts any
 /// integer operand, not just a 0/1.
 pub const UnKind = enum { neg, bit_not, not };
+
+/// Short-circuit logical operators. Unlike `BinKind`, these are *control
+/// flow*, not value ops: the right operand is only evaluated when the left
+/// doesn't already decide the result (`&&` on a false lhs, `||` on a true
+/// lhs). They lower to a value-producing `if_`, never to a backend binary
+/// op, and yield a boolean (an `i32` 0/1).
+pub const LogicalKind = enum { and_, or_ };

@@ -163,6 +163,10 @@ pub const Expr = union(enum) {
     global_get: u32,
     bin: struct { kind: ops.BinKind, lhs: *Expr, rhs: *Expr },
     un: struct { kind: ops.UnKind, operand: *Expr },
+    /// Short-circuit `&&` / `||`. Kept distinct from `bin` because it lowers
+    /// to control flow (a value `if_`), not a backend binary op. Yields a
+    /// boolean (i32 0/1); both operands are truthiness-tested.
+    logical: struct { op: ops.LogicalKind, lhs: *Expr, rhs: *Expr },
     /// A call to another function, resolved to its `FuncId`.
     call: struct { func: FuncId, args: []const *Expr },
     /// A runtime string concatenation (interpolation with dynamic pieces).
