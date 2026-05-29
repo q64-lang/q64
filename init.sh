@@ -259,6 +259,36 @@ install_binaryen() {
         return
     fi
 
+    # Fast path: pull a prebuilt static lib from an external cache, skipping the
+    # ~10-minute from-source build. The cache URL is intentionally NOT hardcoded
+    # here — it stays out of this public repo and is supplied via
+    # BINARYEN_CACHE_URL by the environment that knows it (see qubepods'
+    # scripts/setup-q64-toolchain.sh, which hosts the prebuilt lib in a
+    # public-read R2 bucket). The cached tarball unpacks to a top-level
+    # `binaryen/` dir matching the short-circuit above; any miss or error falls
+    # through to the source build below, so this is purely an accelerator.
+    if [ -n "${BINARYEN_CACHE_URL:-}" ]; then
+        local c_arch c_os c_key c_url c_tar
+        c_arch="$(uname -m)"; case "$c_arch" in amd64) c_arch=x86_64;; arm64) c_arch=aarch64;; esac
+        c_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        c_key="binaryen-${BINARYEN_VERSION}-${c_arch}-${c_os}.tar.gz"
+        c_url="${BINARYEN_CACHE_URL%/}/$c_key"
+        c_tar="$tmpdir/$c_key"
+        echo "init.sh: trying binaryen cache $c_url"
+        if curl -fsSL "$c_url" -o "$c_tar" && [ -s "$c_tar" ]; then
+            mkdir -p "$(dirname "$BINARYEN_DEST")"
+            tar -xzf "$c_tar" -C "$(dirname "$BINARYEN_DEST")"
+            if [ -f "$BINARYEN_DEST/lib/libbinaryen.a" ] && \
+               [ "$(cat "$BINARYEN_DEST/VERSION" 2>/dev/null)" = "$BINARYEN_VERSION" ]; then
+                echo "init.sh: restored prebuilt binaryen $BINARYEN_VERSION from cache"
+                return
+            fi
+            echo "init.sh: cache tarball did not yield binaryen $BINARYEN_VERSION; building from source" >&2
+        else
+            echo "init.sh: binaryen cache miss/unavailable; building from source"
+        fi
+    fi
+
     local src="$tmpdir/binaryen-src"
     local build="$tmpdir/binaryen-build"
     local tag="version_${BINARYEN_VERSION}"

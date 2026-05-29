@@ -113,6 +113,12 @@ cd examples/hello && qube run
 the pinned versions with `ZIG_VERSION=…`, `WASMTIME_VERSION=…`, or
 `BINARYEN_VERSION=…`.
 
+Binaryen is built from source by default (a few minutes). To skip that,
+set `BINARYEN_CACHE_URL=<base>` and `init.sh` will fetch a prebuilt
+`binaryen-<version>-<arch>-<os>.tar.gz` from that base, falling back to the
+source build on any miss. The URL is supplied by the environment rather than
+checked in here; ephemeral CI/web sessions point it at a prebuilt-lib cache.
+
 The remaining bootstrap pieces (still in progress; folders are scaffolded):
 
 - `qube build` will eventually walk `stdlib/` and compile each namespace
