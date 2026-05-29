@@ -5,17 +5,17 @@ layer that makes good on the architectural decision that *language semantics
 must not depend on a backend's IR*: the compiler lowers to its own IR first,
 and only `codegen/` turns that into Binaryen/WASM.
 
-> **Status: incremental adoption.** A per-construct router in
-> [`codegen/emit.zig`](../codegen/emit.zig) sends the constructs the IR can
-> already lower through `AST → HIR → MIR → Binaryen`, and falls back to the
-> legacy direct `AST → Binaryen` emitter for the rest, so the build stays green
-> at every step. Today the IR path handles `fn main` with `env.out(…)` of
+> **Status: the sole emission path.** [`codegen/emit.zig`](../codegen/emit.zig)
+> lowers `AST → HIR → MIR → Binaryen` and nothing else — the interim direct
+> `AST → Binaryen` emitter was removed once the IR covered the surface the
+> compiler emits. Today the IR path handles `fn main` with `env.out(…)` of
 > constants, runtime str values (calls + bindings + interpolation), and i64
 > values (calls + bindings + interpolation), plus the i64 functions (with
 > arithmetic, control flow, and recursion) and str functions (const/pass-
-> through/concat bodies) it transitively calls; each migration phase teaches
-> it one more construct (see the project plan). `Q64_IR_STRICT=1` turns a
-> fallback into a panic, to prove a phase's coverage.
+> through/concat bodies) it transitively calls, and main-less twins (`state`
+> globals + exported handlers). A construct it doesn't represent yet is an
+> honest `UnsupportedExpression`; definite semantic errors surface as their
+> diagnostic codes (`build_hir`'s `Reject` → codegen `mapReject`).
 
 ## The two tiers
 

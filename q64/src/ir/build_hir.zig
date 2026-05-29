@@ -5,10 +5,10 @@
 //! shape/typing checks, and desugaring. The HIR→MIR `lower` pass takes over
 //! from here.
 //!
-//! Migration status: `tryBuild` returns `null` for any construct it cannot
-//! yet represent (signalled internally by `error.Unsupported`), so the
-//! `codegen/emit.zig` router falls back to the legacy AST→Binaryen path.
-//! Handled today:
+//! `tryBuild` returns `.unsupported` for any construct it cannot yet
+//! represent (signalled internally by `error.Unsupported`); `codegen/emit.zig`
+//! reports that as an honest `UnsupportedExpression` (the IR is the sole
+//! emission path — there is no legacy fallback). Handled today:
 //!   - `fn main` whose statements are `env.out(<expr>)` and runtime `let`
 //!     bindings (str and i64), with interpolation in literals mixing const
 //!     runs, str bindings, str-returning calls, and i64 bindings (formatted
@@ -28,8 +28,8 @@ const consteval = @import("consteval.zig");
 pub const ModuleResolver = hir.ModuleResolver;
 
 /// `Unsupported` — a construct the IR path doesn't represent yet; the caller
-/// falls back to the legacy emitter. `Rejected` — a definite semantic error
-/// was recorded in `Builder.reject`; the caller reports it (no fall-back).
+/// reports an honest `UnsupportedExpression`. `Rejected` — a definite semantic
+/// error was recorded in `Builder.reject`; the caller reports its diagnostic.
 const BuildError = error{ Unsupported, Rejected } || std.mem.Allocator.Error;
 
 /// A runtime `str` binding in `main`: its `(ptr, len)` live in two `_start`
@@ -83,8 +83,8 @@ fn tryConst(b: *Builder, expr: ast.Expr) BuildError!?[]const u8 {
 pub const Result = union(enum) {
     /// Built HIR — lower it to MIR and emit.
     module: hir.Module,
-    /// A construct the IR path doesn't represent yet — fall back to the legacy
-    /// emitter (the codegen router decides; `Q64_IR_STRICT=1` panics instead).
+    /// A construct the IR path doesn't represent yet — the caller reports an
+    /// honest `UnsupportedExpression` (there is no legacy fallback).
     unsupported,
     /// A definite semantic error — report it as an honest diagnostic, do NOT
     /// fall back.
@@ -198,8 +198,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 else
                     try buildStrExpr(b, init_expr, &mscope, rt);
                 const ptr_idx: u32 = @intCast(b.main_locals.items.len);
-                try b.main_locals.append(b.a, .i64);
-                try b.main_locals.append(b.a, .i64);
+                // The (ptr, len) backing locals are address-width pointers
+                // (i32 on wasm32, i64 on wasm64) — `.ptr`, not `.i64`.
+                try b.main_locals.append(b.a, .ptr);
+                try b.main_locals.append(b.a, .ptr);
                 try b.main_rt.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
@@ -559,8 +561,7 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) Bui
             } else return error.Unsupported;
         },
         // A nested, non-const call as a str argument (`wrap(shout("yo"))`): bind
-        // it first (`let t = shout("yo"); wrap(t)`). The legacy emitter reports
-        // NotConstExpr here.
+        // it first (`let t = shout("yo"); wrap(t)`). Reported as NotConstExpr.
         .call => return reject(b, .not_const),
         else => return error.Unsupported,
     }
@@ -1108,7 +1109,10 @@ test "tryBuild: a main of env.out string literals builds HIR" {
     try testing.expect(std.mem.indexOf(u8, dump, "host_out \"one\"") != null);
 }
 
-test "tryBuild: runtime interpolation defers to legacy (returns null)" {
+test "tryBuild: runtime interpolation of an unbound name is unsupported (null)" {
+    // `x` is neither a const binding nor a runtime binding here, so the
+    // interpolation isn't representable → `.unsupported` (codegen reports
+    // UnsupportedExpression). buildFromSource maps non-module results to null.
     try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(\"v{x}\")\n}\n", noLib)) == null);
 }
 
@@ -1120,6 +1124,20 @@ test "tryBuild: const interpolation + const let bindings fold to host_out" {
     defer testing.allocator.free(dump);
     // The whole interpolation folds to one constant string at compile time.
     try testing.expect(std.mem.indexOf(u8, dump, "host_out \"9 43\"") != null);
+}
+
+test "tryBuild: a main-less twin exports its public handler (visibility slot)" {
+    // No `fn main`; a `state` global + a `pub fn` command (a backend twin).
+    // The HIR carries the handler's visibility, which `show hir` surfaces and
+    // the (future) component/WIT lift reads as the export surface.
+    var mod = (try buildFromSource(testing.allocator, "state count = 0\npub fn inc() { count = count + 1 }\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expect(mod.entry == null); // main-less
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn inc -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "global_set #0") != null);
 }
 
 test "tryBuild: a const-bodied call folds in a let, not in env.out" {
