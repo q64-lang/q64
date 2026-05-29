@@ -54,6 +54,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "show")) {
+        try cmdShow(gpa, io, &args_it);
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "--version")) {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &buf);
@@ -79,6 +84,8 @@ fn usage(io: std.Io) !void {
         \\                                     --addr selects the linear-memory address space
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
+        \\  show <hir|mir> <file.q> [--module name=dir ...]
+        \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
         \\  --version                          Print the version and exit.
         \\
     );
@@ -239,24 +246,11 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     };
     defer gpa.free(source);
 
-    // Read each dependency module's entry file (`<dir>/lib.q`). Kept
-    // alive until after codegen; freed below.
-    var module_sources: std.ArrayList(emit.ModuleSource) = .empty;
+    // Read each dependency module's entry file (`<dir>/lib.q`); freed below.
+    var module_sources = try readModuleSources(gpa, io, module_args.items);
     defer {
         for (module_sources.items) |m| gpa.free(m.source);
         module_sources.deinit(gpa);
-    }
-    for (module_args.items) |ma| {
-        const lib_path = try std.fs.path.join(gpa, &.{ ma.dir, "lib.q" });
-        defer gpa.free(lib_path);
-        const lib_src = std.Io.Dir.cwd().readFileAlloc(io, lib_path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
-            var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
-            try w.interface.print("q64: cannot read module {s} entry {s}: {s}\n", .{ ma.name, lib_path, @errorName(err) });
-            try w.interface.flush();
-            std.process.exit(2);
-        };
-        try module_sources.append(gpa, .{ .name = ma.name, .source = lib_src });
     }
 
     const bytes = emit.emitFromSource(gpa, source, src, module_sources.items, addr) catch |err| {
@@ -283,4 +277,115 @@ fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
         try w.interface.flush();
         std.process.exit(2);
     };
+}
+
+/// Read each dependency module's entry file (`<dir>/lib.q`) into a list of
+/// `ModuleSource`s for the compiler. The caller frees each `.source` and
+/// deinits the list. A read failure is a usage-level error (exit 2). Shared by
+/// `emit` and `show`.
+fn readModuleSources(gpa: std.mem.Allocator, io: std.Io, module_args: []const ModuleArg) !std.ArrayList(emit.ModuleSource) {
+    var out: std.ArrayList(emit.ModuleSource) = .empty;
+    errdefer {
+        for (out.items) |m| gpa.free(m.source);
+        out.deinit(gpa);
+    }
+    for (module_args) |ma| {
+        const lib_path = try std.fs.path.join(gpa, &.{ ma.dir, "lib.q" });
+        defer gpa.free(lib_path);
+        const lib_src = std.Io.Dir.cwd().readFileAlloc(io, lib_path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writer(io, &buf);
+            try w.interface.print("q64: cannot read module {s} entry {s}: {s}\n", .{ ma.name, lib_path, @errorName(err) });
+            try w.interface.flush();
+            std.process.exit(2);
+        };
+        try out.append(gpa, .{ .name = ma.name, .source = lib_src });
+    }
+    return out;
+}
+
+/// `q64 show <hir|mir> <file.q> [--module name=dir ...]` — dump the Q64 IR
+/// (HIR or MIR) for a source file to stdout (spec/q64-cli.md §"show"). The
+/// front matter (parse + import resolution) is shared with `emit`, so `show`
+/// surfaces the same honest diagnostics on a malformed program.
+fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    var kind: ?[]const u8 = null;
+    var src_path: ?[]const u8 = null;
+    var module_args: std.ArrayList(ModuleArg) = .empty;
+    defer module_args.deinit(gpa);
+
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--module")) {
+            const spec = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
+                var buf: [4096]u8 = undefined;
+                var w = std.Io.File.stderr().writer(io, &buf);
+                try w.interface.print("q64: --module expects name=dir, got '{s}'\n", .{spec});
+                try w.interface.flush();
+                std.process.exit(2);
+            };
+            try module_args.append(gpa, .{ .name = spec[0..eq], .dir = spec[eq + 1 ..] });
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // Tolerate (and ignore) flags this subcommand doesn't consume.
+        } else if (kind == null) {
+            kind = a;
+        } else if (src_path == null) {
+            src_path = a;
+        } else {
+            try usage(io);
+            std.process.exit(2);
+        }
+    }
+
+    const k = kind orelse {
+        try usage(io);
+        std.process.exit(2);
+    };
+    const src = src_path orelse {
+        try usage(io);
+        std.process.exit(2);
+    };
+    const want_hir = std.mem.eql(u8, k, "hir");
+    if (!want_hir and !std.mem.eql(u8, k, "mir")) {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: show: unknown kind '{s}' (expected 'hir' or 'mir')\n", .{k});
+        try w.interface.flush();
+        std.process.exit(2);
+    }
+
+    const source = std.Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: cannot read {s}: {s}\n", .{ src, @errorName(err) });
+        try w.interface.flush();
+        std.process.exit(2);
+    };
+    defer gpa.free(source);
+
+    var module_sources = try readModuleSources(gpa, io, module_args.items);
+    defer {
+        for (module_sources.items) |m| gpa.free(m.source);
+        module_sources.deinit(gpa);
+    }
+
+    const dump = (if (want_hir)
+        emit.showHir(gpa, source, src, module_sources.items)
+    else
+        emit.showMir(gpa, source, src, module_sources.items)) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: show {s} failed: {s}\n", .{ k, @errorName(err) });
+        try w.interface.flush();
+        std.process.exit(1);
+    };
+    defer gpa.free(dump);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(dump);
+    try w.interface.flush();
 }

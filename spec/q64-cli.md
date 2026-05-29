@@ -48,6 +48,13 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 show capabilities <qube>`  | Compiler-derived capability set for `<qube>`'s `pub` surface  |
 | `q64 show denials <fn>`         | Call-graph reachability into `with_capabilities(deny: …)` blocks |
 | `q64 show world <qube>`         | Synthesized WIT world for `<qube>`: exports (public surface) and imports (derived capability set + any imported remote worlds). The component-emission counterpart of `show capabilities`. See [`modules.md` §"The qube as a component"](./modules.md). |
+| `q64 show hir <file.q>`         | Text dump of the **HIR** (Semantic QIR) for `<file.q>` — the name-resolved, desugared tier. Takes the same `--module name=dir` flags as `emit`. Compiler-introspection: the dump format is for humans/tests, not a stable serialization. See [`ARCHITECTURE.md` §ir](../ARCHITECTURE.md). |
+| `q64 show mir <file.q>`         | Text dump of the **MIR** (Executable QIR) — the ABI-lowered tier a backend consumes (`str` = `(ptr,len)`, structured control flow, the static memory image). Same `--module` flags. Compiler-introspection (unstable format). |
+
+The `hir` / `mir` kinds run the front of the compile pipeline (parse →
+resolve imports → build HIR, then lower for `mir`) and print the result to
+stdout; a malformed program surfaces the same honest diagnostic `emit` would
+(e.g. `NameNotFound`, `NotConstExpr`) on stderr with a non-zero exit.
 
 Each form takes additional `--qube <path>` or `--module <name>=<path>`
 flags as needed (see "Global options").

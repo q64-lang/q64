@@ -179,8 +179,9 @@ pub fn emitHelloWasm(allocator: std.mem.Allocator) ![]u8 {
 //
 // `emitFromSource` parses a source string, resolves imports, and emits a
 // wasm module through the Q64 IR pipeline (AST → HIR → MIR → Binaryen).
-// A construct the IR doesn't represent yet is reported as an honest
-// `Error.UnsupportedExpression` rather than miscompiled.
+// `showHir`/`showMir` share its front (parse + resolve + build HIR) and dump
+// the IR tier as text for `q64 show hir|mir`. A construct the IR doesn't
+// represent yet is reported as an honest `Error.UnsupportedExpression`.
 
 pub fn emitFromSource(
     allocator: std.mem.Allocator,
@@ -189,37 +190,35 @@ pub fn emitFromSource(
     modules: []const ModuleSource,
     addr: AddressSpace,
 ) ![]u8 {
-    const parse_result = try parse.parse(allocator, source, file);
-    defer parse_result.deinit(allocator);
-
-    const sf = ast.SourceFile.cast(parse_result.root) orelse return Error.NoMainFunction;
-
-    // Build the link context: resolve every import against `modules`,
-    // and index this file's own functions so a local `version()` works
-    // too. An import codegen can't resolve is an error here, not a
-    // silently-ignored line (ladder step 0).
-    var resolver = Resolver.init(allocator, modules);
-    defer resolver.deinit();
-    try resolver.indexLocalFunctions(sf);
-    try resolver.resolveImports(sf);
-
-    // The Q64 IR path is the only emission path. `tryIrEmit` returns the
-    // wasm bytes, raises an honest diagnostic for a definite semantic error
-    // (an IR `Reject` mapped to its `Error` code), or returns null for a
-    // construct the IR doesn't represent yet — reported as an honest
-    // `UnsupportedExpression` (no silent miscompile, no legacy fallback).
-    const mres = ir.hir.ModuleResolver{ .ctx = &resolver, .lookupFn = resolverLookupShim };
-    return (try tryIrEmit(allocator, sf, mres, addr)) orelse Error.UnsupportedExpression;
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
+        // A shape the lowerer doesn't handle yet → honest UnsupportedExpression.
+        error.Unsupported => return Error.UnsupportedExpression,
+        else => |other| return other,
+    };
+    defer mmod.deinit();
+    return lowerToWasm(allocator, &mmod, addr);
 }
 
-// =====================================================================
-// MIR → Binaryen backend (the back boundary of the Q64 IR pipeline)
-// =====================================================================
-//
-// The only code that touches the Binaryen C API on the IR path. Consumes a
-// `mir.Module` and emits the wasm binary. v0 lowers the literal env.out path
-// (a `_start` of `host_out_const` ops); later phases extend `lowerInst` and
-// the function/feature setup as MIR grows (str ABI, i64 fns, calls, arena).
+/// Build the HIR for `source` and return its text dump (`q64 show hir`).
+pub fn showHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    return ir.print.hirToString(allocator, &hmod);
+}
+
+/// Lower `source` to MIR and return its text dump (`q64 show mir`).
+pub fn showMir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
+        error.Unsupported => return Error.UnsupportedExpression,
+        else => |other| return other,
+    };
+    defer mmod.deinit();
+    return ir.print.mirToString(allocator, &mmod);
+}
 
 /// Adapts the codegen `Resolver` to the IR builder's `ModuleResolver` so
 /// `build_hir` can resolve call targets to their AST without `ir/` depending
@@ -229,28 +228,32 @@ fn resolverLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
     return r.lookup(name);
 }
 
-/// Run the Q64 IR path: AST → HIR → MIR → Binaryen. Returns `null` when a
-/// construct isn't representable yet (build_hir bailed, or lowering hit an
-/// `Unsupported` shape) so `emitFromSource` reports an honest
-/// `UnsupportedExpression`. Other errors (genuine codegen failures) propagate.
-fn tryIrEmit(allocator: std.mem.Allocator, sf: ast.SourceFile, mres: ir.hir.ModuleResolver, addr: AddressSpace) !?[]u8 {
-    switch (try ir.build_hir.tryBuild(allocator, sf, mres)) {
-        // Not yet representable → the caller turns null into UnsupportedExpression.
-        .unsupported => return null,
-        // A definite semantic error the IR path detected — report the honest
-        // diagnostic directly.
-        .rejected => |r| return mapReject(r),
-        .module => |m| {
-            var hmod = m;
-            defer hmod.deinit();
-            var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
-                error.Unsupported => return null,
-                else => |other| return other,
-            };
-            defer mmod.deinit();
-            return try lowerToWasm(allocator, &mmod, addr);
-        },
-    }
+/// Parse `source`, resolve its imports against `modules`, and build the HIR —
+/// the shared front of `emitFromSource` and `q64 show hir|mir`. Returns the
+/// arena-owned HIR module (caller `deinit`s). A construct the IR can't yet
+/// represent is an honest `UnsupportedExpression`; a definite semantic error
+/// surfaces as its diagnostic code (`build_hir.Reject` → `mapReject`). The
+/// parse result and resolver are scoped to HIR construction (the HIR retains
+/// no AST or resolver pointers), so both are freed before returning.
+fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) !ir.hir.Module {
+    const parse_result = try parse.parse(allocator, source, file);
+    defer parse_result.deinit(allocator);
+    const sf = ast.SourceFile.cast(parse_result.root) orelse return Error.NoMainFunction;
+
+    // Resolve every import against `modules` and index this file's own
+    // functions (so a local `version()` resolves without an import). An
+    // unresolvable import is an honest error here (ladder step 0).
+    var resolver = Resolver.init(allocator, modules);
+    defer resolver.deinit();
+    try resolver.indexLocalFunctions(sf);
+    try resolver.resolveImports(sf);
+
+    const mres = ir.hir.ModuleResolver{ .ctx = &resolver, .lookupFn = resolverLookupShim };
+    return switch (try ir.build_hir.tryBuild(allocator, sf, mres)) {
+        .unsupported => Error.UnsupportedExpression,
+        .rejected => |r| mapReject(r),
+        .module => |m| m,
+    };
 }
 
 /// Map an IR-detected semantic error to its honest-baseline diagnostic code

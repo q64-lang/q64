@@ -365,8 +365,23 @@ it with `CfgUnsupported`).
         fallback to gate). **emit.zig: 3854 → 1777 lines.** Re-verified green:
         180/180 unit tests, `link-roundtrip.sh`, 74/74 `q64-test` CLI tests.
         ARCHITECTURE / `ir/README` updated to "IR is the sole emission path".
-- [ ] **P5 introspection + tail seams.** `q64 show hir|mir`; populate HIR
-      visibility/effect slots for the component/WIT + QubePod bundle stages.
+- **P5 introspection + tail seams.**
+  - [x] **`q64 show hir|mir`.** New `show` subcommand dumps either IR tier as
+        text to stdout (takes the same `--module name=dir` flags as `emit`);
+        shares `emit`'s front (`buildHir`: parse → resolve → build HIR), so a
+        malformed program surfaces the same honest diagnostic on stderr +
+        non-zero exit. `emitFromSource` was refactored onto `buildHir` (and the
+        interim `tryIrEmit` removed). Specced in `q64-cli.md`; covered by
+        `q64-test/tests/show.test.ts` (5 CLI tests) + an IR unit test.
+  - [x] **HIR visibility slot surfaced.** `show hir` prints `pub` for a
+        non-entry public function (an exported screen/twin handler) — the
+        export-surface signal the component/WIT lift will read.
+  - [ ] **Effect slot.** `hir.Func` has no `effects` field yet — it lands with
+        the effect pass; the component/WIT lift then reads visibility + effects
+        to synthesize the world (exports = pub surface, imports = capabilities).
+  - [ ] **Dependency-origin visibility.** Today a reached dependency function
+        is modeled `.private` in the app's HIR; the WIT lift needs to scope
+        "exported surface" to the qube being compiled (not its deps).
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
