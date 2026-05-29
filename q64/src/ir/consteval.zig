@@ -16,7 +16,13 @@ const ast = parser.ast;
 const parse = parser.parse;
 const hir = @import("hir.zig");
 
-pub const Error = error{NotConst} || std.mem.Allocator.Error;
+/// `NotConst` — the expression needs a runtime value (a parameter, a runtime
+/// binding, a real call), so the builder should pick another lowering.
+/// `ConstArith` — the expression is *entirely constant* but arithmetically
+/// invalid (divide/modulo by zero, overflow, out-of-range shift); it can never
+/// have a value, so the builder surfaces it as an honest `NotConstExpr` error
+/// rather than falling back.
+pub const Error = error{ NotConst, ConstArith } || std.mem.Allocator.Error;
 
 pub const Evaluator = struct {
     a: std.mem.Allocator, // arena
@@ -63,7 +69,7 @@ pub const Evaluator = struct {
                 const x = try self.evalInt(u.operand() orelse return error.NotConst);
                 const op = u.op() orelse return error.NotConst;
                 return switch (op.kind) {
-                    .MINUS => std.math.negate(x) catch return error.NotConst,
+                    .MINUS => std.math.negate(x) catch return error.ConstArith,
                     .TILDE => ~x,
                     else => error.NotConst,
                 };
@@ -73,16 +79,16 @@ pub const Evaluator = struct {
                 const r = try self.evalInt(b.rhs() orelse return error.NotConst);
                 const op = b.op() orelse return error.NotConst;
                 return switch (op.kind) {
-                    .PLUS => std.math.add(i64, l, r) catch error.NotConst,
-                    .MINUS => std.math.sub(i64, l, r) catch error.NotConst,
-                    .STAR => std.math.mul(i64, l, r) catch error.NotConst,
-                    .SLASH => if (r == 0) error.NotConst else @divTrunc(l, r),
-                    .PERCENT => if (r == 0) error.NotConst else @rem(l, r),
+                    .PLUS => std.math.add(i64, l, r) catch error.ConstArith,
+                    .MINUS => std.math.sub(i64, l, r) catch error.ConstArith,
+                    .STAR => std.math.mul(i64, l, r) catch error.ConstArith,
+                    .SLASH => if (r == 0) error.ConstArith else @divTrunc(l, r),
+                    .PERCENT => if (r == 0) error.ConstArith else @rem(l, r),
                     .AMP => l & r,
                     .PIPE => l | r,
                     .CARET => l ^ r,
-                    .SHL => if (r < 0 or r > 63) error.NotConst else l << @intCast(r),
-                    .SHR => if (r < 0 or r > 63) error.NotConst else l >> @intCast(r),
+                    .SHL => if (r < 0 or r > 63) error.ConstArith else l << @intCast(r),
+                    .SHR => if (r < 0 or r > 63) error.ConstArith else l >> @intCast(r),
                     else => error.NotConst,
                 };
             },

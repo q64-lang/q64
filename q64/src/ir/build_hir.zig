@@ -27,7 +27,10 @@ const consteval = @import("consteval.zig");
 
 pub const ModuleResolver = hir.ModuleResolver;
 
-const BuildError = error{Unsupported} || std.mem.Allocator.Error;
+/// `Unsupported` — a construct the IR path doesn't represent yet; the caller
+/// falls back to the legacy emitter. `Rejected` — a definite semantic error
+/// was recorded in `Builder.reject`; the caller reports it (no fall-back).
+const BuildError = error{ Unsupported, Rejected } || std.mem.Allocator.Error;
 
 /// A runtime `str` binding in `main`: its `(ptr, len)` live in two `_start`
 /// i64 locals.
@@ -52,31 +55,61 @@ const Builder = struct {
     /// Entry FuncId (main → 0) when the module has a `fn main`; null for a
     /// main-less module (e.g. a backend twin: only `state` + exported commands).
     entry: ?hir.FuncId = null,
+    /// The definite semantic error to report when `buildModule` returns
+    /// `error.Rejected` (read by `tryBuild`).
+    reject: ?hir.Reject = null,
 };
 
-/// Try compile-time evaluation, mapping a non-constant result to `null` (so
-/// the caller can pick a runtime lowering). Allocation failure propagates.
+/// Record a definite semantic error and bail. `tryBuild` reads `b.reject` and
+/// surfaces it as an honest diagnostic instead of falling back to legacy.
+fn reject(b: *Builder, r: hir.Reject) BuildError {
+    b.reject = r;
+    return error.Rejected;
+}
+
+/// Try compile-time evaluation. A non-constant result maps to `null` (the
+/// caller picks a runtime lowering); an entirely-constant-but-invalid
+/// expression (`error.ConstArith`: divide-by-zero, overflow) is a definite
+/// error, surfaced as `not_const`. Allocation failure propagates.
 fn tryConst(b: *Builder, expr: ast.Expr) BuildError!?[]const u8 {
     return b.eval.evalExpr(expr) catch |e| switch (e) {
         error.NotConst => null,
+        error.ConstArith => reject(b, .not_const),
         error.OutOfMemory => error.OutOfMemory,
     };
 }
 
-/// Build HIR for `sf`'s `fn main` and its reachable i64 functions, or return
-/// `null` if anything uses a construct the IR path does not yet handle.
+/// The outcome of building HIR for a source file.
+pub const Result = union(enum) {
+    /// Built HIR — lower it to MIR and emit.
+    module: hir.Module,
+    /// A construct the IR path doesn't represent yet — fall back to the legacy
+    /// emitter (the codegen router decides; `Q64_IR_STRICT=1` panics instead).
+    unsupported,
+    /// A definite semantic error — report it as an honest diagnostic, do NOT
+    /// fall back.
+    rejected: hir.Reject,
+};
+
+/// Build HIR for `sf`'s `fn main` and its reachable functions. Returns the
+/// module, `unsupported` (fall back), or a `rejected` reason (report it).
 pub fn tryBuild(
     gpa: std.mem.Allocator,
     sf: ast.SourceFile,
     resolver: ModuleResolver,
-) std.mem.Allocator.Error!?hir.Module {
+) std.mem.Allocator.Error!Result {
     var mod = hir.Module.init(gpa);
     const a = mod.alloc();
     var b = Builder{ .a = a, .resolver = resolver, .eval = .{ .a = a, .resolver = resolver } };
     buildModule(&b, sf) catch |e| switch (e) {
         error.Unsupported => {
             mod.deinit();
-            return null;
+            return .unsupported;
+        },
+        error.Rejected => {
+            const r = b.reject.?;
+            mod.deinit();
+            return .{ .rejected = r };
         },
         error.OutOfMemory => {
             mod.deinit();
@@ -87,7 +120,7 @@ pub fn tryBuild(
     mod.entry = b.entry;
     mod.globals = try b.global_inits.toOwnedSlice(b.a);
     mod.global_names = try b.global_names.toOwnedSlice(b.a);
-    return mod;
+    return .{ .module = mod };
 }
 
 fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
@@ -115,7 +148,18 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // A module may have no `fn main` (a backend twin: just `state` + exported
     // commands). Then there's no entry — build only the screen functions.
     const main_fn = findMain(sf) orelse {
-        try buildScreenFuncs(b, sf);
+        // No `fn main`. A valid main-less module is a backend twin: `state`
+        // globals and/or twin command functions (qview / state-assign bodies).
+        // If a non-twin function turns up (e.g. one with an `env.out` body) or
+        // the module has nothing emittable, it isn't a runnable artifact → the
+        // honest NoMainFunction diagnostic, not a fall-back.
+        buildScreenFuncs(b, sf) catch |e| switch (e) {
+            error.Unsupported => return reject(b, .no_main),
+            else => return e,
+        };
+        if (b.entry == null and b.funcs.items.len == 0 and b.global_inits.items.len == 0) {
+            return reject(b, .no_main);
+        }
         return;
     };
     const body = main_fn.body() orelse return error.Unsupported;
@@ -193,7 +237,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 try stmts.append(b.a, st);
                 continue;
             }
-            if (!isEnvOut(b.a, call)) return error.Unsupported;
+            if (!isEnvOut(b.a, call)) return reject(b, .unsupported_call);
             const arg = firstArg(call) orelse return error.Unsupported;
 
             const st = try b.a.create(hir.Stmt);
@@ -209,8 +253,11 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
                 st.* = .{ .host_out_str = e };
             } else if (arg == .string_lit) {
-                // A string literal with dynamic interpolation → runtime concat.
-                st.* = .{ .host_out_str = try buildConcat(b, arg.string_lit, &mscope, false, rt) };
+                // A string literal with interpolation. If it folds entirely to
+                // a constant (e.g. only untyped fold-only helpers), emit a
+                // folded `host_out`; otherwise a runtime concat.
+                const v = try buildConcat(b, arg.string_lit, &mscope, false, rt);
+                st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
             } else if (try isStrCall(b, arg)) {
                 // A real call to a str-returning function.
                 st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope, rt) };
@@ -242,6 +289,12 @@ fn buildScreenFuncs(b: *Builder, sf: ast.SourceFile) BuildError!void {
             const nm = fd.name() orelse continue;
             if (std.mem.eql(u8, nm.text, "main")) continue;
             if (fd.returnType() != null) continue; // void-returning handlers only
+            // Only the public surface is an exported screen/twin handler the
+            // host invokes (`pub fn on_press`, `pub fn inc`). A private
+            // no-return-type function is a helper — folded into a caller (e.g.
+            // `fn version { "9.9.9" }` used in interpolation) or emitted
+            // on demand via `registerFunc` — not a screen function.
+            if (fd.visibility() == null) continue;
             try buildScreenFunc(b, fd);
         },
         else => {},
@@ -339,7 +392,7 @@ fn pathText(b: *Builder, p: ast.PathExpr) BuildError![]const u8 {
 fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (b.ids.get(name)) |id| return id;
 
-    const fd = b.resolver.lookup(name) orelse return error.Unsupported;
+    const fd = b.resolver.lookup(name) orelse return reject(b, .name_not_found);
     if (try returnsStr(b.a, fd)) return registerStrFunc(b, name, fd);
     if (!(try returnsI64(b.a, fd))) return error.Unsupported;
 
@@ -369,12 +422,30 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = .i64, .body = dummy });
 
     const body = try buildIntBlock(b, fd.body() orelse return error.Unsupported, &scope);
+    // A value-producing i64 function whose tail is an `if` with no `else` has a
+    // path that yields no value → UnsupportedCall (matches the legacy emitter,
+    // which rejects a value `if` lacking an else).
+    if (tailIsValueIfNoElse(body)) return reject(b, .unsupported_call);
     const extra = scope.extra();
     const locals = try b.a.alloc(hir.Type, extra);
     for (locals) |*t| t.* = .i64;
 
     b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .i64, .locals = locals, .body = body };
     return id;
+}
+
+/// True if `body` (an i64 function block) ends in an `if` with no `else` — a
+/// value position with a path that produces no value.
+fn tailIsValueIfNoElse(body: *const hir.Stmt) bool {
+    const items = switch (body.*) {
+        .block => |s| s,
+        else => return false,
+    };
+    if (items.len == 0) return false;
+    return switch (items[items.len - 1].*) {
+        .if_ => |iff| iff.else_ == null,
+        else => false,
+    };
 }
 
 /// Register a `str`-returning function. v0 handles an all-str-parameter
@@ -427,6 +498,7 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
                 out.* = .{ .str_const = bytes };
             } else |e| switch (e) {
                 error.NotConst => return buildConcat(b, sl, scope, true, rt),
+                error.ConstArith => return reject(b, .not_const),
                 error.OutOfMemory => return error.OutOfMemory,
             }
         },
@@ -453,7 +525,7 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             var args: std.ArrayList(*hir.Expr) = .empty;
             var ait = cc.args();
             while (ait.next()) |a| try args.append(b.a, try buildStrArg(b, a, scope, rt));
-            if (args.items.len != b.funcs.items[id].params.len) return error.Unsupported;
+            if (args.items.len != b.funcs.items[id].params.len) return reject(b, .unsupported_call);
             out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
         },
         else => return error.Unsupported,
@@ -486,6 +558,10 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) Bui
                 out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
             } else return error.Unsupported;
         },
+        // A nested, non-const call as a str argument (`wrap(shout("yo"))`): bind
+        // it first (`let t = shout("yo"); wrap(t)`). The legacy emitter reports
+        // NotConstExpr here.
+        .call => return reject(b, .not_const),
         else => return error.Unsupported,
     }
     return out;
@@ -548,12 +624,24 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                     };
                     const cname = try cpath.text(b.a);
                     defer b.a.free(cname);
-                    const id = try registerFunc(b, cname);
-                    if (b.funcs.items[id].ret != .str) return error.Unsupported;
-                    try flush(b, &lit, &pieces);
-                    const e = try b.a.create(hir.Expr);
-                    e.* = .{ .call = .{ .func = id, .args = &.{} } };
-                    try pieces.append(b.a, e);
+                    const fd = b.resolver.lookup(cname) orelse return reject(b, .name_not_found);
+                    // An untyped value function (`fn version { "9.9.9" }`, no
+                    // `-> str`) can't be emitted as a runtime str function, so
+                    // fold its const body — legacy-compatible. A typed `-> str`
+                    // function stays a real runtime call (like `env.out(f())`).
+                    if (fd.returnType() == null) {
+                        b.eval.fold_calls = true;
+                        const folded = try tryConst(b, iexpr);
+                        b.eval.fold_calls = false;
+                        try lit.appendSlice(b.a, folded orelse return reject(b, .unsupported_call));
+                    } else {
+                        const id = try registerFunc(b, cname);
+                        if (b.funcs.items[id].ret != .str) return error.Unsupported;
+                        try flush(b, &lit, &pieces);
+                        const e = try b.a.create(hir.Expr);
+                        e.* = .{ .call = .{ .func = id, .args = &.{} } };
+                        try pieces.append(b.a, e);
+                    }
                 },
                 .path => |pp| {
                     const ptext = try pp.text(b.a);
@@ -599,6 +687,22 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
         i += 1;
     }
     try flush(b, &lit, &pieces);
+
+    // If every piece folded to constants, the interpolation is a compile-time
+    // constant string: return a bare `str_const` so the caller can emit a
+    // folded `host_out` (value + newline contiguous) rather than a runtime
+    // concat. (Reached e.g. for `"{version()}"` where `version` is an untyped
+    // fold-only helper.)
+    if (pieces.items.len <= 1) {
+        const out = try b.a.create(hir.Expr);
+        out.* = if (pieces.items.len == 1 and pieces.items[0].* == .str_const)
+            pieces.items[0].*
+        else if (pieces.items.len == 0)
+            .{ .str_const = "" }
+        else
+            .{ .concat = try pieces.toOwnedSlice(b.a) };
+        return out;
+    }
 
     const out = try b.a.create(hir.Expr);
     out.* = .{ .concat = try pieces.toOwnedSlice(b.a) };
@@ -718,7 +822,7 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             const tname = try tpath.text(b.a);
             defer b.a.free(tname);
             const loc = scope.find(tname) orelse return error.Unsupported;
-            if (!loc.mutable) return error.Unsupported; // immutable → legacy reports ImmutableAssign
+            if (!loc.mutable) return reject(b, .immutable_assign); // a `let` binding or a parameter
             const rhs = try buildIntExpr(b, as.value() orelse return error.Unsupported, scope);
             const op = as.op() orelse return error.Unsupported;
             const value = if (op.kind == .EQ) rhs else blk: {
@@ -803,11 +907,11 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
             const id = try registerFunc(b, cname);
-            if (b.funcs.items[id].ret != .i64) return error.Unsupported; // only i64 callees in an i64 expr
+            if (b.funcs.items[id].ret != .i64) return reject(b, .unsupported_call); // only i64 callees in an i64 expr
             var args: std.ArrayList(*hir.Expr) = .empty;
             var ait = cc.args();
             while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
-            if (args.items.len != b.funcs.items[id].params.len) return error.Unsupported;
+            if (args.items.len != b.funcs.items[id].params.len) return reject(b, .unsupported_call);
             out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
         },
         else => return error.Unsupported,
@@ -966,7 +1070,27 @@ fn buildFromSource(gpa: std.mem.Allocator, source: []const u8, res: ModuleResolv
     const pr = try parser.parse.parse(gpa, source, "<test>");
     defer pr.deinit(gpa);
     const sf = ast.SourceFile.cast(pr.root) orelse return null;
-    return tryBuild(gpa, sf, res);
+    return switch (try tryBuild(gpa, sf, res)) {
+        .module => |m| m,
+        else => null,
+    };
+}
+
+/// Build and return the reject reason, or null if the source built / was
+/// merely unsupported. For tests that assert a specific honest-baseline error.
+fn rejectFromSource(gpa: std.mem.Allocator, source: []const u8, res: ModuleResolver) !?hir.Reject {
+    const pr = try parser.parse.parse(gpa, source, "<test>");
+    defer pr.deinit(gpa);
+    const sf = ast.SourceFile.cast(pr.root) orelse return null;
+    var r = try tryBuild(gpa, sf, res);
+    switch (r) {
+        .module => |*m| {
+            m.deinit();
+            return null;
+        },
+        .unsupported => return null,
+        .rejected => |reason| return reason,
+    }
 }
 
 const noLib: ModuleResolver = .{ .ctx = undefined, .lookupFn = struct {
