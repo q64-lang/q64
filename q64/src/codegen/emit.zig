@@ -52,7 +52,6 @@ pub const Error = error{
     UndeclaredName, // assignment target names no in-scope binding
     BreakOutsideLoop, // `break`/`continue` with no enclosing loop
     CfgUnsupported, // a MIR func body in CFG form — the WASM backend only takes structured
-    Wasm32StringAbiUnsupported, // --addr wasm32 with a program that needs the i64 string/arena ABI (Path B follow-up)
     OutOfMemory,
 };
 
@@ -290,24 +289,12 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // way (q64 ints are i64 — only memory addresses are width-sensitive).
     const ptr_type = if (mem64) i64_type else i32_type;
 
-    // wasm32 (the WebKit/iPad baseline): the const-string path is supported —
-    // `host_out_const` reads bytes straight from a 32-bit data segment at an
-    // i32 offset. The runtime string/arena ABI (concat, int/str formatting,
-    // str values/params/bindings) is still i64-pointer-baked, so reject a
-    // program that needs it rather than emit a broken module (the Path-B
-    // follow-up). The integer/import subset (qview host calls, `state`
-    // globals, i64 arithmetic) carries no string ABI and runs on wasm32.
-    if (addr == .wasm32) {
-        for (m.funcs) |f| {
-            const inst = switch (f.body) {
-                .structured => |x| x,
-                .cfg => return Error.CfgUnsupported,
-            };
-            if (usesStrAbi(inst)) return Error.Wasm32StringAbiUnsupported;
-        }
-    }
-
-    var pair = [_]c.BinaryenType{ i64_type, i64_type };
+    // A `str` value is the `(ptr, len)` pair, both at the address width. So the
+    // whole string/arena ABI — env.out's params, the data-segment offset, the
+    // `sp` bump global, `__fmt_i64`, concat, and str values/params/bindings —
+    // is pointer-width on either address space, and runs on wasm32 (no
+    // Memory64) just as on wasm64.
+    var pair = [_]c.BinaryenType{ ptr_type, ptr_type };
     const pair_type = c.BinaryenTypeCreate(&pair, pair.len);
 
     var env_out_params = [_]c.BinaryenType{ ptr_type, ptr_type };
@@ -346,9 +333,15 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     }
     if (needs_fmt) needs_arena = true;
     if (needs_arena) {
-        _ = c.BinaryenAddGlobal(module, "sp", i64_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(m.data.len))));
+        // The scope-arena bump pointer starts just past the static data, at the
+        // address width (i32 on wasm32, i64 on wasm64).
+        const sp_init = if (mem64)
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(m.data.len)))
+        else
+            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(m.data.len)));
+        _ = c.BinaryenAddGlobal(module, "sp", ptr_type, true, sp_init);
     }
-    if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type);
+    if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
 
     // Host-face imports (e.g. `qview.text`): declare one wasm import per distinct
     // host_call name. All args are i64 (valid on wasm32); the import returns void.
@@ -440,15 +433,16 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const n_extra = f.locals.len + n_tuples + @as(usize, if (sc.has_concat) 3 else 0);
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
-        for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type);
+        for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type, ptr_type);
         for (0..n_tuples) |j| vts[f.locals.len + j] = pair_type;
         if (sc.has_concat) {
-            vts[f.locals.len + n_tuples] = i64_type;
-            vts[f.locals.len + n_tuples + 1] = i64_type;
-            vts[f.locals.len + n_tuples + 2] = i64_type;
+            // buf / off / len are address-width pointers/lengths.
+            vts[f.locals.len + n_tuples] = ptr_type;
+            vts[f.locals.len + n_tuples + 1] = ptr_type;
+            vts[f.locals.len + n_tuples + 2] = ptr_type;
         }
 
-        // Parameter wasm types (str → two i64).
+        // Parameter wasm types (a `str` param → two address-width ptr/len).
         var ptype = none_type;
         var pbuf: []c.BinaryenType = &.{};
         if (params_width > 0) {
@@ -456,11 +450,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             var kk: usize = 0;
             for (f.params) |p| {
                 if (p == .str) {
-                    pbuf[kk] = i64_type;
-                    pbuf[kk + 1] = i64_type;
+                    pbuf[kk] = ptr_type;
+                    pbuf[kk + 1] = ptr_type;
                     kk += 2;
                 } else {
-                    pbuf[kk] = wasmType(p, i64_type, i32_type, none_type, pair_type);
+                    pbuf[kk] = wasmType(p, i64_type, i32_type, none_type, pair_type, ptr_type);
                     kk += 1;
                 }
             }
@@ -468,7 +462,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         }
         defer if (pbuf.len > 0) allocator.free(pbuf);
 
-        const ret = if (is_entry) none_type else wasmType(f.ret, i64_type, i32_type, none_type, pair_type);
+        const ret = if (is_entry) none_type else wasmType(f.ret, i64_type, i32_type, none_type, pair_type, ptr_type);
         const body = try lw.inst(structured);
         _ = c.BinaryenAddFunction(module, f.name.ptr, ptype, ret, if (n_extra > 0) @ptrCast(vts.ptr) else null, @intCast(n_extra), body);
         if (is_entry) {
@@ -493,12 +487,13 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     return out;
 }
 
-fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenType, none_type: c.BinaryenType, pair_type: c.BinaryenType) c.BinaryenType {
+fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenType, none_type: c.BinaryenType, pair_type: c.BinaryenType, ptr_type: c.BinaryenType) c.BinaryenType {
     return switch (t) {
         .i64 => i64_type,
         .i32 => i32_type,
         .f64 => c.BinaryenTypeFloat64(),
         .str => pair_type, // a (ptr, len) multivalue
+        .ptr => ptr_type, // an address-width pointer/length local
         .void => none_type,
     };
 }
@@ -536,39 +531,6 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .global_set => |gs| bodyHasOut(gs.value, want_int),
         .host_out_const, .const_i64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
-    };
-}
-
-/// True if the tree uses the runtime string/arena ABI — the i64-pointer path
-/// not yet ported to wasm32: int/str host-out, runtime concat, or any `str`
-/// value (a const-str value, a parameter, a binding, a bind, or int→str
-/// formatting). A pure `host_out_const` of a constant string does NOT (it
-/// reads bytes straight from the data segment), nor do qview host calls,
-/// `state` globals, or i64 arithmetic. Used to gate wasm32 emission.
-fn usesStrAbi(inst: *const ir.mir.Inst) bool {
-    return switch (inst.op) {
-        .host_out_int, .host_out_str, .str_concat, .str_const_val, .str_param, .str_binding, .str_bind, .fmt_int_to_str => true,
-        .block => |items| {
-            for (items) |ch| if (usesStrAbi(ch)) return true;
-            return false;
-        },
-        .local_set => |ls| usesStrAbi(ls.value),
-        .bin => |b| usesStrAbi(b.lhs) or usesStrAbi(b.rhs),
-        .un => |u| usesStrAbi(u.operand),
-        .call => |cl| {
-            for (cl.args) |a| if (usesStrAbi(a)) return true;
-            return false;
-        },
-        .ret => |v| if (v) |val| usesStrAbi(val) else false,
-        .if_ => |iff| usesStrAbi(iff.cond) or usesStrAbi(iff.then_) or (iff.else_ != null and usesStrAbi(iff.else_.?)),
-        .while_ => |w| usesStrAbi(w.cond) or usesStrAbi(w.body),
-        .loop => |body| usesStrAbi(body),
-        .host_call => |hc| {
-            for (hc.args) |a| if (usesStrAbi(a)) return true;
-            return false;
-        },
-        .global_set => |gs| usesStrAbi(gs.value),
-        .host_out_const, .const_i64, .local_get, .global_get, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -719,16 +681,16 @@ const Lowerer = struct {
             },
             .str_param => |idx| {
                 var elems = [_]c.BinaryenExpressionRef{
-                    c.BinaryenLocalGet(module, idx * 2, self.i64_type),
-                    c.BinaryenLocalGet(module, idx * 2 + 1, self.i64_type),
+                    self.ptrGet(idx * 2),
+                    self.ptrGet(idx * 2 + 1),
                 };
                 return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
             },
             .str_concat => |pieces| return self.emitConcat(pieces),
             .str_binding => |sb| {
                 var elems = [_]c.BinaryenExpressionRef{
-                    c.BinaryenLocalGet(module, sb.ptr_idx, self.i64_type),
-                    c.BinaryenLocalGet(module, sb.len_idx, self.i64_type),
+                    self.ptrGet(sb.ptr_idx),
+                    self.ptrGet(sb.len_idx),
                 };
                 return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
             },
@@ -745,8 +707,8 @@ const Lowerer = struct {
             .ret => |v| return c.BinaryenReturn(module, if (v) |val| try self.inst(val) else null),
             .str_const_val => |sc| {
                 var elems = [_]c.BinaryenExpressionRef{
-                    c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(sc.off))),
-                    c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(sc.len))),
+                    self.ptrConst(@intCast(sc.off)),
+                    self.ptrConst(@intCast(sc.len)),
                 };
                 return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
             },
@@ -851,6 +813,18 @@ const Lowerer = struct {
             c.BinaryenConst(self.module, c.BinaryenLiteralInt64(v));
     }
 
+    /// `local.get idx` typed at the pointer width.
+    fn ptrGet(self: *Lowerer, idx: c.BinaryenIndex) c.BinaryenExpressionRef {
+        return c.BinaryenLocalGet(self.module, idx, self.ptr_type);
+    }
+
+    /// Pointer-width addition (`i32.add` on wasm32, `i64.add` on wasm64) — for
+    /// arena bumps and offset stepping.
+    fn ptrAdd(self: *Lowerer, a: c.BinaryenExpressionRef, b: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        const op = if (self.ptr_type == self.i32_type) c.BinaryenAddInt32() else c.BinaryenAddInt64();
+        return c.BinaryenBinary(self.module, op, a, b);
+    }
+
     /// Write a `(ptr, len)` pair value to env.out, then the newline byte:
     /// stash the pair in the scratch local, extract both halves, env.out them,
     /// then env.out(nl, 1).
@@ -876,15 +850,8 @@ const Lowerer = struct {
     /// `memory.copy`d in. Yields the `(buf, len)` pair.
     fn emitConcat(self: *Lowerer, pieces: []const *ir.mir.Inst) Error!c.BinaryenExpressionRef {
         const m = self.module;
-        const i64t = self.i64_type;
         var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
         defer stmts.deinit(self.allocator);
-
-        const k = struct {
-            fn cst(mm: c.BinaryenModuleRef, v: i64) c.BinaryenExpressionRef {
-                return c.BinaryenConst(mm, c.BinaryenLiteralInt64(v));
-            }
-        };
 
         // 1. Evaluate each tuple-returning piece (call / fmt_int_to_str) into
         // its tuple slot. (str_param, str_binding, str_const_val don't need a
@@ -898,32 +865,32 @@ const Lowerer = struct {
             else => {},
         };
 
-        // 2. len = constant total + each dynamic piece's length.
+        // 2. len = constant total + each dynamic piece's length (all ptr-width).
         var const_total: u64 = 0;
         for (pieces) |p| switch (p.op) {
             .str_const_val => |sc| const_total += sc.len,
             else => {},
         };
-        var total = k.cst(m, @intCast(const_total));
+        var total = self.ptrConst(@intCast(const_total));
         j = 0;
         for (pieces) |p| switch (p.op) {
             .call, .fmt_int_to_str => {
-                total = c.BinaryenBinary(m, c.BinaryenAddInt64(), total, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1));
+                total = self.ptrAdd(total, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1));
                 j += 1;
             },
-            .str_param => |idx| total = c.BinaryenBinary(m, c.BinaryenAddInt64(), total, c.BinaryenLocalGet(m, idx * 2 + 1, i64t)),
-            .str_binding => |sb| total = c.BinaryenBinary(m, c.BinaryenAddInt64(), total, c.BinaryenLocalGet(m, sb.len_idx, i64t)),
+            .str_param => |idx| total = self.ptrAdd(total, self.ptrGet(idx * 2 + 1)),
+            .str_binding => |sb| total = self.ptrAdd(total, self.ptrGet(sb.len_idx)),
             .str_const_val => {},
             else => return Error.UnsupportedCall,
         };
         try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.len_idx, total));
 
         // 3. buf = sp; sp += len.
-        try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.buf_idx, c.BinaryenGlobalGet(m, "sp", i64t)));
-        try stmts.append(self.allocator, c.BinaryenGlobalSet(m, "sp", c.BinaryenBinary(m, c.BinaryenAddInt64(), c.BinaryenLocalGet(m, self.buf_idx, i64t), c.BinaryenLocalGet(m, self.len_idx, i64t))));
+        try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.buf_idx, c.BinaryenGlobalGet(m, "sp", self.ptr_type)));
+        try stmts.append(self.allocator, c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(self.buf_idx), self.ptrGet(self.len_idx))));
 
         // 4. off = buf; memory.copy each piece, bumping off.
-        try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.off_idx, c.BinaryenLocalGet(m, self.buf_idx, i64t)));
+        try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.off_idx, self.ptrGet(self.buf_idx)));
         j = 0;
         for (pieces) |p| {
             var src: c.BinaryenExpressionRef = undefined;
@@ -931,19 +898,19 @@ const Lowerer = struct {
             var ln2: c.BinaryenExpressionRef = undefined;
             switch (p.op) {
                 .str_const_val => |sc| {
-                    src = k.cst(m, @intCast(sc.off));
-                    ln = k.cst(m, @intCast(sc.len));
-                    ln2 = k.cst(m, @intCast(sc.len));
+                    src = self.ptrConst(@intCast(sc.off));
+                    ln = self.ptrConst(@intCast(sc.len));
+                    ln2 = self.ptrConst(@intCast(sc.len));
                 },
                 .str_param => |idx| {
-                    src = c.BinaryenLocalGet(m, idx * 2, i64t);
-                    ln = c.BinaryenLocalGet(m, idx * 2 + 1, i64t);
-                    ln2 = c.BinaryenLocalGet(m, idx * 2 + 1, i64t);
+                    src = self.ptrGet(idx * 2);
+                    ln = self.ptrGet(idx * 2 + 1);
+                    ln2 = self.ptrGet(idx * 2 + 1);
                 },
                 .str_binding => |sb| {
-                    src = c.BinaryenLocalGet(m, sb.ptr_idx, i64t);
-                    ln = c.BinaryenLocalGet(m, sb.len_idx, i64t);
-                    ln2 = c.BinaryenLocalGet(m, sb.len_idx, i64t);
+                    src = self.ptrGet(sb.ptr_idx);
+                    ln = self.ptrGet(sb.len_idx);
+                    ln2 = self.ptrGet(sb.len_idx);
                 },
                 .call, .fmt_int_to_str => {
                     src = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 0);
@@ -953,21 +920,21 @@ const Lowerer = struct {
                 },
                 else => return Error.UnsupportedCall,
             }
-            try stmts.append(self.allocator, c.BinaryenMemoryCopy(m, c.BinaryenLocalGet(m, self.off_idx, i64t), src, ln, "0", "0"));
-            try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.off_idx, c.BinaryenBinary(m, c.BinaryenAddInt64(), c.BinaryenLocalGet(m, self.off_idx, i64t), ln2)));
+            try stmts.append(self.allocator, c.BinaryenMemoryCopy(m, self.ptrGet(self.off_idx), src, ln, "0", "0"));
+            try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.off_idx, self.ptrAdd(self.ptrGet(self.off_idx), ln2)));
         }
 
         // 5. The block yields the assembled (buf, len).
         var elems = [_]c.BinaryenExpressionRef{
-            c.BinaryenLocalGet(m, self.buf_idx, i64t),
-            c.BinaryenLocalGet(m, self.len_idx, i64t),
+            self.ptrGet(self.buf_idx),
+            self.ptrGet(self.len_idx),
         };
         try stmts.append(self.allocator, c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len));
         return c.BinaryenBlock(m, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), self.pair_type);
     }
 
     fn wty(self: *const Lowerer, t: ir.mir.ValueType) c.BinaryenType {
-        return wasmType(t, self.i64_type, self.i32_type, self.none_type, self.pair_type);
+        return wasmType(t, self.i64_type, self.i32_type, self.none_type, self.pair_type, self.ptr_type);
     }
 
     /// Emit the two i64 operands (ptr, len) for a `str` argument. Only simple
@@ -976,16 +943,16 @@ const Lowerer = struct {
     fn strOperands(self: *Lowerer, arg: *const ir.mir.Inst, out: *std.ArrayList(c.BinaryenExpressionRef)) Error!void {
         switch (arg.op) {
             .str_const_val => |sc| {
-                try out.append(self.allocator, c.BinaryenConst(self.module, c.BinaryenLiteralInt64(@intCast(sc.off))));
-                try out.append(self.allocator, c.BinaryenConst(self.module, c.BinaryenLiteralInt64(@intCast(sc.len))));
+                try out.append(self.allocator, self.ptrConst(@intCast(sc.off)));
+                try out.append(self.allocator, self.ptrConst(@intCast(sc.len)));
             },
             .str_param => |idx| {
-                try out.append(self.allocator, c.BinaryenLocalGet(self.module, idx * 2, self.i64_type));
-                try out.append(self.allocator, c.BinaryenLocalGet(self.module, idx * 2 + 1, self.i64_type));
+                try out.append(self.allocator, self.ptrGet(idx * 2));
+                try out.append(self.allocator, self.ptrGet(idx * 2 + 1));
             },
             .str_binding => |sb| {
-                try out.append(self.allocator, c.BinaryenLocalGet(self.module, sb.ptr_idx, self.i64_type));
-                try out.append(self.allocator, c.BinaryenLocalGet(self.module, sb.len_idx, self.i64_type));
+                try out.append(self.allocator, self.ptrGet(sb.ptr_idx));
+                try out.append(self.allocator, self.ptrGet(sb.len_idx));
             },
             else => return Error.UnsupportedCall,
         }
@@ -1111,18 +1078,26 @@ const LoopLabels = struct { brk: [:0]const u8, cont: [:0]const u8 };
 /// Emit `__fmt_i64(n: i64) -> (i64, i64)`: format `n` to decimal in the
 /// scope arena, returning (ptr, len). Writes digits backward into a 24-byte
 /// bump allocation, then prepends `-` for negatives.
-fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_type: c.BinaryenType, pair_type: c.BinaryenType) !void {
+fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_type: c.BinaryenType, pair_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
     const i32_type = c.BinaryenTypeInt32();
     const none = c.BinaryenTypeNone();
-    // Locals: 0=n (param), 1=mag, 2=p, 3=end (i64); 4=neg (i32).
+    // Locals: 0=n (param, i64 value), 1=mag (i64 value), 2=p, 3=end
+    // (address-width pointers into the arena), 4=neg (i32). The digit
+    // arithmetic stays i64; only the cursor + arena pointers track the width.
     const N: c.BinaryenIndex = 0;
     const MAG: c.BinaryenIndex = 1;
     const P: c.BinaryenIndex = 2;
     const END: c.BinaryenIndex = 3;
     const NEG: c.BinaryenIndex = 4;
+    // Pointer-width add/sub and constants (i32 on wasm32, i64 on wasm64).
+    const add_p = if (mem64) c.BinaryenAddInt64() else c.BinaryenAddInt32();
+    const sub_p = if (mem64) c.BinaryenSubInt64() else c.BinaryenSubInt32();
     const k = struct {
         fn i64c(m: c.BinaryenModuleRef, v: i64) c.BinaryenExpressionRef {
             return c.BinaryenConst(m, c.BinaryenLiteralInt64(v));
+        }
+        fn ptrc(m: c.BinaryenModuleRef, m64: bool, v: i64) c.BinaryenExpressionRef {
+            return if (m64) c.BinaryenConst(m, c.BinaryenLiteralInt64(v)) else c.BinaryenConst(m, c.BinaryenLiteralInt32(@intCast(v)));
         }
         fn get(m: c.BinaryenModuleRef, idx: c.BinaryenIndex, t: c.BinaryenType) c.BinaryenExpressionRef {
             return c.BinaryenLocalGet(m, idx, t);
@@ -1141,21 +1116,22 @@ fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
         c.BinaryenBinary(module, c.BinaryenSubInt64(), k.i64c(module, 0), k.get(module, N, i64_type)),
         k.get(module, N, i64_type),
     )));
-    // end = sp + 24; sp = end; p = end
-    try stmts.append(allocator, c.BinaryenLocalSet(module, END, c.BinaryenBinary(module, c.BinaryenAddInt64(), c.BinaryenGlobalGet(module, "sp", i64_type), k.i64c(module, 24))));
-    try stmts.append(allocator, c.BinaryenGlobalSet(module, "sp", k.get(module, END, i64_type)));
-    try stmts.append(allocator, c.BinaryenLocalSet(module, P, k.get(module, END, i64_type)));
+    // end = sp + 24; sp = end; p = end   (pointer arithmetic, ptr-width)
+    try stmts.append(allocator, c.BinaryenLocalSet(module, END, c.BinaryenBinary(module, add_p, c.BinaryenGlobalGet(module, "sp", ptr_type), k.ptrc(module, mem64, 24))));
+    try stmts.append(allocator, c.BinaryenGlobalSet(module, "sp", k.get(module, END, ptr_type)));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, P, k.get(module, END, ptr_type)));
 
     // loop: p--; mem[p] = '0' + mag%10; mag /= 10; repeat while mag != 0.
+    // The store address is ptr-width; the byte value is an i64 (i64.store8).
     var loop_body: std.ArrayList(c.BinaryenExpressionRef) = .empty;
     defer loop_body.deinit(allocator);
-    try loop_body.append(allocator, c.BinaryenLocalSet(module, P, c.BinaryenBinary(module, c.BinaryenSubInt64(), k.get(module, P, i64_type), k.i64c(module, 1))));
+    try loop_body.append(allocator, c.BinaryenLocalSet(module, P, c.BinaryenBinary(module, sub_p, k.get(module, P, ptr_type), k.ptrc(module, mem64, 1))));
     try loop_body.append(allocator, c.BinaryenStore(
         module,
         1,
         0,
         0,
-        k.get(module, P, i64_type),
+        k.get(module, P, ptr_type),
         c.BinaryenBinary(module, c.BinaryenAddInt64(), k.i64c(module, '0'), c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, MAG, i64_type), k.i64c(module, 10))),
         i64_type,
         "0",
@@ -1167,21 +1143,21 @@ fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
 
     // if neg: p--; mem[p] = '-'
     var sign_body = [_]c.BinaryenExpressionRef{
-        c.BinaryenLocalSet(module, P, c.BinaryenBinary(module, c.BinaryenSubInt64(), k.get(module, P, i64_type), k.i64c(module, 1))),
-        c.BinaryenStore(module, 1, 0, 0, k.get(module, P, i64_type), k.i64c(module, '-'), i64_type, "0"),
+        c.BinaryenLocalSet(module, P, c.BinaryenBinary(module, sub_p, k.get(module, P, ptr_type), k.ptrc(module, mem64, 1))),
+        c.BinaryenStore(module, 1, 0, 0, k.get(module, P, ptr_type), k.i64c(module, '-'), i64_type, "0"),
     };
     const sign_block = c.BinaryenBlock(module, null, @ptrCast(&sign_body), sign_body.len, none);
     try stmts.append(allocator, c.BinaryenIf(module, k.get(module, NEG, i32_type), sign_block, null));
 
     // result = (p, end - p)
     var ret = [_]c.BinaryenExpressionRef{
-        k.get(module, P, i64_type),
-        c.BinaryenBinary(module, c.BinaryenSubInt64(), k.get(module, END, i64_type), k.get(module, P, i64_type)),
+        k.get(module, P, ptr_type),
+        c.BinaryenBinary(module, sub_p, k.get(module, END, ptr_type), k.get(module, P, ptr_type)),
     };
     try stmts.append(allocator, c.BinaryenTupleMake(module, @ptrCast(&ret), ret.len));
 
     const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), pair_type);
-    var var_types = [_]c.BinaryenType{ i64_type, i64_type, i64_type, i32_type };
+    var var_types = [_]c.BinaryenType{ i64_type, ptr_type, ptr_type, i32_type };
     _ = c.BinaryenAddFunction(module, "__fmt_i64", i64_type, pair_type, @ptrCast(&var_types), var_types.len, body);
 }
 
@@ -1265,16 +1241,21 @@ test "emitFromSource: a const string emits a valid module on wasm32" {
     try testing.expect(std.mem.indexOf(u8, bytes, "hi\n") != null);
 }
 
-test "emitFromSource: wasm32 rejects the runtime string/arena ABI (Path B)" {
-    // `env.out(double(21))` needs __fmt_i64 + the scope arena, whose pointers
-    // are still i64-baked — an honest Wasm32StringAbiUnsupported until ported.
+test "emitFromSource: the runtime string/arena ABI emits on wasm32 (i32 pointers)" {
+    // `env.out(double(21))` needs __fmt_i64 + the scope arena; both are now
+    // address-width (i32 pointers on wasm32), so the module emits + validates.
     const lib = "pub fn double(n: i64) -> i64 { n + n }\n";
     const app = "import dev.q64.m.{double}\nfn main { env.out(double(21)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    try testing.expectError(
-        Error.Wasm32StringAbiUnsupported,
-        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm32),
-    );
+    // Both widths emit + validate (emitFromSource validates the module, so a
+    // returned slice means the i32 arena/__fmt_i64 path is well-formed).
+    const w32 = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm32);
+    defer testing.allocator.free(w32);
+    try testing.expectEqualSlices(u8, "\x00asm", w32[0..4]);
+    try testing.expect(w32.len > 8);
+    const w64 = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
+    defer testing.allocator.free(w64);
+    try testing.expectEqualSlices(u8, "\x00asm", w64[0..4]);
 }
 
 test "emitFromSource: missing main returns NoMainFunction" {

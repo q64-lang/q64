@@ -300,6 +300,7 @@ fn mapType(t: hir.Type) mir.ValueType {
         .i32 => .i32,
         .f64 => .f64,
         .str => .str,
+        .ptr => .ptr,
         .void => .void,
     };
 }

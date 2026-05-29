@@ -664,21 +664,22 @@ Implementation:
 - [x] **Backend: address space wired (wasm32).** `codegen/emit.zig` takes an
       `AddressSpace` (via `q64 emit --addr`); `wasm32` drops the Memory64 feature
       and sets a 32-bit memory. Values stay i64; only memory *addresses* differ.
-- [x] **wasm32 const-string ABI (Path B, slice 1).** Pointer/length width is now
-      a backend knob (`ptr_type`: i32 on wasm32, i64 on wasm64), threaded through
-      `env.out`'s import, the data-segment offset, and the `host_out_const` path
-      (`Lowerer.ptrConst`). So const-string programs (`env.out("…")`, fully-const
-      interpolation) emit a genuine 32-bit module and **run on the WebKit/iPad
-      baseline**. The wasmtime host became address-space-agnostic: it introspects
-      `env.out`'s import (`envOutWantsI32`) to define a matching func type and
-      reads each arg by runtime kind. Verified end-to-end in `link-roundtrip.sh`
-      (`Hello from wasm32 (42)`) + emit unit tests; wasm64 unchanged.
-      **Remaining (Path B, slice 2):** the runtime string/**arena** ABI —
-      `__fmt_i64`, `str_concat`/the `sp` bump global, str values/params/bindings —
-      is still i64-pointer-baked, so a program needing it still rejects on wasm32
-      (`Wasm32StringAbiUnsupported`, via the `usesStrAbi` gate). Porting it means
-      making the arena pointer ops + the str `(ptr,len)` pair width-aware and
-      fixing `build_hir`'s i64 binding-local typing for pointer locals.
+- [x] **wasm32 string ABI — complete (Path B).** Pointer/length width is a
+      backend knob (`ptr_type`: i32 on wasm32, i64 on wasm64), threaded through
+      the **whole** string/arena ABI: `env.out`'s import + the data-segment
+      offset, the `(ptr,len)` `pair_type`, the `sp` bump global, `__fmt_i64`
+      (its cursor/arena pointers are ptr-width; the digit arithmetic stays i64),
+      `emitConcat`, str values/params/bindings, and the buf/off/len scratch
+      (`Lowerer.ptrConst`/`ptrGet`/`ptrAdd`). A new IR `ptr` type carries the
+      str-binding pointer locals so `build_hir` no longer bakes i64 there. The
+      `usesStrAbi` wasm32 gate is **removed** — string programs (str calls, int
+      formatting, interpolation/concat, bindings) emit a genuine 32-bit module
+      and **run on the WebKit/iPad baseline**. The wasmtime host is
+      address-space-agnostic: it introspects `env.out`'s import (`envOutWantsI32`)
+      to define a matching func type and reads each arg by runtime kind. Verified
+      end-to-end in `link-roundtrip.sh` (the full `intfn` program — `42` / `q64
+      v0.1.0 ok` / `hi!: a=42, b=50` — runs **identically** on wasm32 and wasm64)
+      + emit unit tests; wasm64 unchanged.
 - [x] **`q64` CLI: `--addr <wasm32|wasm64>`** on `q64 emit` (defaults wasm64
       to preserve existing string programs; `--addr wasm32` emits a genuine 32-bit
       module). Required/no-default policy lands with the Path-B string ABI.
@@ -725,10 +726,11 @@ Done:
       source from `@state(app)` declarations (`apps/qview-global/gen-global.mjs`).
 
 Remaining:
-- [~] **wasm32 string ABI** — const strings done (see "Dual address space"
-      above: 32-bit module + i32 `env.out`, runs on WebKit). The runtime
-      str/**arena** path (i32 pointers for `__fmt_i64`/concat/str values) is the
-      remaining slice.
+- [x] **wasm32 string ABI** — done (see "Dual address space" above): the full
+      string/arena ABI is address-width, so string programs run on WebKit/iPad.
+      The browser host glue (`runtime/web`, qubepods) still needs to read the
+      i32 `env.out` args to exercise it in a real PWA (the wasmtime host already
+      does); that's the remaining host-side wiring.
 - [ ] **`screen`/`draw` DSL** as real q64 syntax (the frontend language) —
       unblocks real `@state(app)` syntax + AST partitioning (client
       reads→subscribe, writes→command).

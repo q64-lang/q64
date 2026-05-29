@@ -198,8 +198,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 else
                     try buildStrExpr(b, init_expr, &mscope, rt);
                 const ptr_idx: u32 = @intCast(b.main_locals.items.len);
-                try b.main_locals.append(b.a, .i64);
-                try b.main_locals.append(b.a, .i64);
+                // The (ptr, len) backing locals are address-width pointers
+                // (i32 on wasm32, i64 on wasm64) — `.ptr`, not `.i64`.
+                try b.main_locals.append(b.a, .ptr);
+                try b.main_locals.append(b.a, .ptr);
                 try b.main_rt.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
