@@ -39,7 +39,12 @@ pub const ModuleResolver = struct {
 
 /// Source-level value types. `str` is abstract here (it only becomes a
 /// `(ptr, len)` pair in MIR).
-pub const Type = enum { i64, i32, f64, str, void };
+/// `ptr` is an address-space-width pointer/length (i32 on wasm32, i64 on
+/// wasm64) — used for the two locals backing a runtime `str` binding's
+/// `(ptr, len)`. Distinct from `i64` (a genuine integer value) so the backend
+/// realizes pointer locals at the build's address width. `str` itself stays
+/// abstract (the `(ptr, len)` pair is a lowering concern).
+pub const Type = enum { i64, i32, f64, str, ptr, void };
 
 /// A definite semantic error the AST→HIR builder detected — distinct from
 /// "construct not yet supported" (which signals a fall-back). The codegen
