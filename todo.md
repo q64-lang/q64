@@ -74,6 +74,40 @@ and `qube run`):
       functions unaffected). **Still out of scope** (the per-local-typing work):
       bool **locals** (`let x = a > 0`) and bool **params** — both now fail with
       a clean `UnsupportedExpression` (guarded) rather than an invalid module.
+- [x] **Bool-typed locals (`var x = true`).** A `bool` is a first-class local
+      now, not an int. `let`/`var` bindings infer their type from the
+      initializer (`bool` for a comparison/`&&`/`||`/`!`/literal/`-> bool` call,
+      else i64), the `hir.Expr.local` read carries its type, and codegen's
+      `local_get` uses it (was hardcoded i64) so a bool slot is an i32.
+      Function locals are materialized from the scope's per-local types instead
+      of all-i64. `env.out(x)` of a bool binding prints "true"/"false".
+      **A bool is not an int**: assignment is type-checked — `x = 5` on a bool
+      (and `bool += …`) is rejected, no int↔bool coercion. Verified: `var x =
+      true`, `let flag = 3 > 1`, `var x = true; x = !x` (in a fn), `let even =
+      n % 2 == 0` used in `if`, `let r = is_even(4)`. **Known gap (pre-existing,
+      type-independent):** `main` itself doesn't support local *reassignment* or
+      `while` — that lives in functions today; `var x = true; x = false` works
+      in a fn but not directly in `main` (an i64 reassign in `main` fails the
+      same way). Bool **params** are still the remaining bool surface.
+- [x] **Bool parameters + `main` control flow.** Two follow-ons closing the
+      bool surface and the main/function gap:
+      • **Bool params.** `fn pick(b: bool, n: i64)` works; params can be bool
+        (i32 0/1) as well as i64. Call arguments are type-checked against the
+        parameter — an int to a bool param (or vice-versa) is rejected
+        (`UnsupportedCall`), no int↔bool coercion.
+      • **`main` reassignment + `while`/`if`/`loop`.** `main`'s statement
+        builder was generalized (`buildMainStmt`/`buildMainBlock`) to handle
+        control flow with bodies that still write the host (`env.out`, `qview`)
+        — the function-body builder can't `env.out`. The entry lowering was
+        unified with the function-body setup lowering (`lowerEntryStmt` now
+        covers assign/while/loop/if/break/continue too). Two supporting fixes: a
+        mutable `var` with a constant initializer no longer const-folds (it must
+        stay a runtime local), and a const `let` used in a runtime expression
+        (e.g. an `if` condition) materializes as its constant value.
+      Verified: `var x = true; x = false`, `while i < n { env.out(i); i = i+1 }`
+      in `main`, `if`/`else` with a const-`let` condition, a bool-flag loop
+      (`while !done { … done = true }`), sum 1..5. 197 unit tests + roundtrips +
+      79 CLI tests green.
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile
