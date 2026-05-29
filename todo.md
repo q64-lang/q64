@@ -89,6 +89,25 @@ and `qube run`):
       `while` — that lives in functions today; `var x = true; x = false` works
       in a fn but not directly in `main` (an i64 reassign in `main` fails the
       same way). Bool **params** are still the remaining bool surface.
+- [x] **Bool parameters + `main` control flow.** Two follow-ons closing the
+      bool surface and the main/function gap:
+      • **Bool params.** `fn pick(b: bool, n: i64)` works; params can be bool
+        (i32 0/1) as well as i64. Call arguments are type-checked against the
+        parameter — an int to a bool param (or vice-versa) is rejected
+        (`UnsupportedCall`), no int↔bool coercion.
+      • **`main` reassignment + `while`/`if`/`loop`.** `main`'s statement
+        builder was generalized (`buildMainStmt`/`buildMainBlock`) to handle
+        control flow with bodies that still write the host (`env.out`, `qview`)
+        — the function-body builder can't `env.out`. The entry lowering was
+        unified with the function-body setup lowering (`lowerEntryStmt` now
+        covers assign/while/loop/if/break/continue too). Two supporting fixes: a
+        mutable `var` with a constant initializer no longer const-folds (it must
+        stay a runtime local), and a const `let` used in a runtime expression
+        (e.g. an `if` condition) materializes as its constant value.
+      Verified: `var x = true; x = false`, `while i < n { env.out(i); i = i+1 }`
+      in `main`, `if`/`else` with a const-`let` condition, a bool-flag loop
+      (`while !done { … done = true }`), sum 1..5. 197 unit tests + roundtrips +
+      79 CLI tests green.
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile
