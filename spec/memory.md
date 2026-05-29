@@ -40,21 +40,74 @@ SAB-backed regions.
 | **shared region**   | A region whose backing memory is SAB-shared across threads.                   |
 | **`transfer`**      | The single generic cross-region/cross-heap copy primitive (see §Transfers).   |
 
-## The platform: Wasm 3.0 in 64-bit mode
+## The platform: Wasm 3.0, dual address space (wasm32 / wasm64)
 
-q64 commits to these Wasm 3.0 features unconditionally (per the
-`design.md` "The Bet" frame):
+q64 targets core Wasm 3.0. Two of its features — **Memory64** and
+**Table64** — define the *address space*, and that is a **per-build
+choice, not a default**. Every build is compiled for exactly one
+address space:
 
-- **Memory64** — 64-bit linear-memory addressing; pointers are `i64`.
+| Address space | Pointers | Memory64 / Table64 | Runs on Apple WebKit (Safari + every iPad/iOS browser) |
+|---------------|----------|--------------------|--------------------------------------------------------|
+| **`wasm32`**  | `i32`    | off                | **yes** — the universal baseline (linear memory ≤ 4 GiB) |
+| **`wasm64`**  | `i64`    | on                 | **no** (as of 2026) — unlocks > 4 GiB on capable hosts |
+
+There is **no default address space.** A build must name one
+explicitly — via the target's `addressSpace`, or the `--addr` flag (see
+[`qube.json5.md` §Targets](./qube.json5.md) and
+[`q64-cli.md`](./q64-cli.md) / [`qube-cli.md`](./qube-cli.md)); q64
+errors if neither resolves one. The rationale is compatibility:
+Memory64 is **not** implemented in Apple's WebKit, so a silent 64-bit
+default would emit qubes that cannot run on iPad/iOS — the very floor
+the ecosystem targets. Forcing the choice makes every qube declare
+where it can run, rather than discovering it at runtime.
+
+The remaining Wasm 3.0 features q64 builds on are **independent of the
+address-space choice** and present in both modes:
+
 - **Multiple memories** — a core module declares several linear memory
   instances; q64 uses this to segregate region kinds.
 - **WasmGC** — `struct.new`, `array.new`, engine-managed references.
-- **Table64** — 64-bit reference tables.
 - **Threads + atomics** — SAB-backed shared linear memory.
 - **Stack-switching** — lightweight coroutine stacks.
+- **SIMD** — 128-bit vector ops.
 
 These choices compound. The dual-heap model is **what the platform
-gives us**, not a compromise.
+gives us**, not a compromise. The address-space split is the one place
+the platform is *not* uniform — so q64 surfaces it rather than hiding
+it: it shows up in the target, the build-output path, the synthesized
+manifest, and (downstream) in how a deploy host such as qubepods stores
+and serves the matching artifact.
+
+### Address-space negotiation
+
+A qube that publishes **both** a `wasm32` and a `wasm64` build is served
+by capability, not by guesswork. The contract:
+
+1. **The glue code probes the engine.** The loader — the browser host
+   adapter (`runtime/browser/host.js`), or the gate/runtime in front of a
+   deployed qube — tests for Memory64 support before fetching a module.
+   The cheap, side-effect-free probe is to validate a tiny module that
+   declares a 64-bit memory, e.g.
+   `WebAssembly.validate(<(memory i64 1) module>)`; a `true` result means
+   the engine can run `wasm64`. (Apple WebKit returns `false` as of 2026.)
+2. **The glue code requests the right build.** It asks the store for
+   `wasm64` only when the probe passed; otherwise it asks for `wasm32`.
+3. **The store/registry falls back to `wasm32`.** If the requested build
+   is missing — or the client sent no capability hint, or the hint is
+   unknown — the serving layer returns the `wasm32` artifact. `wasm32` is
+   the **universal safe fallback**: every engine can run it, so no client
+   is ever left without a runnable build. The only unrunnable case is a
+   qube that published `wasm64` *only* and a WebKit client — which is why
+   the toolchain and manifest flag a wasm64-only qube as not-runnable-on-WebKit.
+
+This keeps the negotiation simple: clients never parse modules to discover
+the address space, the store never has to guess, and `wasm32` is always the
+answer when anything is uncertain. The compiled artifacts themselves are not
+stored in the Continuum (it holds **source** archives — see
+[`continuum-api.md`](./continuum-api.md)); the dual-build store + per-request
+selection live in the deploy host (on qubepods, the artifact store keyed by
+the QubePod manifest's `component.variants`).
 
 ## Region kinds
 
@@ -147,7 +200,7 @@ shadows lexically: a nested `scope { … }` introduces a fresh
 **Linear memory**:
 
 - Carved up by allocators (Arena / Pool / Stack / FreeList).
-- Pointer-based; pointers are `i64`.
+- Pointer-based; pointers are `i32` (`wasm32`) or `i64` (`wasm64`), per the build's address space (see §"The platform").
 - Explicit lifetime; the owning region frees the bytes.
 - Lowers to Wasm linear memory.
 - Can be SAB-shared (see §Shared regions).

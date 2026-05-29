@@ -322,6 +322,31 @@ schema themselves.
   computes it at publish time (per "Write — publish" step 3) and
   `qube.lock` records it.
 
+## Address space and compiled artifacts
+
+The Continuum stores **source** archives, not compiled wasm: a published
+`.zip` is the qube's source tree (per "Archive format"), content-addressed by
+its SHA-256. The **address space** (`wasm32` / `wasm64`, see
+[`memory.md` §"The platform"](./memory.md)) is therefore *not* a registry
+concern — it is chosen by the consumer at build time, and one source archive
+yields either variant. The published `qube.json5` only declares which address
+spaces a qube's **targets** can build (per [`qube.json5.md` §Targets](./qube.json5.md)),
+not a compiled artifact.
+
+Storing *both compiled builds* of a qube — so a runtime can hand the
+WebKit-compatible `wasm32` artifact to iPad/Safari and `wasm64` to capable
+engines, falling back to `wasm32` when in doubt — is a **deploy-host**
+responsibility, not the Continuum's. On qubepods that is the artifact store
+plus the QubePod manifest's `component.variants` map; the glue code probes the
+client engine and requests the matching build (see
+[`memory.md` §"Address-space negotiation"](./memory.md)).
+
+> If the ecosystem later wants the Continuum itself to serve prebuilt,
+> content-addressed `wasm32`/`wasm64` artifacts alongside source (the way some
+> npm packages ship prebuilt binaries next to source), that is an **additive**
+> `/v1/qubes/{name}/{version}/artifact?addr=wasm32|wasm64` endpoint — it does
+> not change the source-archive contract above. Tracked as future work.
+
 ## Notes on hosting
 
 The reference deployment runs on Cloudflare Workers (handlers), R2

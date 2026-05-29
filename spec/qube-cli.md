@@ -46,7 +46,8 @@ qube --help    | -h
 |-----------------------------------|---------------------------------------------------------------------------|
 | `--manifest <path>`               | Path to a specific `qube.json5` (default: nearest ancestor)               |
 | `--target <name>`                 | Target name from the manifest's `targets` map                             |
-| `--component`                     | On `build` / `run`: also emit a component wrapping the core module (overrides `component.emit`). Delegates to `q64 build --component`; writes `target/<host>/<name>.component.wasm` alongside the core module. See [`qube.json5.md` §Component](./qube.json5.md). |
+| `--addr <wasm32\|wasm64>`         | Address space to build for, when the selected target doesn't fix one (or to override it). There is **no default**: a build resolves its address space from the target's `addressSpace` or this flag, and errors if neither is set. `wasm32` is the WebKit/iPad baseline; `wasm64` adds Memory64 (not runnable on WebKit). See [`memory.md` §"The platform"](./memory.md). |
+| `--component`                     | On `build` / `run`: also emit a component wrapping the core module (overrides `component.emit`). Delegates to `q64 build --component`; writes `target/<profile>/<addr>/<name>.component.wasm` alongside the core module. See [`qube.json5.md` §Component](./qube.json5.md). |
 | `--release` / `--debug`           | Shortcuts for `optimize: speed` / `optimize: debug`                       |
 | `--offline`                       | Refuse network access; fail if cache misses                               |
 | `--frozen`                        | Refuse to update the lockfile; fail if it would change                    |
@@ -71,22 +72,32 @@ Override: `--manifest <path>` skips discovery.
 
 Build outputs land under `target/` next to `qube.json5`:
 
+Outputs are split by **address space** (`wasm32` / `wasm64`), so a qube can
+hold both builds side by side for a deploy host to publish:
+
 ```
 target/
   debug/                       # default for `qube build`
-    <qube-name>.wasm
-    <qube-name>.component.wasm        # only with --component / component.emit; wraps the core module
-    <qube-name>.runtime.{js,zig}      # runtime adapter for the chosen target host
-    <qube-name>.effects.json          # effect index emitted by q64
-    <qube-name>.graph.json            # stream-graph topology (if any stages)
+    <addr>/                    # wasm32 | wasm64 — the build's address space
+      <qube-name>.wasm
+      <qube-name>.component.wasm      # only with --component / component.emit; wraps the core module
+      <qube-name>.runtime.{js,zig}    # runtime adapter for the chosen target host
+      <qube-name>.effects.json        # effect index emitted by q64
+      <qube-name>.graph.json          # stream-graph topology (if any stages)
   release/                     # `--release`
   test/                        # test executables
   web/                         # `qube web`: wasm + browser adapter shell
-    <qube-name>.wasm
-    host.js
-    index.html
-  <target-name>/               # named targets from qube.json5
+    <addr>/
+      <qube-name>.wasm
+      host.js
+      index.html
+  <target-name>/               # named targets from qube.json5 (under their own <addr>/)
 ```
+
+A `browser`-host target built `wasm64` is emitted but flagged
+**not-runnable-on-WebKit** (per [`memory.md`](./memory.md)); the browser glue
+(`host.js`) probes the engine at load and is the layer that requests the right
+build — see [`memory.md` §"Address-space negotiation"](./memory.md).
 
 ## `qube new`, `qube init`, and `qube pod` (v0)
 

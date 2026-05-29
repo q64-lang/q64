@@ -24,7 +24,7 @@ subcommand, it is treated as `q64 run <file>`.
 | Subcommand              | Purpose                                                       |
 |-------------------------|---------------------------------------------------------------|
 | `q64 run <file>`        | Compile to wasm in memory and run                             |
-| `q64 build <file>`      | Compile to wasm; emit `<file>.wasm` (or `--out` path)         |
+| `q64 build <file>`      | Compile to wasm; emit `<file>.wasm` (or `--out` path). Requires an address space via `--addr` or a `--target` (no default). |
 | `q64 fmt [path]`        | Format source in-place (file or directory); add `--stdout` to print to stdout instead and read from stdin when `path` is omitted |
 | `q64 lsp`               | Run the language server (stdin/stdout LSP)                    |
 | `q64 show <kind> <arg>` | Introspection (see below)                                     |
@@ -68,6 +68,7 @@ flags as needed (see "Global options").
 | `--out <path>`                    | Output path for `build` (defaults to `<input>.wasm`). One output per invocation. |
 | `--component`                     | Also wrap the core module in a WebAssembly component (per [`modules.md` §"The qube as a component"](./modules.md)). Writes `<out>.component.wasm` *in addition to* the core `--out` module — the core module is still produced. Set by `qube build --component`. |
 | `--target <name>`                 | Target name to compile for (resolves via the qube manifest if present)    |
+| `--addr <wasm32\|wasm64>`         | Address space to compile for. **Required** — there is no default: `q64` errors with a diagnostic if neither `--addr` nor a `--target` that fixes an `addressSpace` is given. `wasm32` = 32-bit (`i32` pointers, WebKit/iPad baseline); `wasm64` = 64-bit (Memory64 + Table64, `i64` pointers). See [`memory.md` §"The platform"](./memory.md). |
 | `--module <name>=<path>`          | Map a module name to a source directory. Repeatable. Set by `qube`. Paths are always absolute (also for local-path dependencies, which `qube` resolves to filesystem paths before invocation). |
 | `--features <comma-list>`         | Feature flags active in this build, e.g. `--features fft,mp3`. Repeatable; the union of all `--features` flags is the active set. `qube build` derives this from the manifest's `dependencies[].features` and `default-features` per-dependency rules. |
 | `--no-color`                      | Disable ANSI color in text diagnostics                                    |
@@ -81,12 +82,17 @@ compiler. `qube build` invokes:
 
 ```
 q64 build src/main.q
+  --addr wasm32
   --module dev.q64.audio=/home/user/.qube/cache/dev.q64.audio-0.3.0/src
   --module dev.q64.ai=/home/user/.qube/cache/dev.q64.ai-0.3.0/src
   --module com.openai.whisper=/home/user/.qube/cache/com.openai.whisper-1.0.2/src
   --diagnostics json
-  --out target/main.wasm
+  --out target/debug/wasm32/main.wasm
 ```
+
+To produce both address-space builds, `qube` invokes `q64` once per address
+space (`--addr wasm32` and `--addr wasm64`), writing each under its own
+`target/<profile>/<addr>/` directory.
 
 The compiler resolves `import dev.q64.audio` against the supplied map; it
 never reads `qube.json5` itself. (Core stdlib `q64.*` is built in and
