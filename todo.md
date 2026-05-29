@@ -50,6 +50,16 @@ and `qube run`):
       full truth tables, precedence (`a || b && c`), interaction with `!`, and
       **short-circuit** (a div-by-zero rhs is skipped, not trapped) when the
       lhs already decides the result.
+- [x] **`true` / `false` literals.** Already lexed (`KW_TRUE`/`KW_FALSE`) and
+      parsed (`LITERAL_EXPR`), but `build_hir` didn't handle the `.literal`
+      view, so even `if true` was `UnsupportedExpression`. Added
+      `ast.LiteralExpr.token()`, a `hir.Expr.bool_const` that lowers to
+      `const_i32` (i32 0/1, like comparisons + `!`), and the print arm.
+      Verified end-to-end: `if true`/`if false`, `!true`, `n>0 || true`,
+      `n>0 && false`. Scoped to boolean/condition contexts — first-class
+      `bool` *values* (storable in `let`, returnable, `env.out` → "true"/
+      "false") are the next step and need the type-system plumbing below.
+      (`none` for optionals is still unrepresented.)
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile

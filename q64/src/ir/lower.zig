@@ -267,6 +267,7 @@ fn lowerCond(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
 fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
+        .bool_const => |v| return mk(ctx.a, .i32, .{ .const_i32 = @intFromBool(v) }),
         .local => |idx| return mk(ctx.a, .i64, .{ .local_get = idx }),
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
         .un => |u| {

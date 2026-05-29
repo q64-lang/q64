@@ -157,6 +157,9 @@ pub const Expr = union(enum) {
     /// A fully-resolved constant string value (escapes decoded, no newline).
     str_const: []const u8,
     int_const: i64,
+    /// A `true` / `false` literal. A boolean (i32 0/1), like a comparison or
+    /// `!` — usable in conditions and as an operand of `&&`/`||`/`!`.
+    bool_const: bool,
     /// A parameter or in-body binding, by resolved local index.
     local: u32,
     /// Read a module-level `state` global, by index.

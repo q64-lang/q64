@@ -876,6 +876,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
     const out = try b.a.create(hir.Expr);
     switch (expr) {
         .num_lit => |n| out.* = .{ .int_const = consteval.parseIntLit(n.rawText() orelse return error.Unsupported) catch return error.Unsupported },
+        .literal => |lit| {
+            // `true` / `false`. `none` (optionals) isn't represented yet.
+            const tok = lit.token() orelse return error.Unsupported;
+            out.* = switch (tok.kind) {
+                .KW_TRUE => .{ .bool_const = true },
+                .KW_FALSE => .{ .bool_const = false },
+                else => return error.Unsupported,
+            };
+        },
         .paren => |p| return buildIntExpr(b, p.inner() orelse return error.Unsupported, scope),
         .path => |p| {
             const txt = try p.text(b.a);
@@ -1355,4 +1364,20 @@ test "tryBuild: `&&` / `||` build short-circuit logical nodes (not bin ops)" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "and_") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "or_") != null);
+}
+
+test "tryBuild: `true` / `false` literals build bool_const nodes" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn pick(n: i64) -> i64 { if true { n } else { 0 } }\n");
+    try tr.addLib("pub fn nope(n: i64) -> i64 { if n > 0 && false { 1 } else { 0 } }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(pick(7))\n env.out(nope(7))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "if true") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "false") != null);
 }
