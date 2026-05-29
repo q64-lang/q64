@@ -324,8 +324,22 @@ it with `CfgUnsupported`).
         now carries the entry's `locals` into MIR. Verified `Q64_IR_STRICT=1`:
         `let g = shout("hi"); env.out(g); "{g} and {g}"; let w = wrap(g); "{w}"`
         → `hi!` / `got: hi! and hi!` / `nested: [hi!]`.
-  - [ ] **P3b-5** i64 bindings + int interpolation in `main`.
-  After P3b the whole suite + `link-roundtrip.sh` runs through the IR.
+  - [x] **P3b-5** i64 bindings + int interpolation in `main`. The HIR builder
+        tracks `main`'s runtime i64 `let` bindings in the shared local space
+        (str bindings take two slots, i64 one), resolves later references and
+        `{a}` interpolation pieces (`fmt_int(local#N)`), and `lower` emits a
+        `local_set` in `_start` + `fmt_int_to_str` inside `str_concat`; the
+        backend's entry scratch layout already sits past `f.locals`. Verified
+        end-to-end `Q64_IR_STRICT=1`: `let a = double(21); env.out(add(a, 8));
+        let b = add(a, 8); let g = shout("hi"); env.out("{g}: a={a}, b={b}")`
+        → `50` / `hi!: a=42, b=50` through AST→HIR→MIR→Binaryen, no fallback.
+        Locked in: `build_hir`/`lower` unit tests + a dedicated strict assertion
+        in `link-roundtrip.sh`.
+  **After P3b: done.** The *entire* `link-roundtrip.sh` corpus now emits with
+  `Q64_IR_STRICT=1` and zero fallbacks — every program (literals, str ABI, i64
+  fns + control flow + recursion + loops, and now main-level i64 bindings +
+  interpolation) runs through the IR. This is the threshold for **P4 (delete
+  legacy)**: the router never falls through for the covered corpus.
 - [ ] **P4 delete legacy.** Once the router never falls through (verify with
       `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
       `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.
