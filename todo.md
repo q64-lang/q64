@@ -340,9 +340,28 @@ it with `CfgUnsupported`).
   fns + control flow + recursion + loops, and now main-level i64 bindings +
   interpolation) runs through the IR. This is the threshold for **P4 (delete
   legacy)**: the router never falls through for the covered corpus.
-- [ ] **P4 delete legacy.** Once the router never falls through (verify with
-      `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
-      `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.
+- **P4 delete legacy** (in progress).
+  - [x] **P4a unblock — the router no longer falls through.** The IR path now
+        owns the honest-baseline diagnostics that only the legacy emitter
+        produced before (`hir.Reject` + `build_hir.Result`; codegen `mapReject`
+        → the same `Error` codes: NoMainFunction / UnsupportedCall /
+        NameNotFound / NotConstExpr / ImmutableAssign). `consteval` splits
+        `ConstArith` (all-const but invalid: div-by-zero/overflow → NotConstExpr)
+        from `NotConst` (needs a runtime value → fall back). Closed the one
+        success gap (untyped fold-only helper in interpolation) and scoped
+        `buildScreenFuncs` to the public surface. Verified **strict-clean across
+        the whole test surface**: 180/180 zig unit tests, `link-roundtrip.sh`,
+        and 74/74 `q64-test` CLI tests under `Q64_IR_STRICT=1` (zero fallbacks).
+        Legacy is now unreachable for the corpus.
+  - [ ] **P4b delete.** Remove `emitFn`/`emitModule`'s AST walk, the
+        `Action`/`Segment`/`ArgVal`/`RtBinding` model, the legacy int/concat
+        emitters (`emitInt*`/`appendConcat`/`splitInterpolation`/…), and trim
+        the `Resolver` to the import-resolution + `lookup` the IR path uses
+        (drop its const-eval machinery). Keep the shared `emitFmtI64` / `binOp`
+        / `emitHelloWasm`. Rewire `emitFromSource` so a null from `tryIrEmit`
+        (genuinely unsupported, e.g. faces/streams) becomes an honest
+        `UnsupportedExpression` instead of a fall-back. Re-run the strict
+        surface to confirm no behavior change.
 - [ ] **P5 introspection + tail seams.** `q64 show hir|mir`; populate HIR
       visibility/effect slots for the component/WIT + QubePod bundle stages.
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
