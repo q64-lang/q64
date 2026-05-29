@@ -45,9 +45,13 @@ const Builder = struct {
     /// i64 locals). Only `main` has these (callees use parameters).
     main_rt: RtMap = .empty,
     main_locals: std.ArrayList(hir.Type) = .empty,
-    /// Module-level `state` globals: name → index, plus init values by index.
+    /// Module-level `state` globals: name → index, plus init values + names by index.
     globals: std.StringHashMapUnmanaged(u32) = .empty,
     global_inits: std.ArrayList(i64) = .empty,
+    global_names: std.ArrayList([]const u8) = .empty,
+    /// Entry FuncId (main → 0) when the module has a `fn main`; null for a
+    /// main-less module (e.g. a backend twin: only `state` + exported commands).
+    entry: ?hir.FuncId = null,
 };
 
 /// Try compile-time evaluation, mapping a non-constant result to `null` (so
@@ -80,8 +84,9 @@ pub fn tryBuild(
         },
     };
     mod.funcs = try b.funcs.toOwnedSlice(b.a);
-    mod.entry = 0;
+    mod.entry = b.entry;
     mod.globals = try b.global_inits.toOwnedSlice(b.a);
+    mod.global_names = try b.global_names.toOwnedSlice(b.a);
     return mod;
 }
 
@@ -101,12 +106,18 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 const idx: u32 = @intCast(b.global_inits.items.len);
                 try b.globals.put(b.a, nm.text, idx);
                 try b.global_inits.append(b.a, init_val);
+                try b.global_names.append(b.a, nm.text);
             },
             else => {},
         };
     }
 
-    const main_fn = findMain(sf) orelse return error.Unsupported;
+    // A module may have no `fn main` (a backend twin: just `state` + exported
+    // commands). Then there's no entry — build only the screen functions.
+    const main_fn = findMain(sf) orelse {
+        try buildScreenFuncs(b, sf);
+        return;
+    };
     const body = main_fn.body() orelse return error.Unsupported;
 
     // Reserve FuncId 0 for the entry so callees discovered while building
@@ -216,12 +227,17 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
     b.funcs.items[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public, .locals = try b.main_locals.toOwnedSlice(b.a) };
+    b.entry = 0;
 
-    // Pass 2: other top-level functions with no return type are "screen"
-    // handlers (e.g. `pub fn on_press(id: i64) { count = count + 1; qview… }`).
-    // Build each as an exported screen function (when public).
-    var it2 = sf.items();
-    while (it2.next()) |item| switch (item) {
+    try buildScreenFuncs(b, sf);
+}
+
+/// Build every non-main, void-returning top-level `fn` as an exported screen
+/// handler (e.g. `pub fn on_press(id: i64) { … }`, or a backend twin's
+/// `pub fn inc() { count = count + 1 }`).
+fn buildScreenFuncs(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
         .fn_decl => |fd| {
             const nm = fd.name() orelse continue;
             if (std.mem.eql(u8, nm.text, "main")) continue;

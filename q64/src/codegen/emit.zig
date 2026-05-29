@@ -269,7 +269,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // it so the emitted module is a genuine 32-bit module (the WebKit/iPad
     // baseline). Multivalue + BulkMemory are address-space-independent.
     var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
-        c.BinaryenFeatureBulkMemoryOpt();
+        c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals();
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
     c.BinaryenModuleSetFeatures(module, features);
 
@@ -376,6 +376,12 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const gz = try na.dupeZ(u8, try std.fmt.allocPrint(na, "g{d}", .{gi}));
         _ = c.BinaryenAddGlobal(module, gz.ptr, i64_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt64(init_val)));
         global_names[gi] = gz.ptr;
+        // Export the (mutable) global by its source name so a host can read it
+        // (`exports.<name>.value`) and restore it (mutable → settable from JS).
+        if (gi < m.global_names.len) {
+            const ext = try na.dupeZ(u8, m.global_names[gi]);
+            _ = c.BinaryenAddGlobalExport(module, gz.ptr, ext.ptr);
+        }
     }
 
     for (m.funcs) |f| {
