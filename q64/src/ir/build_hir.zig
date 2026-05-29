@@ -1124,6 +1124,20 @@ test "tryBuild: const interpolation + const let bindings fold to host_out" {
     try testing.expect(std.mem.indexOf(u8, dump, "host_out \"9 43\"") != null);
 }
 
+test "tryBuild: a main-less twin exports its public handler (visibility slot)" {
+    // No `fn main`; a `state` global + a `pub fn` command (a backend twin).
+    // The HIR carries the handler's visibility, which `show hir` surfaces and
+    // the (future) component/WIT lift reads as the export surface.
+    var mod = (try buildFromSource(testing.allocator, "state count = 0\npub fn inc() { count = count + 1 }\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expect(mod.entry == null); // main-less
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn inc -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "global_set #0") != null);
+}
+
 test "tryBuild: a const-bodied call folds in a let, not in env.out" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
