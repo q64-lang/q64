@@ -5,10 +5,10 @@
 //! shape/typing checks, and desugaring. The HIR→MIR `lower` pass takes over
 //! from here.
 //!
-//! Migration status: `tryBuild` returns `null` for any construct it cannot
-//! yet represent (signalled internally by `error.Unsupported`), so the
-//! `codegen/emit.zig` router falls back to the legacy AST→Binaryen path.
-//! Handled today:
+//! `tryBuild` returns `.unsupported` for any construct it cannot yet
+//! represent (signalled internally by `error.Unsupported`); `codegen/emit.zig`
+//! reports that as an honest `UnsupportedExpression` (the IR is the sole
+//! emission path — there is no legacy fallback). Handled today:
 //!   - `fn main` whose statements are `env.out(<expr>)` and runtime `let`
 //!     bindings (str and i64), with interpolation in literals mixing const
 //!     runs, str bindings, str-returning calls, and i64 bindings (formatted
@@ -28,8 +28,8 @@ const consteval = @import("consteval.zig");
 pub const ModuleResolver = hir.ModuleResolver;
 
 /// `Unsupported` — a construct the IR path doesn't represent yet; the caller
-/// falls back to the legacy emitter. `Rejected` — a definite semantic error
-/// was recorded in `Builder.reject`; the caller reports it (no fall-back).
+/// reports an honest `UnsupportedExpression`. `Rejected` — a definite semantic
+/// error was recorded in `Builder.reject`; the caller reports its diagnostic.
 const BuildError = error{ Unsupported, Rejected } || std.mem.Allocator.Error;
 
 /// A runtime `str` binding in `main`: its `(ptr, len)` live in two `_start`
@@ -83,8 +83,8 @@ fn tryConst(b: *Builder, expr: ast.Expr) BuildError!?[]const u8 {
 pub const Result = union(enum) {
     /// Built HIR — lower it to MIR and emit.
     module: hir.Module,
-    /// A construct the IR path doesn't represent yet — fall back to the legacy
-    /// emitter (the codegen router decides; `Q64_IR_STRICT=1` panics instead).
+    /// A construct the IR path doesn't represent yet — the caller reports an
+    /// honest `UnsupportedExpression` (there is no legacy fallback).
     unsupported,
     /// A definite semantic error — report it as an honest diagnostic, do NOT
     /// fall back.
@@ -559,8 +559,7 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) Bui
             } else return error.Unsupported;
         },
         // A nested, non-const call as a str argument (`wrap(shout("yo"))`): bind
-        // it first (`let t = shout("yo"); wrap(t)`). The legacy emitter reports
-        // NotConstExpr here.
+        // it first (`let t = shout("yo"); wrap(t)`). Reported as NotConstExpr.
         .call => return reject(b, .not_const),
         else => return error.Unsupported,
     }
@@ -1108,7 +1107,10 @@ test "tryBuild: a main of env.out string literals builds HIR" {
     try testing.expect(std.mem.indexOf(u8, dump, "host_out \"one\"") != null);
 }
 
-test "tryBuild: runtime interpolation defers to legacy (returns null)" {
+test "tryBuild: runtime interpolation of an unbound name is unsupported (null)" {
+    // `x` is neither a const binding nor a runtime binding here, so the
+    // interpolation isn't representable → `.unsupported` (codegen reports
+    // UnsupportedExpression). buildFromSource maps non-module results to null.
     try testing.expect((try buildFromSource(testing.allocator, "fn main {\n env.out(\"v{x}\")\n}\n", noLib)) == null);
 }
 

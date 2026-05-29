@@ -353,15 +353,18 @@ it with `CfgUnsupported`).
         the whole test surface**: 180/180 zig unit tests, `link-roundtrip.sh`,
         and 74/74 `q64-test` CLI tests under `Q64_IR_STRICT=1` (zero fallbacks).
         Legacy is now unreachable for the corpus.
-  - [ ] **P4b delete.** Remove `emitFn`/`emitModule`'s AST walk, the
+  - [x] **P4b delete.** Removed `emitFn`/`emitModule`, the
         `Action`/`Segment`/`ArgVal`/`RtBinding` model, the legacy int/concat
-        emitters (`emitInt*`/`appendConcat`/`splitInterpolation`/…), and trim
-        the `Resolver` to the import-resolution + `lookup` the IR path uses
-        (drop its const-eval machinery). Keep the shared `emitFmtI64` / `binOp`
-        / `emitHelloWasm`. Rewire `emitFromSource` so a null from `tryIrEmit`
-        (genuinely unsupported, e.g. faces/streams) becomes an honest
-        `UnsupportedExpression` instead of a fall-back. Re-run the strict
-        surface to confirm no behavior change.
+        emitters (`emitInt*`/`appendConcat`/`splitInterpolation`/`ensureCallee`/
+        `IntScope`/…), and trimmed the `Resolver` to import-resolution + `lookup`
+        (dropped its const-eval machinery + the `bindings` table). Kept the
+        shared `emitFmtI64` / `binOp` / `LoopLabels` / `findPublicFn` /
+        `emitHelloWasm`. `emitFromSource` is now IR-only: a null from `tryIrEmit`
+        (genuinely unsupported, e.g. faces/streams) is an honest
+        `UnsupportedExpression`; the `Q64_IR_STRICT` coverage gate is gone (no
+        fallback to gate). **emit.zig: 3854 → 1777 lines.** Re-verified green:
+        180/180 unit tests, `link-roundtrip.sh`, 74/74 `q64-test` CLI tests.
+        ARCHITECTURE / `ir/README` updated to "IR is the sole emission path".
 - [ ] **P5 introspection + tail seams.** `q64 show hir|mir`; populate HIR
       visibility/effect slots for the component/WIT + QubePod bundle stages.
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,

@@ -129,11 +129,13 @@ global are the *Binaryen backend's* realization, not baked into MIR) and the
 `env.*` capability faces lowered per-backend (WASM imports today; a native host
 ABI later).
 
-> **Implementation note.** The two-tier IR is being adopted incrementally: a
-> per-construct router in `codegen/` sends what the IR can already lower through
-> `AST → HIR → MIR → Binaryen` and falls back to the legacy direct
-> `AST → Binaryen` emitter for the rest, so the build stays green at every step.
-> `Q64_IR_STRICT=1` turns a fallback into a hard error, to track coverage.
+> **Implementation note.** The two-tier IR is the **sole** emission path:
+> `codegen/` lowers `AST → HIR → MIR → Binaryen`. A construct the IR doesn't
+> represent yet is reported as an honest `UnsupportedExpression` (never silently
+> miscompiled), and definite semantic errors surface as their diagnostic codes
+> from the IR path itself. The earlier interim direct `AST → Binaryen` emitter —
+> with its per-construct router and `Q64_IR_STRICT` coverage gate — has been
+> removed now that the IR covers the language surface the compiler emits.
 
 ### parser — [`q64/src/parser/`](./q64/src/parser/README.md)
 
