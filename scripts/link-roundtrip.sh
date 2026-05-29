@@ -322,14 +322,13 @@ if [[ "$intfn_out" != "$intfn_expected" ]]; then
 fi
 echo "    ok: runtime i64 functions + bindings + interpolation -> ... / hi!: a=42, b=50"
 
-# P3b-5 (Q64 IR): prove i64 bindings + int interpolation in `main` lower through
-# the IR (AST -> HIR -> MIR -> Binaryen), not the legacy AST->Binaryen emitter.
-# Q64_IR_STRICT=1 turns any router fallback into a panic, so a clean emit plus
-# correct output is the durable proof that this construct is IR-covered.
-echo "==> P3b-5 strict: i64 bindings + int interpolation in main go through the IR"
-strict_app="$tmp/strict_intbind.q"
-strict_wasm="$tmp/strict_intbind.wasm"
-cat > "$strict_app" <<'Q64'
+# P3b-5 (Q64 IR): i64 bindings + int interpolation in `main`. The Q64 IR is the
+# sole emission path (the legacy AST->Binaryen emitter was removed in P4), so a
+# clean emit + correct output is the durable regression for this construct.
+echo "==> P3b-5: i64 bindings + int interpolation in main"
+ib_app="$tmp/intbind.q"
+ib_wasm="$tmp/intbind.wasm"
+cat > "$ib_app" <<'Q64'
 import dev.q64.intlib.{double, add, shout}
 
 fn main {
@@ -340,20 +339,16 @@ fn main {
     env.out("{g}: a={a}, b={b}")
 }
 Q64
-if ! Q64_IR_STRICT=1 "$Q64_BIN" emit "$strict_app" "$strict_wasm" --module "dev.q64.intlib=$intfn_lib" 2>"$tmp/strict.err"; then
-    echo "FAIL: Q64_IR_STRICT=1 emit fell back to legacy (i64 bindings/interp in main not through the IR)" >&2
-    cat "$tmp/strict.err" >&2
+"$Q64_BIN" emit "$ib_app" "$ib_wasm" --module "dev.q64.intlib=$intfn_lib"
+ib_out="$("$HOST_BIN" "$ib_wasm")"
+ib_expected=$'50\nhi!: a=42, b=50'
+if [[ "$ib_out" != "$ib_expected" ]]; then
+    echo "FAIL: P3b-5 output mismatch" >&2
+    printf "  expected: %q\n" "$ib_expected" >&2
+    printf "  actual:   %q\n" "$ib_out" >&2
     exit 1
 fi
-strict_out="$("$HOST_BIN" "$strict_wasm")"
-strict_expected=$'50\nhi!: a=42, b=50'
-if [[ "$strict_out" != "$strict_expected" ]]; then
-    echo "FAIL: P3b-5 strict output mismatch" >&2
-    printf "  expected: %q\n" "$strict_expected" >&2
-    printf "  actual:   %q\n" "$strict_out" >&2
-    exit 1
-fi
-echo "    ok: i64 bindings + int interpolation in main verified through the IR (Q64_IR_STRICT=1)"
+echo "    ok: i64 bindings + int interpolation in main -> 50 / hi!: a=42, b=50"
 
 # Control flow: i64 functions that branch with `if`/`else` (incl. else-if
 # chains, comparisons, and truthiness). The body lowers to a wasm `if`; no
@@ -506,5 +501,22 @@ if [[ "$flow_out" != "$flow_expected" ]]; then
     exit 1
 fi
 echo "    ok: break/continue/return/loop -> 3 / 7 / 1 / 0 / 25 / count_to_sum(10)=4"
+
+# ---------------------------------------------------------------------------
+# wasm32 (the WebKit/iPad baseline, no Memory64). The FULL string ABI is now
+# address-width: a 32-bit module with i32 pointers/lengths in env.out, the
+# `sp` arena, __fmt_i64, concat, and str values. It runs through the host's
+# address-space-agnostic env.out (i32 ptr/len introspected from the import).
+# This is the same `intfn` program exercised above on wasm64 — same output.
+echo "==> wasm32: full string ABI (str calls, int format, concat, bindings)"
+"$Q64_BIN" emit "$intfn_app" "$tmp/intfn32.wasm" --addr wasm32 --module "dev.q64.intlib=$intfn_lib"
+w32_out="$("$HOST_BIN" "$tmp/intfn32.wasm")"
+if [[ "$w32_out" != "$intfn_expected" ]]; then
+    echo "FAIL: wasm32 string-ABI output mismatch" >&2
+    printf "  expected: %q\n" "$intfn_expected" >&2
+    printf "  actual:   %q\n" "$w32_out" >&2
+    exit 1
+fi
+echo "    ok: wasm32 string ABI -> ... / hi!: a=42, b=50 (matches wasm64)"
 
 echo "PASS: $qube_out"

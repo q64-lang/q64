@@ -13,8 +13,13 @@ pub fn hirToString(gpa: std.mem.Allocator, m: *const hir.Module) Error![]u8 {
     var out: Buf = .empty;
     errdefer out.deinit(gpa);
     for (m.funcs, 0..) |f, i| {
-        const marker = if (m.entry != null and m.entry.? == i) " [entry]" else "";
-        try app(gpa, &out, "fn {s} -> {s}{s}\n", .{ f.name, @tagName(f.ret), marker });
+        const is_entry = (m.entry != null and m.entry.? == i);
+        const marker = if (is_entry) " [entry]" else "";
+        // Surface the visibility slot the component/WIT lift will read: a
+        // non-entry `pub` function is part of the exported surface (e.g. a
+        // public screen/twin handler). The entry carries `[entry]` instead.
+        const vis = if (f.visibility == .public and !is_entry) "pub " else "";
+        try app(gpa, &out, "{s}fn {s} -> {s}{s}\n", .{ vis, f.name, @tagName(f.ret), marker });
         try hirStmt(gpa, &out, f.body, 1);
     }
     return out.toOwnedSlice(gpa);

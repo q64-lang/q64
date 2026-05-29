@@ -27,7 +27,10 @@ pub const FuncId = u32;
 /// Wasm-level value types. A `str` is the `(ptr, len)` pair — the backend
 /// realizes it as a two-i64 multivalue (tuple); a str function returns it and
 /// a str parameter is two i64 wasm params.
-pub const ValueType = enum { i64, i32, f64, str, void };
+/// `ptr` is an address-space-width pointer/length (i32 on wasm32, i64 on
+/// wasm64), used for the locals backing a `str` binding's `(ptr, len)`. The
+/// backend realizes it as `i32`/`i64`; integer *values* use `i64` regardless.
+pub const ValueType = enum { i64, i32, f64, str, ptr, void };
 
 pub const Linkage = enum { entry, local, imported_resolved };
 

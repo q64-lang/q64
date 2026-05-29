@@ -92,14 +92,18 @@ Reserved keywords:
 
 ```
 actor   as      break    catch    const    continue
-dyn     else    enum     effect   face     fit
-fn      for     forall   from     graph    handle
-if      import  in       law      let      loop
-match   move    out      panic    pub      ref
-region  return  scope    select   spawn    state
-tell    trap    try      type     use      var
-where   while   with_capabilities
+draw    dyn     else     enum     effect   face
+fit     fn      for      forall   from     graph
+handle  if      import   in       law      let
+loop    match   move     on       out      panic
+pub     ref     region   return   screen   scope
+select  spawn   state    tell     trap     try
+type    use     var      where    while
+with_capabilities
 ```
+
+`screen`, `draw`, and `on` are the QView frontend-DSL keywords (see
+§"Screen declarations" and [`reactivity.md`](./reactivity.md)).
 
 `Self`, `self`, and the auto-prelude names listed in
 [`modules.md` §"The auto-prelude"](./modules.md) (`Vec`, `Option`,
@@ -214,6 +218,8 @@ ItemKind    := FnDecl
              | FaceDecl
              | FitDecl
              | ConstDecl
+             | StateDecl
+             | ScreenDecl
              | ActorDecl
              | EffectDecl
              | GraphDecl
@@ -574,8 +580,18 @@ SpawnExpr     := "spawn" Block
 ActorDecl     := "actor" IDENT GenericParams? ActorBody
 ActorBody     := "{" ActorItem* "}"
 ActorItem     := StateDecl | HandleDecl
-StateDecl     := "state" IDENT ":" TypeExpr ("=" Expr)?
+StateDecl     := "state" IDENT (":" TypeExpr)? ("=" Expr)?
 HandleDecl    := "handle" IDENT ("(" Params? ")")? ("->" TypeExpr)? Block
+
+(* QView frontend DSL — spec/reactivity.md, spec/agent-ui.md. A `screen`
+   groups reactive `state`, a declarative `draw` block of widget calls, and
+   `on <event>` handlers; the view is written once in `draw` and a handler
+   mutates state (the compiler re-emits the view). Lowers to the `qview.*`
+   mutation ops. *)
+ScreenDecl    := "screen" IDENT? "{" ScreenMember* "}"
+ScreenMember  := StateDecl | DrawBlock | OnHandler
+DrawBlock     := "draw" Block
+OnHandler     := "on" IDENT ("(" Params? ")")? Block
 
 ChannelExpr   := "channel" GenericArgs? "(" ChanArgs ")"
 ChanArgs      := NamedArg ("," NamedArg)* ","?

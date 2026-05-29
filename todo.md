@@ -353,17 +353,35 @@ it with `CfgUnsupported`).
         the whole test surface**: 180/180 zig unit tests, `link-roundtrip.sh`,
         and 74/74 `q64-test` CLI tests under `Q64_IR_STRICT=1` (zero fallbacks).
         Legacy is now unreachable for the corpus.
-  - [ ] **P4b delete.** Remove `emitFn`/`emitModule`'s AST walk, the
+  - [x] **P4b delete.** Removed `emitFn`/`emitModule`, the
         `Action`/`Segment`/`ArgVal`/`RtBinding` model, the legacy int/concat
-        emitters (`emitInt*`/`appendConcat`/`splitInterpolation`/…), and trim
-        the `Resolver` to the import-resolution + `lookup` the IR path uses
-        (drop its const-eval machinery). Keep the shared `emitFmtI64` / `binOp`
-        / `emitHelloWasm`. Rewire `emitFromSource` so a null from `tryIrEmit`
-        (genuinely unsupported, e.g. faces/streams) becomes an honest
-        `UnsupportedExpression` instead of a fall-back. Re-run the strict
-        surface to confirm no behavior change.
-- [ ] **P5 introspection + tail seams.** `q64 show hir|mir`; populate HIR
-      visibility/effect slots for the component/WIT + QubePod bundle stages.
+        emitters (`emitInt*`/`appendConcat`/`splitInterpolation`/`ensureCallee`/
+        `IntScope`/…), and trimmed the `Resolver` to import-resolution + `lookup`
+        (dropped its const-eval machinery + the `bindings` table). Kept the
+        shared `emitFmtI64` / `binOp` / `LoopLabels` / `findPublicFn` /
+        `emitHelloWasm`. `emitFromSource` is now IR-only: a null from `tryIrEmit`
+        (genuinely unsupported, e.g. faces/streams) is an honest
+        `UnsupportedExpression`; the `Q64_IR_STRICT` coverage gate is gone (no
+        fallback to gate). **emit.zig: 3854 → 1777 lines.** Re-verified green:
+        180/180 unit tests, `link-roundtrip.sh`, 74/74 `q64-test` CLI tests.
+        ARCHITECTURE / `ir/README` updated to "IR is the sole emission path".
+- **P5 introspection + tail seams.**
+  - [x] **`q64 show hir|mir`.** New `show` subcommand dumps either IR tier as
+        text to stdout (takes the same `--module name=dir` flags as `emit`);
+        shares `emit`'s front (`buildHir`: parse → resolve → build HIR), so a
+        malformed program surfaces the same honest diagnostic on stderr +
+        non-zero exit. `emitFromSource` was refactored onto `buildHir` (and the
+        interim `tryIrEmit` removed). Specced in `q64-cli.md`; covered by
+        `q64-test/tests/show.test.ts` (5 CLI tests) + an IR unit test.
+  - [x] **HIR visibility slot surfaced.** `show hir` prints `pub` for a
+        non-entry public function (an exported screen/twin handler) — the
+        export-surface signal the component/WIT lift will read.
+  - [ ] **Effect slot.** `hir.Func` has no `effects` field yet — it lands with
+        the effect pass; the component/WIT lift then reads visibility + effects
+        to synthesize the world (exports = pub surface, imports = capabilities).
+  - [ ] **Dependency-origin visibility.** Today a reached dependency function
+        is modeled `.private` in the app's HIR; the WIT lift needs to scope
+        "exported surface" to the qube being compiled (not its deps).
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
@@ -645,9 +663,23 @@ Implementation:
 
 - [x] **Backend: address space wired (wasm32).** `codegen/emit.zig` takes an
       `AddressSpace` (via `q64 emit --addr`); `wasm32` drops the Memory64 feature
-      and sets a 32-bit memory. Values stay i64; the i64 **string/arena ABI** is
-      *guarded* under wasm32 (`Wasm32StringAbiUnsupported`) — its i32-pointer
-      conversion is the remaining Path-B follow-up.
+      and sets a 32-bit memory. Values stay i64; only memory *addresses* differ.
+- [x] **wasm32 string ABI — complete (Path B).** Pointer/length width is a
+      backend knob (`ptr_type`: i32 on wasm32, i64 on wasm64), threaded through
+      the **whole** string/arena ABI: `env.out`'s import + the data-segment
+      offset, the `(ptr,len)` `pair_type`, the `sp` bump global, `__fmt_i64`
+      (its cursor/arena pointers are ptr-width; the digit arithmetic stays i64),
+      `emitConcat`, str values/params/bindings, and the buf/off/len scratch
+      (`Lowerer.ptrConst`/`ptrGet`/`ptrAdd`). A new IR `ptr` type carries the
+      str-binding pointer locals so `build_hir` no longer bakes i64 there. The
+      `usesStrAbi` wasm32 gate is **removed** — string programs (str calls, int
+      formatting, interpolation/concat, bindings) emit a genuine 32-bit module
+      and **run on the WebKit/iPad baseline**. The wasmtime host is
+      address-space-agnostic: it introspects `env.out`'s import (`envOutWantsI32`)
+      to define a matching func type and reads each arg by runtime kind. Verified
+      end-to-end in `link-roundtrip.sh` (the full `intfn` program — `42` / `q64
+      v0.1.0 ok` / `hi!: a=42, b=50` — runs **identically** on wasm32 and wasm64)
+      + emit unit tests; wasm64 unchanged.
 - [x] **`q64` CLI: `--addr <wasm32|wasm64>`** on `q64 emit` (defaults wasm64
       to preserve existing string programs; `--addr wasm32` emits a genuine 32-bit
       module). Required/no-default policy lands with the Path-B string ABI.
@@ -694,11 +726,30 @@ Done:
       source from `@state(app)` declarations (`apps/qview-global/gen-global.mjs`).
 
 Remaining:
-- [ ] **wasm32 string ABI** (i32 pointers for the str/arena path) — unblocks
-      string programs on wasm32.
-- [ ] **`screen`/`draw` DSL** as real q64 syntax (the frontend language) —
-      unblocks real `@state(app)` syntax + AST partitioning (client
-      reads→subscribe, writes→command).
+- [x] **wasm32 string ABI** — done (see "Dual address space" above): the full
+      string/arena ABI is address-width, so string programs run on WebKit/iPad.
+      The browser host glue (`runtime/web`, qubepods) still needs to read the
+      i32 `env.out` args to exercise it in a real PWA (the wasmtime host already
+      does); that's the remaining host-side wiring.
+- **`screen`/`draw` DSL** as real q64 syntax (the frontend language).
+  - [x] **Parse + AST (the design + parse slice).** New keywords `screen` /
+        `draw` / `on`; grammar `ScreenDecl := "screen" IDENT? "{" (StateDecl |
+        DrawBlock | OnHandler)* "}"`, `DrawBlock := "draw" Block`, `OnHandler :=
+        "on" IDENT Params? Block` (spec/grammar.md). Parser production
+        (`parseScreenDecl`/`parseDrawBlock`/`parseOnHandler`, reusing the
+        existing Block/Params/StateDecl grammar), `ast.ScreenDecl`/`DrawBlock`/
+        `OnHandler` views (+ a generic `ChildIter`), wired into `ast.Item`.
+        Lossless round-trip + structure tests; no corpus conflict (`on`/`draw`/
+        `screen` appear only in comments today). `q64 check` on a screen file is
+        clean.
+  - [ ] **Lowering.** `build_hir` synthesizes `main` (the `draw` block's widget
+        calls + `qview.present()`) and an exported handler per `on <event>`
+        (its body + re-emit the `draw` block + present — Stage-1 auto-redraw),
+        resolving bare widget calls (`text(…)`) to `qview.*` host calls and the
+        screen's `state` to the reactive globals. Then a real screen `.q` emits
+        to the same wasm the hand-written `qview.*` form does today.
+  - [ ] **`@state(scope)`** syntax + AST partitioning (client reads→subscribe,
+        writes→command) builds on this.
 - [ ] **`@state(scope)`** first-class syntax + a twin `face`/RPC API (typed
       methods beyond `inc`).
 - [ ] **MSDF** text (corner-perfect) + the full retained `Renderer` face
