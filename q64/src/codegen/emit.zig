@@ -369,6 +369,15 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         }
     }
 
+    // Module-level mutable i64 globals (reactive `state`). One `(global (mut i64))`
+    // per entry, initialized to its `state` value; names `g0`, `g1`, … (arena-held).
+    const global_names = try na.alloc([*:0]const u8, m.globals.len);
+    for (m.globals, 0..) |init_val, gi| {
+        const gz = try na.dupeZ(u8, try std.fmt.allocPrint(na, "g{d}", .{gi}));
+        _ = c.BinaryenAddGlobal(module, gz.ptr, i64_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt64(init_val)));
+        global_names[gi] = gz.ptr;
+    }
+
     for (m.funcs) |f| {
         const structured = switch (f.body) {
             .structured => |inst| inst,
@@ -401,6 +410,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .off_idx = base + n_tuples + 1,
             .len_idx = base + n_tuples + 2,
             .host_imports = &host_imports,
+            .global_names = global_names,
         };
         defer lw.deinit();
 
@@ -440,7 +450,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const ret = if (is_entry) none_type else wasmType(f.ret, i64_type, i32_type, none_type, pair_type);
         const body = try lw.inst(structured);
         _ = c.BinaryenAddFunction(module, f.name.ptr, ptype, ret, if (n_extra > 0) @ptrCast(vts.ptr) else null, @intCast(n_extra), body);
-        if (is_entry) _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
+        if (is_entry) {
+            _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
+        } else if (f.exported) {
+            _ = c.BinaryenAddFunctionExport(module, f.name.ptr, f.name.ptr);
+        }
     }
 
     if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
@@ -499,7 +513,8 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
             for (hc.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
             break :blk false;
         },
-        .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
+        .global_set => |gs| bodyHasOut(gs.value, want_int),
+        .host_out_const, .const_i64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -555,7 +570,8 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         },
         .loop => |body| scanScratch(body, s),
         .host_call => |hc| for (hc.args) |a| scanScratch(a, s),
-        .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
+        .global_set => |gs| scanScratch(gs.value, s),
+        .host_out_const, .const_i64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
 
@@ -599,6 +615,8 @@ const Lowerer = struct {
     /// Dotted host-face name (`qview.text`) → the declared wasm import's internal
     /// name (`qview_text`, null-terminated), for lowering `host_call`.
     host_imports: *const std.StringHashMapUnmanaged([*:0]const u8) = undefined,
+    /// Wasm global names by index (`g0`, `g1`, …), for `global_get`/`global_set`.
+    global_names: []const [*:0]const u8 = &.{},
 
     fn deinit(self: *Lowerer) void {
         self.loops.deinit(self.allocator);
@@ -690,6 +708,8 @@ const Lowerer = struct {
                 const name = self.host_imports.get(hc.name) orelse return Error.UnsupportedCall;
                 return c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type);
             },
+            .global_get => |idx| return c.BinaryenGlobalGet(module, self.global_names[idx], self.i64_type),
+            .global_set => |gs| return c.BinaryenGlobalSet(module, self.global_names[gs.idx], try self.inst(gs.value)),
             .fmt_int_to_str => |inner| {
                 // __fmt_i64(value) → (ptr, len). The (pair) result is the str
                 // value; the caller consumes it just like any str-typed inst.

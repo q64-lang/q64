@@ -51,6 +51,10 @@ pub const Module = struct {
     arena: std.heap.ArenaAllocator,
     funcs: []Func = &.{},
     entry: ?FuncId = null,
+    /// Module-level reactive `state` bindings, in declaration order. Each lowers
+    /// to a mutable wasm global initialized to `inits[i]`. Read via `global_get`,
+    /// written via `global_set` (by index).
+    globals: []const i64 = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Module {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -75,6 +79,10 @@ pub const Func = struct {
     body: *Stmt,
     /// Carried for the future component/WIT lift (exports = the pub surface).
     visibility: Visibility = .private,
+    /// A "screen" function — its body is screen statements (host_call / global
+    /// assign / let), lowered like the entry. main is the entry screen; other
+    /// screen functions (e.g. `on_press`) are exported by name when public.
+    is_screen: bool = false,
     // effects: future — the effect pass writes the capability set here, which
     // the component/WIT + QubePod stages consume. Empty in v0.
 };
@@ -97,6 +105,8 @@ pub const Stmt = union(enum) {
     /// A call to a host import face (`qview.text(…)`): `name` is the dotted
     /// source name; `args` are i64 expressions. Lowers to a wasm import call.
     host_call: struct { name: []const u8, args: []const *Expr },
+    /// Write a module-level `state` global (`count = …`), by index.
+    global_set: struct { idx: u32, value: *Expr },
     /// An `i64` expression statement; as a block's tail it is the value.
     expr: *Expr,
     ret: ?*Expr,
@@ -121,6 +131,8 @@ pub const Expr = union(enum) {
     int_const: i64,
     /// A parameter or in-body binding, by resolved local index.
     local: u32,
+    /// Read a module-level `state` global, by index.
+    global_get: u32,
     bin: struct { kind: ops.BinKind, lhs: *Expr, rhs: *Expr },
     un: struct { kind: ops.UnKind, operand: *Expr },
     /// A call to another function, resolved to its `FuncId`.

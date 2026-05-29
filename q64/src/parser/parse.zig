@@ -225,7 +225,7 @@ const Parser = struct {
 
     fn isItemKeyword(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_FACE, .KW_FIT => true,
+            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT => true,
             else => false,
         };
     }
@@ -287,6 +287,7 @@ const Parser = struct {
             .KW_ENUM => self.parseEnumDecl(),
             .KW_TYPE => self.parseTypeDecl(),
             .KW_CONST => self.parseConstDecl(),
+            .KW_STATE => self.parseStateDecl(),
             .KW_FACE => self.parseFaceOrFit(.FACE_DECL),
             .KW_FIT => self.parseFaceOrFit(.FIT_DECL),
             else => unreachable,
@@ -581,6 +582,32 @@ const Parser = struct {
             try children.append(self.arena, .{ .node = try self.parseExpr() });
         }
         return try cst.makeNode(self.arena, .CONST_DECL, children.items);
+    }
+
+    /// `StateDecl := "state" IDENT (":" TypeExpr)? "=" Expr` — module-level
+    /// reactive state (a mutable instance binding). Same shape as a const decl;
+    /// the type is optional (inferred from the initializer in v0).
+    fn parseStateDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // state
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        try self.eatTrivia(&children);
+        if (self.peek() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseType() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .EQ) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+        }
+        return try cst.makeNode(self.arena, .STATE_DECL, children.items);
     }
 
     /// `face`/`fit` shell: visibility, keyword, a raw header up to the

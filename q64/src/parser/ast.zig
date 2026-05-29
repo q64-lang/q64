@@ -51,6 +51,7 @@ pub const Item = union(enum) {
     enum_decl: EnumDecl,
     type_decl: TypeDecl,
     const_decl: ConstDecl,
+    state_decl: StateDecl,
     face_decl: FaceDecl,
     fit_decl: FitDecl,
 
@@ -61,6 +62,7 @@ pub const Item = union(enum) {
             .ENUM_DECL => .{ .enum_decl = .{ .cst = node } },
             .TYPE_DECL => .{ .type_decl = .{ .cst = node } },
             .CONST_DECL => .{ .const_decl = .{ .cst = node } },
+            .STATE_DECL => .{ .state_decl = .{ .cst = node } },
             .FACE_DECL => .{ .face_decl = .{ .cst = node } },
             .FIT_DECL => .{ .fit_decl = .{ .cst = node } },
             else => null,
@@ -427,6 +429,27 @@ pub const ConstDecl = struct {
 
     /// The initializer expression after `=`, if present.
     pub fn value(self: ConstDecl) ?Expr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Expr.cast(n)) |e| return e,
+            .token => {},
+        };
+        return null;
+    }
+};
+
+/// `StateDecl := "state" IDENT (":" TypeExpr)? "=" Expr` — module-level
+/// reactive state (a mutable instance binding).
+pub const StateDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: StateDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn name(self: StateDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+    /// The initializer expression after `=`, if present.
+    pub fn value(self: StateDecl) ?Expr {
         for (self.cst.children) |c| switch (c) {
             .node => |n| if (Expr.cast(n)) |e| return e,
             .token => {},
