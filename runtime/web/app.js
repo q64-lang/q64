@@ -1,8 +1,9 @@
 // QView WebGPU host (POC, wasm32). Real WebGPU rendering driven by a q64-built
 // wasm32 module over the `qview` host face. No fakes: real WebAssembly.instantiate,
-// real GPUDevice, real textured/solid quads. Glyph rasterization uses OffscreenCanvas
-// 2D (standard technique) — the *compositing* is WebGPU. iPad Safari (WebKit) runs
-// wasm32 + WebGPU; that is the target this proves.
+// real GPUDevice. Widgets are drawn PROCEDURALLY in the shader: rounded-rects via
+// an SDF, and text via a single-channel SDF atlas (rasterize -> 8SSEDT distance
+// transform -> sampled with analytic AA) — crisp/resolution-independent, no DOM
+// text. iPad Safari (WebKit) runs wasm32 + WebGPU; that is the target this proves.
 
 // Host-owned glyph catalog (text-by-id; no strings cross the wasm32 boundary).
 const LABELS = {
@@ -76,8 +77,10 @@ async function initGPU(canvas) {
       return min(max(q.x, q.y), 0.0) + length(max(q, vec2f(0.0, 0.0))) - r;
     }
     @fragment fn fmain(in: VOut) -> @location(0) vec4f {
-      if (p.params.z > 0.5) {                        // textured glyph: tint by fill, alpha = coverage
-        let a = textureSample(tex, samp, in.uv).a;
+      if (p.params.z > 0.5) {                        // SDF glyph: distance in .r, 0.5 = edge
+        let dist = textureSample(tex, samp, in.uv).r;
+        let aa = max(fwidth(dist), 0.0001);
+        let a = smoothstep(0.5 - aa, 0.5 + aa, dist); // analytic AA, crisp at any scale
         return vec4f(p.fill.rgb, p.fill.a * a);
       }
       let half = p.rect.zw * 0.5;
@@ -122,29 +125,68 @@ async function initGPU(canvas) {
 
 let whiteTex, bgLayout;
 
-// Rasterize a label string to a GPUTexture via OffscreenCanvas 2D (glyph raster
-// only; WebGPU does the compositing).
-function labelTexture(text) {
-  const pad = 4, fontPx = Math.round(28 * DPR);
+// 8SSEDT: distance (in px) from every cell to the nearest seed cell. O(n), two
+// passes. Returns Float32 distances. Standard signed-distance-field building block.
+function edt(seed, w, h) {
+  const INF = 1e9;
+  const gx = new Float64Array(w * h), gy = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) { gx[i] = seed[i] ? 0 : INF; gy[i] = seed[i] ? 0 : INF; }
+  const d2 = (i) => gx[i] * gx[i] + gy[i] * gy[i];
+  const cmp = (x, y, ox, oy) => {
+    const nx = x + ox, ny = y + oy;
+    if (nx < 0 || ny < 0 || nx >= w || ny >= h) return;
+    const c = y * w + x, n = ny * w + nx;
+    const cgx = gx[n] + ox, cgy = gy[n] + oy;
+    if (cgx * cgx + cgy * cgy < d2(c)) { gx[c] = cgx; gy[c] = cgy; }
+  };
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) { cmp(x, y, -1, 0); cmp(x, y, 0, -1); cmp(x, y, -1, -1); cmp(x, y, 1, -1); }
+    for (let x = w - 1; x >= 0; x--) cmp(x, y, 1, 0);
+  }
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = w - 1; x >= 0; x--) { cmp(x, y, 1, 0); cmp(x, y, 0, 1); cmp(x, y, -1, 1); cmp(x, y, 1, 1); }
+    for (let x = 0; x < w; x++) cmp(x, y, -1, 0);
+  }
+  const out = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) out[i] = Math.sqrt(d2(i));
+  return out;
+}
+
+// Rasterize a string, then build a single-channel SDF (r8) so the glyph shader
+// can resolve it crisply at any scale (resolution-independent — the point of
+// shader text). NOTE: this is single-channel SDF; true multi-channel MSDF
+// (sharper corners, needs glyph outlines) is a later refinement.
+function sdfTexture(text) {
+  const fontPx = Math.round(30 * DPR);
+  const spread = Math.round(8 * DPR);          // SDF range in px (= the pad)
   const oc = new OffscreenCanvas(8, 8);
   let g = oc.getContext('2d');
   g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
-  const w = Math.ceil(g.measureText(text).width) + pad * 2;
-  const h = fontPx + pad * 2;
+  const w = Math.ceil(g.measureText(text).width) + spread * 2;
+  const h = fontPx + spread * 2;
   oc.width = w; oc.height = h;
   g = oc.getContext('2d');
   g.clearRect(0, 0, w, h);
   g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
   g.fillStyle = '#fff'; g.textBaseline = 'top';
-  g.fillText(text, pad, pad);
-  const img = g.getImageData(0, 0, w, h);
-  const tex = device.createTexture({ size: [w, h], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
-  device.queue.writeTexture({ texture: tex }, img.data, { bytesPerRow: w * 4 }, [w, h]);
+  g.fillText(text, spread, spread);
+  const a = g.getImageData(0, 0, w, h).data;
+  const inside = new Uint8Array(w * h), outside = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) { const on = a[i * 4 + 3] > 127 ? 1 : 0; inside[i] = on; outside[i] = on ? 0 : 1; }
+  const dOut = edt(inside, w, h);   // for OUTSIDE cells: dist to nearest inside pixel
+  const dIn = edt(outside, w, h);   // for INSIDE cells: dist to nearest outside pixel
+  const bytes = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const sd = inside[i] ? dIn[i] : -dOut[i];                 // +inside, -outside, 0 at edge
+    bytes[i] = Math.max(0, Math.min(255, Math.round((0.5 + sd / (2 * spread)) * 255)));
+  }
+  const tex = device.createTexture({ size: [w, h], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  device.queue.writeTexture({ texture: tex }, bytes, { bytesPerRow: w }, [w, h]);
   return { tex, view: tex.createView(), w: w / DPR, h: h / DPR };
 }
 
 function getLabel(id) {
-  if (!labelTex.has(id)) labelTex.set(id, labelTexture(LABELS[id] ?? `#${id}`));
+  if (!labelTex.has(id)) labelTex.set(id, sdfTexture(LABELS[id] ?? `#${id}`));
   return labelTex.get(id);
 }
 
@@ -240,7 +282,7 @@ function runFrame(fn, ...args) {
     const prev = prevKeys.get(id);
     if (prev === undefined) muts.push(`create #${id} ${c.op}`);
     else if (prev !== key) muts.push(`set_attr #${id} ${c.op}${str !== null ? ` "${str}"` : ''}`);
-    if (prev !== key && str !== null) nodeTex.set(id, labelTexture(str)); // only the changed node re-rasterizes
+    if (prev !== key && str !== null) nodeTex.set(id, sdfTexture(str)); // only the changed node re-rasterizes
     prevKeys.set(id, key);
   });
   for (const id of [...prevKeys.keys()]) {
