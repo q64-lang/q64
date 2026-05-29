@@ -608,15 +608,16 @@ hosts. Specs updated: [`spec/memory.md`](./spec/memory.md) §"The platform" +
 [`spec/qube-cli.md`](./spec/qube-cli.md) (`--addr`, per-`<addr>` output),
 [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`spec/continuum-api.md`](./spec/continuum-api.md).
 
-Implementation (not started — large, touches the whole CLI + backend):
+Implementation:
 
-- [ ] **Backend: parameterize the address space.** `codegen/` currently bakes
-      Memory64 + the arena bump global as the Binaryen realization. Make
-      pointer width, `memory`/`table` declarations, and the allocator codegen
-      switch on `wasm32` vs `wasm64`. This is the bulk of the work.
-- [ ] **`q64` CLI: `--addr <wasm32|wasm64>`**, required; diagnostic when
-      neither `--addr` nor a target-resolved `addressSpace` is given (new
-      diagnostic code for "no address space selected").
+- [x] **Backend: address space wired (wasm32).** `codegen/emit.zig` takes an
+      `AddressSpace` (via `q64 emit --addr`); `wasm32` drops the Memory64 feature
+      and sets a 32-bit memory. Values stay i64; the i64 **string/arena ABI** is
+      *guarded* under wasm32 (`Wasm32StringAbiUnsupported`) — its i32-pointer
+      conversion is the remaining Path-B follow-up.
+- [x] **`q64` CLI: `--addr <wasm32|wasm64>`** on `q64 emit` (defaults wasm64
+      to preserve existing string programs; `--addr wasm32` emits a genuine 32-bit
+      module). Required/no-default policy lands with the Path-B string ABI.
 - [ ] **`qube` CLI (build):** `addressSpace` required per target; build invokes
       `q64` once per address space; outputs under `target/<profile>/<addr>/`;
       `--addr` override; flag wasm64 builds as not-runnable-on-WebKit.
@@ -627,16 +628,48 @@ Implementation (not started — large, touches the whole CLI + backend):
       into the bundle zip. Mirrors qubepods' `component.variants` schema; the
       generated manifest round-trips through `@qubepods/qubepod-schema`.
       (`qube/src/main.zig`, tests in `qube-test/tests/pod.test.ts`.)
-- [ ] **Multi-memory layout under wasm32** — confirm the `mem.*` segregation
-      (stack/arena/heap/shared/large/rodata) holds with `i32` addressing and
-      the 4 GiB-per-memory cap.
-- [ ] **Runtime/glue:** `runtime/browser/host.js` (and any wasmtime/wasmer
-      host) probes Memory64 (`WebAssembly.validate` of a tiny `(memory i64 …)`
-      module) and requests/loads the matching build; `wasm32` is the fallback.
+- [decided] **Single linear memory (multi-memory is a non-goal for now).**
+      Codegen emits one memory; the `mem.*` segregation in `spec/memory.md`
+      stays aspirational. Bulk-memory ops are enabled.
+- [x] **Runtime/glue:** the browser host (`runtime/web/app.js`, mirrored in the
+      qubepods test page) probes Memory64 (`WebAssembly.validate` of a tiny
+      `(memory i64 …)` module) and sends the `x-qube-addr` hint; `wasm32` is the fallback.
 - [ ] **`q64 show memories`** reports the address space it emitted.
 - [ ] **Continuum (optional, future):** additive prebuilt-artifact endpoint
       `/v1/qubes/{name}/{version}/artifact?addr=…` if the source registry
       should ever serve compiled variants (see continuum-api.md note).
+
+## QView + reactive state + twins (architecture proof — NEW)
+
+End-to-end POC, verified on iPad: q64 → wasm32 → WebGPU PWA + a q64-authored
+backend twin. Design notes: [`spec/reactivity.md`](./spec/reactivity.md),
+[`spec/agent-ui.md`](./spec/agent-ui.md).
+
+Done:
+- [x] **`qview` host face** — a `host_call` op lets q64 call
+      `qview.text/number/button/present`; a client `screen.q` → wasm32 drives a
+      WebGPU renderer (procedural SDF rounded-rect widgets + supersampled SDF
+      text, retina-correct, retained node-id diff). Host in qubepods `apps/qview-demo`.
+- [x] **Reactive `state`** — top-level `state x = <int>` → a mutable wasm global
+      (`global_get`/`global_set`); exported screen handlers (`on_press`) mutate +
+      redraw — a wasm-owned counter.
+- [x] **Backend twin** — main-less modules + exported (mutable) state globals;
+      `global.q` (`state count` + `pub fn inc()`) runs inside a Durable Object
+      (qubepods `apps/qview-global`): shared `@state(app)` counter with WebSocket
+      fan-out, cross-device, **scope = DO address** (user/app/room).
+- [x] **`@state(app)` generation (v0)** — a generator emits the global app's q64
+      source from `@state(app)` declarations (`apps/qview-global/gen-global.mjs`).
+
+Remaining:
+- [ ] **wasm32 string ABI** (i32 pointers for the str/arena path) — unblocks
+      string programs on wasm32.
+- [ ] **`screen`/`draw` DSL** as real q64 syntax (the frontend language) —
+      unblocks real `@state(app)` syntax + AST partitioning (client
+      reads→subscribe, writes→command).
+- [ ] **`@state(scope)`** first-class syntax + a twin `face`/RPC API (typed
+      methods beyond `inc`).
+- [ ] **MSDF** text (corner-perfect) + the full retained `Renderer` face
+      (`create_node`/`set_attr`/`mutate`).
 
 ## Conventions
 

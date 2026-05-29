@@ -415,6 +415,11 @@ instance (their thread).
 
 ## Multi-memory architecture
 
+> **Status (impl):** *not yet implemented — aspirational target.* Codegen emits a
+> **single** linear memory today; the region kinds below are byte-offset regions
+> within it (the bump-arena `sp` global, etc.). Multi-memory segregation is a
+> deferred non-goal for now. Bulk-memory ops are enabled.
+
 Wasm 3.0's multiple-memory feature lets q64 segregate region kinds
 into distinct linear memory instances:
 
