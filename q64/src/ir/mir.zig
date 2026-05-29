@@ -39,6 +39,9 @@ pub const Module = struct {
     /// agnostic bytes; the WASM backend installs it as one active data
     /// segment.
     data: []const u8 = &.{},
+    /// Module-level mutable i64 globals (reactive `state`), with their init
+    /// values. The backend emits one `(global (mut i64))` per entry.
+    globals: []const i64 = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Module {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -59,6 +62,9 @@ pub const Func = struct {
     locals: []const ValueType = &.{},
     body: Body,
     linkage: Linkage = .local,
+    /// Export this function by `name` (in addition to the entry's `_start`).
+    /// Set for public screen handlers (e.g. `on_press`) the host invokes.
+    exported: bool = false,
 };
 
 /// A function body in one of two interchangeable forms. **Structured is the
@@ -150,6 +156,9 @@ pub const Op = union(enum) {
     /// (`(import "qview" "text" …)`) and emits the call. Args are i64 values
     /// (valid on wasm32 — only memory *addresses* are width-sensitive). Void.
     host_call: struct { name: []const u8, args: []const *Inst },
+    /// Read / write a module-level mutable i64 global (reactive `state`), by index.
+    global_get: u32,
+    global_set: struct { idx: u32, value: *Inst },
     /// The decimal `str` value of an i64 — formats `value` via `__fmt_i64` and
     /// yields its `(ptr, len)`. Used as a piece inside `str_concat` when an
     /// i64 binding (or any i64 expression) appears in interpolation.

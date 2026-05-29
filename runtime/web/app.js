@@ -18,11 +18,9 @@ const log = (m) => { const el = document.getElementById('log'); if (el) el.textC
 let scene = [];
 let buttons = []; // {bid,x,y,w,h} in CSS px, for hit-testing
 let pressedBid = null;
-// Click counter — CLIENT (host) state for now ("first we can use local state").
-// The wasm lays out the number widget via qview.number; the host fills the live
-// value here. Moving this into the wasm (exported render(n) / module global) is
-// the next step (W2b proper).
-let count = 0;
+// The click counter is WASM-OWNED reactive `state` (a module global in screen.q):
+// on_press increments it and re-emits qview.number(count); the host just renders
+// the value the wasm passes. No client-side counter.
 // Retained-mode bookkeeping: per-node "key" (its visible state) to diff frames,
 // and a per-node glyph-texture cache so only a *changed* node re-rasterizes.
 // (The GPU clear+pass is cheap; the surgical part is the texture rebuilds +
@@ -247,8 +245,8 @@ function render() {
       const lbl = nodeTex.get(c.nodeId);
       if (lbl) drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.9, 0.95, 1.0, 1], { texView: lbl.view });
     } else if (c.op === 'number') {
-      // The wasm lays out the number widget (qview.number); the live value is
-      // client `state` for now (see W2b note). Texture is rebuilt only on change.
+      // The value is WASM-OWNED `state` (a module global): on_press increments it
+      // and re-emits qview.number(count); we render the value the wasm passed.
       const lbl = nodeTex.get(c.nodeId);
       if (lbl) drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.62, 0.83, 0.95, 1], { texView: lbl.view });
     }
@@ -288,7 +286,7 @@ function runFrame(fn, ...args) {
   scene.forEach((c, id) => {
     c.nodeId = id; seen.add(id);
     const str = c.op === 'text' ? (LABELS[c.id] ?? '#' + c.id)
-      : c.op === 'number' ? ('taps: ' + count) : null;
+      : c.op === 'number' ? ('taps: ' + c.n) : null;   // c.n = the WASM-owned counter
     const key = JSON.stringify({ op: c.op, x: c.x, y: c.y, w: c.w, h: c.h, lid: c.id, str, pressed: c.bid === pressedBid });
     const prev = prevKeys.get(id);
     if (prev === undefined) muts.push(`create #${id} ${c.op}`);
@@ -326,9 +324,8 @@ async function main() {
     const hit = buttons.find((b) => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
     if (!hit) return;
     pressedBid = hit.bid;
-    count++; // client-side `state` for now
-    // Prefer a genuine wasm callback when present (W2b); else re-run _start so
-    // the wasm re-lays-out the scene and the host fills the live count.
+    // The counter is WASM-OWNED now: on_press(id) increments the state global and
+    // re-emits the scene. (Falls back to _start only if a build lacks on_press.)
     if (typeof instance.exports.on_press === 'function') {
       runFrame(instance.exports.on_press, hit.bid);
     } else {

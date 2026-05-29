@@ -50,6 +50,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             }
             try app(gpa, out, ")\n", .{});
         },
+        .global_set => |gs| {
+            try app(gpa, out, "global_set #{d} = ", .{gs.idx});
+            try hirExpr(gpa, out, gs.value);
+            try app(gpa, out, "\n", .{});
+        },
         .expr => |e| {
             try app(gpa, out, "expr ", .{});
             try hirExpr(gpa, out, e);
@@ -105,6 +110,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
         .str_const => |b| try app(gpa, out, "\"{s}\"", .{b}),
         .int_const => |v| try app(gpa, out, "{d}", .{v}),
         .local => |i| try app(gpa, out, "local#{d}", .{i}),
+        .global_get => |i| try app(gpa, out, "global#{d}", .{i}),
         .un => |u| {
             try app(gpa, out, "({s} ", .{@tagName(u.kind)});
             try hirExpr(gpa, out, u.operand);
@@ -188,6 +194,8 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         },
         .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
         .local_get => |i| try app(gpa, out, "local_get {d}\n", .{i}),
+        .global_get => |i| try app(gpa, out, "global_get {d}\n", .{i}),
+        .global_set => |gs| { try app(gpa, out, "global_set {d}\n", .{gs.idx}); try mirInst(gpa, out, gs.value, depth + 1); },
         .local_set => |ls| {
             try app(gpa, out, "local_set {d}\n", .{ls.idx});
             try mirInst(gpa, out, ls.value, depth + 1);

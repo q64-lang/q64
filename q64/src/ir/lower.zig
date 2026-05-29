@@ -47,15 +47,23 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     const funcs = try a.alloc(mir.Func, h.funcs.len);
     for (h.funcs, 0..) |hf, i| {
         const is_entry = (h.entry != null and h.entry.? == i);
-        if (is_entry) {
+        // The entry and any `is_screen` function (e.g. `on_press`) share the
+        // entry lowering: their bodies are screen statements (host_call / global
+        // assign / let), which `lowerEntryStmt` handles. Other functions are
+        // i64/str callees.
+        if (is_entry or hf.is_screen) {
+            const params = try a.alloc(mir.ValueType, hf.params.len);
+            for (hf.params, 0..) |p, j| params[j] = mapType(p.ty);
             const locals = try a.alloc(mir.ValueType, hf.locals.len);
             for (hf.locals, 0..) |t, j| locals[j] = mapType(t);
             funcs[i] = .{
-                .name = "start",
+                .name = if (is_entry) "start" else try a.dupeZ(u8, hf.name),
+                .params = params,
                 .ret = .void,
                 .locals = locals,
                 .body = .{ .structured = try lowerEntry(ctx, hf.body) },
-                .linkage = .entry,
+                .linkage = if (is_entry) .entry else .local,
+                .exported = (!is_entry and hf.visibility == .public),
             };
         } else {
             funcs[i] = try lowerCallee(ctx, hf);
@@ -65,6 +73,7 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     mod.funcs = funcs;
     mod.entry = h.entry;
     mod.data = try data.toOwnedSlice(a);
+    mod.globals = try a.dupe(i64, h.globals);
     return mod;
 }
 
@@ -104,6 +113,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             for (hc.args, 0..) |a, i| args[i] = try lowerExpr(ctx, a);
             return mk(ctx.a, .void, .{ .host_call = .{ .name = hc.name, .args = args } });
         },
+        .global_set => |gs| return mk(ctx.a, .void, .{ .global_set = .{ .idx = gs.idx, .value = try lowerExpr(ctx, gs.value) } }),
         .str_let => |sl| return mk(ctx.a, .void, .{ .str_bind = .{ .ptr_idx = sl.ptr_idx, .len_idx = sl.len_idx, .value = try lowerStrExpr(ctx, sl.value) } }),
         .let => |l| return mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } }),
         else => unreachable, // main has no value/tail statements
@@ -257,6 +267,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .local => |idx| return mk(ctx.a, .i64, .{ .local_get = idx }),
+        .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
         .un => |u| return mk(ctx.a, .i64, .{ .un = .{ .kind = u.kind, .operand = try lowerExpr(ctx, u.operand) } }),
         .bin => |bx| {
             const ty: mir.ValueType = if (isCmp(bx.kind)) .i32 else .i64;

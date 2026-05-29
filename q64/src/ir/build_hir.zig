@@ -45,6 +45,9 @@ const Builder = struct {
     /// i64 locals). Only `main` has these (callees use parameters).
     main_rt: RtMap = .empty,
     main_locals: std.ArrayList(hir.Type) = .empty,
+    /// Module-level `state` globals: name → index, plus init values by index.
+    globals: std.StringHashMapUnmanaged(u32) = .empty,
+    global_inits: std.ArrayList(i64) = .empty,
 };
 
 /// Try compile-time evaluation, mapping a non-constant result to `null` (so
@@ -78,10 +81,31 @@ pub fn tryBuild(
     };
     mod.funcs = try b.funcs.toOwnedSlice(b.a);
     mod.entry = 0;
+    mod.globals = try b.global_inits.toOwnedSlice(b.a);
     return mod;
 }
 
 fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    // Pass 0: register module-level `state x = <int>` globals (by declaration
+    // order). The init must be an integer literal in v0.
+    {
+        var it0 = sf.items();
+        while (it0.next()) |item| switch (item) {
+            .state_decl => |sd| {
+                const nm = sd.name() orelse return error.Unsupported;
+                const v = sd.value() orelse return error.Unsupported;
+                const init_val: i64 = switch (v) {
+                    .num_lit => |n| consteval.parseIntLit(n.rawText() orelse return error.Unsupported) catch return error.Unsupported,
+                    else => return error.Unsupported, // v0: integer-literal init only
+                };
+                const idx: u32 = @intCast(b.global_inits.items.len);
+                try b.globals.put(b.a, nm.text, idx);
+                try b.global_inits.append(b.a, init_val);
+            },
+            else => {},
+        };
+    }
+
     const main_fn = findMain(sf) orelse return error.Unsupported;
     const body = main_fn.body() orelse return error.Unsupported;
 
@@ -192,6 +216,100 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
     b.funcs.items[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public, .locals = try b.main_locals.toOwnedSlice(b.a) };
+
+    // Pass 2: other top-level functions with no return type are "screen"
+    // handlers (e.g. `pub fn on_press(id: i64) { count = count + 1; qview… }`).
+    // Build each as an exported screen function (when public).
+    var it2 = sf.items();
+    while (it2.next()) |item| switch (item) {
+        .fn_decl => |fd| {
+            const nm = fd.name() orelse continue;
+            if (std.mem.eql(u8, nm.text, "main")) continue;
+            if (fd.returnType() != null) continue; // void-returning handlers only
+            try buildScreenFunc(b, fd);
+        },
+        else => {},
+    };
+}
+
+/// Build a non-main "screen" function: i64 params, a void body of screen
+/// statements (`qview.*` host calls and `state` global assignments). Appended
+/// to `b.funcs`, exported when public.
+fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
+    var scope = Scope{ .a = b.a };
+    var params: std.ArrayList(hir.Param) = .empty;
+    if (fd.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| {
+            if (!(try paramIsI64(b.a, p))) return error.Unsupported;
+            const pn = (p.name() orelse return error.Unsupported).text;
+            _ = try scope.declare(pn, false, .i64);
+            try params.append(b.a, .{ .name = pn, .ty = .i64 });
+        }
+    }
+    scope.n_params = @intCast(params.items.len);
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    var it = (fd.body() orelse return error.Unsupported).statements();
+    while (it.next()) |stmt| switch (stmt) {
+        .expr_stmt => |es| {
+            const call = switch (es.expression() orelse return error.Unsupported) {
+                .call => |cc| cc,
+                else => return error.Unsupported,
+            };
+            const fname = (try hostFaceName(b, call)) orelse return error.Unsupported;
+            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope));
+        },
+        .assign_stmt => |as| {
+            const tgt = switch (as.target() orelse return error.Unsupported) {
+                .path => |p| p,
+                else => return error.Unsupported,
+            };
+            const tname = try tgt.text(b.a);
+            defer b.a.free(tname);
+            const gi = b.globals.get(tname) orelse return error.Unsupported; // global assign only
+            const rhs = try buildIntExpr(b, as.value() orelse return error.Unsupported, &scope);
+            const op = as.op() orelse return error.Unsupported;
+            const value = if (op.kind == .EQ) rhs else blk: {
+                const k = compoundOp(op) orelse return error.Unsupported;
+                const lhs = try b.a.create(hir.Expr);
+                lhs.* = .{ .global_get = gi };
+                const bx = try b.a.create(hir.Expr);
+                bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
+                break :blk bx;
+            };
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .global_set = .{ .idx = gi, .value = value } };
+            try stmts.append(b.a, st);
+        },
+        else => return error.Unsupported,
+    };
+
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals) |*t| t.* = .i64;
+    const vis: hir.Visibility = if (fd.visibility() != null) .public else .private;
+    try b.funcs.append(b.a, .{
+        .name = try b.a.dupe(u8, (fd.name() orelse return error.Unsupported).text),
+        .params = try params.toOwnedSlice(b.a),
+        .ret = .void,
+        .locals = locals,
+        .body = block,
+        .visibility = vis,
+        .is_screen = true,
+    });
+}
+
+/// Build a `qview.*` host-call statement: all-i64 args via `buildIntExpr`.
+fn buildHostCall(b: *Builder, fname: []const u8, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+    var args: std.ArrayList(*hir.Expr) = .empty;
+    var ait = call.args();
+    while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
+    return st;
 }
 
 fn pathText(b: *Builder, p: ast.PathExpr) BuildError![]const u8 {
@@ -641,9 +759,12 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
         .path => |p| {
             const txt = try p.text(b.a);
             defer b.a.free(txt);
-            const loc = scope.find(txt) orelse return error.Unsupported;
-            if (loc.ty != .i64) return error.Unsupported; // a str local in an i64 context
-            out.* = .{ .local = loc.idx };
+            if (scope.find(txt)) |loc| {
+                if (loc.ty != .i64) return error.Unsupported; // a str local in an i64 context
+                out.* = .{ .local = loc.idx };
+            } else if (b.globals.get(txt)) |gi| {
+                out.* = .{ .global_get = gi };       // module-level `state`
+            } else return error.Unsupported;
         },
         .unary => |u| {
             const kind = unKind(u.op() orelse return error.Unsupported) orelse return error.Unsupported;
