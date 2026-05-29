@@ -47,6 +47,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
+        .host_out_bool => |e| {
+            try app(gpa, out, "host_out_bool ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
         .host_call => |hc| {
             try app(gpa, out, "host_call {s}(", .{hc.name});
             for (hc.args, 0..) |a, i| {
@@ -114,6 +119,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
     switch (e.*) {
         .str_const => |b| try app(gpa, out, "\"{s}\"", .{b}),
         .int_const => |v| try app(gpa, out, "{d}", .{v}),
+        .bool_const => |v| try app(gpa, out, "{s}", .{if (v) "true" else "false"}),
         .local => |i| try app(gpa, out, "local#{d}", .{i}),
         .global_get => |i| try app(gpa, out, "global#{d}", .{i}),
         .un => |u| {
@@ -126,6 +132,13 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, b.lhs);
             try app(gpa, out, " {s} ", .{@tagName(b.kind)});
             try hirExpr(gpa, out, b.rhs);
+            try app(gpa, out, ")", .{});
+        },
+        .logical => |lg| {
+            try app(gpa, out, "(", .{});
+            try hirExpr(gpa, out, lg.lhs);
+            try app(gpa, out, " {s} ", .{@tagName(lg.op)});
+            try hirExpr(gpa, out, lg.rhs);
             try app(gpa, out, ")", .{});
         },
         .call => |cl| {
@@ -198,6 +211,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             for (hc.args) |a| try mirInst(gpa, out, a, depth + 1);
         },
         .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
+        .const_i32 => |v| try app(gpa, out, "const_i32 {d}\n", .{v}),
         .local_get => |i| try app(gpa, out, "local_get {d}\n", .{i}),
         .global_get => |i| try app(gpa, out, "global_get {d}\n", .{i}),
         .global_set => |gs| { try app(gpa, out, "global_set {d}\n", .{gs.idx}); try mirInst(gpa, out, gs.value, depth + 1); },
