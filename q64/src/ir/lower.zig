@@ -181,7 +181,7 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             try ctx.data.appendSlice(ctx.a, bytes);
             return mk(ctx.a, .str, .{ .str_const_val = .{ .off = off, .len = @intCast(bytes.len) } });
         },
-        .local => |idx| return mk(ctx.a, .str, .{ .str_param = idx }),
+        .local => |l| return mk(ctx.a, .str, .{ .str_param = l.idx }),
         .call => |cl| {
             const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
             for (cl.args, 0..) |arg, i| args[i] = try lowerStrExpr(ctx, arg);
@@ -289,7 +289,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .bool_const => |v| return mk(ctx.a, .i32, .{ .const_i32 = @intFromBool(v) }),
-        .local => |idx| return mk(ctx.a, .i64, .{ .local_get = idx }),
+        .local => |l| return mk(ctx.a, mapType(l.ty), .{ .local_get = l.idx }),
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg`/`bit_not` preserve i64.

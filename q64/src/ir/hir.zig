@@ -164,8 +164,10 @@ pub const Expr = union(enum) {
     /// A `true` / `false` literal. A boolean (i32 0/1), like a comparison or
     /// `!` — usable in conditions and as an operand of `&&`/`||`/`!`.
     bool_const: bool,
-    /// A parameter or in-body binding, by resolved local index.
-    local: u32,
+    /// A parameter or in-body binding, by resolved local index. `ty` is the
+    /// binding's type (i64 / bool / str), so lowering reads it as the right
+    /// kind (an i64/i32 `local_get`, or a `str_param`).
+    local: struct { idx: u32, ty: Type = .i64 },
     /// Read a module-level `state` global, by index.
     global_get: u32,
     bin: struct { kind: ops.BinKind, lhs: *Expr, rhs: *Expr },

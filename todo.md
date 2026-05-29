@@ -74,6 +74,21 @@ and `qube run`):
       functions unaffected). **Still out of scope** (the per-local-typing work):
       bool **locals** (`let x = a > 0`) and bool **params** — both now fail with
       a clean `UnsupportedExpression` (guarded) rather than an invalid module.
+- [x] **Bool-typed locals (`var x = true`).** A `bool` is a first-class local
+      now, not an int. `let`/`var` bindings infer their type from the
+      initializer (`bool` for a comparison/`&&`/`||`/`!`/literal/`-> bool` call,
+      else i64), the `hir.Expr.local` read carries its type, and codegen's
+      `local_get` uses it (was hardcoded i64) so a bool slot is an i32.
+      Function locals are materialized from the scope's per-local types instead
+      of all-i64. `env.out(x)` of a bool binding prints "true"/"false".
+      **A bool is not an int**: assignment is type-checked — `x = 5` on a bool
+      (and `bool += …`) is rejected, no int↔bool coercion. Verified: `var x =
+      true`, `let flag = 3 > 1`, `var x = true; x = !x` (in a fn), `let even =
+      n % 2 == 0` used in `if`, `let r = is_even(4)`. **Known gap (pre-existing,
+      type-independent):** `main` itself doesn't support local *reassignment* or
+      `while` — that lives in functions today; `var x = true; x = false` works
+      in a fn but not directly in `main` (an i64 reassign in `main` fails the
+      same way). Bool **params** are still the remaining bool surface.
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile

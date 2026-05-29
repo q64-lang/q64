@@ -207,20 +207,19 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
                 try stmts.append(b.a, st);
             } else {
-                // A runtime i64 binding (`let a = double(21)`, `let b = a + 1`).
-                // A boolean initializer (`let x = a > 0`) would need a bool
-                // local; locals are i64-only today, so reject it honestly
-                // rather than emit an i32-into-i64 store.
-                if (try exprIsBool(b, init_expr)) return error.Unsupported;
+                // A runtime value binding: an i64 (`let a = double(21)`) or a
+                // bool (`let even = n % 2 == 0`, `var flag = true`). A bool
+                // binding takes one slot too — its value is an i32 0/1.
+                const lty: hir.Type = if (try exprIsBool(b, init_expr, &mscope)) .bool else .i64;
                 // Build the initializer first so it can't see its own name,
-                // then allocate a single i64 local and register in mscope so
-                // later i64 expressions can resolve it. The local index is the
+                // then allocate a single local and register in mscope so
+                // later expressions can resolve it. The local index is the
                 // current size of `main_locals` (str bindings take two slots
-                // each, i64 bindings take one — the same shared index space).
+                // each, i64/bool bindings take one — the same shared index space).
                 mscope.next_idx = @intCast(b.main_locals.items.len);
                 const value = try buildIntExpr(b, init_expr, &mscope);
-                const idx = try mscope.declare(nm.text, ls.isVar(), .i64);
-                try b.main_locals.append(b.a, .i64);
+                const idx = try mscope.declare(nm.text, ls.isVar(), lty);
+                try b.main_locals.append(b.a, lty);
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = value } };
                 try stmts.append(b.a, st);
@@ -267,9 +266,9 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
             } else if (try isStrCall(b, arg)) {
                 // A real call to a str-returning function.
                 st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope, rt) };
-            } else if (try exprIsBool(b, arg)) {
-                // A boolean: a comparison, `&&`/`||`/`!`, a literal, or a
-                // `-> bool` call. Printed as "true" / "false".
+            } else if (try exprIsBool(b, arg, &mscope)) {
+                // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
+                // binding, or a `-> bool` call. Printed as "true" / "false".
                 st.* = .{ .host_out_bool = try buildIntExpr(b, arg, &mscope) };
             } else {
                 // Otherwise an i64 expression (a call to an i64 function).
@@ -368,7 +367,9 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
     const extra = scope.extra();
     const locals = try b.a.alloc(hir.Type, extra);
-    for (locals) |*t| t.* = .i64;
+    // The non-parameter locals, in index order, carry their declared types
+    // (i64 by default, bool for a boolean `let`/`var` binding).
+    for (locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
     const vis: hir.Visibility = if (fd.visibility() != null) .public else .private;
     try b.funcs.append(b.a, .{
         .name = try b.a.dupe(u8, (fd.name() orelse return error.Unsupported).text),
@@ -440,7 +441,9 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (tailIsValueIfNoElse(body)) return reject(b, .unsupported_call);
     const extra = scope.extra();
     const locals = try b.a.alloc(hir.Type, extra);
-    for (locals) |*t| t.* = .i64;
+    // The non-parameter locals, in index order, carry their declared types
+    // (i64 by default, bool for a boolean `let`/`var` binding).
+    for (locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
 
     b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
@@ -519,7 +522,7 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             defer b.a.free(txt);
             if (scope.find(txt)) |loc| {
                 if (loc.ty != .str) return error.Unsupported; // an i64 local in a str position
-                out.* = .{ .local = loc.idx };
+                out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (rtBinding(rt, txt)) |bnd| {
                 out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
             } else return error.Unsupported;
@@ -565,7 +568,7 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) Bui
             defer b.a.free(txt);
             if (scope.find(txt)) |loc| {
                 if (loc.ty != .str) return error.Unsupported; // an i64 local in a str arg slot
-                out.* = .{ .local = loc.idx };
+                out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (rtBinding(rt, txt)) |bnd| {
                 out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
             } else return error.Unsupported;
@@ -663,10 +666,10 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                         // A str local (callee param) passes through as-is; an
                         // i64 local interpolates as its decimal text.
                         if (loc.ty == .str) {
-                            piece.* = .{ .local = loc.idx };
+                            piece.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
                         } else {
                             const lref = try b.a.create(hir.Expr);
-                            lref.* = .{ .local = loc.idx };
+                            lref.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
                             piece.* = .{ .fmt_int = lref };
                         }
                         try pieces.append(b.a, piece);
@@ -772,16 +775,23 @@ fn returnsBool(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
 /// Syntactic check: does `arg` denote a boolean value? Covers the boolean
 /// expression grammar (comparison / `&&` / `||` / `!` / `true` / `false`) and
 /// a call to a `-> bool` function. Used to route `env.out` to the bool path.
-fn exprIsBool(b: *Builder, arg: ast.Expr) BuildError!bool {
+fn exprIsBool(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
     switch (arg) {
         .literal => |lit| {
             const t = lit.token() orelse return false;
             return t.kind == .KW_TRUE or t.kind == .KW_FALSE;
         },
-        .paren => |p| return exprIsBool(b, p.inner() orelse return false),
+        .paren => |p| return exprIsBool(b, p.inner() orelse return false, scope),
         .unary => |u| return (u.op() orelse return false).kind == .BANG,
         .bin => |bx| return isBoolOp((bx.op() orelse return false).kind),
         .call => return isBoolCall(b, arg),
+        .path => |p| {
+            // A bare name that resolves to a `bool` binding/parameter.
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            if (scope.find(txt)) |loc| return loc.ty == .bool;
+            return false;
+        },
         else => return false,
     }
 }
@@ -865,12 +875,13 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
             const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
-            // Locals are i64-only; a boolean initializer would need a bool
-            // local, so reject it rather than store an i32 into an i64 slot.
-            if (try exprIsBool(b, init_expr)) return error.Unsupported;
+            // A `bool` binding (`let even = n % 2 == 0`) gets a bool local; any
+            // other value expression is i64. (str lets in a value body aren't
+            // reached here — those functions take the str path.)
+            const ty: hir.Type = if (try exprIsBool(b, init_expr, scope)) .bool else .i64;
             // Build the initializer before declaring, so it can't see itself.
             const value = try buildIntExpr(b, init_expr, scope);
-            const idx = try scope.declare(nm.text, ls.isVar(), .i64);
+            const idx = try scope.declare(nm.text, ls.isVar(), ty);
             out.* = .{ .let = .{ .idx = idx, .value = value } };
         },
         .assign_stmt => |as| {
@@ -883,12 +894,22 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             defer b.a.free(tname);
             const loc = scope.find(tname) orelse return error.Unsupported;
             if (!loc.mutable) return reject(b, .immutable_assign); // a `let` binding or a parameter
-            const rhs = try buildIntExpr(b, as.value() orelse return error.Unsupported, scope);
+            const rhs_ast = as.value() orelse return error.Unsupported;
             const op = as.op() orelse return error.Unsupported;
+            // A bool is not an int: the two don't interconvert. A plain `=` must
+            // assign a value of the binding's type; compound ops (`+=` …) are
+            // arithmetic and only apply to an i64 binding.
+            const rhs_is_bool = try exprIsBool(b, rhs_ast, scope);
+            if (op.kind == .EQ) {
+                if ((loc.ty == .bool) != rhs_is_bool) return error.Unsupported;
+            } else if (loc.ty != .i64) {
+                return error.Unsupported; // `bool += …` and the like are not arithmetic
+            }
+            const rhs = try buildIntExpr(b, rhs_ast, scope);
             const value = if (op.kind == .EQ) rhs else blk: {
                 const k = compoundOp(op) orelse return error.Unsupported;
                 const lhs = try b.a.create(hir.Expr);
-                lhs.* = .{ .local = loc.idx };
+                lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
                 const bx = try b.a.create(hir.Expr);
                 bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
                 break :blk bx;
@@ -949,8 +970,10 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             const txt = try p.text(b.a);
             defer b.a.free(txt);
             if (scope.find(txt)) |loc| {
-                if (loc.ty != .i64) return error.Unsupported; // a str local in an i64 context
-                out.* = .{ .local = loc.idx };
+                // i64 and bool (i32 0/1) locals are readable here; a `str`
+                // local belongs in the str path, not an i64/bool expression.
+                if (loc.ty != .i64 and loc.ty != .bool) return error.Unsupported;
+                out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
             } else return error.Unsupported;
@@ -1471,4 +1494,34 @@ test "tryBuild: env.out of a bare comparison / literal is a bool, not an int" {
     // Both env.out args are booleans → host_out_bool, never host_out_int.
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") == null);
+}
+
+test "tryBuild: a bool `let` binding is read back as a bool (host_out_bool)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A bool local in a function body: declared from a comparison, reassigned
+    // with `!`, and returned — all in the bool (i32) lane.
+    try tr.addLib("pub fn check(n: i64) -> bool { var even = n % 2 == 0\n even = !even\n even }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n let flag = 5 > 2\n env.out(flag)\n env.out(check(4))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn check -> bool") != null);
+    // `env.out(flag)` where flag is a bool binding → the bool path.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") == null);
+}
+
+test "tryBuild: a bool is not an int — assigning an int to a bool is rejected" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `x` is a bool; `x = 5` mixes the types and must not build.
+    try tr.addLib("pub fn bad() -> i64 { var x = 1 == 1\n x = 5\n 0 }\n");
+
+    const mod = try buildFromSource(testing.allocator,
+        "fn main {\n env.out(bad())\n}\n", tr.resolver());
+    try testing.expect(mod == null); // unsupported: no int↔bool coercion
 }
