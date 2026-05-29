@@ -44,7 +44,7 @@ pub const ModuleResolver = struct {
 /// `(ptr, len)`. Distinct from `i64` (a genuine integer value) so the backend
 /// realizes pointer locals at the build's address width. `str` itself stays
 /// abstract (the `(ptr, len)` pair is a lowering concern).
-pub const Type = enum { i64, i32, f64, str, ptr, void };
+pub const Type = enum { i64, i32, f64, str, bool, ptr, void };
 
 /// A definite semantic error the AST→HIR builder detected — distinct from
 /// "construct not yet supported" (which signals a fall-back). The codegen
@@ -130,6 +130,10 @@ pub const Stmt = union(enum) {
     /// `env.out(expr)` where `expr` is a runtime `str` value (e.g. a call to a
     /// str-returning function) — its `(ptr, len)` is written, then a newline.
     host_out_str: *Expr,
+    /// `env.out(expr)` where `expr` is a boolean (a comparison, `&&`/`||`/`!`,
+    /// a `true`/`false` literal, or a `-> bool` call). Lowers to a value `if`
+    /// that writes the constant `"true"` / `"false"` text.
+    host_out_bool: *Expr,
     /// A call to a host import face (`qview.text(…)`): `name` is the dotted
     /// source name; `args` are i64 expressions. Lowers to a wasm import call.
     host_call: struct { name: []const u8, args: []const *Expr },
@@ -157,12 +161,19 @@ pub const Expr = union(enum) {
     /// A fully-resolved constant string value (escapes decoded, no newline).
     str_const: []const u8,
     int_const: i64,
+    /// A `true` / `false` literal. A boolean (i32 0/1), like a comparison or
+    /// `!` — usable in conditions and as an operand of `&&`/`||`/`!`.
+    bool_const: bool,
     /// A parameter or in-body binding, by resolved local index.
     local: u32,
     /// Read a module-level `state` global, by index.
     global_get: u32,
     bin: struct { kind: ops.BinKind, lhs: *Expr, rhs: *Expr },
     un: struct { kind: ops.UnKind, operand: *Expr },
+    /// Short-circuit `&&` / `||`. Kept distinct from `bin` because it lowers
+    /// to control flow (a value `if_`), not a backend binary op. Yields a
+    /// boolean (i32 0/1); both operands are truthiness-tested.
+    logical: struct { op: ops.LogicalKind, lhs: *Expr, rhs: *Expr },
     /// A call to another function, resolved to its `FuncId`.
     call: struct { func: FuncId, args: []const *Expr },
     /// A runtime string concatenation (interpolation with dynamic pieces).

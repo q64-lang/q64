@@ -208,6 +208,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 try stmts.append(b.a, st);
             } else {
                 // A runtime i64 binding (`let a = double(21)`, `let b = a + 1`).
+                // A boolean initializer (`let x = a > 0`) would need a bool
+                // local; locals are i64-only today, so reject it honestly
+                // rather than emit an i32-into-i64 store.
+                if (try exprIsBool(b, init_expr)) return error.Unsupported;
                 // Build the initializer first so it can't see its own name,
                 // then allocate a single i64 local and register in mscope so
                 // later i64 expressions can resolve it. The local index is the
@@ -263,6 +267,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
             } else if (try isStrCall(b, arg)) {
                 // A real call to a str-returning function.
                 st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope, rt) };
+            } else if (try exprIsBool(b, arg)) {
+                // A boolean: a comparison, `&&`/`||`/`!`, a literal, or a
+                // `-> bool` call. Printed as "true" / "false".
+                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, &mscope) };
             } else {
                 // Otherwise an i64 expression (a call to an i64 function).
                 const e = try buildIntExpr(b, arg, &mscope);
@@ -396,7 +404,9 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
 
     const fd = b.resolver.lookup(name) orelse return reject(b, .name_not_found);
     if (try returnsStr(b.a, fd)) return registerStrFunc(b, name, fd);
-    if (!(try returnsI64(b.a, fd))) return error.Unsupported;
+    // An i64 or a `-> bool` (i32 0/1) value function; both have i64 params and
+    // a value body built by `buildIntBlock`.
+    const ret_ty: hir.Type = if (try returnsBool(b.a, fd)) .bool else if (try returnsI64(b.a, fd)) .i64 else return error.Unsupported;
 
     const owned = try b.a.dupe(u8, name);
 
@@ -421,7 +431,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     const dummy = try b.a.create(hir.Stmt);
     dummy.* = .{ .block = &.{} };
     // Reserve with the real params so recursive arg-count checks are correct.
-    try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = .i64, .body = dummy });
+    try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = ret_ty, .body = dummy });
 
     const body = try buildIntBlock(b, fd.body() orelse return error.Unsupported, &scope);
     // A value-producing i64 function whose tail is an `if` with no `else` has a
@@ -432,7 +442,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     const locals = try b.a.alloc(hir.Type, extra);
     for (locals) |*t| t.* = .i64;
 
-    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .i64, .locals = locals, .body = body };
+    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
 }
 
@@ -753,6 +763,52 @@ fn returnsStr(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
     return typeNamed(a, te, "str");
 }
 
+fn returnsBool(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
+    const rt = fd.returnType() orelse return false;
+    const te = rt.type_() orelse return false;
+    return typeNamed(a, te, "bool");
+}
+
+/// Syntactic check: does `arg` denote a boolean value? Covers the boolean
+/// expression grammar (comparison / `&&` / `||` / `!` / `true` / `false`) and
+/// a call to a `-> bool` function. Used to route `env.out` to the bool path.
+fn exprIsBool(b: *Builder, arg: ast.Expr) BuildError!bool {
+    switch (arg) {
+        .literal => |lit| {
+            const t = lit.token() orelse return false;
+            return t.kind == .KW_TRUE or t.kind == .KW_FALSE;
+        },
+        .paren => |p| return exprIsBool(b, p.inner() orelse return false),
+        .unary => |u| return (u.op() orelse return false).kind == .BANG,
+        .bin => |bx| return isBoolOp((bx.op() orelse return false).kind),
+        .call => return isBoolCall(b, arg),
+        else => return false,
+    }
+}
+
+fn isBoolOp(k: parser.cst.SyntaxKind) bool {
+    return switch (k) {
+        .EQ_EQ, .BANG_EQ, .L_ANGLE, .R_ANGLE, .LT_EQ, .GT_EQ, .AMP_AMP, .PIPE_PIPE => true,
+        else => false,
+    };
+}
+
+fn isBoolCall(b: *Builder, arg: ast.Expr) BuildError!bool {
+    const call = switch (arg) {
+        .call => |cc| cc,
+        else => return false,
+    };
+    const callee = call.callee() orelse return false;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return false,
+    };
+    const cname = try cpath.text(b.a);
+    defer b.a.free(cname);
+    const fd = b.resolver.lookup(cname) orelse return false;
+    return returnsBool(b.a, fd);
+}
+
 fn paramIsStr(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
     const te = p.type_() orelse return false;
     return typeNamed(a, te, "str");
@@ -809,6 +865,9 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
             const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            // Locals are i64-only; a boolean initializer would need a bool
+            // local, so reject it rather than store an i32 into an i64 slot.
+            if (try exprIsBool(b, init_expr)) return error.Unsupported;
             // Build the initializer before declaring, so it can't see itself.
             const value = try buildIntExpr(b, init_expr, scope);
             const idx = try scope.declare(nm.text, ls.isVar(), .i64);
@@ -876,6 +935,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
     const out = try b.a.create(hir.Expr);
     switch (expr) {
         .num_lit => |n| out.* = .{ .int_const = consteval.parseIntLit(n.rawText() orelse return error.Unsupported) catch return error.Unsupported },
+        .literal => |lit| {
+            // `true` / `false`. `none` (optionals) isn't represented yet.
+            const tok = lit.token() orelse return error.Unsupported;
+            out.* = switch (tok.kind) {
+                .KW_TRUE => .{ .bool_const = true },
+                .KW_FALSE => .{ .bool_const = false },
+                else => return error.Unsupported,
+            };
+        },
         .paren => |p| return buildIntExpr(b, p.inner() orelse return error.Unsupported, scope),
         .path => |p| {
             const txt = try p.text(b.a);
@@ -892,12 +960,17 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             out.* = .{ .un = .{ .kind = kind, .operand = try buildIntExpr(b, u.operand() orelse return error.Unsupported, scope) } };
         },
         .bin => |bx| {
-            const kind = binKind(bx.op() orelse return error.Unsupported) orelse return error.Unsupported;
-            out.* = .{ .bin = .{
-                .kind = kind,
-                .lhs = try buildIntExpr(b, bx.lhs() orelse return error.Unsupported, scope),
-                .rhs = try buildIntExpr(b, bx.rhs() orelse return error.Unsupported, scope),
-            } };
+            const op_tok = bx.op() orelse return error.Unsupported;
+            const lhs = try buildIntExpr(b, bx.lhs() orelse return error.Unsupported, scope);
+            const rhs = try buildIntExpr(b, bx.rhs() orelse return error.Unsupported, scope);
+            if (logicalKind(op_tok)) |lk| {
+                // `&&` / `||` short-circuit, so they're control flow, not a
+                // binary value op (see `lowerExpr`'s `.logical` → `if_`).
+                out.* = .{ .logical = .{ .op = lk, .lhs = lhs, .rhs = rhs } };
+            } else {
+                const kind = binKind(op_tok) orelse return error.Unsupported;
+                out.* = .{ .bin = .{ .kind = kind, .lhs = lhs, .rhs = rhs } };
+            }
         },
         .call => |cc| {
             const callee = cc.callee() orelse return error.Unsupported;
@@ -908,7 +981,12 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
             const id = try registerFunc(b, cname);
-            if (b.funcs.items[id].ret != .i64) return reject(b, .unsupported_call); // only i64 callees in an i64 expr
+            // An i64 or bool (i32 0/1) callee produces a value usable here; a
+            // str callee does not belong in an i64/bool expression.
+            switch (b.funcs.items[id].ret) {
+                .i64, .bool => {},
+                else => return reject(b, .unsupported_call),
+            }
             var args: std.ArrayList(*hir.Expr) = .empty;
             var ait = cc.args();
             while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
@@ -953,10 +1031,19 @@ fn binKind(tok: parser.cst.Token) ?ops.BinKind {
     };
 }
 
+fn logicalKind(tok: parser.cst.Token) ?ops.LogicalKind {
+    return switch (tok.kind) {
+        .AMP_AMP => .and_,
+        .PIPE_PIPE => .or_,
+        else => null,
+    };
+}
+
 fn unKind(tok: parser.cst.Token) ?ops.UnKind {
     return switch (tok.kind) {
         .MINUS => .neg,
         .TILDE => .bit_not,
+        .BANG => .not,
         else => null,
     };
 }
@@ -1309,4 +1396,79 @@ test "tryBuild: a recursive control-flow body builds HIR" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "if ") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "call#1") != null); // recursive call to fact
+}
+
+test "tryBuild: logical not in a condition builds a (not ...) over the comparison" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `if !(n == 0)` — the `!is_even(n)` shape, grounded on a comparison so it
+    // stays inside the i64 expression subset.
+    try tr.addLib("pub fn nonzero(n: i64) -> i64 { if !(n == 0) { 1 } else { 0 } }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(nonzero(7))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "(not ") != null); // the `!` node
+    try testing.expect(std.mem.indexOf(u8, dump, "eq") != null); // wrapping the comparison
+}
+
+test "tryBuild: `&&` / `||` build short-circuit logical nodes (not bin ops)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn both(a: i64, b: i64) -> i64 { if a > 0 && b > 0 { 1 } else { 0 } }\n");
+    try tr.addLib("pub fn either(a: i64, b: i64) -> i64 { if a > 0 || b > 0 { 1 } else { 0 } }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(both(1, 1))\n env.out(either(0, 1))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "and_") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "or_") != null);
+}
+
+test "tryBuild: `true` / `false` literals build bool_const nodes" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn pick(n: i64) -> i64 { if true { n } else { 0 } }\n");
+    try tr.addLib("pub fn nope(n: i64) -> i64 { if n > 0 && false { 1 } else { 0 } }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(pick(7))\n env.out(nope(7))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "if true") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "false") != null);
+}
+
+test "tryBuild: a `-> bool` function + env.out routes to host_out_bool" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn is_even(n: i64) -> bool { n % 2 == 0 }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(is_even(4))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn is_even -> bool") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null);
+}
+
+test "tryBuild: env.out of a bare comparison / literal is a bool, not an int" {
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(3 > 5)\n env.out(true)\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Both env.out args are booleans → host_out_bool, never host_out_int.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") == null);
 }

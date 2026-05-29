@@ -22,6 +22,9 @@ const Ctx = struct {
     a: std.mem.Allocator,
     data: *std.ArrayList(u8),
     nl_off: *?u32,
+    /// The HIR functions, so a `call` can recover its callee's return type
+    /// (an i64 vs a bool/i32 result) instead of assuming i64.
+    funcs: []const hir.Func,
 
     /// The shared trailing-newline byte env.out writes after a formatted
     /// value; materialized once into the memory image.
@@ -42,7 +45,7 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
 
     var data: std.ArrayList(u8) = .empty;
     var nl_off: ?u32 = null;
-    const ctx = Ctx{ .a = a, .data = &data, .nl_off = &nl_off };
+    const ctx = Ctx{ .a = a, .data = &data, .nl_off = &nl_off, .funcs = h.funcs };
 
     const funcs = try a.alloc(mir.Func, h.funcs.len);
     for (h.funcs, 0..) |hf, i| {
@@ -96,10 +99,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
                 .str_const => |b| b,
                 else => unreachable,
             };
-            const off: u32 = @intCast(ctx.data.items.len);
-            try ctx.data.appendSlice(ctx.a, bytes);
-            try ctx.data.append(ctx.a, '\n');
-            return mk(ctx.a, .void, .{ .host_out_const = .{ .off = off, .len = @intCast(bytes.len + 1) } });
+            return hostOutConst(ctx, bytes);
         },
         .host_out_int => |e| {
             const nl = try ctx.newline();
@@ -108,6 +108,15 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .host_out_str => |e| {
             const nl = try ctx.newline();
             return mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, e), .nl_off = nl } });
+        },
+        .host_out_bool => |e| {
+            // `env.out(<bool>)` → `if e { out("true") } else { out("false") }`.
+            const cond = try lowerCond(ctx, e);
+            return mk(ctx.a, .void, .{ .if_ = .{
+                .cond = cond,
+                .then_ = try hostOutConst(ctx, "true"),
+                .else_ = try hostOutConst(ctx, "false"),
+            } });
         },
         .host_call => |hc| {
             const args = try ctx.a.alloc(*mir.Inst, hc.args.len);
@@ -121,6 +130,15 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
     }
 }
 
+/// Fold `bytes` + a trailing newline into the data image and emit the
+/// `env.out` of that constant run (the `env.out("X")` shape).
+fn hostOutConst(ctx: Ctx, bytes: []const u8) Error!*mir.Inst {
+    const off: u32 = @intCast(ctx.data.items.len);
+    try ctx.data.appendSlice(ctx.a, bytes);
+    try ctx.data.append(ctx.a, '\n');
+    return mk(ctx.a, .void, .{ .host_out_const = .{ .off = off, .len = @intCast(bytes.len + 1) } });
+}
+
 fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
     const params = try ctx.a.alloc(mir.ValueType, hf.params.len);
     for (hf.params, 0..) |p, i| params[i] = mapType(p.ty);
@@ -129,7 +147,7 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
 
     const body = switch (hf.ret) {
         .str => try lowerStrExpr(ctx, singleTail(hf.body) orelse return error.Unsupported),
-        else => try lowerIntBlock(ctx, hf.body, true),
+        else => try lowerIntBlock(ctx, hf.body, mapType(hf.ret)),
     };
 
     return .{
@@ -184,7 +202,10 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
 /// its last statement is the tail (an expression, `return`, value-`if`, or a
 /// diverging `loop`); earlier statements are setup. Mirrors the legacy
 /// `emitIntBlock`. Returns `Unsupported` when a tail produces no value.
-fn lowerIntBlock(ctx: Ctx, blk: *const hir.Stmt, want_value: bool) Error!*mir.Inst {
+/// Lower a value/void block. `value_ty` is the type the block must produce
+/// (the enclosing function's return type, or an `if`'s type) — `null` lowers
+/// it as a void block (a loop/while body, a void `if` branch).
+fn lowerIntBlock(ctx: Ctx, blk: *const hir.Stmt, value_ty: ?mir.ValueType) Error!*mir.Inst {
     const stmts = switch (blk.*) {
         .block => |s| s,
         else => return error.Unsupported,
@@ -192,42 +213,42 @@ fn lowerIntBlock(ctx: Ctx, blk: *const hir.Stmt, want_value: bool) Error!*mir.In
 
     var items: std.ArrayList(*mir.Inst) = .empty;
     const n = stmts.len;
-    const tail_at: ?usize = if (want_value and n > 0) n - 1 else null;
+    const tail_at: ?usize = if (value_ty != null and n > 0) n - 1 else null;
 
     for (stmts, 0..) |s, i| {
         if (tail_at != null and i == tail_at.?) continue;
         try lowerSetupStmt(ctx, s, &items);
     }
 
-    if (!want_value) return mk(ctx.a, .void, .{ .block = try items.toOwnedSlice(ctx.a) });
+    const vty = value_ty orelse return mk(ctx.a, .void, .{ .block = try items.toOwnedSlice(ctx.a) });
 
     const tail = if (tail_at) |t| stmts[t] else return error.Unsupported;
 
     // A diverging `loop` tail: emit it, then `unreachable` so the block types
-    // as i64 (it must exit via `return`).
+    // as the value type (it must exit via `return`).
     if (tail.* == .loop_) {
         try items.append(ctx.a, try lowerLoop(ctx, tail.loop_));
         try items.append(ctx.a, try mk(ctx.a, .void, .@"unreachable"));
-        return mk(ctx.a, .i64, .{ .block = try items.toOwnedSlice(ctx.a) });
+        return mk(ctx.a, vty, .{ .block = try items.toOwnedSlice(ctx.a) });
     }
 
     const tail_val: *mir.Inst = switch (tail.*) {
         .expr => |e| try lowerExpr(ctx, e),
         .ret => |e| try lowerExpr(ctx, e orelse return error.Unsupported),
-        .if_ => |iff| try lowerValueIf(ctx, iff),
+        .if_ => |iff| try lowerValueIf(ctx, iff, vty),
         else => return error.Unsupported,
     };
 
     if (items.items.len == 0) return tail_val;
     try items.append(ctx.a, tail_val);
-    return mk(ctx.a, .i64, .{ .block = try items.toOwnedSlice(ctx.a) });
+    return mk(ctx.a, vty, .{ .block = try items.toOwnedSlice(ctx.a) });
 }
 
 fn lowerSetupStmt(ctx: Ctx, s: *const hir.Stmt, items: *std.ArrayList(*mir.Inst)) Error!void {
     switch (s.*) {
         .let => |l| try items.append(ctx.a, try mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } })),
         .assign => |as| try items.append(ctx.a, try mk(ctx.a, .void, .{ .local_set = .{ .idx = as.idx, .value = try lowerExpr(ctx, as.value) } })),
-        .while_ => |w| try items.append(ctx.a, try mk(ctx.a, .void, .{ .while_ = .{ .cond = try lowerCond(ctx, w.cond), .body = try lowerIntBlock(ctx, w.body, false) } })),
+        .while_ => |w| try items.append(ctx.a, try mk(ctx.a, .void, .{ .while_ = .{ .cond = try lowerCond(ctx, w.cond), .body = try lowerIntBlock(ctx, w.body, null) } })),
         .loop_ => try items.append(ctx.a, try lowerLoop(ctx, s.loop_)),
         .if_ => |iff| try items.append(ctx.a, try lowerVoidIf(ctx, iff)),
         .ret => |e| try items.append(ctx.a, try mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null })),
@@ -238,20 +259,20 @@ fn lowerSetupStmt(ctx: Ctx, s: *const hir.Stmt, items: *std.ArrayList(*mir.Inst)
 }
 
 fn lowerLoop(ctx: Ctx, body_blk: *const hir.Stmt) Error!*mir.Inst {
-    return mk(ctx.a, .void, .{ .loop = try lowerIntBlock(ctx, body_blk, false) });
+    return mk(ctx.a, .void, .{ .loop = try lowerIntBlock(ctx, body_blk, null) });
 }
 
-fn lowerValueIf(ctx: Ctx, iff: anytype) Error!*mir.Inst {
+fn lowerValueIf(ctx: Ctx, iff: anytype, vty: mir.ValueType) Error!*mir.Inst {
     const cond = try lowerCond(ctx, iff.cond);
-    const then_ = try lowerIntBlock(ctx, iff.then_, true);
-    const else_ = try lowerIntBlock(ctx, iff.else_ orelse return error.Unsupported, true);
-    return mk(ctx.a, .i64, .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } });
+    const then_ = try lowerIntBlock(ctx, iff.then_, vty);
+    const else_ = try lowerIntBlock(ctx, iff.else_ orelse return error.Unsupported, vty);
+    return mk(ctx.a, vty, .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } });
 }
 
 fn lowerVoidIf(ctx: Ctx, iff: anytype) Error!*mir.Inst {
     const cond = try lowerCond(ctx, iff.cond);
-    const then_ = try lowerIntBlock(ctx, iff.then_, false);
-    const else_: ?*mir.Inst = if (iff.else_) |eb| try lowerIntBlock(ctx, eb, false) else null;
+    const then_ = try lowerIntBlock(ctx, iff.then_, null);
+    const else_: ?*mir.Inst = if (iff.else_) |eb| try lowerIntBlock(ctx, eb, null) else null;
     return mk(ctx.a, .void, .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } });
 }
 
@@ -267,9 +288,14 @@ fn lowerCond(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
 fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
+        .bool_const => |v| return mk(ctx.a, .i32, .{ .const_i32 = @intFromBool(v) }),
         .local => |idx| return mk(ctx.a, .i64, .{ .local_get = idx }),
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
-        .un => |u| return mk(ctx.a, .i64, .{ .un = .{ .kind = u.kind, .operand = try lowerExpr(ctx, u.operand) } }),
+        .un => |u| {
+            // `not` yields a boolean (i32 0/1); `neg`/`bit_not` preserve i64.
+            const ty: mir.ValueType = if (u.kind == .not) .i32 else .i64;
+            return mk(ctx.a, ty, .{ .un = .{ .kind = u.kind, .operand = try lowerExpr(ctx, u.operand) } });
+        },
         .bin => |bx| {
             const ty: mir.ValueType = if (isCmp(bx.kind)) .i32 else .i64;
             return mk(ctx.a, ty, .{ .bin = .{
@@ -278,10 +304,29 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
                 .rhs = try lowerExpr(ctx, bx.rhs),
             } });
         },
+        .logical => |lg| {
+            // Short-circuit via a value `if_` (i32 0/1): `a && b` is
+            // `if a { b } else { 0 }`; `a || b` is `if a { 1 } else { b }`.
+            // Both operands are truthiness-tested so `b` need not be a 0/1.
+            const lhs = try lowerCond(ctx, lg.lhs);
+            const rhs = try lowerCond(ctx, lg.rhs);
+            const lit = switch (lg.op) {
+                .and_ => @as(i32, 0), // the false short-circuit result
+                .or_ => @as(i32, 1), // the true short-circuit result
+            };
+            const konst = try mk(ctx.a, .i32, .{ .const_i32 = lit });
+            const branches = switch (lg.op) {
+                .and_ => .{ rhs, konst }, // then = rhs, else = 0
+                .or_ => .{ konst, rhs }, // then = 1,   else = rhs
+            };
+            return mk(ctx.a, .i32, .{ .if_ = .{ .cond = lhs, .then_ = branches[0], .else_ = branches[1] } });
+        },
         .call => |cl| {
             const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
             for (cl.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
-            return mk(ctx.a, .i64, .{ .call = .{ .func = cl.func, .args = args } });
+            // The call's value type follows the callee's return type (i64, or
+            // i32 for a `-> bool`), so it validates against the callee sig.
+            return mk(ctx.a, mapType(ctx.funcs[cl.func].ret), .{ .call = .{ .func = cl.func, .args = args } });
         },
         .str_const, .concat, .str_binding, .fmt_int => unreachable, // str values never reach the i64 path
     }
@@ -300,6 +345,7 @@ fn mapType(t: hir.Type) mir.ValueType {
         .i32 => .i32,
         .f64 => .f64,
         .str => .str,
+        .bool => .i32, // a boolean is an i32 0/1 at the executable tier
         .ptr => .ptr,
         .void => .void,
     };
@@ -421,4 +467,83 @@ test "lower: i64 binding interpolation lowers to fmt_int_to_str inside str_conca
     try testing.expect(std.mem.indexOf(u8, dump, "fmt_int_to_str") != null);
     // The fmt_int_to_str wraps a local_get of the binding's local (idx 0).
     try testing.expect(std.mem.indexOf(u8, dump, "local_get 0") != null);
+}
+
+test "lower: `!` in an if-condition lowers to a `un not` over the comparison" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn nonzero(n: i64) -> i64 { if !(n == 0) { 1 } else { 0 } }\n");
+
+    const pr = try parser.parse.parse(testing.allocator,
+        "fn main {\n env.out(nonzero(7))\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    // The `!` survives lowering as a `un not`, wrapping the `bin eq`. The
+    // condition is used directly (lowerCond keeps an i32 as-is — see the
+    // `un not` result type), so there is no extra `!= 0` truthiness wrap.
+    try testing.expect(std.mem.indexOf(u8, dump, "un not") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "bin eq") != null);
+}
+
+test "lower: `&&` lowers to a short-circuit `if_` with a const_i32 false leaf" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn both(a: i64, b: i64) -> i64 { if a > 0 && b > 0 { 1 } else { 0 } }\n");
+
+    const pr = try parser.parse.parse(testing.allocator,
+        "fn main {\n env.out(both(1, 1))\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    // The `&&` becomes a value `if : i32` whose else-leaf is the false 0/1
+    // constant — there is no backend binary op for it.
+    try testing.expect(std.mem.indexOf(u8, dump, "if : i32") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "const_i32 0") != null);
+}
+
+test "lower: env.out(<bool>) interns true/false and lowers to a void if" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn is_even(n: i64) -> bool { n % 2 == 0 }\n");
+
+    const pr = try parser.parse.parse(testing.allocator,
+        "fn main {\n env.out(is_even(4))\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    // "true" and "false" (with trailing newlines) are folded into the image.
+    try testing.expect(std.mem.indexOf(u8, m.data, "true\n") != null);
+    try testing.expect(std.mem.indexOf(u8, m.data, "false\n") != null);
+    // The callee lowers with an i32 (bool) return type.
+    var saw_bool_ret = false;
+    for (m.funcs) |f| {
+        if (std.mem.eql(u8, f.name, "is_even")) saw_bool_ret = (f.ret == .i32);
+    }
+    try testing.expect(saw_bool_ret);
 }

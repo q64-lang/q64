@@ -1356,7 +1356,20 @@ pub const NumLit = struct {
     }
 };
 
-pub const LiteralExpr = struct { cst: *const cst.Node };
+pub const LiteralExpr = struct {
+    cst: *const cst.Node,
+
+    /// The literal's keyword token (`true` / `false` / `none`), if it is one
+    /// of those forms. Other literals (numbers, strings) have their own
+    /// `Expr` variants, so a `LiteralExpr` only ever holds a keyword token.
+    pub fn token(self: LiteralExpr) ?cst.Token {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .KW_TRUE or t.kind == .KW_FALSE or t.kind == .KW_NONE) return t,
+            .node => {},
+        };
+        return null;
+    }
+};
 
 // =====================================================================
 // Operator and postfix expressions

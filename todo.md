@@ -32,6 +32,48 @@ and `qube run`):
       verifies → extracts to `~/.qube/cache/sha256/<ab>/<cd>/<digest>/` → edits
       the manifest's `dependencies`.
 - [x] Test pair built: `dev.q64.hello_world` (published, live) + `dev.q64.hello_app`.
+- [x] **Logical not (`!`).** `!` was already lexed (`BANG`) and parsed as a
+      prefix op; wired the IR/codegen tail: `ops.UnKind.not`, `build_hir.unKind`
+      maps `.BANG`, `lower` types `not` as a boolean (i32 0/1), `emit` lowers it
+      to `eqz` (width follows the operand — i32 for a comparison, i64
+      otherwise), and `consteval` const-folds it. It's truthiness
+      (`x == 0 ? 1 : 0`), so it accepts any integer operand. Verified
+      end-to-end via the wasmtime host: `if !is_even(n)`, `!0`/`!5`, `!!5`.
+- [x] **Short-circuit `&&` / `||`.** Completes the boolean operator set. Both
+      were already lexed (`AMP_AMP`/`PIPE_PIPE`) and parsed with precedence
+      (`||`=2, `&&`=3) but didn't lower. They're control flow, not value ops:
+      a new `hir.Expr.logical` node (`ops.LogicalKind`) lowers to a value
+      `if_` — `a && b` → `if a { b } else { 0 }`, `a || b` → `if a { 1 } else
+      { b }` — yielding an i32 0/1 (matching comparisons + `!`). Added a
+      `mir.const_i32` for the boolean branch leaves. Both operands are
+      truthiness-tested, so the rhs need not be a 0/1. Verified end-to-end:
+      full truth tables, precedence (`a || b && c`), interaction with `!`, and
+      **short-circuit** (a div-by-zero rhs is skipped, not trapped) when the
+      lhs already decides the result.
+- [x] **`true` / `false` literals.** Already lexed (`KW_TRUE`/`KW_FALSE`) and
+      parsed (`LITERAL_EXPR`), but `build_hir` didn't handle the `.literal`
+      view, so even `if true` was `UnsupportedExpression`. Added
+      `ast.LiteralExpr.token()`, a `hir.Expr.bool_const` that lowers to
+      `const_i32` (i32 0/1, like comparisons + `!`), and the print arm.
+      Verified end-to-end: `if true`/`if false`, `!true`, `n>0 || true`,
+      `n>0 && false`. Scoped to boolean/condition contexts — first-class
+      `bool` *values* (storable in `let`, returnable, `env.out` → "true"/
+      "false") are the next step and need the type-system plumbing below.
+      (`none` for optionals is still unrepresented.)
+- [x] **First-class `bool` values (return + print).** A `-> bool` function and
+      `env.out(<bool>)` now work, so `fn is_even(n: i64) -> bool { n % 2 == 0 }`
+      + `env.out(is_even(4))` prints `true`. Added `hir.Type.bool` (→ MIR i32),
+      a `hir.Stmt.host_out_bool` that lowers to a value `if` writing the interned
+      `"true"`/`"false"` text, `returnsBool`/`exprIsBool` detection (comparison /
+      `&&` / `||` / `!` / literal / `-> bool` call) routing `env.out`, and the
+      `-> bool` registration path. To do this soundly, lowering now **threads the
+      value type** through `lowerIntBlock`/`lowerValueIf` and reads a call's type
+      from its callee (both previously hardcoded i64), so a bool body/return
+      validates as i32. Verified end-to-end (incl. `env.out(!is_even(3))`,
+      bare `env.out(3 > 5)`, value-`if` and `let`-bearing bool bodies; i64
+      functions unaffected). **Still out of scope** (the per-local-typing work):
+      bool **locals** (`let x = a > 0`) and bool **params** — both now fail with
+      a clean `UnsupportedExpression` (guarded) rather than an invalid module.
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile
