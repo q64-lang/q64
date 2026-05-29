@@ -94,6 +94,9 @@ pub const Stmt = union(enum) {
     /// `env.out(expr)` where `expr` is a runtime `str` value (e.g. a call to a
     /// str-returning function) — its `(ptr, len)` is written, then a newline.
     host_out_str: *Expr,
+    /// A call to a host import face (`qview.text(…)`): `name` is the dotted
+    /// source name; `args` are i64 expressions. Lowers to a wasm import call.
+    host_call: struct { name: []const u8, args: []const *Expr },
     /// An `i64` expression statement; as a block's tail it is the value.
     expr: *Expr,
     ret: ?*Expr,

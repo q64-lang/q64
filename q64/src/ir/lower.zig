@@ -99,6 +99,11 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             const nl = try ctx.newline();
             return mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, e), .nl_off = nl } });
         },
+        .host_call => |hc| {
+            const args = try ctx.a.alloc(*mir.Inst, hc.args.len);
+            for (hc.args, 0..) |a, i| args[i] = try lowerExpr(ctx, a);
+            return mk(ctx.a, .void, .{ .host_call = .{ .name = hc.name, .args = args } });
+        },
         .str_let => |sl| return mk(ctx.a, .void, .{ .str_bind = .{ .ptr_idx = sl.ptr_idx, .len_idx = sl.len_idx, .value = try lowerStrExpr(ctx, sl.value) } }),
         .let => |l| return mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } }),
         else => unreachable, // main has no value/tail statements

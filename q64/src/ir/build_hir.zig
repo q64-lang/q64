@@ -147,6 +147,17 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 .call => |cc| cc,
                 else => return error.Unsupported,
             };
+            // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`):
+            // all-i64 args, no return. The backend declares the matching import.
+            if (try hostFaceName(b, call)) |fname| {
+                var args: std.ArrayList(*hir.Expr) = .empty;
+                var ait = call.args();
+                while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, &mscope));
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
+                try stmts.append(b.a, st);
+                continue;
+            }
             if (!isEnvOut(b.a, call)) return error.Unsupported;
             const arg = firstArg(call) orelse return error.Unsupported;
 
@@ -717,6 +728,21 @@ fn findMain(sf: ast.SourceFile) ?ast.FnDecl {
         },
         else => {},
     };
+    return null;
+}
+
+/// If `call`'s callee is a host face we drive directly (today: `qview.<fn>`),
+/// return its dotted name (arena-owned). Such a call lowers to a wasm import
+/// call with i64 args and no result. Otherwise null.
+fn hostFaceName(b: *Builder, call: ast.CallExpr) BuildError!?[]const u8 {
+    const callee = call.callee() orelse return null;
+    const path = switch (callee) {
+        .path => |p| p,
+        else => return null,
+    };
+    const txt = try path.text(b.a);
+    if (std.mem.startsWith(u8, txt, "qview.")) return txt; // arena-owned; kept
+    b.a.free(txt);
     return null;
 }
 

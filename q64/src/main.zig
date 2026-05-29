@@ -74,8 +74,10 @@ fn usage(io: std.Io) !void {
         \\
         \\Commands:
         \\  check <file> [--diagnostics json]  Parse a single file and emit diagnostics.
-        \\  emit <file.q> <out.wasm> [--module name=dir ...]
+        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--module name=dir ...]
         \\                                     Compile a q64 source file to wasm via codegen.
+        \\                                     --addr selects the linear-memory address space
+        \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
         \\  --version                          Print the version and exit.
         \\
@@ -167,11 +169,32 @@ const ModuleArg = struct { name: []const u8, dir: []const u8 };
 fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
     var src_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
+    // Address space (spec/memory.md §"The platform"). Explicit per build; we
+    // default to wasm64 to preserve existing behavior for string programs until
+    // the wasm32 string ABI lands (Path B). `--addr wasm32` opts in to a genuine
+    // 32-bit module (the WebKit/iPad baseline) for the integer/import subset.
+    var addr: emit.AddressSpace = .wasm64;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
 
     while (args_it.next()) |a| {
-        if (std.mem.eql(u8, a, "--module")) {
+        if (std.mem.eql(u8, a, "--addr")) {
+            const v = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+            if (std.mem.eql(u8, v, "wasm32")) {
+                addr = .wasm32;
+            } else if (std.mem.eql(u8, v, "wasm64")) {
+                addr = .wasm64;
+            } else {
+                var buf: [4096]u8 = undefined;
+                var w = std.Io.File.stderr().writer(io, &buf);
+                try w.interface.print("q64: --addr expects wasm32 or wasm64, got '{s}'\n", .{v});
+                try w.interface.flush();
+                std.process.exit(2);
+            }
+        } else if (std.mem.eql(u8, a, "--module")) {
             const spec = args_it.next() orelse {
                 try usage(io);
                 std.process.exit(2);
@@ -236,7 +259,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         try module_sources.append(gpa, .{ .name = ma.name, .source = lib_src });
     }
 
-    const bytes = emit.emitFromSource(gpa, source, src, module_sources.items) catch |err| {
+    const bytes = emit.emitFromSource(gpa, source, src, module_sources.items, addr) catch |err| {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
         try w.interface.print("q64: emit failed: {s}\n", .{@errorName(err)});

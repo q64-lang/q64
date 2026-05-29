@@ -145,6 +145,11 @@ pub const Op = union(enum) {
     /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
     /// shared newline byte at `nl_off`.
     host_out_str: struct { value: *Inst, nl_off: u32 },
+    /// A call to a host import face (e.g. `qview.text`). `name` is the dotted
+    /// source name; the backend declares the matching wasm import
+    /// (`(import "qview" "text" …)`) and emits the call. Args are i64 values
+    /// (valid on wasm32 — only memory *addresses* are width-sensitive). Void.
+    host_call: struct { name: []const u8, args: []const *Inst },
     /// The decimal `str` value of an i64 — formats `value` via `__fmt_i64` and
     /// yields its `(ptr, len)`. Used as a piece inside `str_concat` when an
     /// i64 binding (or any i64 expression) appears in interpolation.
