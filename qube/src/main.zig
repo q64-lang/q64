@@ -1812,6 +1812,11 @@ const PodConfig = struct {
     version: ?[]const u8,
     language: ?[]const u8,
     wasm: []const u8,
+    // Optional address-space list (comma-separated `wasm32` / `wasm64`). When
+    // set, the component is emitted as a `variants` map (one build per address
+    // space) instead of the single legacy `wasm`; each variant's path is derived
+    // from `wasm` by inserting `.<addr>` before the `.wasm` extension.
+    addr: ?[]const u8,
     wit_package: []const u8,
     wit_world: []const u8,
     http_route: ?[]const u8,
@@ -1845,6 +1850,10 @@ fn podHelp(io: std.Io) !void {
         \\  --wasm <path>          Path to the wasm component.             (required)
         \\  --wit-package <id>     WIT package id, e.g. qubepods:app@0.1.0.(required)
         \\  --wit-world <world>    WIT world name.                         (required)
+        \\  --addr <list>          Address spaces to ship (wasm32,wasm64); emits a
+        \\                         component.variants map. Per-variant paths derive
+        \\                         from --wasm (./x.wasm -> ./x.wasm32.wasm). Omit
+        \\                         for a single legacy component.wasm.
         \\  --language <lang>      Source language (optional).
         \\  --version <semver>     Manifest version (optional).
         \\  --api-version <ver>    apiVersion (default qubepods.dev/v0.1).
@@ -1876,6 +1885,13 @@ fn podWizard(gpa: std.mem.Allocator, io: std.Io, name_default: ?[]const u8) !Pod
     const wit_package = try prompt(gpa, io, r, "component.wit.package", witpkg_def);
 
     const wit_world = try prompt(gpa, io, r, "component.wit.world", name);
+
+    const addr_raw = try prompt(gpa, io, r, "address spaces (optional, e.g. wasm32,wasm64)", null);
+    const addr: ?[]const u8 = if (addr_raw.len == 0) blk: {
+        gpa.free(addr_raw);
+        break :blk null;
+    } else addr_raw;
+
     const language_raw = try prompt(gpa, io, r, "component.language (optional)", null);
     const language: ?[]const u8 = if (language_raw.len == 0) blk: {
         gpa.free(language_raw);
@@ -1901,6 +1917,7 @@ fn podWizard(gpa: std.mem.Allocator, io: std.Io, name_default: ?[]const u8) !Pod
         .version = null,
         .language = language,
         .wasm = wasm,
+        .addr = addr,
         .wit_package = wit_package,
         .wit_world = wit_world,
         .http_route = http_route,
@@ -1916,9 +1933,17 @@ fn freePodConfig(gpa: std.mem.Allocator, cfg: PodConfig) void {
     gpa.free(cfg.wasm);
     gpa.free(cfg.wit_package);
     gpa.free(cfg.wit_world);
+    if (cfg.addr) |a| gpa.free(a);
     if (cfg.language) |l| gpa.free(l);
     if (cfg.http_route) |r| gpa.free(r);
     if (cfg.assets_dir) |d| gpa.free(d);
+}
+
+/// Per-address-space wasm path for a `variants` entry: insert `.<addr>` before
+/// the `.wasm` extension of the base path (`./dist/r.wasm` -> `./dist/r.wasm32.wasm`).
+fn variantWasmPath(gpa: std.mem.Allocator, wasm: []const u8, addr: []const u8) ![]u8 {
+    const base = if (std.mem.endsWith(u8, wasm, ".wasm")) wasm[0 .. wasm.len - ".wasm".len] else wasm;
+    return std.fmt.allocPrint(gpa, "{s}.{s}.wasm", .{ base, addr });
 }
 
 fn buildPodManifest(gpa: std.mem.Allocator, cfg: PodConfig) ![]u8 {
@@ -1937,11 +1962,29 @@ fn buildPodManifest(gpa: std.mem.Allocator, cfg: PodConfig) ![]u8 {
     if (cfg.language) |l| {
         if (l.len > 0) try out.print(gpa, "    \"language\": \"{s}\",\n", .{l});
     }
-    try out.print(gpa, "    \"wasm\": \"{s}\",\n", .{cfg.wasm});
-    try out.appendSlice(gpa, "    \"wit\": {\n");
-    try out.print(gpa, "      \"package\": \"{s}\",\n", .{cfg.wit_package});
-    try out.print(gpa, "      \"world\": \"{s}\",\n", .{cfg.wit_world});
-    try out.appendSlice(gpa, "    },\n  },\n");
+    if (cfg.addr) |addr_spec| {
+        // One wasm build per declared address space.
+        try out.appendSlice(gpa, "    \"wit\": {\n");
+        try out.print(gpa, "      \"package\": \"{s}\",\n", .{cfg.wit_package});
+        try out.print(gpa, "      \"world\": \"{s}\",\n", .{cfg.wit_world});
+        try out.appendSlice(gpa, "    },\n");
+        try out.appendSlice(gpa, "    \"variants\": {\n");
+        var it = std.mem.splitScalar(u8, addr_spec, ',');
+        while (it.next()) |tok_raw| {
+            const tok = std.mem.trim(u8, tok_raw, " ");
+            if (tok.len == 0) continue;
+            const vpath = try variantWasmPath(gpa, cfg.wasm, tok);
+            defer gpa.free(vpath);
+            try out.print(gpa, "      \"{s}\": {{ \"wasm\": \"{s}\" }},\n", .{ tok, vpath });
+        }
+        try out.appendSlice(gpa, "    },\n  },\n");
+    } else {
+        try out.print(gpa, "    \"wasm\": \"{s}\",\n", .{cfg.wasm});
+        try out.appendSlice(gpa, "    \"wit\": {\n");
+        try out.print(gpa, "      \"package\": \"{s}\",\n", .{cfg.wit_package});
+        try out.print(gpa, "      \"world\": \"{s}\",\n", .{cfg.wit_world});
+        try out.appendSlice(gpa, "    },\n  },\n");
+    }
     if (cfg.http_route) |r| {
         if (r.len > 0) {
             try out.appendSlice(gpa, "\n  \"exports\": {\n    \"http\": {\n");
@@ -1970,6 +2013,23 @@ fn scaffoldPod(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: PodConf
     if (cfg.name.len == 0 or cfg.wasm.len == 0 or cfg.wit_package.len == 0 or cfg.wit_world.len == 0) {
         try writeStderr(io, "qube pod: name, --wasm, --wit-package and --wit-world are all required\n");
         std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+    if (cfg.addr) |addr_spec| {
+        var it = std.mem.splitScalar(u8, addr_spec, ',');
+        var n: usize = 0;
+        while (it.next()) |tok_raw| {
+            const tok = std.mem.trim(u8, tok_raw, " ");
+            if (tok.len == 0) continue;
+            if (!std.mem.eql(u8, tok, "wasm32") and !std.mem.eql(u8, tok, "wasm64")) {
+                try printStderr(io, "qube pod: --addr must be wasm32 or wasm64 (got '{s}')\n", .{tok});
+                std.process.exit(@intFromEnum(ExitCode.input));
+            }
+            n += 1;
+        }
+        if (n == 0) {
+            try writeStderr(io, "qube pod: --addr needs at least one of wasm32, wasm64\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
     }
 
     try std.Io.Dir.cwd().createDirPath(io, dir);
@@ -2018,18 +2078,22 @@ fn stripDotSlash(s: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, s, "./")) s[2..] else s;
 }
 
-// Stage the manifest, the wasm (at its manifest-relative path), and the asset
-// tree, then zip them at the archive root (no wrapping folder). OUT is absolute
-// so the trailing `zip` (run from $STAGE) writes to the right place.
+// Stage the manifest, every component wasm (each at its manifest-relative path),
+// and the asset tree, then zip them at the archive root (no wrapping folder).
+// OUT is absolute so the trailing `zip` (run from $STAGE) writes to the right
+// place. Wasm paths are passed as trailing args so a dual-variant qube ships
+// both its wasm32 and wasm64 build.
 const pod_pack_script =
     \\set -e
-    \\PROJECT="$1"; OUT="$2"; WASM="$3"; ASSETS="$4"
+    \\PROJECT="$1"; OUT="$2"; ASSETS="$3"; shift 3
     \\STAGE="$(mktemp -d)"
     \\mkdir -p "$(dirname "$OUT")"
     \\cd "$PROJECT"
     \\cp qubepod.jsonc "$STAGE/qubepod.jsonc"
-    \\mkdir -p "$STAGE/$(dirname "$WASM")"
-    \\cp "$WASM" "$STAGE/$WASM"
+    \\for WASM in "$@"; do
+    \\  mkdir -p "$STAGE/$(dirname "$WASM")"
+    \\  cp "$WASM" "$STAGE/$WASM"
+    \\done
     \\if [ -n "$ASSETS" ] && [ -d "$ASSETS" ]; then
     \\  mkdir -p "$STAGE/$ASSETS"
     \\  cp -R "$ASSETS/." "$STAGE/$ASSETS/"
@@ -2099,14 +2163,32 @@ fn cmdPodDeploy(
         try writeStderr(io, "qube pod deploy: manifest has no \"name\" field\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
-    const wasm_rel = extractStringField(raw, "\"wasm\"") orelse {
-        try writeStderr(io, "qube pod deploy: manifest has no component.wasm\n");
+
+    // Component wasm path(s): a `variants` map ships one per address space
+    // (wasm32 / wasm64); a legacy manifest has a single `component.wasm`.
+    var wasm_norms: std.ArrayList([]const u8) = .empty;
+    defer wasm_norms.deinit(gpa);
+    if (std.mem.indexOf(u8, raw, "\"variants\"") != null) {
+        for ([_][]const u8{ "\"wasm32\"", "\"wasm64\"" }) |key| {
+            if (std.mem.indexOf(u8, raw, key)) |k| {
+                if (extractStringField(raw[k..], "\"wasm\"")) |p| {
+                    try wasm_norms.append(gpa, stripDotSlash(p));
+                }
+            }
+        }
+        if (wasm_norms.items.len == 0) {
+            try writeStderr(io, "qube pod deploy: component.variants has no wasm32/wasm64 build\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
+    } else if (extractStringField(raw, "\"wasm\"")) |wasm_rel| {
+        try wasm_norms.append(gpa, stripDotSlash(wasm_rel));
+    } else {
+        try writeStderr(io, "qube pod deploy: manifest has no component.wasm or component.variants\n");
         std.process.exit(@intFromEnum(ExitCode.input));
-    };
+    }
+
     // Optional asset tree: assets.directory is the only "directory" key.
     const assets_dir_opt = extractStringField(raw, "\"directory\"");
-
-    const wasm_norm = stripDotSlash(wasm_rel);
     const assets_norm = if (assets_dir_opt) |d| stripDotSlash(d) else "";
 
     // Token: --token wins, else QUBEPODS_TOKEN (both borrowed; no free).
@@ -2122,8 +2204,12 @@ fn cmdPodDeploy(
     defer gpa.free(out_zip_full);
 
     {
-        const argv = [_][]const u8{ "sh", "-c", pod_pack_script, "sh", cwd_path, out_zip_full, wasm_norm, assets_norm };
-        const term = try spawnInherit(io, &argv);
+        // sh -c <script> sh PROJECT OUT ASSETS <wasm...>
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.appendSlice(gpa, &.{ "sh", "-c", pod_pack_script, "sh", cwd_path, out_zip_full, assets_norm });
+        try argv.appendSlice(gpa, wasm_norms.items);
+        const term = try spawnInherit(io, argv.items);
         if (termCode(term) != 0) {
             try writeStderr(io, "qube pod deploy: packing the bundle failed\n");
             std.process.exit(@intFromEnum(ExitCode.internal));
@@ -2169,6 +2255,7 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
     var name_arg: ?[]const u8 = null;
     var project: ?[]const u8 = null;
     var wasm: ?[]const u8 = null;
+    var addr: ?[]const u8 = null;
     var wit_package: ?[]const u8 = null;
     var wit_world: ?[]const u8 = null;
     var language: ?[]const u8 = null;
@@ -2193,6 +2280,9 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
         } else if (std.mem.eql(u8, a, "--wasm")) {
             any_flag = true;
             wasm = try flagValue(io, args_it, "--wasm");
+        } else if (std.mem.eql(u8, a, "--addr")) {
+            any_flag = true;
+            addr = try flagValue(io, args_it, "--addr");
         } else if (std.mem.eql(u8, a, "--wit-package")) {
             any_flag = true;
             wit_package = try flagValue(io, args_it, "--wit-package");
@@ -2254,6 +2344,7 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
                 try writeStderr(io, "qube pod: --wasm is required\n");
                 std.process.exit(@intFromEnum(ExitCode.usage));
             },
+            .addr = addr,
             .wit_package = wit_package orelse {
                 try writeStderr(io, "qube pod: --wit-package is required\n");
                 std.process.exit(@intFromEnum(ExitCode.usage));
