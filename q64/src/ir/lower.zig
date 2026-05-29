@@ -126,7 +126,16 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .global_set => |gs| return mk(ctx.a, .void, .{ .global_set = .{ .idx = gs.idx, .value = try lowerExpr(ctx, gs.value) } }),
         .str_let => |sl| return mk(ctx.a, .void, .{ .str_bind = .{ .ptr_idx = sl.ptr_idx, .len_idx = sl.len_idx, .value = try lowerStrExpr(ctx, sl.value) } }),
         .let => |l| return mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } }),
-        else => unreachable, // main has no value/tail statements
+        // Void control flow — shared by `main` and function-body setup
+        // statements (a non-tail `if`/`while`/`loop`/assign/break/continue).
+        .assign => |a| return mk(ctx.a, .void, .{ .local_set = .{ .idx = a.idx, .value = try lowerExpr(ctx, a.value) } }),
+        .while_ => |w| return mk(ctx.a, .void, .{ .while_ = .{ .cond = try lowerCond(ctx, w.cond), .body = try lowerIntBlock(ctx, w.body, null) } }),
+        .loop_ => return lowerLoop(ctx, s.loop_),
+        .if_ => |iff| return lowerVoidIf(ctx, iff),
+        .ret => |e| return mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null }),
+        .brk => return mk(ctx.a, .void, .br),
+        .cont => return mk(ctx.a, .void, .br_cont),
+        else => return error.Unsupported, // a value/tail-only statement (e.g. bare expr)
     }
 }
 
@@ -244,18 +253,10 @@ fn lowerIntBlock(ctx: Ctx, blk: *const hir.Stmt, value_ty: ?mir.ValueType) Error
     return mk(ctx.a, vty, .{ .block = try items.toOwnedSlice(ctx.a) });
 }
 
+/// Lower a non-tail (void) statement. Shared with `lowerEntryStmt`, which
+/// covers the same control-flow set plus `main`'s host statements.
 fn lowerSetupStmt(ctx: Ctx, s: *const hir.Stmt, items: *std.ArrayList(*mir.Inst)) Error!void {
-    switch (s.*) {
-        .let => |l| try items.append(ctx.a, try mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } })),
-        .assign => |as| try items.append(ctx.a, try mk(ctx.a, .void, .{ .local_set = .{ .idx = as.idx, .value = try lowerExpr(ctx, as.value) } })),
-        .while_ => |w| try items.append(ctx.a, try mk(ctx.a, .void, .{ .while_ = .{ .cond = try lowerCond(ctx, w.cond), .body = try lowerIntBlock(ctx, w.body, null) } })),
-        .loop_ => try items.append(ctx.a, try lowerLoop(ctx, s.loop_)),
-        .if_ => |iff| try items.append(ctx.a, try lowerVoidIf(ctx, iff)),
-        .ret => |e| try items.append(ctx.a, try mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null })),
-        .brk => try items.append(ctx.a, try mk(ctx.a, .void, .br)),
-        .cont => try items.append(ctx.a, try mk(ctx.a, .void, .br_cont)),
-        else => return error.Unsupported, // a non-tail bare expr has no value consumer
-    }
+    try items.append(ctx.a, try lowerEntryStmt(ctx, s));
 }
 
 fn lowerLoop(ctx: Ctx, body_blk: *const hir.Stmt) Error!*mir.Inst {

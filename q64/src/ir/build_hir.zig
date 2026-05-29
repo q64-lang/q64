@@ -177,26 +177,45 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
 
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
     var it = body.statements();
-    while (it.next()) |stmt| switch (stmt) {
+    while (it.next()) |stmt| try buildMainStmt(b, stmt, &mscope, rt, &stmts);
+
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
+    b.funcs.items[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public, .locals = try b.main_locals.toOwnedSlice(b.a) };
+    b.entry = 0;
+
+    try buildScreenFuncs(b, sf);
+}
+
+/// Build one statement of `main`'s body, appending 0+ HIR statements to `out`.
+/// Unlike a function body, `main` statements can write the host (`env.out`,
+/// `qview.*`) and have no value/tail — so this handles the host shapes *and*
+/// control flow, recursing into `while`/`if` bodies via `buildMainBlock`.
+fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    switch (stmt) {
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
             const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
-            // A `let` initializer that const-folds (incl. a const-bodied call,
-            // e.g. `let v = version()`) becomes a compile-time binding.
-            b.eval.fold_calls = true;
-            const folded = try tryConst(b, init_expr);
-            b.eval.fold_calls = false;
-            if (folded) |bytes| {
-                try b.eval.bind(nm.text, bytes);
-                continue;
+            // An immutable `let` whose initializer const-folds (incl. a
+            // const-bodied call, e.g. `let v = version()`) becomes a
+            // compile-time binding. A `var` is mutable, so it must stay a real
+            // runtime local even when its initializer is constant.
+            if (!ls.isVar()) {
+                b.eval.fold_calls = true;
+                const folded = try tryConst(b, init_expr);
+                b.eval.fold_calls = false;
+                if (folded) |bytes| {
+                    try b.eval.bind(nm.text, bytes);
+                    return;
+                }
             }
             // Otherwise a runtime str binding (`let g = shout("hi")`): build
             // the str value and store its (ptr, len) into two new locals.
             if (init_expr == .string_lit or (try isStrCall(b, init_expr))) {
                 const value = if (init_expr == .string_lit)
-                    try buildConcat(b, init_expr.string_lit, &mscope, false, rt)
+                    try buildConcat(b, init_expr.string_lit, scope, false, rt)
                 else
-                    try buildStrExpr(b, init_expr, &mscope, rt);
+                    try buildStrExpr(b, init_expr, scope, rt);
                 const ptr_idx: u32 = @intCast(b.main_locals.items.len);
                 // The (ptr, len) backing locals are address-width pointers
                 // (i32 on wasm32, i64 on wasm64) — `.ptr`, not `.i64`.
@@ -205,24 +224,24 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 try b.main_rt.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
-                try stmts.append(b.a, st);
+                try out.append(b.a, st);
             } else {
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
                 // bool (`let even = n % 2 == 0`, `var flag = true`). A bool
                 // binding takes one slot too — its value is an i32 0/1.
-                const lty: hir.Type = if (try exprIsBool(b, init_expr, &mscope)) .bool else .i64;
+                const lty: hir.Type = if (try exprIsBool(b, init_expr, scope)) .bool else .i64;
                 // Build the initializer first so it can't see its own name,
-                // then allocate a single local and register in mscope so
-                // later expressions can resolve it. The local index is the
-                // current size of `main_locals` (str bindings take two slots
-                // each, i64/bool bindings take one — the same shared index space).
-                mscope.next_idx = @intCast(b.main_locals.items.len);
-                const value = try buildIntExpr(b, init_expr, &mscope);
-                const idx = try mscope.declare(nm.text, ls.isVar(), lty);
+                // then allocate a single local and register in scope so later
+                // expressions can resolve it. The local index is the current
+                // size of `main_locals` (str bindings take two slots each,
+                // i64/bool bindings take one — the same shared index space).
+                scope.next_idx = @intCast(b.main_locals.items.len);
+                const value = try buildIntExpr(b, init_expr, scope);
+                const idx = try scope.declare(nm.text, ls.isVar(), lty);
                 try b.main_locals.append(b.a, lty);
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = value } };
-                try stmts.append(b.a, st);
+                try out.append(b.a, st);
             }
         },
         .expr_stmt => |es| {
@@ -236,11 +255,11 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
             if (try hostFaceName(b, call)) |fname| {
                 var args: std.ArrayList(*hir.Expr) = .empty;
                 var ait = call.args();
-                while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, &mscope));
+                while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
-                try stmts.append(b.a, st);
-                continue;
+                try out.append(b.a, st);
+                return;
             }
             if (!isEnvOut(b.a, call)) return reject(b, .unsupported_call);
             const arg = firstArg(call) orelse return error.Unsupported;
@@ -261,31 +280,117 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 // A string literal with interpolation. If it folds entirely to
                 // a constant (e.g. only untyped fold-only helpers), emit a
                 // folded `host_out`; otherwise a runtime concat.
-                const v = try buildConcat(b, arg.string_lit, &mscope, false, rt);
+                const v = try buildConcat(b, arg.string_lit, scope, false, rt);
                 st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
             } else if (try isStrCall(b, arg)) {
                 // A real call to a str-returning function.
-                st.* = .{ .host_out_str = try buildStrExpr(b, arg, &mscope, rt) };
-            } else if (try exprIsBool(b, arg, &mscope)) {
+                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
+            } else if (try exprIsBool(b, arg, scope)) {
                 // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
                 // binding, or a `-> bool` call. Printed as "true" / "false".
-                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, &mscope) };
+                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
             } else {
                 // Otherwise an i64 expression (a call to an i64 function).
-                const e = try buildIntExpr(b, arg, &mscope);
+                const e = try buildIntExpr(b, arg, scope);
                 st.* = .{ .host_out_int = e };
             }
-            try stmts.append(b.a, st);
+            try out.append(b.a, st);
+        },
+        .assign_stmt => |as| {
+            const tgt = as.target() orelse return error.Unsupported;
+            const tpath = switch (tgt) {
+                .path => |p| p,
+                else => return error.Unsupported,
+            };
+            const tname = try tpath.text(b.a);
+            defer b.a.free(tname);
+            const op = as.op() orelse return error.Unsupported;
+            const rhs_ast = as.value() orelse return error.Unsupported;
+            const st = try b.a.create(hir.Stmt);
+            if (scope.find(tname)) |loc| {
+                // Local reassignment (`x = …`, `x += …`). A bool is not an int:
+                // a plain `=` must match the binding's type; compound ops are
+                // arithmetic (i64 only).
+                if (!loc.mutable) return reject(b, .immutable_assign);
+                const rhs_is_bool = try exprIsBool(b, rhs_ast, scope);
+                if (op.kind == .EQ) {
+                    if ((loc.ty == .bool) != rhs_is_bool) return error.Unsupported;
+                } else if (loc.ty != .i64) {
+                    return error.Unsupported;
+                }
+                const rhs = try buildIntExpr(b, rhs_ast, scope);
+                const value = if (op.kind == .EQ) rhs else blk: {
+                    const k = compoundOp(op) orelse return error.Unsupported;
+                    const lhs = try b.a.create(hir.Expr);
+                    lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                    const bx = try b.a.create(hir.Expr);
+                    bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
+                    break :blk bx;
+                };
+                st.* = .{ .assign = .{ .idx = loc.idx, .value = value } };
+            } else if (b.globals.get(tname)) |gi| {
+                // A module-level `state` global (`count = count + 1`).
+                if (op.kind != .EQ) return error.Unsupported;
+                st.* = .{ .global_set = .{ .idx = gi, .value = try buildIntExpr(b, rhs_ast, scope) } };
+            } else return error.Unsupported;
+            try out.append(b.a, st);
+        },
+        .while_stmt => |ws| {
+            const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, scope);
+            const wbody = try buildMainBlock(b, ws.body() orelse return error.Unsupported, scope, rt);
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .while_ = .{ .cond = cond, .body = wbody } };
+            try out.append(b.a, st);
+        },
+        .if_stmt => |is| try out.append(b.a, try buildMainIfNode(b, is, scope, rt)),
+        .loop_stmt => |lp| {
+            const lbody = try buildMainBlock(b, lp.body() orelse return error.Unsupported, scope, rt);
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .loop_ = lbody };
+            try out.append(b.a, st);
+        },
+        .break_stmt => |bs| {
+            if (bs.value() != null) return error.Unsupported; // value-break not supported
+            const st = try b.a.create(hir.Stmt);
+            st.* = .brk;
+            try out.append(b.a, st);
+        },
+        .continue_stmt => {
+            const st = try b.a.create(hir.Stmt);
+            st.* = .cont;
+            try out.append(b.a, st);
         },
         else => return error.Unsupported,
-    };
+    }
+}
 
-    const block = try b.a.create(hir.Stmt);
-    block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
-    b.funcs.items[0] = .{ .name = "main", .ret = .void, .body = block, .visibility = .public, .locals = try b.main_locals.toOwnedSlice(b.a) };
-    b.entry = 0;
+/// Build a `{ … }` block of `main` statements into one HIR block.
+fn buildMainBlock(b: *Builder, block: ast.Block, scope: *Scope, rt: *RtMap) BuildError!*hir.Stmt {
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    var it = block.statements();
+    while (it.next()) |stmt| try buildMainStmt(b, stmt, scope, rt, &items);
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return out;
+}
 
-    try buildScreenFuncs(b, sf);
+/// The `main` analogue of `buildIfStmtNode`: an `if`/`else(-if)` whose bodies
+/// can contain host statements. An `else if` nests as a one-statement block.
+fn buildMainIfNode(b: *Builder, is: ast.IfStmt, scope: *Scope, rt: *RtMap) BuildError!*hir.Stmt {
+    const cond = try buildIntExpr(b, is.condition() orelse return error.Unsupported, scope);
+    const then_ = try buildMainBlock(b, is.thenBody() orelse return error.Unsupported, scope, rt);
+    const else_: ?*hir.Stmt = if (is.elseIf()) |eif| blk: {
+        const inner = try buildMainIfNode(b, eif, scope, rt);
+        const wrap = try b.a.create(hir.Stmt);
+        wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+        break :blk wrap;
+    } else if (is.elseBody()) |eb|
+        try buildMainBlock(b, eb, scope, rt)
+    else
+        null;
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
+    return out;
 }
 
 /// Build every non-main, void-returning top-level `fn` as an exported screen
@@ -411,16 +516,16 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
 
     const owned = try b.a.dupe(u8, name);
 
-    // Parameters (all i64) occupy local indices 0..n; seed the body scope.
+    // Parameters (i64 or bool) occupy local indices 0..n; seed the body scope.
     var scope = Scope{ .a = b.a };
     var params: std.ArrayList(hir.Param) = .empty;
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
-            if (!(try paramIsI64(b.a, p))) return error.Unsupported;
+            const pty: hir.Type = if (try paramIsBool(b.a, p)) .bool else if (try paramIsI64(b.a, p)) .i64 else return error.Unsupported;
             const pn = (p.name() orelse return error.Unsupported).text;
-            _ = try scope.declare(pn, false, .i64);
-            try params.append(b.a, .{ .name = pn, .ty = .i64 });
+            _ = try scope.declare(pn, false, pty);
+            try params.append(b.a, .{ .name = pn, .ty = pty });
         }
     }
     scope.n_params = @intCast(params.items.len);
@@ -824,6 +929,11 @@ fn paramIsStr(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
     return typeNamed(a, te, "str");
 }
 
+fn paramIsBool(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
+    const te = p.type_() orelse return false;
+    return typeNamed(a, te, "bool");
+}
+
 /// Name → local-index resolution for a function body. Append-only with a
 /// backward scan (latest declaration wins), mirroring the legacy IntScope:
 /// parameters first, then in-body `let`/`var` in declaration order. `ty`
@@ -976,7 +1086,12 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
-            } else return error.Unsupported;
+            } else if (b.eval.evalInt(expr)) |v| {
+                // A compile-time `let` binding (`let n = 7`) used in a runtime
+                // expression (e.g. an `if`/`while` condition) materializes as
+                // its constant value.
+                out.* = .{ .int_const = v };
+            } else |_| return error.Unsupported;
         },
         .unary => |u| {
             const kind = unKind(u.op() orelse return error.Unsupported) orelse return error.Unsupported;
@@ -1010,10 +1125,22 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 .i64, .bool => {},
                 else => return reject(b, .unsupported_call),
             }
+            // Snapshot which parameters are bool before building the args — a
+            // bool is not an int, so each arg's kind must match its parameter.
+            // (Building an arg may register a new callee and grow `b.funcs`,
+            // so we can't hold a slice into it across the loop.)
+            const np = b.funcs.items[id].params.len;
+            const param_is_bool = try b.a.alloc(bool, np);
+            for (b.funcs.items[id].params, 0..) |p, k| param_is_bool[k] = (p.ty == .bool);
+
             var args: std.ArrayList(*hir.Expr) = .empty;
             var ait = cc.args();
-            while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
-            if (args.items.len != b.funcs.items[id].params.len) return reject(b, .unsupported_call);
+            var ai: usize = 0;
+            while (ait.next()) |a| : (ai += 1) {
+                if (ai < np and param_is_bool[ai] != (try exprIsBool(b, a, scope))) return reject(b, .unsupported_call);
+                try args.append(b.a, try buildIntExpr(b, a, scope));
+            }
+            if (args.items.len != np) return reject(b, .unsupported_call);
             out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
         },
         else => return error.Unsupported,
@@ -1524,4 +1651,50 @@ test "tryBuild: a bool is not an int — assigning an int to a bool is rejected"
     const mod = try buildFromSource(testing.allocator,
         "fn main {\n env.out(bad())\n}\n", tr.resolver());
     try testing.expect(mod == null); // unsupported: no int↔bool coercion
+}
+
+test "tryBuild: a bool parameter is accepted; an int arg to it is rejected" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn pick(b: bool, n: i64) -> i64 { if b { n } else { 0 } }\n");
+
+    var ok = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(pick(true, 42))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    ok.deinit();
+
+    // `pick(5, 42)` passes an int where a bool param is expected → rejected.
+    const bad = try buildFromSource(testing.allocator,
+        "fn main {\n env.out(pick(5, 42))\n}\n", tr.resolver());
+    if (bad) |*m| {
+        var mm = m.*;
+        mm.deinit();
+        return error.TestUnexpectedResult; // should not have built
+    }
+}
+
+test "tryBuild: main supports reassignment + while + if (with host bodies)" {
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var i = 0\n while i < 3 { env.out(i)\n i = i + 1 }\n if i == 3 { env.out(\"done\") }\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "assign") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "if ") != null);
+    // env.out inside the loop body is a real host write, not folded away.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null);
+}
+
+test "tryBuild: a `var` with a constant initializer stays a runtime local" {
+    // `var` is mutable, so it must NOT const-fold (unlike an immutable `let`).
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var n = 0\n n = n + 1\n env.out(n)\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "let") != null); // a real local, not folded
+    try testing.expect(std.mem.indexOf(u8, dump, "assign") != null);
 }
