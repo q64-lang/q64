@@ -114,6 +114,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
     switch (e.*) {
         .str_const => |b| try app(gpa, out, "\"{s}\"", .{b}),
         .int_const => |v| try app(gpa, out, "{d}", .{v}),
+        .bool_const => |v| try app(gpa, out, "{s}", .{if (v) "true" else "false"}),
         .local => |i| try app(gpa, out, "local#{d}", .{i}),
         .global_get => |i| try app(gpa, out, "global#{d}", .{i}),
         .un => |u| {
