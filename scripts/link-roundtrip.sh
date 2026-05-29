@@ -502,4 +502,36 @@ if [[ "$flow_out" != "$flow_expected" ]]; then
 fi
 echo "    ok: break/continue/return/loop -> 3 / 7 / 1 / 0 / 25 / count_to_sum(10)=4"
 
+# ---------------------------------------------------------------------------
+# wasm32 (the WebKit/iPad baseline, no Memory64). The const-string path emits a
+# genuine 32-bit module (i32 data offset + i32 env.out) and runs through the
+# host's address-space-agnostic env.out (reads the i32 ptr/len it introspected
+# from the import). The runtime string/arena ABI is still i64-baked, so it
+# rejects honestly (the remaining Path-B follow-up).
+echo "==> wasm32: const string emits a 32-bit module and runs"
+w32_app="$tmp/w32.q"
+w32_wasm="$tmp/w32.wasm"
+cat > "$w32_app" <<'Q64'
+fn main {
+    let n = 6 * 7
+    env.out("Hello from wasm32 ({n})")
+}
+Q64
+"$Q64_BIN" emit "$w32_app" "$w32_wasm" --addr wasm32
+w32_out="$("$HOST_BIN" "$w32_wasm")"
+if [[ "$w32_out" != "Hello from wasm32 (42)" ]]; then
+    echo "FAIL: wasm32 const-string output mismatch" >&2
+    printf "  expected: %q\n" "Hello from wasm32 (42)" >&2
+    printf "  actual:   %q\n" "$w32_out" >&2
+    exit 1
+fi
+echo "    ok: wasm32 const string -> $w32_out"
+
+echo "==> wasm32: runtime string ABI rejects (Path B not yet ported)"
+if "$Q64_BIN" emit "$intfn_app" "$tmp/intfn32.wasm" --addr wasm32 --module "dev.q64.intlib=$intfn_lib" 2>/dev/null; then
+    echo "FAIL: wasm32 unexpectedly accepted the runtime string/arena ABI" >&2
+    exit 1
+fi
+echo "    ok: wasm32 rejects the runtime string/arena ABI"
+
 echo "PASS: $qube_out"

@@ -280,33 +280,37 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
     c.BinaryenModuleSetFeatures(module, features);
 
-    // Path A (POC): wasm32 supports the integer/import subset. The string/arena
-    // ABI still uses i64 addresses, which are invalid on a 32-bit memory, so we
-    // refuse rather than emit a broken module — the honest gap until the i32
-    // pointer conversion lands (Path B).
+    const mem64 = addr.memory64();
+    const i64_type = c.BinaryenTypeInt64();
+    const i32_type = c.BinaryenTypeInt32();
+    const none_type = c.BinaryenTypeNone();
+    // A pointer / length is i64 on wasm64 (Memory64) and i32 on wasm32. The
+    // string `(ptr, len)` pair, env.out's params, the data-segment offset, and
+    // the scope arena all follow this width; integer *values* stay i64 either
+    // way (q64 ints are i64 — only memory addresses are width-sensitive).
+    const ptr_type = if (mem64) i64_type else i32_type;
+
+    // wasm32 (the WebKit/iPad baseline): the const-string path is supported —
+    // `host_out_const` reads bytes straight from a 32-bit data segment at an
+    // i32 offset. The runtime string/arena ABI (concat, int/str formatting,
+    // str values/params/bindings) is still i64-pointer-baked, so reject a
+    // program that needs it rather than emit a broken module (the Path-B
+    // follow-up). The integer/import subset (qview host calls, `state`
+    // globals, i64 arithmetic) carries no string ABI and runs on wasm32.
     if (addr == .wasm32) {
-        var needs_mem = m.data.len > 0;
         for (m.funcs) |f| {
             const inst = switch (f.body) {
                 .structured => |x| x,
                 .cfg => return Error.CfgUnsupported,
             };
-            if (bodyHasOut(inst, true)) needs_mem = true;
-            var sc2 = Scratch{};
-            scanScratch(inst, &sc2);
-            if (sc2.has_concat) needs_mem = true;
+            if (usesStrAbi(inst)) return Error.Wasm32StringAbiUnsupported;
         }
-        if (needs_mem) return Error.Wasm32StringAbiUnsupported;
     }
-    const mem64 = addr.memory64();
 
-    const i64_type = c.BinaryenTypeInt64();
-    const i32_type = c.BinaryenTypeInt32();
-    const none_type = c.BinaryenTypeNone();
     var pair = [_]c.BinaryenType{ i64_type, i64_type };
     const pair_type = c.BinaryenTypeCreate(&pair, pair.len);
 
-    var env_out_params = [_]c.BinaryenType{ i64_type, i64_type };
+    var env_out_params = [_]c.BinaryenType{ ptr_type, ptr_type };
     const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
     c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
 
@@ -317,7 +321,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var seg_datas = [_][*c]const u8{m.data.ptr};
         var seg_passives = [_]bool{false};
         var seg_offsets = [_]c.BinaryenExpressionRef{
-            c.BinaryenConst(module, c.BinaryenLiteralInt64(0)),
+            if (mem64)
+                c.BinaryenConst(module, c.BinaryenLiteralInt64(0))
+            else
+                c.BinaryenConst(module, c.BinaryenLiteralInt32(0)),
         };
         var seg_sizes = [_]c.BinaryenIndex{@intCast(m.data.len)};
         c.BinaryenSetMemory(module, 1, 1, "memory", null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, mem64, "0");
@@ -416,6 +423,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .funcs = m.funcs,
             .i64_type = i64_type,
             .i32_type = i32_type,
+            .ptr_type = ptr_type,
             .none_type = none_type,
             .pair_type = pair_type,
             .pair_idx = base,
@@ -531,6 +539,39 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
     };
 }
 
+/// True if the tree uses the runtime string/arena ABI — the i64-pointer path
+/// not yet ported to wasm32: int/str host-out, runtime concat, or any `str`
+/// value (a const-str value, a parameter, a binding, a bind, or int→str
+/// formatting). A pure `host_out_const` of a constant string does NOT (it
+/// reads bytes straight from the data segment), nor do qview host calls,
+/// `state` globals, or i64 arithmetic. Used to gate wasm32 emission.
+fn usesStrAbi(inst: *const ir.mir.Inst) bool {
+    return switch (inst.op) {
+        .host_out_int, .host_out_str, .str_concat, .str_const_val, .str_param, .str_binding, .str_bind, .fmt_int_to_str => true,
+        .block => |items| {
+            for (items) |ch| if (usesStrAbi(ch)) return true;
+            return false;
+        },
+        .local_set => |ls| usesStrAbi(ls.value),
+        .bin => |b| usesStrAbi(b.lhs) or usesStrAbi(b.rhs),
+        .un => |u| usesStrAbi(u.operand),
+        .call => |cl| {
+            for (cl.args) |a| if (usesStrAbi(a)) return true;
+            return false;
+        },
+        .ret => |v| if (v) |val| usesStrAbi(val) else false,
+        .if_ => |iff| usesStrAbi(iff.cond) or usesStrAbi(iff.then_) or (iff.else_ != null and usesStrAbi(iff.else_.?)),
+        .while_ => |w| usesStrAbi(w.cond) or usesStrAbi(w.body),
+        .loop => |body| usesStrAbi(body),
+        .host_call => |hc| {
+            for (hc.args) |a| if (usesStrAbi(a)) return true;
+            return false;
+        },
+        .global_set => |gs| usesStrAbi(gs.value),
+        .host_out_const, .const_i64, .local_get, .global_get, .br, .br_cont, .@"unreachable" => false,
+    };
+}
+
 /// Per-function scratch needs, gathered in one pass: whether it writes an i64
 /// or str value (needs the pair scratch local), whether it concatenates (needs
 /// the arena buf/off/len), and the most call-result tuple slots any single
@@ -613,6 +654,8 @@ const Lowerer = struct {
     funcs: []const ir.mir.Func,
     i64_type: c.BinaryenType,
     i32_type: c.BinaryenType,
+    /// Pointer/length width: `i32_type` on wasm32, `i64_type` on wasm64.
+    ptr_type: c.BinaryenType,
     none_type: c.BinaryenType,
     pair_type: c.BinaryenType,
     /// The pair scratch local (host_out extraction) — also the base of the
@@ -793,10 +836,19 @@ const Lowerer = struct {
 
     fn envOut(self: *Lowerer, off: i64, len: i64) c.BinaryenExpressionRef {
         var args = [_]c.BinaryenExpressionRef{
-            c.BinaryenConst(self.module, c.BinaryenLiteralInt64(off)),
-            c.BinaryenConst(self.module, c.BinaryenLiteralInt64(len)),
+            self.ptrConst(off),
+            self.ptrConst(len),
         };
         return c.BinaryenCall(self.module, "env_out", @ptrCast(&args), args.len, self.none_type);
+    }
+
+    /// A pointer/length constant at the build's address-space width (i32 on
+    /// wasm32, i64 on wasm64).
+    fn ptrConst(self: *Lowerer, v: i64) c.BinaryenExpressionRef {
+        return if (self.ptr_type == self.i32_type)
+            c.BinaryenConst(self.module, c.BinaryenLiteralInt32(@intCast(v)))
+        else
+            c.BinaryenConst(self.module, c.BinaryenLiteralInt64(v));
     }
 
     /// Write a `(ptr, len)` pair value to env.out, then the newline byte:
@@ -1200,6 +1252,29 @@ test "emitFromSource: supports multiple env.out calls" {
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
     try testing.expect(std.mem.indexOf(u8, bytes, "one\n") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "two\n") != null);
+}
+
+test "emitFromSource: a const string emits a valid module on wasm32" {
+    // The const-string path (host_out_const, i32 data offset + i32 env.out) is
+    // supported on the WebKit/iPad baseline. The module validates (emit would
+    // error otherwise) and carries the string bytes + newline in its data.
+    const src = "fn main { env.out(\"hi\") }\n";
+    const bytes = try emitFromSource(testing.allocator, src, "hi.q", &.{}, .wasm32);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "hi\n") != null);
+}
+
+test "emitFromSource: wasm32 rejects the runtime string/arena ABI (Path B)" {
+    // `env.out(double(21))` needs __fmt_i64 + the scope arena, whose pointers
+    // are still i64-baked — an honest Wasm32StringAbiUnsupported until ported.
+    const lib = "pub fn double(n: i64) -> i64 { n + n }\n";
+    const app = "import dev.q64.m.{double}\nfn main { env.out(double(21)) }\n";
+    const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
+    try testing.expectError(
+        Error.Wasm32StringAbiUnsupported,
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm32),
+    );
 }
 
 test "emitFromSource: missing main returns NoMainFunction" {

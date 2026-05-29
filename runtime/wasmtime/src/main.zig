@@ -8,14 +8,17 @@
 //!
 //! v0 ABI it implements (spec/env.md §"Capability faces"):
 //!
-//!   env.out :: (ptr: i64, len: i64) -> ()
+//!   env.out :: (ptr, len) -> ()
 //!     Writes `len` bytes from linear memory starting at `ptr` to
 //!     the host's stdout, verbatim. UTF-8 is the producer contract;
-//!     the host does not validate it. Pointers are i64: q64 targets
-//!     Wasm Memory64 (spec/memory.md).
+//!     the host does not validate it. ptr/len are i64 on wasm64
+//!     (Memory64) and i32 on wasm32 (spec/memory.md §"The platform"):
+//!     the host introspects the module's `env.out` import to define a
+//!     matching func type and reads each arg by its runtime kind, so one
+//!     binary runs modules of either address space.
 //!
 //! The module must export:
-//!   - `memory` — a single 64-bit (Memory64) linear memory.
+//!   - `memory` — a single linear memory (32-bit on wasm32, Memory64 on wasm64).
 //!   - `_start` — a `() -> ()` function the host invokes.
 
 const std = @import("std");
@@ -107,14 +110,20 @@ pub fn main(init: std.process.Init) !void {
     defer c.wasmtime_module_delete(module);
 
     // -------------------------------------------------------------
-    // Linker: define env.out :: (i32, i32) -> ().
+    // Linker: define env.out :: (ptr, len) -> (). q64 emits ptr/len as i64 on
+    // wasm64 (Memory64) and i32 on wasm32, so the host func type must match the
+    // module's import — introspect it. The callback then reads each arg by its
+    // runtime kind, so one host binary runs modules of either address space.
     // -------------------------------------------------------------
+    const env_out_i32 = envOutWantsI32(module);
+
     const linker = c.wasmtime_linker_new(engine) orelse return error.LinkerNewFailed;
     defer c.wasmtime_linker_delete(linker);
 
+    const arg_valkind: c.wasm_valkind_t = if (env_out_i32) c.WASM_I32 else c.WASM_I64;
     var param_types = [_]?*c.wasm_valtype_t{
-        c.wasm_valtype_new(c.WASM_I64),
-        c.wasm_valtype_new(c.WASM_I64),
+        c.wasm_valtype_new(arg_valkind),
+        c.wasm_valtype_new(arg_valkind),
     };
     var params_vec: c.wasm_valtype_vec_t = undefined;
     c.wasm_valtype_vec_new(&params_vec, param_types.len, @ptrCast(&param_types));
@@ -218,10 +227,12 @@ fn envOutCallback(
     _ = results;
     _ = nresults;
 
-    if (nargs != 2) return trap("env.out: expected (i64, i64)");
+    if (nargs != 2) return trap("env.out: expected (ptr, len)");
 
-    const ptr_i64 = args[0].of.i64;
-    const len_i64 = args[1].of.i64;
+    // ptr/len are i32 (wasm32) or i64 (wasm64); read each by its runtime kind
+    // so the host is address-space-agnostic.
+    const ptr_i64 = argAddr(args[0]);
+    const len_i64 = argAddr(args[1]);
     if (ptr_i64 < 0 or len_i64 < 0) return trap("env.out: negative ptr/len");
 
     var memory_item: c.wasmtime_extern_t = undefined;
@@ -248,6 +259,42 @@ fn envOutCallback(
     w.interface.flush() catch return trap("env.out: stdout flush failed");
 
     return null;
+}
+
+/// Read a wasm value as an address, accepting either an i32 (wasm32) or i64
+/// (wasm64) pointer/length and widening to i64.
+fn argAddr(v: c.wasmtime_val_t) i64 {
+    return switch (v.kind) {
+        c.WASMTIME_I32 => v.of.i32,
+        else => v.of.i64,
+    };
+}
+
+/// Inspect the module's imports for `env`/`out` and report whether its first
+/// parameter is i32 (wasm32). The host defines a matching func type. Defaults
+/// to i64 (wasm64) when the import is absent or not a function.
+fn envOutWantsI32(module: ?*c.wasmtime_module_t) bool {
+    var imports: c.wasm_importtype_vec_t = undefined;
+    c.wasmtime_module_imports(module, &imports);
+    defer c.wasm_importtype_vec_delete(&imports);
+    var i: usize = 0;
+    while (i < imports.size) : (i += 1) {
+        const it = imports.data[i] orelse continue;
+        if (!nameEql(c.wasm_importtype_module(it), "env")) continue;
+        if (!nameEql(c.wasm_importtype_name(it), "out")) continue;
+        const ft = c.wasm_externtype_as_functype(@constCast(c.wasm_importtype_type(it))) orelse return false;
+        const ps = c.wasm_functype_params(ft);
+        if (ps.*.size >= 1) return c.wasm_valtype_kind(ps.*.data[0]) == c.WASM_I32;
+        return false;
+    }
+    return false;
+}
+
+/// Compare a `wasm_name_t` (byte vector, not NUL-terminated) to a Zig slice.
+fn nameEql(name: ?*const c.wasm_name_t, s: []const u8) bool {
+    const n = name orelse return false;
+    if (n.*.size != s.len) return false;
+    return std.mem.eql(u8, n.*.data[0..s.len], s);
 }
 
 // =====================================================================
