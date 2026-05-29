@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#07090d"/>
+  <rect x="96" y="96" width="320" height="320" rx="40" fill="none" stroke="#5fd4ff" stroke-width="20"/>
+  <text x="256" y="300" font-family="ui-monospace, monospace" font-size="150" font-weight="700"
+        fill="#5fd4ff" text-anchor="middle">q64</text>
+</svg>
