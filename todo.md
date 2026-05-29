@@ -32,6 +32,14 @@ and `qube run`):
       verifies → extracts to `~/.qube/cache/sha256/<ab>/<cd>/<digest>/` → edits
       the manifest's `dependencies`.
 - [x] Test pair built: `dev.q64.hello_world` (published, live) + `dev.q64.hello_app`.
+- [x] **Logical not (`!`).** Completes the boolean operator surface (`&&`/`||`
+      lex+parse, comparisons + `!` lower). `!` was already lexed (`BANG`) and
+      parsed as a prefix op; wired the IR/codegen tail: `ops.UnKind.not`,
+      `build_hir.unKind` maps `.BANG`, `lower` types `not` as a boolean (i32
+      0/1), `emit` lowers it to `eqz` (width follows the operand — i32 for a
+      comparison, i64 otherwise), and `consteval` const-folds it. It's
+      truthiness (`x == 0 ? 1 : 0`), so it accepts any integer operand. Verified
+      end-to-end via the wasmtime host: `if !is_even(n)`, `!0`/`!5`, `!!5`.
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile

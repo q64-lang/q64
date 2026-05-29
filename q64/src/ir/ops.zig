@@ -24,5 +24,8 @@ pub const BinKind = enum {
     ge,
 };
 
-/// Unary operators: arithmetic negation and bitwise complement.
-pub const UnKind = enum { neg, bit_not };
+/// Unary operators: arithmetic negation, bitwise complement, and logical
+/// not. `not` is the only one that yields a boolean (an `i32` 0/1 in MIR) —
+/// it is truthiness on its operand (`x == 0 ? 1 : 0`), so it accepts any
+/// integer operand, not just a 0/1.
+pub const UnKind = enum { neg, bit_not, not };

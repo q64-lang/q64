@@ -664,6 +664,10 @@ const Lowerer = struct {
                 return switch (u.kind) {
                     .neg => c.BinaryenBinary(module, c.BinaryenSubInt64(), c.BinaryenConst(module, c.BinaryenLiteralInt64(0)), x),
                     .bit_not => c.BinaryenBinary(module, c.BinaryenXorInt64(), x, c.BinaryenConst(module, c.BinaryenLiteralInt64(-1))),
+                    // Logical not is truthiness: `x == 0 ? 1 : 0`. `eqz` already
+                    // yields an i32 0/1; pick the width of the operand (a
+                    // comparison is i32, any other integer expr is i64).
+                    .not => c.BinaryenUnary(module, if (u.operand.ty == .i32) c.BinaryenEqZInt32() else c.BinaryenEqZInt64(), x),
                 };
             },
             .call => |cl| {
