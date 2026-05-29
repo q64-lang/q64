@@ -27,6 +27,11 @@ let pressedBid = null;
 // the mutation list — the Renderer-face model: update only what changed.)
 let prevKeys = new Map();
 let nodeTex = new Map();
+// @state(app): the SHARED counter lives in the `app` twin (a Durable Object); we
+// hold the last value it pushed and render it. Tapping sends an `inc` command;
+// the twin fans the new value out to every connected view (cross-device live).
+let appCount = 0;
+let twinWS = null;
 
 // ---- WebGPU setup ----
 let device, ctx, format, primPipe, sampler, uniformBuf;
@@ -286,7 +291,7 @@ function runFrame(fn, ...args) {
   scene.forEach((c, id) => {
     c.nodeId = id; seen.add(id);
     const str = c.op === 'text' ? (LABELS[c.id] ?? '#' + c.id)
-      : c.op === 'number' ? ('taps: ' + c.n) : null;   // c.n = the WASM-owned counter
+      : c.op === 'number' ? ('shared: ' + appCount) : null;   // @state(app): value from the twin
     const key = JSON.stringify({ op: c.op, x: c.x, y: c.y, w: c.w, h: c.h, lid: c.id, str, pressed: c.bid === pressedBid });
     const prev = prevKeys.get(id);
     if (prev === undefined) muts.push(`create #${id} ${c.op}`);
@@ -299,6 +304,22 @@ function runFrame(fn, ...args) {
   }
   if (muts.length) log('mutate: ' + muts.join(', '));
   render();
+}
+
+// Connect to the `app` twin (a Durable Object) over WebSocket. Its pushed value
+// is the shared @state(app) counter; reconnect on drop. The twin is the single
+// owner/serializer of the shared state; this view just subscribes + commands.
+function connectTwin() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/twin`);
+  twinWS = ws;
+  ws.addEventListener('message', (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (typeof m.count === 'number') { appCount = m.count; runFrame(instance.exports._start); } // diff → resubscribe-render
+  });
+  ws.addEventListener('open', () => log('twin connected (shared @state(app))'));
+  ws.addEventListener('close', () => { twinWS = null; setTimeout(connectTwin, 1500); });
+  ws.addEventListener('error', () => { try { ws.close(); } catch {} });
 }
 
 async function main() {
@@ -317,6 +338,7 @@ async function main() {
   instance = inst;
   log('wasm32 module loaded (' + bytes.byteLength + ' B). Rendering with WebGPU.');
   runFrame(instance.exports._start);
+  connectTwin();
 
   canvas.addEventListener('pointerdown', (ev) => {
     const r = canvas.getBoundingClientRect();
@@ -324,19 +346,15 @@ async function main() {
     const hit = buttons.find((b) => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
     if (!hit) return;
     pressedBid = hit.bid;
-    // The counter is WASM-OWNED now: on_press(id) increments the state global and
-    // re-emits the scene. on_press takes an i64, so the arg MUST be a BigInt —
-    // passing a Number throws a TypeError (which is why the counter was stuck).
-    try {
-      if (typeof instance.exports.on_press === 'function') {
-        runFrame(instance.exports.on_press, BigInt(hit.bid));
-      } else {
-        runFrame(instance.exports._start);
-      }
-    } catch (e) {
-      log('on_press error: ' + e.message);
-      return;
+    // @state(app): the counter is owned by the `app` twin. Send an `inc` command;
+    // the twin increments the shared state and broadcasts the new value to every
+    // view (this device + any others) — the redraw happens on the twin's message.
+    if (twinWS && twinWS.readyState === WebSocket.OPEN) {
+      twinWS.send(JSON.stringify({ cmd: 'inc' }));
+    } else {
+      log('twin offline — reconnecting…');
     }
+    render(); // immediate pressed-state flash; the count updates when the twin replies
     // runFrame() already logged the surgical mutations (e.g. set_attr #1 number
     // "taps: N") — that IS the demonstration of retained, diff-driven redraw.
     setTimeout(() => { pressedBid = null; render(); }, 120);
