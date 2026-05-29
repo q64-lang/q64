@@ -265,6 +265,11 @@ qview.on(node_id, event_id, handler_export)  // wire input → an exported wasm 
 qview.present()                              // commit the frame's mutations
 ```
 
+> This op set is **producer-agnostic** — a q64 compiler emits it, and so can an AI
+> agent. It is therefore both the compiler target *and* an agent-facing API; see
+> [`agent-ui.md`](./agent-ui.md) (command vocabulary as a versioned contract,
+> safe-by-capability).
+
 The host keeps a `node_id → GPU draw record` map (identity preserved). Stage 1 can emit
 `create` once and then only `set_attr` on change; Stage 2 has the compiler emit exactly
 those `set_attr`s per state write. Remote `@state` emits the same ops from the backend.
