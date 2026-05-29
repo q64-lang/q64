@@ -74,6 +74,7 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     mod.entry = h.entry;
     mod.data = try data.toOwnedSlice(a);
     mod.globals = try a.dupe(i64, h.globals);
+    mod.global_names = try a.dupe([]const u8, h.global_names);
     return mod;
 }
 

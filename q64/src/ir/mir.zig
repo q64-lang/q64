@@ -42,6 +42,8 @@ pub const Module = struct {
     /// Module-level mutable i64 globals (reactive `state`), with their init
     /// values. The backend emits one `(global (mut i64))` per entry.
     globals: []const i64 = &.{},
+    /// Global names parallel to `globals` (exported by name so a host can read them).
+    global_names: []const []const u8 = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Module {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };

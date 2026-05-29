@@ -55,6 +55,8 @@ pub const Module = struct {
     /// to a mutable wasm global initialized to `inits[i]`. Read via `global_get`,
     /// written via `global_set` (by index).
     globals: []const i64 = &.{},
+    /// Names of the module globals, parallel to `globals` (for exporting by name).
+    global_names: []const []const u8 = &.{},
 
     pub fn init(gpa: std.mem.Allocator) Module {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
