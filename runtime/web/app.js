@@ -7,8 +7,8 @@
 
 // Host-owned glyph catalog (text-by-id; no strings cross the wasm32 boundary).
 const LABELS = {
-  0: 'q64 → wasm32 → WebGPU',
-  1: 'Tap me',
+  0: 'Shared counter — open on 2 devices',
+  1: 'Tap +1',
 };
 
 const DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
