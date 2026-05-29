@@ -123,7 +123,8 @@ language's semantics never depend on a backend's IR — see
 
 Nothing under `ir/` links Binaryen; only `codegen/` does. That seam is what
 keeps a future second backend (`MIR → LLVM IR → native`) an additive change —
-the same MIR feeds it, with allocation kept abstract (Memory64 + the arena bump
+the same MIR feeds it, with allocation kept abstract (the address space —
+`wasm32`/`wasm64`, i.e. whether Memory64 + Table64 are on — plus the arena bump
 global are the *Binaryen backend's* realization, not baked into MIR) and the
 `env.*` capability faces lowered per-backend (WASM imports today; a native host
 ABI later).
@@ -229,7 +230,8 @@ MIR through a sibling `MIR → LLVM IR` lowerer.
 
 codegen owns:
 
-- **Wasm 3.0 feature lowering**: Memory64, multi-memory, table64, WasmGC,
+- **Wasm 3.0 feature lowering**: the address space (`wasm32`/`wasm64` —
+  Memory64 + Table64 only when `wasm64`), multi-memory, WasmGC,
   threads + atomics, stack-switching, and SIMD.
 - **Region-allocator codegen**: emitting the bump / pool / free-list / stack /
   GC allocator that backs each region kind from the `region` pass.

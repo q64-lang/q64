@@ -189,16 +189,18 @@ all members; from inside a member it builds just that qube.
 ```json5
 targets: {
   "<name>": {
-    host:     "browser" | "wasmtime" | "wasmer" | "audio-host" | "custom",
-    optimize: "debug" | "size" | "speed",   // default "speed"
+    host:         "browser" | "wasmtime" | "wasmer" | "audio-host" | "custom",
+    addressSpace: "wasm32" | "wasm64",       // REQUIRED — no default (see below)
+    optimize:     "debug" | "size" | "speed",   // default "speed"
     wasm: {
-      memory64:       true,
-      "multi-memory": true,
-      table64:        true,
-      gc:             true,
-      threads:        true,
+      // memory64 / table64 are NOT free toggles: they follow `addressSpace`
+      // (wasm64 ⇒ on, wasm32 ⇒ off). Listing them is redundant; contradicting
+      // `addressSpace` (e.g. memory64: true under wasm32) is an error.
+      "multi-memory":    true,
+      gc:                true,
+      threads:           true,
       "stack-switching": true,
-      simd:           true,
+      simd:              true,
     },
     // Host-specific blocks (only the matching one is used):
     browser: {
@@ -215,13 +217,32 @@ targets: {
 }
 ```
 
-The `wasm.*` flags are Wasm 3.0 feature toggles. All default to `true`
-(matching the design's "Wasm 3.0 in 64-bit mode, full feature set assumed"
-commitment). Setting any of them `false` is an explicit narrowing — `qube
-build` errors out if any source uses the disabled feature.
+Every target **must** set `addressSpace` — there is no default. It selects
+the linear-memory address space the build is compiled for:
+
+- **`wasm32`** — 32-bit linear memory (`i32` pointers, ≤ 4 GiB). The
+  universal baseline; the only address space Apple WebKit (Safari and every
+  iPad/iOS browser) runs as of 2026, and the **safe fallback** a deploy host
+  serves when it can't confirm 64-bit support.
+- **`wasm64`** — 64-bit linear memory (Memory64 + Table64, `i64` pointers).
+  Unlocks > 4 GiB but does **not** run on WebKit.
+
+`qube build` errors (with a diagnostic, see [`qube-cli.md`](./qube-cli.md)) if
+the selected target has no `addressSpace`, or if `--addr` is also absent. To
+ship a qube that runs everywhere *and* exploits 64-bit where available,
+declare two targets (one per address space) and publish **both** artifacts —
+the deploy host then probes the client and serves the match, falling back to
+`wasm32`. On qubepods this is the QubePod manifest's `component.variants` map.
+See [`memory.md` §"The platform"](./memory.md) for the full rationale.
+
+The other `wasm.*` flags are Wasm 3.0 feature toggles that default to `true`.
+Setting one `false` is an explicit narrowing — `qube build` errors if any
+source uses a disabled feature. `memory64` and `table64` are **not** set here
+directly; they follow `addressSpace`.
 
 User-defined target names are kebab-case (`browser`, `desktop`, `plugin`,
-`edge-worker`, etc.) — the name is just a label; `host` decides everything.
+`edge-worker`, etc.) — the name is just a label; `host` and `addressSpace`
+decide everything.
 
 ### Effects
 

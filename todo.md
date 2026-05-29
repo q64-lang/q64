@@ -594,6 +594,43 @@ visible at a glance whether it's been picked up.
       `annotations.md`, `strings.md` land, the historical sources for
       them can be archived or deleted. Per MIGRATION.md's own plan.
 
+## Dual address space (wasm32 / wasm64) — NEW, SPEC LANDED
+
+The `/wasm` probe on qubepods proved the floor: **Apple WebKit (Safari +
+every iPad/iOS browser) has no Memory64 as of 2026.** The POC only "passed"
+because it served a 32-bit Rust-built wasm — real `q64` output is 64-bit and
+would not have run on iPad. So the address space is now an **explicit
+per-build choice with no default** (decision recorded with the spec edits):
+`wasm32` is the universal/WebKit baseline, `wasm64` adds Memory64 for capable
+hosts. Specs updated: [`spec/memory.md`](./spec/memory.md) §"The platform" +
+§"Address-space negotiation", [`spec/qube.json5.md`](./spec/qube.json5.md)
+§Targets (`addressSpace` required), [`spec/q64-cli.md`](./spec/q64-cli.md) &
+[`spec/qube-cli.md`](./spec/qube-cli.md) (`--addr`, per-`<addr>` output),
+[`ARCHITECTURE.md`](./ARCHITECTURE.md), [`spec/continuum-api.md`](./spec/continuum-api.md).
+
+Implementation (not started — large, touches the whole CLI + backend):
+
+- [ ] **Backend: parameterize the address space.** `codegen/` currently bakes
+      Memory64 + the arena bump global as the Binaryen realization. Make
+      pointer width, `memory`/`table` declarations, and the allocator codegen
+      switch on `wasm32` vs `wasm64`. This is the bulk of the work.
+- [ ] **`q64` CLI: `--addr <wasm32|wasm64>`**, required; diagnostic when
+      neither `--addr` nor a target-resolved `addressSpace` is given (new
+      diagnostic code for "no address space selected").
+- [ ] **`qube` CLI:** `addressSpace` required per target; build invokes `q64`
+      once per address space; outputs under `target/<profile>/<addr>/`;
+      `--addr` override; flag wasm64 builds as not-runnable-on-WebKit.
+- [ ] **Multi-memory layout under wasm32** — confirm the `mem.*` segregation
+      (stack/arena/heap/shared/large/rodata) holds with `i32` addressing and
+      the 4 GiB-per-memory cap.
+- [ ] **Runtime/glue:** `runtime/browser/host.js` (and any wasmtime/wasmer
+      host) probes Memory64 (`WebAssembly.validate` of a tiny `(memory i64 …)`
+      module) and requests/loads the matching build; `wasm32` is the fallback.
+- [ ] **`q64 show memories`** reports the address space it emitted.
+- [ ] **Continuum (optional, future):** additive prebuilt-artifact endpoint
+      `/v1/qubes/{name}/{version}/artifact?addr=…` if the source registry
+      should ever serve compiled variants (see continuum-api.md note).
+
 ## Conventions
 
 - Tick `[x]` when done. Strike through and leave the line until the

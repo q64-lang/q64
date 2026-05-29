@@ -37,10 +37,13 @@ suite.
 ## Wasm 3.0 is the platform; the Component Model is an optional wrapper
 
 Core Wasm 3.0 (the feature set committed in
-[`memory.md` §"The platform"](./memory.md) — Memory64, multiple memories,
-WasmGC, threads + atomics, stack-switching, SIMD) is q64's compilation
-target and **primary artifact**. The default `qube build` produces a
-**core module**.
+[`memory.md` §"The platform"](./memory.md) — multiple memories, WasmGC,
+threads + atomics, stack-switching, SIMD, plus a per-build **address
+space** of either `wasm32` or `wasm64`) is q64's compilation target and
+**primary artifact**. `qube build` produces a **core module**; the
+address space is chosen explicitly per build — there is no default
+(`wasm32` is the WebKit/iPad-compatible baseline; `wasm64` adds Memory64
+for capable hosts).
 
 WIT and the WebAssembly Component Model are **not** part of core Wasm 3.0
 — they are a layered spec for host integration. q64 treats them as an
@@ -116,6 +119,7 @@ covering both.
 | **module**    | A q64 **source** namespace — the unit of `import` / visibility / re-export inside a qube. See [`modules.md`](./modules.md). Never the Wasm artifact; that is a **core module**. |
 | **core module** | The primary Wasm 3.0 artifact `q64 emit` produces. The default `qube build` output. Distinct from a q64 source `module` and from a `component`. |
 | **component** | The opt-in WebAssembly Component Model wrapper around the core module (Component Model + WIT, *not* part of core Wasm 3.0). Emitted only when asked; embeds the unmodified core module. See [`modules.md` §"The qube as a component"](./modules.md). |
+| **wasm32 / wasm64** | The build's **address space**: 32-bit (`i32` pointers, ≤ 4 GiB — the universal/WebKit baseline) or 64-bit (Memory64 + Table64, `i64` pointers — not on WebKit). Chosen explicitly per build; there is **no default**. See [`memory.md` §"The platform"](./memory.md). |
 | **world**     | The WIT `world` synthesized from a qube's public surface — its component exports (public functions) and imports (derived capability set). Authored by no one; generated. Also the RPC contract (see [`rpc.md`](./rpc.md)). |
 | **interface** | The **WIT** sense: a named group of functions / types / resources in a `world`. Reserved for this meaning in the spec. q64's type-class abstraction is a **`face`**, never called an "interface" unqualified. |
 | **resource**  | A WIT handle to host- or instance-local state (e.g. an open file). Adapter-internal: q64 user code never holds one, and resources are **not** surfaced as faces/fits, nor sent over RPC. |
