@@ -325,11 +325,17 @@ async function main() {
     if (!hit) return;
     pressedBid = hit.bid;
     // The counter is WASM-OWNED now: on_press(id) increments the state global and
-    // re-emits the scene. (Falls back to _start only if a build lacks on_press.)
-    if (typeof instance.exports.on_press === 'function') {
-      runFrame(instance.exports.on_press, hit.bid);
-    } else {
-      runFrame(instance.exports._start);
+    // re-emits the scene. on_press takes an i64, so the arg MUST be a BigInt —
+    // passing a Number throws a TypeError (which is why the counter was stuck).
+    try {
+      if (typeof instance.exports.on_press === 'function') {
+        runFrame(instance.exports.on_press, BigInt(hit.bid));
+      } else {
+        runFrame(instance.exports._start);
+      }
+    } catch (e) {
+      log('on_press error: ' + e.message);
+      return;
     }
     // runFrame() already logged the surgical mutations (e.g. set_attr #1 number
     // "taps: N") — that IS the demonstration of retained, diff-driven redraw.

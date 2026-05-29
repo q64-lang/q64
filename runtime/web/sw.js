@@ -1,7 +1,7 @@
 // App-shell service worker. NETWORK-FIRST so active iteration always gets fresh
 // code on reload; the cache is only a fallback for offline. (A cache-first SW
 // made updates stale during development.) Bump CACHE to drop old entries.
-const CACHE = 'qview-poc-v8';
+const CACHE = 'qview-poc-v9';
 const SHELL = ['./', './index.html', './app.js', './screen.wasm', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
