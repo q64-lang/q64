@@ -1,6 +1,6 @@
 // Minimal app-shell service worker so the POC is an installable, offline-capable
 // PWA. Cache-first for the shell; bump CACHE to invalidate.
-const CACHE = 'qview-poc-v1';
+const CACHE = 'qview-poc-v2';
 const SHELL = ['./', './index.html', './app.js', './screen.wasm', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
