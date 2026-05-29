@@ -1,6 +1,7 @@
-// Minimal app-shell service worker so the POC is an installable, offline-capable
-// PWA. Cache-first for the shell; bump CACHE to invalidate.
-const CACHE = 'qview-poc-v2';
+// App-shell service worker. NETWORK-FIRST so active iteration always gets fresh
+// code on reload; the cache is only a fallback for offline. (A cache-first SW
+// made updates stale during development.) Bump CACHE to drop old entries.
+const CACHE = 'qview-poc-v3';
 const SHELL = ['./', './index.html', './app.js', './screen.wasm', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
@@ -11,5 +12,9 @@ self.addEventListener('activate', (e) => {
 });
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
-  e.respondWith(caches.match(e.request).then((hit) => hit || fetch(e.request)));
+  e.respondWith(
+    fetch(e.request)
+      .then((res) => { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); return res; })
+      .catch(() => caches.match(e.request))
+  );
 });
