@@ -957,6 +957,7 @@ fn unKind(tok: parser.cst.Token) ?ops.UnKind {
     return switch (tok.kind) {
         .MINUS => .neg,
         .TILDE => .bit_not,
+        .BANG => .not,
         else => null,
     };
 }
@@ -1309,4 +1310,20 @@ test "tryBuild: a recursive control-flow body builds HIR" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "if ") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "call#1") != null); // recursive call to fact
+}
+
+test "tryBuild: logical not in a condition builds a (not ...) over the comparison" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `if !(n == 0)` — the `!is_even(n)` shape, grounded on a comparison so it
+    // stays inside the i64 expression subset.
+    try tr.addLib("pub fn nonzero(n: i64) -> i64 { if !(n == 0) { 1 } else { 0 } }\n");
+
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(nonzero(7))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "(not ") != null); // the `!` node
+    try testing.expect(std.mem.indexOf(u8, dump, "eq") != null); // wrapping the comparison
 }

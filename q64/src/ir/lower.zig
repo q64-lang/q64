@@ -269,7 +269,11 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .local => |idx| return mk(ctx.a, .i64, .{ .local_get = idx }),
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
-        .un => |u| return mk(ctx.a, .i64, .{ .un = .{ .kind = u.kind, .operand = try lowerExpr(ctx, u.operand) } }),
+        .un => |u| {
+            // `not` yields a boolean (i32 0/1); `neg`/`bit_not` preserve i64.
+            const ty: mir.ValueType = if (u.kind == .not) .i32 else .i64;
+            return mk(ctx.a, ty, .{ .un = .{ .kind = u.kind, .operand = try lowerExpr(ctx, u.operand) } });
+        },
         .bin => |bx| {
             const ty: mir.ValueType = if (isCmp(bx.kind)) .i32 else .i64;
             return mk(ctx.a, ty, .{ .bin = .{
@@ -421,4 +425,30 @@ test "lower: i64 binding interpolation lowers to fmt_int_to_str inside str_conca
     try testing.expect(std.mem.indexOf(u8, dump, "fmt_int_to_str") != null);
     // The fmt_int_to_str wraps a local_get of the binding's local (idx 0).
     try testing.expect(std.mem.indexOf(u8, dump, "local_get 0") != null);
+}
+
+test "lower: `!` in an if-condition lowers to a `un not` over the comparison" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn nonzero(n: i64) -> i64 { if !(n == 0) { 1 } else { 0 } }\n");
+
+    const pr = try parser.parse.parse(testing.allocator,
+        "fn main {\n env.out(nonzero(7))\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    // The `!` survives lowering as a `un not`, wrapping the `bin eq`. The
+    // condition is used directly (lowerCond keeps an i32 as-is — see the
+    // `un not` result type), so there is no extra `!= 0` truthiness wrap.
+    try testing.expect(std.mem.indexOf(u8, dump, "un not") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "bin eq") != null);
 }

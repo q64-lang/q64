@@ -71,6 +71,7 @@ pub const Evaluator = struct {
                 return switch (op.kind) {
                     .MINUS => std.math.negate(x) catch return error.ConstArith,
                     .TILDE => ~x,
+                    .BANG => @as(i64, @intFromBool(x == 0)),
                     else => error.NotConst,
                 };
             },
