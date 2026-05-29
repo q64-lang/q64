@@ -22,6 +22,12 @@ let pressedBid = null;
 // value here. Moving this into the wasm (exported render(n) / module global) is
 // the next step (W2b proper).
 let count = 0;
+// Retained-mode bookkeeping: per-node "key" (its visible state) to diff frames,
+// and a per-node glyph-texture cache so only a *changed* node re-rasterizes.
+// (The GPU clear+pass is cheap; the surgical part is the texture rebuilds +
+// the mutation list — the Renderer-face model: update only what changed.)
+let prevKeys = new Map();
+let nodeTex = new Map();
 
 // ---- WebGPU setup ----
 let device, ctx, format, primPipe, sampler, uniformBuf;
@@ -185,13 +191,13 @@ function render() {
       const lbl = getLabel(c.id);
       drawPrim(pass, c.x + (c.w - lbl.w) / 2, c.y + (c.h - lbl.h) / 2, lbl.w, lbl.h, [0.03, 0.05, 0.08, 1], { texView: lbl.view });
     } else if (c.op === 'text') {
-      const lbl = getLabel(c.id);
-      drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.9, 0.95, 1.0, 1], { texView: lbl.view });
+      const lbl = nodeTex.get(c.nodeId);
+      if (lbl) drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.9, 0.95, 1.0, 1], { texView: lbl.view });
     } else if (c.op === 'number') {
       // The wasm lays out the number widget (qview.number); the live value is
-      // client `state` for now (see W2b note). Draw the host counter here.
-      const lbl = labelTexture('taps: ' + count); // dynamic; not cached
-      drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.62, 0.83, 0.95, 1], { texView: lbl.view });
+      // client `state` for now (see W2b note). Texture is rebuilt only on change.
+      const lbl = nodeTex.get(c.nodeId);
+      if (lbl) drawPrim(pass, c.x, c.y, lbl.w, lbl.h, [0.62, 0.83, 0.95, 1], { texView: lbl.view });
     }
   }
   pass.end();
@@ -215,9 +221,32 @@ function qviewImports() {
   };
 }
 
+// Re-run the wasm to (re)emit the scene, then DIFF against the previous frame:
+// assign each node a stable id (emission order), compute a key from its visible
+// state, and emit create/set_attr/remove mutations — rebuilding only a changed
+// node's glyph texture. This is the retained Renderer-face model: surgical
+// updates, not a blind repaint. Mutations are logged so you can see it.
 function runFrame(fn, ...args) {
   scene = []; buttons = [];
-  fn(...args);   // wasm emits qview.* calls, then qview.present()
+  fn(...args);                       // wasm emits qview.* calls, then qview.present()
+
+  const muts = [];
+  const seen = new Set();
+  scene.forEach((c, id) => {
+    c.nodeId = id; seen.add(id);
+    const str = c.op === 'text' ? (LABELS[c.id] ?? '#' + c.id)
+      : c.op === 'number' ? ('taps: ' + count) : null;
+    const key = JSON.stringify({ op: c.op, x: c.x, y: c.y, w: c.w, h: c.h, lid: c.id, str, pressed: c.bid === pressedBid });
+    const prev = prevKeys.get(id);
+    if (prev === undefined) muts.push(`create #${id} ${c.op}`);
+    else if (prev !== key) muts.push(`set_attr #${id} ${c.op}${str !== null ? ` "${str}"` : ''}`);
+    if (prev !== key && str !== null) nodeTex.set(id, labelTexture(str)); // only the changed node re-rasterizes
+    prevKeys.set(id, key);
+  });
+  for (const id of [...prevKeys.keys()]) {
+    if (!seen.has(id)) { muts.push(`remove #${id}`); prevKeys.delete(id); nodeTex.delete(id); }
+  }
+  if (muts.length) log('mutate: ' + muts.join(', '));
   render();
 }
 
@@ -252,7 +281,8 @@ async function main() {
     } else {
       runFrame(instance.exports._start);
     }
-    log(`tap → count ${count} (client-side state; wasm draws the layout — wasm-owned state = next)`);
+    // runFrame() already logged the surgical mutations (e.g. set_attr #1 number
+    // "taps: N") — that IS the demonstration of retained, diff-driven redraw.
     setTimeout(() => { pressedBid = null; render(); }, 120);
   });
 

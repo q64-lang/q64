@@ -87,6 +87,27 @@ emitting to wasm — exactly the Svelte/Solid-compiler sweet spot. It can do at
   diff regardless of origin; the only difference is where it's computed and the `@kv`
   effect that surfaces remote state in the qube manifest.
 
+## `state` vs `@state` (decision)
+
+**Decided — the surface distinction is the `@` effect sigil:**
+
+- **`state x: T = v`** → **local**: an in-memory reactive signal, lives in the instance
+  (wasm), **pure** (no effect). Lost on reload. Lowers to a wasm global/cell + a
+  `q64.reactive` signal.
+- **`@state x: T = v`** → **remote/persisted**: the *same* reactive signal, but its
+  read/write go through an `env` capability, so they carry an **effect** (`@kv`/`@db`).
+  The `@` is q64's existing effect marker — `@state` is self-documenting ("this state
+  crosses a boundary"). It **desugars** to `state x = env.kv("x", v)`, so the `@kv`
+  effect is inferred exactly like any `env.kv` call and **propagates into the qube's
+  capability set → the QubePod manifest `imports` → QAD/AI-visibility**. Local `state`
+  adds nothing to the manifest; remote `@state` shows up automatically. Both share the
+  same reactive semantics and the same `Renderer` mutation protocol — local diffs
+  originate in the wasm, remote diffs from the qubepods backend over the gate socket.
+
+**Open (defaulted, refinable):** how `@state` names its store/scope — default is per-user,
+keyed by field name in the qube's default store; `@state shared …` for a per-qube global;
+`@state(db "table") …` to name the store. This doesn't change the surface distinction.
+
 ## Rendering substrate: WebGPU-only (decision)
 
 **QView targets WebGPU; we do not support old browsers or a DOM/canvas2d fallback.**
