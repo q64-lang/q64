@@ -41,6 +41,27 @@ pub const ModuleResolver = struct {
 /// `(ptr, len)` pair in MIR).
 pub const Type = enum { i64, i32, f64, str, void };
 
+/// A definite semantic error the AST→HIR builder detected — distinct from
+/// "construct not yet supported" (which signals a fall-back). The codegen
+/// front maps each to its honest-baseline diagnostic code, so the IR path
+/// owns these diagnostics directly (no legacy emitter needed). Backend-neutral
+/// (no Binaryen, no codegen `Error` dependency): the mapping lives in codegen.
+pub const Reject = enum {
+    /// No `fn main` and the module isn't a valid main-less twin → NoMainFunction.
+    no_main,
+    /// A call that can't be lowered as written: a non-`env.out`/non-host callee,
+    /// a wrong argument count, a non-i64 callee in an i64 expression, or a
+    /// value `if` with no `else` → UnsupportedCall.
+    unsupported_call,
+    /// A called/interpolated name resolves to no function → NameNotFound.
+    name_not_found,
+    /// An entirely-constant expression that can't be evaluated (divide-by-zero,
+    /// overflow), or a nested non-const call argument → NotConstExpr.
+    not_const,
+    /// Assignment to a `let` binding or a parameter → ImmutableAssign.
+    immutable_assign,
+};
+
 pub const Visibility = enum { private, public };
 
 /// One module's worth of HIR, arena-owned. Callers allocate every node via

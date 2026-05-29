@@ -327,7 +327,10 @@ test "lower: literals fold into the memory image with newlines" {
     const pr = try parser.parse.parse(testing.allocator, "fn main {\n env.out(\"one\")\n env.out(\"two\")\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = (try build_hir.tryBuild(testing.allocator, sf, noLib)).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, noLib)) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
     defer h.deinit();
 
     var m = try lower(testing.allocator, &h);
@@ -379,7 +382,10 @@ test "lower: an i64 binding in main becomes a local_set in _start" {
         "fn main {\n let a = double(21)\n env.out(a)\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
     defer h.deinit();
 
     var m = try lower(testing.allocator, &h);
@@ -400,7 +406,10 @@ test "lower: i64 binding interpolation lowers to fmt_int_to_str inside str_conca
         "fn main {\n let a = double(21)\n env.out(\"a={a}\")\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
     defer h.deinit();
 
     var m = try lower(testing.allocator, &h);
