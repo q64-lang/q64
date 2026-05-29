@@ -1,0 +1,14 @@
+{
+  "name": "QView · q64 → wasm32 → WebGPU",
+  "short_name": "QView",
+  "description": "Architecture proof: a q64-built wasm32 module drives a WebGPU renderer over the qview host face.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#07090d",
+  "theme_color": "#07090d",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
