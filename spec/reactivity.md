@@ -107,6 +107,37 @@ fall back to a second renderer. Consequences for this design:
 - It frees us from DOM reconciliation semantics (keys-as-DOM-identity, hydration);
   node identity is just our `node_id → GPU object` map.
 
+## Rendering model: widgets as SDF shaders (decision)
+
+**Widgets are drawn procedurally in shaders via signed-distance fields (SDF), not
+textured quads or tessellated meshes.** A widget is one quad whose fragment shader
+evaluates an SDF (rounded-rect, circle, capsule, line) → crisp fill, border, shadow,
+gradient — all analytic. This is the modern GPU-UI approach (Zed's GPUI, Rive, game
+UIs; SDF/MSDF text after Valve/msdfgen). It composes with everything above:
+
+- **Resolution-independent** → crisp at any DPR, scale, and **under 3D/perspective**
+  (the floating-layers payoff): an SDF button in a transformed layer stays razor-sharp;
+  a textured one pixelates.
+- **The retained scene = an instance buffer of widget params** (transform, rect, radius,
+  border, fill/border color, shadow, z). `set_attr` updates one instance; `present`
+  re-uploads only changed instances and re-encodes. **Mutation is a param write, never a
+  geometry rebuild** — a perfect fit for the reactivity model and the `Renderer` face.
+- **Instanced** → thousands of widgets per draw call; **analytic anti-aliasing** for free
+  (smoothstep on the distance).
+- **Authored in q64.** `q64.gfx` compiles shaders from q64 → WGSL/SPIR-V, so the SDF
+  widget library is q64 code, not hand-WGSL.
+
+**Coverage (≈ the visual MVP):** rounded-rect SDF → `box`/`button`/`input`/`card`/`stack`
+backgrounds; circle/capsule; SDF `icon`s; **MSDF** atlas → scalable crisp `text`/`number`.
+`image` is a textured quad; `row/column/stack/scroll` are layout/clip+transform, not
+rendering. So one instanced SDF pipeline + an MSDF text pipeline covers the kit.
+
+**Caveats (scope it right):** arbitrary **vector paths** (complex SVG, charts) aren't a
+single SDF — those need a **compute vector renderer** (Vello/piet-gpu style), deferred;
+**MSDF text** needs a glyph-SDF atlas pipeline (solved, but real work); **backdrop blur**
+is an extra sampling pass, not one SDF. The current POC's textured-quad + canvas2d-glyph
+host is a scaffold to be replaced by the SDF pipeline (rounded-rect first, MSDF text next).
+
 ## Recommended model + staged path
 
 Target: **signal-decides-what + retained-mutation-applies-how**, with the **compiler
