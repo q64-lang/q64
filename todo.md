@@ -32,14 +32,24 @@ and `qube run`):
       verifies → extracts to `~/.qube/cache/sha256/<ab>/<cd>/<digest>/` → edits
       the manifest's `dependencies`.
 - [x] Test pair built: `dev.q64.hello_world` (published, live) + `dev.q64.hello_app`.
-- [x] **Logical not (`!`).** Completes the boolean operator surface (`&&`/`||`
-      lex+parse, comparisons + `!` lower). `!` was already lexed (`BANG`) and
-      parsed as a prefix op; wired the IR/codegen tail: `ops.UnKind.not`,
-      `build_hir.unKind` maps `.BANG`, `lower` types `not` as a boolean (i32
-      0/1), `emit` lowers it to `eqz` (width follows the operand — i32 for a
-      comparison, i64 otherwise), and `consteval` const-folds it. It's
-      truthiness (`x == 0 ? 1 : 0`), so it accepts any integer operand. Verified
+- [x] **Logical not (`!`).** `!` was already lexed (`BANG`) and parsed as a
+      prefix op; wired the IR/codegen tail: `ops.UnKind.not`, `build_hir.unKind`
+      maps `.BANG`, `lower` types `not` as a boolean (i32 0/1), `emit` lowers it
+      to `eqz` (width follows the operand — i32 for a comparison, i64
+      otherwise), and `consteval` const-folds it. It's truthiness
+      (`x == 0 ? 1 : 0`), so it accepts any integer operand. Verified
       end-to-end via the wasmtime host: `if !is_even(n)`, `!0`/`!5`, `!!5`.
+- [x] **Short-circuit `&&` / `||`.** Completes the boolean operator set. Both
+      were already lexed (`AMP_AMP`/`PIPE_PIPE`) and parsed with precedence
+      (`||`=2, `&&`=3) but didn't lower. They're control flow, not value ops:
+      a new `hir.Expr.logical` node (`ops.LogicalKind`) lowers to a value
+      `if_` — `a && b` → `if a { b } else { 0 }`, `a || b` → `if a { 1 } else
+      { b }` — yielding an i32 0/1 (matching comparisons + `!`). Added a
+      `mir.const_i32` for the boolean branch leaves. Both operands are
+      truthiness-tested, so the rhs need not be a 0/1. Verified end-to-end:
+      full truth tables, precedence (`a || b && c`), interaction with `!`, and
+      **short-circuit** (a div-by-zero rhs is skipped, not trapped) when the
+      lhs already decides the result.
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile

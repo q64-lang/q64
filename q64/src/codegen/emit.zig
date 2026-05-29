@@ -530,7 +530,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
             break :blk false;
         },
         .global_set => |gs| bodyHasOut(gs.value, want_int),
-        .host_out_const, .const_i64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
+        .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -587,7 +587,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         .loop => |body| scanScratch(body, s),
         .host_call => |hc| for (hc.args) |a| scanScratch(a, s),
         .global_set => |gs| scanScratch(gs.value, s),
-        .host_out_const, .const_i64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
+        .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
 
@@ -656,6 +656,7 @@ const Lowerer = struct {
             },
             .host_out_const => |hc| return self.envOut(@intCast(hc.off), @intCast(hc.len)),
             .const_i64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt64(v)),
+            .const_i32 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt32(v)),
             .local_get => |idx| return c.BinaryenLocalGet(module, idx, self.i64_type),
             .local_set => |ls| return c.BinaryenLocalSet(module, ls.idx, try self.inst(ls.value)),
             .bin => |b| return c.BinaryenBinary(module, binOp(b.kind), try self.inst(b.lhs), try self.inst(b.rhs)),

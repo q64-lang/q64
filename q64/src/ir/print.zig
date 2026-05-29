@@ -128,6 +128,13 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, b.rhs);
             try app(gpa, out, ")", .{});
         },
+        .logical => |lg| {
+            try app(gpa, out, "(", .{});
+            try hirExpr(gpa, out, lg.lhs);
+            try app(gpa, out, " {s} ", .{@tagName(lg.op)});
+            try hirExpr(gpa, out, lg.rhs);
+            try app(gpa, out, ")", .{});
+        },
         .call => |cl| {
             try app(gpa, out, "call#{d}(", .{cl.func});
             for (cl.args, 0..) |arg, i| {
@@ -198,6 +205,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             for (hc.args) |a| try mirInst(gpa, out, a, depth + 1);
         },
         .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
+        .const_i32 => |v| try app(gpa, out, "const_i32 {d}\n", .{v}),
         .local_get => |i| try app(gpa, out, "local_get {d}\n", .{i}),
         .global_get => |i| try app(gpa, out, "global_get {d}\n", .{i}),
         .global_set => |gs| { try app(gpa, out, "global_set {d}\n", .{gs.idx}); try mirInst(gpa, out, gs.value, depth + 1); },

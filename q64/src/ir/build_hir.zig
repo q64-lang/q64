@@ -892,12 +892,17 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             out.* = .{ .un = .{ .kind = kind, .operand = try buildIntExpr(b, u.operand() orelse return error.Unsupported, scope) } };
         },
         .bin => |bx| {
-            const kind = binKind(bx.op() orelse return error.Unsupported) orelse return error.Unsupported;
-            out.* = .{ .bin = .{
-                .kind = kind,
-                .lhs = try buildIntExpr(b, bx.lhs() orelse return error.Unsupported, scope),
-                .rhs = try buildIntExpr(b, bx.rhs() orelse return error.Unsupported, scope),
-            } };
+            const op_tok = bx.op() orelse return error.Unsupported;
+            const lhs = try buildIntExpr(b, bx.lhs() orelse return error.Unsupported, scope);
+            const rhs = try buildIntExpr(b, bx.rhs() orelse return error.Unsupported, scope);
+            if (logicalKind(op_tok)) |lk| {
+                // `&&` / `||` short-circuit, so they're control flow, not a
+                // binary value op (see `lowerExpr`'s `.logical` → `if_`).
+                out.* = .{ .logical = .{ .op = lk, .lhs = lhs, .rhs = rhs } };
+            } else {
+                const kind = binKind(op_tok) orelse return error.Unsupported;
+                out.* = .{ .bin = .{ .kind = kind, .lhs = lhs, .rhs = rhs } };
+            }
         },
         .call => |cc| {
             const callee = cc.callee() orelse return error.Unsupported;
@@ -949,6 +954,14 @@ fn binKind(tok: parser.cst.Token) ?ops.BinKind {
         .LT_EQ => .le,
         .R_ANGLE => .gt,
         .GT_EQ => .ge,
+        else => null,
+    };
+}
+
+fn logicalKind(tok: parser.cst.Token) ?ops.LogicalKind {
+    return switch (tok.kind) {
+        .AMP_AMP => .and_,
+        .PIPE_PIPE => .or_,
         else => null,
     };
 }
@@ -1326,4 +1339,20 @@ test "tryBuild: logical not in a condition builds a (not ...) over the compariso
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "(not ") != null); // the `!` node
     try testing.expect(std.mem.indexOf(u8, dump, "eq") != null); // wrapping the comparison
+}
+
+test "tryBuild: `&&` / `||` build short-circuit logical nodes (not bin ops)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn both(a: i64, b: i64) -> i64 { if a > 0 && b > 0 { 1 } else { 0 } }\n");
+    try tr.addLib("pub fn either(a: i64, b: i64) -> i64 { if a > 0 || b > 0 { 1 } else { 0 } }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(both(1, 1))\n env.out(either(0, 1))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "and_") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "or_") != null);
 }

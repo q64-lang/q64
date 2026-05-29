@@ -131,6 +131,9 @@ pub const Op = union(enum) {
     block: []const *Inst,
     host_out_const: struct { off: u32, len: u32 },
     const_i64: i64,
+    /// A boolean (0/1) constant — the branch leaves of a short-circuit
+    /// `&&`/`||` `if_`, which yields an i32 to match comparisons and `!`.
+    const_i32: i32,
     local_get: u32,
     local_set: struct { idx: u32, value: *Inst },
     bin: struct { kind: ops.BinKind, lhs: *Inst, rhs: *Inst },
