@@ -663,9 +663,22 @@ Implementation:
 
 - [x] **Backend: address space wired (wasm32).** `codegen/emit.zig` takes an
       `AddressSpace` (via `q64 emit --addr`); `wasm32` drops the Memory64 feature
-      and sets a 32-bit memory. Values stay i64; the i64 **string/arena ABI** is
-      *guarded* under wasm32 (`Wasm32StringAbiUnsupported`) — its i32-pointer
-      conversion is the remaining Path-B follow-up.
+      and sets a 32-bit memory. Values stay i64; only memory *addresses* differ.
+- [x] **wasm32 const-string ABI (Path B, slice 1).** Pointer/length width is now
+      a backend knob (`ptr_type`: i32 on wasm32, i64 on wasm64), threaded through
+      `env.out`'s import, the data-segment offset, and the `host_out_const` path
+      (`Lowerer.ptrConst`). So const-string programs (`env.out("…")`, fully-const
+      interpolation) emit a genuine 32-bit module and **run on the WebKit/iPad
+      baseline**. The wasmtime host became address-space-agnostic: it introspects
+      `env.out`'s import (`envOutWantsI32`) to define a matching func type and
+      reads each arg by runtime kind. Verified end-to-end in `link-roundtrip.sh`
+      (`Hello from wasm32 (42)`) + emit unit tests; wasm64 unchanged.
+      **Remaining (Path B, slice 2):** the runtime string/**arena** ABI —
+      `__fmt_i64`, `str_concat`/the `sp` bump global, str values/params/bindings —
+      is still i64-pointer-baked, so a program needing it still rejects on wasm32
+      (`Wasm32StringAbiUnsupported`, via the `usesStrAbi` gate). Porting it means
+      making the arena pointer ops + the str `(ptr,len)` pair width-aware and
+      fixing `build_hir`'s i64 binding-local typing for pointer locals.
 - [x] **`q64` CLI: `--addr <wasm32|wasm64>`** on `q64 emit` (defaults wasm64
       to preserve existing string programs; `--addr wasm32` emits a genuine 32-bit
       module). Required/no-default policy lands with the Path-B string ABI.
@@ -712,8 +725,10 @@ Done:
       source from `@state(app)` declarations (`apps/qview-global/gen-global.mjs`).
 
 Remaining:
-- [ ] **wasm32 string ABI** (i32 pointers for the str/arena path) — unblocks
-      string programs on wasm32.
+- [~] **wasm32 string ABI** — const strings done (see "Dual address space"
+      above: 32-bit module + i32 `env.out`, runs on WebKit). The runtime
+      str/**arena** path (i32 pointers for `__fmt_i64`/concat/str values) is the
+      remaining slice.
 - [ ] **`screen`/`draw` DSL** as real q64 syntax (the frontend language) —
       unblocks real `@state(app)` syntax + AST partitioning (client
       reads→subscribe, writes→command).
