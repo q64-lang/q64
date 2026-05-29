@@ -324,11 +324,44 @@ it with `CfgUnsupported`).
         now carries the entry's `locals` into MIR. Verified `Q64_IR_STRICT=1`:
         `let g = shout("hi"); env.out(g); "{g} and {g}"; let w = wrap(g); "{w}"`
         → `hi!` / `got: hi! and hi!` / `nested: [hi!]`.
-  - [ ] **P3b-5** i64 bindings + int interpolation in `main`.
-  After P3b the whole suite + `link-roundtrip.sh` runs through the IR.
-- [ ] **P4 delete legacy.** Once the router never falls through (verify with
-      `Q64_IR_STRICT=1`), remove `emitFn`/`emitModule`'s AST walk, the
-      `Action`/`Segment`/`ArgVal`/`RtBinding` model, and the `Resolver`.
+  - [x] **P3b-5** i64 bindings + int interpolation in `main`. The HIR builder
+        tracks `main`'s runtime i64 `let` bindings in the shared local space
+        (str bindings take two slots, i64 one), resolves later references and
+        `{a}` interpolation pieces (`fmt_int(local#N)`), and `lower` emits a
+        `local_set` in `_start` + `fmt_int_to_str` inside `str_concat`; the
+        backend's entry scratch layout already sits past `f.locals`. Verified
+        end-to-end `Q64_IR_STRICT=1`: `let a = double(21); env.out(add(a, 8));
+        let b = add(a, 8); let g = shout("hi"); env.out("{g}: a={a}, b={b}")`
+        → `50` / `hi!: a=42, b=50` through AST→HIR→MIR→Binaryen, no fallback.
+        Locked in: `build_hir`/`lower` unit tests + a dedicated strict assertion
+        in `link-roundtrip.sh`.
+  **After P3b: done.** The *entire* `link-roundtrip.sh` corpus now emits with
+  `Q64_IR_STRICT=1` and zero fallbacks — every program (literals, str ABI, i64
+  fns + control flow + recursion + loops, and now main-level i64 bindings +
+  interpolation) runs through the IR. This is the threshold for **P4 (delete
+  legacy)**: the router never falls through for the covered corpus.
+- **P4 delete legacy** (in progress).
+  - [x] **P4a unblock — the router no longer falls through.** The IR path now
+        owns the honest-baseline diagnostics that only the legacy emitter
+        produced before (`hir.Reject` + `build_hir.Result`; codegen `mapReject`
+        → the same `Error` codes: NoMainFunction / UnsupportedCall /
+        NameNotFound / NotConstExpr / ImmutableAssign). `consteval` splits
+        `ConstArith` (all-const but invalid: div-by-zero/overflow → NotConstExpr)
+        from `NotConst` (needs a runtime value → fall back). Closed the one
+        success gap (untyped fold-only helper in interpolation) and scoped
+        `buildScreenFuncs` to the public surface. Verified **strict-clean across
+        the whole test surface**: 180/180 zig unit tests, `link-roundtrip.sh`,
+        and 74/74 `q64-test` CLI tests under `Q64_IR_STRICT=1` (zero fallbacks).
+        Legacy is now unreachable for the corpus.
+  - [ ] **P4b delete.** Remove `emitFn`/`emitModule`'s AST walk, the
+        `Action`/`Segment`/`ArgVal`/`RtBinding` model, the legacy int/concat
+        emitters (`emitInt*`/`appendConcat`/`splitInterpolation`/…), and trim
+        the `Resolver` to the import-resolution + `lookup` the IR path uses
+        (drop its const-eval machinery). Keep the shared `emitFmtI64` / `binOp`
+        / `emitHelloWasm`. Rewire `emitFromSource` so a null from `tryIrEmit`
+        (genuinely unsupported, e.g. faces/streams) becomes an honest
+        `UnsupportedExpression` instead of a fall-back. Re-run the strict
+        surface to confirm no behavior change.
 - [ ] **P5 introspection + tail seams.** `q64 show hir|mir`; populate HIR
       visibility/effect slots for the component/WIT + QubePod bundle stages.
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
