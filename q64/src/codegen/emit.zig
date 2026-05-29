@@ -52,7 +52,23 @@ pub const Error = error{
     UndeclaredName, // assignment target names no in-scope binding
     BreakOutsideLoop, // `break`/`continue` with no enclosing loop
     CfgUnsupported, // a MIR func body in CFG form — the WASM backend only takes structured
+    Wasm32StringAbiUnsupported, // --addr wasm32 with a program that needs the i64 string/arena ABI (Path B follow-up)
     OutOfMemory,
+};
+
+/// The linear-memory address space a build targets (spec/memory.md §"The
+/// platform"). It is an explicit per-build choice: `wasm32` (i32 addresses,
+/// the WebKit/iPad baseline) or `wasm64` (Memory64, i64 addresses). Values stay
+/// i64 either way — only memory *addresses* differ — so the wasm32 POC supports
+/// the integer/import subset today and guards the string/arena ABI (i32 pointer
+/// conversion) as a Path-B follow-up rather than emitting an invalid module.
+pub const AddressSpace = enum {
+    wasm32,
+    wasm64,
+
+    pub fn memory64(self: AddressSpace) bool {
+        return self == .wasm64;
+    }
 };
 
 /// A dependency module made available to codegen. `name` is the bare-
@@ -173,6 +189,7 @@ pub fn emitFromSource(
     source: []const u8,
     file: []const u8,
     modules: []const ModuleSource,
+    addr: AddressSpace,
 ) ![]u8 {
     const parse_result = try parse.parse(allocator, source, file);
     defer parse_result.deinit(allocator);
@@ -195,7 +212,7 @@ pub fn emitFromSource(
     // diagnostics fire on either path. `Q64_IR_STRICT=1` turns a fallback
     // into a panic, to prove a phase's coverage in CI.
     const mres = ir.hir.ModuleResolver{ .ctx = &resolver, .lookupFn = resolverLookupShim };
-    if (try tryIrEmit(allocator, sf, mres)) |bytes| return bytes;
+    if (try tryIrEmit(allocator, sf, mres, addr)) |bytes| return bytes;
     if (std.c.getenv("Q64_IR_STRICT") != null) {
         @panic("Q64_IR_STRICT: a construct fell back to the legacy emitter");
     }
@@ -209,7 +226,7 @@ pub fn emitFromSource(
         else => {},
     } else return Error.NoMainFunction;
 
-    return emitFn(allocator, &resolver, main_fn);
+    return emitFn(allocator, &resolver, main_fn, addr);
 }
 
 // =====================================================================
@@ -233,7 +250,7 @@ fn resolverLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
 /// construct isn't representable yet (build_hir bailed, or lowering hit an
 /// `Unsupported` shape) so the caller falls back to the legacy emitter. Other
 /// errors (genuine codegen failures) propagate.
-fn tryIrEmit(allocator: std.mem.Allocator, sf: ast.SourceFile, mres: ir.hir.ModuleResolver) !?[]u8 {
+fn tryIrEmit(allocator: std.mem.Allocator, sf: ast.SourceFile, mres: ir.hir.ModuleResolver, addr: AddressSpace) !?[]u8 {
     var hmod = (try ir.build_hir.tryBuild(allocator, sf, mres)) orelse return null;
     defer hmod.deinit();
     var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
@@ -241,20 +258,40 @@ fn tryIrEmit(allocator: std.mem.Allocator, sf: ast.SourceFile, mres: ir.hir.Modu
         else => |other| return other,
     };
     defer mmod.deinit();
-    return try lowerToWasm(allocator, &mmod);
+    return try lowerToWasm(allocator, &mmod, addr);
 }
 
-fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
+fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
-    // Same Wasm 3.0 feature set as the legacy emitter (Memory64 + the
-    // string-ABI helpers), so the IR path and legacy path agree.
-    c.BinaryenModuleSetFeatures(
-        module,
-        c.BinaryenFeatureMultivalue() | c.BinaryenFeatureMemory64() |
-            c.BinaryenFeatureBulkMemory() | c.BinaryenFeatureBulkMemoryOpt(),
-    );
+    // Wasm 3.0 feature set. Memory64 is included only for wasm64; wasm32 omits
+    // it so the emitted module is a genuine 32-bit module (the WebKit/iPad
+    // baseline). Multivalue + BulkMemory are address-space-independent.
+    var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
+        c.BinaryenFeatureBulkMemoryOpt();
+    if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
+    c.BinaryenModuleSetFeatures(module, features);
+
+    // Path A (POC): wasm32 supports the integer/import subset. The string/arena
+    // ABI still uses i64 addresses, which are invalid on a 32-bit memory, so we
+    // refuse rather than emit a broken module — the honest gap until the i32
+    // pointer conversion lands (Path B).
+    if (addr == .wasm32) {
+        var needs_mem = m.data.len > 0;
+        for (m.funcs) |f| {
+            const inst = switch (f.body) {
+                .structured => |x| x,
+                .cfg => return Error.CfgUnsupported,
+            };
+            if (bodyHasOut(inst, true)) needs_mem = true;
+            var sc2 = Scratch{};
+            scanScratch(inst, &sc2);
+            if (sc2.has_concat) needs_mem = true;
+        }
+        if (needs_mem) return Error.Wasm32StringAbiUnsupported;
+    }
+    const mem64 = addr.memory64();
 
     const i64_type = c.BinaryenTypeInt64();
     const i32_type = c.BinaryenTypeInt32();
@@ -268,7 +305,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
 
     // One active data segment at offset 0 holds the whole memory image.
     if (m.data.len == 0) {
-        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, true, "0");
+        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, mem64, "0");
     } else {
         var seg_datas = [_][*c]const u8{m.data.ptr};
         var seg_passives = [_]bool{false};
@@ -276,7 +313,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
             c.BinaryenConst(module, c.BinaryenLiteralInt64(0)),
         };
         var seg_sizes = [_]c.BinaryenIndex{@intCast(m.data.len)};
-        c.BinaryenSetMemory(module, 1, 1, "memory", null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, true, "0");
+        c.BinaryenSetMemory(module, 1, 1, "memory", null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, mem64, "0");
     }
 
     // Int formatting needs `__fmt_i64`; either formatting or a concat needs
@@ -298,6 +335,39 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
         _ = c.BinaryenAddGlobal(module, "sp", i64_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(m.data.len))));
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type);
+
+    // Host-face imports (e.g. `qview.text`): declare one wasm import per distinct
+    // host_call name. All args are i64 (valid on wasm32); the import returns void.
+    // Names live in `name_arena` through module emission.
+    var name_arena = std.heap.ArenaAllocator.init(allocator);
+    defer name_arena.deinit();
+    const na = name_arena.allocator();
+    var host_imports = std.StringHashMapUnmanaged([*:0]const u8){};
+    {
+        var arity = std.StringHashMapUnmanaged(usize){};
+        for (m.funcs) |f| {
+            const inst = switch (f.body) {
+                .structured => |x| x,
+                .cfg => return Error.CfgUnsupported,
+            };
+            try scanHostCalls(inst, &arity, na);
+        }
+        var it = arity.iterator();
+        while (it.next()) |e| {
+            const dotted = e.key_ptr.*;
+            const n = e.value_ptr.*;
+            const dot = std.mem.indexOfScalar(u8, dotted, '.') orelse return Error.UnsupportedCall;
+            const mod_z = try na.dupeZ(u8, dotted[0..dot]);
+            const field_z = try na.dupeZ(u8, dotted[dot + 1 ..]);
+            const internal = try std.fmt.allocPrint(na, "{s}_{s}", .{ dotted[0..dot], dotted[dot + 1 ..] });
+            const internal_z = try na.dupeZ(u8, internal);
+            const params = try na.alloc(c.BinaryenType, n);
+            for (params) |*p| p.* = i64_type;
+            const ptype = if (n > 0) c.BinaryenTypeCreate(params.ptr, @intCast(n)) else none_type;
+            c.BinaryenAddFunctionImport(module, internal_z.ptr, mod_z.ptr, field_z.ptr, ptype, none_type);
+            try host_imports.put(na, dotted, internal_z.ptr);
+        }
+    }
 
     for (m.funcs) |f| {
         const structured = switch (f.body) {
@@ -330,6 +400,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module) ![]u8 {
             .buf_idx = base + n_tuples,
             .off_idx = base + n_tuples + 1,
             .len_idx = base + n_tuples + 2,
+            .host_imports = &host_imports,
         };
         defer lw.deinit();
 
@@ -424,6 +495,10 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .str_bind => |sb| bodyHasOut(sb.value, want_int),
         .fmt_int_to_str => |inner| want_int or bodyHasOut(inner, want_int),
+        .host_call => |hc| blk: {
+            for (hc.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
+            break :blk false;
+        },
         .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -479,7 +554,25 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(w.body, s);
         },
         .loop => |body| scanScratch(body, s),
+        .host_call => |hc| for (hc.args) |a| scanScratch(a, s),
         .host_out_const, .const_i64, .local_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
+    }
+}
+
+/// Collect distinct host-face call names (e.g. `qview.text`) and their arity, so
+/// `lowerToWasm` can declare one wasm import per face. Host calls appear only at
+/// statement positions; their i64 args never contain another host call.
+fn scanHostCalls(inst: *const ir.mir.Inst, out: *std.StringHashMapUnmanaged(usize), a: std.mem.Allocator) Error!void {
+    switch (inst.op) {
+        .block => |items| for (items) |ch| try scanHostCalls(ch, out, a),
+        .if_ => |iff| {
+            try scanHostCalls(iff.then_, out, a);
+            if (iff.else_) |e| try scanHostCalls(e, out, a);
+        },
+        .while_ => |w| try scanHostCalls(w.body, out, a),
+        .loop => |body| try scanHostCalls(body, out, a),
+        .host_call => |hc| try out.put(a, hc.name, hc.args.len),
+        else => {},
     }
 }
 
@@ -503,6 +596,9 @@ const Lowerer = struct {
     len_idx: c.BinaryenIndex = 0,
     label_ctr: u32 = 0,
     loops: std.ArrayList(LoopLabels) = .empty,
+    /// Dotted host-face name (`qview.text`) → the declared wasm import's internal
+    /// name (`qview_text`, null-terminated), for lowering `host_call`.
+    host_imports: *const std.StringHashMapUnmanaged([*:0]const u8) = undefined,
 
     fn deinit(self: *Lowerer) void {
         self.loops.deinit(self.allocator);
@@ -587,6 +683,13 @@ const Lowerer = struct {
                 return self.hostOutPair(fmt, @intCast(hi.nl_off));
             },
             .host_out_str => |hs| return self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)),
+            .host_call => |hc| {
+                var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer operands.deinit(self.allocator);
+                for (hc.args) |a| try operands.append(self.allocator, try self.inst(a));
+                const name = self.host_imports.get(hc.name) orelse return Error.UnsupportedCall;
+                return c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type);
+            },
             .fmt_int_to_str => |inner| {
                 // __fmt_i64(value) → (ptr, len). The (pair) result is the str
                 // value; the caller consumes it just like any str-typed inst.
@@ -906,7 +1009,7 @@ const Action = union(enum) {
     print_int_binding: struct { local: u32, nl_off: u32 },
 };
 
-fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]u8 {
+fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl, addr: AddressSpace) ![]u8 {
     const body = fd.body() orelse return Error.NoBody;
 
     // The module's linear-memory image, the ordered plan for `_start`,
@@ -1119,7 +1222,7 @@ fn emitFn(allocator: std.mem.Allocator, resolver: *Resolver, fd: ast.FnDecl) ![]
         }
     }
 
-    return emitModule(allocator, data.items, actions.items, callees.items, segments.items, call_args.items, n_rt);
+    return emitModule(allocator, data.items, actions.items, callees.items, segments.items, call_args.items, n_rt, addr);
 }
 
 /// Reserve the shared newline byte env.out appends; idempotent.
@@ -2656,20 +2759,24 @@ fn emitModule(
     segments: []const Segment,
     call_args: []const ArgVal,
     n_rt_bindings: u32,
+    addr: AddressSpace,
 ) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
-    // q64 is 64-bit: Memory64 linear memory with i64 pointers (spec/
-    // memory.md §"The platform"). The string-return ABI is a `(i64, i64)`
-    // (ptr, len) multi-value return with a tuple local at the call site
-    // (Multivalue + Memory64); arena concatenation uses memory.copy
-    // (BulkMemory).
-    c.BinaryenModuleSetFeatures(
-        module,
-        c.BinaryenFeatureMultivalue() | c.BinaryenFeatureMemory64() |
-            c.BinaryenFeatureBulkMemory() | c.BinaryenFeatureBulkMemoryOpt(),
-    );
+    // The string-return ABI is a `(i64, i64)` (ptr, len) multi-value return; its
+    // i64 addresses are only valid on a 64-bit memory, so this legacy (non-IR)
+    // path requires wasm64 whenever it ships any data. wasm32 support for the
+    // string/arena ABI is the Path-B i32 pointer conversion.
+    if (addr == .wasm32 and data.len > 0) return Error.Wasm32StringAbiUnsupported;
+    const mem64 = addr.memory64();
+
+    // Wasm 3.0 feature set; Memory64 only for wasm64. Multivalue + BulkMemory
+    // are address-space-independent.
+    var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
+        c.BinaryenFeatureBulkMemoryOpt();
+    if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
+    c.BinaryenModuleSetFeatures(module, features);
 
     const i64_type = c.BinaryenTypeInt64();
     const none_type = c.BinaryenTypeNone();
@@ -2683,7 +2790,7 @@ fn emitModule(
     // One active data segment at offset 0 holds the whole memory image.
     // The offset is an i64 const because the memory is 64-bit.
     if (data.len == 0) {
-        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, true, "0");
+        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, mem64, "0");
     } else {
         var seg_datas = [_][*c]const u8{data.ptr};
         var seg_passives = [_]bool{false};
@@ -2703,7 +2810,7 @@ fn emitModule(
             @ptrCast(&seg_sizes),
             seg_sizes.len,
             false,
-            true,
+            mem64,
             "0",
         );
     }
@@ -3086,7 +3193,7 @@ test "emitFromSource: parses fn main { env.out(\"Hello, q64.\") } and emits a va
         \\}
         \\
     ;
-    const bytes = try emitFromSource(testing.allocator, src, "hello.q", &.{});
+    const bytes = try emitFromSource(testing.allocator, src, "hello.q", &.{}, .wasm64);
     defer testing.allocator.free(bytes);
 
     // Valid wasm magic + version.
@@ -3109,7 +3216,7 @@ test "emitFromSource: supports multiple env.out calls" {
         \\}
         \\
     ;
-    const bytes = try emitFromSource(testing.allocator, src, "two.q", &.{});
+    const bytes = try emitFromSource(testing.allocator, src, "two.q", &.{}, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3121,7 +3228,7 @@ test "emitFromSource: missing main returns NoMainFunction" {
     const src = "fn helper { env.out(\"x\") }\n";
     try testing.expectError(
         Error.NoMainFunction,
-        emitFromSource(testing.allocator, src, "no-main.q", &.{}),
+        emitFromSource(testing.allocator, src, "no-main.q", &.{}, .wasm64),
     );
 }
 
@@ -3129,7 +3236,7 @@ test "emitFromSource: non-env.out callee returns UnsupportedCall" {
     const src = "fn main { other.write(\"x\") }\n";
     try testing.expectError(
         Error.UnsupportedCall,
-        emitFromSource(testing.allocator, src, "bad.q", &.{}),
+        emitFromSource(testing.allocator, src, "bad.q", &.{}, .wasm64),
     );
 }
 
@@ -3150,7 +3257,7 @@ test "emitFromSource: resolves a cross-module call inside interpolation" {
         \\
     ;
     const modules = [_]ModuleSource{.{ .name = "dev.q64.hello_world", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3169,7 +3276,7 @@ test "emitFromSource: interpolation with literal text concatenates at runtime" {
     const lib = "pub fn version() -> str { \"0.1.0\" }\n";
     const app = "import dev.q64.hw.{version}\nfn main { env.out(\"v{version()}!\") }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.hw", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3180,7 +3287,7 @@ test "emitFromSource: interpolation with literal text concatenates at runtime" {
 
 test "emitFromSource: a local function is callable inside interpolation" {
     const app = "fn version { \"9.9.9\" }\nfn main { env.out(\"{version()}\") }\n";
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "9.9.9\n") != null);
 }
@@ -3191,7 +3298,7 @@ test "emitFromSource: a const fn bodied with `return` folds" {
     const lib = "pub fn version() -> str { return \"2.0.0\" }\n";
     const app = "import dev.q64.hw.{version}\nfn main { env.out(\"{version()}\") }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.hw", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "2.0.0") != null);
 }
@@ -3211,7 +3318,7 @@ test "emitFromSource: env.out(version()) emits a real (non-folded) call" {
         \\
     ;
     const modules = [_]ModuleSource{.{ .name = "dev.q64.hello_world", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3222,7 +3329,7 @@ test "emitFromSource: env.out of an unknown function errors" {
     const app = "fn main { env.out(mystery()) }\n";
     try testing.expectError(
         Error.NameNotFound,
-        emitFromSource(testing.allocator, app, "main.q", &.{}),
+        emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64),
     );
 }
 
@@ -3233,7 +3340,7 @@ test "emitFromSource: a string parameter is passed and returned (passthrough)" {
     const lib = "pub fn id(s: str) -> str { s }\n";
     const app = "import dev.q64.s.{id}\nfn main { env.out(id(\"hi\")) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3246,7 +3353,7 @@ test "emitFromSource: wrong argument count errors" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
     try testing.expectError(
         Error.UnsupportedCall,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3258,7 +3365,7 @@ test "emitFromSource: a parameterized body transforms its argument" {
     const lib = "pub fn shout(s: str) -> str { \"{s}!\" }\n";
     const app = "import dev.q64.s.{shout}\nfn main { env.out(shout(\"hi\")) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3273,7 +3380,7 @@ test "emitFromSource: a multi-parameter body joins its arguments" {
     const lib = "pub fn join(a: str, b: str) -> str { \"{a}-{b}\" }\n";
     const app = "import dev.q64.s.{join}\nfn main { env.out(join(\"x\", \"y\")) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3290,7 +3397,7 @@ test "emitFromSource: a const-foldable call argument composes" {
     const lib = "pub fn version() -> str { \"0.1.0\" }\npub fn shout(s: str) -> str { \"{s}!\" }\n";
     const app = "import dev.q64.s.{version, shout}\nfn main { env.out(shout(version())) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3299,14 +3406,14 @@ test "emitFromSource: a const-foldable call argument composes" {
 
 test "emitFromSource: a let binding folds into interpolation" {
     const app = "fn main {\n    let name = \"world\"\n    env.out(\"Hello, {name}!\")\n}\n";
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "Hello, world!\n") != null);
 }
 
 test "emitFromSource: integer arithmetic folds at compile time" {
     const app = "fn main {\n    env.out(\"{2 + 3}\")\n    env.out(\"{(1 + 2) * 3}\")\n    env.out(\"{-5 + 8}\")\n}\n";
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "5\n") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "9\n") != null);
@@ -3315,7 +3422,7 @@ test "emitFromSource: integer arithmetic folds at compile time" {
 
 test "emitFromSource: an integer binding folds in arithmetic" {
     const app = "fn main {\n    let n = 6 * 7\n    env.out(\"{n + 1}\")\n}\n";
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "43\n") != null);
 }
@@ -3324,7 +3431,7 @@ test "emitFromSource: division by zero isn't const-foldable" {
     const app = "fn main { env.out(\"{1 / 0}\") }\n";
     try testing.expectError(
         Error.NotConstExpr,
-        emitFromSource(testing.allocator, app, "main.q", &.{}),
+        emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64),
     );
 }
 
@@ -3335,7 +3442,7 @@ test "emitFromSource: a runtime i64 function is called and formatted" {
     const lib = "pub fn double(n: i64) -> i64 { n + n }\n";
     const app = "import dev.q64.m.{double}\nfn main { env.out(double(21)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
     try testing.expect(std.mem.indexOf(u8, bytes, "42") == null);
@@ -3345,7 +3452,7 @@ test "emitFromSource: a multi-parameter i64 function" {
     const lib = "pub fn add(a: i64, b: i64) -> i64 { a + b }\n";
     const app = "import dev.q64.m.{add}\nfn main { env.out(add(40, 2)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3357,7 +3464,7 @@ test "emitFromSource: an i64 function branches on a comparison" {
     const lib = "pub fn max(a: i64, b: i64) -> i64 { if a > b { a } else { b } }\n";
     const app = "import dev.q64.m.{max}\nfn main { env.out(max(3, 9)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3366,7 +3473,7 @@ test "emitFromSource: an else-if chain lowers to nested ifs" {
     const lib = "pub fn sign(n: i64) -> i64 { if n > 0 { 1 } else if n < 0 { 0 - 1 } else { 0 } }\n";
     const app = "import dev.q64.m.{sign}\nfn main { env.out(sign(0 - 7)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3378,7 +3485,7 @@ test "emitFromSource: a value `if` without an else is rejected" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.UnsupportedCall,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3388,7 +3495,7 @@ test "emitFromSource: an i64 let binding is bound, chained, and printed" {
     const lib = "pub fn double(n: i64) -> i64 { n + n }\npub fn add(a: i64, b: i64) -> i64 { a + b }\n";
     const app = "import dev.q64.m.{double, add}\nfn main {\n    let a = double(21)\n    env.out(a)\n    env.out(add(a, 8))\n}\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3399,7 +3506,7 @@ test "emitFromSource: an i64 binding interpolates into a string" {
     const lib = "pub fn double(n: i64) -> i64 { n + n }\n";
     const app = "import dev.q64.m.{double}\nfn main {\n    let a = double(21)\n    env.out(\"a = {a}\")\n}\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
     try testing.expect(std.mem.indexOf(u8, bytes, "a = ") != null);
@@ -3412,7 +3519,7 @@ test "emitFromSource: a string and an i64 binding interpolate together" {
     const lib = "pub fn double(n: i64) -> i64 { n + n }\npub fn shout(s: str) -> str { \"{s}!\" }\n";
     const app = "import dev.q64.m.{double, shout}\nfn main {\n    let a = double(21)\n    let g = shout(\"hi\")\n    env.out(\"{g} a is {a}\")\n}\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
     try testing.expect(std.mem.indexOf(u8, bytes, " a is ") != null);
@@ -3422,7 +3529,7 @@ test "emitFromSource: a binding can name a const call result, referenced directl
     const lib = "pub fn version() -> str { \"0.1.0\" }\n";
     const app = "import dev.q64.s.{version}\nfn main {\n    let v = version()\n    env.out(v)\n}\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "0.1.0\n") != null);
 }
@@ -3443,7 +3550,7 @@ test "emitFromSource: a runtime binding holds a call result, used in interpolati
         \\
     ;
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
 
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
@@ -3467,7 +3574,7 @@ test "emitFromSource: a runtime binding can be passed as an argument" {
         \\
     ;
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
     try testing.expect(std.mem.indexOf(u8, bytes, "[hi!]") == null); // built at runtime
@@ -3481,13 +3588,13 @@ test "emitFromSource: a nested runtime call argument is unsupported" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.s", .source = lib }};
     try testing.expectError(
         Error.NotConstExpr,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
 test "emitFromSource: doubled braces are literal, not interpolation" {
     const app = "fn main { env.out(\"{{not interp}}\") }\n";
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{});
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "{not interp}\n") != null);
 }
@@ -3496,7 +3603,7 @@ test "emitFromSource: interpolating an unknown name errors (honest baseline)" {
     const app = "fn main { env.out(\"{mystery()}\") }\n";
     try testing.expectError(
         Error.NameNotFound,
-        emitFromSource(testing.allocator, app, "main.q", &.{}),
+        emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64),
     );
 }
 
@@ -3504,7 +3611,7 @@ test "emitFromSource: an unresolved import errors (honest baseline)" {
     const app = "import dev.q64.absent.{version}\nfn main { env.out(\"hi\") }\n";
     try testing.expectError(
         Error.UnknownModule,
-        emitFromSource(testing.allocator, app, "main.q", &.{}),
+        emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64),
     );
 }
 
@@ -3514,7 +3621,7 @@ test "emitFromSource: importing a name the module lacks errors" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.hw", .source = lib }};
     try testing.expectError(
         Error.NameNotFound,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3522,7 +3629,7 @@ test "emitFromSource: a relative import is unsupported in v0" {
     const app = "import \"./util.q\".{helper}\nfn main { env.out(\"hi\") }\n";
     try testing.expectError(
         Error.UnsupportedImport,
-        emitFromSource(testing.allocator, app, "main.q", &.{}),
+        emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm64),
     );
 }
 
@@ -3532,7 +3639,7 @@ test "emitFromSource: a while loop sums with var accumulators" {
     const lib = "pub fn sum_to(n: i64) -> i64 { var s = 0; var i = 1; while i <= n { s = s + i; i = i + 1 } s }\n";
     const app = "import dev.q64.m.{sum_to}\nfn main { env.out(sum_to(10)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3541,7 +3648,7 @@ test "emitFromSource: a while loop multiplies (factorial)" {
     const lib = "pub fn fact(n: i64) -> i64 { var r = 1; var i = 2; while i <= n { r = r * i; i = i + 1 } r }\n";
     const app = "import dev.q64.m.{fact}\nfn main { env.out(fact(5)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3550,7 +3657,7 @@ test "emitFromSource: in-body let bindings feed the tail value" {
     const lib = "pub fn poly(n: i64) -> i64 { let a = n + 1; let b = a * 2; a + b }\n";
     const app = "import dev.q64.m.{poly}\nfn main { env.out(poly(3)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3559,7 +3666,7 @@ test "emitFromSource: compound assignment to a var" {
     const lib = "pub fn acc(n: i64) -> i64 { var s = 0; var i = 0; while i < n { s += i; i += 1 } s }\n";
     const app = "import dev.q64.m.{acc}\nfn main { env.out(acc(4)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3570,7 +3677,7 @@ test "emitFromSource: assigning to a let binding is rejected" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.ImmutableAssign,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3580,7 +3687,7 @@ test "emitFromSource: assigning to a parameter is rejected" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.ImmutableAssign,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3588,7 +3695,7 @@ test "emitFromSource: an i64 function recurses (factorial)" {
     const lib = "pub fn fact(n: i64) -> i64 { if n <= 1 { 1 } else { n * fact(n - 1) } }\n";
     const app = "import dev.q64.m.{fact}\nfn main { env.out(fact(6)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3597,7 +3704,7 @@ test "emitFromSource: a recursive function with two self-calls (fib)" {
     const lib = "pub fn fib(n: i64) -> i64 { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n";
     const app = "import dev.q64.m.{fib}\nfn main { env.out(fib(10)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3608,7 +3715,7 @@ test "emitFromSource: composition registers a transitively-called function" {
     const lib = "pub fn square(n: i64) -> i64 { n * n }\npub fn hyp_sq(a: i64, b: i64) -> i64 { square(a) + square(b) }\n";
     const app = "import dev.q64.m.{square, hyp_sq}\nfn main { env.out(hyp_sq(3, 4)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3619,7 +3726,7 @@ test "emitFromSource: a call with the wrong argument count is rejected" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.UnsupportedCall,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3629,7 +3736,7 @@ test "emitFromSource: calling a non-i64 function in an i64 expression is rejecte
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.UnsupportedCall,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3641,7 +3748,7 @@ test "emitFromSource: a loop with an early return finds the first factor" {
     const lib = "pub fn first_factor(n: i64) -> i64 { var i = 2; loop { if n % i == 0 { return i } i = i + 1 } }\n";
     const app = "import dev.q64.m.{first_factor}\nfn main { env.out(first_factor(15)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3650,7 +3757,7 @@ test "emitFromSource: break exits a while loop early" {
     const lib = "pub fn count_to_sum(limit: i64) -> i64 { var s = 0; var i = 0; while i < 1000 { i = i + 1; s = s + i; if s >= limit { break } } i }\n";
     const app = "import dev.q64.m.{count_to_sum}\nfn main { env.out(count_to_sum(10)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3659,7 +3766,7 @@ test "emitFromSource: continue skips an iteration" {
     const lib = "pub fn sum_odd(n: i64) -> i64 { var s = 0; var i = 0; while i < n { i = i + 1; if i % 2 == 0 { continue } s = s + i } s }\n";
     const app = "import dev.q64.m.{sum_odd}\nfn main { env.out(sum_odd(10)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3668,7 +3775,7 @@ test "emitFromSource: an early-return guard and an inner-loop return (is_prime)"
     const lib = "pub fn is_prime(n: i64) -> i64 { if n < 2 { return 0 } var i = 2; while i * i <= n { if n % i == 0 { return 0 } i = i + 1 } 1 }\n";
     const app = "import dev.q64.m.{is_prime}\nfn main { env.out(is_prime(13)) }\n";
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
-    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules);
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64);
     defer testing.allocator.free(bytes);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
@@ -3679,7 +3786,7 @@ test "emitFromSource: break outside a loop is rejected" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.BreakOutsideLoop,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }
 
@@ -3689,6 +3796,6 @@ test "emitFromSource: continue outside a loop is rejected" {
     const modules = [_]ModuleSource{.{ .name = "dev.q64.m", .source = lib }};
     try testing.expectError(
         Error.BreakOutsideLoop,
-        emitFromSource(testing.allocator, app, "main.q", &modules),
+        emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
 }

@@ -42,6 +42,14 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
+        .host_call => |hc| {
+            try app(gpa, out, "host_call {s}(", .{hc.name});
+            for (hc.args, 0..) |a, i| {
+                if (i > 0) try app(gpa, out, ", ", .{});
+                try hirExpr(gpa, out, a);
+            }
+            try app(gpa, out, ")\n", .{});
+        },
         .expr => |e| {
             try app(gpa, out, "expr ", .{});
             try hirExpr(gpa, out, e);
@@ -174,6 +182,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             for (items) |child| try mirInst(gpa, out, child, depth + 1);
         },
         .host_out_const => |hc| try app(gpa, out, "host_out_const off={d} len={d}\n", .{ hc.off, hc.len }),
+        .host_call => |hc| {
+            try app(gpa, out, "host_call {s} ({d} args)\n", .{ hc.name, hc.args.len });
+            for (hc.args) |a| try mirInst(gpa, out, a, depth + 1);
+        },
         .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
         .local_get => |i| try app(gpa, out, "local_get {d}\n", .{i}),
         .local_set => |ls| {
