@@ -47,6 +47,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
+        .host_out_bool => |e| {
+            try app(gpa, out, "host_out_bool ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
         .host_call => |hc| {
             try app(gpa, out, "host_call {s}(", .{hc.name});
             for (hc.args, 0..) |a, i| {

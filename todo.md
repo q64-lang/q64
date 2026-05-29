@@ -60,6 +60,20 @@ and `qube run`):
       `bool` *values* (storable in `let`, returnable, `env.out` → "true"/
       "false") are the next step and need the type-system plumbing below.
       (`none` for optionals is still unrepresented.)
+- [x] **First-class `bool` values (return + print).** A `-> bool` function and
+      `env.out(<bool>)` now work, so `fn is_even(n: i64) -> bool { n % 2 == 0 }`
+      + `env.out(is_even(4))` prints `true`. Added `hir.Type.bool` (→ MIR i32),
+      a `hir.Stmt.host_out_bool` that lowers to a value `if` writing the interned
+      `"true"`/`"false"` text, `returnsBool`/`exprIsBool` detection (comparison /
+      `&&` / `||` / `!` / literal / `-> bool` call) routing `env.out`, and the
+      `-> bool` registration path. To do this soundly, lowering now **threads the
+      value type** through `lowerIntBlock`/`lowerValueIf` and reads a call's type
+      from its callee (both previously hardcoded i64), so a bool body/return
+      validates as i32. Verified end-to-end (incl. `env.out(!is_even(3))`,
+      bare `env.out(3 > 5)`, value-`if` and `let`-bearing bool bodies; i64
+      functions unaffected). **Still out of scope** (the per-local-typing work):
+      bool **locals** (`let x = a > 0`) and bool **params** — both now fail with
+      a clean `UnsupportedExpression` (guarded) rather than an invalid module.
 
 ### The linking ladder (do in order)
 0. [x] **DO FIRST.** `q64 emit` now **errors** on constructs it can't compile
