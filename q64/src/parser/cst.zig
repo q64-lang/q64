@@ -81,6 +81,9 @@ pub const SyntaxKind = enum {
     KW_REGION,
     KW_RETURN,
     KW_SCOPE,
+    KW_SCREEN,
+    KW_DRAW,
+    KW_ON,
     KW_SELECT,
     KW_SELF, // lowercase `self`
     KW_SELF_TYPE, // capitalized `Self`
@@ -248,6 +251,11 @@ pub const SyntaxKind = enum {
     ACTOR_BODY,
     STATE_DECL,
     HANDLE_DECL,
+
+    // Screen / QView DSL
+    SCREEN_DECL,
+    DRAW_BLOCK,
+    ON_HANDLER,
 
     // Bindings
     LET_STMT,

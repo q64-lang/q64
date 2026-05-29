@@ -731,9 +731,25 @@ Remaining:
       The browser host glue (`runtime/web`, qubepods) still needs to read the
       i32 `env.out` args to exercise it in a real PWA (the wasmtime host already
       does); that's the remaining host-side wiring.
-- [ ] **`screen`/`draw` DSL** as real q64 syntax (the frontend language) —
-      unblocks real `@state(app)` syntax + AST partitioning (client
-      reads→subscribe, writes→command).
+- **`screen`/`draw` DSL** as real q64 syntax (the frontend language).
+  - [x] **Parse + AST (the design + parse slice).** New keywords `screen` /
+        `draw` / `on`; grammar `ScreenDecl := "screen" IDENT? "{" (StateDecl |
+        DrawBlock | OnHandler)* "}"`, `DrawBlock := "draw" Block`, `OnHandler :=
+        "on" IDENT Params? Block` (spec/grammar.md). Parser production
+        (`parseScreenDecl`/`parseDrawBlock`/`parseOnHandler`, reusing the
+        existing Block/Params/StateDecl grammar), `ast.ScreenDecl`/`DrawBlock`/
+        `OnHandler` views (+ a generic `ChildIter`), wired into `ast.Item`.
+        Lossless round-trip + structure tests; no corpus conflict (`on`/`draw`/
+        `screen` appear only in comments today). `q64 check` on a screen file is
+        clean.
+  - [ ] **Lowering.** `build_hir` synthesizes `main` (the `draw` block's widget
+        calls + `qview.present()`) and an exported handler per `on <event>`
+        (its body + re-emit the `draw` block + present — Stage-1 auto-redraw),
+        resolving bare widget calls (`text(…)`) to `qview.*` host calls and the
+        screen's `state` to the reactive globals. Then a real screen `.q` emits
+        to the same wasm the hand-written `qview.*` form does today.
+  - [ ] **`@state(scope)`** syntax + AST partitioning (client reads→subscribe,
+        writes→command) builds on this.
 - [ ] **`@state(scope)`** first-class syntax + a twin `face`/RPC API (typed
       methods beyond `inc`).
 - [ ] **MSDF** text (corner-perfect) + the full retained `Renderer` face
