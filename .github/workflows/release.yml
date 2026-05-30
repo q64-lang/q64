@@ -2,28 +2,20 @@
 # them as GitHub Releases on this repo. The qubepods builder container reads
 # `manifest.json` from a release to discover the binary URLs + sha256s.
 #
-# Triggers:
-#   - tag `v*`           -> stable release at that tag
-#   - push to `main`     -> rolling prerelease `nightly` (overwritten each push)
-#   - workflow_dispatch  -> on-demand build (does not publish unless ref is main or a tag)
+# This is a MANUAL release action — it never runs on a routine push to main
+# (we push far more often than we release). Triggers:
+#   - workflow_dispatch  -> manual `nightly` refresh (run it on `main`); on any
+#                           other branch it builds but does not publish
+#   - tag `v*`           -> immutable stable release at that tag
 
 name: release
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  # PRs only run the `build` job (the `release` job's `if:` gates publishing
-  # to main + tags). This lets us validate init.sh + the Zig builds + the
-  # matrix on a PR without cutting a real release. Path-filtered so doc-only
-  # PRs don't burn CI minutes on a 5-minute Binaryen build.
-  pull_request:
-    paths:
-      - '.github/workflows/release.yml'
-      - 'init.sh'
-      - 'q64/**'
-      - 'qube/**'
+  # Manual button (run on `main` to refresh `nightly`) + version tags only.
+  # NOT on push to main and NOT on pull_request.
   workflow_dispatch:
+  push:
+    tags: ['v*']
 
 # Least-privilege default for a public repo: the build job runs read-only
 # (it doesn't need to push, tag, or release), and only the release job
@@ -191,36 +183,32 @@ jobs:
           ls -la release
           cat release/manifest.json
 
-      # `nightly` is a moving target. Delete the old release + retag so the
-      # download URLs stay stable across pushes. Tag releases (vX.Y.Z) are
-      # immutable -- the create step below will fail if the tag already has
-      # a release, which is the behaviour we want.
-      - name: Replace prior nightly
-        if: steps.assemble.outputs.prerelease == 'true'
+      - name: Publish / update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release delete nightly --yes --cleanup-tag || true
-
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
+          tag="${{ steps.assemble.outputs.tag }}"
           notes="q64 + qube linux binaries built from ${GITHUB_SHA}.
 
           Consumed by the qubepods builder container via \`manifest.json\`.
           macOS binaries (if any) are attached separately via scripts/release-mac.sh."
-          # Upload every staged binary (q64-*/qube-*) + the metadata files. With
-          # a linux-only matrix this is just the linux-amd64 pair today.
-          gh release create "${{ steps.assemble.outputs.tag }}" \
-            --target "${GITHUB_SHA}" \
-            --title "${{ steps.assemble.outputs.tag }}" \
-            --notes "$notes" \
-            $([ "${{ steps.assemble.outputs.prerelease }}" = "true" ] && echo --prerelease) \
-            release/q64-* \
-            release/qube-* \
-            release/SHA256SUMS \
-            release/manifest.json \
-            release/doc.json
+          assets=(release/q64-* release/qube-* release/SHA256SUMS release/manifest.json release/doc.json)
+
+          if [ "${{ steps.assemble.outputs.prerelease }}" = "true" ]; then
+            # `nightly` is a moving target. We never DELETE it — we update the
+            # target/notes and clobber-upload only the files this build produced.
+            # Assets added out-of-band (the darwin binaries from
+            # scripts/release-mac.sh) are NOT in the upload set, so they survive
+            # across pushes.
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --target "${GITHUB_SHA}" --notes "$notes" --prerelease
+            else
+              gh release create "$tag" --target "${GITHUB_SHA}" --title "$tag" --notes "$notes" --prerelease
+            fi
+            gh release upload "$tag" --clobber "${assets[@]}"
+          else
+            # Tag releases (vX.Y.Z) are immutable: create fails if the tag
+            # already has a release, which is the behaviour we want.
+            gh release create "$tag" --target "${GITHUB_SHA}" --title "$tag" --notes "$notes" "${assets[@]}"
+          fi

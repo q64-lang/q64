@@ -8,7 +8,7 @@ plus a sibling concern in the qubepods repo.
 |---|---|---|---|
 | **q64.dev** | `q64-web` | `web/` | `pnpm run deploy` |
 | **docs.q64.dev** | `q64-docs` | `q64-docs/` | `pnpm run deploy` |
-| **q64 + qube binaries** | GitHub Release `nightly` | `.github/workflows/release.yml` | push to `main` |
+| **q64 + qube binaries** | GitHub Release `nightly` | `.github/workflows/release.yml` | manual (`workflow_dispatch`) |
 | **macOS binaries** | release assets | `scripts/release-mac.sh` | run on a Mac |
 | **qubepods.com `.well-known`** | `qubepods-web` | *qubepods repo* `apps/web/` | `pnpm -C apps/web deploy` |
 
@@ -86,17 +86,24 @@ fail); deploy manually with the command above.
 
 ## Binary release — q64 + qube (+ doc.json)
 
-Pushing to `main` triggers `.github/workflows/release.yml`, which builds
-**linux-amd64** `q64` + `qube` (ReleaseFast) and overwrites the rolling
-`nightly` release with:
+The release is a **manual** action — it does **not** run on routine pushes to
+main (we push far more often than we release). Refresh the rolling `nightly`:
+
+```sh
+gh workflow run release.yml --ref main      # or Actions → release → Run workflow
+```
+
+Push a `vX.Y.Z` tag for an immutable stable release instead. Either way it builds
+**linux-amd64** `q64` + `qube` (ReleaseFast) and updates the `nightly` release:
 
 ```
 q64-linux-amd64  qube-linux-amd64  SHA256SUMS  manifest.json  doc.json
 ```
 
 `manifest.json` is the contract the **qubepods builder container** reads to
-fetch (and sha-verify) the binaries. A tag push (`v*`) cuts an immutable release
-instead of `nightly`.
+fetch (and sha-verify) the binaries. The action **updates** `nightly` in place
+(it no longer deletes/recreates it) and only clobbers the files it builds, so
+**out-of-band assets like the macOS binaries survive** across releases.
 
 > After a release that changes the compiler, **rebuild / repin the qubepods
 > builder container** so it picks up the new `q64`/`qube` (e.g. to use
@@ -109,9 +116,13 @@ static lib (so it can't be cross-compiled from linux). Build them on a Mac and
 attach them to the release:
 
 ```sh
-# after the nightly release exists (CI has run)
+# after the nightly release exists (you've run the release action)
 scripts/release-mac.sh           # TAG defaults to "nightly"
 ```
+
+Because the release action updates `nightly` in place (never deletes it), these
+mac binaries persist across subsequent releases — re-run this only when you want
+to refresh them for a new compiler build.
 
 It builds the host arch (arm64 on Apple Silicon, amd64 on Intel) and
 `gh release upload`s `q64-darwin-<arch>` + `qube-darwin-<arch>`. Run it once on
