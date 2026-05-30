@@ -52,8 +52,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
-          cache-dependency-path: q64-docs/pnpm-lock.yaml
+          # No pnpm cache: install is gated on the Cloudflare secret below, so
+          # the store may not exist — the cache-save post-step would then error.
 
       # Best-effort: pull the latest published doc.json. If there is no release
       # yet (or the asset is missing), the generator uses the committed fixture.
