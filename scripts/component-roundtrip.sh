@@ -19,6 +19,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIG="$REPO_ROOT/vendor/zig/zig"
 Q64_BIN="$REPO_ROOT/q64/zig-out/bin/q64"
+QUBE_BIN="$REPO_ROOT/qube/zig-out/bin/qube"
 CHECK_BIN="$REPO_ROOT/runtime/wasmtime/zig-out/bin/q64-component-check"
 
 export LD_LIBRARY_PATH="$REPO_ROOT/vendor/wasmtime/lib:${LD_LIBRARY_PATH:-}"
@@ -30,6 +31,8 @@ fi
 
 echo "==> building q64"
 "$ZIG" build --build-file "$REPO_ROOT/q64/build.zig"
+echo "==> building qube"
+"$ZIG" build --build-file "$REPO_ROOT/qube/build.zig"
 echo "==> building component validator (wasmtime)"
 "$ZIG" build --build-file "$REPO_ROOT/runtime/wasmtime/build.zig"
 
@@ -72,4 +75,15 @@ echo "==> q64 emit --component (mixed str + scalar) lifts the scalar export"
 "$Q64_BIN" emit "$tmp/mixed.q" "$tmp/mixed.wasm" --addr wasm32 --component
 "$CHECK_BIN" "$tmp/mixed.component.wasm" sub 50 8 42
 
-echo "PASS: component lift validated by wasmtime (add/mul/sub), boundaries honest"
+# --- qube build --component drives the same lift through the package tool -----
+echo "==> qube build --component (examples/math-lib library)"
+mathlib_dir="$REPO_ROOT/examples/math-lib"
+rm -rf "$mathlib_dir/target"
+( cd "$mathlib_dir" && Q64_BIN="$Q64_BIN" "$QUBE_BIN" build --component )
+mathlib_comp="$mathlib_dir/target/debug/wasm64/dev.q64.math.component.wasm"
+test -f "$mathlib_comp" || { echo "FAIL: qube build produced no component" >&2; exit 1; }
+echo "==> wasmtime: call dev.q64.math add(40,2) == 42"
+"$CHECK_BIN" "$mathlib_comp" add 40 2 42
+rm -rf "$mathlib_dir/target"
+
+echo "PASS: component lift validated by wasmtime (add/mul/sub), via q64 emit and qube build"

@@ -519,10 +519,19 @@ spec/q64-cli.md `--component`).
         roundtrip.sh` (+ `zig build component-roundtrip`) proves `add(2,3)=5`,
         `mul(6,7)=42`, `sub(50,8)=42` through real components, and asserts the
         boundary rejections. Plus `component.zig` structural unit tests.
-- [ ] **`qube build --component` delegation.** `qube build` is still a stub; wire
-      it (and `--component` / `component.emit`) to invoke `q64 emit --component`
-      and place `target/<profile>/<addr>/<name>.component.wasm` per
-      qube-cli.md §"Build outputs".
+- [x] **`qube build --component` delegation.** `qube build [--component]
+      [--addr wasm32|wasm64] [--release]` (`qube/src/main.zig` `cmdBuild`) reads
+      the manifest, resolves deps to `--module` specs, and delegates to `q64
+      emit` — writing `target/<profile>/<addr>/<name>.wasm` and, with
+      `--component` (flag or manifest `component.emit: true`),
+      `<name>.component.wasm`. Builds libraries as well as apps; doesn't run the
+      result. New `examples/math-lib/` (a scalar library that lifts cleanly).
+      Verified: `qube-test/tests/build.test.ts` rewritten to real compiles
+      (gated on `q64Available`, `Q64_BIN` threaded through) + `usage`/`exit-codes`
+      pins updated; `scripts/component-roundtrip.sh` now also drives `qube build
+      --component` on the example and validates with wasmtime. 113/113 qube-test
+      + 81/81 q64-test green. **Remaining:** `--target <name>` (named manifest
+      targets) is accepted-but-ignored, not yet wired.
 - [ ] **Import lowering (capability faces).** Lower `env.out` (→ a WASI/host
       import) through `canon lower` so an *app* (not just a pure library) wraps
       as a component. Needs the core module to export `memory` + `cabi_realloc`
