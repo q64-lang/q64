@@ -398,23 +398,34 @@ fn buildMainIfNode(b: *Builder, is: ast.IfStmt, scope: *Scope, rt: *RtMap) Build
     return out;
 }
 
-/// Build every non-main, void-returning top-level `fn` as an exported screen
-/// handler (e.g. `pub fn on_press(id: i64) { … }`, or a backend twin's
-/// `pub fn inc() { count = count + 1 }`).
+/// Build the qube's **public surface**: every non-`main` top-level `pub fn`,
+/// whether or not `main` reaches it. A void-returning one is an exported screen/
+/// twin handler (`pub fn on_press(id: i64) { … }`, `pub fn inc() { count += 1 }`);
+/// a value-returning one (`pub fn greet(name: str) -> str { … }`) is a library
+/// export, built through `registerFunc`. Either way the function is marked
+/// `.public` so the component/WIT lift surfaces it as an export — and so a local
+/// `pub fn` already built `.private` because `main` called it is upgraded to
+/// public here (a transitively-reached *dependency* function, declared in
+/// another file, never reaches this pass, so it correctly stays `.private`).
+///
+/// A private no-return-type helper is skipped — it's folded into a caller or
+/// emitted on demand via `registerFunc`, not part of the surface.
 fn buildScreenFuncs(b: *Builder, sf: ast.SourceFile) BuildError!void {
     var it = sf.items();
     while (it.next()) |item| switch (item) {
         .fn_decl => |fd| {
             const nm = fd.name() orelse continue;
             if (std.mem.eql(u8, nm.text, "main")) continue;
-            if (fd.returnType() != null) continue; // void-returning handlers only
-            // Only the public surface is an exported screen/twin handler the
-            // host invokes (`pub fn on_press`, `pub fn inc`). A private
-            // no-return-type function is a helper — folded into a caller (e.g.
-            // `fn version { "9.9.9" }` used in interpolation) or emitted
-            // on demand via `registerFunc` — not a screen function.
-            if (fd.visibility() == null) continue;
-            try buildScreenFunc(b, fd);
+            if (fd.visibility() == null) continue; // private — built on demand if reached
+            if (fd.returnType() == null) {
+                try buildScreenFunc(b, fd); // void-returning handler
+            } else {
+                // A value-returning export (i64 / bool / str). `registerFunc`
+                // dedups, so a `pub fn` already built because `main` reached it
+                // returns its existing id; we then mark it public.
+                const id = try registerFunc(b, nm.text);
+                b.funcs.items[id].visibility = .public;
+            }
         },
         else => {},
     };
@@ -1739,4 +1750,56 @@ test "effects: a pure i64 helper carries no capability" {
     try testing.expect(std.mem.indexOf(u8, dump, "fn double -> i64\n") != null);
     // main still writes stdout.
     try testing.expect(std.mem.indexOf(u8, dump, "@stdout") != null);
+}
+
+// The surface pass resolves a file-local `pub fn` by name; production indexes
+// the compiled file's own functions (`Resolver.indexLocalFunctions`). The test
+// resolver simulates that by also registering the source as a lookup source.
+fn buildLocal(gpa: std.mem.Allocator, tr: *TestResolver, source: []const u8) !?hir.Module {
+    try tr.addLib(source);
+    return buildFromSource(gpa, source, tr.resolver());
+}
+
+test "surface: an unreached pub fn is built and exported (public)" {
+    // `greet` is never called by main, but as a `pub fn` it is part of the
+    // qube's export surface — it must still be built and marked public.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        "pub fn greet(name: str) -> str { \"hi {name}\" }\nfn main {\n env.out(\"hello\")\n}\n")) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn greet -> str") != null);
+}
+
+test "surface: a reached local pub fn is upgraded to a public export" {
+    // `shout` is called by main (so built `.private` on demand), but it is
+    // declared `pub` in this file, so the surface pass upgrades it to public.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        "pub fn shout(s: str) -> str { \"{s}!\" }\nfn main {\n env.out(shout(\"hi\"))\n}\n")) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn shout -> str") != null);
+}
+
+test "surface: a main-less library of pub fns builds (not NoMainFunction)" {
+    // A library qube (no `fn main`) exporting only value-returning pub fns was
+    // rejected as no_main before the surface pass built value exports.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        "pub fn version() -> str { \"0.1.0\" }\npub fn add(a: i64, b: i64) -> i64 { a + b }\n")) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expect(mod.entry == null); // no entry — it's a library
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn version -> str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn add -> i64") != null);
 }

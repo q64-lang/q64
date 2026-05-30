@@ -38,4 +38,14 @@ describe.skipIf(!binaryAvailable())("q64 show world", () => {
     expect(r.stdout).toContain("export main");
     expect(r.stdout).toContain("import wasi:cli/stdout");
   });
+
+  test("exports the full public surface of a main-less library, exit 0", () => {
+    // A library qube (no `fn main`) — its world is exports-only, even though no
+    // entry reaches them, and its pure surface imports nothing.
+    const r = runCli(["show", "world", "--qube", fixture("library.q")]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("export version: func() -> string");
+    expect(r.stdout).toContain("export add: func(a: s64, b: s64) -> s64");
+    expect(r.stdout).toContain("(none — pure surface)");
+  });
 });
