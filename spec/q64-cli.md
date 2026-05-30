@@ -78,7 +78,7 @@ flags as needed (see "Global options").
 
 | Flag        | Meaning                                                                          |
 |-------------|----------------------------------------------------------------------------------|
-| `--stdout`  | Read source from stdin (when `path` is omitted) or from `path`, write the formatted result to stdout. Leaves the input file untouched. Used by the MCP server and editors that own the file's on-disk state. |
+| `--stdout`  | Read source from stdin (when `path` is omitted) or from `path`, write the formatted result to stdout. Leaves the input file untouched. Used by editors and tools that own the file's on-disk state. |
 | `--lint`    | Report formatting issues as diagnostics on stderr; do not modify files.          |
 | `--check`   | Exit `64` if any file would be reformatted; do not modify files.                 |
 

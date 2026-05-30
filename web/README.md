@@ -14,9 +14,9 @@ the in-browser q64 playground.
   search, dark mode, prev/next navigation) and the splash landing page.
 - **Cloudflare Worker + Static Assets** — deployment. One Worker
   (`q64-web`) serves the static build and handles hostname-level
-  concerns. The registry API ([`../continuum`](../continuum)) and the
-  MCP server ([`../mcp`](../mcp)) stay as separate Workers for blast
-  radius — cross-Worker calls go through service bindings.
+  concerns. The registry API ([`../continuum`](../continuum)) stays as a
+  separate Worker for blast radius — cross-Worker calls go through
+  service bindings.
 
 ## Develop
 
@@ -92,7 +92,7 @@ on first deploy if it doesn't exist.
 
 ## Why one Worker for the site only
 
-Folding the registry API and MCP server into this Worker would let one
+Folding the registry API into this Worker would let one
 bad deploy (e.g. a Starlight upgrade that fails at build time) take
 out the API surface too. Keeping them as siblings means the deploy
 units match the failure domains. Service bindings keep cross-Worker

@@ -75,7 +75,7 @@ the module:
 This is **informational**, not enforced. The compiler ignores the
 `exports:` line for visibility purposes — only `pub` declarations
 actually control what's exported. The header drives `q64 show modules`
-output, LSP hover/summary panels, and the MCP `q64.show.modules` tool.
+output and LSP hover/summary panels.
 
 ## Import grammar
 
