@@ -475,14 +475,21 @@ it with `CfgUnsupported`).
         `cmdShow`. Flipped `show/types-effects.test.ts` (effects) and
         `show/capabilities-world.test.ts` (capabilities, world) from `test.failing`
         to passing; 80/80 CLI tests + roundtrips green.
-  - [ ] **Dependency-origin visibility / unreached `pub` surface.** Today the HIR
-        builder constructs only functions *reachable from `main`*, and a reached
-        dependency function is modeled `.private`. Two consequences for the lift:
-        an unreached `pub fn` (an export with no internal caller) is absent from
-        the HIR, so `show world` omits it and `show effects <that fn>` is
-        `NameNotFound`; and the WIT lift needs to scope "exported surface" to the
-        qube being compiled (not its deps). Build the full `pub` surface, not just
-        the reachable graph.
+  - [x] **Dependency-origin visibility / unreached `pub` surface.** The HIR
+        builder now constructs the qube's **full public surface**, not just the
+        `main`-reachable graph: `buildScreenFuncs` walks every non-`main` top-level
+        `pub fn` and builds it — void-returning ones as screen/twin handlers (as
+        before), value-returning ones (`pub fn greet(name: str) -> str`) via
+        `registerFunc`. Each is marked `.public`, which also **upgrades a local
+        `pub fn` that `main` already built `.private`** to a public export; a
+        transitively-reached *dependency* function (declared in another file) never
+        reaches this pass, so it correctly stays `.private` — scoping the export
+        surface to the qube being compiled. `show world`/`show effects <fn>` now
+        see unreached exports (the `NameNotFound`/omission boundary is gone), and a
+        **main-less library qube** (only `pub fn`s) builds + emits instead of being
+        rejected `NoMainFunction`. Verified: 3 build_hir surface tests
+        (unreached export, reached→public upgrade, main-less library) + a `show
+        world` library CLI test; 81/81 CLI tests + roundtrip green.
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
