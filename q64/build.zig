@@ -101,6 +101,14 @@ pub fn build(b: *std.Build) void {
     const hello_step = b.step("hello-roundtrip", "Run the end-to-end hello-world smoke test");
     hello_step.dependOn(&hello_script.step);
 
+    // End-to-end: emit a component and validate + call it with wasmtime.
+    const component_script = b.addSystemCommand(&.{
+        "bash",
+        "../scripts/component-roundtrip.sh",
+    });
+    const component_step = b.step("component-roundtrip", "Emit a component and validate it with wasmtime");
+    component_step.dependOn(&component_script.step);
+
     // Black-box CLI suite (Bun). Builds the binary, then runs `bun test`
     // in the sibling ../q64-test against zig-out/bin/q64. Only runs when
     // invoked explicitly; needs `bun` on PATH.

@@ -166,6 +166,9 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
         .locals = locals,
         .body = .{ .structured = body },
         .linkage = .local,
+        // A public value-returning function (a library export) is exported by
+        // name so a host — or the component lift — can reach it.
+        .exported = (hf.visibility == .public),
     };
 }
 

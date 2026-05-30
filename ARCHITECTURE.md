@@ -145,6 +145,13 @@ ABI later).
 > synthesizes the component's WIT (exports = the pub surface, imports = the
 > capability set), which is the input to the `component` stage above. The assert
 > markers (`@pure`/`@realtime`/…) and the typeck/region stages remain ahead.
+>
+> The **component** stage has a first slice too: `q64 emit --component`
+> (`codegen/component.zig`) hand-encodes a real WebAssembly component that wraps
+> the core module and lifts its import-free, scalar export surface through the
+> canonical ABI — validated end-to-end by wasmtime (`q64-component-check`).
+> Capability-import lowering (so an app, not just a pure library, wraps) and
+> string/list lifting are the next slices.
 
 ### parser — [`q64/src/parser/`](./q64/src/parser/README.md)
 
