@@ -33,9 +33,10 @@ describe.skipIf(!binaryAvailable())("q64 show world", () => {
     const r = runCli(["show", "world", "--qube", fixture("hello.q")]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout.trim().length).toBeGreaterThan(0);
-    // The world exports the public surface (main) and imports its capabilities.
+    // An app (has `fn main`) is a WASI command: the world exports
+    // `wasi:cli/run` and imports the capabilities `main` reaches.
     expect(r.stdout).toContain("world ");
-    expect(r.stdout).toContain("export main");
+    expect(r.stdout).toContain("export wasi:cli/run");
     expect(r.stdout).toContain("import wasi:cli/stdout");
   });
 
