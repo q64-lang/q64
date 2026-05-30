@@ -223,9 +223,19 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     const core = try lowerToWasm(allocator, &mmod, addr);
     defer allocator.free(core);
 
-    // The import-lowering case (a capability face like `env.out` → a WASI
-    // import) isn't encoded yet — only an import-free core module lifts cleanly.
-    if (coreHasImports(core)) return Error.ComponentNeedsImportLowering;
+    // An app that reaches a capability face imports `env.out`. We lower that one
+    // import (→ a component `log: func(string)`) via the indirection pattern and
+    // lift `_start` as `run`. The canonical ABI here is wasm32-only for now
+    // (the 32-bit linear memory the string lowering reads); a wasm64 import
+    // build is reported as not-yet-supported.
+    if (coreHasImports(core)) {
+        if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
+        const shim = try buildShimModule(allocator);
+        defer allocator.free(shim);
+        const fixup = try buildFixupModule(allocator);
+        defer allocator.free(fixup);
+        return component.encodeApp(allocator, core, shim, fixup);
+    }
 
     // Gather the scalar public exports. A non-scalar (`str`/list) export needs
     // memory/realloc canon options not in this slice — skip it for now.
@@ -261,6 +271,75 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
 
     if (exports.items.len == 0) return Error.ComponentNoExports;
     return component.encode(allocator, core, exports.items);
+}
+
+/// Serialize a Binaryen module to an owned byte slice.
+fn writeBinaryenModule(allocator: std.mem.Allocator, module: c.BinaryenModuleRef) ![]u8 {
+    if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
+    const result = c.BinaryenModuleAllocateAndWrite(module, null);
+    defer if (result.binary) |b| std.c.free(b);
+    defer if (result.sourceMap) |s| std.c.free(s);
+    const ptr = result.binary orelse return Error.SerializeEmpty;
+    if (result.binaryBytes == 0) return Error.SerializeEmpty;
+    const src: [*]const u8 = @ptrCast(ptr);
+    const out = try allocator.alloc(u8, result.binaryBytes);
+    @memcpy(out, src[0..result.binaryBytes]);
+    return out;
+}
+
+/// Build the **shim** core module for component import lowering: a 1-slot
+/// funcref table (exported as `$imports`) plus a trampoline `(i32, i32) -> ()`
+/// (exported as `0`) that `call_indirect`s table slot 0. The q64 core module's
+/// `env.out` import is satisfied by this trampoline; the real lowered import is
+/// patched into the table by the fixup module — breaking the instantiation
+/// cycle (the lowered import needs the core memory, which only exists after the
+/// core module is instantiated).
+fn buildShimModule(allocator: std.mem.Allocator) ![]u8 {
+    const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
+    defer c.BinaryenModuleDispose(module);
+    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureAll());
+    const i32_t = c.BinaryenTypeInt32();
+    const none_t = c.BinaryenTypeNone();
+    const funcref = c.BinaryenTypeFuncref();
+    var pp = [_]c.BinaryenType{ i32_t, i32_t };
+    const params = c.BinaryenTypeCreate(&pp, pp.len);
+
+    _ = c.BinaryenAddTable(module, "$imports", 1, 1, funcref, null);
+    var ops = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalGet(module, 0, i32_t),
+        c.BinaryenLocalGet(module, 1, i32_t),
+    };
+    const target = c.BinaryenConst(module, c.BinaryenLiteralInt32(0));
+    const body = c.BinaryenCallIndirect(module, "$imports", target, &ops, ops.len, params, none_t);
+    _ = c.BinaryenAddFunction(module, "0", params, none_t, null, 0, body);
+    _ = c.BinaryenAddFunctionExport(module, "0", "0");
+    _ = c.BinaryenAddTableExport(module, "$imports", "$imports");
+    return writeBinaryenModule(allocator, module);
+}
+
+/// Build the **fixup** core module: imports the shim's table (`"" "$imports"`)
+/// and the lowered import func (`"" "0"`), and an active element segment writes
+/// the func into table slot 0 at instantiation. After this runs, the shim
+/// trampoline dispatches to the real canonical-ABI-lowered import.
+fn buildFixupModule(allocator: std.mem.Allocator) ![]u8 {
+    const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
+    defer c.BinaryenModuleDispose(module);
+    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureAll());
+    const i32_t = c.BinaryenTypeInt32();
+    const none_t = c.BinaryenTypeNone();
+    const funcref = c.BinaryenTypeFuncref();
+    var pp = [_]c.BinaryenType{ i32_t, i32_t };
+    const params = c.BinaryenTypeCreate(&pp, pp.len);
+
+    c.BinaryenAddFunctionImport(module, "f", "", "0", params, none_t);
+    // Create the table, then mark it imported (Binaryen needs the table object
+    // to exist for the element segment to reference it).
+    _ = c.BinaryenAddTable(module, "$imports", 1, 1, funcref, null);
+    c.BinaryenAddTableImport(module, "$imports", "", "$imports");
+    const offset = c.BinaryenConst(module, c.BinaryenLiteralInt32(0));
+    var fnames = [_][*c]const u8{"f"};
+    _ = c.BinaryenAddActiveElementSegment(module, "$imports", "e", &fnames, fnames.len, offset);
+    return writeBinaryenModule(allocator, module);
 }
 
 /// Scan a core module for an import section (id 2). Used to gate component

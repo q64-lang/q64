@@ -9,6 +9,16 @@
 #     capability-face imports (env.out, …).
 #   - Binaryen (vendor/binaryen/) — used by q64/src/codegen/ to
 #     assemble Wasm modules from the typed AST.
+#   - wabt / wat2wasm (vendor/wabt/) — OPTIONAL: compile WAT fixtures +
+#     component helper modules and inspect emitted wasm. sha256-pinned;
+#     skipped on platforms without a pinned hash (the core build never
+#     needs it).
+#   - wasm-tools (vendor/wasm-tools/) — OPTIONAL: component-model tooling
+#     (validate / WIT extraction / component new); used to differential-test
+#     the q64 component encoder. sha256-pinned; skipped where unpinned.
+#   - WASI preview1 adapter (vendor/wasi/) — OPTIONAL: the shim `wasm-tools
+#     component new --adapt` uses to wrap a preview1 core module into a real
+#     wasi:cli/* component. sha256-pinned.
 #
 # Re-runnable; skips work that's already done. Run from the repo root:
 #
@@ -40,6 +50,49 @@ WASMTIME_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/dow
 BINARYEN_VERSION="${BINARYEN_VERSION:-129}"
 BINARYEN_DEST="vendor/binaryen"
 BINARYEN_REPO="https://github.com/WebAssembly/binaryen.git"
+# Prebuilt-cache accelerator (a top-level `binaryen/` tarball: static lib +
+# headers) — skips the ~10-minute from-source build. Defaults to q64's public
+# CDN bucket under `toolchain/`; verified against the pinned sha256 below, with
+# the from-source build as the fallback on miss / mismatch / unpinned platform.
+BINARYEN_CACHE_URL="${BINARYEN_CACHE_URL-https://cdn.q64.dev/toolchain}"
+BINARYEN_CACHE_SHA256_x86_64_linux="7258855e9e193b50252124f1c2d6a4ab67072acd501f9c782ee154321006d7d5"
+
+# wabt (wat2wasm / wasm2wat) — OPTIONAL developer tooling: compile the WAT
+# fixtures + component helper modules to wasm, and inspect emitted modules.
+# The toolchain (q64, host, codegen) does NOT require it; a platform without a
+# pinned hash just skips it. Trust root is the pinned sha256 below — verified
+# whatever the source. WABT_CACHE_URL defaults to q64's public CDN bucket
+# (cdn.q64.dev, bucket `q64`) under the `toolchain/` prefix, which mirrors the
+# upstream release tarball by its asset name (object key
+# `toolchain/wabt-<ver>-<os>.tar.gz`); init.sh tries the CDN first and falls
+# back to github.com on a miss. The pin makes the mirror safe regardless.
+# Override the URL (or set it empty) to force the upstream release.
+WABT_VERSION="${WABT_VERSION:-1.0.37}"
+WABT_DEST="vendor/wabt"
+WABT_RELEASE_BASE="https://github.com/WebAssembly/wabt/releases/download"
+WABT_CACHE_URL="${WABT_CACHE_URL-https://cdn.q64.dev/toolchain}"
+
+# wasm-tools — OPTIONAL: the component-model swiss-army knife (validate / print
+# / parse components, extract a component's WIT world, `component new/embed`).
+# Used to differential-test the q64 component encoder against the reference
+# implementation. Not needed for the core build. Same fetch model as wabt: the
+# public CDN mirror, sha256-pinned, github.com as fallback. The upstream release
+# tag carries a `v` prefix (v<ver>); the asset basename does not.
+WASMTOOLS_VERSION="${WASMTOOLS_VERSION:-1.251.0}"
+WASMTOOLS_DEST="vendor/wasm-tools"
+WASMTOOLS_RELEASE_BASE="https://github.com/bytecodealliance/wasm-tools/releases/download"
+WASMTOOLS_CACHE_URL="${WASMTOOLS_CACHE_URL-https://cdn.q64.dev/toolchain}"
+
+# WASI Preview 1 adapter (a single .wasm) — OPTIONAL: the official preview1->
+# preview2 shim `wasm-tools component new --adapt` uses to wrap a preview1 core
+# module (one that imports wasi_snapshot_preview1.*) into a real wasi:cli/*
+# component. Tied to the wasmtime version. CDN mirror (versioned name) first,
+# the wasmtime release (unversioned name) as fallback; sha256-pinned.
+WASI_ADAPTER_VERSION="${WASI_ADAPTER_VERSION:-45.0.0}"
+WASI_ADAPTER_DEST="vendor/wasi"
+WASI_ADAPTER_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/download"
+WASI_ADAPTER_CACHE_URL="${WASI_ADAPTER_CACHE_URL-https://cdn.q64.dev/toolchain}"
+WASI_ADAPTER_SHA256="eb843effeade4b79d7b9e9bf0e21ba33c24c26d54f347414a1ba72bcb65fac74"
 
 cd "$(dirname "$0")"
 
@@ -259,33 +312,45 @@ install_binaryen() {
         return
     fi
 
-    # Fast path: pull a prebuilt static lib from an external cache, skipping the
-    # ~10-minute from-source build. The cache URL is intentionally NOT hardcoded
-    # here — it stays out of this public repo and is supplied via
-    # BINARYEN_CACHE_URL by the environment that knows it (see qubepods'
-    # scripts/setup-q64-toolchain.sh, which hosts the prebuilt lib in a
-    # public-read R2 bucket). The cached tarball unpacks to a top-level
-    # `binaryen/` dir matching the short-circuit above; any miss or error falls
-    # through to the source build below, so this is purely an accelerator.
+    # Fast path: pull a prebuilt static lib from q64's public CDN cache
+    # (cdn.q64.dev/toolchain/, the same bucket as wabt), skipping the ~10-minute
+    # from-source build. The cached tarball unpacks to a top-level `binaryen/`
+    # dir matching the short-circuit above. The pinned sha256 is the trust root:
+    # a download that doesn't match (or a platform with no pin, or any miss)
+    # falls through to the source build below, so the cache is a safe accelerator.
     if [ -n "${BINARYEN_CACHE_URL:-}" ]; then
-        local c_arch c_os c_key c_url c_tar
+        local c_arch c_os c_key c_url c_tar pin_key pin got_sha
         c_arch="$(uname -m)"; case "$c_arch" in amd64) c_arch=x86_64;; arm64) c_arch=aarch64;; esac
         c_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-        c_key="binaryen-${BINARYEN_VERSION}-${c_arch}-${c_os}.tar.gz"
-        c_url="${BINARYEN_CACHE_URL%/}/$c_key"
-        c_tar="$tmpdir/$c_key"
-        echo "init.sh: trying binaryen cache $c_url"
-        if curl -fsSL "$c_url" -o "$c_tar" && [ -s "$c_tar" ]; then
-            mkdir -p "$(dirname "$BINARYEN_DEST")"
-            tar -xzf "$c_tar" -C "$(dirname "$BINARYEN_DEST")"
-            if [ -f "$BINARYEN_DEST/lib/libbinaryen.a" ] && \
-               [ "$(cat "$BINARYEN_DEST/VERSION" 2>/dev/null)" = "$BINARYEN_VERSION" ]; then
-                echo "init.sh: restored prebuilt binaryen $BINARYEN_VERSION from cache"
-                return
-            fi
-            echo "init.sh: cache tarball did not yield binaryen $BINARYEN_VERSION; building from source" >&2
+        pin_key="BINARYEN_CACHE_SHA256_${c_arch}_${c_os}"
+        pin="${!pin_key:-}"
+        if [ -z "$pin" ]; then
+            echo "init.sh: no pinned binaryen cache for ${c_arch}-${c_os}; building from source"
         else
-            echo "init.sh: binaryen cache miss/unavailable; building from source"
+            c_key="binaryen-${BINARYEN_VERSION}-${c_arch}-${c_os}.tar.gz"
+            c_url="${BINARYEN_CACHE_URL%/}/$c_key"
+            c_tar="$tmpdir/$c_key"
+            echo "init.sh: trying binaryen cache $c_url"
+            if curl -fsSL "$c_url" -o "$c_tar" && [ -s "$c_tar" ]; then
+                got_sha="$("${sha256_cmd[@]}" "$c_tar" | awk '{print $1}')"
+                if [ "$got_sha" = "$pin" ]; then
+                    echo "init.sh: binaryen cache sha256 verified ($got_sha)"
+                    mkdir -p "$(dirname "$BINARYEN_DEST")"
+                    tar -xzf "$c_tar" -C "$(dirname "$BINARYEN_DEST")"
+                    if [ -f "$BINARYEN_DEST/lib/libbinaryen.a" ] && \
+                       [ "$(cat "$BINARYEN_DEST/VERSION" 2>/dev/null)" = "$BINARYEN_VERSION" ]; then
+                        echo "init.sh: restored prebuilt binaryen $BINARYEN_VERSION from cache"
+                        return
+                    fi
+                    echo "init.sh: cache tarball did not yield binaryen $BINARYEN_VERSION; building from source" >&2
+                else
+                    echo "init.sh: binaryen cache sha256 mismatch — ignoring cache, building from source" >&2
+                    echo "  expected: $pin" >&2
+                    echo "  got:      $got_sha" >&2
+                fi
+            else
+                echo "init.sh: binaryen cache miss/unavailable; building from source"
+            fi
         fi
     fi
 
@@ -348,9 +413,185 @@ install_binaryen() {
     echo "init.sh: binaryen $BINARYEN_VERSION installed at $BINARYEN_DEST"
 }
 
+# =====================================================================
+# wabt (wat2wasm / wasm2wat) — optional dev tooling, sha256-pinned
+# =====================================================================
+#
+# Downloaded prebuilt from the upstream GitHub release and VERIFIED against a
+# pinned sha256 (the security control: a tampered byte stream is rejected
+# regardless of where it was fetched from). Optional WABT_CACHE_URL provides an
+# R2 mirror — the same upstream tarball, so the same pin verifies it. A platform
+# without a pinned hash is skipped (the core toolchain doesn't need wabt), and
+# any failure is non-fatal.
+
+# triple -> "<release-asset-basename>:<sha256>" for the pinned WABT_VERSION.
+# Add a platform by downloading its release asset and pasting basename + hash.
+WABT_KNOWN_x86_64_linux="wabt-${WABT_VERSION}-ubuntu-20.04.tar.gz:cfc675dc9b663d9adc8c75d982c1ba29f661448a2e026a67e71fe3f76a3e09f3"
+
+# triple -> "<release-asset-basename>:<sha256>" for the pinned WASMTOOLS_VERSION.
+WASMTOOLS_KNOWN_x86_64_linux="wasm-tools-${WASMTOOLS_VERSION}-x86_64-linux.tar.gz:08d523676ec71d9afbae05aa4255041ce91bf2d325d87b7e722d190d558be689"
+
+install_wabt() {
+    if [ -x "$WABT_DEST/bin/wat2wasm" ] && \
+       [ "$(cat "$WABT_DEST/VERSION" 2>/dev/null)" = "$WABT_VERSION" ]; then
+        echo "init.sh: wabt $WABT_VERSION already installed at $WABT_DEST"
+        return 0
+    fi
+
+    local key="WABT_KNOWN_${arch}_${os}"
+    local entry="${!key:-}"
+    if [ -z "$entry" ]; then
+        echo "init.sh: no pinned wat2wasm for ${arch}-${os} — skipping (optional tooling)"
+        return 0
+    fi
+    local asset="${entry%%:*}"
+    local expected_sha="${entry##*:}"
+    local tarball="$tmpdir/$asset"
+
+    # Try the optional R2 mirror first, then the upstream release. Either source
+    # is checked against the same pinned sha256, so a bad mirror can't poison it.
+    local got=""
+    if [ -n "$WABT_CACHE_URL" ] && \
+       curl -fsSL "${WABT_CACHE_URL%/}/$asset" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="cache"
+    elif curl -fsSL "${WABT_RELEASE_BASE}/${WABT_VERSION}/${asset}" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="release"
+    else
+        echo "init.sh: wat2wasm download failed — skipping (optional tooling)" >&2
+        return 0
+    fi
+
+    local actual_sha
+    actual_sha="$("${sha256_cmd[@]}" "$tarball" | awk '{print $1}')"
+    if [ "$actual_sha" != "$expected_sha" ]; then
+        echo "init.sh: wabt sha256 mismatch (from $got) — refusing:" >&2
+        echo "  expected: $expected_sha" >&2
+        echo "  got:      $actual_sha" >&2
+        return 0
+    fi
+    echo "init.sh: wabt sha256 verified ($actual_sha, from $got)"
+
+    tar -xzf "$tarball" -C "$tmpdir"
+    local extracted="$tmpdir/wabt-${WABT_VERSION}"
+    if [ ! -d "$extracted" ]; then
+        echo "init.sh: unexpected wabt tarball layout — skipping" >&2
+        return 0
+    fi
+    rm -rf "$WABT_DEST"
+    mv "$extracted" "$WABT_DEST"
+    echo "$WABT_VERSION" > "$WABT_DEST/VERSION"
+    echo "init.sh: wabt $WABT_VERSION installed at $WABT_DEST ($("$WABT_DEST/bin/wat2wasm" --version 2>/dev/null || echo '?'))"
+}
+
+# =====================================================================
+# wasm-tools — optional component-model tooling, sha256-pinned
+# =====================================================================
+
+install_wasmtools() {
+    if [ -x "$WASMTOOLS_DEST/wasm-tools" ] && \
+       [ "$(cat "$WASMTOOLS_DEST/VERSION" 2>/dev/null)" = "$WASMTOOLS_VERSION" ]; then
+        echo "init.sh: wasm-tools $WASMTOOLS_VERSION already installed at $WASMTOOLS_DEST"
+        return 0
+    fi
+
+    local key="WASMTOOLS_KNOWN_${arch}_${os}"
+    local entry="${!key:-}"
+    if [ -z "$entry" ]; then
+        echo "init.sh: no pinned wasm-tools for ${arch}-${os} — skipping (optional tooling)"
+        return 0
+    fi
+    local asset="${entry%%:*}"
+    local expected_sha="${entry##*:}"
+    local tarball="$tmpdir/$asset"
+
+    # CDN mirror first, then the upstream release (tag carries a `v` prefix).
+    # Both are checked against the same pin, so a bad mirror can't poison it.
+    local got=""
+    if [ -n "$WASMTOOLS_CACHE_URL" ] && \
+       curl -fsSL "${WASMTOOLS_CACHE_URL%/}/$asset" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="cache"
+    elif curl -fsSL "${WASMTOOLS_RELEASE_BASE}/v${WASMTOOLS_VERSION}/${asset}" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="release"
+    else
+        echo "init.sh: wasm-tools download failed — skipping (optional tooling)" >&2
+        return 0
+    fi
+
+    local actual_sha
+    actual_sha="$("${sha256_cmd[@]}" "$tarball" | awk '{print $1}')"
+    if [ "$actual_sha" != "$expected_sha" ]; then
+        echo "init.sh: wasm-tools sha256 mismatch (from $got) — refusing:" >&2
+        echo "  expected: $expected_sha" >&2
+        echo "  got:      $actual_sha" >&2
+        return 0
+    fi
+    echo "init.sh: wasm-tools sha256 verified ($actual_sha, from $got)"
+
+    tar -xzf "$tarball" -C "$tmpdir"
+    # The tarball extracts to a dir named after the asset basename.
+    local extracted="$tmpdir/${asset%.tar.gz}"
+    if [ ! -x "$extracted/wasm-tools" ]; then
+        echo "init.sh: unexpected wasm-tools tarball layout — skipping" >&2
+        return 0
+    fi
+    rm -rf "$WASMTOOLS_DEST"
+    mv "$extracted" "$WASMTOOLS_DEST"
+    echo "$WASMTOOLS_VERSION" > "$WASMTOOLS_DEST/VERSION"
+    echo "init.sh: wasm-tools $WASMTOOLS_VERSION installed at $WASMTOOLS_DEST ($("$WASMTOOLS_DEST/wasm-tools" --version 2>/dev/null || echo '?'))"
+}
+
+# =====================================================================
+# wasi adapter — optional preview1->preview2 shim, sha256-pinned
+# =====================================================================
+
+install_wasi_adapter() {
+    local file="$WASI_ADAPTER_DEST/wasi_snapshot_preview1.command.wasm"
+    if [ -f "$file" ] && \
+       [ "$(cat "$WASI_ADAPTER_DEST/VERSION" 2>/dev/null)" = "$WASI_ADAPTER_VERSION" ]; then
+        echo "init.sh: wasi adapter $WASI_ADAPTER_VERSION already installed at $WASI_ADAPTER_DEST"
+        return 0
+    fi
+
+    # A single .wasm (not a tarball). The CDN mirror uses a versioned object
+    # name; the wasmtime release uses the unversioned name. Both are checked
+    # against the same pin, so a bad mirror can't poison it.
+    local cdn_name="wasi_snapshot_preview1.command-${WASI_ADAPTER_VERSION}.wasm"
+    local rel_name="wasi_snapshot_preview1.command.wasm"
+    local out="$tmpdir/wasi-adapter.wasm"
+    local got=""
+    if [ -n "$WASI_ADAPTER_CACHE_URL" ] && \
+       curl -fsSL "${WASI_ADAPTER_CACHE_URL%/}/$cdn_name" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+        got="cache"
+    elif curl -fsSL "${WASI_ADAPTER_RELEASE_BASE}/v${WASI_ADAPTER_VERSION}/${rel_name}" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+        got="release"
+    else
+        echo "init.sh: wasi adapter download failed — skipping (optional tooling)" >&2
+        return 0
+    fi
+
+    local actual_sha
+    actual_sha="$("${sha256_cmd[@]}" "$out" | awk '{print $1}')"
+    if [ "$actual_sha" != "$WASI_ADAPTER_SHA256" ]; then
+        echo "init.sh: wasi adapter sha256 mismatch (from $got) — refusing:" >&2
+        echo "  expected: $WASI_ADAPTER_SHA256" >&2
+        echo "  got:      $actual_sha" >&2
+        return 0
+    fi
+    echo "init.sh: wasi adapter sha256 verified ($actual_sha, from $got)"
+
+    rm -rf "$WASI_ADAPTER_DEST"
+    mkdir -p "$WASI_ADAPTER_DEST"
+    mv "$out" "$file"
+    echo "$WASI_ADAPTER_VERSION" > "$WASI_ADAPTER_DEST/VERSION"
+    echo "init.sh: wasi adapter $WASI_ADAPTER_VERSION installed at $WASI_ADAPTER_DEST"
+}
+
 install_zig
 install_wasmtime
 install_binaryen
+install_wabt
+install_wasmtools
+install_wasi_adapter
 
 echo
 echo "Add zig to PATH for this shell:"

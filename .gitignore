@@ -7,6 +7,9 @@ zig-cache/
 vendor/zig/
 vendor/wasmtime/
 vendor/binaryen/
+vendor/wabt/
+vendor/wasm-tools/
+vendor/wasi/
 
 # Node / Astro / web tooling
 node_modules/
