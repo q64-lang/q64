@@ -1,0 +1,38 @@
+---
+title: q64 documentation
+description: Documentation for the q64 language and toolchain — guides, reference, and the spec.
+template: splash
+hero:
+  tagline: |
+    <span class="hero-headline">LEARN q64.</span>
+    <span class="hero-sub">A stream-first language for WebAssembly 3.0. Guides to get you started, a generated reference, and the formal spec — in one place.</span>
+    <span class="hero-note"><strong>Pre-alpha.</strong> The language, runtime, and registry are under active development.</span>
+  actions:
+    - text: Get started
+      link: /guides/getting-started
+      variant: primary
+    - text: Reference
+      link: /reference/keywords
+      variant: minimal
+    - text: View on GitHub
+      link: https://github.com/q64-lang/q64
+      icon: github
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <Card title="Guides" icon="open-book">
+    Hand-written walkthroughs — start with [Getting started](/guides/getting-started).
+  </Card>
+  <Card title="Reference" icon="list-format">
+    Generated from the compiler: [keywords](/reference/keywords), [builtin types](/reference/types), and every [diagnostic code](/reference/diagnostics).
+  </Card>
+  <Card title="Spec" icon="document">
+    The authoritative language and tooling [specification](/spec).
+  </Card>
+  <Card title="For agents" icon="rocket">
+    A machine-ingestible reference lives at <a href="/llms.txt"><code>/llms.txt</code></a>.
+  </Card>
+</CardGrid>

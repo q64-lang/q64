@@ -28,6 +28,7 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 fmt [path]`        | Format source in-place (file or directory); add `--stdout` to print to stdout instead and read from stdin when `path` is omitted |
 | `q64 lsp`               | Run the language server (stdin/stdout LSP)                    |
 | `q64 show <kind> <arg>` | Introspection (see below)                                     |
+| `q64 doc --json [--qube <file.q>]` | Emit the language documentation index as JSON (see below) |
 | `q64 explain <code>`    | Print structured documentation for a diagnostic code          |
 | `q64 repl`              | Interactive REPL (eventual; not in v0)                        |
 
@@ -204,7 +205,7 @@ $ q64 explain TYP041 --diagnostics json
     }
   ],
   "see_also": ["TYP040", "TYP042"],
-  "url": "https://q64.dev/diagnostics/TYP041"
+  "url": "https://docs.q64.dev/diagnostics/TYP041"
 }
 ```
 
@@ -215,7 +216,47 @@ fix it?"* without scraping prose documentation. Mirrors Vercel Zero's
 
 The data backing each code is generated from the per-spec diagnostic
 tables (`spec/modules.md`, `spec/faces.md`, `spec/errors.md`, …) at
-compiler build time; the registry is part of the compiler binary.
+compiler build time; the registry is part of the compiler binary. The
+same registry backs `q64 doc --json` and the diagnostic pages at
+`docs.q64.dev/diagnostics/<CODE>` (the canonical `url` above), so the
+terminal, the JSON index, and the web pages never disagree.
+
+**v0 fields.** The implemented surface emits `{code, subsystem,
+severity, message, url}`. The prose fields above (`title`, `summary`,
+`examples`, `see_also`) land as the per-spec diagnostic prose is filled
+in; consumers must treat them as optional.
+
+## `q64 doc --json`
+
+Emits the **language documentation index** as a single JSON document on
+stdout — the machine-readable superset of `show modules`, and the single
+source of truth the docs site (`docs.q64.dev`) renders into reference
+pages and `llms.txt`. `--json` is required (there is no human renderer in
+v0).
+
+```
+$ q64 doc --json                       # language-level index (no source)
+$ q64 doc --json --qube lib.q          # + that qube's public surface
+```
+
+The schema is versioned (`schema_version`) and separates three tiers so
+it is forward-stable as the type checker lands:
+
+- **`language`** (available now) — `keywords[] {text, kind}`,
+  `builtin_types[] {name, category, doc}`, and `diagnostics[] {code,
+  subsystem, severity, message, url}` (the registry shared with
+  `explain`; each `url` is `docs.q64.dev/diagnostics/<CODE>`).
+- **`qube`** (`null` without `--qube`) — the qube's module `//!` doc and,
+  per top-level item, `{kind, name, visibility, doc, signature}` plus
+  `params`/`return_type` (functions), `fields` (structs), `variants`
+  (enums). Extracted from the parser.
+- **`resolved`** (per item) — reserved for type-checker output
+  (`return_type`, `param_types`, `effects`, `capabilities`); emitted
+  empty in v0 and filled with no schema change once `typeck` lands.
+
+Parse diagnostics on a `--qube` source are written to stderr as the
+standard envelope (per [`diagnostics.md`](./diagnostics.md)), mirroring
+`check`.
 
 ## LSP
 

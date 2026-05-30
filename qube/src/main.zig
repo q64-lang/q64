@@ -19,7 +19,7 @@ const version_string = "qube 0.0.1 (pre-alpha)";
 // Emitted by the QUBE_FORCE_ICE test seam (see main). A single-line diagnostic
 // envelope matching spec/diagnostics.md §"ICE convention".
 const ice_envelope =
-    \\{"ok":false,"diagnostics":[{"code":"Q9001","severity":"internal","kind":"ice","message":"forced internal error (QUBE_FORCE_ICE)","repair":{"id":"report-upstream","safety":"n/a","report_url":"https://q64.dev/ice?code=Q9001"}}]}
+    \\{"ok":false,"diagnostics":[{"code":"Q9001","severity":"internal","kind":"ice","message":"forced internal error (QUBE_FORCE_ICE)","repair":{"id":"report-upstream","safety":"n/a","report_url":"https://docs.q64.dev/diagnostics/Q9001"}}]}
 ;
 
 // Kept in sync with q64/src/main.zig's `--version` output. The `qube web`

@@ -80,6 +80,17 @@ pub fn build(b: *std.Build) void {
     const ir_tests = b.addTest(.{ .root_module = ir_tests_mod });
     test_step.dependOn(&b.addRunArtifact(ir_tests).step);
 
+    // `doc` (q64 doc --json) is parser-only — no Binaryen link — but needs the
+    // `parser` import, so it gets its own test module like the IR tests.
+    const doc_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/doc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    doc_tests_mod.addImport("parser", parser_mod);
+    const doc_tests = b.addTest(.{ .root_module = doc_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(doc_tests).step);
+
     const codegen_mod = b.createModule(.{
         .root_source_file = b.path("src/codegen/emit.zig"),
         .target = target,
