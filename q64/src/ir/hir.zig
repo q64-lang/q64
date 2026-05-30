@@ -69,6 +69,96 @@ pub const Reject = enum {
 
 pub const Visibility = enum { private, public };
 
+/// A positive **capability effect** — "this function may do X" (spec/effects.md
+/// §"Capabilities"). The compiler infers a function's set from the host faces
+/// it transitively reaches; the component/WIT lift turns the set into the
+/// synthesized world's *imports* (visibility gives the *exports*). Capabilities
+/// propagate **up** the call graph: calling an `@io` callee makes the caller
+/// `@io` too.
+///
+/// v0 detects the faces the HIR models today (`env.out` → `@stdout`, a `qview.*`
+/// host call → `@ui`); the remaining markers are listed so the enum is
+/// spec-complete and the lift has stable names, even before a face that emits
+/// them lands. The *assert* / *observation* markers (`@pure`, `@realtime`,
+/// `@cancel`, …) are a separate, later pass — this enum is capabilities only.
+///
+/// `@io` sorts last so a set prints finest-grained first (`@stdout + @io`).
+pub const Effect = enum {
+    stdout,
+    stderr,
+    network,
+    fs,
+    kv,
+    audio,
+    midi,
+    ui,
+    inference,
+    time,
+    random,
+    exit,
+    envvars,
+    wire,
+    io,
+
+    /// The `@`-prefixed source marker (`@stdout`, …).
+    pub fn marker(self: Effect) []const u8 {
+        return switch (self) {
+            .stdout => "@stdout",
+            .stderr => "@stderr",
+            .network => "@network",
+            .fs => "@fs",
+            .kv => "@kv",
+            .audio => "@audio",
+            .midi => "@midi",
+            .ui => "@ui",
+            .inference => "@inference",
+            .time => "@time",
+            .random => "@random",
+            .exit => "@exit",
+            .envvars => "@envvars",
+            .wire => "@wire",
+            .io => "@io",
+        };
+    }
+
+    /// The capability this effect implies, if any (`@stdout` ⇒ `@io`), per
+    /// spec/effects.md §"Implication graph". One level; the effect pass closes
+    /// it transitively. The peer capabilities (`@audio`, `@ui`, `@time`, …) do
+    /// not imply `@io` — they target dedicated host surfaces.
+    pub fn implies(self: Effect) ?Effect {
+        return switch (self) {
+            .stdout, .stderr, .network, .fs, .kv, .wire => .io,
+            else => null,
+        };
+    }
+
+    /// The WIT interface a component built from this qube imports for the
+    /// effect, per spec/effects.md §"The capability table is the import table".
+    /// `null` for effects with no single import surface: `@io` (the umbrella —
+    /// only its finer-grained members import) and `@wire` (the import is the
+    /// remote qube's own `world`, not a fixed interface). The WASI rows pin to
+    /// the WASIp3 snapshot env.md tracks; the host-custom rows (`@audio`/`@midi`/
+    /// `@ui`/`@inference`) have no WASI P2 interface.
+    pub fn witImport(self: Effect) ?[]const u8 {
+        return switch (self) {
+            .stdout => "wasi:cli/stdout",
+            .stderr => "wasi:cli/stderr",
+            .network => "wasi:sockets/*",
+            .fs => "wasi:filesystem/*",
+            .kv => "wasi:keyvalue/store",
+            .time => "wasi:clocks/*",
+            .random => "wasi:random/random",
+            .envvars => "wasi:cli/environment",
+            .exit => "wasi:cli/exit",
+            .audio => "q64:host/audio",
+            .midi => "q64:host/midi",
+            .ui => "q64:host/ui",
+            .inference => "q64:host/inference",
+            .io, .wire => null,
+        };
+    }
+};
+
 /// One module's worth of HIR, arena-owned. Callers allocate every node via
 /// `alloc()` so the whole graph frees in one `deinit()`. The arena is moved
 /// with the struct (its buffers live on the heap), so do not hold a
@@ -111,8 +201,12 @@ pub const Func = struct {
     /// assign / let), lowered like the entry. main is the entry screen; other
     /// screen functions (e.g. `on_press`) are exported by name when public.
     is_screen: bool = false,
-    // effects: future — the effect pass writes the capability set here, which
-    // the component/WIT + QubePod stages consume. Empty in v0.
+    /// The capability effect set, inferred by the effect pass (`effects.zig`):
+    /// the host faces this function transitively reaches, implication-closed and
+    /// sorted (finest-grained first, `@io` last), deduped. Empty before the pass
+    /// runs and for a function that reaches no capability. The component/WIT +
+    /// QubePod stages read this as the import side of the world.
+    effects: []const Effect = &.{},
 };
 
 /// High-level statements. `block` is shared; the `host_out*` forms appear in

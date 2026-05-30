@@ -1,60 +1,79 @@
 /**
- * `qube build [--target <name>]` (spec/qube-cli.md §Subcommands, §"target/
- * layout"). Compiles the qube to wasm, invoking q64 per source file.
+ * `qube build [--component] [--addr <addr>] [--release]` (spec/qube-cli.md
+ * §Subcommands, §"Build outputs"). Compiles the qube to wasm by delegating to
+ * `q64 emit`, writing `target/<profile>/<addr>/<name>.wasm` (and, with
+ * `--component`, `<name>.component.wasm`).
  *
- * Test-first: not implemented in v0 (stub exits 2 — pinned in usage.test.ts).
- * `test.failing` asserts the artifacts/exit codes until it lands.
+ * These really compile, so they need the `q64` binary built; gated on
+ * `q64Available()` and pass `Q64_BIN` through to the spawned qube. The default
+ * address space is wasm64 (q64 emit's default). End-to-end component validation
+ * (wasmtime instantiating + calling the lifted exports) lives in
+ * scripts/component-roundtrip.sh.
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { appManifest, binaryAvailable, makeProject, runCli } from "../src/harness";
+import { Q64_BIN, appManifest, binaryAvailable, makeProject, q64Available, runCli } from "../src/harness";
+
+const env = { Q64_BIN };
 
 function appProject() {
   return makeProject({ "qube.json5": appManifest(), "src/main.q": "fn main { env.out(\"x\") }\n" });
 }
 
-describe.skipIf(!binaryAvailable())("qube build", () => {
-  test.failing("writes target/debug/<name>.wasm by default, exit 0", () => {
+// A scalar library — its exports lift to a component with no capability imports
+// (the slice `--component` handles today).
+function scalarLibProject() {
+  return makeProject({
+    "qube.json5": '{ "name": "dev.q64.math", "version": "0.1.0", "license": "MIT", "type": "library", "entry": "src/lib.q" }',
+    "src/lib.q": "pub fn add(a: i64, b: i64) -> i64 { a + b }\n",
+  });
+}
+
+describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
+  test("writes target/debug/<addr>/<name>.wasm by default, exit 0", () => {
     const proj = appProject();
-    const r = runCli(["build"], { cwd: proj });
+    const r = runCli(["build"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
-    expect(existsSync(join(proj, "target/debug/dev.q64.test_app.wasm"))).toBe(true);
+    expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.test_app.wasm"))).toBe(true);
   });
 
-  test.failing("--release writes target/release/<name>.wasm", () => {
+  test("--release writes target/release/<addr>/<name>.wasm", () => {
     const proj = appProject();
-    const r = runCli(["build", "--release"], { cwd: proj });
+    const r = runCli(["build", "--release"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
-    expect(existsSync(join(proj, "target/release/dev.q64.test_app.wasm"))).toBe(true);
+    expect(existsSync(join(proj, "target/release/wasm64/dev.q64.test_app.wasm"))).toBe(true);
   });
 
-  test.failing("--component also writes a <name>.component.wasm", () => {
+  test("--addr wasm32 selects the address-space subdir", () => {
     const proj = appProject();
-    runCli(["build", "--component"], { cwd: proj });
-    expect(existsSync(join(proj, "target/debug/dev.q64.test_app.component.wasm"))).toBe(true);
-  });
-
-  test.failing("--debug builds into target/debug (unoptimised), exit 0", () => {
-    const proj = appProject();
-    const r = runCli(["build", "--debug"], { cwd: proj });
+    const r = runCli(["build", "--addr", "wasm32"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
-    expect(existsSync(join(proj, "target/debug/dev.q64.test_app.wasm"))).toBe(true);
+    expect(existsSync(join(proj, "target/debug/wasm32/dev.q64.test_app.wasm"))).toBe(true);
   });
 
-  test.failing("--target <name> selects a named target from the manifest, exit 0", () => {
-    const proj = makeProject({
-      "qube.json5": '{ "name": "dev.q64.test_app", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q", "targets": { "desktop": { "host": "wasmtime" } } }',
-      "src/main.q": "fn main { env.out(\"x\") }\n",
-    });
-    expect(runCli(["build", "--target", "desktop"], { cwd: proj }).exitCode).toBe(0);
+  test("--component on a scalar library also writes <name>.component.wasm", () => {
+    const proj = scalarLibProject();
+    const r = runCli(["build", "--component"], { cwd: proj, env });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.math.wasm"))).toBe(true);
+    expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.math.component.wasm"))).toBe(true);
   });
 
-  test.failing("a compile error from q64 propagates as exit 64", () => {
+  test("a compile error from q64 propagates as exit 64", () => {
     const proj = makeProject({
       "qube.json5": appManifest(),
       "src/main.q": "import q64.math.*\nfn main { env.out(\"x\") }\n",
     });
-    expect(runCli(["build"], { cwd: proj }).exitCode).toBe(64);
+    expect(runCli(["build"], { cwd: proj, env }).exitCode).toBe(64);
+  });
+
+  // `--component` on an *application* needs capability-import lowering
+  // (`env.out` → `wasi:cli/stdout`), which isn't implemented yet — the build
+  // errors instead of mis-wrapping. Pinned until import lowering lands.
+  test.failing("--component on an app that writes stdout succeeds", () => {
+    const proj = appProject();
+    const r = runCli(["build", "--component"], { cwd: proj, env });
+    expect(r.exitCode).toBe(0);
   });
 });

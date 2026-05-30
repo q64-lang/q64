@@ -452,12 +452,94 @@ it with `CfgUnsupported`).
   - [x] **HIR visibility slot surfaced.** `show hir` prints `pub` for a
         non-entry public function (an exported screen/twin handler) — the
         export-surface signal the component/WIT lift will read.
-  - [ ] **Effect slot.** `hir.Func` has no `effects` field yet — it lands with
-        the effect pass; the component/WIT lift then reads visibility + effects
-        to synthesize the world (exports = pub surface, imports = capabilities).
-  - [ ] **Dependency-origin visibility.** Today a reached dependency function
-        is modeled `.private` in the app's HIR; the WIT lift needs to scope
-        "exported surface" to the qube being compiled (not its deps).
+  - [x] **Effect slot + effect pass.** `hir.Func` carries an `effects` field —
+        the capability set (`hir.Effect`, spec/effects.md) inferred by a new
+        pure-Zig HIR pass (`ir/effects.zig`). It walks each function's body for
+        host faces (`env.out` → `@stdout`, a `qview.*` host call → `@ui`), unions
+        callee sets up the call graph to a fixpoint (handles recursion/cycles),
+        closes implications (`@stdout` ⇒ `@io`), and writes the sorted set back.
+        Runs inside `build_hir.tryBuild`, so every consumer sees effect-annotated
+        HIR. `show hir` now prints the set on each function's header line
+        (`fn main -> void [entry] @stdout + @io`). Verified: effects.zig API
+        tests (`implies`/`marker`/`witImport`/`close`) + build_hir integration
+        tests (stdout/ui/pure-helper) + `show effects` CLI test.
+  - [x] **Component/WIT lift seams — `show effects|capabilities|world`.** Three
+        new `show` kinds over the effect-annotated HIR (spec/q64-cli.md): `show
+        effects <fn> --qube <file>` prints one function's set; `show capabilities
+        --qube <file>` prints the qube's capability closure over its public
+        surface; `show world --qube <file>` synthesizes the WIT `world` — exports
+        = the public surface (signatures lowered to the canonical ABI via the
+        `witType` map), imports = the capability set mapped through the
+        effect→WIT-import table (`hir.Effect.witImport`: `@stdout` →
+        `wasi:cli/stdout`, `@ui` → `q64:host/ui`, …). `--qube` flag added to
+        `cmdShow`. Flipped `show/types-effects.test.ts` (effects) and
+        `show/capabilities-world.test.ts` (capabilities, world) from `test.failing`
+        to passing; 80/80 CLI tests + roundtrips green.
+  - [x] **Dependency-origin visibility / unreached `pub` surface.** The HIR
+        builder now constructs the qube's **full public surface**, not just the
+        `main`-reachable graph: `buildScreenFuncs` walks every non-`main` top-level
+        `pub fn` and builds it — void-returning ones as screen/twin handlers (as
+        before), value-returning ones (`pub fn greet(name: str) -> str`) via
+        `registerFunc`. Each is marked `.public`, which also **upgrades a local
+        `pub fn` that `main` already built `.private`** to a public export; a
+        transitively-reached *dependency* function (declared in another file) never
+        reaches this pass, so it correctly stays `.private` — scoping the export
+        surface to the qube being compiled. `show world`/`show effects <fn>` now
+        see unreached exports (the `NameNotFound`/omission boundary is gone), and a
+        **main-less library qube** (only `pub fn`s) builds + emits instead of being
+        rejected `NoMainFunction`. Verified: 3 build_hir surface tests
+        (unreached export, reached→public upgrade, main-less library) + a `show
+        world` library CLI test; 81/81 CLI tests + roundtrip green.
+
+## Component emission — `q64 emit --component` — ACTIVE
+
+Wiring the WIT lift into a build artifact: a real WebAssembly **component**
+wrapping the core module (spec/modules.md §"The qube as a component",
+spec/q64-cli.md `--component`).
+
+- [x] **Smallest faithful slice — validated by wasmtime.** `q64 emit <f> <out>
+      --component` writes the core module *and* `<out>.component.wasm`, a genuine
+      component the vendored wasmtime accepts, instantiates, and can call.
+      - `codegen/component.zig` — a pure-Zig component-model binary encoder
+        (preamble + core-module / core-instance / alias / type / canon-lift /
+        export sections). `emit.emitComponent` emits the core module, checks it
+        is import-free, gathers the scalar `pub` surface, and wraps it.
+      - **Scope:** import-free core modules, **scalar** exports (`i64`→`s64`,
+        `bool`, `f64`) that cross the canonical ABI with no memory/`realloc`
+        glue. A `str`/list export is skipped; a core module that imports a
+        capability face (`env.out`) is `ComponentNeedsImportLowering` (honest,
+        not mis-wrapped); an empty liftable surface is `ComponentNoExports`.
+      - **Two supporting codegen fixes:** the `env.out` import is now declared
+        only when used (`usesEnvOut`) — a pure library imports nothing; and a
+        public value-returning callee is now `exported` by name (was only set on
+        the entry/screen path), so a library's functions reach the host + lift.
+      - **Validation harness:** `runtime/wasmtime/src/component_check.zig` →
+        `q64-component-check`, which runs `wasmtime_component_new` (validate) and
+        optionally instantiates + calls a scalar export. `scripts/component-
+        roundtrip.sh` (+ `zig build component-roundtrip`) proves `add(2,3)=5`,
+        `mul(6,7)=42`, `sub(50,8)=42` through real components, and asserts the
+        boundary rejections. Plus `component.zig` structural unit tests.
+- [x] **`qube build --component` delegation.** `qube build [--component]
+      [--addr wasm32|wasm64] [--release]` (`qube/src/main.zig` `cmdBuild`) reads
+      the manifest, resolves deps to `--module` specs, and delegates to `q64
+      emit` — writing `target/<profile>/<addr>/<name>.wasm` and, with
+      `--component` (flag or manifest `component.emit: true`),
+      `<name>.component.wasm`. Builds libraries as well as apps; doesn't run the
+      result. New `examples/math-lib/` (a scalar library that lifts cleanly).
+      Verified: `qube-test/tests/build.test.ts` rewritten to real compiles
+      (gated on `q64Available`, `Q64_BIN` threaded through) + `usage`/`exit-codes`
+      pins updated; `scripts/component-roundtrip.sh` now also drives `qube build
+      --component` on the example and validates with wasmtime. 113/113 qube-test
+      + 81/81 q64-test green. **Remaining:** `--target <name>` (named manifest
+      targets) is accepted-but-ignored, not yet wired.
+- [ ] **Import lowering (capability faces).** Lower `env.out` (→ a WASI/host
+      import) through `canon lower` so an *app* (not just a pure library) wraps
+      as a component. Needs the core module to export `memory` + `cabi_realloc`
+      and the import-side canon encoding.
+- [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
+      the canonical ABI string representation (memory + realloc canon options);
+      today they're skipped from the component surface.
+
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).

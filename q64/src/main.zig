@@ -86,6 +86,9 @@ fn usage(io: std.Io) !void {
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
         \\  show <hir|mir> <file.q> [--module name=dir ...]
         \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
+        \\  show effects <fn> --qube <file.q>  Print a function's inferred capability effect set.
+        \\  show capabilities --qube <file.q>  Print the qube's compiler-derived capability set.
+        \\  show world --qube <file.q>         Print the synthesized WIT world (exports + imports).
         \\  --version                          Print the version and exit.
         \\
     );
@@ -181,11 +184,16 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     // the wasm32 string ABI lands (Path B). `--addr wasm32` opts in to a genuine
     // 32-bit module (the WebKit/iPad baseline) for the integer/import subset.
     var addr: emit.AddressSpace = .wasm64;
+    var want_component = false;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
 
     while (args_it.next()) |a| {
-        if (std.mem.eql(u8, a, "--addr")) {
+        if (std.mem.eql(u8, a, "--component")) {
+            // Also wrap the core module in a component (spec/q64-cli.md). The
+            // core module is still written to `out`.
+            want_component = true;
+        } else if (std.mem.eql(u8, a, "--addr")) {
             const v = args_it.next() orelse {
                 try usage(io);
                 std.process.exit(2);
@@ -263,6 +271,24 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     defer gpa.free(bytes);
 
     try writeFile(io, out, bytes);
+
+    // --component: additionally wrap the core module in a WebAssembly component,
+    // written to `<out without .wasm>.component.wasm` (spec/q64-cli.md).
+    if (want_component) {
+        const comp = emit.emitComponent(gpa, source, src, module_sources.items, addr) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writer(io, &buf);
+            try w.interface.print("q64: component emit failed: {s}\n", .{@errorName(err)});
+            try w.interface.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(comp);
+
+        const base = if (std.mem.endsWith(u8, out, ".wasm")) out[0 .. out.len - ".wasm".len] else out;
+        const comp_path = try std.fmt.allocPrint(gpa, "{s}.component.wasm", .{base});
+        defer gpa.free(comp_path);
+        try writeFile(io, comp_path, comp);
+    }
 }
 
 fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
@@ -310,7 +336,10 @@ fn readModuleSources(gpa: std.mem.Allocator, io: std.Io, module_args: []const Mo
 /// surfaces the same honest diagnostics on a malformed program.
 fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
     var kind: ?[]const u8 = null;
-    var src_path: ?[]const u8 = null;
+    // The second positional: a source file for `hir`/`mir`, or a subject (a
+    // function name) for `effects`. The qube-level kinds take `--qube` instead.
+    var arg2: ?[]const u8 = null;
+    var qube_file: ?[]const u8 = null;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
 
@@ -328,12 +357,17 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
                 std.process.exit(2);
             };
             try module_args.append(gpa, .{ .name = spec[0..eq], .dir = spec[eq + 1 ..] });
+        } else if (std.mem.eql(u8, a, "--qube")) {
+            qube_file = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
         } else if (std.mem.startsWith(u8, a, "--")) {
             // Tolerate (and ignore) flags this subcommand doesn't consume.
         } else if (kind == null) {
             kind = a;
-        } else if (src_path == null) {
-            src_path = a;
+        } else if (arg2 == null) {
+            arg2 = a;
         } else {
             try usage(io);
             std.process.exit(2);
@@ -344,16 +378,36 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         try usage(io);
         std.process.exit(2);
     };
-    const src = src_path orelse {
+
+    // Classify the kind and resolve which positional is the source file.
+    const Kind = enum { hir, mir, effects, capabilities, world };
+    const which: Kind = if (std.mem.eql(u8, k, "hir"))
+        .hir
+    else if (std.mem.eql(u8, k, "mir"))
+        .mir
+    else if (std.mem.eql(u8, k, "effects"))
+        .effects
+    else if (std.mem.eql(u8, k, "capabilities"))
+        .capabilities
+    else if (std.mem.eql(u8, k, "world"))
+        .world
+    else {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: show: unknown kind '{s}'\n", .{k});
+        try w.interface.flush();
+        std.process.exit(2);
+    };
+
+    // `hir`/`mir` take the source file as the second positional; the effect /
+    // component kinds take `--qube <file>` (and `effects` a `<fn>` positional).
+    const ir_kind = which == .hir or which == .mir;
+    const src = (if (ir_kind) (arg2 orelse qube_file) else qube_file) orelse {
         try usage(io);
         std.process.exit(2);
     };
-    const want_hir = std.mem.eql(u8, k, "hir");
-    if (!want_hir and !std.mem.eql(u8, k, "mir")) {
-        var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
-        try w.interface.print("q64: show: unknown kind '{s}' (expected 'hir' or 'mir')\n", .{k});
-        try w.interface.flush();
+    if (which == .effects and arg2 == null) {
+        try usage(io);
         std.process.exit(2);
     }
 
@@ -372,10 +426,13 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         module_sources.deinit(gpa);
     }
 
-    const dump = (if (want_hir)
-        emit.showHir(gpa, source, src, module_sources.items)
-    else
-        emit.showMir(gpa, source, src, module_sources.items)) catch |err| {
+    const dump = (switch (which) {
+        .hir => emit.showHir(gpa, source, src, module_sources.items),
+        .mir => emit.showMir(gpa, source, src, module_sources.items),
+        .effects => emit.showEffects(gpa, source, src, module_sources.items, arg2.?),
+        .capabilities => emit.showCapabilities(gpa, source, src, module_sources.items),
+        .world => emit.showWorld(gpa, source, src, module_sources.items),
+    }) catch |err| {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
         try w.interface.print("q64: show {s} failed: {s}\n", .{ k, @errorName(err) });

@@ -27,6 +27,16 @@ export const QUBE_BIN = process.env.QUBE_BIN
   ? resolve(process.env.QUBE_BIN)
   : resolve(here, "../../qube/zig-out/bin/qube");
 
+/**
+ * Absolute path to the `q64` compiler the qube binary shells out to. `build`
+ * (and `run`) delegate to it; tests that exercise a real compile pass this as
+ * `Q64_BIN` in the spawn env so the qube binary finds it from a temp project
+ * dir (where the in-tree repo-root heuristic can't).
+ */
+export const Q64_BIN = process.env.Q64_BIN
+  ? resolve(process.env.Q64_BIN)
+  : resolve(here, "../../q64/zig-out/bin/q64");
+
 /** Directory holding static fixture qube projects. */
 export const FIXTURES = resolve(here, "../fixtures");
 
@@ -38,6 +48,11 @@ export function fixture(name: string): string {
 /** True when the qube binary exists and can be spawned. */
 export function binaryAvailable(): boolean {
   return existsSync(QUBE_BIN);
+}
+
+/** True when the `q64` compiler is built — gates suites that really compile. */
+export function q64Available(): boolean {
+  return existsSync(Q64_BIN);
 }
 
 export type Severity = "error" | "warning" | "note" | "help" | "internal";

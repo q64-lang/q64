@@ -44,11 +44,18 @@ CFG converter would live at this seam.
 ## Passes
 
 - [`build_hir.zig`](./build_hir.zig) — **AST → HIR**. Imports `parser`; owns
-  desugaring, name resolution, (eventual) typing, and const-folding.
+  desugaring, name resolution, (eventual) typing, and const-folding. Runs the
+  effect pass before returning, so the HIR it hands back is effect-annotated.
+- [`effects.zig`](./effects.zig) — **effect pass** (HIR → HIR). Infers each
+  function's capability set (`hir.Effect`, spec/effects.md): walks bodies for
+  host faces (`env.out` → `@stdout`, `qview.*` → `@ui`), unions callee sets up
+  the call graph to a fixpoint, and closes implications (`@stdout` ⇒ `@io`).
+  The component/WIT lift reads the result as a function's imports; `q64 show
+  effects|capabilities|world` print it.
 - [`lower.zig`](./lower.zig) — **HIR → MIR**. Makes the `str` ABI, the region/
   allocator model, and int→string formatting explicit.
 - [`print.zig`](./print.zig) — text dumps of either tier (golden tests +
-  `q64 show hir|mir`).
+  `q64 show hir|mir`); the HIR dump shows each function's visibility + effects.
 
 ## Neutrality invariant
 

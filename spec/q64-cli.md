@@ -51,6 +51,20 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 show hir <file.q>`         | Text dump of the **HIR** (Semantic QIR) for `<file.q>` — the name-resolved, desugared tier. Takes the same `--module name=dir` flags as `emit`. Compiler-introspection: the dump format is for humans/tests, not a stable serialization. See [`ARCHITECTURE.md` §ir](../ARCHITECTURE.md). |
 | `q64 show mir <file.q>`         | Text dump of the **MIR** (Executable QIR) — the ABI-lowered tier a backend consumes (`str` = `(ptr,len)`, structured control flow, the static memory image). Same `--module` flags. Compiler-introspection (unstable format). |
 
+The source qube is given positionally for `hir`/`mir` (`q64 show hir
+<file.q>`) and via `--qube <file.q>` for the kinds whose positional argument is
+a subject — a function, expression, type, or stage (`q64 show effects main
+--qube app.q`). The qube-level kinds (`capabilities`, `world`, `modules`) take
+only `--qube <file.q>`. All forms accept the same `--module name=dir` flags as
+`emit`.
+
+**Implemented today:** `hir`, `mir`, `effects`, `capabilities`, `world` — the
+last three over the effect-annotated HIR (the effect pass infers a function's
+capability set; `world` synthesizes the WIT world per [`modules.md` §"The qube
+as a component"](./modules.md) and the effect→WIT-import table in
+[`effects.md`](./effects.md)). The remaining kinds are specified but not yet
+implemented (an unknown/unimplemented kind is a usage error, exit 2).
+
 The `hir` / `mir` kinds run the front of the compile pipeline (parse →
 resolve imports → build HIR, then lower for `mir`) and print the result to
 stdout; a malformed program surfaces the same honest diagnostic `emit` would
@@ -73,7 +87,7 @@ flags as needed (see "Global options").
 |-----------------------------------|---------------------------------------------------------------------------|
 | `--diagnostics <text\|json>`      | Diagnostic format. Default `text` interactive, `json` when stdout is not a TTY or when run by `qube`. |
 | `--out <path>`                    | Output path for `build` (defaults to `<input>.wasm`). One output per invocation. |
-| `--component`                     | Also wrap the core module in a WebAssembly component (per [`modules.md` §"The qube as a component"](./modules.md)). Writes `<out>.component.wasm` *in addition to* the core `--out` module — the core module is still produced. Set by `qube build --component`. |
+| `--component`                     | Also wrap the core module in a WebAssembly component (per [`modules.md` §"The qube as a component"](./modules.md)). Writes `<out>.component.wasm` *in addition to* the core `--out` module — the core module is still produced. Set by `qube build --component`. **v0 coverage:** lifts an import-free core module's scalar export surface (`s64`/`bool`/`f64`); a capability-importing qube errors (`ComponentNeedsImportLowering`) and `str`/list exports are skipped pending the canonical-ABI memory glue. |
 | `--target <name>`                 | Target name to compile for (resolves via the qube manifest if present)    |
 | `--addr <wasm32\|wasm64>`         | Address space to compile for. **Required** — there is no default: `q64` errors with a diagnostic if neither `--addr` nor a `--target` that fixes an `addressSpace` is given. `wasm32` = 32-bit (`i32` pointers, WebKit/iPad baseline); `wasm64` = 64-bit (Memory64 + Table64, `i64` pointers). See [`memory.md` §"The platform"](./memory.md). |
 | `--module <name>=<path>`          | Map a module name to a source directory. Repeatable. Set by `qube`. Paths are always absolute (also for local-path dependencies, which `qube` resolves to filesystem paths before invocation). |
