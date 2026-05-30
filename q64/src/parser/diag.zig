@@ -74,43 +74,80 @@ pub const LineIndex = struct {
     }
 };
 
+/// Canonical host the compiler points diagnostic URLs at. Each code's
+/// documentation page lives at `<diagnostics_base>/<CODE>` — the page the
+/// docs site generates from this same registry (spec/q64-cli.md §"explain").
+pub const diagnostics_base = "https://docs.q64.dev/diagnostics";
+
+/// One row of the diagnostics registry — the single source of truth shared by
+/// the emitter (`messageFor`), `q64 explain`, and `q64 doc --json`. Enriching a
+/// diagnostic (subsystem, future summary/examples) happens here, once.
+pub const CodeInfo = struct {
+    code: []const u8,
+    subsystem: []const u8,
+    severity: Severity,
+    message: []const u8,
+};
+
 /// Look up the canonical short-message for a diagnostic code.
 /// Returns `""` for unknown codes — the caller is responsible for
 /// supplying a message in that case.
 pub fn messageFor(code: []const u8) []const u8 {
-    inline for (message_table) |entry| {
+    inline for (codes) |entry| {
         if (std.mem.eql(u8, entry.code, code)) return entry.message;
     }
     return "";
 }
 
-const MessageEntry = struct { code: []const u8, message: []const u8 };
+/// The full registry entry for a code, or `null` if unknown. Used by
+/// `q64 explain` (single-row lookup) and `q64 doc --json` (full iteration).
+pub fn lookup(code: []const u8) ?CodeInfo {
+    inline for (codes) |entry| {
+        if (std.mem.eql(u8, entry.code, code)) return entry;
+    }
+    return null;
+}
 
-/// Stable code → short-message table. Mirrors the rows in each
-/// spec's "Diagnostic codes" section. New codes append; numbers
-/// are never reused.
-const message_table = [_]MessageEntry{
+/// The subsystem a code belongs to, derived from its letter prefix. The
+/// registry stores it explicitly (above), but this also classifies codes the
+/// registry hasn't enumerated yet (e.g. a freshly emitted `TYP…`).
+pub fn subsystemFor(code: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, code, "LEX")) return "Lexical";
+    if (std.mem.startsWith(u8, code, "PAR")) return "Parser";
+    if (std.mem.startsWith(u8, code, "NAM")) return "Names";
+    if (std.mem.startsWith(u8, code, "TYP")) return "Type checking";
+    if (std.mem.startsWith(u8, code, "EFF")) return "Effects";
+    if (std.mem.startsWith(u8, code, "REG")) return "Regions";
+    if (std.mem.startsWith(u8, code, "Q9")) return "Internal";
+    return "Other";
+}
+
+/// Stable diagnostics registry. Mirrors the rows in each spec's "Diagnostic
+/// codes" section. New codes append; numbers are never reused. `severity` is
+/// the canonical level the code is emitted at. (Title/summary/examples for the
+/// web pages land here as the per-spec prose is filled in.)
+pub const codes = [_]CodeInfo{
     // Lexical
-    .{ .code = "LEX010", .message = "stray carriage return" },
-    .{ .code = "LEX020", .message = "unknown string-literal prefix" },
-    .{ .code = "LEX021", .message = "unexpected `&` in type position" },
-    .{ .code = "LEX030", .message = "unterminated string literal" },
-    .{ .code = "LEX031", .message = "char literals are not supported" },
-    .{ .code = "LEX040", .message = "unexpected character" },
+    .{ .code = "LEX010", .subsystem = "Lexical", .severity = .err, .message = "stray carriage return" },
+    .{ .code = "LEX020", .subsystem = "Lexical", .severity = .err, .message = "unknown string-literal prefix" },
+    .{ .code = "LEX021", .subsystem = "Lexical", .severity = .err, .message = "unexpected `&` in type position" },
+    .{ .code = "LEX030", .subsystem = "Lexical", .severity = .err, .message = "unterminated string literal" },
+    .{ .code = "LEX031", .subsystem = "Lexical", .severity = .err, .message = "char literals are not supported" },
+    .{ .code = "LEX040", .subsystem = "Lexical", .severity = .err, .message = "unexpected character" },
     // Parser
-    .{ .code = "PAR040", .message = "generic vs less-than ambiguity" },
+    .{ .code = "PAR040", .subsystem = "Parser", .severity = .err, .message = "generic vs less-than ambiguity" },
     // Names
-    .{ .code = "NAM001", .message = "unknown module" },
-    .{ .code = "NAM002", .message = "import path escapes qube" },
-    .{ .code = "NAM003", .message = "wildcard import is forbidden" },
-    .{ .code = "NAM004", .message = "selective import combined with alias" },
-    .{ .code = "NAM005", .message = "name collision in import scope" },
-    .{ .code = "NAM006", .message = "name is private to its qube" },
-    .{ .code = "NAM007", .message = "sub-module not re-exported" },
-    .{ .code = "NAM008", .message = "re-export cycle" },
-    .{ .code = "NAM009", .message = "block `pub` form is forbidden" },
-    .{ .code = "NAM010", .message = "unknown name in source module" },
-    .{ .code = "NAM011", .message = "dash in bare module path" },
+    .{ .code = "NAM001", .subsystem = "Names", .severity = .err, .message = "unknown module" },
+    .{ .code = "NAM002", .subsystem = "Names", .severity = .err, .message = "import path escapes qube" },
+    .{ .code = "NAM003", .subsystem = "Names", .severity = .err, .message = "wildcard import is forbidden" },
+    .{ .code = "NAM004", .subsystem = "Names", .severity = .err, .message = "selective import combined with alias" },
+    .{ .code = "NAM005", .subsystem = "Names", .severity = .err, .message = "name collision in import scope" },
+    .{ .code = "NAM006", .subsystem = "Names", .severity = .err, .message = "name is private to its qube" },
+    .{ .code = "NAM007", .subsystem = "Names", .severity = .err, .message = "sub-module not re-exported" },
+    .{ .code = "NAM008", .subsystem = "Names", .severity = .err, .message = "re-export cycle" },
+    .{ .code = "NAM009", .subsystem = "Names", .severity = .err, .message = "block `pub` form is forbidden" },
+    .{ .code = "NAM010", .subsystem = "Names", .severity = .err, .message = "unknown name in source module" },
+    .{ .code = "NAM011", .subsystem = "Names", .severity = .err, .message = "dash in bare module path" },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"
@@ -149,7 +186,10 @@ pub fn emitJson(
     try writer.writeByte('\n');
 }
 
-fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+/// Write `s` as a JSON string literal (with surrounding quotes), escaping the
+/// control characters and `"`/`\`. Shared by the diagnostics envelope and
+/// `q64 doc --json` so both encode strings identically.
+pub fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |c| switch (c) {
         '"' => try writer.writeAll("\\\""),

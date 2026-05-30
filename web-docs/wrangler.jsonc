@@ -1,0 +1,39 @@
+// Cloudflare Worker config for docs.q64.dev.
+//
+// Same Workers + Static Assets model as ../web (q64-web): this Worker serves
+// the Astro static build from ./dist/ via the ASSETS binding, with
+// `run_worker_first` so the fetch handler sees every request.
+//
+// Separate Worker from the landing site (q64-web) so docs deploy on their own
+// cadence — a docs/spec edit ships without rebuilding the compiler (the
+// reference data arrives as the `doc.json` release artifact; see
+// scripts/gen-docs.mjs). The `q64-` deploy-name prefix groups it under the Q64
+// project in the Cloudflare account.
+//
+// The docs.q64.dev custom domain is attached in the Cloudflare dashboard
+// (Workers & Pages -> q64-docs -> Domains & Routes -> Add custom domain) on the
+// existing q64.dev zone; the route below then attaches on deploy.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "q64-docs",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "html_handling": "auto-trailing-slash",
+    "run_worker_first": ["/*"]
+  },
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  "routes": [
+    { "pattern": "docs.q64.dev", "custom_domain": true }
+  ]
+}

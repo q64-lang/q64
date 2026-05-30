@@ -1,0 +1,76 @@
+# Deploys docs.q64.dev (web-docs/) to the q64-docs Cloudflare Worker.
+#
+# Decoupled from the compiler build: this workflow does NOT build Zig. The
+# reference data arrives as the `doc.json` asset published by release.yml; the
+# generator (web-docs/scripts/gen-docs.mjs) renders it, mirrors the spec, and
+# emits llms.txt. A docs/spec edit therefore ships in seconds without the
+# toolchain. If no doc.json release exists yet, the generator falls back to the
+# committed fixture (web-docs/fixtures/doc.json).
+#
+# Requires repo secrets CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID (the
+# release workflow uses only the ambient GITHUB_TOKEN; these are new).
+
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/docs.yml'
+      - 'web-docs/**'
+      - 'spec/**'
+      - 'web/src/styles/**'
+      - 'web/public/brand/**'
+  # Refresh the site whenever the compiler publishes a new doc.json.
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web-docs/pnpm-lock.yaml
+
+      # Best-effort: pull the latest published doc.json. If there is no release
+      # yet (or the asset is missing), the generator uses the committed fixture.
+      - name: Fetch doc.json from latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if gh release download nightly --pattern doc.json --output web-docs/.doc.json 2>/dev/null \
+            || gh release download --pattern doc.json --output web-docs/.doc.json 2>/dev/null; then
+            echo "DOC_JSON=$PWD/web-docs/.doc.json" >> "$GITHUB_ENV"
+            echo "Using doc.json from release"
+          else
+            echo "No doc.json release asset; generator will use the committed fixture"
+          fi
+
+      - name: Install
+        working-directory: web-docs
+        run: pnpm install --frozen-lockfile
+
+      - name: Deploy
+        working-directory: web-docs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm run deploy

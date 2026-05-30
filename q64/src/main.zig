@@ -10,6 +10,7 @@ const parser = @import("parser");
 const parse = parser.parse;
 const diag = parser.diag;
 const emit = @import("codegen/emit.zig");
+const doc = @import("doc.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -23,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
         try w.interface.writeAll(
-            \\{"ok":false,"diagnostics":[{"code":"Q9001","severity":"internal","kind":"ice","message":"forced internal error (Q64_FORCE_ICE)","repair":{"id":"report-upstream","safety":"n/a","report_url":"https://q64.dev/ice?code=Q9001"}}]}
+            \\{"ok":false,"diagnostics":[{"code":"Q9001","severity":"internal","kind":"ice","message":"forced internal error (Q64_FORCE_ICE)","repair":{"id":"report-upstream","safety":"n/a","report_url":"https://docs.q64.dev/diagnostics/Q9001"}}]}
         );
         try w.interface.writeAll("\n");
         try w.interface.flush();
@@ -59,6 +60,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "doc")) {
+        try cmdDoc(gpa, io, &args_it);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "explain")) {
+        try cmdExplain(gpa, io, &args_it);
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "--version")) {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &buf);
@@ -89,6 +100,8 @@ fn usage(io: std.Io) !void {
         \\  show effects <fn> --qube <file.q>  Print a function's inferred capability effect set.
         \\  show capabilities --qube <file.q>  Print the qube's compiler-derived capability set.
         \\  show world --qube <file.q>         Print the synthesized WIT world (exports + imports).
+        \\  doc --json [--qube <file.q>]       Emit the language documentation index as JSON.
+        \\  explain <code> [--diagnostics json]  Print documentation for a diagnostic code.
         \\  --version                          Print the version and exit.
         \\
     );
@@ -578,5 +591,117 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
     try w.interface.writeAll(dump);
+    try w.interface.flush();
+}
+
+/// `q64 doc --json [--qube <file.q>] [--module name=dir ...]` — emit the
+/// documentation index as JSON on stdout (spec/q64-cli.md §"doc"). With no
+/// `--qube`, emits the language-level index (keywords, builtin types,
+/// diagnostics). With `--qube`, additionally emits that qube's public surface.
+/// Parse diagnostics on a `--qube` source go to stderr as the standard
+/// envelope, mirroring `check`.
+fn cmdDoc(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    var json = false;
+    var qube_file: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--json")) {
+            json = true;
+        } else if (std.mem.eql(u8, a, "--qube")) {
+            qube_file = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, a, "--module")) {
+            // The public surface is extracted from the qube's own source;
+            // dependency modules are not needed. Tolerate + skip the value.
+            _ = args_it.next();
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // Ignore flags this subcommand doesn't consume.
+        } else if (qube_file == null) {
+            qube_file = a;
+        }
+    }
+
+    if (!json) {
+        // v0 has only the JSON form; there is no human renderer for `doc` yet.
+        var ebuf: [256]u8 = undefined;
+        var ew = std.Io.File.stderr().writer(io, &ebuf);
+        try ew.interface.writeAll("q64: doc requires --json\n");
+        try ew.interface.flush();
+        std.process.exit(2);
+    }
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+
+    if (qube_file) |path| {
+        const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+            var ebuf: [4096]u8 = undefined;
+            var ew = std.Io.File.stderr().writer(io, &ebuf);
+            try ew.interface.print("q64: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+            try ew.interface.flush();
+            std.process.exit(2);
+        };
+        defer gpa.free(source);
+        try doc.emitQubeJson(&w.interface, gpa, source, path);
+    } else {
+        try doc.emitLanguageJson(&w.interface, gpa);
+    }
+    try w.interface.flush();
+}
+
+/// `q64 explain <code> [--diagnostics json]` — print documentation for a
+/// diagnostic code (spec/q64-cli.md §"explain"). Reads the same `diag.codes`
+/// registry `doc --json` iterates, so the terminal and the web pages never
+/// disagree. Unknown codes exit 1.
+fn cmdExplain(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    _ = gpa;
+    var code: ?[]const u8 = null;
+    var json = false;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--diagnostics")) {
+            // Next arg is "json"; flag-style, mirroring `check`.
+        } else if (std.mem.eql(u8, a, "json")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // Ignore unknown flags.
+        } else if (code == null) {
+            code = a;
+        }
+    }
+
+    const c = code orelse {
+        try usage(io);
+        std.process.exit(2);
+    };
+
+    const info = diag.lookup(c) orelse {
+        var ebuf: [256]u8 = undefined;
+        var ew = std.Io.File.stderr().writer(io, &ebuf);
+        try ew.interface.print("q64: explain: unknown diagnostic code '{s}'\n", .{c});
+        try ew.interface.flush();
+        std.process.exit(1);
+    };
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    if (json) {
+        try w.interface.writeAll("{\"code\":");
+        try diag.writeJsonString(&w.interface, info.code);
+        try w.interface.writeAll(",\"subsystem\":");
+        try diag.writeJsonString(&w.interface, info.subsystem);
+        try w.interface.writeAll(",\"severity\":");
+        try diag.writeJsonString(&w.interface, info.severity.toString());
+        try w.interface.writeAll(",\"message\":");
+        try diag.writeJsonString(&w.interface, info.message);
+        try w.interface.writeAll(",\"url\":");
+        try w.interface.print("\"{s}/{s}\"", .{ diag.diagnostics_base, info.code });
+        try w.interface.writeAll("}\n");
+    } else {
+        try w.interface.print("{s} [{s}, {s}]\n  {s}\n  {s}/{s}\n", .{
+            info.code, info.subsystem, info.severity.toString(),
+            info.message, diag.diagnostics_base, info.code,
+        });
+    }
     try w.interface.flush();
 }

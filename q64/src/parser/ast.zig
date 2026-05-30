@@ -37,6 +37,96 @@ pub const SourceFile = struct {
     }
 };
 
+/// The file-level `//!` doc block — the run of `DOC_COMMENT` tokens at the top
+/// of the file, before the first item or import. License/test banner `//`
+/// comments above it are skipped. Each line's `//!` prefix is stripped and
+/// lines are joined with `\n`. `null` when the file has no header doc. Caller
+/// owns the slice. Used by `q64 doc --json` for a qube's module documentation.
+pub fn fileHeaderDoc(allocator: std.mem.Allocator, sf: SourceFile) !?[]u8 {
+    const children = sf.cst.children;
+    var end: usize = 0;
+    var has_doc = false;
+    var started = false;
+    var blanks: usize = 0; // consecutive newlines since the last doc line
+    for (children, 0..) |c, i| switch (c) {
+        .token => |t| switch (t.kind) {
+            .WHITESPACE => {},
+            .NEWLINE => {
+                // A blank line (2+ newlines) ends the contiguous header block,
+                // separating it from a following item's own doc comment.
+                if (started) {
+                    blanks += 1;
+                    if (blanks >= 2) break;
+                }
+            },
+            // Banner `//` comments may precede the header doc, but one inside
+            // the block (after it starts) ends it.
+            .LINE_COMMENT => if (started) break,
+            .DOC_COMMENT => {
+                has_doc = true;
+                started = true;
+                blanks = 0;
+                end = i + 1;
+            },
+            else => break,
+        },
+        .node => break,
+    };
+    if (!has_doc) return null;
+    return joinDocComments(allocator, children[0..end]);
+}
+
+/// The `//!` doc block immediately preceding `item_node` among `sf`'s direct
+/// children. Walking backward from the item, whitespace and newlines are
+/// skipped and contiguous `DOC_COMMENT` tokens are collected; any other token
+/// (including a plain `//` comment) or node ends the run. Each line's `//!`
+/// prefix is stripped and lines are joined with `\n`. `null` when no doc leads
+/// the item. Caller owns the slice. `item_node` must be a direct child of `sf`.
+pub fn leadingDoc(
+    allocator: std.mem.Allocator,
+    sf: SourceFile,
+    item_node: *const cst.Node,
+) !?[]u8 {
+    const children = sf.cst.children;
+    var idx: ?usize = null;
+    for (children, 0..) |c, i| switch (c) {
+        .node => |n| if (n == item_node) {
+            idx = i;
+            break;
+        },
+        .token => {},
+    };
+    const start = idx orelse return null;
+
+    var first: usize = start;
+    var has_doc = false;
+    var blanks: usize = 0; // consecutive newlines since the last doc line seen
+    var i: usize = start;
+    while (i > 0) {
+        i -= 1;
+        switch (children[i]) {
+            .token => |t| switch (t.kind) {
+                .WHITESPACE => {},
+                .NEWLINE => {
+                    // A blank line ends the run, separating an item's own doc
+                    // from a preceding item's doc or the file header.
+                    blanks += 1;
+                    if (blanks >= 2) break;
+                },
+                .DOC_COMMENT => {
+                    first = i;
+                    has_doc = true;
+                    blanks = 0;
+                },
+                else => break,
+            },
+            .node => break,
+        }
+    }
+    if (!has_doc) return null;
+    return joinDocComments(allocator, children[first..start]);
+}
+
 // =====================================================================
 // Items
 // =====================================================================
@@ -1607,6 +1697,39 @@ fn firstChildType(parent: *const cst.Node) ?TypeExpr {
     return null;
 }
 
+/// Join the text of every `DOC_COMMENT` token in `elems`, stripping each
+/// line's `//!` prefix (and one optional following space) and separating lines
+/// with `\n`. Non-doc elements are ignored. `null` if none are present. Caller
+/// owns the slice.
+fn joinDocComments(allocator: std.mem.Allocator, elems: []const cst.Element) !?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var n: usize = 0;
+    for (elems) |c| switch (c) {
+        .token => |t| if (t.kind == .DOC_COMMENT) {
+            if (n > 0) try out.append(allocator, '\n');
+            try out.appendSlice(allocator, stripDocPrefix(t.text));
+            n += 1;
+        },
+        .node => {},
+    };
+    if (n == 0) {
+        out.deinit(allocator);
+        return null;
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Strip the `//!` lead (and one following space) from a doc-comment token's
+/// text, plus any trailing CR left by a CRLF line ending.
+fn stripDocPrefix(text: []const u8) []const u8 {
+    var s = text;
+    if (std.mem.startsWith(u8, s, "//!")) s = s[3..];
+    if (s.len > 0 and s[0] == ' ') s = s[1..];
+    if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
+    return s;
+}
+
 /// Render all of `node`'s leaf tokens as source text, trivia-trimmed.
 /// Caller owns the slice.
 fn renderNodeText(allocator: std.mem.Allocator, node: *const cst.Node) ![]u8 {
@@ -2059,4 +2182,72 @@ test "Params: empty parens, iteration, and Param accessors" {
     try testing.expectEqualStrings("str", (try second.typeText(a)).?);
 
     try testing.expect(it.next() == null);
+}
+
+test "fileHeaderDoc: collects the header block, stops at a blank line" {
+    const parse = @import("parse.zig");
+    // Banner `//` comments precede the header; a blank line separates it from
+    // the item's own doc, which must NOT be folded into the header.
+    const src =
+        \\// banner
+        \\//! line one.
+        \\//! line two.
+        \\
+        \\//! item doc.
+        \\fn main {}
+        \\
+    ;
+    var r = try parse.parse(testing.allocator, src, "h.q");
+    defer r.deinit(testing.allocator);
+    const sf = SourceFile.cast(r.root).?;
+
+    const hdr = (try fileHeaderDoc(testing.allocator, sf)) orelse return error.TestExpectedNonNull;
+    defer testing.allocator.free(hdr);
+    try testing.expectEqualStrings("line one.\nline two.", hdr);
+}
+
+test "fileHeaderDoc: null when the file opens with an item" {
+    const parse = @import("parse.zig");
+    var r = try parse.parse(testing.allocator, "fn main {}\n", "h.q");
+    defer r.deinit(testing.allocator);
+    const sf = SourceFile.cast(r.root).?;
+    try testing.expect((try fileHeaderDoc(testing.allocator, sf)) == null);
+}
+
+test "leadingDoc: the contiguous block directly above an item, not the header" {
+    const parse = @import("parse.zig");
+    const src =
+        \\//! header.
+        \\
+        \\//! Adds.
+        \\pub fn add(a: i64, b: i64) -> i64 { a + b }
+        \\
+    ;
+    var r = try parse.parse(testing.allocator, src, "lib.q");
+    defer r.deinit(testing.allocator);
+    const sf = SourceFile.cast(r.root).?;
+
+    var items = sf.items();
+    const item = items.next() orelse return error.TestExpectedNonNull;
+    const doc = (try leadingDoc(testing.allocator, sf, item.fn_decl.cst)) orelse return error.TestExpectedNonNull;
+    defer testing.allocator.free(doc);
+    try testing.expectEqualStrings("Adds.", doc);
+}
+
+test "leadingDoc: null when a blank line separates doc from item" {
+    const parse = @import("parse.zig");
+    const src =
+        \\//! detached.
+        \\
+        \\fn main {}
+        \\
+    ;
+    var r = try parse.parse(testing.allocator, src, "m.q");
+    defer r.deinit(testing.allocator);
+    const sf = SourceFile.cast(r.root).?;
+    var items = sf.items();
+    const item = items.next() orelse return error.TestExpectedNonNull;
+    // The lone doc is the file header, separated by a blank line — not the
+    // item's leading doc.
+    try testing.expect((try leadingDoc(testing.allocator, sf, item.fn_decl.cst)) == null);
 }

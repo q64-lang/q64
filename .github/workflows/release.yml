@@ -87,6 +87,14 @@ jobs:
           ( cd out && sha256sum "q64-linux-${{ matrix.arch }}" "qube-linux-${{ matrix.arch }}" > "SHA256SUMS-${{ matrix.arch }}" )
           ls -la out
 
+      # The documentation index (keywords, builtin types, diagnostics) the
+      # docs.q64.dev site renders — see web-docs/. Architecture-independent, so
+      # only the amd64 matrix entry produces it; the docs deploy downloads this
+      # release asset (no Zig toolchain needed to ship a docs change).
+      - name: Generate doc.json
+        if: matrix.arch == 'amd64'
+        run: ./q64/zig-out/bin/q64 doc --json > out/doc.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.arch }}
@@ -120,6 +128,7 @@ jobs:
           mkdir -p release
           cp artifacts/q64-linux-amd64   release/
           cp artifacts/qube-linux-amd64  release/
+          cp artifacts/doc.json          release/
 
           # One combined SHA256SUMS over the published binaries.
           ( cd release && sha256sum q64-linux-amd64 qube-linux-amd64 > SHA256SUMS )
@@ -190,4 +199,5 @@ jobs:
             release/q64-linux-amd64 \
             release/qube-linux-amd64 \
             release/SHA256SUMS \
-            release/manifest.json
+            release/manifest.json \
+            release/doc.json

@@ -461,9 +461,13 @@ fn isIdentCont(c: u8) bool {
 // Keyword table
 // =====================================================================
 
-const Keyword = struct { text: []const u8, kind: cst.SyntaxKind };
+pub const Keyword = struct { text: []const u8, kind: cst.SyntaxKind };
 
-const keywords = [_]Keyword{
+/// The complete keyword table, in source-spelling order. `pub` so the
+/// documentation generator (`q64 doc --json`) can enumerate the language's
+/// reserved words from the same array the lexer classifies against — one
+/// source of truth, no drift between the lexer and the published reference.
+pub const keywords = [_]Keyword{
     .{ .text = "actor", .kind = .KW_ACTOR },
     .{ .text = "as", .kind = .KW_AS },
     .{ .text = "break", .kind = .KW_BREAK },
