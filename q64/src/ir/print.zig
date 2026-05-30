@@ -19,10 +19,21 @@ pub fn hirToString(gpa: std.mem.Allocator, m: *const hir.Module) Error![]u8 {
         // non-entry `pub` function is part of the exported surface (e.g. a
         // public screen/twin handler). The entry carries `[entry]` instead.
         const vis = if (f.visibility == .public and !is_entry) "pub " else "";
-        try app(gpa, &out, "{s}fn {s} -> {s}{s}\n", .{ vis, f.name, @tagName(f.ret), marker });
+        try app(gpa, &out, "{s}fn {s} -> {s}{s}", .{ vis, f.name, @tagName(f.ret), marker });
+        // Surface the inferred capability effect set the WIT lift reads as the
+        // function's imports (`@stdout + @io`); omitted when the set is empty.
+        try hirEffects(gpa, &out, f.effects);
+        try app(gpa, &out, "\n", .{});
         try hirStmt(gpa, &out, f.body, 1);
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// Append the effect set as ` @a + @b` (leading space), or nothing when empty.
+fn hirEffects(gpa: std.mem.Allocator, out: *Buf, effs: []const hir.Effect) Error!void {
+    for (effs, 0..) |eff, i| {
+        try app(gpa, out, "{s}{s}", .{ if (i == 0) " " else " + ", eff.marker() });
+    }
 }
 
 fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) Error!void {

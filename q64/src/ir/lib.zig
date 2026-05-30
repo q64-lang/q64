@@ -7,6 +7,7 @@
 //!   - `mir` — Mid-level / Executable QIR ("how it executes").
 //! The passes:
 //!   - `build_hir` — AST → HIR (imports `parser`).
+//!   - `effects`   — HIR effect pass (infers each function's capability set).
 //!   - `lower`     — HIR → MIR.
 //!   - `print`     — text dumps of either tier.
 //!
@@ -20,6 +21,7 @@ pub const hir = @import("hir.zig");
 pub const mir = @import("mir.zig");
 pub const consteval = @import("consteval.zig");
 pub const build_hir = @import("build_hir.zig");
+pub const effects = @import("effects.zig");
 pub const lower = @import("lower.zig");
 pub const print = @import("print.zig");
 
@@ -31,6 +33,7 @@ test {
     _ = mir;
     _ = consteval;
     _ = build_hir;
+    _ = effects;
     _ = lower;
     _ = print;
 }

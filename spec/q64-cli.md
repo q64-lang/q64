@@ -51,6 +51,20 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 show hir <file.q>`         | Text dump of the **HIR** (Semantic QIR) for `<file.q>` — the name-resolved, desugared tier. Takes the same `--module name=dir` flags as `emit`. Compiler-introspection: the dump format is for humans/tests, not a stable serialization. See [`ARCHITECTURE.md` §ir](../ARCHITECTURE.md). |
 | `q64 show mir <file.q>`         | Text dump of the **MIR** (Executable QIR) — the ABI-lowered tier a backend consumes (`str` = `(ptr,len)`, structured control flow, the static memory image). Same `--module` flags. Compiler-introspection (unstable format). |
 
+The source qube is given positionally for `hir`/`mir` (`q64 show hir
+<file.q>`) and via `--qube <file.q>` for the kinds whose positional argument is
+a subject — a function, expression, type, or stage (`q64 show effects main
+--qube app.q`). The qube-level kinds (`capabilities`, `world`, `modules`) take
+only `--qube <file.q>`. All forms accept the same `--module name=dir` flags as
+`emit`.
+
+**Implemented today:** `hir`, `mir`, `effects`, `capabilities`, `world` — the
+last three over the effect-annotated HIR (the effect pass infers a function's
+capability set; `world` synthesizes the WIT world per [`modules.md` §"The qube
+as a component"](./modules.md) and the effect→WIT-import table in
+[`effects.md`](./effects.md)). The remaining kinds are specified but not yet
+implemented (an unknown/unimplemented kind is a usage error, exit 2).
+
 The `hir` / `mir` kinds run the front of the compile pipeline (parse →
 resolve imports → build HIR, then lower for `mir`) and print the result to
 stdout; a malformed program surfaces the same honest diagnostic `emit` would
