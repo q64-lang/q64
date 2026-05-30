@@ -1,0 +1,26 @@
+{
+  "name": "@q64/core-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "q64's analysis core compiled to wasm, with TypeScript bindings.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./q64-core.wasm": "./q64-core.wasm"
+  },
+  "files": ["dist", "q64-core.wasm"],
+  "scripts": {
+    "build:wasm": "zig build -Doptimize=ReleaseSmall && cp zig-out/bin/q64-core.wasm ./q64-core.wasm",
+    "build:ts": "tsc -p tsconfig.json",
+    "build": "pnpm run build:wasm && pnpm run build:ts",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}
