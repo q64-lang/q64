@@ -23,7 +23,9 @@ export default defineConfig({
       sidebar: [
         { label: 'Start here', slug: 'index' },
         { label: 'Guides', autogenerate: { directory: 'guides' } },
-        { label: 'Reference', autogenerate: { directory: 'reference' } },
+        // `collapsed` inside autogenerate collapses nested subgroups (the long
+        // Diagnostics code list) by default, while Reference itself stays open.
+        { label: 'Reference', autogenerate: { directory: 'reference', collapsed: true } },
         { label: 'Spec', autogenerate: { directory: 'spec' }, collapsed: true },
       ],
       customCss: ['./src/styles/custom.css'],
