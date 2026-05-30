@@ -48,7 +48,7 @@ AST → Wasm 3.0 emission. Uses the Binaryen C API.
 | File         | Status          | Purpose                                                   |
 |-----------------|----------|------------------------------------------------------------------|
 | `emit.zig`      | partial  | Binaryen bindings, `emitFromSource`, `emitComponent`, `emitHelloWasm`. |
-| `component.zig` | v0 slice | Pure-Zig WebAssembly **component** encoder — wraps the core module in a component whose WIT world is the synthesized export surface. v0 lifts import-free scalar (`s64`/`bool`/`f64`) exports, and for a wasm32 app `encodeApp` lowers the `env.out` capability import to a component `log` function (canonical-ABI indirection: shim table + fixup elem) and lifts `_start` as `run`. Validated + run end-to-end by wasmtime (`q64-component-check [--run]`). |
+| `component.zig` | v0 slice | Pure-Zig WebAssembly **component** encoder for the import-free **library** lift — wraps the core module in a component whose WIT world is the synthesized scalar (`s64`/`bool`/`f64`) export surface. An **app** (one that reaches `@stdout`) isn't encoded here: `emit.zig` emits it as a WASI **preview1** core (`env.out` → `wasi_snapshot_preview1.fd_write`, `StdoutAbi.wasi_preview1`) and the CLI runs `wasm-tools component new --adapt` (vendor/wasi/) to lift it into a real `wasi:cli/run` command importing `wasi:cli/stdout`. Both validated + run end-to-end by wasmtime (`q64-component-check [--run]`). |
 
 ## External
 

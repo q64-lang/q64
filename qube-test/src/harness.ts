@@ -37,6 +37,24 @@ export const Q64_BIN = process.env.Q64_BIN
   ? resolve(process.env.Q64_BIN)
   : resolve(here, "../../q64/zig-out/bin/q64");
 
+/**
+ * The WASI component toolchain `q64 emit --component` shells out to for an
+ * **app**: `wasm-tools` (lifts the preview1 core with `component new --adapt`)
+ * and the WASI preview1 adapter. Passed to the spawn env as `Q64_WASM_TOOLS` /
+ * `Q64_WASI_ADAPTER` so the q64 subprocess finds them from a temp project dir.
+ */
+export const WASM_TOOLS = process.env.Q64_WASM_TOOLS
+  ? resolve(process.env.Q64_WASM_TOOLS)
+  : resolve(here, "../../vendor/wasm-tools/wasm-tools");
+export const WASI_ADAPTER = process.env.Q64_WASI_ADAPTER
+  ? resolve(process.env.Q64_WASI_ADAPTER)
+  : resolve(here, "../../vendor/wasi/wasi_snapshot_preview1.command.wasm");
+
+/** True when the WASI component toolchain is vendored — gates the app lift. */
+export function componentToolsAvailable(): boolean {
+  return existsSync(WASM_TOOLS) && existsSync(WASI_ADAPTER);
+}
+
 /** Directory holding static fixture qube projects. */
 export const FIXTURES = resolve(here, "../fixtures");
 

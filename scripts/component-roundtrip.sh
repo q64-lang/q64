@@ -21,8 +21,14 @@ ZIG="$REPO_ROOT/vendor/zig/zig"
 Q64_BIN="$REPO_ROOT/q64/zig-out/bin/q64"
 QUBE_BIN="$REPO_ROOT/qube/zig-out/bin/qube"
 CHECK_BIN="$REPO_ROOT/runtime/wasmtime/zig-out/bin/q64-component-check"
+WASMTOOLS_BIN="$REPO_ROOT/vendor/wasm-tools/wasm-tools"
 
 export LD_LIBRARY_PATH="$REPO_ROOT/vendor/wasmtime/lib:${LD_LIBRARY_PATH:-}"
+# The app path shells out to wasm-tools + the WASI preview1 adapter to lift the
+# preview1 core into a real `wasi:cli/run` command. Point q64 at the vendored
+# toolchain explicitly so the lift works regardless of cwd.
+export Q64_WASM_TOOLS="$WASMTOOLS_BIN"
+export Q64_WASI_ADAPTER="$REPO_ROOT/vendor/wasi/wasi_snapshot_preview1.command.wasm"
 
 if [[ ! -x "$ZIG" ]]; then
     echo "error: pinned zig not found at $ZIG — run ./init.sh first" >&2
@@ -56,29 +62,36 @@ echo "==> wasmtime: call add(2,3) == 5"
 echo "==> wasmtime: call mul(6,7) == 42"
 "$CHECK_BIN" "$tmp/mathlib.component.wasm" mul 6 7 42
 
-# --- app: lower the env.out capability import + run the component -----------
+# --- app: lower env.out → WASI preview1, adapt, + run the real WASI command --
 cat > "$tmp/app.q" <<'EOF'
 fn main { env.out("Hello, q64.") }
 EOF
-echo "==> q64 emit --component (app, wasm32) lowers env.out via the indirection pattern"
+echo "==> q64 emit --component (app, wasm32) lowers env.out → wasi_snapshot_preview1.fd_write, then wasm-tools --adapt"
 "$Q64_BIN" emit "$tmp/app.q" "$tmp/app.wasm" --addr wasm32 --component
+test -f "$tmp/app.component.wasm" || { echo "FAIL: no app component artifact" >&2; exit 1; }
 echo "==> wasmtime: validate the app component"
 "$CHECK_BIN" "$tmp/app.component.wasm"
 
-# Differential check against the reference implementation, when available: the
-# component must validate under wasm-tools too, and its extracted WIT world must
-# be exactly the import-lowered shape q64 encoded.
-WASMTOOLS_BIN="$REPO_ROOT/vendor/wasm-tools/wasm-tools"
+# The component is produced by the reference tool (wasm-tools component new
+# --adapt), so the assertion is that its world is the *real* WASI command world:
+# it imports wasi:cli/stdout and exports wasi:cli/run, not a q64-internal face.
 if [ -x "$WASMTOOLS_BIN" ]; then
-    echo "==> wasm-tools: validate + extract the component's WIT"
+    echo "==> wasm-tools: validate + extract the component's WIT (real WASI world)"
     "$WASMTOOLS_BIN" validate --features all "$tmp/app.component.wasm"
     wit="$("$WASMTOOLS_BIN" component wit "$tmp/app.component.wasm")"
-    echo "$wit" | grep -q "import log: func(msg: string)" || { echo "FAIL: WIT missing the lowered log import" >&2; echo "$wit" >&2; exit 1; }
-    echo "$wit" | grep -q "export run: func()" || { echo "FAIL: WIT missing the run export" >&2; echo "$wit" >&2; exit 1; }
-    echo "    ok: wasm-tools agrees — world { import log: func(msg: string); export run: func() }"
+    echo "$wit" | grep -q "import wasi:cli/stdout" || { echo "FAIL: WIT missing the wasi:cli/stdout import" >&2; echo "$wit" >&2; exit 1; }
+    echo "$wit" | grep -q "export wasi:cli/run"   || { echo "FAIL: WIT missing the wasi:cli/run export" >&2; echo "$wit" >&2; exit 1; }
+    echo "    ok: wasm-tools agrees — world imports wasi:cli/stdout, exports wasi:cli/run"
 fi
 
-echo "==> wasmtime: instantiate + run; the lowered log import receives env.out"
+# q64's synthesized world (show world) must name the same WASI interfaces.
+echo "==> q64 show world names the WASI world (wasi:cli/stdout + wasi:cli/run)"
+world="$("$Q64_BIN" show world --qube "$tmp/app.q")"
+echo "$world" | grep -q "import wasi:cli/stdout" || { echo "FAIL: show world missing wasi:cli/stdout import" >&2; echo "$world" >&2; exit 1; }
+echo "$world" | grep -q "export wasi:cli/run"   || { echo "FAIL: show world missing wasi:cli/run export" >&2; echo "$world" >&2; exit 1; }
+echo "    ok: show world matches — import wasi:cli/stdout; export wasi:cli/run"
+
+echo "==> wasmtime: instantiate with WASI + run; stdout flows env.out → fd_write → wasi:cli/stdout"
 got="$("$CHECK_BIN" "$tmp/app.component.wasm" --run)"
 if [ "$got" != "Hello, q64." ]; then
     echo "FAIL: app component printed '$got', expected 'Hello, q64.'" >&2
