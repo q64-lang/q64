@@ -173,6 +173,9 @@ fn usage(io: std.Io) !void {
         \\  new [name] [flags]      Scaffold a new qube in a new directory (wizard if no flags).
         \\  init [flags]            Scaffold a qube in the current directory (wizard if no flags).
         \\  pod <new|init> [flags]  Scaffold a QubePod deploy manifest (wizard if no flags).
+        \\  pod login [--token <t>] Save a qubepods token (minted in the console) for deploys.
+        \\  pod info                Show the qubepods provider, API origin, and auth status.
+        \\  pod logout              Remove the saved qubepods token.
         \\  pod deploy [flags]      Pack the bundle (manifest+wasm+assets) and deploy to qubepods.
         \\  build [--component] [--addr wasm32|wasm64] [--release]
         \\                          Compile the qube to wasm under target/<profile>/<addr>/.
@@ -1982,7 +1985,17 @@ fn isSlug(s: []const u8) bool {
 
 fn podHelp(io: std.Io) !void {
     try writeStdout(io,
-        \\usage: qube pod <new [name] | init | deploy> [flags]
+        \\usage: qube pod <new [name] | init | login | logout | info | deploy> [flags]
+        \\
+        \\Auth (qubepods provider):
+        \\  qube pod login [--token <t>] [--url <origin>]
+        \\                         Save a qubepods token for deploys. The qubepods
+        \\                         console mints the token; with no --token it is
+        \\                         read (pasted) from stdin. Stored in
+        \\                         ~/.qube/pods.toml (separate from `qube login`).
+        \\  qube pod info [--url <origin>]
+        \\                         Show the provider, API origin, and auth status.
+        \\  qube pod logout        Remove the saved qubepods token.
         \\
         \\Scaffold a QubePod deploy manifest (qubepod.jsonc). With no flags, an
         \\interactive wizard prompts for each field; passing any flag runs
@@ -2199,7 +2212,7 @@ fn cmdPod(
     args_it: *std.process.Args.Iterator,
 ) !void {
     const subsub = args_it.next() orelse {
-        try writeStderr(io, "usage: qube pod <new|init|deploy> [flags]\n");
+        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|deploy> [flags]\n");
         std.process.exit(@intFromEnum(ExitCode.usage));
     };
     if (std.mem.eql(u8, subsub, "--help") or std.mem.eql(u8, subsub, "-h")) {
@@ -2208,9 +2221,162 @@ fn cmdPod(
     }
     if (std.mem.eql(u8, subsub, "new")) return scaffoldPodCmd(gpa, io, args_it, false);
     if (std.mem.eql(u8, subsub, "init")) return scaffoldPodCmd(gpa, io, args_it, true);
+    if (std.mem.eql(u8, subsub, "login")) return cmdPodLogin(gpa, io, env, args_it);
+    if (std.mem.eql(u8, subsub, "logout")) return cmdPodLogout(gpa, io, env, args_it);
+    if (std.mem.eql(u8, subsub, "info")) return cmdPodInfo(gpa, io, env, args_it);
     if (std.mem.eql(u8, subsub, "deploy")) return cmdPodDeploy(gpa, io, env, args_it);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
+}
+
+// ---------------------------------------------------------------------------
+// qubepods auth — `qube pod login` / `logout` / `info`
+//
+// Provider abstraction (today: only qubepods). Credentials live in
+// `<qube home>/pods.toml`, separate from the Continuum `credentials.toml`, so
+// the two never clobber each other. Token model: the qubepods API has no CLI
+// token-issuance endpoint (its `/auth/login` is cookie-based for the console),
+// so `qube pod login` saves a token you minted in the qubepods console; it does
+// not do an interactive email/password exchange.
+// ---------------------------------------------------------------------------
+
+const QubepodsProvider = "qubepods";
+
+fn podsCredPath(gpa: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
+    const home = try qubeHome(gpa, env);
+    defer gpa.free(home);
+    return std.fs.path.join(gpa, &.{ home, "pods.toml" });
+}
+
+/// Read the saved qubepods token, or `error.NotLoggedIn` if none. v0 keeps a
+/// single provider, so we take the first `token = "…"` line.
+fn readPodToken(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) ![]u8 {
+    const path = try podsCredPath(gpa, env);
+    defer gpa.free(path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch
+        return error.NotLoggedIn;
+    defer gpa.free(text);
+    const key = "token = \"";
+    const i = std.mem.indexOf(u8, text, key) orelse return error.NotLoggedIn;
+    const start = i + key.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return error.NotLoggedIn;
+    return gpa.dupe(u8, text[start..end]);
+}
+
+fn cmdPodLogin(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    // qube pod login [--token <t>] [--url <origin>]
+    var api_url: []const u8 = default_pods_api;
+    var token_flag: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--url")) {
+            api_url = try flagValue(io, args_it, "--url");
+        } else if (std.mem.eql(u8, a, "--token")) {
+            token_flag = try flagValue(io, args_it, "--token");
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube pod login: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else {
+            try printStderr(io, "qube pod login: unexpected arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    // The qubepods console (app.qubepods.com) mints project API tokens; the API
+    // has no CLI token exchange, so we save a token rather than do an email/
+    // password login. --token wins; else read one (pasted) from stdin.
+    var token_owned: ?[]u8 = null;
+    defer if (token_owned) |t| gpa.free(t);
+    const token: []const u8 = if (token_flag) |t| t else blk: {
+        try writeStdout(io, "Paste your qubepods token (from the console): ");
+        const line = try readPasswordSilent(gpa, io);
+        token_owned = line;
+        try writeStdout(io, "\n");
+        break :blk std.mem.trim(u8, line, " \t\r\n");
+    };
+    if (token.len == 0) {
+        try writeStderr(io, "qube pod login: empty token\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+
+    const host = stripScheme(api_url);
+    const home = try qubeHome(gpa, env);
+    defer gpa.free(home);
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    const path = try podsCredPath(gpa, env);
+    defer gpa.free(path);
+
+    const toml = try std.fmt.allocPrint(gpa,
+        \\# qubepods credentials. Written by `qube pod login`.
+        \\# Do not check in. The token grants deploy access to your qubes.
+        \\
+        \\provider = "{s}"
+        \\
+        \\[pods."{s}"]
+        \\token = "{s}"
+        \\
+    , .{ QubepodsProvider, host, token });
+    defer gpa.free(toml);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = toml });
+    try printStdout(io, "Saved qubepods token for {s} in {s}.\n", .{ host, path });
+}
+
+fn cmdPodLogout(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    while (args_it.next()) |a| {
+        try printStderr(io, "qube pod logout: unexpected arg: {s}\n", .{a});
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+    const path = try podsCredPath(gpa, env);
+    defer gpa.free(path);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {
+        try writeStdout(io, "Not logged in to qubepods.\n");
+        return;
+    };
+    try printStdout(io, "Logged out of qubepods (removed {s}).\n", .{path});
+}
+
+fn cmdPodInfo(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var api_url: []const u8 = default_pods_api;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--url")) {
+            api_url = try flagValue(io, args_it, "--url");
+        } else {
+            try printStderr(io, "qube pod info: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    const authed = blk: {
+        const t = readPodToken(gpa, io, env) catch break :blk false;
+        gpa.free(t);
+        break :blk true;
+    };
+
+    try printStdout(io,
+        \\Provider:       {s}
+        \\API:            {s}
+        \\Authenticated:  {s}
+        \\
+    , .{
+        QubepodsProvider,
+        api_url,
+        if (authed) "yes  (token in pods.toml; run `qube pod logout` to clear)" else "no   (run `qube pod login`)",
+    });
 }
 
 // qube pod deploy  (pack the bundle zip and upload it to qubepods)
@@ -2336,11 +2502,18 @@ fn cmdPodDeploy(
     const assets_dir_opt = extractStringField(raw, "\"directory\"");
     const assets_norm = if (assets_dir_opt) |d| stripDotSlash(d) else "";
 
-    // Token: --token wins, else QUBEPODS_TOKEN (both borrowed; no free).
-    const token = token_flag orelse (env.get("QUBEPODS_TOKEN") orelse {
-        try writeStderr(io, "qube pod deploy: no token; pass --token or set QUBEPODS_TOKEN\n");
-        std.process.exit(@intFromEnum(ExitCode.registry));
-    });
+    // Token: --token wins, else QUBEPODS_TOKEN, else the saved `qube pod login`
+    // credentials. The first two are borrowed; the saved one is owned (freed).
+    var saved_token: ?[]u8 = null;
+    defer if (saved_token) |t| gpa.free(t);
+    const token: []const u8 = token_flag orelse env.get("QUBEPODS_TOKEN") orelse blk: {
+        const t = readPodToken(gpa, io, env) catch {
+            try writeStderr(io, "qube pod deploy: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
+            std.process.exit(@intFromEnum(ExitCode.registry));
+        };
+        saved_token = t;
+        break :blk t;
+    };
 
     // Pack target/deploy/<name>.zip (absolute, so the staged `zip` finds it).
     const out_zip = try std.fs.path.join(gpa, &.{ cwd_path, "target", "deploy", name });
