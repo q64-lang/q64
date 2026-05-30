@@ -277,6 +277,26 @@ every upstream RC release** until WASI 1.0:
   remains available for legacy **core-module** hosts that predate the
   Component Model; it carries no component, no native async, and no RPC.)
 
+> **What "0.3" versions, and what stays 0.2.x.** WASIp3's `0.3` is the **async
+> `wasi:io`** layer (native `stream<T>`/`future<T>`, retiring the Preview 2
+> `poll`/`streams` resource ceremony) plus the component-model async ABI. The
+> **`wasi:cli` command world** (`wasi:cli/run`, `wasi:cli/stdout`, …) is *not*
+> bumped to 0.3 — it stays **`wasi:cli@0.2.x`** upstream (even the wasi-cli
+> `v0.3.0-rc-*` tags declare `package wasi:cli@0.2.7`). So a q64 command
+> component correctly imports `wasi:cli/stdout@0.2.x` and exports
+> `wasi:cli/run@0.2.x`; "no Preview 2" means q64 does not target the synchronous
+> Preview 2 *runtime* — it runs under the async WASIp3 runtime (`wasmtime run -S
+> p3`), where the underlying `wasi:io` streams are 0.3. The `wasi:cli` interface
+> version is the latest the upstream command world ships, not a separate q64
+> choice.
+>
+> **Implementation status.** Today q64 lowers `env.out` to a `preview1`
+> `fd_write` core import and lifts it with `wasm-tools component new --adapt`
+> (the vendored adapter), which yields a command using the *synchronous*
+> `wasi:io/streams@0.2.x` write — correct as a command but not yet the async
+> path. Emitting genuinely async `wasi:io@0.3` I/O (no adapter shortcut) is the
+> next codegen milestone; the runtime is already WASIp3 via `-S p3`.
+
 ### Env ↔ WASI Preview 3
 
 | `Env` field | Capability face | WASI Preview 3 interface(s) |

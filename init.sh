@@ -7,6 +7,11 @@
 #   - the wasmtime C API (vendor/wasmtime/) — used by
 #     runtime/wasmtime/ to embed wasm modules and provide q64's
 #     capability-face imports (env.out, …).
+#   - the wasmtime CLI (vendor/wasmtime/bin/wasmtime) — OPTIONAL: the
+#     WASIp3-capable component runner (`wasmtime run -S p3`). The embedded
+#     C API only exposes WASIp2; the CLI is how the component-roundtrip
+#     runs an app component under the async WASIp3 runtime. sha256-pinned;
+#     skipped where unpinned.
 #   - Binaryen (vendor/binaryen/) — used by q64/src/codegen/ to
 #     assemble Wasm modules from the typed AST.
 #   - wabt / wat2wasm (vendor/wabt/) — OPTIONAL: compile WAT fixtures +
@@ -241,6 +246,13 @@ EOF
 # pasting the printed hash here.
 WASMTIME_KNOWN_SHA256_x86_64_linux="95959e7a4cc4bfc12bbe45c9dea82cf45dd5b4321d9163e66343c50728429129"
 
+# The wasmtime *CLI* archive (no `-c-api` suffix) ships the `wasmtime` binary.
+# We vendor it as the WASIp3 component runner (`wasmtime run -S p3`) — the C API
+# we embed only implements WASIp2, so the CLI is how a WASIp3 (async) component
+# is run end-to-end. triple -> sha256 for the pinned WASMTIME_VERSION; unlisted
+# platforms skip (optional tooling) unless WASMTIME_CLI_SHA256 is set.
+WASMTIME_CLI_KNOWN_SHA256_x86_64_linux="9d92e6dc04630f617e0e5d532327a5a917ac4898587e07f4fb7a5fc7fffef760"
+
 install_wasmtime() {
     if [ -f "$WASMTIME_DEST/lib/libwasmtime.$shlib_ext" ] && \
        [ "$(cat "$WASMTIME_DEST/VERSION" 2>/dev/null)" = "$WASMTIME_VERSION" ]; then
@@ -292,6 +304,59 @@ install_wasmtime() {
     echo "$WASMTIME_VERSION" > "$WASMTIME_DEST/VERSION"
 
     echo "init.sh: wasmtime $WASMTIME_VERSION installed at $WASMTIME_DEST"
+}
+
+# Vendor the wasmtime CLI binary (the WASIp3 runner) into
+# vendor/wasmtime/bin/wasmtime. Optional: skipped on platforms without a pinned
+# sha (the core build never needs it; only the component-roundtrip run step
+# does). Must run *after* install_wasmtime, which owns $WASMTIME_DEST.
+install_wasmtime_cli() {
+    local cli_dest="$WASMTIME_DEST/bin/wasmtime"
+    if [ -x "$cli_dest" ] && \
+       [ "$("$cli_dest" --version 2>/dev/null | awk '{print $2}')" = "$WASMTIME_VERSION" ]; then
+        echo "init.sh: wasmtime CLI $WASMTIME_VERSION already installed at $cli_dest"
+        return
+    fi
+
+    local tarball="wasmtime-v${WASMTIME_VERSION}-${arch}-${os}.tar.xz"
+    local url="${WASMTIME_RELEASE_BASE}/v${WASMTIME_VERSION}/${tarball}"
+    local key="WASMTIME_CLI_KNOWN_SHA256_${arch}_${os}"
+    local expected_sha="${WASMTIME_CLI_SHA256:-${!key:-}}"
+    if [ -z "$expected_sha" ]; then
+        echo "init.sh: no pinned sha256 for the wasmtime CLI on ${arch}-${os} — skipping (optional WASIp3 runner)." >&2
+        return 0
+    fi
+
+    echo "init.sh: downloading $url"
+    if ! curl -fsSL "$url" -o "$tmpdir/$tarball"; then
+        echo "init.sh: wasmtime CLI download failed — skipping (optional WASIp3 runner)" >&2
+        return 0
+    fi
+
+    if [ "$expected_sha" != "skip" ]; then
+        local actual_sha
+        actual_sha="$("${sha256_cmd[@]}" "$tmpdir/$tarball" | awk '{print $1}')"
+        if [ "$actual_sha" != "$expected_sha" ]; then
+            echo "init.sh: wasmtime CLI sha256 mismatch — refusing:" >&2
+            echo "  expected: $expected_sha" >&2
+            echo "  got:      $actual_sha" >&2
+            exit 1
+        fi
+        echo "init.sh: wasmtime CLI sha256 verified ($actual_sha)"
+    else
+        echo "init.sh: skipping wasmtime CLI sha256 verification (WASMTIME_CLI_SHA256=skip)"
+    fi
+
+    tar -xJf "$tmpdir/$tarball" -C "$tmpdir"
+    local extracted_dir="$tmpdir/wasmtime-v${WASMTIME_VERSION}-${arch}-${os}"
+    if [ ! -x "$extracted_dir/wasmtime" ]; then
+        echo "init.sh: unexpected CLI tarball layout — no $extracted_dir/wasmtime" >&2
+        exit 1
+    fi
+    mkdir -p "$WASMTIME_DEST/bin"
+    cp "$extracted_dir/wasmtime" "$cli_dest"
+    chmod +x "$cli_dest"
+    echo "init.sh: wasmtime CLI $WASMTIME_VERSION installed at $cli_dest"
 }
 
 # =====================================================================
@@ -588,6 +653,7 @@ install_wasi_adapter() {
 
 install_zig
 install_wasmtime
+install_wasmtime_cli
 install_binaryen
 install_wabt
 install_wasmtools
