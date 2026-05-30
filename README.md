@@ -143,6 +143,8 @@ The remaining bootstrap pieces (still in progress; folders are scaffolded):
   code disagree, the spec wins.
 - [`CLAUDE.md`](./CLAUDE.md) — repo conventions, chiefly the naming/casing
   rules (`Q64` vs `q64`, `Qube` vs `qube`, the Continuum).
+- [`DEPLOYMENT.md`](./DEPLOYMENT.md) — how the web properties (q64.dev,
+  docs.q64.dev) and the q64/qube binary releases ship, and what enables each.
 
 ## License
 
