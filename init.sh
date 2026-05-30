@@ -9,6 +9,10 @@
 #     capability-face imports (env.out, …).
 #   - Binaryen (vendor/binaryen/) — used by q64/src/codegen/ to
 #     assemble Wasm modules from the typed AST.
+#   - wabt / wat2wasm (vendor/wabt/) — OPTIONAL: compile WAT fixtures +
+#     component helper modules and inspect emitted wasm. sha256-pinned;
+#     skipped on platforms without a pinned hash (the core build never
+#     needs it).
 #
 # Re-runnable; skips work that's already done. Run from the repo root:
 #
@@ -40,6 +44,17 @@ WASMTIME_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/dow
 BINARYEN_VERSION="${BINARYEN_VERSION:-129}"
 BINARYEN_DEST="vendor/binaryen"
 BINARYEN_REPO="https://github.com/WebAssembly/binaryen.git"
+
+# wabt (wat2wasm / wasm2wat) — OPTIONAL developer tooling: compile the WAT
+# fixtures + component helper modules to wasm, and inspect emitted modules.
+# The toolchain (q64, host, codegen) does NOT require it; a platform without a
+# pinned hash just skips it. Trust root is the upstream GitHub release verified
+# against the pinned sha256 below; WABT_CACHE_URL is an optional R2 mirror
+# (Binaryen-style) for networks that block github.com but allow the bucket.
+WABT_VERSION="${WABT_VERSION:-1.0.37}"
+WABT_DEST="vendor/wabt"
+WABT_RELEASE_BASE="https://github.com/WebAssembly/wabt/releases/download"
+WABT_CACHE_URL="${WABT_CACHE_URL:-}"
 
 cd "$(dirname "$0")"
 
@@ -348,9 +363,77 @@ install_binaryen() {
     echo "init.sh: binaryen $BINARYEN_VERSION installed at $BINARYEN_DEST"
 }
 
+# =====================================================================
+# wabt (wat2wasm / wasm2wat) — optional dev tooling, sha256-pinned
+# =====================================================================
+#
+# Downloaded prebuilt from the upstream GitHub release and VERIFIED against a
+# pinned sha256 (the security control: a tampered byte stream is rejected
+# regardless of where it was fetched from). Optional WABT_CACHE_URL provides an
+# R2 mirror — the same upstream tarball, so the same pin verifies it. A platform
+# without a pinned hash is skipped (the core toolchain doesn't need wabt), and
+# any failure is non-fatal.
+
+# triple -> "<release-asset-basename>:<sha256>" for the pinned WABT_VERSION.
+# Add a platform by downloading its release asset and pasting basename + hash.
+WABT_KNOWN_x86_64_linux="wabt-${WABT_VERSION}-ubuntu-20.04.tar.gz:cfc675dc9b663d9adc8c75d982c1ba29f661448a2e026a67e71fe3f76a3e09f3"
+
+install_wabt() {
+    if [ -x "$WABT_DEST/bin/wat2wasm" ] && \
+       [ "$(cat "$WABT_DEST/VERSION" 2>/dev/null)" = "$WABT_VERSION" ]; then
+        echo "init.sh: wabt $WABT_VERSION already installed at $WABT_DEST"
+        return 0
+    fi
+
+    local key="WABT_KNOWN_${arch}_${os}"
+    local entry="${!key:-}"
+    if [ -z "$entry" ]; then
+        echo "init.sh: no pinned wat2wasm for ${arch}-${os} — skipping (optional tooling)"
+        return 0
+    fi
+    local asset="${entry%%:*}"
+    local expected_sha="${entry##*:}"
+    local tarball="$tmpdir/$asset"
+
+    # Try the optional R2 mirror first, then the upstream release. Either source
+    # is checked against the same pinned sha256, so a bad mirror can't poison it.
+    local got=""
+    if [ -n "$WABT_CACHE_URL" ] && \
+       curl -fsSL "${WABT_CACHE_URL%/}/$asset" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="cache"
+    elif curl -fsSL "${WABT_RELEASE_BASE}/${WABT_VERSION}/${asset}" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="release"
+    else
+        echo "init.sh: wat2wasm download failed — skipping (optional tooling)" >&2
+        return 0
+    fi
+
+    local actual_sha
+    actual_sha="$("${sha256_cmd[@]}" "$tarball" | awk '{print $1}')"
+    if [ "$actual_sha" != "$expected_sha" ]; then
+        echo "init.sh: wabt sha256 mismatch (from $got) — refusing:" >&2
+        echo "  expected: $expected_sha" >&2
+        echo "  got:      $actual_sha" >&2
+        return 0
+    fi
+    echo "init.sh: wabt sha256 verified ($actual_sha, from $got)"
+
+    tar -xzf "$tarball" -C "$tmpdir"
+    local extracted="$tmpdir/wabt-${WABT_VERSION}"
+    if [ ! -d "$extracted" ]; then
+        echo "init.sh: unexpected wabt tarball layout — skipping" >&2
+        return 0
+    fi
+    rm -rf "$WABT_DEST"
+    mv "$extracted" "$WABT_DEST"
+    echo "$WABT_VERSION" > "$WABT_DEST/VERSION"
+    echo "init.sh: wabt $WABT_VERSION installed at $WABT_DEST ($("$WABT_DEST/bin/wat2wasm" --version 2>/dev/null || echo '?'))"
+}
+
 install_zig
 install_wasmtime
 install_binaryen
+install_wabt
 
 echo
 echo "Add zig to PATH for this shell:"
