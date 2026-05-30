@@ -191,6 +191,169 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export)
     return out.buf.toOwnedSlice(gpa);
 }
 
+/// Encode a component for an **app** core module that imports `env.out`
+/// (module `env`, field `out`, `(i32 ptr, i32 len) -> ()` on wasm32). The one
+/// capability import is lowered to a component-level `log: func(msg: string)`
+/// through the canonical ABI; `_start` is lifted as `run: func()`.
+///
+/// The string lowering needs the core module's memory, which only exists once
+/// the module is instantiated — but the module needs the lowered import to
+/// instantiate. That cycle is broken with the **indirection pattern**: the core
+/// `env.out` import is satisfied by a `shim` trampoline that `call_indirect`s a
+/// table slot; after the core module (and its memory) exist, the real lowered
+/// import is patched into that slot by the `fixup` module's element segment.
+/// `shim` / `fixup` are the Binaryen-built helper core modules.
+pub fn encodeApp(gpa: std.mem.Allocator, core: []const u8, shim: []const u8, fixup: []const u8) Error![]u8 {
+    var out = W{ .a = gpa };
+    errdefer out.buf.deinit(gpa);
+    try out.bytes(&.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+
+    var s = W{ .a = gpa };
+    defer s.buf.deinit(gpa);
+    const reset = struct {
+        fn f(w: *W) void {
+            w.buf.clearRetainingCapacity();
+        }
+    }.f;
+
+    // §7 type: 0 = log `(func (param "msg" string))`; 1 = run `(func)`.
+    reset(&s);
+    try s.uleb(2);
+    try s.byte(0x40); // functype (log)
+    try s.uleb(1);
+    try s.name("msg");
+    try s.byte(0x73); // string
+    try s.byte(0x01); // named results …
+    try s.uleb(0); // … none
+    try s.byte(0x40); // functype (run)
+    try s.uleb(0);
+    try s.byte(0x01);
+    try s.uleb(0);
+    try section(&out, 7, s.buf.items);
+
+    // §10 import "log" (func, type 0) → component func 0.
+    reset(&s);
+    try s.uleb(1);
+    try s.byte(0x00); // import-name plain tag
+    try s.name("log");
+    try s.byte(0x01); // externdesc: func …
+    try s.uleb(0); // … type 0
+    try section(&out, 10, s.buf.items);
+
+    // §1 core modules: 0 = MAIN (the q64 core), 1 = SHIM, 2 = FIXUP.
+    try section(&out, 1, core);
+    try section(&out, 1, shim);
+    try section(&out, 1, fixup);
+
+    // §2 core instance 0 = instantiate SHIM (module 1), no imports.
+    reset(&s);
+    try s.uleb(1);
+    try s.byte(0x00);
+    try s.uleb(1); // module 1
+    try s.uleb(0); // 0 args
+    try section(&out, 2, s.buf.items);
+
+    // §6 alias the shim's exports: core func 0 = trampoline, core table 0 = slot.
+    reset(&s);
+    try s.uleb(2);
+    try aliasCoreExport(&s, 0x00, 0, "0"); // core func ← inst0 "0"
+    try aliasCoreExport(&s, 0x01, 0, "$imports"); // core table ← inst0 "$imports"
+    try section(&out, 6, s.buf.items);
+
+    // §2 core instance 1 = synthetic `env` { "out": core func 0 };
+    //    core instance 2 = instantiate MAIN (module 0) with `env` = instance 1.
+    reset(&s);
+    try s.uleb(2);
+    try s.byte(0x01); // from-exports
+    try s.uleb(1);
+    try s.name("out");
+    try s.byte(0x00); // core sort func
+    try s.uleb(0); // core func 0
+    try s.byte(0x00); // instantiate
+    try s.uleb(0); // module 0
+    try s.uleb(1); // 1 arg
+    try s.name("env");
+    try s.byte(0x12); // core sort instance
+    try s.uleb(1); // instance 1
+    try section(&out, 2, s.buf.items);
+
+    // §6 alias core memory 0 = MAIN instance (2) export "memory".
+    reset(&s);
+    try s.uleb(1);
+    try aliasCoreExport(&s, 0x02, 2, "memory"); // core memory ← inst2 "memory"
+    try section(&out, 6, s.buf.items);
+
+    // §8 canon lower (component func 0 = log) (memory 0) → core func 1.
+    reset(&s);
+    try s.uleb(1);
+    try s.byte(0x01); // canon …
+    try s.byte(0x00); // … lower
+    try s.uleb(0); // component func 0
+    try s.uleb(1); // 1 option …
+    try s.byte(0x03); // … memory
+    try s.uleb(0); // core memory 0
+    try section(&out, 8, s.buf.items);
+
+    // §2 core instance 3 = synthetic { "$imports": table 0, "0": core func 1 };
+    //    core instance 4 = instantiate FIXUP (module 2) with "" = instance 3.
+    reset(&s);
+    try s.uleb(2);
+    try s.byte(0x01); // from-exports
+    try s.uleb(2);
+    try s.name("$imports");
+    try s.byte(0x01); // core sort table
+    try s.uleb(0); // core table 0
+    try s.name("0");
+    try s.byte(0x00); // core sort func
+    try s.uleb(1); // core func 1 (lowered log)
+    try s.byte(0x00); // instantiate
+    try s.uleb(2); // module 2 (FIXUP)
+    try s.uleb(1); // 1 arg
+    try s.name(""); // module ""
+    try s.byte(0x12); // core sort instance
+    try s.uleb(3); // instance 3
+    try section(&out, 2, s.buf.items);
+
+    // §6 alias core func 2 = MAIN instance (2) export "_start".
+    reset(&s);
+    try s.uleb(1);
+    try aliasCoreExport(&s, 0x00, 2, "_start");
+    try section(&out, 6, s.buf.items);
+
+    // §8 canon lift (core func 2 = _start) → component func 1, type 1 (run).
+    reset(&s);
+    try s.uleb(1);
+    try s.byte(0x00); // canon …
+    try s.byte(0x00); // … lift
+    try s.uleb(2); // core func 2
+    try s.uleb(0); // 0 options
+    try s.uleb(1); // component type 1
+    try section(&out, 8, s.buf.items);
+
+    // §11 export "run" = component func 1.
+    reset(&s);
+    try s.uleb(1);
+    try s.byte(0x00); // export-name plain tag
+    try s.name("run");
+    try s.byte(0x01); // sort: component func
+    try s.uleb(1); // component func 1
+    try s.byte(0x00); // no extern-desc ascription
+    try section(&out, 11, s.buf.items);
+
+    return out.buf.toOwnedSlice(gpa);
+}
+
+/// Emit one core-instance-export alias: `(alias core export <instance> <name>
+/// (core <sort>))`. `core_sort` is the core sort byte (0x00 func, 0x01 table,
+/// 0x02 memory).
+fn aliasCoreExport(s: *W, core_sort: u8, instance: usize, name: []const u8) Error!void {
+    try s.byte(0x00); // sort: core
+    try s.byte(core_sort); // core sort
+    try s.byte(0x01); // target: core instance export
+    try s.uleb(instance);
+    try s.name(name);
+}
+
 const testing = std.testing;
 
 test "encode: component preamble + section ids for a scalar export" {

@@ -532,10 +532,26 @@ spec/q64-cli.md `--component`).
       --component` on the example and validates with wasmtime. 113/113 qube-test
       + 81/81 q64-test green. **Remaining:** `--target <name>` (named manifest
       targets) is accepted-but-ignored, not yet wired.
-- [ ] **Import lowering (capability faces).** Lower `env.out` (→ a WASI/host
-      import) through `canon lower` so an *app* (not just a pure library) wraps
-      as a component. Needs the core module to export `memory` + `cabi_realloc`
-      and the import-side canon encoding.
+- [x] **Import lowering (capability faces) — an app wraps + runs.** `q64 emit
+      --component --addr wasm32` on an app that writes stdout now lowers its one
+      `env.out` capability import to a component `log: func(msg: string)` through
+      the canonical ABI, and lifts `_start` as `run: func()`. The string lowering
+      needs the core module's memory, which only exists after instantiation —
+      that cycle is broken with the **indirection pattern**: `env.out` is
+      satisfied by a Binaryen-built *shim* trampoline that `call_indirect`s a
+      table slot, and a *fixup* module's element segment patches the real lowered
+      import into that slot once the memory exists (`component.encodeApp`,
+      `emit.buildShimModule`/`buildFixupModule`). Verified **end-to-end**:
+      `q64-component-check --run` instantiates the component, provides `log`, and
+      calls `run` — `fn main { env.out("Hello, q64.") }` prints `Hello, q64.`
+      through the lowered import; `examples/hello-component` builds + runs via
+      `qube build --component --addr wasm32`. `component-roundtrip.sh` asserts
+      the run; build.test.ts covers the app path. **Scope:** wasm32 only (the
+      32-bit canonical ABI); a single string import (`env.out`). Multiple
+      capabilities and the wasm64 canonical ABI are the next slices.
+      **Note:** the import is a q64-internal `log` face, not yet `wasi:cli/stdout`
+      (which uses resource/stream types) — mapping `@stdout` to the real WASI
+      interface the synthesized world names is a follow-on.
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.
