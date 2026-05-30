@@ -48,13 +48,16 @@ BINARYEN_REPO="https://github.com/WebAssembly/binaryen.git"
 # wabt (wat2wasm / wasm2wat) — OPTIONAL developer tooling: compile the WAT
 # fixtures + component helper modules to wasm, and inspect emitted modules.
 # The toolchain (q64, host, codegen) does NOT require it; a platform without a
-# pinned hash just skips it. Trust root is the upstream GitHub release verified
-# against the pinned sha256 below; WABT_CACHE_URL is an optional R2 mirror
-# (Binaryen-style) for networks that block github.com but allow the bucket.
+# pinned hash just skips it. Trust root is the pinned sha256 below — verified
+# whatever the source. WABT_CACHE_URL defaults to q64's public CDN bucket
+# (cdn.q64.dev, bucket `q64`), which mirrors the upstream release tarball under
+# its asset name; init.sh tries the CDN first and falls back to github.com on a
+# miss. The pin makes the mirror safe regardless. Override the URL (or set it
+# empty) to force the upstream release.
 WABT_VERSION="${WABT_VERSION:-1.0.37}"
 WABT_DEST="vendor/wabt"
 WABT_RELEASE_BASE="https://github.com/WebAssembly/wabt/releases/download"
-WABT_CACHE_URL="${WABT_CACHE_URL:-}"
+WABT_CACHE_URL="${WABT_CACHE_URL-https://cdn.q64.dev}"
 
 cd "$(dirname "$0")"
 
