@@ -219,6 +219,154 @@ pub fn showMir(allocator: std.mem.Allocator, source: []const u8, file: []const u
     return ir.print.mirToString(allocator, &mmod);
 }
 
+/// `q64 show effects <fn> --qube <file>` — the inferred capability effect set
+/// of one function (spec/q64-cli.md §"show", spec/effects.md). Builds the
+/// effect-annotated HIR and prints `<fn>: @stdout + @io` (or `: (none)` for a
+/// function that reaches no capability). An unknown function name is
+/// `NameNotFound`, matching `emit`/`show hir`.
+pub fn showEffects(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, fn_name: []const u8) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    for (hmod.funcs) |f| {
+        if (std.mem.eql(u8, f.name, fn_name)) {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.appendSlice(allocator, fn_name);
+            try out.appendSlice(allocator, ": ");
+            try appendEffectSet(allocator, &out, f.effects);
+            try out.append(allocator, '\n');
+            return out.toOwnedSlice(allocator);
+        }
+    }
+    return Error.NameNotFound;
+}
+
+/// `q64 show capabilities --qube <file>` — the qube's compiler-derived
+/// capability set: the closure of effects over its public (exported) surface
+/// (spec/q64-cli.md §"show", spec/modules.md §"The qube as a component"). One
+/// marker per line, finest-grained first; `(none)` when the surface is pure.
+pub fn showCapabilities(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    const caps = qubeCapabilities(&hmod);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (caps.count() == 0) {
+        try out.appendSlice(allocator, "(none)\n");
+    } else {
+        var it = caps.iterator();
+        while (it.next()) |eff| {
+            try out.appendSlice(allocator, eff.marker());
+            try out.append(allocator, '\n');
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// `q64 show world --qube <file>` — the synthesized WIT `world` for the qube
+/// (spec/q64-cli.md §"show", spec/modules.md §"The qube as a component"):
+/// exports = the public surface, imports = the derived capability set mapped
+/// through the effect→WIT-import table (spec/effects.md). The format is
+/// human/test-facing, not a stable serialization.
+pub fn showWorld(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    const caps = qubeCapabilities(&hmod);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const world = worldName(file);
+    try out.print(allocator, "// synthesized WIT world for {s} (q64 show world)\n", .{file});
+    try out.print(allocator, "world {s} {{\n", .{world});
+
+    // Imports — the derived capability set, mapped to WIT interfaces. `@io`
+    // (the umbrella) and `@wire` carry no fixed interface, so they're noted but
+    // not emitted as an `import`.
+    try out.appendSlice(allocator, "  // imports — derived capability set\n");
+    var any_import = false;
+    var it = caps.iterator();
+    while (it.next()) |eff| {
+        if (eff.witImport()) |wit| {
+            try out.print(allocator, "  import {s};\n", .{wit});
+            any_import = true;
+        }
+    }
+    if (!any_import) try out.appendSlice(allocator, "  // (none — pure surface)\n");
+
+    // Exports — the public surface. The entry (`main`) and every `pub` function
+    // whose signature lowers to the canonical ABI.
+    try out.appendSlice(allocator, "  // exports — public surface\n");
+    for (hmod.funcs, 0..) |f, i| {
+        const is_entry = (hmod.entry != null and hmod.entry.? == i);
+        if (f.visibility != .public and !is_entry) continue;
+        try out.print(allocator, "  export {s}: func(", .{f.name});
+        for (f.params, 0..) |p, pi| {
+            if (pi > 0) try out.appendSlice(allocator, ", ");
+            try out.print(allocator, "{s}: {s}", .{ p.name, witType(p.ty) });
+        }
+        try out.appendSlice(allocator, ")");
+        if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
+        try out.appendSlice(allocator, ";\n");
+    }
+
+    try out.appendSlice(allocator, "}\n");
+    return out.toOwnedSlice(allocator);
+}
+
+/// Union the effect sets of the qube's public surface (entry + `pub` funcs).
+/// Each function's `effects` is already the transitive closure, so a private
+/// helper's capabilities are folded into its public callers — unioning the
+/// public funcs yields the whole qube's capability set.
+fn qubeCapabilities(m: *const ir.hir.Module) std.EnumSet(ir.hir.Effect) {
+    var caps = std.EnumSet(ir.hir.Effect).initEmpty();
+    for (m.funcs, 0..) |f, i| {
+        const is_entry = (m.entry != null and m.entry.? == i);
+        if (f.visibility != .public and !is_entry) continue;
+        for (f.effects) |eff| caps.insert(eff);
+    }
+    return caps;
+}
+
+/// Append an effect set as `@a + @b`, or `(none)` when empty.
+fn appendEffectSet(allocator: std.mem.Allocator, out: *std.ArrayList(u8), effs: []const ir.hir.Effect) !void {
+    if (effs.len == 0) {
+        try out.appendSlice(allocator, "(none)");
+        return;
+    }
+    for (effs, 0..) |eff, i| {
+        if (i > 0) try out.appendSlice(allocator, " + ");
+        try out.appendSlice(allocator, eff.marker());
+    }
+}
+
+/// Lower a q64 type to its WIT canonical-ABI name (spec/modules.md §"Lowering
+/// q64 types to the canonical ABI"). v0 covers the scalar surface the compiler
+/// emits; `ptr` is an internal lowering artifact and should not reach a `pub`
+/// signature.
+fn witType(t: ir.hir.Type) []const u8 {
+    return switch (t) {
+        .i64 => "s64",
+        .i32 => "s32",
+        .f64 => "f64",
+        .bool => "bool",
+        .str => "string",
+        .ptr => "u64", // internal pointer width; not a canonical-ABI export type
+        .void => "_",
+    };
+}
+
+/// Derive a WIT world name from the source file: its basename without the
+/// extension, with non-identifier bytes mapped to `-` (WIT uses kebab-case).
+fn worldName(file: []const u8) []const u8 {
+    var name = file;
+    if (std.mem.lastIndexOfScalar(u8, name, '/')) |slash| name = name[slash + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+        if (dot > 0) name = name[0..dot];
+    }
+    return if (name.len == 0) "qube" else name;
+}
+
 /// Adapts the codegen `Resolver` to the IR builder's `ModuleResolver` so
 /// `build_hir` can resolve call targets to their AST without `ir/` depending
 /// on `codegen/`.

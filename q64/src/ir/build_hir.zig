@@ -24,6 +24,7 @@ const ast = parser.ast;
 const hir = @import("hir.zig");
 const ops = @import("ops.zig");
 const consteval = @import("consteval.zig");
+const effects = @import("effects.zig");
 
 pub const ModuleResolver = hir.ModuleResolver;
 
@@ -120,6 +121,10 @@ pub fn tryBuild(
     mod.entry = b.entry;
     mod.globals = try b.global_inits.toOwnedSlice(b.a);
     mod.global_names = try b.global_names.toOwnedSlice(b.a);
+    // Effect pass: infer each function's capability set over the built graph,
+    // so every HIR consumer (emit, `show hir`, `show effects`, the future WIT
+    // lift) sees effect-annotated functions.
+    try effects.analyze(&mod);
     return .{ .module = mod };
 }
 
@@ -1697,4 +1702,41 @@ test "tryBuild: a `var` with a constant initializer stays a runtime local" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "let") != null); // a real local, not folded
     try testing.expect(std.mem.indexOf(u8, dump, "assign") != null);
+}
+
+test "effects: main's env.out infers @stdout (+ @io)" {
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(\"hi\")\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The header line carries the inferred set; @stdout implies @io.
+    try testing.expect(std.mem.indexOf(u8, dump, "@stdout + @io") != null);
+}
+
+test "effects: a qview host call infers @ui (a peer, no @io)" {
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n qview.text(0, 0, 0)\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "@ui") != null);
+    // @ui is a peer surface — it must NOT pull in @io.
+    try testing.expect(std.mem.indexOf(u8, dump, "@io") == null);
+}
+
+test "effects: a pure i64 helper carries no capability" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn double(n: i64) -> i64 { n + n }\n");
+    var mod = (try buildFromSource(testing.allocator,
+        "import dev.q64.m.{double}\nfn main {\n env.out(double(21))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `double` does no I/O — its header has no effect markers.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn double -> i64\n") != null);
+    // main still writes stdout.
+    try testing.expect(std.mem.indexOf(u8, dump, "@stdout") != null);
 }

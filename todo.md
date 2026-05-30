@@ -452,12 +452,37 @@ it with `CfgUnsupported`).
   - [x] **HIR visibility slot surfaced.** `show hir` prints `pub` for a
         non-entry public function (an exported screen/twin handler) — the
         export-surface signal the component/WIT lift will read.
-  - [ ] **Effect slot.** `hir.Func` has no `effects` field yet — it lands with
-        the effect pass; the component/WIT lift then reads visibility + effects
-        to synthesize the world (exports = pub surface, imports = capabilities).
-  - [ ] **Dependency-origin visibility.** Today a reached dependency function
-        is modeled `.private` in the app's HIR; the WIT lift needs to scope
-        "exported surface" to the qube being compiled (not its deps).
+  - [x] **Effect slot + effect pass.** `hir.Func` carries an `effects` field —
+        the capability set (`hir.Effect`, spec/effects.md) inferred by a new
+        pure-Zig HIR pass (`ir/effects.zig`). It walks each function's body for
+        host faces (`env.out` → `@stdout`, a `qview.*` host call → `@ui`), unions
+        callee sets up the call graph to a fixpoint (handles recursion/cycles),
+        closes implications (`@stdout` ⇒ `@io`), and writes the sorted set back.
+        Runs inside `build_hir.tryBuild`, so every consumer sees effect-annotated
+        HIR. `show hir` now prints the set on each function's header line
+        (`fn main -> void [entry] @stdout + @io`). Verified: effects.zig API
+        tests (`implies`/`marker`/`witImport`/`close`) + build_hir integration
+        tests (stdout/ui/pure-helper) + `show effects` CLI test.
+  - [x] **Component/WIT lift seams — `show effects|capabilities|world`.** Three
+        new `show` kinds over the effect-annotated HIR (spec/q64-cli.md): `show
+        effects <fn> --qube <file>` prints one function's set; `show capabilities
+        --qube <file>` prints the qube's capability closure over its public
+        surface; `show world --qube <file>` synthesizes the WIT `world` — exports
+        = the public surface (signatures lowered to the canonical ABI via the
+        `witType` map), imports = the capability set mapped through the
+        effect→WIT-import table (`hir.Effect.witImport`: `@stdout` →
+        `wasi:cli/stdout`, `@ui` → `q64:host/ui`, …). `--qube` flag added to
+        `cmdShow`. Flipped `show/types-effects.test.ts` (effects) and
+        `show/capabilities-world.test.ts` (capabilities, world) from `test.failing`
+        to passing; 80/80 CLI tests + roundtrips green.
+  - [ ] **Dependency-origin visibility / unreached `pub` surface.** Today the HIR
+        builder constructs only functions *reachable from `main`*, and a reached
+        dependency function is modeled `.private`. Two consequences for the lift:
+        an unreached `pub fn` (an export with no internal caller) is absent from
+        the HIR, so `show world` omits it and `show effects <that fn>` is
+        `NameNotFound`; and the WIT lift needs to scope "exported surface" to the
+        qube being compiled (not its deps). Build the full `pub` surface, not just
+        the reachable graph.
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
