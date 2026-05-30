@@ -44,6 +44,12 @@ WASMTIME_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/dow
 BINARYEN_VERSION="${BINARYEN_VERSION:-129}"
 BINARYEN_DEST="vendor/binaryen"
 BINARYEN_REPO="https://github.com/WebAssembly/binaryen.git"
+# Prebuilt-cache accelerator (a top-level `binaryen/` tarball: static lib +
+# headers) — skips the ~10-minute from-source build. Defaults to q64's public
+# CDN bucket under `toolchain/`; verified against the pinned sha256 below, with
+# the from-source build as the fallback on miss / mismatch / unpinned platform.
+BINARYEN_CACHE_URL="${BINARYEN_CACHE_URL-https://cdn.q64.dev/toolchain}"
+BINARYEN_CACHE_SHA256_x86_64_linux="7258855e9e193b50252124f1c2d6a4ab67072acd501f9c782ee154321006d7d5"
 
 # wabt (wat2wasm / wasm2wat) — OPTIONAL developer tooling: compile the WAT
 # fixtures + component helper modules to wasm, and inspect emitted modules.
@@ -278,33 +284,45 @@ install_binaryen() {
         return
     fi
 
-    # Fast path: pull a prebuilt static lib from an external cache, skipping the
-    # ~10-minute from-source build. The cache URL is intentionally NOT hardcoded
-    # here — it stays out of this public repo and is supplied via
-    # BINARYEN_CACHE_URL by the environment that knows it (see qubepods'
-    # scripts/setup-q64-toolchain.sh, which hosts the prebuilt lib in a
-    # public-read R2 bucket). The cached tarball unpacks to a top-level
-    # `binaryen/` dir matching the short-circuit above; any miss or error falls
-    # through to the source build below, so this is purely an accelerator.
+    # Fast path: pull a prebuilt static lib from q64's public CDN cache
+    # (cdn.q64.dev/toolchain/, the same bucket as wabt), skipping the ~10-minute
+    # from-source build. The cached tarball unpacks to a top-level `binaryen/`
+    # dir matching the short-circuit above. The pinned sha256 is the trust root:
+    # a download that doesn't match (or a platform with no pin, or any miss)
+    # falls through to the source build below, so the cache is a safe accelerator.
     if [ -n "${BINARYEN_CACHE_URL:-}" ]; then
-        local c_arch c_os c_key c_url c_tar
+        local c_arch c_os c_key c_url c_tar pin_key pin got_sha
         c_arch="$(uname -m)"; case "$c_arch" in amd64) c_arch=x86_64;; arm64) c_arch=aarch64;; esac
         c_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-        c_key="binaryen-${BINARYEN_VERSION}-${c_arch}-${c_os}.tar.gz"
-        c_url="${BINARYEN_CACHE_URL%/}/$c_key"
-        c_tar="$tmpdir/$c_key"
-        echo "init.sh: trying binaryen cache $c_url"
-        if curl -fsSL "$c_url" -o "$c_tar" && [ -s "$c_tar" ]; then
-            mkdir -p "$(dirname "$BINARYEN_DEST")"
-            tar -xzf "$c_tar" -C "$(dirname "$BINARYEN_DEST")"
-            if [ -f "$BINARYEN_DEST/lib/libbinaryen.a" ] && \
-               [ "$(cat "$BINARYEN_DEST/VERSION" 2>/dev/null)" = "$BINARYEN_VERSION" ]; then
-                echo "init.sh: restored prebuilt binaryen $BINARYEN_VERSION from cache"
-                return
-            fi
-            echo "init.sh: cache tarball did not yield binaryen $BINARYEN_VERSION; building from source" >&2
+        pin_key="BINARYEN_CACHE_SHA256_${c_arch}_${c_os}"
+        pin="${!pin_key:-}"
+        if [ -z "$pin" ]; then
+            echo "init.sh: no pinned binaryen cache for ${c_arch}-${c_os}; building from source"
         else
-            echo "init.sh: binaryen cache miss/unavailable; building from source"
+            c_key="binaryen-${BINARYEN_VERSION}-${c_arch}-${c_os}.tar.gz"
+            c_url="${BINARYEN_CACHE_URL%/}/$c_key"
+            c_tar="$tmpdir/$c_key"
+            echo "init.sh: trying binaryen cache $c_url"
+            if curl -fsSL "$c_url" -o "$c_tar" && [ -s "$c_tar" ]; then
+                got_sha="$("${sha256_cmd[@]}" "$c_tar" | awk '{print $1}')"
+                if [ "$got_sha" = "$pin" ]; then
+                    echo "init.sh: binaryen cache sha256 verified ($got_sha)"
+                    mkdir -p "$(dirname "$BINARYEN_DEST")"
+                    tar -xzf "$c_tar" -C "$(dirname "$BINARYEN_DEST")"
+                    if [ -f "$BINARYEN_DEST/lib/libbinaryen.a" ] && \
+                       [ "$(cat "$BINARYEN_DEST/VERSION" 2>/dev/null)" = "$BINARYEN_VERSION" ]; then
+                        echo "init.sh: restored prebuilt binaryen $BINARYEN_VERSION from cache"
+                        return
+                    fi
+                    echo "init.sh: cache tarball did not yield binaryen $BINARYEN_VERSION; building from source" >&2
+                else
+                    echo "init.sh: binaryen cache sha256 mismatch — ignoring cache, building from source" >&2
+                    echo "  expected: $pin" >&2
+                    echo "  got:      $got_sha" >&2
+                fi
+            else
+                echo "init.sh: binaryen cache miss/unavailable; building from source"
+            fi
         fi
     fi
 
