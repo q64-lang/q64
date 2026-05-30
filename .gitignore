@@ -8,6 +8,7 @@ vendor/zig/
 vendor/wasmtime/
 vendor/binaryen/
 vendor/wabt/
+vendor/wasm-tools/
 
 # Node / Astro / web tooling
 node_modules/

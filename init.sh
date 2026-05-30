@@ -13,6 +13,9 @@
 #     component helper modules and inspect emitted wasm. sha256-pinned;
 #     skipped on platforms without a pinned hash (the core build never
 #     needs it).
+#   - wasm-tools (vendor/wasm-tools/) — OPTIONAL: component-model tooling
+#     (validate / WIT extraction / component new); used to differential-test
+#     the q64 component encoder. sha256-pinned; skipped where unpinned.
 #
 # Re-runnable; skips work that's already done. Run from the repo root:
 #
@@ -65,6 +68,17 @@ WABT_VERSION="${WABT_VERSION:-1.0.37}"
 WABT_DEST="vendor/wabt"
 WABT_RELEASE_BASE="https://github.com/WebAssembly/wabt/releases/download"
 WABT_CACHE_URL="${WABT_CACHE_URL-https://cdn.q64.dev/toolchain}"
+
+# wasm-tools — OPTIONAL: the component-model swiss-army knife (validate / print
+# / parse components, extract a component's WIT world, `component new/embed`).
+# Used to differential-test the q64 component encoder against the reference
+# implementation. Not needed for the core build. Same fetch model as wabt: the
+# public CDN mirror, sha256-pinned, github.com as fallback. The upstream release
+# tag carries a `v` prefix (v<ver>); the asset basename does not.
+WASMTOOLS_VERSION="${WASMTOOLS_VERSION:-1.251.0}"
+WASMTOOLS_DEST="vendor/wasm-tools"
+WASMTOOLS_RELEASE_BASE="https://github.com/bytecodealliance/wasm-tools/releases/download"
+WASMTOOLS_CACHE_URL="${WASMTOOLS_CACHE_URL-https://cdn.q64.dev/toolchain}"
 
 cd "$(dirname "$0")"
 
@@ -400,6 +414,9 @@ install_binaryen() {
 # Add a platform by downloading its release asset and pasting basename + hash.
 WABT_KNOWN_x86_64_linux="wabt-${WABT_VERSION}-ubuntu-20.04.tar.gz:cfc675dc9b663d9adc8c75d982c1ba29f661448a2e026a67e71fe3f76a3e09f3"
 
+# triple -> "<release-asset-basename>:<sha256>" for the pinned WASMTOOLS_VERSION.
+WASMTOOLS_KNOWN_x86_64_linux="wasm-tools-${WASMTOOLS_VERSION}-x86_64-linux.tar.gz:08d523676ec71d9afbae05aa4255041ce91bf2d325d87b7e722d190d558be689"
+
 install_wabt() {
     if [ -x "$WABT_DEST/bin/wat2wasm" ] && \
        [ "$(cat "$WABT_DEST/VERSION" 2>/dev/null)" = "$WABT_VERSION" ]; then
@@ -452,10 +469,68 @@ install_wabt() {
     echo "init.sh: wabt $WABT_VERSION installed at $WABT_DEST ($("$WABT_DEST/bin/wat2wasm" --version 2>/dev/null || echo '?'))"
 }
 
+# =====================================================================
+# wasm-tools — optional component-model tooling, sha256-pinned
+# =====================================================================
+
+install_wasmtools() {
+    if [ -x "$WASMTOOLS_DEST/wasm-tools" ] && \
+       [ "$(cat "$WASMTOOLS_DEST/VERSION" 2>/dev/null)" = "$WASMTOOLS_VERSION" ]; then
+        echo "init.sh: wasm-tools $WASMTOOLS_VERSION already installed at $WASMTOOLS_DEST"
+        return 0
+    fi
+
+    local key="WASMTOOLS_KNOWN_${arch}_${os}"
+    local entry="${!key:-}"
+    if [ -z "$entry" ]; then
+        echo "init.sh: no pinned wasm-tools for ${arch}-${os} — skipping (optional tooling)"
+        return 0
+    fi
+    local asset="${entry%%:*}"
+    local expected_sha="${entry##*:}"
+    local tarball="$tmpdir/$asset"
+
+    # CDN mirror first, then the upstream release (tag carries a `v` prefix).
+    # Both are checked against the same pin, so a bad mirror can't poison it.
+    local got=""
+    if [ -n "$WASMTOOLS_CACHE_URL" ] && \
+       curl -fsSL "${WASMTOOLS_CACHE_URL%/}/$asset" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="cache"
+    elif curl -fsSL "${WASMTOOLS_RELEASE_BASE}/v${WASMTOOLS_VERSION}/${asset}" -o "$tarball" 2>/dev/null && [ -s "$tarball" ]; then
+        got="release"
+    else
+        echo "init.sh: wasm-tools download failed — skipping (optional tooling)" >&2
+        return 0
+    fi
+
+    local actual_sha
+    actual_sha="$("${sha256_cmd[@]}" "$tarball" | awk '{print $1}')"
+    if [ "$actual_sha" != "$expected_sha" ]; then
+        echo "init.sh: wasm-tools sha256 mismatch (from $got) — refusing:" >&2
+        echo "  expected: $expected_sha" >&2
+        echo "  got:      $actual_sha" >&2
+        return 0
+    fi
+    echo "init.sh: wasm-tools sha256 verified ($actual_sha, from $got)"
+
+    tar -xzf "$tarball" -C "$tmpdir"
+    # The tarball extracts to a dir named after the asset basename.
+    local extracted="$tmpdir/${asset%.tar.gz}"
+    if [ ! -x "$extracted/wasm-tools" ]; then
+        echo "init.sh: unexpected wasm-tools tarball layout — skipping" >&2
+        return 0
+    fi
+    rm -rf "$WASMTOOLS_DEST"
+    mv "$extracted" "$WASMTOOLS_DEST"
+    echo "$WASMTOOLS_VERSION" > "$WASMTOOLS_DEST/VERSION"
+    echo "init.sh: wasm-tools $WASMTOOLS_VERSION installed at $WASMTOOLS_DEST ($("$WASMTOOLS_DEST/wasm-tools" --version 2>/dev/null || echo '?'))"
+}
+
 install_zig
 install_wasmtime
 install_binaryen
 install_wabt
+install_wasmtools
 
 echo
 echo "Add zig to PATH for this shell:"

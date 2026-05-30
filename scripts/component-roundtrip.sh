@@ -64,6 +64,20 @@ echo "==> q64 emit --component (app, wasm32) lowers env.out via the indirection 
 "$Q64_BIN" emit "$tmp/app.q" "$tmp/app.wasm" --addr wasm32 --component
 echo "==> wasmtime: validate the app component"
 "$CHECK_BIN" "$tmp/app.component.wasm"
+
+# Differential check against the reference implementation, when available: the
+# component must validate under wasm-tools too, and its extracted WIT world must
+# be exactly the import-lowered shape q64 encoded.
+WASMTOOLS_BIN="$REPO_ROOT/vendor/wasm-tools/wasm-tools"
+if [ -x "$WASMTOOLS_BIN" ]; then
+    echo "==> wasm-tools: validate + extract the component's WIT"
+    "$WASMTOOLS_BIN" validate --features all "$tmp/app.component.wasm"
+    wit="$("$WASMTOOLS_BIN" component wit "$tmp/app.component.wasm")"
+    echo "$wit" | grep -q "import log: func(msg: string)" || { echo "FAIL: WIT missing the lowered log import" >&2; echo "$wit" >&2; exit 1; }
+    echo "$wit" | grep -q "export run: func()" || { echo "FAIL: WIT missing the run export" >&2; echo "$wit" >&2; exit 1; }
+    echo "    ok: wasm-tools agrees — world { import log: func(msg: string); export run: func() }"
+fi
+
 echo "==> wasmtime: instantiate + run; the lowered log import receives env.out"
 got="$("$CHECK_BIN" "$tmp/app.component.wasm" --run)"
 if [ "$got" != "Hello, q64." ]; then
