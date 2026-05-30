@@ -3,16 +3,15 @@
 A stream-first language for Wasm 3.0, with managed and unmanaged memory as
 first-class peers.
 
-![Q64 designed architecture: the q64 compiler and qube build driver turning .q source into a linked Wasm module](./img/Q64Design.jpeg)
+![Q64 designed architecture: the q64 compiler and qube build driver turning .q source into a linked Wasm module](./assets/img/Q64Design.png)
 
 *The designed architecture at a glance: `q64` lowers `.q` source to Wasm 3.0;
 `qube` resolves projects, dependencies, components, and runtime execution. See
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full walkthrough.*
 
 This repository is the q64 implementation monorepo. The language design
-discussion that preceded the spec is archived in
-[`docs/history/`](./docs/history); the
-[`q64-lang/design`](https://github.com/q64-lang/design) repo is a tombstone
+discussion that preceded the spec lived in the
+[`q64-lang/design`](https://github.com/q64-lang/design) repo, now a tombstone
 pointing here.
 
 > **Status: pre-alpha.** Folders are scaffolded; most are not yet implemented.
@@ -22,9 +21,7 @@ pointing here.
 | Folder         | Purpose                                                                                       |
 |----------------|-----------------------------------------------------------------------------------------------|
 | [`continuum/`](./continuum) | Qube registry server (Cloudflare Workers; hosts qubes published from `qube publish`) |
-| [`docs/`](./docs)           | Language reference and tutorials (source; rendered by `web/`)                        |
 | [`examples/`](./examples)   | Sample qubes (voice-agent, audio DSP, 3D demo)                                       |
-| [`mcp/`](./mcp)             | MCP server exposing the q64 toolchain to AI agents (Bun/TypeScript)                  |
 | [`q64/`](./q64)             | Zig project → `q64` binary — the language tool (`fmt`, `lsp`, `show`, single-file)   |
 | [`qube/`](./qube)           | Zig project → `qube` binary — the package and build tool                             |
 | [`runtime/`](./runtime)     | Host adapters: `browser/`, `wasmtime/`, `wasmer/`, `audio-host/`                     |
@@ -56,10 +53,6 @@ the same way `cargo build` invokes `rustc`.
   Wasmtime/Wasmer/audio-host adapters; TypeScript for the browser adapter).
 - **`continuum/`** — **TypeScript** on Cloudflare Workers, using D1, R2, and
   KV.
-- **`mcp/`** — **TypeScript on Bun**. Thin shim that re-exposes `q64`, `qube`,
-  and `continuum` surfaces as MCP tools for AI agents (`q64.show.*`,
-  `qube.audit`, `continuum.search`, etc.). Adds no new contracts —
-  wraps the existing CLI flags and HTTP endpoints.
 - **`web/`** — **Astro + Starlight**. Starlight runs the docs; marketing
   pages are plain Astro routes; the playground and registry UI are Astro
   islands. The playground loads a wasm build of `q64/` to compile q64 source
@@ -150,7 +143,6 @@ The remaining bootstrap pieces (still in progress; folders are scaffolded):
   code disagree, the spec wins.
 - [`CLAUDE.md`](./CLAUDE.md) — repo conventions, chiefly the naming/casing
   rules (`Q64` vs `q64`, `Qube` vs `qube`, the Continuum).
-- [`docs/`](./docs) — language reference and tutorials (rendered by `web/`).
 
 ## License
 

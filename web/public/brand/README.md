@@ -44,8 +44,7 @@ against a particle field. The brand sheet describes it as:
 
 This is q64's nod to **Q** of *Star Trek: The Next Generation* —
 the omnipotent entity from the Q Continuum (cf. the etymology
-note that lived in the old design repo's README and now in
-`docs/history/`). The mascot is not a literal Q character; it's
+note that lived in the old design repo's README). The mascot is not a literal Q character; it's
 a stylized "observer beyond systems" who happens to share a
 silhouette and a single-letter signifier.
 

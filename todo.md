@@ -1,8 +1,7 @@
 # todo
 
 Active work tracker. Things to do, things to decide, kept short and
-ticked off as they land. Long-form design questions live in
-[`docs/history/MIGRATION.md`](./docs/history/MIGRATION.md); this file is
+ticked off as they land. Long-form design questions are tracked separately; this file is
 for items the next session should be able to pick up and act on.
 
 ## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
@@ -835,9 +834,6 @@ visible at a glance whether it's been picked up.
 - [ ] Pattern grammar completion — close the `(* open *)` markers in
       `grammar.md` §Patterns (guards, or-patterns, deep destructuring,
       range patterns, exhaustiveness).
-- [ ] `docs/history/` cleanup — once `units.md`, `kinds.md`,
-      `annotations.md`, `strings.md` land, the historical sources for
-      them can be archived or deleted. Per MIGRATION.md's own plan.
 
 ## Dual address space (wasm32 / wasm64) — NEW, SPEC LANDED
 

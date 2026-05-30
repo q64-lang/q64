@@ -4,7 +4,7 @@ import sitemap from '@astrojs/sitemap';
 
 // docs.q64.dev — the q64 language documentation.
 //
-// Three nav groups, two engines + one mirror (see web-docs/README.md):
+// Three nav groups, two engines + one mirror (see q64-docs/README.md):
 //   Guides     — hand-written, committed.
 //   Reference  — GENERATED from `q64 doc --json` (scripts/gen-docs.mjs).
 //   Spec       — MIRRORED from ../spec/*.md at build time.
