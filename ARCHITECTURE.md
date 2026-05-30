@@ -136,6 +136,22 @@ ABI later).
 > from the IR path itself. The earlier interim direct `AST → Binaryen` emitter —
 > with its per-construct router and `Q64_IR_STRICT` coverage gate — has been
 > removed now that the IR covers the language surface the compiler emits.
+>
+> A first slice of the **effect** stage is live: a pure-Zig HIR pass
+> (`ir/effects.zig`) infers each function's capability set (`@stdout`, `@ui`, …,
+> implication-closed) from the host faces it transitively reaches, and writes it
+> onto `hir.Func`. It runs inside `build_hir`, so the HIR is effect-annotated for
+> every consumer. `q64 show effects|capabilities|world` expose it — `world`
+> synthesizes the component's WIT (exports = the pub surface, imports = the
+> capability set), which is the input to the `component` stage above. The assert
+> markers (`@pure`/`@realtime`/…) and the typeck/region stages remain ahead.
+>
+> The **component** stage has a first slice too: `q64 emit --component`
+> (`codegen/component.zig`) hand-encodes a real WebAssembly component that wraps
+> the core module and lifts its import-free, scalar export surface through the
+> canonical ABI — validated end-to-end by wasmtime (`q64-component-check`).
+> Capability-import lowering (so an app, not just a pure library, wraps) and
+> string/list lifting are the next slices.
 
 ### parser — [`q64/src/parser/`](./q64/src/parser/README.md)
 

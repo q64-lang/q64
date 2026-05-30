@@ -27,6 +27,7 @@ const parser = @import("parser");
 const parse = parser.parse;
 const ast = parser.ast;
 const ir = @import("ir");
+const component = @import("component.zig");
 
 const c = @cImport({
     @cInclude("binaryen-c.h");
@@ -52,6 +53,10 @@ pub const Error = error{
     UndeclaredName, // assignment target names no in-scope binding
     BreakOutsideLoop, // `break`/`continue` with no enclosing loop
     CfgUnsupported, // a MIR func body in CFG form — the WASM backend only takes structured
+    // Component lift (q64 emit --component).
+    ComponentNeedsImportLowering, // the core module imports a capability; lowering not yet implemented
+    ComponentNoExports, // nothing in the public surface lifts to the canonical ABI yet
+    NonScalarExport,
     OutOfMemory,
 };
 
@@ -200,6 +205,86 @@ pub fn emitFromSource(
     return lowerToWasm(allocator, &mmod, addr);
 }
 
+/// Emit a WebAssembly **component** wrapping the core module (`q64 emit
+/// --component`). v0 lifts the import-free, scalar-signature slice of the
+/// public surface (spec/modules.md §"The qube as a component"): the core module
+/// is emitted as today, then `component.zig` wraps it, instantiating it and
+/// lifting each scalar `pub fn` through the canonical ABI. A core module that
+/// imports a capability (needs import lowering) is `ComponentNeedsImportLowering`;
+/// a surface with no liftable export is `ComponentNoExports`.
+pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
+        error.Unsupported => return Error.UnsupportedExpression,
+        else => |other| return other,
+    };
+    defer mmod.deinit();
+    const core = try lowerToWasm(allocator, &mmod, addr);
+    defer allocator.free(core);
+
+    // The import-lowering case (a capability face like `env.out` → a WASI
+    // import) isn't encoded yet — only an import-free core module lifts cleanly.
+    if (coreHasImports(core)) return Error.ComponentNeedsImportLowering;
+
+    // Gather the scalar public exports. A non-scalar (`str`/list) export needs
+    // memory/realloc canon options not in this slice — skip it for now.
+    var exports: std.ArrayList(component.Export) = .empty;
+    defer exports.deinit(allocator);
+    for (hmod.funcs, 0..) |f, i| {
+        const is_entry = (hmod.entry != null and hmod.entry.? == i);
+        if (f.visibility != .public and !is_entry) continue;
+        const params = try allocator.alloc(component.Scalar, f.params.len);
+        var ok = true;
+        for (f.params, 0..) |p, j| {
+            params[j] = component.Scalar.fromHir(p.ty) orelse {
+                ok = false;
+                break;
+            };
+        }
+        const ret: ?component.Scalar = if (f.ret == .void) null else component.Scalar.fromHir(f.ret) orelse {
+            allocator.free(params);
+            continue;
+        };
+        if (!ok) {
+            allocator.free(params);
+            continue;
+        }
+        try exports.append(allocator, .{
+            .name = f.name,
+            .core_name = if (is_entry) "_start" else f.name,
+            .params = params,
+            .ret = ret,
+        });
+    }
+    defer for (exports.items) |e| allocator.free(e.params);
+
+    if (exports.items.len == 0) return Error.ComponentNoExports;
+    return component.encode(allocator, core, exports.items);
+}
+
+/// Scan a core module for an import section (id 2). Used to gate component
+/// emission — an import-free module is the slice the lift handles today.
+fn coreHasImports(core: []const u8) bool {
+    if (core.len < 8) return false;
+    var p: usize = 8; // skip the 8-byte preamble
+    while (p < core.len) {
+        const id = core[p];
+        p += 1;
+        var size: usize = 0;
+        var shift: u6 = 0;
+        while (p < core.len) : (shift += 7) {
+            const b = core[p];
+            p += 1;
+            size |= @as(usize, b & 0x7f) << shift;
+            if (b & 0x80 == 0) break;
+        }
+        if (id == 2) return true; // import section
+        p += size;
+    }
+    return false;
+}
+
 /// Build the HIR for `source` and return its text dump (`q64 show hir`).
 pub fn showHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
     var hmod = try buildHir(allocator, source, file, modules);
@@ -217,6 +302,154 @@ pub fn showMir(allocator: std.mem.Allocator, source: []const u8, file: []const u
     };
     defer mmod.deinit();
     return ir.print.mirToString(allocator, &mmod);
+}
+
+/// `q64 show effects <fn> --qube <file>` — the inferred capability effect set
+/// of one function (spec/q64-cli.md §"show", spec/effects.md). Builds the
+/// effect-annotated HIR and prints `<fn>: @stdout + @io` (or `: (none)` for a
+/// function that reaches no capability). An unknown function name is
+/// `NameNotFound`, matching `emit`/`show hir`.
+pub fn showEffects(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, fn_name: []const u8) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    for (hmod.funcs) |f| {
+        if (std.mem.eql(u8, f.name, fn_name)) {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            try out.appendSlice(allocator, fn_name);
+            try out.appendSlice(allocator, ": ");
+            try appendEffectSet(allocator, &out, f.effects);
+            try out.append(allocator, '\n');
+            return out.toOwnedSlice(allocator);
+        }
+    }
+    return Error.NameNotFound;
+}
+
+/// `q64 show capabilities --qube <file>` — the qube's compiler-derived
+/// capability set: the closure of effects over its public (exported) surface
+/// (spec/q64-cli.md §"show", spec/modules.md §"The qube as a component"). One
+/// marker per line, finest-grained first; `(none)` when the surface is pure.
+pub fn showCapabilities(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    const caps = qubeCapabilities(&hmod);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (caps.count() == 0) {
+        try out.appendSlice(allocator, "(none)\n");
+    } else {
+        var it = caps.iterator();
+        while (it.next()) |eff| {
+            try out.appendSlice(allocator, eff.marker());
+            try out.append(allocator, '\n');
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// `q64 show world --qube <file>` — the synthesized WIT `world` for the qube
+/// (spec/q64-cli.md §"show", spec/modules.md §"The qube as a component"):
+/// exports = the public surface, imports = the derived capability set mapped
+/// through the effect→WIT-import table (spec/effects.md). The format is
+/// human/test-facing, not a stable serialization.
+pub fn showWorld(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
+    var hmod = try buildHir(allocator, source, file, modules);
+    defer hmod.deinit();
+    const caps = qubeCapabilities(&hmod);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const world = worldName(file);
+    try out.print(allocator, "// synthesized WIT world for {s} (q64 show world)\n", .{file});
+    try out.print(allocator, "world {s} {{\n", .{world});
+
+    // Imports — the derived capability set, mapped to WIT interfaces. `@io`
+    // (the umbrella) and `@wire` carry no fixed interface, so they're noted but
+    // not emitted as an `import`.
+    try out.appendSlice(allocator, "  // imports — derived capability set\n");
+    var any_import = false;
+    var it = caps.iterator();
+    while (it.next()) |eff| {
+        if (eff.witImport()) |wit| {
+            try out.print(allocator, "  import {s};\n", .{wit});
+            any_import = true;
+        }
+    }
+    if (!any_import) try out.appendSlice(allocator, "  // (none — pure surface)\n");
+
+    // Exports — the public surface. The entry (`main`) and every `pub` function
+    // whose signature lowers to the canonical ABI.
+    try out.appendSlice(allocator, "  // exports — public surface\n");
+    for (hmod.funcs, 0..) |f, i| {
+        const is_entry = (hmod.entry != null and hmod.entry.? == i);
+        if (f.visibility != .public and !is_entry) continue;
+        try out.print(allocator, "  export {s}: func(", .{f.name});
+        for (f.params, 0..) |p, pi| {
+            if (pi > 0) try out.appendSlice(allocator, ", ");
+            try out.print(allocator, "{s}: {s}", .{ p.name, witType(p.ty) });
+        }
+        try out.appendSlice(allocator, ")");
+        if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
+        try out.appendSlice(allocator, ";\n");
+    }
+
+    try out.appendSlice(allocator, "}\n");
+    return out.toOwnedSlice(allocator);
+}
+
+/// Union the effect sets of the qube's public surface (entry + `pub` funcs).
+/// Each function's `effects` is already the transitive closure, so a private
+/// helper's capabilities are folded into its public callers — unioning the
+/// public funcs yields the whole qube's capability set.
+fn qubeCapabilities(m: *const ir.hir.Module) std.EnumSet(ir.hir.Effect) {
+    var caps = std.EnumSet(ir.hir.Effect).initEmpty();
+    for (m.funcs, 0..) |f, i| {
+        const is_entry = (m.entry != null and m.entry.? == i);
+        if (f.visibility != .public and !is_entry) continue;
+        for (f.effects) |eff| caps.insert(eff);
+    }
+    return caps;
+}
+
+/// Append an effect set as `@a + @b`, or `(none)` when empty.
+fn appendEffectSet(allocator: std.mem.Allocator, out: *std.ArrayList(u8), effs: []const ir.hir.Effect) !void {
+    if (effs.len == 0) {
+        try out.appendSlice(allocator, "(none)");
+        return;
+    }
+    for (effs, 0..) |eff, i| {
+        if (i > 0) try out.appendSlice(allocator, " + ");
+        try out.appendSlice(allocator, eff.marker());
+    }
+}
+
+/// Lower a q64 type to its WIT canonical-ABI name (spec/modules.md §"Lowering
+/// q64 types to the canonical ABI"). v0 covers the scalar surface the compiler
+/// emits; `ptr` is an internal lowering artifact and should not reach a `pub`
+/// signature.
+fn witType(t: ir.hir.Type) []const u8 {
+    return switch (t) {
+        .i64 => "s64",
+        .i32 => "s32",
+        .f64 => "f64",
+        .bool => "bool",
+        .str => "string",
+        .ptr => "u64", // internal pointer width; not a canonical-ABI export type
+        .void => "_",
+    };
+}
+
+/// Derive a WIT world name from the source file: its basename without the
+/// extension, with non-identifier bytes mapped to `-` (WIT uses kebab-case).
+fn worldName(file: []const u8) []const u8 {
+    var name = file;
+    if (std.mem.lastIndexOfScalar(u8, name, '/')) |slash| name = name[slash + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+        if (dot > 0) name = name[0..dot];
+    }
+    return if (name.len == 0) "qube" else name;
 }
 
 /// Adapts the codegen `Resolver` to the IR builder's `ModuleResolver` so
@@ -297,9 +530,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var pair = [_]c.BinaryenType{ ptr_type, ptr_type };
     const pair_type = c.BinaryenTypeCreate(&pair, pair.len);
 
-    var env_out_params = [_]c.BinaryenType{ ptr_type, ptr_type };
-    const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
-    c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
+    // Only declare the `env.out` import when the program actually writes to it.
+    // A pure library (`pub fn add(…) -> i64`) imports nothing — which lets the
+    // component lift wrap it with no capability imports to lower.
+    if (usesEnvOut(m)) {
+        var env_out_params = [_]c.BinaryenType{ ptr_type, ptr_type };
+        const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
+        c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
+    }
 
     // One active data segment at offset 0 holds the whole memory image.
     if (m.data.len == 0) {
@@ -538,6 +776,48 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
 /// or str value (needs the pair scratch local), whether it concatenates (needs
 /// the arena buf/off/len), and the most call-result tuple slots any single
 /// concat requires.
+/// Whether any function in the module calls `env.out` (a `host_out_*` op) —
+/// gates the `env.out` import declaration. `host_call` (`qview.*`) faces have
+/// their own imports and don't count.
+fn usesEnvOut(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| switch (f.body) {
+        .structured => |root| if (instUsesEnvOut(root)) return true,
+        .cfg => {},
+    };
+    return false;
+}
+
+fn instUsesEnvOut(inst: *const ir.mir.Inst) bool {
+    switch (inst.op) {
+        .host_out_const, .host_out_int, .host_out_str => return true,
+        .str_concat => |pieces| for (pieces) |p| {
+            if (instUsesEnvOut(p)) return true;
+        },
+        .fmt_int_to_str => |inner| return instUsesEnvOut(inner),
+        .block => |items| for (items) |ch| {
+            if (instUsesEnvOut(ch)) return true;
+        },
+        .local_set => |ls| return instUsesEnvOut(ls.value),
+        .bin => |b| return instUsesEnvOut(b.lhs) or instUsesEnvOut(b.rhs),
+        .un => |u| return instUsesEnvOut(u.operand),
+        .call => |cl| for (cl.args) |a| {
+            if (instUsesEnvOut(a)) return true;
+        },
+        .ret => |v| if (v) |val| return instUsesEnvOut(val),
+        .if_ => |iff| return instUsesEnvOut(iff.cond) or instUsesEnvOut(iff.then_) or
+            (iff.else_ != null and instUsesEnvOut(iff.else_.?)),
+        .while_ => |w| return instUsesEnvOut(w.cond) or instUsesEnvOut(w.body),
+        .loop => |body| return instUsesEnvOut(body),
+        .host_call => |hc| for (hc.args) |a| {
+            if (instUsesEnvOut(a)) return true;
+        },
+        .global_set => |gs| return instUsesEnvOut(gs.value),
+        .str_bind => |sb| return instUsesEnvOut(sb.value),
+        else => {},
+    }
+    return false;
+}
+
 const Scratch = struct { host_out: bool = false, has_concat: bool = false, max_tuples: u32 = 0 };
 
 fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
@@ -1171,6 +1451,11 @@ fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
 // =====================================================================
 
 const testing = std.testing;
+
+// Pull the component encoder's embedded tests into the codegen test target.
+test {
+    _ = component;
+}
 
 test "emitHelloWasm: produces a non-empty Wasm module starting with the magic" {
     const bytes = try emitHelloWasm(testing.allocator);

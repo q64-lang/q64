@@ -46,8 +46,9 @@ AST → Wasm 3.0 emission. Uses the Binaryen C API.
 ## Files
 
 | File         | Status          | Purpose                                                   |
-|--------------|-----------------|-----------------------------------------------------------|
-| `emit.zig`   | partial         | Binaryen bindings, `emitFromSource`, `emitHelloWasm`.     |
+|-----------------|----------|------------------------------------------------------------------|
+| `emit.zig`      | partial  | Binaryen bindings, `emitFromSource`, `emitComponent`, `emitHelloWasm`. |
+| `component.zig` | v0 slice | Pure-Zig WebAssembly **component** encoder — wraps the core module in a component whose WIT world is the synthesized export surface. v0 lifts import-free, scalar (`s64`/`bool`/`f64`) exports through the canonical ABI; validated end-to-end by wasmtime (`q64-component-check`). |
 
 ## External
 
