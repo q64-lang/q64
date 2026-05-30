@@ -1,4 +1,4 @@
-# web-docs — docs.q64.dev
+# q64-docs — docs.q64.dev
 
 The q64 language documentation site. Astro + Starlight on a Cloudflare Worker
 (`q64-docs`, route `docs.q64.dev`). Separate from the landing site

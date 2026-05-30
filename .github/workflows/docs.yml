@@ -1,11 +1,11 @@
-# Deploys docs.q64.dev (web-docs/) to the q64-docs Cloudflare Worker.
+# Deploys docs.q64.dev (q64-docs/) to the q64-docs Cloudflare Worker.
 #
 # Decoupled from the compiler build: this workflow does NOT build Zig. The
 # reference data arrives as the `doc.json` asset published by release.yml; the
-# generator (web-docs/scripts/gen-docs.mjs) renders it, mirrors the spec, and
+# generator (q64-docs/scripts/gen-docs.mjs) renders it, mirrors the spec, and
 # emits llms.txt. A docs/spec edit therefore ships in seconds without the
 # toolchain. If no doc.json release exists yet, the generator falls back to the
-# committed fixture (web-docs/fixtures/doc.json).
+# committed fixture (q64-docs/fixtures/doc.json).
 #
 # Requires repo secrets CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID (the
 # release workflow uses only the ambient GITHUB_TOKEN; these are new).
@@ -17,7 +17,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/docs.yml'
-      - 'web-docs/**'
+      - 'q64-docs/**'
       - 'spec/**'
       - 'web/src/styles/**'
       - 'web/public/brand/**'
@@ -47,7 +47,7 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
-          cache-dependency-path: web-docs/pnpm-lock.yaml
+          cache-dependency-path: q64-docs/pnpm-lock.yaml
 
       # Best-effort: pull the latest published doc.json. If there is no release
       # yet (or the asset is missing), the generator uses the committed fixture.
@@ -56,20 +56,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          if gh release download nightly --pattern doc.json --output web-docs/.doc.json 2>/dev/null \
-            || gh release download --pattern doc.json --output web-docs/.doc.json 2>/dev/null; then
-            echo "DOC_JSON=$PWD/web-docs/.doc.json" >> "$GITHUB_ENV"
+          if gh release download nightly --pattern doc.json --output q64-docs/.doc.json 2>/dev/null \
+            || gh release download --pattern doc.json --output q64-docs/.doc.json 2>/dev/null; then
+            echo "DOC_JSON=$PWD/q64-docs/.doc.json" >> "$GITHUB_ENV"
             echo "Using doc.json from release"
           else
             echo "No doc.json release asset; generator will use the committed fixture"
           fi
 
       - name: Install
-        working-directory: web-docs
+        working-directory: q64-docs
         run: pnpm install --frozen-lockfile
 
       - name: Deploy
-        working-directory: web-docs
+        working-directory: q64-docs
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

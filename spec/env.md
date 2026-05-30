@@ -20,8 +20,7 @@ mechanism: shadow the ambient binding.
 > parameter) are retired. A follow-up sweep across `errors.md`,
 > `concurrency.md`, `streams.md`, `faces.md`, `effects.md`,
 > `memory.md`, and `spec/tests/golden/` is required to remove
-> the residual `env: Env` parameters from their examples; tracked
-> in [`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md).
+> the residual `env: Env` parameters from their examples.
 
 ## Design goals
 

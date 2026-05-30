@@ -122,8 +122,7 @@ That is a complete, publishable library qube. The default `entry` is
 | `entry` | string | `src/lib.q` for libraries, `src/main.q` for applications                      | Path to the main `.q` source file.                             |
 | `build` | string | none                                                                          | Optional path to `build.q` for computed configuration.         |
 
-Per [`docs/history/design.md` §"Manifest"](../docs/history/design.md):
-static configuration lives in `qube.json5`; `build.q` is the imperative escape
+Static configuration lives in `qube.json5`; `build.q` is the imperative escape
 hatch for projects that need to compute target configuration at build time.
 
 ### Dependencies
@@ -447,9 +446,6 @@ versions together until 1.0.
   install.
 - [`q64-cli.md`](./q64-cli.md) — `q64 show effects <qube>` and
   `q64 show capabilities <qube>` introspection.
-- [`docs/history/design.md`](../docs/history/design.md) — original
-  pre-spec design discussion (archived).
-- [`docs/history/stdlib.md`](../docs/history/stdlib.md) — the
-  built-in `q64.*` stdlib namespaces (`q64.math`, `q64.net`, etc.).
-  These are reserved and shipped with the toolchain, so they never
-  appear in `dependencies`.
+- The built-in `q64.*` stdlib namespaces (`q64.math`, `q64.net`, etc.)
+  are reserved and shipped with the toolchain, so they never appear in
+  `dependencies`.

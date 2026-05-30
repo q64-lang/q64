@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url';
 const SCHEMA_MAJOR = 1;
 
 const here = dirname(fileURLToPath(import.meta.url));
-const root = resolve(here, '..'); // web-docs/
+const root = resolve(here, '..'); // q64-docs/
 const repo = resolve(root, '..'); // q64 repo root
 const docsDir = join(root, 'src', 'content', 'docs');
 const refDir = join(docsDir, 'reference');

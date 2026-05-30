@@ -781,8 +781,7 @@ These three are **language builtins**, not user-declared types:
 the compiler knows their layout, monomorphization rules, and
 Wasm 3.0 lowering. The user-facing `@kind` annotation for
 defining zero-cost semantic newtypes (e.g. `@kind PCM<T>`,
-`@kind UserId`) is a separate construct tracked in
-[`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md)
+`@kind UserId`) is a separate construct tracked
 as the forthcoming `kinds.md` spec; until that lands, only
 these three compiler-blessed kinds exist.
 

@@ -16,8 +16,7 @@ program, expressions, statements, patterns) those specs assumed.
 > pattern grammar (guards, or-patterns, exhaustive struct destructuring),
 > region-parameter elision in `fn` signatures, the result-builder graph
 > DSL beyond `graph { let … }`, and operator overloading on units.
-> Tracked in [`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md)
-> §"Material that still needs *new* design work."
+> These items still need new design work.
 
 ## Notation
 
@@ -870,8 +869,7 @@ fn main {
 
 ## Open items deferred
 
-These are the four grammar-shaped open items tracked in
-[`docs/history/MIGRATION.md`](../docs/history/MIGRATION.md), reproduced
+These are the four grammar-shaped open items, reproduced
 here so a reader of this spec can see exactly what is **not** pinned.
 
 1. **Pattern matching grammar.** Guards (`Pattern if cond`),

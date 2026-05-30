@@ -88,7 +88,7 @@ jobs:
           ls -la out
 
       # The documentation index (keywords, builtin types, diagnostics) the
-      # docs.q64.dev site renders — see web-docs/. Architecture-independent, so
+      # docs.q64.dev site renders — see q64-docs/. Architecture-independent, so
       # only the amd64 matrix entry produces it; the docs deploy downloads this
       # release asset (no Zig toolchain needed to ship a docs change).
       - name: Generate doc.json

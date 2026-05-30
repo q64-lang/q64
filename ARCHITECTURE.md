@@ -11,7 +11,7 @@ doc and the spec disagree, the spec wins (see [`CLAUDE.md`](./CLAUDE.md)).
 > scaffolded but not yet fully implemented. This doc covers the intended
 > architecture rather than auditing what is wired up on any given day.
 
-![Q64 designed architecture: the q64 compiler stages, the qube build driver, and the end-to-end build flow from .q source to a running Wasm module](./img/Q64Design.jpeg)
+![Q64 designed architecture: the q64 compiler stages, the qube build driver, and the end-to-end build flow from .q source to a running Wasm module](./assets/img/Q64Design.png)
 
 The diagram above is the one-page map this document walks through. The two
 panels are the two binaries: the **q64 compiler** on the left lowers a single

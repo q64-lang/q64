@@ -518,9 +518,7 @@ pub fn render(target: dyn Display) {
 ```
 
 `dyn Face` is a type position. It is **separate** from the face-as-a-bound:
-`fn f<T: Display>` is static, `fn f(x: dyn Display)` is dynamic. Per
-[`docs/history/influences.md`](../docs/history/influences.md)
-§Swift, q64 deliberately separates "face as interface" from "face as
+`fn f<T: Display>` is static, `fn f(x: dyn Display)` is dynamic. q64 deliberately separates "face as interface" from "face as
 existential type" — Swift's conflation causes the `Self`-with-existential
 pain that q64 avoids.
 
