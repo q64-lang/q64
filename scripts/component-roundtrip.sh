@@ -56,13 +56,26 @@ echo "==> wasmtime: call add(2,3) == 5"
 echo "==> wasmtime: call mul(6,7) == 42"
 "$CHECK_BIN" "$tmp/mathlib.component.wasm" mul 6 7 42
 
-# --- boundary: a capability import is rejected, not mis-wrapped --------------
+# --- app: lower the env.out capability import + run the component -----------
 cat > "$tmp/app.q" <<'EOF'
-fn main { env.out("hi") }
+fn main { env.out("Hello, q64.") }
 EOF
-echo "==> q64 emit --component on an app that writes stdout must error"
-if "$Q64_BIN" emit "$tmp/app.q" "$tmp/app.wasm" --addr wasm32 --component 2>/dev/null; then
-    echo "FAIL: component emit on a capability-importing qube unexpectedly succeeded" >&2
+echo "==> q64 emit --component (app, wasm32) lowers env.out via the indirection pattern"
+"$Q64_BIN" emit "$tmp/app.q" "$tmp/app.wasm" --addr wasm32 --component
+echo "==> wasmtime: validate the app component"
+"$CHECK_BIN" "$tmp/app.component.wasm"
+echo "==> wasmtime: instantiate + run; the lowered log import receives env.out"
+got="$("$CHECK_BIN" "$tmp/app.component.wasm" --run)"
+if [ "$got" != "Hello, q64." ]; then
+    echo "FAIL: app component printed '$got', expected 'Hello, q64.'" >&2
+    exit 1
+fi
+echo "    ok: app component ran -> $got"
+
+# --- boundary: a wasm64 app import is not yet lowerable ----------------------
+echo "==> q64 emit --component on a wasm64 app must error (no 64-bit canonical ABI yet)"
+if "$Q64_BIN" emit "$tmp/app.q" "$tmp/app64.wasm" --addr wasm64 --component 2>/dev/null; then
+    echo "FAIL: wasm64 app component unexpectedly succeeded" >&2
     exit 1
 fi
 
