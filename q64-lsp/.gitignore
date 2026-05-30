@@ -1,0 +1,20 @@
+# Node / TS
+node_modules/
+dist/
+out/
+*.tsbuildinfo
+
+# Zig (core-wasm build)
+zig-out/
+.zig-cache/
+
+# Built wasm is a CI artifact, not source
+*.wasm
+
+# VSCode extension package
+*.vsix
+
+# Local env — never commit secrets to this public repo
+.env
+.env.local
+.DS_Store

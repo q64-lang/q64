@@ -1,0 +1,5 @@
+packages:
+  - "packages/*"
+# Note: `test/` is intentionally excluded. It is a black-box conformance
+# suite and must reach the server only as a real client would — by spawning
+# it and speaking LSP — never by importing workspace internals.

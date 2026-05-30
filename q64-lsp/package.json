@@ -1,0 +1,13 @@
+{
+  "name": "q64-lsp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The q64 language server, editor clients, and the wasm build of the q64 analysis core.",
+  "scripts": {
+    "build": "pnpm -r build",
+    "check": "pnpm -r check",
+    "test": "pnpm -C test test"
+  },
+  "packageManager": "pnpm@10.17.1"
+}
