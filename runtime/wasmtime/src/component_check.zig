@@ -22,6 +22,12 @@ const c = @cImport({
     @cInclude("wasmtime/component/val.h");
 });
 
+// Running an *app* component is not done here: the embedded wasmtime C API only
+// implements WASIp2, while q64 targets the WASIp3 (async) runtime. The
+// component-roundtrip runs an app with the vendored wasmtime **CLI**
+// (`wasmtime run -S p3`). This tool stays focused on what the C API does well:
+// validating a component (`wasmtime_component_new`) and calling a scalar export.
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -37,13 +43,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    // `--run`: instantiate an app component, provide its `log` import, call
-    // `run`, and print what `log` received (the program's env.out output).
-    const second = it.next();
-    const run_mode = second != null and std.mem.eql(u8, second.?, "--run");
-
     // Optional call check: <fn> <a> <b> <expected> (two s64 args, one s64 result).
-    const call_fn = if (run_mode) null else second;
+    const call_fn = it.next();
     const call_a = it.next();
     const call_b = it.next();
     const call_expected = it.next();
@@ -70,15 +71,10 @@ pub fn main(init: std.process.Init) !void {
     }
     defer c.wasmtime_component_delete(component);
 
-    if (!run_mode and call_fn == null) {
+    if (call_fn == null) {
         var w = std.Io.File.stdout().writer(io, &.{});
         try w.interface.print("ok: {s} is a valid component\n", .{path});
         try w.interface.flush();
-        return;
-    }
-
-    if (run_mode) {
-        try runApp(io, engine, component);
         return;
     }
 
@@ -131,80 +127,6 @@ pub fn main(init: std.process.Init) !void {
 
     var w = std.Io.File.stdout().writer(io, &.{});
     try w.interface.print("ok: {s}({d},{d}) = {d}\n", .{ call_fn.?, a_val, b_val, result.of.s64 });
-    try w.interface.flush();
-}
-
-/// Captures the bytes the component's `log` import receives — i.e. the
-/// program's `env.out` output, marshaled across the canonical ABI as a string.
-const Capture = struct { buf: [64 * 1024]u8 = undefined, len: usize = 0 };
-
-fn logCallback(
-    env: ?*anyopaque,
-    ctx: ?*c.wasmtime_context_t,
-    ty: ?*const c.wasmtime_component_func_type_t,
-    args: [*c]const c.wasmtime_component_val_t,
-    nargs: usize,
-    results: [*c]c.wasmtime_component_val_t,
-    nresults: usize,
-) callconv(.c) ?*c.wasmtime_error_t {
-    _ = ctx;
-    _ = ty;
-    _ = results;
-    _ = nresults;
-    const cap: *Capture = @ptrCast(@alignCast(env.?));
-    if (nargs >= 1 and args[0].kind == c.WASMTIME_COMPONENT_STRING) {
-        const s = args[0].of.string;
-        const n = @min(s.size, cap.buf.len - cap.len);
-        if (n > 0) @memcpy(cap.buf[cap.len..][0..n], s.data[0..n]);
-        cap.len += n;
-    }
-    return null;
-}
-
-/// Instantiate an app component: provide its `log: func(string)` import, call
-/// the lifted `run`, and write what `log` received to stdout. Proves the
-/// import-lowering + indirection encoding runs, not just validates.
-fn runApp(io: std.Io, engine: ?*c.wasm_engine_t, component: ?*c.wasmtime_component_t) !void {
-    const store = c.wasmtime_store_new(engine, null, null) orelse return error.StoreNewFailed;
-    defer c.wasmtime_store_delete(store);
-    const ctx = c.wasmtime_store_context(store);
-
-    const linker = c.wasmtime_component_linker_new(engine) orelse return error.LinkerNewFailed;
-    defer c.wasmtime_component_linker_delete(linker);
-
-    var cap = Capture{};
-    const root = c.wasmtime_component_linker_root(linker) orelse return error.LinkerRootFailed;
-    defer c.wasmtime_component_linker_instance_delete(root);
-    if (c.wasmtime_component_linker_instance_add_func(root, "log", "log".len, logCallback, &cap, null)) |e| {
-        try printErr(io, e, "define log");
-        std.process.exit(1);
-    }
-
-    var instance: c.wasmtime_component_instance_t = undefined;
-    if (c.wasmtime_component_linker_instantiate(linker, ctx, component, &instance)) |e| {
-        try printErr(io, e, "instantiate");
-        std.process.exit(1);
-    }
-
-    const idx = c.wasmtime_component_instance_get_export_index(&instance, ctx, null, "run", "run".len) orelse {
-        var buf: [256]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
-        try w.interface.writeAll("q64-component-check: export 'run' not found\n");
-        try w.interface.flush();
-        std.process.exit(1);
-    };
-    defer c.wasmtime_component_export_index_delete(idx);
-    var func: c.wasmtime_component_func_t = undefined;
-    if (!c.wasmtime_component_instance_get_func(&instance, ctx, idx, &func)) {
-        std.process.exit(1);
-    }
-    if (c.wasmtime_component_func_call(&func, ctx, null, 0, null, 0)) |e| {
-        try printErr(io, e, "call run");
-        std.process.exit(1);
-    }
-
-    var w = std.Io.File.stdout().writer(io, &.{});
-    try w.interface.writeAll(cap.buf[0..cap.len]);
     try w.interface.flush();
 }
 

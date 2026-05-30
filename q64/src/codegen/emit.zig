@@ -75,6 +75,21 @@ pub const AddressSpace = enum {
     }
 };
 
+/// How a core module's stdout capability (`env.out`) is lowered to a wasm
+/// import (spec/env.md §"Env ↔ WASI"). Two shapes:
+///   - `.env_out` — q64's raw host face `(import "env" "out" (func (param ptr
+///     len)))`, satisfied directly by `runtime/wasmtime/` and `runtime/browser/`.
+///   - `.wasi_preview1` — the WASI preview1 `fd_write` import `(import
+///     "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result
+///     i32)))`, writing one iovec to fd 1. This is the shape `wasm-tools
+///     component new --adapt` lifts (via `vendor/wasi/`) into a real
+///     `wasi:cli/run` command that imports `wasi:cli/stdout`. Preview1 is 32-bit,
+///     so this lowering is wasm32-only.
+pub const StdoutAbi = enum {
+    env_out,
+    wasi_preview1,
+};
+
 /// A dependency module made available to codegen. `name` is the bare-
 /// dotted module path (`dev.q64.hello_world`); `source` is the text of
 /// that module's entry file (`src/lib.q`). The compiler resolves
@@ -202,17 +217,38 @@ pub fn emitFromSource(
         else => |other| return other,
     };
     defer mmod.deinit();
-    return lowerToWasm(allocator, &mmod, addr);
+    // The raw core module keeps q64's `env.out` host face (the contract with
+    // `runtime/wasmtime/` and `runtime/browser/`). The component path emits the
+    // preview1 variant separately.
+    return lowerToWasm(allocator, &mmod, addr, .env_out);
 }
 
-/// Emit a WebAssembly **component** wrapping the core module (`q64 emit
-/// --component`). v0 lifts the import-free, scalar-signature slice of the
-/// public surface (spec/modules.md §"The qube as a component"): the core module
-/// is emitted as today, then `component.zig` wraps it, instantiating it and
-/// lifting each scalar `pub fn` through the canonical ABI. A core module that
-/// imports a capability (needs import lowering) is `ComponentNeedsImportLowering`;
-/// a surface with no liftable export is `ComponentNoExports`.
-pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace) ![]u8 {
+/// The product of `emitComponent`. Either a finished component (the import-free
+/// scalar library lift, which `component.zig` encodes in pure Zig), or — for an
+/// app that reaches stdout — a WASI **preview1 core module** the caller adapts
+/// into a real `wasi:cli/run` component (`q64 emit --component` shells out to
+/// `wasm-tools component new --adapt` with the `vendor/wasi/` adapter). Keeping
+/// the adapter shell-out in the CLI layer leaves this codegen module free of
+/// subprocess/filesystem concerns.
+pub const ComponentArtifact = union(enum) {
+    /// A finished WebAssembly component, ready to write. Caller owns the slice.
+    component: []u8,
+    /// A WASI preview1 core module (imports `wasi_snapshot_preview1.fd_write`,
+    /// exports `_start`) to be wrapped by the WASI adapter. Caller owns it.
+    preview1_app: []u8,
+};
+
+/// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
+/// qube as a component"). A library lifts the import-free, scalar-signature
+/// slice of its public surface through the canonical ABI (`component.encode`).
+/// An app — one that reaches the `@stdout` capability (`env.out`) — is emitted
+/// as a WASI **preview1 core module** (the `fd_write` import shape) for the
+/// caller to run through the WASI adapter; preview1 is 32-bit, so a wasm64 app
+/// is `ComponentNeedsImportLowering`. A library whose core still imports a
+/// capability the lift can't satisfy (e.g. a `qview.*` face) is likewise
+/// `ComponentNeedsImportLowering`; a surface with no liftable export is
+/// `ComponentNoExports`.
+pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace) !ComponentArtifact {
     var hmod = try buildHir(allocator, source, file, modules);
     defer hmod.deinit();
     var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
@@ -220,22 +256,23 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
         else => |other| return other,
     };
     defer mmod.deinit();
-    const core = try lowerToWasm(allocator, &mmod, addr);
+
+    // An app reaches stdout (`env.out` → `@stdout`). Emit a preview1 core module
+    // — `wasi_snapshot_preview1.fd_write`, `_start` — and hand it back for the
+    // WASI adapter to lift into `wasi:cli/run` importing `wasi:cli/stdout`. The
+    // preview1 ABI is 32-bit (i32 iovec/fd_write); a wasm64 app isn't lowerable.
+    if (usesEnvOut(&mmod)) {
+        if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
+        return .{ .preview1_app = try lowerToWasm(allocator, &mmod, addr, .wasi_preview1) };
+    }
+
+    const core = try lowerToWasm(allocator, &mmod, addr, .env_out);
     defer allocator.free(core);
 
-    // An app that reaches a capability face imports `env.out`. We lower that one
-    // import (→ a component `log: func(string)`) via the indirection pattern and
-    // lift `_start` as `run`. The canonical ABI here is wasm32-only for now
-    // (the 32-bit linear memory the string lowering reads); a wasm64 import
-    // build is reported as not-yet-supported.
-    if (coreHasImports(core)) {
-        if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
-        const shim = try buildShimModule(allocator);
-        defer allocator.free(shim);
-        const fixup = try buildFixupModule(allocator);
-        defer allocator.free(fixup);
-        return component.encodeApp(allocator, core, shim, fixup);
-    }
+    // A library core that still imports something (e.g. a `qview.*` host face)
+    // can't be lifted by the scalar encoder — report it honestly rather than
+    // emitting an invalid component.
+    if (coreHasImports(core)) return Error.ComponentNeedsImportLowering;
 
     // Gather the scalar public exports. A non-scalar (`str`/list) export needs
     // memory/realloc canon options not in this slice — skip it for now.
@@ -270,76 +307,7 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     defer for (exports.items) |e| allocator.free(e.params);
 
     if (exports.items.len == 0) return Error.ComponentNoExports;
-    return component.encode(allocator, core, exports.items);
-}
-
-/// Serialize a Binaryen module to an owned byte slice.
-fn writeBinaryenModule(allocator: std.mem.Allocator, module: c.BinaryenModuleRef) ![]u8 {
-    if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
-    const result = c.BinaryenModuleAllocateAndWrite(module, null);
-    defer if (result.binary) |b| std.c.free(b);
-    defer if (result.sourceMap) |s| std.c.free(s);
-    const ptr = result.binary orelse return Error.SerializeEmpty;
-    if (result.binaryBytes == 0) return Error.SerializeEmpty;
-    const src: [*]const u8 = @ptrCast(ptr);
-    const out = try allocator.alloc(u8, result.binaryBytes);
-    @memcpy(out, src[0..result.binaryBytes]);
-    return out;
-}
-
-/// Build the **shim** core module for component import lowering: a 1-slot
-/// funcref table (exported as `$imports`) plus a trampoline `(i32, i32) -> ()`
-/// (exported as `0`) that `call_indirect`s table slot 0. The q64 core module's
-/// `env.out` import is satisfied by this trampoline; the real lowered import is
-/// patched into the table by the fixup module — breaking the instantiation
-/// cycle (the lowered import needs the core memory, which only exists after the
-/// core module is instantiated).
-fn buildShimModule(allocator: std.mem.Allocator) ![]u8 {
-    const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
-    defer c.BinaryenModuleDispose(module);
-    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureAll());
-    const i32_t = c.BinaryenTypeInt32();
-    const none_t = c.BinaryenTypeNone();
-    const funcref = c.BinaryenTypeFuncref();
-    var pp = [_]c.BinaryenType{ i32_t, i32_t };
-    const params = c.BinaryenTypeCreate(&pp, pp.len);
-
-    _ = c.BinaryenAddTable(module, "$imports", 1, 1, funcref, null);
-    var ops = [_]c.BinaryenExpressionRef{
-        c.BinaryenLocalGet(module, 0, i32_t),
-        c.BinaryenLocalGet(module, 1, i32_t),
-    };
-    const target = c.BinaryenConst(module, c.BinaryenLiteralInt32(0));
-    const body = c.BinaryenCallIndirect(module, "$imports", target, &ops, ops.len, params, none_t);
-    _ = c.BinaryenAddFunction(module, "0", params, none_t, null, 0, body);
-    _ = c.BinaryenAddFunctionExport(module, "0", "0");
-    _ = c.BinaryenAddTableExport(module, "$imports", "$imports");
-    return writeBinaryenModule(allocator, module);
-}
-
-/// Build the **fixup** core module: imports the shim's table (`"" "$imports"`)
-/// and the lowered import func (`"" "0"`), and an active element segment writes
-/// the func into table slot 0 at instantiation. After this runs, the shim
-/// trampoline dispatches to the real canonical-ABI-lowered import.
-fn buildFixupModule(allocator: std.mem.Allocator) ![]u8 {
-    const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
-    defer c.BinaryenModuleDispose(module);
-    c.BinaryenModuleSetFeatures(module, c.BinaryenFeatureAll());
-    const i32_t = c.BinaryenTypeInt32();
-    const none_t = c.BinaryenTypeNone();
-    const funcref = c.BinaryenTypeFuncref();
-    var pp = [_]c.BinaryenType{ i32_t, i32_t };
-    const params = c.BinaryenTypeCreate(&pp, pp.len);
-
-    c.BinaryenAddFunctionImport(module, "f", "", "0", params, none_t);
-    // Create the table, then mark it imported (Binaryen needs the table object
-    // to exist for the element segment to reference it).
-    _ = c.BinaryenAddTable(module, "$imports", 1, 1, funcref, null);
-    c.BinaryenAddTableImport(module, "$imports", "", "$imports");
-    const offset = c.BinaryenConst(module, c.BinaryenLiteralInt32(0));
-    var fnames = [_][*c]const u8{"f"};
-    _ = c.BinaryenAddActiveElementSegment(module, "$imports", "e", &fnames, fnames.len, offset);
-    return writeBinaryenModule(allocator, module);
+    return .{ .component = try component.encode(allocator, core, exports.items) };
 }
 
 /// Scan a core module for an import section (id 2). Used to gate component
@@ -458,20 +426,27 @@ pub fn showWorld(allocator: std.mem.Allocator, source: []const u8, file: []const
     }
     if (!any_import) try out.appendSlice(allocator, "  // (none — pure surface)\n");
 
-    // Exports — the public surface. The entry (`main`) and every `pub` function
-    // whose signature lowers to the canonical ABI.
+    // Exports — the public surface. An **app** (one with an entry point) is a
+    // WASI command: the adapter lifts `_start` to `wasi:cli/run`, so the world
+    // exports exactly that — its `pub` functions aren't lifted across the
+    // canonical ABI. A **library** exports each `pub` function whose signature
+    // lowers to the canonical ABI.
     try out.appendSlice(allocator, "  // exports — public surface\n");
-    for (hmod.funcs, 0..) |f, i| {
-        const is_entry = (hmod.entry != null and hmod.entry.? == i);
-        if (f.visibility != .public and !is_entry) continue;
-        try out.print(allocator, "  export {s}: func(", .{f.name});
-        for (f.params, 0..) |p, pi| {
-            if (pi > 0) try out.appendSlice(allocator, ", ");
-            try out.print(allocator, "{s}: {s}", .{ p.name, witType(p.ty) });
+    if (hmod.entry != null) {
+        try out.appendSlice(allocator, "  export wasi:cli/run;\n");
+    } else {
+        for (hmod.funcs, 0..) |f, i| {
+            const is_entry = (hmod.entry != null and hmod.entry.? == i);
+            if (f.visibility != .public and !is_entry) continue;
+            try out.print(allocator, "  export {s}: func(", .{f.name});
+            for (f.params, 0..) |p, pi| {
+                if (pi > 0) try out.appendSlice(allocator, ", ");
+                try out.print(allocator, "{s}: {s}", .{ p.name, witType(p.ty) });
+            }
+            try out.appendSlice(allocator, ")");
+            if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
+            try out.appendSlice(allocator, ";\n");
         }
-        try out.appendSlice(allocator, ")");
-        if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
-        try out.appendSlice(allocator, ";\n");
     }
 
     try out.appendSlice(allocator, "}\n");
@@ -579,7 +554,7 @@ fn mapReject(r: ir.hir.Reject) Error {
     };
 }
 
-fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace) ![]u8 {
+fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace, stdout_abi: StdoutAbi) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
@@ -609,18 +584,45 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var pair = [_]c.BinaryenType{ ptr_type, ptr_type };
     const pair_type = c.BinaryenTypeCreate(&pair, pair.len);
 
-    // Only declare the `env.out` import when the program actually writes to it.
-    // A pure library (`pub fn add(…) -> i64`) imports nothing — which lets the
-    // component lift wrap it with no capability imports to lower.
-    if (usesEnvOut(m)) {
-        var env_out_params = [_]c.BinaryenType{ ptr_type, ptr_type };
-        const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
-        c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
+    // The `env.out` capability import — declared only when the program actually
+    // writes to it (a pure library imports nothing, which lets the component
+    // lift wrap it with no imports). Two import shapes (see `StdoutAbi`):
+    //   - `.env_out`       → q64's raw host face `(import "env" "out")`.
+    //   - `.wasi_preview1` → WASI `(import "wasi_snapshot_preview1" "fd_write")`,
+    //                        which the WASI adapter lifts to `wasi:cli/stdout`.
+    // The preview1 path also reserves a fixed scratch region (`iovec_base`) just
+    // past the static data for the iovec + `nwritten` cell `fd_write` needs; the
+    // arena starts past it so concat buffers never clobber the iovec.
+    const wants_out = usesEnvOut(m);
+    const preview1 = (stdout_abi == .wasi_preview1) and wants_out;
+    // iovec (8 bytes: i32 buf, i32 len) + nwritten (4 bytes), padded to 16.
+    const iovec_scratch: usize = if (preview1) 16 else 0;
+    const iovec_base: u32 = @intCast(m.data.len);
+    if (wants_out) {
+        switch (stdout_abi) {
+            .env_out => {
+                var env_out_params = [_]c.BinaryenType{ ptr_type, ptr_type };
+                const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
+                c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
+            },
+            .wasi_preview1 => {
+                // fd_write(fd: i32, iovs: i32, iovs_len: i32, nwritten: i32) -> errno: i32.
+                var fd_params = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type };
+                const fd_params_type = c.BinaryenTypeCreate(&fd_params, fd_params.len);
+                c.BinaryenAddFunctionImport(module, "fd_write", "wasi_snapshot_preview1", "fd_write", fd_params_type, i32_type);
+            },
+        }
     }
+
+    // Memory maximum. The preview1 path leaves it unbounded (Binaryen's
+    // `kUnlimitedSize` sentinel emits no max) because the WASI adapter grows the
+    // memory to carve its own stack at startup — a fixed 1-page max would trap
+    // `allocate_stack`. The raw `env.out`/library paths keep the 1-page cap.
+    const mem_max: c.BinaryenIndex = if (preview1) 0xffff_ffff else 1;
 
     // One active data segment at offset 0 holds the whole memory image.
     if (m.data.len == 0) {
-        c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, mem64, "0");
+        c.BinaryenSetMemory(module, 1, mem_max, "memory", null, null, null, null, null, 0, false, mem64, "0");
     } else {
         var seg_datas = [_][*c]const u8{m.data.ptr};
         var seg_passives = [_]bool{false};
@@ -631,7 +633,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
                 c.BinaryenConst(module, c.BinaryenLiteralInt32(0)),
         };
         var seg_sizes = [_]c.BinaryenIndex{@intCast(m.data.len)};
-        c.BinaryenSetMemory(module, 1, 1, "memory", null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, mem64, "0");
+        c.BinaryenSetMemory(module, 1, mem_max, "memory", null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, mem64, "0");
     }
 
     // Int formatting needs `__fmt_i64`; either formatting or a concat needs
@@ -650,12 +652,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     }
     if (needs_fmt) needs_arena = true;
     if (needs_arena) {
-        // The scope-arena bump pointer starts just past the static data, at the
-        // address width (i32 on wasm32, i64 on wasm64).
+        // The scope-arena bump pointer starts just past the static data — and,
+        // on the preview1 path, past the reserved iovec scratch — at the address
+        // width (i32 on wasm32, i64 on wasm64).
+        const arena_start = m.data.len + iovec_scratch;
         const sp_init = if (mem64)
-            c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(m.data.len)))
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(arena_start)))
         else
-            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(m.data.len)));
+            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(arena_start)));
         _ = c.BinaryenAddGlobal(module, "sp", ptr_type, true, sp_init);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
@@ -742,6 +746,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .len_idx = base + n_tuples + 2,
             .host_imports = &host_imports,
             .global_names = global_names,
+            .stdout_abi = stdout_abi,
+            .iovec_base = iovec_base,
         };
         defer lw.deinit();
 
@@ -994,6 +1000,12 @@ const Lowerer = struct {
     host_imports: *const std.StringHashMapUnmanaged([*:0]const u8) = undefined,
     /// Wasm global names by index (`g0`, `g1`, …), for `global_get`/`global_set`.
     global_names: []const [*:0]const u8 = &.{},
+    /// How a stdout write (`env.out`) lowers: q64's `env.out` host face, or a
+    /// WASI preview1 `fd_write` to fd 1 (see `StdoutAbi`).
+    stdout_abi: StdoutAbi = .env_out,
+    /// Static address of the reserved iovec scratch (preview1 path only): the
+    /// iovec lives at `[iovec_base, iovec_base+8)`, `nwritten` at `iovec_base+8`.
+    iovec_base: u32 = 0,
 
     fn deinit(self: *Lowerer) void {
         self.loops.deinit(self.allocator);
@@ -1160,12 +1172,49 @@ const Lowerer = struct {
         }
     }
 
+    /// Write `[off, off+len)` of linear memory to stdout — `host_out_const` and
+    /// the trailing newline of `host_out_*` go through here.
     fn envOut(self: *Lowerer, off: i64, len: i64) c.BinaryenExpressionRef {
-        var args = [_]c.BinaryenExpressionRef{
-            self.ptrConst(off),
-            self.ptrConst(len),
+        return self.writeStdout(self.ptrConst(off), self.ptrConst(len));
+    }
+
+    /// Emit a single stdout write of the `(ptr, len)` pair, lowered per the
+    /// build's `StdoutAbi`: a direct `env.out(ptr, len)` call, or a WASI
+    /// `fd_write` of one iovec to fd 1.
+    fn writeStdout(self: *Lowerer, ptr_expr: c.BinaryenExpressionRef, len_expr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        return switch (self.stdout_abi) {
+            .env_out => blk: {
+                var args = [_]c.BinaryenExpressionRef{ ptr_expr, len_expr };
+                break :blk c.BinaryenCall(self.module, "env_out", @ptrCast(&args), args.len, self.none_type);
+            },
+            .wasi_preview1 => self.fdWrite(ptr_expr, len_expr),
         };
-        return c.BinaryenCall(self.module, "env_out", @ptrCast(&args), args.len, self.none_type);
+    }
+
+    /// WASI preview1 stdout write: assemble an iovec `{buf: ptr, len}` at the
+    /// reserved scratch address and `fd_write(1, iovec, 1, nwritten)`, dropping
+    /// the errno. The preview1 ABI is 32-bit, so addresses/values are i32.
+    fn fdWrite(self: *Lowerer, ptr_expr: c.BinaryenExpressionRef, len_expr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        const m = self.module;
+        const i32c = struct {
+            fn f(mod: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+                return c.BinaryenConst(mod, c.BinaryenLiteralInt32(v));
+            }
+        }.f;
+        const base: i32 = @intCast(self.iovec_base);
+        var call_args = [_]c.BinaryenExpressionRef{
+            i32c(m, 1), // fd 1 = stdout
+            i32c(m, base), // iovs: the iovec we just stored
+            i32c(m, 1), // iovs_len: one iovec
+            i32c(m, base + 8), // nwritten: 4-byte scratch cell
+        };
+        var seq = [_]c.BinaryenExpressionRef{
+            // iovec.buf = ptr; iovec.len = len (4-byte i32 stores, natural align).
+            c.BinaryenStore(m, 4, 0, 0, i32c(m, base), ptr_expr, self.i32_type, "0"),
+            c.BinaryenStore(m, 4, 4, 0, i32c(m, base), len_expr, self.i32_type, "0"),
+            c.BinaryenDrop(m, c.BinaryenCall(m, "fd_write", @ptrCast(&call_args), call_args.len, self.i32_type)),
+        };
+        return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.none_type);
     }
 
     /// A pointer/length constant at the build's address-space width (i32 on
@@ -1196,13 +1245,10 @@ const Lowerer = struct {
         const module = self.module;
         var seq = [_]c.BinaryenExpressionRef{
             c.BinaryenLocalSet(module, self.pair_idx, pair),
-            blk: {
-                var cargs = [_]c.BinaryenExpressionRef{
-                    c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 0),
-                    c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
-                };
-                break :blk c.BinaryenCall(module, "env_out", @ptrCast(&cargs), cargs.len, self.none_type);
-            },
+            self.writeStdout(
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 0),
+                c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
+            ),
             self.envOut(nl_off, 1),
         };
         return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);

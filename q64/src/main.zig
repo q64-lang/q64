@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, sub, "emit")) {
-        try cmdEmit(gpa, io, &args_it);
+        try cmdEmit(gpa, io, init.environ_map, &args_it);
         return;
     }
 
@@ -176,7 +176,7 @@ fn cmdEmitHello(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.I
 /// from `dir`; it never reads `qube.json5` (spec/q64-cli.md §"--module").
 const ModuleArg = struct { name: []const u8, dir: []const u8 };
 
-fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, args_it: *std.process.Args.Iterator) !void {
     var src_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
     // Address space (spec/memory.md §"The platform"). Explicit per build; we
@@ -273,22 +273,156 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     try writeFile(io, out, bytes);
 
     // --component: additionally wrap the core module in a WebAssembly component,
-    // written to `<out without .wasm>.component.wasm` (spec/q64-cli.md).
+    // written to `<out without .wasm>.component.wasm` (spec/q64-cli.md). A
+    // library lift is a finished component; an app is a WASI preview1 core that
+    // we run through `wasm-tools component new --adapt` (vendor/wasi/) to get a
+    // real `wasi:cli/run` command importing `wasi:cli/stdout`.
     if (want_component) {
-        const comp = emit.emitComponent(gpa, source, src, module_sources.items, addr) catch |err| {
+        const artifact = emit.emitComponent(gpa, source, src, module_sources.items, addr) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writer(io, &buf);
             try w.interface.print("q64: component emit failed: {s}\n", .{@errorName(err)});
             try w.interface.flush();
             std.process.exit(1);
         };
-        defer gpa.free(comp);
 
         const base = if (std.mem.endsWith(u8, out, ".wasm")) out[0 .. out.len - ".wasm".len] else out;
         const comp_path = try std.fmt.allocPrint(gpa, "{s}.component.wasm", .{base});
         defer gpa.free(comp_path);
-        try writeFile(io, comp_path, comp);
+
+        switch (artifact) {
+            .component => |comp_bytes| {
+                defer gpa.free(comp_bytes);
+                try writeFile(io, comp_path, comp_bytes);
+            },
+            .preview1_app => |core| {
+                defer gpa.free(core);
+                try adaptPreview1Component(gpa, io, env, core, comp_path);
+            },
+        }
     }
+}
+
+/// Lift a WASI **preview1 core module** into a real component by shelling out to
+/// `wasm-tools component new --adapt` with the vendored WASI adapter
+/// (`vendor/wasi/`). The result — a `wasi:cli/run` command importing
+/// `wasi:cli/stdout` — is written to `comp_path`. `wasm-tools` and the adapter
+/// are located via env override (`Q64_WASM_TOOLS` / `Q64_WASI_ADAPTER`), then
+/// the repo's `vendor/`, then `PATH`.
+fn adaptPreview1Component(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    core: []const u8,
+    comp_path: []const u8,
+) !void {
+    const repo_root = findRepoRoot(gpa, io, ".") catch null;
+    defer if (repo_root) |r| gpa.free(r);
+
+    const wasm_tools = try resolveBinary(gpa, io, env, "Q64_WASM_TOOLS", repo_root, "vendor/wasm-tools/wasm-tools", "wasm-tools");
+    defer gpa.free(wasm_tools);
+    const adapter = try resolveBinary(gpa, io, env, "Q64_WASI_ADAPTER", repo_root, "vendor/wasi/wasi_snapshot_preview1.command.wasm", "wasi_snapshot_preview1.command.wasm");
+    defer gpa.free(adapter);
+
+    // Write the preview1 core next to the component output, run the adapter,
+    // then remove the scratch core (best-effort).
+    const tmp_core = try std.fmt.allocPrint(gpa, "{s}.p1core.wasm", .{comp_path});
+    defer gpa.free(tmp_core);
+    try writeFile(io, tmp_core, core);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_core) catch {};
+
+    const adapt_arg = try std.fmt.allocPrint(gpa, "wasi_snapshot_preview1={s}", .{adapter});
+    defer gpa.free(adapt_arg);
+
+    const argv = [_][]const u8{ wasm_tools, "component", "new", tmp_core, "--adapt", adapt_arg, "-o", comp_path };
+    const term = spawnInherit(io, &argv) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: could not run wasm-tools ({s}): {s}\n", .{ wasm_tools, @errorName(err) });
+        try w.interface.print("q64: set Q64_WASM_TOOLS / Q64_WASI_ADAPTER, or run ./init.sh to vendor the WASI toolchain\n", .{});
+        try w.interface.flush();
+        std.process.exit(1);
+    };
+    if (termCode(term) != @as(u8, 0)) {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64: wasm-tools component new failed (the WASI adapter could not lift the preview1 core)\n", .{});
+        try w.interface.flush();
+        std.process.exit(1);
+    }
+}
+
+fn spawnInherit(io: std.Io, argv: []const []const u8) !std.process.Child.Term {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    return child.wait(io);
+}
+
+fn termCode(term: std.process.Child.Term) ?u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => null,
+    };
+}
+
+/// Walk up from `start` to the repo root — the directory holding `vendor/zig`.
+/// Used to locate the vendored `wasm-tools` + WASI adapter when no env override
+/// is set. Returns null if no such ancestor exists.
+fn findRepoRoot(gpa: std.mem.Allocator, io: std.Io, start: []const u8) !?[]u8 {
+    const abs = if (std.fs.path.isAbsolute(start))
+        try gpa.dupe(u8, start)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd);
+        break :blk try std.fs.path.join(gpa, &.{ cwd, start });
+    };
+    defer gpa.free(abs);
+
+    var cur: []const u8 = abs;
+    while (true) {
+        const candidate = try std.fs.path.join(gpa, &.{ cur, "vendor", "zig" });
+        defer gpa.free(candidate);
+        const ok = blk: {
+            std.Io.Dir.cwd().access(io, candidate, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (ok) return try gpa.dupe(u8, cur);
+
+        const parent = std.fs.path.dirname(cur) orelse return null;
+        if (std.mem.eql(u8, parent, cur)) return null;
+        cur = parent;
+    }
+}
+
+/// Resolve a vendored tool: an explicit `env_key` override wins; otherwise try
+/// `<repo_root>/<repo_rel>`; otherwise fall back to `path_name` for the OS to
+/// resolve via `PATH` at spawn time.
+fn resolveBinary(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    env_key: []const u8,
+    repo_root: ?[]const u8,
+    repo_rel: []const u8,
+    path_name: []const u8,
+) ![]u8 {
+    if (env.get(env_key)) |v| {
+        if (v.len > 0) return try gpa.dupe(u8, v);
+    }
+    if (repo_root) |root| {
+        const candidate = try std.fs.path.join(gpa, &.{ root, repo_rel });
+        const ok = blk: {
+            std.Io.Dir.cwd().access(io, candidate, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (ok) return candidate;
+        gpa.free(candidate);
+    }
+    return try gpa.dupe(u8, path_name);
 }
 
 fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {

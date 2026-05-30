@@ -532,26 +532,46 @@ spec/q64-cli.md `--component`).
       --component` on the example and validates with wasmtime. 113/113 qube-test
       + 81/81 q64-test green. **Remaining:** `--target <name>` (named manifest
       targets) is accepted-but-ignored, not yet wired.
-- [x] **Import lowering (capability faces) — an app wraps + runs.** `q64 emit
-      --component --addr wasm32` on an app that writes stdout now lowers its one
-      `env.out` capability import to a component `log: func(msg: string)` through
-      the canonical ABI, and lifts `_start` as `run: func()`. The string lowering
-      needs the core module's memory, which only exists after instantiation —
-      that cycle is broken with the **indirection pattern**: `env.out` is
-      satisfied by a Binaryen-built *shim* trampoline that `call_indirect`s a
-      table slot, and a *fixup* module's element segment patches the real lowered
-      import into that slot once the memory exists (`component.encodeApp`,
-      `emit.buildShimModule`/`buildFixupModule`). Verified **end-to-end**:
-      `q64-component-check --run` instantiates the component, provides `log`, and
-      calls `run` — `fn main { env.out("Hello, q64.") }` prints `Hello, q64.`
-      through the lowered import; `examples/hello-component` builds + runs via
-      `qube build --component --addr wasm32`. `component-roundtrip.sh` asserts
-      the run; build.test.ts covers the app path. **Scope:** wasm32 only (the
-      32-bit canonical ABI); a single string import (`env.out`). Multiple
-      capabilities and the wasm64 canonical ABI are the next slices.
-      **Note:** the import is a q64-internal `log` face, not yet `wasi:cli/stdout`
-      (which uses resource/stream types) — mapping `@stdout` to the real WASI
-      interface the synthesized world names is a follow-on.
+- [x] **App → WASI command component (`wasi:cli/run` + `wasi:cli/stdout`), run
+      under WASIp3.** `q64 emit --component --addr wasm32` on an app that writes
+      stdout emits a WASI **preview1 core module** — `env.out` lowered to a
+      `wasi_snapshot_preview1.fd_write` import (an iovec written to fd 1,
+      `emit.StdoutAbi.wasi_preview1`) — and runs `wasm-tools component new
+      --adapt` with the vendored WASI adapter (`vendor/wasi/`) to lift it into a
+      `wasi:cli/run` command that imports `wasi:cli/stdout`. The CLI drives the
+      shell-out (`q64`'s `main.adaptPreview1Component`; tools resolved via
+      `Q64_WASM_TOOLS` / `Q64_WASI_ADAPTER`, else repo `vendor/`, else `PATH`),
+      so `codegen/` stays free of subprocess concerns. `q64 show world` names the
+      same world (`import wasi:cli/stdout; export wasi:cli/run`). Verified
+      **end-to-end**: the app is run with the vendored **wasmtime CLI** under the
+      async WASIp3 runtime — `wasmtime run -S p3` — and
+      `fn main { env.out("Hello, q64.") }` prints `Hello, q64.`;
+      `examples/hello-component` builds + runs via `qube build --component --addr
+      wasm32`. `component-roundtrip.sh` asserts the WASI world (via `wasm-tools
+      component wit` *and* `q64 show world`) and the `-S p3` run. The retired
+      hand-rolled `log`-face indirection encoder (`component.encodeApp`,
+      `emit.buildShimModule`/`buildFixupModule`) is gone.
+      - **WASI-version reality (important).** The CLI command world is
+        **`wasi:cli@0.2.x`** — there is *no* `wasi:cli@0.3` upstream (even the
+        wasi-cli `v0.3.0-rc-*` tags declare `package wasi:cli@0.2.7`). "WASIp3 /
+        0.3" is the async **`wasi:io@0.3`** layer (native `stream`/`future`,
+        retiring the poll/streams resource ceremony) plus the component-model
+        async ABI — *not* a `wasi:cli` version bump. So `wasi:cli/run@0.2.x` is
+        the correct, only command world; it is **not** a "Preview 2 fallback".
+      - **Runner = the wasmtime CLI.** The embedded wasmtime **C API** only
+        implements WASIp2 (`add_wasip2`, no `add_wasip3`); the **CLI** has `-S
+        p3`. So `init.sh` now also vendors the wasmtime CLI binary
+        (`vendor/wasmtime/bin/wasmtime`, sha256-pinned) as the WASIp3 runner, and
+        `q64-component-check` is back to validate-only + scalar-call (no app
+        run).
+      - **Scope:** wasm32 only (preview1 is 32-bit); the `@stdout` capability.
+      - **Follow-on:** **async-native `wasi:io@0.3` stdout emission.** Today the
+        emit path uses the preview1 adapter → synchronous `wasi:io/streams@0.2.x`
+        (the resource ceremony WASIp3 retires). Emitting genuinely async I/O
+        means async canonical-ABI codegen (wit-bindgen-async-style import of the
+        0.3 stream write) — no adapter shortcut exists. That's the next slice;
+        the runtime is already p3 via `-S p3`. Plus multiple capabilities
+        (`@fs`, `@time`, …).
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.
