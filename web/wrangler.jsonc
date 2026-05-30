@@ -6,7 +6,7 @@
 // www.q64.dev -> q64.dev redirect).
 //
 // Scope is intentionally narrow: this Worker serves the *site*.
-// ../continuum (registry API) and ../mcp (MCP server) stay as
+// ../continuum (registry API) stays as a
 // separate Workers — blast radius isolation. Cross-Worker calls
 // happen via service bindings (commented stubs below).
 //
@@ -73,7 +73,7 @@
   //   { "tag": "v1", "new_classes": ["PlaygroundSession"] }
   // ],
 
-  // Service bindings — call sibling Workers (../continuum, ../mcp)
+  // Service bindings — call sibling Workers (../continuum)
   // without crossing the public network. Zero-cost intra-CF.
   // "services": [
   //   { "binding": "CONTINUUM", "service": "continuum" }

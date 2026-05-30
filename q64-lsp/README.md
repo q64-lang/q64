@@ -19,7 +19,7 @@ The analysis core is **never reimplemented** — `packages/core-wasm` compiles
 q64's existing Zig modules to a single `q64-core.wasm`. The TypeScript server
 loads that wasm and speaks LSP. One core, every host: Node (desktop editors),
 a browser Web Worker (vscode.dev, the qubepods editor), or a Cloudflare
-Worker (hosted MCP).
+Worker.
 
 ## No credentials, ever
 

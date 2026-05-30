@@ -52,4 +52,4 @@ diagnostics from JS.
 As `typeck`/`effect`/`region` land in [`../../../q64`](../../../q64), add
 `q64_hover`, `q64_definition`, `q64_effects`, etc. — each a pure
 `(source, position?) -> JSON` query. The same query surface is what the LSP
-server and the hosted MCP tools both consume.
+server consumes.

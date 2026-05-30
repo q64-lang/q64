@@ -24,7 +24,7 @@ app.get("/", (c) =>
 <body>
   <h1>Continuum API</h1>
   <p>This is <code>qubes.q64.dev</code> — the machine-readable surface for the Q64 package registry.</p>
-  <p>Humans probably want <a href="https://continuum.q64.dev">continuum.q64.dev</a>. Agents want <a href="https://mcp.q64.dev">mcp.q64.dev</a>.</p>
+  <p>Humans probably want <a href="https://continuum.q64.dev">continuum.q64.dev</a>; agents can start at <a href="https://docs.q64.dev">docs.q64.dev</a>.</p>
   <p>Wire contract: <a href="https://github.com/q64-lang/q64/blob/main/spec/continuum-api.md">spec/continuum-api.md</a></p>
 </body>
 </html>`),

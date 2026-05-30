@@ -21,7 +21,7 @@ export default {
     }
 
     // Future site-local routes (playground glue, etc.) branch here.
-    // Anything calling out to continuum / mcp goes via service binding.
+    // Anything calling out to continuum goes via service binding.
 
     return env.ASSETS.fetch(request);
   },

@@ -36,7 +36,7 @@ None. Pure Zig.
 
 ## Notes
 
-The `show` surface is the data backing the MCP server (`../../../mcp/`)
-— any agent tool that asks "what's the type of this expression" or
+The `show` surface is the data backing agent and editor introspection
+— any tool that asks "what's the type of this expression" or
 "what does this graph look like" goes through `q64 show` rather than
 reimplementing inference.
