@@ -14,6 +14,7 @@ const std = @import("std");
 
 const c = @cImport({
     @cInclude("wasm.h");
+    @cInclude("wasi.h");
     @cInclude("wasmtime.h");
     @cInclude("wasmtime/component/component.h");
     @cInclude("wasmtime/component/instance.h");
@@ -21,6 +22,11 @@ const c = @cImport({
     @cInclude("wasmtime/component/linker.h");
     @cInclude("wasmtime/component/val.h");
 });
+
+/// The WASI interface-version suffix the vendored adapter (`vendor/wasi/`)
+/// produces — see `vendor/wasi/` and `wasm-tools component wit`. The `run`
+/// export lives in the instance `wasi:cli/run@<this>`.
+const wasi_version = "0.2.6";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -37,8 +43,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
-    // `--run`: instantiate an app component, provide its `log` import, call
-    // `run`, and print what `log` received (the program's env.out output).
+    // `--run`: instantiate a WASI command component, wire WASI with stdout
+    // captured, call its `wasi:cli/run` export, and print what it wrote to
+    // stdout (the program's env.out output, now via `fd_write` → the adapter).
     const second = it.next();
     const run_mode = second != null and std.mem.eql(u8, second.?, "--run");
 
@@ -134,49 +141,44 @@ pub fn main(init: std.process.Init) !void {
     try w.interface.flush();
 }
 
-/// Captures the bytes the component's `log` import receives — i.e. the
-/// program's `env.out` output, marshaled across the canonical ABI as a string.
+/// Captures the bytes the component writes to stdout — i.e. the program's
+/// `env.out` output, now flowing through `fd_write` → the WASI adapter →
+/// `wasi:cli/stdout`, which we direct here via `wasi_config_set_stdout_custom`.
 const Capture = struct { buf: [64 * 1024]u8 = undefined, len: usize = 0 };
 
-fn logCallback(
-    env: ?*anyopaque,
-    ctx: ?*c.wasmtime_context_t,
-    ty: ?*const c.wasmtime_component_func_type_t,
-    args: [*c]const c.wasmtime_component_val_t,
-    nargs: usize,
-    results: [*c]c.wasmtime_component_val_t,
-    nresults: usize,
-) callconv(.c) ?*c.wasmtime_error_t {
-    _ = ctx;
-    _ = ty;
-    _ = results;
-    _ = nresults;
+/// WASI stdout sink: append the written bytes and report them all consumed.
+fn stdoutCallback(env: ?*anyopaque, buf: [*c]const u8, len: usize) callconv(.c) isize {
     const cap: *Capture = @ptrCast(@alignCast(env.?));
-    if (nargs >= 1 and args[0].kind == c.WASMTIME_COMPONENT_STRING) {
-        const s = args[0].of.string;
-        const n = @min(s.size, cap.buf.len - cap.len);
-        if (n > 0) @memcpy(cap.buf[cap.len..][0..n], s.data[0..n]);
-        cap.len += n;
-    }
-    return null;
+    const n = @min(len, cap.buf.len - cap.len);
+    if (n > 0) @memcpy(cap.buf[cap.len..][0..n], buf[0..n]);
+    cap.len += n;
+    return @intCast(len);
 }
 
-/// Instantiate an app component: provide its `log: func(string)` import, call
-/// the lifted `run`, and write what `log` received to stdout. Proves the
-/// import-lowering + indirection encoding runs, not just validates.
+/// Instantiate a WASI command component: configure WASI with stdout captured,
+/// add the WASI host implementation to the linker, call the lifted
+/// `wasi:cli/run`, and write the captured stdout out. Proves the preview1 core
+/// + WASI adapter run end-to-end, not just validate.
 fn runApp(io: std.Io, engine: ?*c.wasm_engine_t, component: ?*c.wasmtime_component_t) !void {
     const store = c.wasmtime_store_new(engine, null, null) orelse return error.StoreNewFailed;
     defer c.wasmtime_store_delete(store);
     const ctx = c.wasmtime_store_context(store);
 
+    // WASI context: capture stdout into `cap`; everything else is empty/denied.
+    var cap = Capture{};
+    const wasi_config = c.wasi_config_new() orelse return error.WasiConfigNewFailed;
+    c.wasi_config_set_stdout_custom(wasi_config, stdoutCallback, &cap, null);
+    if (c.wasmtime_context_set_wasi(ctx, wasi_config)) |e| {
+        try printErr(io, e, "context_set_wasi");
+        std.process.exit(1);
+    }
+
     const linker = c.wasmtime_component_linker_new(engine) orelse return error.LinkerNewFailed;
     defer c.wasmtime_component_linker_delete(linker);
 
-    var cap = Capture{};
-    const root = c.wasmtime_component_linker_root(linker) orelse return error.LinkerRootFailed;
-    defer c.wasmtime_component_linker_instance_delete(root);
-    if (c.wasmtime_component_linker_instance_add_func(root, "log", "log".len, logCallback, &cap, null)) |e| {
-        try printErr(io, e, "define log");
+    // Provide the WASI interfaces the adapter imports (wasi:cli/stdout, …).
+    if (c.wasmtime_component_linker_add_wasip2(linker)) |e| {
+        try printErr(io, e, "add_wasip2");
         std.process.exit(1);
     }
 
@@ -186,7 +188,18 @@ fn runApp(io: std.Io, engine: ?*c.wasm_engine_t, component: ?*c.wasmtime_compone
         std.process.exit(1);
     }
 
-    const idx = c.wasmtime_component_instance_get_export_index(&instance, ctx, null, "run", "run".len) orelse {
+    // The command's entry is `run` inside the `wasi:cli/run@<ver>` instance:
+    // resolve the instance export, then the `run` func within it.
+    const run_iface = "wasi:cli/run@" ++ wasi_version;
+    const iface_idx = c.wasmtime_component_instance_get_export_index(&instance, ctx, null, run_iface.ptr, run_iface.len) orelse {
+        var buf: [256]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &buf);
+        try w.interface.print("q64-component-check: instance '{s}' not found\n", .{run_iface});
+        try w.interface.flush();
+        std.process.exit(1);
+    };
+    defer c.wasmtime_component_export_index_delete(iface_idx);
+    const idx = c.wasmtime_component_instance_get_export_index(&instance, ctx, iface_idx, "run", "run".len) orelse {
         var buf: [256]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
         try w.interface.writeAll("q64-component-check: export 'run' not found\n");
@@ -198,7 +211,11 @@ fn runApp(io: std.Io, engine: ?*c.wasm_engine_t, component: ?*c.wasmtime_compone
     if (!c.wasmtime_component_instance_get_func(&instance, ctx, idx, &func)) {
         std.process.exit(1);
     }
-    if (c.wasmtime_component_func_call(&func, ctx, null, 0, null, 0)) |e| {
+
+    // `run: func() -> result` — one result value; a trap or an `err` return
+    // surfaces as a call error.
+    var run_result: c.wasmtime_component_val_t = .{ .kind = c.WASMTIME_COMPONENT_BOOL, .of = .{ .boolean = false } };
+    if (c.wasmtime_component_func_call(&func, ctx, null, 0, &run_result, 1)) |e| {
         try printErr(io, e, "call run");
         std.process.exit(1);
     }

@@ -13,9 +13,9 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { Q64_BIN, appManifest, binaryAvailable, makeProject, q64Available, runCli } from "../src/harness";
+import { Q64_BIN, WASI_ADAPTER, WASM_TOOLS, appManifest, binaryAvailable, componentToolsAvailable, makeProject, q64Available, runCli } from "../src/harness";
 
-const env = { Q64_BIN };
+const env = { Q64_BIN, Q64_WASM_TOOLS: WASM_TOOLS, Q64_WASI_ADAPTER: WASI_ADAPTER };
 
 function appProject() {
   return makeProject({ "qube.json5": appManifest(), "src/main.q": "fn main { env.out(\"x\") }\n" });
@@ -68,9 +68,10 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
     expect(runCli(["build"], { cwd: proj, env }).exitCode).toBe(64);
   });
 
-  // `--component` on an *application* lowers its `env.out` capability import
-  // (→ a component `log` import) via the canonical ABI; wasm32-only for now.
-  test("--component --addr wasm32 on an app lowers the capability import", () => {
+  // `--component` on an *application* emits a WASI preview1 core (env.out →
+  // fd_write) and adapts it into a real `wasi:cli/run` component via wasm-tools;
+  // wasm32-only for now. Skipped when the WASI toolchain isn't vendored.
+  test.skipIf(!componentToolsAvailable())("--component --addr wasm32 on an app emits the WASI component", () => {
     const proj = appProject();
     const r = runCli(["build", "--component", "--addr", "wasm32"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);

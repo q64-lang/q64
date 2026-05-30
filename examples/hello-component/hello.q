@@ -10,11 +10,11 @@
 //!   q64-component-check …/hello-component.component.wasm --run
 //!   # → Hello, q64.
 //!
-//! Proves: core-module embedding + one capability-import lowering (env.out →
-//! a component `log` import, via the canonical-ABI indirection pattern), with
-//! `_start` lifted as `run` and the core module still produced. wasm32-only
-//! for now (the 32-bit canonical ABI). Mapping the import to the real
-//! `wasi:cli/stdout` interface the synthesized world names is a follow-on.
+//! Proves: env.out is lowered to a WASI preview1 `fd_write` import (writing an
+//! iovec to fd 1), and `wasm-tools component new --adapt` (with the vendored
+//! WASI adapter) lifts that preview1 core into a real `wasi:cli/run` command
+//! that imports `wasi:cli/stdout` — the same world `q64 show world` names. The
+//! core module is still produced. wasm32-only for now (preview1 is 32-bit).
 //! See spec/modules.md §"The qube as a component" and spec/env.md
 //! §"Env ↔ WASI Preview 3".
 
