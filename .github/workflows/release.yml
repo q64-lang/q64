@@ -38,16 +38,18 @@ concurrency:
 
 jobs:
   build:
-    # Matrix is intentionally one entry: Cloudflare Containers (the consumer
-    # of these binaries via the qubepods builder container) schedule on
-    # x86_64 only today. Add `arch: arm64, runner: ubuntu-24.04-arm` back
-    # here (and pin WASMTIME_KNOWN_SHA256_aarch64_linux in init.sh) when CF
-    # arm64 containers ship or another consumer needs them.
+    # CI builds linux-amd64 only — no hosted macOS/arm runners are available.
+    # The qubepods builder container (Cloudflare Containers, x86_64 linux)
+    # consumes this via manifest.json. The matrix is kept generic (os+arch) so
+    # darwin/arm entries can be added if self-hosted runners appear; until then
+    # macOS binaries are built on a Mac and attached to the release with
+    # `scripts/release-mac.sh`.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - os: linux
+            arch: amd64
             runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     steps:
@@ -55,7 +57,8 @@ jobs:
 
       # vendor/ is populated by ./init.sh: Zig toolchain, wasmtime C API,
       # and a from-source Binaryen static lib. Binaryen is the slow step
-      # (~3-5 min). Key includes init.sh so a version bump invalidates.
+      # (~3-5 min). Key includes the OS+arch (the Binaryen archive is host
+      # toolchain-specific) and init.sh so a version bump invalidates.
       - name: Cache vendored toolchain
         uses: actions/cache@v4
         with:
@@ -63,9 +66,13 @@ jobs:
             vendor/zig
             vendor/wasmtime
             vendor/binaryen
-          key: vendor-${{ matrix.arch }}-${{ hashFiles('init.sh') }}
+          key: vendor-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('init.sh') }}
 
       - name: init.sh (Zig + wasmtime + Binaryen)
+        env:
+          # Empty on linux (init.sh uses its pinned sha); skip the unpinned
+          # wasmtime verification on macOS — it isn't on the q64/qube build path.
+          WASMTIME_SHA256: ${{ matrix.os == 'darwin' && 'skip' || '' }}
         run: ./init.sh
 
       - name: Build q64 (ReleaseFast)
@@ -76,28 +83,30 @@ jobs:
         working-directory: qube
         run: ../vendor/zig/zig build -Doptimize=ReleaseFast
 
-      # Stage binaries under a per-arch dir so the release job can merge
+      # Stage binaries under a per-platform name so the release job can merge
       # the matrix outputs by simply downloading every artifact.
       - name: Stage binaries
+        shell: bash
         run: |
           set -euo pipefail
+          plat="${{ matrix.os }}-${{ matrix.arch }}"
           mkdir -p out
-          cp q64/zig-out/bin/q64   "out/q64-linux-${{ matrix.arch }}"
-          cp qube/zig-out/bin/qube "out/qube-linux-${{ matrix.arch }}"
-          ( cd out && sha256sum "q64-linux-${{ matrix.arch }}" "qube-linux-${{ matrix.arch }}" > "SHA256SUMS-${{ matrix.arch }}" )
+          cp q64/zig-out/bin/q64   "out/q64-${plat}"
+          cp qube/zig-out/bin/qube "out/qube-${plat}"
+          ( cd out && shasum -a 256 "q64-${plat}" "qube-${plat}" > "SHA256SUMS-${plat}" )
           ls -la out
 
       # The documentation index (keywords, builtin types, diagnostics) the
       # docs.q64.dev site renders — see q64-docs/. Architecture-independent, so
-      # only the amd64 matrix entry produces it; the docs deploy downloads this
-      # release asset (no Zig toolchain needed to ship a docs change).
+      # only the linux entry produces it; the docs deploy downloads this release
+      # asset (no Zig toolchain needed to ship a docs change).
       - name: Generate doc.json
-        if: matrix.arch == 'amd64'
+        if: matrix.os == 'linux'
         run: ./q64/zig-out/bin/q64 doc --json > out/doc.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.arch }}
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
           path: out/*
           if-no-files-found: error
           retention-days: 7
@@ -126,12 +135,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          cp artifacts/q64-linux-amd64   release/
-          cp artifacts/qube-linux-amd64  release/
-          cp artifacts/doc.json          release/
+          # Every per-platform binary the matrix produced, plus the one doc.json.
+          cp artifacts/q64-*  release/
+          cp artifacts/qube-* release/
+          cp artifacts/doc.json release/
+          # Drop the per-platform SHA files staged by the build job; we recompute
+          # one combined SHA256SUMS over the published binaries below.
+          rm -f release/SHA256SUMS-*
 
-          # One combined SHA256SUMS over the published binaries.
-          ( cd release && sha256sum q64-linux-amd64 qube-linux-amd64 > SHA256SUMS )
+          ( cd release && sha256sum q64-* qube-* > SHA256SUMS )
 
           # Resolve release name + whether this is a prerelease.
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
@@ -144,29 +156,37 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
-          commit="${GITHUB_SHA}"
           built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
 
-          sha() { awk -v f="$1" '$2==f{print $1}' release/SHA256SUMS; }
-
-          # manifest.json: the contract the qubepods builder container
-          # reads on cold start to pick (and verify) the right binaries.
-          cat > release/manifest.json <<EOF
-          {
-            "version": "${tag}",
-            "commit": "${commit}",
-            "builtAt": "${built_at}",
-            "binaries": {
-              "q64": {
-                "linux-amd64": { "url": "${base_url}/q64-linux-amd64",  "sha256": "$(sha q64-linux-amd64)" }
-              },
-              "qube": {
-                "linux-amd64": { "url": "${base_url}/qube-linux-amd64", "sha256": "$(sha qube-linux-amd64)" }
-              }
-            }
+          # manifest.json: the contract the qubepods builder container reads on
+          # cold start to pick (and verify) the right binaries. Generated from
+          # whatever platforms are present, so adding a matrix entry is enough.
+          # The container keys on linux-amd64; the darwin entries are additive.
+          TAG="$tag" COMMIT="$GITHUB_SHA" BUILT_AT="$built_at" BASE_URL="$base_url" \
+            python3 - <<'PY'
+          import json, os, pathlib
+          rel = pathlib.Path("release")
+          sums = {}
+          for line in (rel / "SHA256SUMS").read_text().splitlines():
+              sha, name = line.split()
+              sums[name] = sha
+          bins = {"q64": {}, "qube": {}}
+          for name in sums:
+              tool, _, plat = name.partition("-")  # q64-linux-amd64 -> q64, linux-amd64
+              if tool in bins:
+                  bins[tool][plat] = {
+                      "url": f"{os.environ['BASE_URL']}/{name}",
+                      "sha256": sums[name],
+                  }
+          manifest = {
+              "version": os.environ["TAG"],
+              "commit": os.environ["COMMIT"],
+              "builtAt": os.environ["BUILT_AT"],
+              "binaries": bins,
           }
-          EOF
+          (rel / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
 
           ls -la release
           cat release/manifest.json
@@ -190,14 +210,17 @@ jobs:
           set -euo pipefail
           notes="q64 + qube linux binaries built from ${GITHUB_SHA}.
 
-          Consumed by the qubepods builder container via \`manifest.json\`."
+          Consumed by the qubepods builder container via \`manifest.json\`.
+          macOS binaries (if any) are attached separately via scripts/release-mac.sh."
+          # Upload every staged binary (q64-*/qube-*) + the metadata files. With
+          # a linux-only matrix this is just the linux-amd64 pair today.
           gh release create "${{ steps.assemble.outputs.tag }}" \
             --target "${GITHUB_SHA}" \
             --title "${{ steps.assemble.outputs.tag }}" \
             --notes "$notes" \
             $([ "${{ steps.assemble.outputs.prerelease }}" = "true" ] && echo --prerelease) \
-            release/q64-linux-amd64 \
-            release/qube-linux-amd64 \
+            release/q64-* \
+            release/qube-* \
             release/SHA256SUMS \
             release/manifest.json \
             release/doc.json
