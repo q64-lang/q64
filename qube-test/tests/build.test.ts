@@ -68,12 +68,19 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
     expect(runCli(["build"], { cwd: proj, env }).exitCode).toBe(64);
   });
 
-  // `--component` on an *application* needs capability-import lowering
-  // (`env.out` → `wasi:cli/stdout`), which isn't implemented yet — the build
-  // errors instead of mis-wrapping. Pinned until import lowering lands.
-  test.failing("--component on an app that writes stdout succeeds", () => {
+  // `--component` on an *application* lowers its `env.out` capability import
+  // (→ a component `log` import) via the canonical ABI; wasm32-only for now.
+  test("--component --addr wasm32 on an app lowers the capability import", () => {
     const proj = appProject();
-    const r = runCli(["build", "--component"], { cwd: proj, env });
+    const r = runCli(["build", "--component", "--addr", "wasm32"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
+    expect(existsSync(join(proj, "target/debug/wasm32/dev.q64.test_app.component.wasm"))).toBe(true);
+  });
+
+  // The 64-bit canonical ABI for the import lowering isn't supported yet, so
+  // `--component` on a wasm64 app errors rather than mis-wrapping.
+  test("--component on a wasm64 app errors (import lowering is wasm32-only)", () => {
+    const proj = appProject();
+    expect(runCli(["build", "--component", "--addr", "wasm64"], { cwd: proj, env }).exitCode).not.toBe(0);
   });
 });

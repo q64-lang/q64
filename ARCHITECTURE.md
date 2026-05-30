@@ -148,10 +148,14 @@ ABI later).
 >
 > The **component** stage has a first slice too: `q64 emit --component`
 > (`codegen/component.zig`) hand-encodes a real WebAssembly component that wraps
-> the core module and lifts its import-free, scalar export surface through the
-> canonical ABI — validated end-to-end by wasmtime (`q64-component-check`).
-> Capability-import lowering (so an app, not just a pure library, wraps) and
-> string/list lifting are the next slices.
+> the core module — validated end-to-end by wasmtime (`q64-component-check`). It
+> lifts the import-free, scalar export surface through the canonical ABI, and for
+> a wasm32 app it also **lowers the `env.out` capability import** to a component
+> `log` function (the canonical-ABI indirection pattern: a shim table +
+> a fixup element segment), lifting `_start` as `run` — `q64-component-check
+> --run` instantiates and runs it, so `fn main { env.out("…") }` prints through
+> the lowered import. Multiple capabilities, the real `wasi:cli/stdout` mapping,
+> the wasm64 ABI, and string/list lifting are the next slices.
 
 ### parser — [`q64/src/parser/`](./q64/src/parser/README.md)
 
