@@ -114,7 +114,7 @@ function frontmatter(title, description) {
 
 function renderKeywords(lang) {
   const rows = lang.keywords
-    .map((k) => `| \`${cell(k.text)}\` | \`${cell(k.kind)}\` |`)
+    .map((k) => `| \`${cell(k.text)}\` | ${cell(k.doc || '')} | \`${cell(k.kind)}\` |`)
     .join('\n');
   const body = `${frontmatter('Keywords', "q64's reserved words, generated from the lexer.")}${BANNER}
 
@@ -122,8 +122,8 @@ q64 reserves the following ${lang.keywords.length} keywords. This list is
 generated directly from the compiler's lexer, so it never drifts from what the
 parser actually recognizes.
 
-| Keyword | Token kind |
-| --- | --- |
+| Keyword | Description | Token kind |
+| --- | --- | --- |
 ${rows}
 `;
   write(join(refDir, 'keywords.md'), body);
@@ -164,6 +164,15 @@ ${rows}
 
   // One page per code. These are the canonical URLs the compiler emits.
   for (const d of lang.diagnostics) {
+    // Render the registry summary when present, else the "coming soon" note.
+    const body = d.summary
+      ? `${d.summary}\n`
+      : `:::note
+Extended prose (examples, related codes) lands as the per-spec diagnostic
+tables are filled in. This page is generated from the compiler's diagnostic
+registry.
+:::
+`;
     const page = `${frontmatter(d.code, d.message)}${BANNER}
 
 **${d.code}** — ${d.message}
@@ -173,17 +182,12 @@ ${rows}
 | Subsystem | ${cell(d.subsystem)} |
 | Severity | ${cell(d.severity)} |
 
+${body}
 From your terminal:
 
 \`\`\`sh
 q64 explain ${d.code}
 \`\`\`
-
-:::note
-Extended prose (explanation, examples, related codes) lands as the per-spec
-diagnostic tables are filled in. This page is generated from the compiler's
-diagnostic registry.
-:::
 `;
     write(join(refDir, 'diagnostics', `${d.code.toLowerCase()}.md`), page);
   }

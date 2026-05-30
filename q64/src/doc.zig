@@ -71,6 +71,74 @@ const builtin_types = [_]BuiltinType{
     .{ .name = "Arena", .category = "prelude", .doc = "An arena allocator over a region (spec/memory.md)." },
 };
 
+// A short, human description per keyword. Hand-maintained here in the doc layer
+// (the lexer's `keywords` table carries only text + token kind). Keywords with
+// no entry emit an empty `doc`.
+const KeywordDoc = struct { text: []const u8, doc: []const u8 };
+const keyword_docs = [_]KeywordDoc{
+    .{ .text = "actor", .doc = "Declare an actor — an isolated unit of concurrent state with message handlers." },
+    .{ .text = "as", .doc = "Bind an import under a different name (`import foo as bar`)." },
+    .{ .text = "break", .doc = "Exit the innermost loop, optionally yielding a value." },
+    .{ .text = "catch", .doc = "Handle an error or a failed task." },
+    .{ .text = "const", .doc = "A compile-time constant binding." },
+    .{ .text = "continue", .doc = "Skip to the next iteration of the innermost loop." },
+    .{ .text = "draw", .doc = "A `screen`'s declarative view block; its statements are widget calls." },
+    .{ .text = "dyn", .doc = "Dynamic dispatch over a face used as a type (`dyn Face`)." },
+    .{ .text = "effect", .doc = "Declare an effect or an effect relationship (spec/effects.md)." },
+    .{ .text = "else", .doc = "The alternative branch of an `if`." },
+    .{ .text = "enum", .doc = "Declare an enum (sum type) with named variants." },
+    .{ .text = "face", .doc = "Declare a face — q64's interface/trait for polymorphism (spec/faces.md)." },
+    .{ .text = "false", .doc = "The boolean literal `false`." },
+    .{ .text = "fit", .doc = "Implement a face for a type (`fit T : Face`)." },
+    .{ .text = "fn", .doc = "Declare a function." },
+    .{ .text = "for", .doc = "Iterate over a sequence (`for x in xs`)." },
+    .{ .text = "forall", .doc = "Universal quantifier used in laws and generic reasoning." },
+    .{ .text = "from", .doc = "Source clause of a re-export." },
+    .{ .text = "graph", .doc = "A stream graph — connected dataflow stages (spec/streams.md)." },
+    .{ .text = "handle", .doc = "Declare an actor's handler for a message." },
+    .{ .text = "if", .doc = "A conditional." },
+    .{ .text = "import", .doc = "Bring a module or selected names into scope." },
+    .{ .text = "in", .doc = "The by-value `in` parameter mode; also the `for x in xs` separator." },
+    .{ .text = "law", .doc = "State an algebraic law a `fit` must satisfy (property-checked)." },
+    .{ .text = "let", .doc = "An immutable local binding." },
+    .{ .text = "loop", .doc = "An unconditional loop (exit with `break`)." },
+    .{ .text = "match", .doc = "Pattern-match a value against arms." },
+    .{ .text = "move", .doc = "The `move` parameter mode — transfer ownership." },
+    .{ .text = "on", .doc = "An event handler in a `screen` (`on press(…) { … }`)." },
+    .{ .text = "out", .doc = "The `out` parameter mode — a write-only output parameter." },
+    .{ .text = "panic", .doc = "Abort the current computation with an error." },
+    .{ .text = "pub", .doc = "Mark an item public — part of the qube's exported surface." },
+    .{ .text = "ref", .doc = "A reference type (`ref T`) or the `ref` parameter mode." },
+    .{ .text = "region", .doc = "A memory region — the unit of allocation lifetime (spec/memory.md)." },
+    .{ .text = "return", .doc = "Return a value from a function." },
+    .{ .text = "scope", .doc = "A structured-concurrency scope that bounds spawned tasks." },
+    .{ .text = "screen", .doc = "The QView frontend DSL: `state`, a `draw` block, and `on` handlers." },
+    .{ .text = "select", .doc = "Wait on multiple channel operations, taking the first ready." },
+    .{ .text = "self", .doc = "The receiver value of a method." },
+    .{ .text = "Self", .doc = "The enclosing / implementing type." },
+    .{ .text = "spawn", .doc = "Start a concurrent task within a scope." },
+    .{ .text = "state", .doc = "A reactive state binding (in a `screen` or actor)." },
+    .{ .text = "struct", .doc = "Declare a struct (record type)." },
+    .{ .text = "tell", .doc = "Send a fire-and-forget message to an actor." },
+    .{ .text = "trap", .doc = "Raise an unrecoverable trap." },
+    .{ .text = "true", .doc = "The boolean literal `true`." },
+    .{ .text = "try", .doc = "Propagate an error from a `Result` (early-return on failure)." },
+    .{ .text = "type", .doc = "Declare a type alias (`type Name = …`)." },
+    .{ .text = "use", .doc = "Re-export names from a module (`pub use …`)." },
+    .{ .text = "var", .doc = "A mutable local binding." },
+    .{ .text = "where", .doc = "Attach bounds to generic parameters." },
+    .{ .text = "while", .doc = "A loop that runs while a condition holds." },
+    .{ .text = "with_capabilities", .doc = "Run a block with a narrowed capability set (grant / deny)." },
+    .{ .text = "None", .doc = "The `Option` `None` value / pattern." },
+};
+
+fn keywordDoc(text: []const u8) []const u8 {
+    for (keyword_docs) |kd| {
+        if (std.mem.eql(u8, kd.text, text)) return kd.doc;
+    }
+    return "";
+}
+
 // =====================================================================
 // Public entry points
 // =====================================================================
@@ -139,6 +207,8 @@ fn writeLanguageObject(w: *std.Io.Writer, gpa: std.mem.Allocator) !void {
         try diag.writeJsonString(w, kw.text);
         try w.writeAll(",\"kind\":");
         try diag.writeJsonString(w, @tagName(kw.kind));
+        try w.writeAll(",\"doc\":");
+        try diag.writeJsonString(w, keywordDoc(kw.text));
         try w.writeByte('}');
     }
     // builtin types
@@ -165,6 +235,8 @@ fn writeLanguageObject(w: *std.Io.Writer, gpa: std.mem.Allocator) !void {
         try diag.writeJsonString(w, c.severity.toString());
         try w.writeAll(",\"message\":");
         try diag.writeJsonString(w, c.message);
+        try w.writeAll(",\"summary\":");
+        try diag.writeJsonString(w, c.summary);
         try w.writeAll(",\"url\":");
         const url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ diag.diagnostics_base, c.code });
         defer gpa.free(url);
