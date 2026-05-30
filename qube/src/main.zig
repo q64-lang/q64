@@ -137,12 +137,21 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "build")) {
+        cmdBuild(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: build failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     // Documented subcommands that are not implemented yet. Listed
     // explicitly so unknown names still hit the usage fallback.
     const stub_subs = [_][]const u8{
-        "remove",   "build", "test",      "install",
-        "lock",     "outdated", "audit",  "clean",
-        "explain",  "fix",   "fmt",       "workspace",
+        "remove", "test",     "install",
+        "lock",   "outdated", "audit",
+        "clean",  "explain",  "fix",
+        "fmt",    "workspace",
     };
     for (stub_subs) |s| {
         if (std.mem.eql(u8, sub, s)) {
@@ -165,6 +174,8 @@ fn usage(io: std.Io) !void {
         \\  init [flags]            Scaffold a qube in the current directory (wizard if no flags).
         \\  pod <new|init> [flags]  Scaffold a QubePod deploy manifest (wizard if no flags).
         \\  pod deploy [flags]      Pack the bundle (manifest+wasm+assets) and deploy to qubepods.
+        \\  build [--component] [--addr wasm32|wasm64] [--release]
+        \\                          Compile the qube to wasm under target/<profile>/<addr>/.
         \\  run                     Build and run the qube in the current directory.
         \\  web                     Build the qube to wasm and serve it in a browser.
         \\  add <name>[@version]    Resolve a dependency from the Continuum and add it.
@@ -173,7 +184,7 @@ fn usage(io: std.Io) !void {
         \\  --version, -v           Print the version and exit.
         \\  --help, -h              Print this help and exit.
         \\
-        \\Other subcommands from the spec (remove, build, test,
+        \\Other subcommands from the spec (remove, test,
         \\fix, explain, fmt, workspace, ...) are not implemented yet.
         \\
     );
@@ -465,6 +476,140 @@ fn cmdRun(
         } else {
             std.process.exit(@intFromEnum(ExitCode.runtime_failure));
         }
+    }
+}
+
+/// `qube build [--component] [--addr wasm32|wasm64] [--release]` — compile the
+/// qube to wasm (spec/qube-cli.md §build). Delegates to `q64 emit`, placing the
+/// core module at `target/<profile>/<addr>/<name>.wasm`; with `--component`
+/// (or `component.emit: true`) also wraps it in a component
+/// (`<name>.component.wasm`) via `q64 emit --component`. Unlike `run`, this
+/// builds libraries as well as applications and does not execute the result.
+fn cmdBuild(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var want_component = false;
+    var addr: []const u8 = "wasm64"; // q64 emit's default; --addr overrides
+    var profile: []const u8 = "debug";
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--component")) {
+            want_component = true;
+        } else if (std.mem.eql(u8, a, "--release")) {
+            profile = "release";
+        } else if (std.mem.eql(u8, a, "--debug")) {
+            profile = "debug";
+        } else if (std.mem.eql(u8, a, "--addr")) {
+            const v = args_it.next() orelse {
+                try writeStderr(io, "qube build: --addr expects wasm32 or wasm64\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+            if (!std.mem.eql(u8, v, "wasm32") and !std.mem.eql(u8, v, "wasm64")) {
+                try printStderr(io, "qube build: --addr expects wasm32 or wasm64, got '{s}'\n", .{v});
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            }
+            addr = v;
+        } else {
+            try printStderr(io, "qube build: ignoring unrecognised arg in v0: {s}\n", .{a});
+        }
+    }
+
+    // Discover + parse qube.json5 (same front as `run`).
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const manifest_path = try findManifestUpward(gpa, io, cwd_path) orelse {
+        try writeStderr(io, "qube: no qube.json5 found in this directory or any parent\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(manifest_path);
+    const project_dir = std.fs.path.dirname(manifest_path) orelse ".";
+
+    const manifest_src = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1 * 1024 * 1024)) catch |err| {
+        try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(manifest_src);
+    const json = json5ToJson(gpa, manifest_src) catch |err| {
+        try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(json);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |err| {
+        try printStderr(io, "qube: cannot parse {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try writeStderr(io, "qube: manifest is not a JSON object\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        },
+    };
+
+    const name = manifestString(root, "name") orelse {
+        try writeStderr(io, "qube: manifest has no \"name\"\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    // `component.emit: true` in the manifest turns component emission on; the
+    // `--component` flag overrides (per qube-cli.md).
+    if (!want_component) {
+        if (root.get("component")) |comp| switch (comp) {
+            .object => |co| if (co.get("emit")) |e| switch (e) {
+                .bool => |bv| want_component = bv,
+                else => {},
+            },
+            else => {},
+        };
+    }
+
+    // A library defaults its entry to src/lib.q; an application to src/main.q.
+    const type_str = manifestString(root, "type");
+    const is_lib = if (type_str) |t| std.mem.eql(u8, t, "library") else false;
+    const entry_rel = manifestString(root, "entry") orelse if (is_lib) "src/lib.q" else "src/main.q";
+    const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
+    defer gpa.free(entry_path);
+
+    var module_specs = resolveModuleSpecs(gpa, io, project_dir, root) catch |err| {
+        try printStderr(io, "qube: dependency resolution failed: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    };
+    defer {
+        for (module_specs.items) |s| gpa.free(s);
+        module_specs.deinit(gpa);
+    }
+
+    const repo_root_opt = findRepoRoot(gpa, io, project_dir) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const q64_bin = try resolveBinary(gpa, io, env, "Q64_BIN", repo_root_opt, "q64/zig-out/bin/q64", "q64");
+    defer gpa.free(q64_bin);
+
+    // Build output: target/<profile>/<addr>/<name>.wasm (qube-cli.md §"Build outputs").
+    const out_dir = try std.fs.path.join(gpa, &.{ project_dir, "target", profile, addr });
+    defer gpa.free(out_dir);
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    const wasm_name = try std.fmt.allocPrint(gpa, "{s}.wasm", .{name});
+    defer gpa.free(wasm_name);
+    const wasm_path = try std.fs.path.join(gpa, &.{ out_dir, wasm_name });
+    defer gpa.free(wasm_path);
+
+    // q64 emit <entry> <wasm> --addr <addr> [--module …] [--component]
+    {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.appendSlice(gpa, &.{ q64_bin, "emit", entry_path, wasm_path, "--addr", addr });
+        for (module_specs.items) |spec| try argv.appendSlice(gpa, &.{ "--module", spec });
+        if (want_component) try argv.append(gpa, "--component");
+        const term = try spawnInherit(io, argv.items);
+        const code = termCode(term) orelse std.process.exit(@intFromEnum(ExitCode.compile));
+        if (code != 0) std.process.exit(if (code == 1) @intFromEnum(ExitCode.compile) else code);
+    }
+
+    try printStderr(io, "qube: built {s}\n", .{wasm_path});
+    if (want_component) {
+        try printStderr(io, "qube: built {s}/{s}.component.wasm\n", .{ out_dir, name });
     }
 }
 

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "dev.q64.math",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "A scalar library qube, emitted as a WebAssembly component.",
+  "type": "library",
+  "entry": "src/lib.q",
+
+  // Emit a component in addition to the core module. This library's exports
+  // are all scalar (i64 -> s64), so they lift through the canonical ABI with
+  // no capability imports — the slice `q64 emit --component` handles today.
+  // See spec/modules.md §"The qube as a component".
+  "component": {
+    "emit": true,
+    "world": "dev-q64-math",
+  },
+}

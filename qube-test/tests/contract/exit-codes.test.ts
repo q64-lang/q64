@@ -17,7 +17,7 @@ describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
   });
 
   test("not-yet-implemented subcommand → usage, exit 2", () => {
-    expect(runCli(["build"]).exitCode).toBe(2);
+    expect(runCli(["remove"]).exitCode).toBe(2);
   });
 
   test("`run` with no manifest → input error, exit 65", () => {
@@ -64,11 +64,13 @@ describe.skipIf(!binaryAvailable())("exit codes (spec surface)", () => {
     expect(runCli(["build"], { cwd: proj }).exitCode).toBe(64);
   });
 
-  test.failing("a dependency cache miss with --offline exits 66", () => {
+  test("a dependency cache miss with --offline exits 66", () => {
     const proj = makeProject({
       "qube.json5": '{ "name": "dev.q64.x", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q", "dependencies": { "dev.q64.absent": "^9.9" } }',
       "src/main.q": "fn main { env.out(\"x\") }\n",
     });
+    // Dependency resolution fails before any compile work, so this needs no
+    // q64 — a real exit now that `build` resolves the manifest's deps.
     expect(runCli(["build", "--offline"], { cwd: proj, timeout: 15_000 }).exitCode).toBe(66);
   });
 });
