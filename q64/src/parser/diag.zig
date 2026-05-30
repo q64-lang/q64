@@ -87,6 +87,10 @@ pub const CodeInfo = struct {
     subsystem: []const u8,
     severity: Severity,
     message: []const u8,
+    /// One or two sentences explaining the diagnostic and how to resolve it.
+    /// Surfaced by `q64 explain`, `q64 doc --json`, and the docs pages. May be
+    /// `""` for codes whose prose hasn't been written yet.
+    summary: []const u8 = "",
 };
 
 /// Look up the canonical short-message for a diagnostic code.
@@ -128,26 +132,26 @@ pub fn subsystemFor(code: []const u8) []const u8 {
 /// web pages land here as the per-spec prose is filled in.)
 pub const codes = [_]CodeInfo{
     // Lexical
-    .{ .code = "LEX010", .subsystem = "Lexical", .severity = .err, .message = "stray carriage return" },
-    .{ .code = "LEX020", .subsystem = "Lexical", .severity = .err, .message = "unknown string-literal prefix" },
-    .{ .code = "LEX021", .subsystem = "Lexical", .severity = .err, .message = "unexpected `&` in type position" },
-    .{ .code = "LEX030", .subsystem = "Lexical", .severity = .err, .message = "unterminated string literal" },
-    .{ .code = "LEX031", .subsystem = "Lexical", .severity = .err, .message = "char literals are not supported" },
-    .{ .code = "LEX040", .subsystem = "Lexical", .severity = .err, .message = "unexpected character" },
+    .{ .code = "LEX010", .subsystem = "Lexical", .severity = .err, .message = "stray carriage return", .summary = "A bare carriage return (CR) was found in the source. q64 source uses Unix line endings (LF, `\\n`); a lone `\\r` not paired with `\\n` is rejected. Re-save the file with LF line endings." },
+    .{ .code = "LEX020", .subsystem = "Lexical", .severity = .err, .message = "unknown string-literal prefix", .summary = "An identifier directly preceding a string literal was read as a typed-string prefix (e.g. `url\"…\"`), but it isn't a recognized prefix. Check the spelling, or add a space if you didn't mean a typed string." },
+    .{ .code = "LEX021", .subsystem = "Lexical", .severity = .err, .message = "unexpected `&` in type position", .summary = "`&` is not q64's reference sigil. References are written `ref T` (and `ref`/`out`/`move` parameter modes), not `&T`. See spec/types.md." },
+    .{ .code = "LEX030", .subsystem = "Lexical", .severity = .err, .message = "unterminated string literal", .summary = "A string literal opened with `\"` but the line or file ended before a closing `\"`. Add the closing quote, or use a raw string (`r\"…\"`) if the content spans forms the lexer can't see through." },
+    .{ .code = "LEX031", .subsystem = "Lexical", .severity = .err, .message = "char literals are not supported", .summary = "q64 has no character-literal type, so `'a'` is invalid. Use a one-character string `\"a\"`, or a numeric code point if you need the integer value." },
+    .{ .code = "LEX040", .subsystem = "Lexical", .severity = .err, .message = "unexpected character", .summary = "A character that isn't part of any q64 token appeared in the source. Remove it or check for a stray/non-ASCII symbol." },
     // Parser
-    .{ .code = "PAR040", .subsystem = "Parser", .severity = .err, .message = "generic vs less-than ambiguity" },
+    .{ .code = "PAR040", .subsystem = "Parser", .severity = .err, .message = "generic vs less-than ambiguity", .summary = "A `<` following a name was ambiguous between a generic-argument list (`Vec<T>`) and a less-than comparison (`a < b`). Add parentheses to force the comparison, or whitespace/turbofish per the grammar (spec/grammar.md)." },
     // Names
-    .{ .code = "NAM001", .subsystem = "Names", .severity = .err, .message = "unknown module" },
-    .{ .code = "NAM002", .subsystem = "Names", .severity = .err, .message = "import path escapes qube" },
-    .{ .code = "NAM003", .subsystem = "Names", .severity = .err, .message = "wildcard import is forbidden" },
-    .{ .code = "NAM004", .subsystem = "Names", .severity = .err, .message = "selective import combined with alias" },
-    .{ .code = "NAM005", .subsystem = "Names", .severity = .err, .message = "name collision in import scope" },
-    .{ .code = "NAM006", .subsystem = "Names", .severity = .err, .message = "name is private to its qube" },
-    .{ .code = "NAM007", .subsystem = "Names", .severity = .err, .message = "sub-module not re-exported" },
-    .{ .code = "NAM008", .subsystem = "Names", .severity = .err, .message = "re-export cycle" },
-    .{ .code = "NAM009", .subsystem = "Names", .severity = .err, .message = "block `pub` form is forbidden" },
-    .{ .code = "NAM010", .subsystem = "Names", .severity = .err, .message = "unknown name in source module" },
-    .{ .code = "NAM011", .subsystem = "Names", .severity = .err, .message = "dash in bare module path" },
+    .{ .code = "NAM001", .subsystem = "Names", .severity = .err, .message = "unknown module", .summary = "An `import` names a module the compiler can't resolve. Check the dotted module path and that the dependency is declared in `qube.json5` (or provided via `--module`). See spec/modules.md." },
+    .{ .code = "NAM002", .subsystem = "Names", .severity = .err, .message = "import path escapes qube", .summary = "A quoted relative import (e.g. `\"../other/lib.q\"`) resolves outside the qube's own source tree. Imports may not escape the qube; depend on the other qube by its module path instead." },
+    .{ .code = "NAM003", .subsystem = "Names", .severity = .err, .message = "wildcard import is forbidden", .summary = "Glob imports like `import foo.*` are not allowed — they make the imported surface implicit. List names explicitly (`import foo.{a, b}`) or import the namespace and qualify uses." },
+    .{ .code = "NAM004", .subsystem = "Names", .severity = .err, .message = "selective import combined with alias", .summary = "A selective import (`import foo.{a, b}`) cannot also carry an `as` alias — the two binding forms are mutually exclusive. Use one or the other." },
+    .{ .code = "NAM005", .subsystem = "Names", .severity = .err, .message = "name collision in import scope", .summary = "Two imports bind the same name into one scope, so a use would be ambiguous. Rename one binding with `as`." },
+    .{ .code = "NAM006", .subsystem = "Names", .severity = .err, .message = "name is private to its qube", .summary = "The imported name exists in the target module but isn't `pub`, so it's private to its qube. Only `pub` declarations are importable; export it or import a different name." },
+    .{ .code = "NAM007", .subsystem = "Names", .severity = .err, .message = "sub-module not re-exported", .summary = "A sub-module isn't re-exported by its parent, so it can't be reached through that path. Add a `pub use` re-export in the parent, or import the sub-module by its own path. See spec/modules.md." },
+    .{ .code = "NAM008", .subsystem = "Names", .severity = .err, .message = "re-export cycle", .summary = "The `pub use` re-exports form a cycle (A re-exports B which re-exports A). Break the loop so the export graph is acyclic." },
+    .{ .code = "NAM009", .subsystem = "Names", .severity = .err, .message = "block `pub` form is forbidden", .summary = "A `pub { … }` block applying visibility to a group of items is not allowed. Mark each item `pub` individually." },
+    .{ .code = "NAM010", .subsystem = "Names", .severity = .err, .message = "unknown name in source module", .summary = "A name referenced here is neither declared in this module nor brought into scope by an `import`. Check for a typo, a missing `import`, or a name that isn't `pub` in its module." },
+    .{ .code = "NAM011", .subsystem = "Names", .severity = .err, .message = "dash in bare module path", .summary = "A bare (dotted) module path segment contains `-`, but segments are snake_case identifiers (`[a-z][a-z0-9_]*`). Rename the segment, or use a quoted relative path for a file whose name contains a dash." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"

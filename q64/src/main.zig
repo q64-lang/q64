@@ -694,14 +694,19 @@ fn cmdExplain(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Ite
         try diag.writeJsonString(&w.interface, info.severity.toString());
         try w.interface.writeAll(",\"message\":");
         try diag.writeJsonString(&w.interface, info.message);
+        try w.interface.writeAll(",\"summary\":");
+        try diag.writeJsonString(&w.interface, info.summary);
         try w.interface.writeAll(",\"url\":");
         try w.interface.print("\"{s}/{s}\"", .{ diag.diagnostics_base, info.code });
         try w.interface.writeAll("}\n");
     } else {
-        try w.interface.print("{s} [{s}, {s}]\n  {s}\n  {s}/{s}\n", .{
-            info.code, info.subsystem, info.severity.toString(),
-            info.message, diag.diagnostics_base, info.code,
+        try w.interface.print("{s} [{s}, {s}]\n  {s}\n", .{
+            info.code, info.subsystem, info.severity.toString(), info.message,
         });
+        if (info.summary.len > 0) {
+            try w.interface.print("\n  {s}\n", .{info.summary});
+        }
+        try w.interface.print("\n  {s}/{s}\n", .{ diag.diagnostics_base, info.code });
     }
     try w.interface.flush();
 }
