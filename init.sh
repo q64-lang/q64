@@ -16,6 +16,9 @@
 #   - wasm-tools (vendor/wasm-tools/) — OPTIONAL: component-model tooling
 #     (validate / WIT extraction / component new); used to differential-test
 #     the q64 component encoder. sha256-pinned; skipped where unpinned.
+#   - WASI preview1 adapter (vendor/wasi/) — OPTIONAL: the shim `wasm-tools
+#     component new --adapt` uses to wrap a preview1 core module into a real
+#     wasi:cli/* component. sha256-pinned.
 #
 # Re-runnable; skips work that's already done. Run from the repo root:
 #
@@ -79,6 +82,17 @@ WASMTOOLS_VERSION="${WASMTOOLS_VERSION:-1.251.0}"
 WASMTOOLS_DEST="vendor/wasm-tools"
 WASMTOOLS_RELEASE_BASE="https://github.com/bytecodealliance/wasm-tools/releases/download"
 WASMTOOLS_CACHE_URL="${WASMTOOLS_CACHE_URL-https://cdn.q64.dev/toolchain}"
+
+# WASI Preview 1 adapter (a single .wasm) — OPTIONAL: the official preview1->
+# preview2 shim `wasm-tools component new --adapt` uses to wrap a preview1 core
+# module (one that imports wasi_snapshot_preview1.*) into a real wasi:cli/*
+# component. Tied to the wasmtime version. CDN mirror (versioned name) first,
+# the wasmtime release (unversioned name) as fallback; sha256-pinned.
+WASI_ADAPTER_VERSION="${WASI_ADAPTER_VERSION:-45.0.0}"
+WASI_ADAPTER_DEST="vendor/wasi"
+WASI_ADAPTER_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/download"
+WASI_ADAPTER_CACHE_URL="${WASI_ADAPTER_CACHE_URL-https://cdn.q64.dev/toolchain}"
+WASI_ADAPTER_SHA256="eb843effeade4b79d7b9e9bf0e21ba33c24c26d54f347414a1ba72bcb65fac74"
 
 cd "$(dirname "$0")"
 
@@ -526,11 +540,58 @@ install_wasmtools() {
     echo "init.sh: wasm-tools $WASMTOOLS_VERSION installed at $WASMTOOLS_DEST ($("$WASMTOOLS_DEST/wasm-tools" --version 2>/dev/null || echo '?'))"
 }
 
+# =====================================================================
+# wasi adapter — optional preview1->preview2 shim, sha256-pinned
+# =====================================================================
+
+install_wasi_adapter() {
+    local file="$WASI_ADAPTER_DEST/wasi_snapshot_preview1.command.wasm"
+    if [ -f "$file" ] && \
+       [ "$(cat "$WASI_ADAPTER_DEST/VERSION" 2>/dev/null)" = "$WASI_ADAPTER_VERSION" ]; then
+        echo "init.sh: wasi adapter $WASI_ADAPTER_VERSION already installed at $WASI_ADAPTER_DEST"
+        return 0
+    fi
+
+    # A single .wasm (not a tarball). The CDN mirror uses a versioned object
+    # name; the wasmtime release uses the unversioned name. Both are checked
+    # against the same pin, so a bad mirror can't poison it.
+    local cdn_name="wasi_snapshot_preview1.command-${WASI_ADAPTER_VERSION}.wasm"
+    local rel_name="wasi_snapshot_preview1.command.wasm"
+    local out="$tmpdir/wasi-adapter.wasm"
+    local got=""
+    if [ -n "$WASI_ADAPTER_CACHE_URL" ] && \
+       curl -fsSL "${WASI_ADAPTER_CACHE_URL%/}/$cdn_name" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+        got="cache"
+    elif curl -fsSL "${WASI_ADAPTER_RELEASE_BASE}/v${WASI_ADAPTER_VERSION}/${rel_name}" -o "$out" 2>/dev/null && [ -s "$out" ]; then
+        got="release"
+    else
+        echo "init.sh: wasi adapter download failed — skipping (optional tooling)" >&2
+        return 0
+    fi
+
+    local actual_sha
+    actual_sha="$("${sha256_cmd[@]}" "$out" | awk '{print $1}')"
+    if [ "$actual_sha" != "$WASI_ADAPTER_SHA256" ]; then
+        echo "init.sh: wasi adapter sha256 mismatch (from $got) — refusing:" >&2
+        echo "  expected: $WASI_ADAPTER_SHA256" >&2
+        echo "  got:      $actual_sha" >&2
+        return 0
+    fi
+    echo "init.sh: wasi adapter sha256 verified ($actual_sha, from $got)"
+
+    rm -rf "$WASI_ADAPTER_DEST"
+    mkdir -p "$WASI_ADAPTER_DEST"
+    mv "$out" "$file"
+    echo "$WASI_ADAPTER_VERSION" > "$WASI_ADAPTER_DEST/VERSION"
+    echo "init.sh: wasi adapter $WASI_ADAPTER_VERSION installed at $WASI_ADAPTER_DEST"
+}
+
 install_zig
 install_wasmtime
 install_binaryen
 install_wabt
 install_wasmtools
+install_wasi_adapter
 
 echo
 echo "Add zig to PATH for this shell:"
