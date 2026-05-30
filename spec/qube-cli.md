@@ -22,6 +22,9 @@ qube --help    | -h
 | `qube new <name>`                | Create a new qube directory with a starter manifest and `src/`     |
 | `qube init`                      | Initialize a qube in the current directory                         |
 | `qube pod <new\|init>`           | Scaffold a QubePod deploy manifest (`qubepod.jsonc`)               |
+| `qube pod login`                 | Save a qubepods token (from the console) for deploys              |
+| `qube pod info`                  | Show the qubepods provider, API origin, and auth status          |
+| `qube pod logout`                | Remove the saved qubepods token                                  |
 | `qube pod deploy`                | Pack the bundle (manifest + wasm + assets) and deploy to qubepods |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
@@ -163,6 +166,28 @@ WebKit. See [`memory.md` §"The platform"](./memory.md).
 | `--assets <dir>`      | —                          | Add an `assets` block shipping `<dir>`. |
 | `--dir <path>`        | the name (`new` only)      | Target directory.                    |
 
+### `qube pod login` / `info` / `logout`
+
+`qube pod` targets a **provider** — today only **qubepods**. Auth is kept
+separate from the Continuum registry credentials: `qube login` writes
+`~/.qube/credentials.toml` (registry), while `qube pod login` writes
+`~/.qube/pods.toml` (qubepods), so the two never clobber each other.
+
+The qubepods API has no CLI token-issuance endpoint (its `/auth/login` is
+cookie-based for the web console), so `qube pod login` **saves a token you
+minted in the qubepods console** rather than performing an email/password
+exchange. With `--token <t>` it stores that token; with no flag it reads one
+(pasted) from stdin.
+
+| Form | Effect |
+|---|---|
+| `qube pod login [--token <t>] [--url <origin>]` | Save the token under `[pods."<host>"]` in `~/.qube/pods.toml` (host from `--url`, default the qubepods API). |
+| `qube pod info [--url <origin>]` | Print the provider, API origin, and whether a token is saved. |
+| `qube pod logout` | Delete `~/.qube/pods.toml`. |
+
+`qube pod deploy` resolves its token in order: `--token` → `$QUBEPODS_TOKEN` →
+the saved `qube pod login` credentials.
+
 ### `qube pod deploy`
 
 `qube pod deploy` packs a **bundle zip** from the `qubepod.jsonc` in the
@@ -180,7 +205,7 @@ tolerated on the server side.
 |------------------|----------------------------------|--------------------------------------|
 | `--env <name>`   | `production`                     | Target environment.                  |
 | `--url <origin>` | `https://api-stage.qubepods.com` | API origin.                          |
-| `--token <jwt>`  | `$QUBEPODS_TOKEN`                | Bearer token for the deploy API.     |
+| `--token <t>`    | `$QUBEPODS_TOKEN`, then `qube pod login` | Bearer token for the deploy API. |
 
 ## `qube web` (v0)
 
