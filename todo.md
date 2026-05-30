@@ -490,6 +490,47 @@ it with `CfgUnsupported`).
         rejected `NoMainFunction`. Verified: 3 build_hir surface tests
         (unreached export, reached→public upgrade, main-less library) + a `show
         world` library CLI test; 81/81 CLI tests + roundtrip green.
+
+## Component emission — `q64 emit --component` — ACTIVE
+
+Wiring the WIT lift into a build artifact: a real WebAssembly **component**
+wrapping the core module (spec/modules.md §"The qube as a component",
+spec/q64-cli.md `--component`).
+
+- [x] **Smallest faithful slice — validated by wasmtime.** `q64 emit <f> <out>
+      --component` writes the core module *and* `<out>.component.wasm`, a genuine
+      component the vendored wasmtime accepts, instantiates, and can call.
+      - `codegen/component.zig` — a pure-Zig component-model binary encoder
+        (preamble + core-module / core-instance / alias / type / canon-lift /
+        export sections). `emit.emitComponent` emits the core module, checks it
+        is import-free, gathers the scalar `pub` surface, and wraps it.
+      - **Scope:** import-free core modules, **scalar** exports (`i64`→`s64`,
+        `bool`, `f64`) that cross the canonical ABI with no memory/`realloc`
+        glue. A `str`/list export is skipped; a core module that imports a
+        capability face (`env.out`) is `ComponentNeedsImportLowering` (honest,
+        not mis-wrapped); an empty liftable surface is `ComponentNoExports`.
+      - **Two supporting codegen fixes:** the `env.out` import is now declared
+        only when used (`usesEnvOut`) — a pure library imports nothing; and a
+        public value-returning callee is now `exported` by name (was only set on
+        the entry/screen path), so a library's functions reach the host + lift.
+      - **Validation harness:** `runtime/wasmtime/src/component_check.zig` →
+        `q64-component-check`, which runs `wasmtime_component_new` (validate) and
+        optionally instantiates + calls a scalar export. `scripts/component-
+        roundtrip.sh` (+ `zig build component-roundtrip`) proves `add(2,3)=5`,
+        `mul(6,7)=42`, `sub(50,8)=42` through real components, and asserts the
+        boundary rejections. Plus `component.zig` structural unit tests.
+- [ ] **`qube build --component` delegation.** `qube build` is still a stub; wire
+      it (and `--component` / `component.emit`) to invoke `q64 emit --component`
+      and place `target/<profile>/<addr>/<name>.component.wasm` per
+      qube-cli.md §"Build outputs".
+- [ ] **Import lowering (capability faces).** Lower `env.out` (→ a WASI/host
+      import) through `canon lower` so an *app* (not just a pure library) wraps
+      as a component. Needs the core module to export `memory` + `cabi_realloc`
+      and the import-side canon encoding.
+- [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
+      the canonical ABI string representation (memory + realloc canon options);
+      today they're skipped from the component surface.
+
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).

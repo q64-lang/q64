@@ -52,4 +52,23 @@ pub fn build(b: *std.Build) void {
     hello_run.expectStdOutEqual("Hello, q64.\n");
     const hello_step = b.step("hello", "Run hello.wat and assert stdout");
     hello_step.dependOn(&hello_run.step);
+
+    // q64-component-check — validates a WebAssembly component with wasmtime's
+    // component-model compiler (and optionally calls a scalar export). Used by
+    // the component-build tests to prove `q64 build --component` output is real.
+    const check_mod = b.createModule(.{
+        .root_source_file = b.path("src/component_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    check_mod.link_libc = true;
+    check_mod.addIncludePath(wasmtime_include);
+    check_mod.addLibraryPath(wasmtime_lib_dir);
+    check_mod.linkSystemLibrary("wasmtime", .{});
+    check_mod.addRPath(wasmtime_lib_dir);
+    const check_exe = b.addExecutable(.{
+        .name = "q64-component-check",
+        .root_module = check_mod,
+    });
+    b.installArtifact(check_exe);
 }

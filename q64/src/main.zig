@@ -184,11 +184,16 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     // the wasm32 string ABI lands (Path B). `--addr wasm32` opts in to a genuine
     // 32-bit module (the WebKit/iPad baseline) for the integer/import subset.
     var addr: emit.AddressSpace = .wasm64;
+    var want_component = false;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
 
     while (args_it.next()) |a| {
-        if (std.mem.eql(u8, a, "--addr")) {
+        if (std.mem.eql(u8, a, "--component")) {
+            // Also wrap the core module in a component (spec/q64-cli.md). The
+            // core module is still written to `out`.
+            want_component = true;
+        } else if (std.mem.eql(u8, a, "--addr")) {
             const v = args_it.next() orelse {
                 try usage(io);
                 std.process.exit(2);
@@ -266,6 +271,24 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     defer gpa.free(bytes);
 
     try writeFile(io, out, bytes);
+
+    // --component: additionally wrap the core module in a WebAssembly component,
+    // written to `<out without .wasm>.component.wasm` (spec/q64-cli.md).
+    if (want_component) {
+        const comp = emit.emitComponent(gpa, source, src, module_sources.items, addr) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writer(io, &buf);
+            try w.interface.print("q64: component emit failed: {s}\n", .{@errorName(err)});
+            try w.interface.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(comp);
+
+        const base = if (std.mem.endsWith(u8, out, ".wasm")) out[0 .. out.len - ".wasm".len] else out;
+        const comp_path = try std.fmt.allocPrint(gpa, "{s}.component.wasm", .{base});
+        defer gpa.free(comp_path);
+        try writeFile(io, comp_path, comp);
+    }
 }
 
 fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
