@@ -9,6 +9,9 @@ export default defineConfig({
     starlight({
       title: 'q64',
       description: 'A modern toolchain for WebAssembly and beyond.',
+      social: {
+        github: 'https://github.com/q64-lang/q64',
+      },
       sidebar: [
         { label: 'Welcome', slug: 'welcome' },
       ],
