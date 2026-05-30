@@ -36,6 +36,12 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-24.04
+    # Surface the Cloudflare token as a job env so steps can gate on it: when
+    # the repo secrets aren't set yet, the job skips the deploy and stays green
+    # instead of failing red.
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,12 +71,15 @@ jobs:
           fi
 
       - name: Install
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
         working-directory: q64-docs
         run: pnpm install --frozen-lockfile
 
       - name: Deploy
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' }}
         working-directory: q64-docs
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: pnpm run deploy
+
+      - name: Skip deploy (no Cloudflare token)
+        if: ${{ env.CLOUDFLARE_API_TOKEN == '' }}
+        run: echo "CLOUDFLARE_API_TOKEN not set — skipping docs deploy. Add the CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID repo secrets to enable auto-deploy."
