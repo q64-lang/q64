@@ -8,14 +8,8 @@ export function register(kind, impl) {
 }
 export function widgetFor(kind) { return registry.get(kind); }
 
-// Shared palette so widgets look consistent. One place to tune.
-export const THEME = {
-  fg:          [0.90, 0.95, 1.00, 1],
-  muted:       [0.62, 0.69, 0.78, 1],
-  surface:     [0.10, 0.13, 0.18, 1],
-  accent:      [0.37, 0.83, 1.00, 1],
-  accentDim:   [0.20, 0.55, 0.75, 1],
-  border:      [0.16, 0.45, 0.62, 1],
-  track:       [0.18, 0.22, 0.28, 1],
-  inkOnAccent: [0.03, 0.05, 0.08, 1],
-};
+// The theme is per-platform and lives in theme.js (the single source of truth).
+// Widgets never import a palette directly — they read `r.theme` from the render
+// context, which the host sets to the resolved platform's tokens. This re-export
+// is a back-compat default (desktop) for any non-context consumer.
+export { THEME } from './theme.js';

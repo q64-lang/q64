@@ -116,11 +116,13 @@ export function drawPrim(pass, x, y, w, h, fill, opts = {}) {
 }
 
 // Begin a render pass (clears the surface); returns the pass for drawing.
-export function beginFrame() {
+// `bg` is the platform background [r,g,b,a] in 0..1 (defaults to the house dark).
+export function beginFrame(bg = [0.027, 0.035, 0.05, 1]) {
   const canvas = ctx.canvas;
   device.queue.writeBuffer(uniformBuf, 0, new Float32Array([canvas.width, canvas.height, 0, 0]));
   const enc = device.createCommandEncoder();
-  const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r: 0.027, g: 0.035, b: 0.05, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+  const clearValue = { r: bg[0], g: bg[1], b: bg[2], a: bg[3] ?? 1 };
+  const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue, loadOp: 'clear', storeOp: 'store' }] });
   return { enc, pass };
 }
 export function endFrame(frame) { frame.pass.end(); device.queue.submit([frame.enc.finish()]); }
