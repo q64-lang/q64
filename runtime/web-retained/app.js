@@ -23,14 +23,25 @@ import { themeFor } from './theme.js';
 // ?platform= override); the per-platform theme tokens flow to every widget via
 // r.platform / r.theme. Shaders and the protocol are unchanged — only tokens and
 // (for structurally-different controls) per-platform draw variants differ.
-const PLATFORM = resolvePlatform();
-const THEME = themeFor(PLATFORM);
+// Mutable so the platform dropdown can RE-THEME the gallery live (pick Android ->
+// Material). Starts from device detection / ?platform=; setPlatform() swaps it.
+let PLATFORM = resolvePlatform();
+let THEME = themeFor(PLATFORM);
+// Catalog id of a platform option (1012..1015) -> theme platform key.
+const OPTION_PLATFORM = { 1012: 'ios', 1013: 'android', 1014: 'desktop', 1015: 'desktop' };
+function setPlatform(p) {
+  if (!p || p === PLATFORM) return;
+  PLATFORM = p; THEME = themeFor(p);
+  renderCtx.theme = THEME; renderCtx.platform = PLATFORM;   // live-update the render context
+  render();
+}
 
 const log = (m) => { const el = document.getElementById('log'); if (el) el.textContent = m; console.log('[qview]', m); };
 
 // Host-owned glyph catalog (Stage-1 text-by-id; no strings cross wasm). A label
 // whose text_id < CATALOG.length shows that string; otherwise the id is rendered
 // as an integer (the POC's `number` path — live counters etc.).
+const CATALOG_BASE = 1000;  // catalog ids are 1000+, so small ints render as numbers
 const CATALOG = [
   'Widget gallery',  // 0
   'Label',           // 1
@@ -72,7 +83,9 @@ function textStringFor(node) {
   const id = node.attrs.get(ATTR.text_id);
   if (id === undefined) return null;
   const n = Number(id);
-  return (n >= 0 && n < CATALOG.length) ? CATALOG[n] : String(n);
+  // text_id >= CATALOG_BASE is a catalog string; below it is a literal integer
+  // (e.g. a live counter), so 'show the number 0' never collides with CATALOG[0].
+  return (n >= CATALOG_BASE && n - CATALOG_BASE < CATALOG.length) ? CATALOG[n - CATALOG_BASE] : String(n);
 }
 function glyphFor(node) {
   const str = textStringFor(node);
@@ -186,7 +199,7 @@ function withViewport(spec) {
 const idGlyphCache = new Map();
 function glyphForCatalog(textId) {
   const n = Number(textId);
-  const str = (n >= 0 && n < CATALOG.length) ? CATALOG[n] : String(n);
+  const str = (n >= CATALOG_BASE && n - CATALOG_BASE < CATALOG.length) ? CATALOG[n - CATALOG_BASE] : String(n);
   if (!idGlyphCache.has(str)) idGlyphCache.set(str, sdfTexture(str));
   return idGlyphCache.get(str);
 }
@@ -326,8 +339,11 @@ async function main() {
       const target = contextSpec ? contextNode : nodes.get(openDropdownId);
       const chosen = hitMenu(spec, px, py);
       openDropdownId = null; contextSpec = null; contextNode = null;
-      if (chosen !== null && chosen !== undefined && target) dispatch(target, EVENT.change, chosen);
-      else render();
+      if (chosen !== null && chosen !== undefined && target) {
+        dispatch(target, EVENT.change, chosen);     // wasm updates the field/selection
+        // The platform dropdown re-themes the whole gallery live (iOS/Material/…).
+        if (OPTION_PLATFORM[chosen]) setPlatform(OPTION_PLATFORM[chosen]);
+      } else render();
       return;
     }
 
