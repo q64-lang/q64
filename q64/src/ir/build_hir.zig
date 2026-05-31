@@ -437,17 +437,38 @@ fn buildScreenFuncs(b: *Builder, sf: ast.SourceFile) BuildError!void {
 /// to `b.funcs`, exported when public.
 fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
     var scope = Scope{ .a = b.a };
+    // Runtime str bindings for `str` PARAMS (a handler's `text: str`). A str
+    // param occupies two wasm slots (ptr, len); we resolve references to it as a
+    // `str_binding` at those exact slot offsets via this map — NOT through
+    // `scope` (which would route to the `str_param idx*2` ABI that assumes every
+    // param is a str). i64/bool params stay in `scope`.
+    var rt: RtMap = .empty;
     var params: std.ArrayList(hir.Param) = .empty;
+    // Count of params that live in `scope` (i64/bool). A str param is not a
+    // scope local, so `scope.locals` stays 1:1 with single-slot bindings and the
+    // body-locals slice below can be sliced off it directly.
+    var n_scope_params: u32 = 0;
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
-            if (!(try paramIsI64(b.a, p))) return error.Unsupported;
             const pn = (p.name() orelse return error.Unsupported).text;
-            _ = try scope.declare(pn, false, .i64);
-            try params.append(b.a, .{ .name = pn, .ty = .i64 });
+            if (try paramIsStr(b.a, p)) {
+                // Two wasm slots at the current offset: ptr then len. Advance
+                // next_idx past both so a following i64 param / body local lands
+                // at the correct wasm local index.
+                const ptr_idx = scope.next_idx;
+                try rt.put(b.a, pn, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
+                scope.next_idx += 2;
+                try params.append(b.a, .{ .name = pn, .ty = .str });
+            } else {
+                const pty: hir.Type = if (try paramIsBool(b.a, p)) .bool else if (try paramIsI64(b.a, p)) .i64 else return error.Unsupported;
+                _ = try scope.declare(pn, false, pty);
+                n_scope_params += 1;
+                try params.append(b.a, .{ .name = pn, .ty = pty });
+            }
         }
     }
-    scope.n_params = @intCast(params.items.len);
+    scope.n_params = n_scope_params;
 
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
     var it = (fd.body() orelse return error.Unsupported).statements();
@@ -458,9 +479,8 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
                 else => return error.Unsupported,
             };
             const fname = (try hostFaceName(b, call)) orelse return error.Unsupported;
-            // Screen-func params live in `scope` (a str param resolves there), so
-            // no RtMap is needed for str args here.
-            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope, null));
+            // i64 params resolve via `scope`; a `str` param via `rt` (above).
+            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope, &rt));
         },
         .assign_stmt => |as| {
             const tgt = switch (as.target() orelse return error.Unsupported) {
@@ -489,11 +509,15 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
 
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
-    const extra = scope.extra();
-    const locals = try b.a.alloc(hir.Type, extra);
+    // Body locals = the scope entries past the (scope-resident) params. A str
+    // param isn't a scope entry, so this slice is correct even with str params;
+    // their two slots were accounted for in `next_idx` so body-local wasm
+    // indices already land past the params.
+    const n_body: usize = scope.locals.items.len - n_scope_params;
+    const locals = try b.a.alloc(hir.Type, n_body);
     // The non-parameter locals, in index order, carry their declared types
     // (i64 by default, bool for a boolean `let`/`var` binding).
-    for (locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
+    for (locals, 0..) |*t, j| t.* = scope.locals.items[n_scope_params + j].ty;
     const vis: hir.Visibility = if (fd.visibility() != null) .public else .private;
     try b.funcs.append(b.a, .{
         .name = try b.a.dupe(u8, (fd.name() orelse return error.Unsupported).text),
