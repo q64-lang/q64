@@ -5,7 +5,7 @@
 // then mutates it surgically from the on_event dispatcher. present() re-encodes
 // the current tree. Node identity (and thus future focus/caret/scroll) is the
 // node_id, preserved across frames — never a blind full re-emit.
-import { KIND, ATTR, EVENT, EVENT_NAME, unpackColor, PROTOCOL_VERSION } from './protocol.js';
+import { KIND, ATTR, EVENT, EVENT_NAME, SURFACE, unpackColor, PROTOCOL_VERSION } from './protocol.js';
 import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, DPR } from './gpu.js';
 import { widgetFor } from './widgets.js';
 import { resolvePlatform } from './platform.js';
@@ -111,11 +111,26 @@ function removeSubtree(id) {
 const kindName = (k) => Object.keys(KIND).find((n) => KIND[n] === k) ?? `kind${k}`;
 const attrName = (a) => Object.keys(ATTR).find((n) => ATTR[n] === a) ?? `attr${a}`;
 
+// ATTR.surface role tag -> theme token key (the translucent material fills).
+const SURFACE_KEY = { [SURFACE.none]: 'none', [SURFACE.surface]: 'surface', [SURFACE.material]: 'material', [SURFACE.materialThin]: 'materialThin', [SURFACE.scrim]: 'scrim' };
+
 // ---- render: walk the retained tree, dispatch each node to its widget --------
 const renderCtx = {
   pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
   attr: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : Number(v); },
   color: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : unpackColor(v); },
+  // Resolve a node's fill, honoring a semantic ATTR.surface role (theme-resolved
+  // translucent material) over a literal ATTR.fill over the given default.
+  surfaceFill: (node, dflt) => {
+    const role = node.attrs.get(ATTR.surface);
+    if (role !== undefined) {
+      const key = SURFACE_KEY[Number(role)];
+      if (key && key !== 'none') return THEME[key] ?? dflt;
+      if (key === 'none') return null;
+    }
+    const lit = node.attrs.get(ATTR.fill);
+    return lit === undefined ? dflt : unpackColor(lit);
+  },
   textFor: (node) => glyphFor(node),
   isPressed: (id) => id === pressedId,
 };

@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.0';
+export const PROTOCOL_VERSION = '1.1';
 
 // Node kinds (spec §"Node kinds"). 13 = text_input is RESERVED (deferred).
 export const KIND = {
@@ -19,8 +19,18 @@ export const ATTR = {
   x: 0, y: 1, w: 2, h: 3, radius: 4, border_w: 5, fill: 6, border: 7, fg: 8,
   text_id: 9, image_id: 10, enabled: 11, checked: 12, selected: 13, group: 14,
   min: 15, max: 16, value: 17, z: 18, gap: 19,
+  // surface (20): a SEMANTIC fill role resolved against the platform theme,
+  // instead of a literal AARRGGBB `fill`. Lets a producer say "this is a frosted
+  // bar" and get the iOS/Material/desktop material automatically. Values = SURFACE.
+  surface: 20,
 };
 export const ATTR_NAME = Object.fromEntries(Object.entries(ATTR).map(([k, v]) => [v, k]));
+
+// Surface roles for ATTR.surface (theme-resolved translucent fills). Alpha
+// material today; true backdrop blur is a deferred renderer pass.
+export const SURFACE = {
+  none: 0, surface: 1, material: 2, materialThin: 3, scrim: 4,
+};
 
 // Events (spec §"Events"). 4..6 reserved for text_input.
 export const EVENT = {

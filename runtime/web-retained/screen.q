@@ -142,6 +142,23 @@ fn main {
   qview.set_attr(81, 1, 430)
   qview.set_attr(81, 9, 9)
 
+  // Translucent material top bar (90) — created LAST so the tree walk draws it
+  // over the title/content beneath, showing the frosted material per platform.
+  // surface=3 (materialThin); the host resolves the platform's material token.
+  // attr surface=20.
+  qview.create(90, 0, 0)
+  qview.set_attr(90, 0, 0)
+  qview.set_attr(90, 1, 0)
+  qview.set_attr(90, 2, 408)
+  qview.set_attr(90, 3, 64)
+  qview.set_attr(90, 4, 0)
+  qview.set_attr(90, 20, 3)
+  // Bar title (91), over the material.
+  qview.create(91, 4, 0)
+  qview.set_attr(91, 0, 20)
+  qview.set_attr(91, 1, 22)
+  qview.set_attr(91, 9, 0)
+
   qview.present()
 }
 

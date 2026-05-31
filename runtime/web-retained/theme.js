@@ -9,6 +9,16 @@
 
 const rgb = (r, g, b, a = 1) => [r / 255, g / 255, b / 255, a];
 
+// Translucent material tokens (frosted-tint surfaces + modal scrims). These are
+// ALPHA fills only — drawPrim already blends src-alpha, so a material panel over
+// colored content reads as "tinted glass" today. True backdrop BLUR (sampling +
+// Gaussian-blurring what's behind the panel) is a deferred renderer pass
+// (offscreen target + blur pipeline); see spec/qview-protocol.md. Until then a
+// material is a semi-opaque tint — the right color/alpha, just not yet blurred.
+//   material        — bar / sheet / card "frosted" surface tint
+//   materialThin    — lighter chrome (nav/tool bars)
+//   scrim           — full-screen dim behind a modal/sheet
+
 // iOS (dark). System blue accent, green toggles, continuous-feel radii.
 const ios = {
   name: 'ios',
@@ -22,6 +32,9 @@ const ios = {
   track:       rgb(57, 57, 61),       // switch OFF track
   on:          rgb(48, 209, 88),      // systemGreen — iOS switch ON
   knob:        rgb(255, 255, 255),
+  material:     rgb(44, 44, 46, 0.72),    // systemThickMaterial-ish (dark)
+  materialThin: rgb(30, 30, 32, 0.62),    // bar chrome (thin material)
+  scrim:        rgb(0, 0, 0, 0.40),       // sheet/alert dim
   // shape / variant tokens
   font:        'system-ui, -apple-system, sans-serif',
   controlRadius: 7,
@@ -45,6 +58,9 @@ const android = {
   track:       rgb(73, 69, 79),       // surfaceVariant — switch OFF track
   on:          rgb(208, 188, 255),    // M3: track ON = primary
   knob:        rgb(230, 225, 229),
+  material:     rgb(54, 52, 59, 0.86),    // M3 elevated surface tint
+  materialThin: rgb(44, 42, 49, 0.78),    // top-app-bar surface
+  scrim:        rgb(0, 0, 0, 0.32),       // M3 scrim ~32%
   font:        'system-ui, Roboto, sans-serif',
   controlRadius: 4,
   buttonShape:   'pill',              // M3 buttons are fully rounded
@@ -67,6 +83,9 @@ const desktop = {
   track:       rgb(46, 56, 71),
   on:          rgb(94, 212, 255),
   knob:        rgb(230, 242, 255),
+  material:     rgb(20, 27, 38, 0.74),    // frosted panel
+  materialThin: rgb(14, 19, 28, 0.64),    // bar chrome
+  scrim:        rgb(0, 0, 0, 0.45),
   font:        'system-ui, sans-serif',
   controlRadius: 8,
   buttonShape:   'rounded',
