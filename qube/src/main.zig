@@ -2212,7 +2212,7 @@ fn cmdPod(
     args_it: *std.process.Args.Iterator,
 ) !void {
     const subsub = args_it.next() orelse {
-        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|deploy> [flags]\n");
+        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|deploy|hostname> [flags]\n");
         std.process.exit(@intFromEnum(ExitCode.usage));
     };
     if (std.mem.eql(u8, subsub, "--help") or std.mem.eql(u8, subsub, "-h")) {
@@ -2225,6 +2225,7 @@ fn cmdPod(
     if (std.mem.eql(u8, subsub, "logout")) return cmdPodLogout(gpa, io, env, args_it);
     if (std.mem.eql(u8, subsub, "info")) return cmdPodInfo(gpa, io, env, args_it);
     if (std.mem.eql(u8, subsub, "deploy")) return cmdPodDeploy(gpa, io, env, args_it);
+    if (std.mem.eql(u8, subsub, "hostname")) return cmdPodHostname(gpa, io, env, args_it);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
 }
@@ -2571,6 +2572,137 @@ fn cmdPodDeploy(
         return;
     }
     try printStderr(io, "qube pod deploy: api returned {d}:\n{s}\n", .{ status, body });
+    std.process.exit(@intFromEnum(ExitCode.registry));
+}
+
+// ---------------------------------------------------------------------------
+// qube pod hostname — choose a subdomain (<name>.<root>) for this app
+//
+//   qube pod hostname                 show the current hostname + available roots
+//   qube pod hostname <name> [--root qubepod.app|etiamo.app]   set it
+//   qube pod hostname --clear         release the current hostname
+//
+// Reads project + app name from qubepod.jsonc in the cwd (the deploy target),
+// and the saved token (qube pod login) / --token / QUBEPODS_TOKEN, same as deploy.
+// ---------------------------------------------------------------------------
+fn cmdPodHostname(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var api_url: []const u8 = default_pods_api;
+    var token_flag: ?[]const u8 = null;
+    var root: []const u8 = "qubepod.app";
+    var name_arg: ?[]const u8 = null;
+    var clear = false;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try writeStdout(io,
+                \\usage: qube pod hostname [<name>] [flags]
+                \\
+                \\Choose a subdomain (<name>.<root>) for this app, or show the current one.
+                \\Run from the directory holding qubepod.jsonc.
+                \\
+                \\  (no name)        Show the current hostname and available roots.
+                \\  <name>           Set the subdomain label (3–63 chars, [a-z0-9-]).
+                \\  --root <root>    qubepod.app (default) or etiamo.app.
+                \\  --clear          Release the current hostname.
+                \\  --url <origin>   API origin (default: api-stage.qubepods.com).
+                \\  --token <jwt>    Bearer token (or QUBEPODS_TOKEN / qube pod login).
+                \\
+            );
+            return;
+        } else if (std.mem.eql(u8, a, "--url")) {
+            api_url = try flagValue(io, args_it, "--url");
+        } else if (std.mem.eql(u8, a, "--token")) {
+            token_flag = try flagValue(io, args_it, "--token");
+        } else if (std.mem.eql(u8, a, "--root")) {
+            root = try flagValue(io, args_it, "--root");
+        } else if (std.mem.eql(u8, a, "--clear")) {
+            clear = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube pod hostname: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else {
+            name_arg = a;
+        }
+    }
+
+    // Project + app name from qubepod.jsonc.
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const manifest_path = try std.fs.path.join(gpa, &.{ cwd_path, "qubepod.jsonc" });
+    defer gpa.free(manifest_path);
+    if (!fileExists(io, manifest_path)) {
+        try writeStderr(io, "qube pod hostname: no qubepod.jsonc in this directory\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
+    defer gpa.free(raw);
+    const project = extractStringField(raw, "\"project\"") orelse {
+        try writeStderr(io, "qube pod hostname: manifest has no \"project\"\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const app_name = extractStringField(raw, "\"name\"") orelse {
+        try writeStderr(io, "qube pod hostname: manifest has no \"name\"\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+
+    // Token: --token > QUBEPODS_TOKEN > saved login.
+    var saved_token: ?[]u8 = null;
+    defer if (saved_token) |t| gpa.free(t);
+    const token: []const u8 = token_flag orelse env.get("QUBEPODS_TOKEN") orelse blk: {
+        const t = readPodToken(gpa, io, env) catch {
+            try writeStderr(io, "qube pod hostname: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
+            std.process.exit(@intFromEnum(ExitCode.registry));
+        };
+        saved_token = t;
+        break :blk t;
+    };
+
+    const base = try std.fmt.allocPrint(gpa, "{s}/me/projects/{s}/apps/{s}/hostname", .{ api_url, project, app_name });
+    defer gpa.free(base);
+    const auth = try std.fmt.allocPrint(gpa, "authorization: Bearer {s}", .{token});
+    defer gpa.free(auth);
+
+    // GET (show), PUT (set), or DELETE (clear).
+    var cap: Captured = undefined;
+    if (clear) {
+        const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", "-X", "DELETE", base, "-H", auth };
+        cap = try runCapture(gpa, io, &argv);
+    } else if (name_arg) |nm| {
+        const body_json = try std.fmt.allocPrint(gpa, "{{\"name\":\"{s}\",\"root\":\"{s}\"}}", .{ nm, root });
+        defer gpa.free(body_json);
+        const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", "-X", "PUT", base, "-H", auth, "-H", "content-type: application/json", "-d", body_json };
+        cap = try runCapture(gpa, io, &argv);
+    } else {
+        const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", base, "-H", auth };
+        cap = try runCapture(gpa, io, &argv);
+    }
+    defer gpa.free(cap.stdout);
+
+    const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse cap.stdout.len;
+    const resp_body = cap.stdout[0..nl];
+    const status = if (nl < cap.stdout.len)
+        std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout[nl + 1 ..], " \r\n"), 10) catch 0
+    else
+        0;
+
+    if (status >= 200 and status < 300) {
+        if (extractStringField(resp_body, "\"hostnameUrl\"")) |u| {
+            try printStdout(io, "{s}\n", .{u});
+        } else if (clear) {
+            try printStdout(io, "hostname released.\n", .{});
+        } else {
+            try printStdout(io, "{s}\n", .{resp_body});
+        }
+        if (extractStringField(resp_body, "\"warning\"")) |w| {
+            try printStderr(io, "warning: {s}\n", .{w});
+        }
+        return;
+    }
+    try printStderr(io, "qube pod hostname: api returned {d}:\n{s}\n", .{ status, resp_body });
     std.process.exit(@intFromEnum(ExitCode.registry));
 }
 
