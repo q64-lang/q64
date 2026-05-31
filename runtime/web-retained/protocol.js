@@ -4,9 +4,9 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.5';
+export const PROTOCOL_VERSION = '1.6';
 
-// Node kinds (spec §"Node kinds"). 13 = text_input is RESERVED (deferred).
+// Node kinds (spec §"Node kinds").
 export const KIND = {
   box: 0, row: 1, column: 2, stack: 3, label: 4, image: 5, button: 6,
   checkbox: 7, switch: 8, radio: 9, slider: 10, progress: 11, dropdown: 12,
@@ -14,7 +14,7 @@ export const KIND = {
   group: 14,     // titled container: a panel + heading that holds sub-widgets
   meter: 15,     // level/VU meter (mono or stereo) — value=level, used for peak meters
   knob: 16,      // rotary control (pan, volume) — value on min..max, dragged to rotate
-  // text_input: 17,  // reserved — focus/blur/key follow-up
+  text_input: 17, // single-line / multi-line text field (host-owned editable value)
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 
@@ -48,11 +48,20 @@ export const ALIGN = {
   start: 0, center: 1, end: 2, stretch: 3,
 };
 
-// Events (spec §"Events"). 4..6 reserved for text_input.
+// Events (spec §"Events"). text_input uses input (per keystroke), change (on
+// commit/blur), focus, blur.
 export const EVENT = {
   press: 0, change: 1, input: 2, drag: 3, key: 4, focus: 5, blur: 6,
 };
 export const EVENT_NAME = Object.fromEntries(Object.entries(EVENT).map(([k, v]) => [v, k]));
+
+// Text-channel keys for the `set_text` op (a STRING crosses the wasm boundary as
+// (ptr, len) into linear memory — distinct from the integer `set_attr`). A node
+// carries a small set of named strings; the host reads UTF-8 from wasm memory.
+//   value:       the field's text (app sets initial/validated text; host owns edits)
+//   placeholder: dimmed prompt shown when value is empty
+export const TEXTKEY = { value: 0, placeholder: 1 };
+export const TEXTKEY_NAME = Object.fromEntries(Object.entries(TEXTKEY).map(([k, v]) => [v, k]));
 
 // A packed-color i64 (0x00AARRGGBB) -> normalized [r,g,b,a] for WebGPU.
 export function unpackColor(v) {

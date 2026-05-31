@@ -246,6 +246,31 @@ fn main {
   qview.set_attr(420, 17, level)
   qview.on(420, 0, 420)
 
+  // ---- Text input: a field q64 validates LIVE via the string ABI. The
+  //      placeholder is shipped as a STRING arg (qview.set_text — app->host);
+  //      the handler reads the typed text as a `str` param and uses text.len +
+  //      text.contains("@") with an if/else (host->app + string ops). ----
+  qview.create(209, 13, 100)        // divider
+  qview.set_attr(209, 2, 348)
+  qview.set_attr(209, 3, 1)
+  qview.create(210, 4, 100)         // section label "Text input"
+  qview.set_attr(210, 9, 1026)
+  qview.create(200, 17, 100)        // the text field (kind 17)
+  qview.set_attr(200, 2, 340)
+  qview.set_attr(200, 3, 44)
+  qview.set_text(200, 1, "type your name")   // placeholder (TEXTKEY.placeholder = 1)
+  qview.on(200, 2, 200)             // EVENT.input (2) -> on_200
+  // Status row (HStack 220): "<len> chars   <has @ | no @ yet>".
+  qview.create(220, 1, 100)
+  qview.set_attr(220, 19, 8)
+  qview.set_attr(220, 21, 1)
+  qview.create(201, 4, 220)         // live byte length (renders the integer)
+  qview.set_attr(201, 9, 0)
+  qview.create(211, 4, 220)         // "chars"
+  qview.set_attr(211, 9, 1028)
+  qview.create(202, 4, 220)         // validation status
+  qview.set_attr(202, 9, 1030)      // "no @ yet" initially
+
   qview.present()
 }
 // One branchless handler per control (the on_<id> dispatch shape).
@@ -352,5 +377,17 @@ pub fn on_420(node: i64, event: i64, value: i64) {
   qview.set_attr(332, 23, level * (100 + pan) / 100)
   qview.set_attr(332, 24, level * (100 - pan) / 100)
   qview.set_attr(332, 25, level * (100 + pan) / 100)
+  qview.present()
+}
+// Text field: the host passes the typed text as a `str` param. Show its byte
+// length (label 201 renders the integer) and a contains-based validity hint
+// (label 202). Exercises rungs 2/3/6 + handler control flow end to end.
+pub fn on_200(node: i64, event: i64, text: str) {
+  qview.set_attr(201, 9, text.len)
+  if text.contains("@") {
+    qview.set_attr(202, 9, 1029)
+  } else {
+    qview.set_attr(202, 9, 1030)
+  }
   qview.present()
 }
