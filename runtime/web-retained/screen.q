@@ -22,6 +22,9 @@ state taps      = 0
 state platform  = 1012 // dropdown: catalog id of the selected option (12 = iOS)
 state grouped   = 1    // the checkbox inside the group widget
 state picked    = 1020 // long-click menu: last picked item (20 = Copy)
+state stackVal  = 60   // the vertical slider in the stacks section
+state sChecked  = 1    // stacks-section checkbox
+state sToggled  = 0    // stacks-section switch
 
 fn main {
   // Layout grid: a control column at x=24 and a name-label column at x=150,
@@ -32,7 +35,7 @@ fn main {
   qview.set_attr(2, 0, 16)
   qview.set_attr(2, 1, 72)
   qview.set_attr(2, 2, 380)
-  qview.set_attr(2, 3, 664)
+  qview.set_attr(2, 3, 860)
   qview.set_attr(2, 4, 18)
   qview.set_attr(2, 5, 1)
 
@@ -200,6 +203,39 @@ fn main {
   qview.set_attr(9, 13, 1020)
   qview.on(9, 1, 9)
 
+  // Layout (stacks) section: an HStack (row, node 300) at (40, 748) auto-arranges
+  // its children — NO x/y on them, the stack positions them. gap 28, align start.
+  // Left: a VStack (column 310) of a label + checkbox + switch. Right: a label
+  // over a VERTICAL slider (320). Demonstrates HStack/VStack + vertical slider.
+  qview.create(300, 1, 0)
+  qview.set_attr(300, 0, 40)
+  qview.set_attr(300, 1, 748)
+  qview.set_attr(300, 19, 28)
+  // left VStack (column 310), gap 14
+  qview.create(310, 2, 300)
+  qview.set_attr(310, 19, 14)
+  qview.create(311, 4, 310)
+  qview.set_attr(311, 9, 1016)
+  qview.create(312, 7, 310)
+  qview.set_attr(312, 12, sChecked)
+  qview.on(312, 0, 312)
+  qview.create(313, 8, 310)
+  qview.set_attr(313, 12, sToggled)
+  qview.on(313, 0, 313)
+  // right VStack (column 320), centered, label over a vertical slider (322)
+  qview.create(320, 2, 300)
+  qview.set_attr(320, 19, 10)
+  qview.set_attr(320, 21, 1)
+  qview.create(321, 4, 320)
+  qview.set_attr(321, 9, 1007)
+  qview.create(322, 10, 320)
+  qview.set_attr(322, 2, 28)
+  qview.set_attr(322, 3, 150)
+  qview.set_attr(322, 15, 0)
+  qview.set_attr(322, 16, 100)
+  qview.set_attr(322, 17, stackVal)
+  qview.on(322, 0, 322)
+
   // Translucent material top bar (90), created LAST so it overlays nothing but
   // the panel's top edge — showing the platform material. surface=3 materialThin.
   qview.create(90, 0, 0)
@@ -275,5 +311,20 @@ pub fn on_8(node: i64, event: i64) {
 pub fn on_9(node: i64, event: i64, value: i64) {
   picked = value
   qview.set_attr(9, 13, picked)
+  qview.present()
+}
+pub fn on_312(node: i64, event: i64) {
+  sChecked = 1 - sChecked
+  qview.set_attr(312, 12, sChecked)
+  qview.present()
+}
+pub fn on_313(node: i64, event: i64) {
+  sToggled = 1 - sToggled
+  qview.set_attr(313, 12, sToggled)
+  qview.present()
+}
+pub fn on_322(node: i64, event: i64, value: i64) {
+  stackVal = value
+  qview.set_attr(322, 17, stackVal)
   qview.present()
 }
