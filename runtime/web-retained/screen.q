@@ -53,16 +53,24 @@ fn main {
   qview.set_attr(80, 9, 12)
   qview.on(80, 0, 80)
 
-  // Label row (10 control, 11 name)
+  // Thin divider (5) under the dropdown — separates the platform selector from
+  // the widget list. kind divider=13; h = thickness (1px).
+  qview.create(5, 13, 0)
+  qview.set_attr(5, 0, 40)
+  qview.set_attr(5, 1, 144)
+  qview.set_attr(5, 2, 336)
+  qview.set_attr(5, 3, 1)
+
+  // Label demo (10) — the "Label" widget, just below the divider.
   qview.create(10, 4, 0)
   qview.set_attr(10, 0, 40)
-  qview.set_attr(10, 1, 150)
+  qview.set_attr(10, 1, 168)
   qview.set_attr(10, 9, 1)
 
   // Button (20) -> handler 20, name (21 taps count to its right)
   qview.create(20, 6, 0)
   qview.set_attr(20, 0, 40)
-  qview.set_attr(20, 1, 132)
+  qview.set_attr(20, 1, 196)
   qview.set_attr(20, 2, 150)
   qview.set_attr(20, 3, 48)
   qview.set_attr(20, 4, 12)
@@ -70,29 +78,29 @@ fn main {
   qview.on(20, 0, 20)
   qview.create(21, 4, 0)
   qview.set_attr(21, 0, 210)
-  qview.set_attr(21, 1, 146)
+  qview.set_attr(21, 1, 210)
   qview.set_attr(21, 9, taps)
 
   // Checkbox (30) -> handler 30, name (31)
   qview.create(30, 7, 0)
   qview.set_attr(30, 0, 40)
-  qview.set_attr(30, 1, 200)
+  qview.set_attr(30, 1, 252)
   qview.on(30, 0, 30)
   qview.set_attr(30, 12, checked)
   qview.create(31, 4, 0)
   qview.set_attr(31, 0, 80)
-  qview.set_attr(31, 1, 202)
+  qview.set_attr(31, 1, 254)
   qview.set_attr(31, 9, 3)
 
   // Switch (40) -> handler 40, name (41)
   qview.create(40, 8, 0)
   qview.set_attr(40, 0, 40)
-  qview.set_attr(40, 1, 248)
+  qview.set_attr(40, 1, 304)
   qview.on(40, 0, 40)
   qview.set_attr(40, 12, toggled)
   qview.create(41, 4, 0)
   qview.set_attr(41, 0, 108)
-  qview.set_attr(41, 1, 250)
+  qview.set_attr(41, 1, 306)
   qview.set_attr(41, 9, 4)
 
   // Radio A (50) -> 50, name (51); Radio B (52) -> 52, name (53). group 1.
@@ -101,7 +109,7 @@ fn main {
   // within the same row so tapping anywhere on "Radio A" selects it.
   qview.create(50, 9, 0)
   qview.set_attr(50, 0, 32)
-  qview.set_attr(50, 1, 290)
+  qview.set_attr(50, 1, 356)
   qview.set_attr(50, 2, 172)
   qview.set_attr(50, 3, 56)
   qview.set_attr(50, 14, 1)
@@ -109,11 +117,11 @@ fn main {
   qview.on(50, 0, 50)
   qview.create(51, 4, 0)
   qview.set_attr(51, 0, 72)
-  qview.set_attr(51, 1, 308)
+  qview.set_attr(51, 1, 374)
   qview.set_attr(51, 9, 5)
   qview.create(52, 9, 0)
   qview.set_attr(52, 0, 208)
-  qview.set_attr(52, 1, 290)
+  qview.set_attr(52, 1, 356)
   qview.set_attr(52, 2, 172)
   qview.set_attr(52, 3, 56)
   qview.set_attr(52, 14, 1)
@@ -121,17 +129,17 @@ fn main {
   qview.on(52, 0, 52)
   qview.create(53, 4, 0)
   qview.set_attr(53, 0, 248)
-  qview.set_attr(53, 1, 308)
+  qview.set_attr(53, 1, 374)
   qview.set_attr(53, 9, 6)
 
   // Slider row: name (61) above the control (60).
   qview.create(61, 4, 0)
   qview.set_attr(61, 0, 40)
-  qview.set_attr(61, 1, 348)
+  qview.set_attr(61, 1, 408)
   qview.set_attr(61, 9, 7)
   qview.create(60, 10, 0)
   qview.set_attr(60, 0, 40)
-  qview.set_attr(60, 1, 374)
+  qview.set_attr(60, 1, 434)
   qview.set_attr(60, 2, 320)
   qview.set_attr(60, 15, 0)
   qview.set_attr(60, 16, 100)
@@ -141,17 +149,35 @@ fn main {
   // Progress row: name (71) above the control (70).
   qview.create(71, 4, 0)
   qview.set_attr(71, 0, 40)
-  qview.set_attr(71, 1, 424)
+  qview.set_attr(71, 1, 486)
   qview.set_attr(71, 9, 8)
   qview.create(70, 11, 0)
   qview.set_attr(70, 0, 40)
-  qview.set_attr(70, 1, 450)
+  qview.set_attr(70, 1, 512)
   qview.set_attr(70, 2, 320)
   qview.set_attr(70, 15, 0)
   qview.set_attr(70, 16, 100)
   qview.set_attr(70, 17, sliderVal)
 
-  // (The platform dropdown is at the top — see node 80 above.)
+  // Group widget (6): a titled panel holding sub-widgets. kind group=14;
+  // text_id 16 = "Grouped". Its children (a label + a checkbox) are positioned
+  // inside it and drawn on top by the tree walk — any widget can be grouped.
+  qview.create(6, 14, 0)
+  qview.set_attr(6, 0, 40)
+  qview.set_attr(6, 1, 552)
+  qview.set_attr(6, 2, 320)
+  qview.set_attr(6, 3, 96)
+  qview.set_attr(6, 9, 16)
+  // sub-label (7) inside the group
+  qview.create(7, 4, 6)
+  qview.set_attr(7, 0, 56)
+  qview.set_attr(7, 1, 600)
+  qview.set_attr(7, 9, 17)
+  // sub-checkbox (8) inside the group
+  qview.create(8, 7, 6)
+  qview.set_attr(8, 0, 280)
+  qview.set_attr(8, 1, 596)
+  qview.set_attr(8, 12, 1)
 
   // Translucent material top bar (90), created LAST so it overlays nothing but
   // the panel's top edge — showing the platform material. surface=3 materialThin.

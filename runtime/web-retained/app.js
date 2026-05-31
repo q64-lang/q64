@@ -48,6 +48,8 @@ const CATALOG = [
   'Android',         // 13
   'Windows',         // 14
   'Linux',           // 15
+  'Grouped',         // 16  group heading
+  'In a group',      // 17  group sub-label
 ];
 
 // ---- the retained tree -------------------------------------------------------
