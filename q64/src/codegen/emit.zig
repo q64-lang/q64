@@ -864,6 +864,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
             break :blk false;
         },
         .global_set => |gs| bodyHasOut(gs.value, want_int),
+        .str_len => |s| bodyHasOut(s, want_int),
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -963,6 +964,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         .loop => |body| scanScratch(body, s),
         .host_call => |hc| for (hc.args) |a| scanScratch(a, s),
         .global_set => |gs| scanScratch(gs.value, s),
+        .str_len => |inner| scanScratch(inner, s),
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
@@ -1132,6 +1134,12 @@ const Lowerer = struct {
                 // value; the caller consumes it just like any str-typed inst.
                 var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(inner)};
                 return c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
+            },
+            .str_len => |s| {
+                // The str value's (ptr, len) pair; take element 1 (len). q64 ints
+                // are i64, so zero-extend the address-width len on wasm32.
+                const len = c.BinaryenTupleExtract(module, try self.inst(s), 1);
+                return if (self.ptr_type == self.i64_type) len else c.BinaryenUnary(module, c.BinaryenExtendUInt32(), len);
             },
             .if_ => |iff| {
                 const cond = try self.inst(iff.cond);

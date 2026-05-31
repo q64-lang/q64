@@ -171,6 +171,9 @@ pub const Op = union(enum) {
     /// yields its `(ptr, len)`. Used as a piece inside `str_concat` when an
     /// i64 binding (or any i64 expression) appears in interpolation.
     fmt_int_to_str: *Inst,
+    /// The byte length of a `str` value as i64 (`s.len`). `value` is a str-typed
+    /// inst; the backend reads its len component and zero-extends to i64.
+    str_len: *Inst,
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the

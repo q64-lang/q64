@@ -347,6 +347,9 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             // i32 for a `-> bool`), so it validates against the callee sig.
             return mk(ctx.a, mapType(ctx.funcs[cl.func].ret), .{ .call = .{ .func = cl.func, .args = args } });
         },
+        // `s.len` — lower the str operand to its (ptr, len) value; the backend
+        // reads the len component and zero-extends it to i64.
+        .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
         .str_const, .concat, .str_binding, .fmt_int => unreachable, // str values never reach the i64 path
     }
 }
