@@ -717,13 +717,14 @@ async function main() {
     const w = hit && widgetFor(hit.kind);
 
     // Tapping a text field focuses it (summons the soft keyboard); tapping
-    // anything else blurs the current field (dismisses it) before proceeding.
+    // anything else MAY dismiss it — but only on a real tap, decided at
+    // pointerup (see endDrag). Do NOT blur here: a scroll gesture starts with a
+    // pointerdown on empty space, and scrolling must keep the keyboard open.
     if (hit && hit.kind === KIND.text_input) {
       ev.preventDefault();
       focusField(hit);
       return;
     }
-    if (focusedId !== null) blurField();
 
     // No interactive target under the finger -> arm a SCROLL drag (when content
     // overflows the viewport). A vertical drag on empty space / a label scrolls.
@@ -807,7 +808,11 @@ async function main() {
     if (scrollDrag) {
       try { canvas.releasePointerCapture(ev.pointerId); } catch {}
       const v = scrollDrag.vel || 0;
+      const moved = scrollDrag.moved;
       scrollDrag = null;
+      // A tap on empty space (no movement) dismisses the keyboard; a scroll
+      // (moved) keeps it open. So tap-to-dismiss works, scrolling doesn't close.
+      if (!moved && focusedId !== null) { blurField(); return; }
       // Flick -> glide (momentum also springs back if it hits an edge); otherwise
       // if we were left overscrolled, spring back to the boundary.
       if (Math.abs(v) > 1) startMomentum(v);
