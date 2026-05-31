@@ -170,8 +170,16 @@ function hitTest(px, py) {
 }
 
 function dispatch(node, event, payload = 0) {
-  const handler = node.handlers.get(event);
-  if (handler === undefined) return;
+  // Find the handler for this event; if the node has no handler for this exact
+  // event (e.g. a slider wired to `press` but we're sending `input` during a
+  // drag), fall back to its single registered handler. A Stage-1 control wires
+  // exactly one handler, so this routes drag/input to it without the producer
+  // having to wire every event id.
+  let handler = node.handlers.get(event);
+  if (handler === undefined) {
+    if (node.handlers.size === 1) handler = node.handlers.values().next().value;
+    else return;
+  }
   // Stage-1 dispatch (spec/qview-protocol.md §Events). The wasm handler reads
   // state, mutates the exact node(s), and calls present(). Two shapes, in order:
   //   1. per-handler export `on_<id>` (the handler id from qview.on) — branchless,
