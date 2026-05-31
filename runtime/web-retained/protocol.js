@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.3';
+export const PROTOCOL_VERSION = '1.4';
 
 // Node kinds (spec §"Node kinds"). 13 = text_input is RESERVED (deferred).
 export const KIND = {
@@ -12,7 +12,8 @@ export const KIND = {
   checkbox: 7, switch: 8, radio: 9, slider: 10, progress: 11, dropdown: 12,
   divider: 13,   // thin separator line (hairline rule)
   group: 14,     // titled container: a panel + heading that holds sub-widgets
-  // text_input: 15,  // reserved — focus/blur/key follow-up
+  meter: 15,     // level/VU meter (mono or stereo) — value=level, used for peak meters
+  // text_input: 16,  // reserved — focus/blur/key follow-up
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 
@@ -28,6 +29,10 @@ export const ATTR = {
   // align (21): cross-axis alignment of a stack's children (a row aligns on y, a
   // column on x). Values = ALIGN. pad (22): inner padding of a stack/group.
   align: 21, pad: 22,
+  // value2 (23): a second channel value (a stereo meter's right level; left is
+  // ATTR.value). peak (24): peak-hold level for the left channel; peak2 (25) the
+  // right. All on the min..max scale.
+  value2: 23, peak: 24, peak2: 25,
 };
 export const ATTR_NAME = Object.fromEntries(Object.entries(ATTR).map(([k, v]) => [v, k]));
 
