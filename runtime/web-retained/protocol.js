@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.6';
+export const PROTOCOL_VERSION = '1.7';
 
 // Node kinds (spec §"Node kinds").
 export const KIND = {
@@ -14,7 +14,8 @@ export const KIND = {
   group: 14,     // titled container: a panel + heading that holds sub-widgets
   meter: 15,     // level/VU meter (mono or stereo) — value=level, used for peak meters
   knob: 16,      // rotary control (pan, volume) — value on min..max, dragged to rotate
-  text_input: 17, // single-line / multi-line text field (host-owned editable value)
+  text_input: 17, // single-line text field (host-owned editable value)
+  text_area: 18,  // multi-line text field (wraps; Enter inserts a newline)
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 
