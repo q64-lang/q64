@@ -437,37 +437,24 @@ fn buildScreenFuncs(b: *Builder, sf: ast.SourceFile) BuildError!void {
 /// to `b.funcs`, exported when public.
 fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
     var scope = Scope{ .a = b.a };
-    // Runtime str bindings for `str` PARAMS (a handler's `text: str`). A str
-    // param occupies two wasm slots (ptr, len); we resolve references to it as a
-    // `str_binding` at those exact slot offsets via this map — NOT through
-    // `scope` (which would route to the `str_param idx*2` ABI that assumes every
-    // param is a str). i64/bool params stay in `scope`.
-    var rt: RtMap = .empty;
     var params: std.ArrayList(hir.Param) = .empty;
-    // Count of params that live in `scope` (i64/bool). A str param is not a
-    // scope local, so `scope.locals` stays 1:1 with single-slot bindings and the
-    // body-locals slice below can be sliced off it directly.
-    var n_scope_params: u32 = 0;
+    // A str param occupies TWO wasm slots (ptr, len). It lives in `scope` with
+    // its idx = the ptr slot; references resolve to a str_binding {idx, idx+1}
+    // (see buildStrExpr). We bump next_idx by one extra so the following param /
+    // body local lands at the right wasm local index. n_params counts every
+    // param (str included) since each is one `scope` entry; only the wasm SLOT
+    // count diverges, which next_idx tracks.
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
             const pn = (p.name() orelse return error.Unsupported).text;
-            if (try paramIsStr(b.a, p)) {
-                // Two wasm slots at the current offset: ptr then len. Advance
-                // next_idx past both so a following i64 param / body local lands
-                // at the correct wasm local index.
-                const ptr_idx = scope.next_idx;
-                try rt.put(b.a, pn, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
-                scope.next_idx += 2;
-                try params.append(b.a, .{ .name = pn, .ty = .str });
-            } else {
-                const pty: hir.Type = if (try paramIsBool(b.a, p)) .bool else if (try paramIsI64(b.a, p)) .i64 else return error.Unsupported;
-                _ = try scope.declare(pn, false, pty);
-                n_scope_params += 1;
-                try params.append(b.a, .{ .name = pn, .ty = pty });
-            }
+            const pty: hir.Type = if (try paramIsStr(b.a, p)) .str else if (try paramIsBool(b.a, p)) .bool else if (try paramIsI64(b.a, p)) .i64 else return error.Unsupported;
+            _ = try scope.declare(pn, false, pty);
+            if (pty == .str) scope.next_idx += 1; // second slot (len)
+            try params.append(b.a, .{ .name = pn, .ty = pty });
         }
     }
+    const n_scope_params: u32 = @intCast(params.items.len);
     scope.n_params = n_scope_params;
 
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
@@ -479,8 +466,8 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
                 else => return error.Unsupported,
             };
             const fname = (try hostFaceName(b, call)) orelse return error.Unsupported;
-            // i64 params resolve via `scope`; a `str` param via `rt` (above).
-            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope, &rt));
+            // All params (i64/bool/str) resolve via `scope`; no RtMap needed.
+            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope, null));
         },
         .assign_stmt => |as| {
             const tgt = switch (as.target() orelse return error.Unsupported) {
@@ -509,10 +496,9 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
 
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
-    // Body locals = the scope entries past the (scope-resident) params. A str
-    // param isn't a scope entry, so this slice is correct even with str params;
-    // their two slots were accounted for in `next_idx` so body-local wasm
-    // indices already land past the params.
+    // Body locals = the scope entries past the params (each param, str included,
+    // is one scope entry). A str param's extra wasm slot was added to next_idx,
+    // so body-local wasm indices already land past the full params width.
     const n_body: usize = scope.locals.items.len - n_scope_params;
     const locals = try b.a.alloc(hir.Type, n_body);
     // The non-parameter locals, in index order, carry their declared types
@@ -685,7 +671,11 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             defer b.a.free(txt);
             if (scope.find(txt)) |loc| {
                 if (loc.ty != .str) return error.Unsupported; // an i64 local in a str position
-                out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                // A `str` local/param occupies two slots; `loc.idx` is the ptr
+                // slot and `loc.idx + 1` the len slot. Resolve to an explicit
+                // str_binding (not the str_param idx*2 ABI) so mixed i64/str
+                // params index their wasm locals correctly.
+                out.* = .{ .str_binding = .{ .ptr_idx = loc.idx, .len_idx = loc.idx + 1 } };
             } else if (rtBinding(rt, txt)) |bnd| {
                 out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
             } else return error.Unsupported;
@@ -731,7 +721,8 @@ fn buildStrArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) Bui
             defer b.a.free(txt);
             if (scope.find(txt)) |loc| {
                 if (loc.ty != .str) return error.Unsupported; // an i64 local in a str arg slot
-                out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                // ptr slot at loc.idx, len at loc.idx + 1 (see buildStrExpr).
+                out.* = .{ .str_binding = .{ .ptr_idx = loc.idx, .len_idx = loc.idx + 1 } };
             } else if (rtBinding(rt, txt)) |bnd| {
                 out.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
             } else return error.Unsupported;
@@ -1137,6 +1128,21 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
         .path => |p| {
             const txt = try p.text(b.a);
             defer b.a.free(txt);
+            // `s.len` parses as the dotted path "s.len" (like `qview.set_attr`),
+            // not a FieldExpr. If the prefix names a `str` local, it's the i64
+            // byte-length read. (`loc.idx` is the ptr slot, `+1` the len slot.)
+            if (std.mem.lastIndexOfScalar(u8, txt, '.')) |dot| {
+                if (std.mem.eql(u8, txt[dot + 1 ..], "len")) {
+                    if (scope.find(txt[0..dot])) |loc| {
+                        if (loc.ty == .str) {
+                            const sval = try b.a.create(hir.Expr);
+                            sval.* = .{ .str_binding = .{ .ptr_idx = loc.idx, .len_idx = loc.idx + 1 } };
+                            out.* = .{ .str_len = sval };
+                            return out;
+                        }
+                    }
+                }
+            }
             if (scope.find(txt)) |loc| {
                 // i64 and bool (i32 0/1) locals are readable here; a `str`
                 // local belongs in the str path, not an i64/bool expression.
@@ -1200,6 +1206,18 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             }
             if (args.items.len != np) return reject(b, .unsupported_call);
             out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
+        },
+        .field => |fe| {
+            // `s.len` — the byte length of a str value, as i64. (The only field
+            // access supported today; structs aren't represented in this path.)
+            const fld = (fe.field() orelse return error.Unsupported).text;
+            if (!std.mem.eql(u8, fld, "len")) return error.Unsupported;
+            const base = fe.base() orelse return error.Unsupported;
+            const sval = buildStrExpr(b, base, scope, null) catch |e| switch (e) {
+                error.Unsupported => return error.Unsupported, // `.len` on a non-str
+                else => return e,
+            };
+            out.* = .{ .str_len = sval };
         },
         else => return error.Unsupported,
     }
@@ -1501,7 +1519,9 @@ test "tryBuild: a str passthrough function + str-literal arg builds HIR" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn id -> str") != null);
-    try testing.expect(std.mem.indexOf(u8, dump, "local#0") != null); // passthrough param ref
+    // The passthrough param ref resolves to an explicit str_binding at its two
+    // wasm slots (ptr=0, len=1) — the uniform str-value form (no str_param idx*2).
+    try testing.expect(std.mem.indexOf(u8, dump, "str_binding[0,1]") != null);
 }
 
 test "tryBuild: interpolation with a call builds a concat" {

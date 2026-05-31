@@ -283,4 +283,8 @@ pub const Expr = union(enum) {
     /// as the value of an `env.out(<i64>)` would be — but `host_out_int` is the
     /// shorter path for the latter, so `fmt_int` only appears inside `concat`.
     fmt_int: *Expr,
+    /// The byte length of a `str` value as an i64 (`s.len`). The operand is a
+    /// str-valued expression; lowering reads its `(ptr, len)` len component and
+    /// zero-extends it to i64.
+    str_len: *Expr,
 };
