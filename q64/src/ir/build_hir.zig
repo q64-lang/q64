@@ -255,12 +255,13 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 .call => |cc| cc,
                 else => return error.Unsupported,
             };
-            // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`):
-            // all-i64 args, no return. The backend declares the matching import.
+            // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`
+            // or `qview.set_text(80, 9, "…")`): str args flow as (ptr, len), the
+            // rest as i64; no return. The backend declares the matching import.
             if (try hostFaceName(b, call)) |fname| {
                 var args: std.ArrayList(*hir.Expr) = .empty;
                 var ait = call.args();
-                while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
+                while (ait.next()) |a| try args.append(b.a, try buildHostArg(b, a, scope, rt));
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
                 try out.append(b.a, st);
@@ -457,7 +458,9 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
                 else => return error.Unsupported,
             };
             const fname = (try hostFaceName(b, call)) orelse return error.Unsupported;
-            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope));
+            // Screen-func params live in `scope` (a str param resolves there), so
+            // no RtMap is needed for str args here.
+            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope, null));
         },
         .assign_stmt => |as| {
             const tgt = switch (as.target() orelse return error.Unsupported) {
@@ -503,11 +506,26 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
     });
 }
 
-/// Build a `qview.*` host-call statement: all-i64 args via `buildIntExpr`.
-fn buildHostCall(b: *Builder, fname: []const u8, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+/// Build one host-call argument. Prefer the `str` path — a string literal, a
+/// `str` local, or a runtime `str` binding (a handler's `text: str` param) — so
+/// `qview.set_text(node, attr, "…")` flows as a (ptr, len) pair. Fall back to
+/// the i64 path for everything else (numbers, i64 locals/globals).
+fn buildHostArg(b: *Builder, arg: ast.Expr, scope: *Scope, rt: ?*const RtMap) BuildError!*hir.Expr {
+    if (buildStrExpr(b, arg, scope, rt)) |e| {
+        return e;
+    } else |err| switch (err) {
+        error.Unsupported => {}, // not a str — try the i64 path
+        else => return err,
+    }
+    return buildIntExpr(b, arg, scope);
+}
+
+/// Build a `qview.*` host-call statement: str args via the str path, the rest
+/// as i64 (see `buildHostArg`).
+fn buildHostCall(b: *Builder, fname: []const u8, call: ast.CallExpr, scope: *Scope, rt: ?*const RtMap) BuildError!*hir.Stmt {
     var args: std.ArrayList(*hir.Expr) = .empty;
     var ait = call.args();
-    while (ait.next()) |a| try args.append(b.a, try buildIntExpr(b, a, scope));
+    while (ait.next()) |a| try args.append(b.a, try buildHostArg(b, a, scope, rt));
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
     return st;

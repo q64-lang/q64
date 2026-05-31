@@ -119,8 +119,11 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             } });
         },
         .host_call => |hc| {
+            // A `str`-valued argument lowers to a (ptr, len) str inst; any other
+            // is an i64. The backend reads each arg's `.ty` to push 2 or 1 wasm
+            // operands (and to declare the matching import param types).
             const args = try ctx.a.alloc(*mir.Inst, hc.args.len);
-            for (hc.args, 0..) |a, i| args[i] = try lowerExpr(ctx, a);
+            for (hc.args, 0..) |a, i| args[i] = if (isStrExpr(a)) try lowerStrExpr(ctx, a) else try lowerExpr(ctx, a);
             return mk(ctx.a, .void, .{ .host_call = .{ .name = hc.name, .args = args } });
         },
         .global_set => |gs| return mk(ctx.a, .void, .{ .global_set = .{ .idx = gs.idx, .value = try lowerExpr(ctx, gs.value) } }),
@@ -182,6 +185,18 @@ fn singleTail(body: *const hir.Stmt) ?*hir.Expr {
     return switch (items[0].*) {
         .expr => |e| e,
         else => null,
+    };
+}
+
+/// Does this HIR expression yield a `str` value? Used to route host-call
+/// arguments to the str path (a (ptr, len) pair) vs the i64 path. A bare
+/// `local` is str only when its binding type is `str`; `fmt_int` is the str of
+/// an i64 (only appears inside concat today, but classify it as str for safety).
+fn isStrExpr(e: *const hir.Expr) bool {
+    return switch (e.*) {
+        .str_const, .concat, .str_binding, .fmt_int => true,
+        .local => |l| l.ty == .str,
+        else => false,
     };
 }
 

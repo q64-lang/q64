@@ -672,26 +672,37 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     const na = name_arena.allocator();
     var host_imports = std.StringHashMapUnmanaged([*:0]const u8){};
     {
-        var arity = std.StringHashMapUnmanaged(usize){};
+        var sigs = std.StringHashMapUnmanaged([]const *ir.mir.Inst){};
         for (m.funcs) |f| {
             const inst = switch (f.body) {
                 .structured => |x| x,
                 .cfg => return Error.CfgUnsupported,
             };
-            try scanHostCalls(inst, &arity, na);
+            try scanHostCalls(inst, &sigs, na);
         }
-        var it = arity.iterator();
+        var it = sigs.iterator();
         while (it.next()) |e| {
             const dotted = e.key_ptr.*;
-            const n = e.value_ptr.*;
+            const cargs = e.value_ptr.*;
             const dot = std.mem.indexOfScalar(u8, dotted, '.') orelse return Error.UnsupportedCall;
             const mod_z = try na.dupeZ(u8, dotted[0..dot]);
             const field_z = try na.dupeZ(u8, dotted[dot + 1 ..]);
             const internal = try std.fmt.allocPrint(na, "{s}_{s}", .{ dotted[0..dot], dotted[dot + 1 ..] });
             const internal_z = try na.dupeZ(u8, internal);
-            const params = try na.alloc(c.BinaryenType, n);
-            for (params) |*p| p.* = i64_type;
-            const ptype = if (n > 0) c.BinaryenTypeCreate(params.ptr, @intCast(n)) else none_type;
+            // Per-arg param types: a `str` arg lowers to two address-width values
+            // (ptr, len); any other arg is one i64. Must match the call-site
+            // operands (see the `.host_call` lowering / `strOperands`).
+            var ptypes: std.ArrayList(c.BinaryenType) = .empty;
+            defer ptypes.deinit(na);
+            for (cargs) |arg| {
+                if (arg.ty == .str) {
+                    try ptypes.append(na, ptr_type);
+                    try ptypes.append(na, ptr_type);
+                } else {
+                    try ptypes.append(na, i64_type);
+                }
+            }
+            const ptype = if (ptypes.items.len > 0) c.BinaryenTypeCreate(ptypes.items.ptr, @intCast(ptypes.items.len)) else none_type;
             c.BinaryenAddFunctionImport(module, internal_z.ptr, mod_z.ptr, field_z.ptr, ptype, none_type);
             try host_imports.put(na, dotted, internal_z.ptr);
         }
@@ -959,7 +970,11 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
 /// Collect distinct host-face call names (e.g. `qview.text`) and their arity, so
 /// `lowerToWasm` can declare one wasm import per face. Host calls appear only at
 /// statement positions; their i64 args never contain another host call.
-fn scanHostCalls(inst: *const ir.mir.Inst, out: *std.StringHashMapUnmanaged(usize), a: std.mem.Allocator) Error!void {
+// Collect each distinct host-import name → a representative argument list, so
+// the import can be declared with the right per-arg wasm types (a `str` arg is
+// two address-width params; any other is one i64). Call sites of the same
+// import are assumed to share a signature (the last seen wins).
+fn scanHostCalls(inst: *const ir.mir.Inst, out: *std.StringHashMapUnmanaged([]const *ir.mir.Inst), a: std.mem.Allocator) Error!void {
     switch (inst.op) {
         .block => |items| for (items) |ch| try scanHostCalls(ch, out, a),
         .if_ => |iff| {
@@ -968,7 +983,7 @@ fn scanHostCalls(inst: *const ir.mir.Inst, out: *std.StringHashMapUnmanaged(usiz
         },
         .while_ => |w| try scanHostCalls(w.body, out, a),
         .loop => |body| try scanHostCalls(body, out, a),
-        .host_call => |hc| try out.put(a, hc.name, hc.args.len),
+        .host_call => |hc| try out.put(a, hc.name, hc.args),
         else => {},
     }
 }
@@ -1096,9 +1111,17 @@ const Lowerer = struct {
             },
             .host_out_str => |hs| return self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)),
             .host_call => |hc| {
+                // A `str` argument expands to two operands (ptr, len), exactly
+                // like a regular `.call`; any other arg is one i64 value.
                 var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
                 defer operands.deinit(self.allocator);
-                for (hc.args) |a| try operands.append(self.allocator, try self.inst(a));
+                for (hc.args) |a| {
+                    if (a.ty == .str) {
+                        try self.strOperands(a, &operands);
+                    } else {
+                        try operands.append(self.allocator, try self.inst(a));
+                    }
+                }
                 const name = self.host_imports.get(hc.name) orelse return Error.UnsupportedCall;
                 return c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type);
             },
