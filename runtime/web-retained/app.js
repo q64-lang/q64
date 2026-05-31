@@ -34,7 +34,11 @@ const OPTION_PLATFORM = { 1012: 'ios', 1013: 'android', 1014: 'desktop', 1015: '
 function setPlatform(p) {
   if (!p || p === PLATFORM) return;
   PLATFORM = p; THEME = themeFor(p);
-  renderCtx.theme = THEME; renderCtx.platform = PLATFORM;   // live-update the render context
+  // Live-update both contexts; theme can change control sizes (switch variant),
+  // so relayout then render.
+  renderCtx.theme = THEME; renderCtx.platform = PLATFORM;
+  layoutCtx.theme = THEME; layoutCtx.platform = PLATFORM;
+  layout();
   render();
 }
 
@@ -109,6 +113,8 @@ function glyphFor(node) {
 // may change a node's text, so we evict its glyph key around the applier.
 function ops() {
   const sceneFace = scene.face(() => {
+    // present() = the tree just changed -> relayout (Phase 1) then render (Phase 2).
+    layout();
     render();
     const m = scene.drainMuts();
     if (m.length) log('mutate: ' + m.join(', '));
@@ -165,6 +171,17 @@ const renderCtx = {
   isOpen: (id) => id === openDropdownId,
 };
 
+// The LAYOUT context: a PURE view for the layout pass. Its attr reads raw node
+// attrs (no layoutMap, no scroll) — layout is computing those rects, and must be
+// independent of scroll/render state (SwiftUI keeps layout pure). Shares text
+// measurement so a label/button can size to its glyph.
+const layoutCtx = {
+  theme: THEME, platform: PLATFORM,
+  attr: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : Number(v); },
+  textFor: (node) => glyphFor(node),
+  glyphForId: (textId) => glyphForCatalog(textId),
+};
+
 // The node currently showing a menu (one open at a time), or null. Any widget
 // exposing menuSpec(node, r) can raise the shared popup; today that's the
 // dropdown, tomorrow a context menu.
@@ -202,24 +219,32 @@ function glyphForCatalog(textId) {
   return idGlyphCache.get(str);
 }
 
+// ===========================================================================
+// Phase 1 — LAYOUT (one pure pass, SwiftUI-style). Geometry only: measure +
+// arrange the tree into resolved rects (layoutMap). No scroll, no GPU, no clip.
+// Recomputed only when the tree changes (layout()), NOT every frame. Also derives
+// the content height and the sticky-header band from the pure geometry.
+// ===========================================================================
+let headerH = 0;            // bottom of the pinned header band (layout space)
+function layout() {
+  layoutMap = computeLayout(scene, layoutCtx);
+  contentH = 0; headerH = 0;
+  for (const [id, rc] of layoutMap) {
+    contentH = Math.max(contentH, rc.y + rc.h);
+    const n = nodes.get(id);
+    if (n && n._pinned) headerH = Math.max(headerH, rc.y + rc.h);
+  }
+}
+
+// ===========================================================================
+// Phase 2 — RENDER PATH (consumes the resolved geometry). Applies scroll as a
+// draw-time translate, clips scrollable content below the sticky header, draws.
+// The GPU host and the soft renderer are two such paths over the same layout.
+// ===========================================================================
 function render() {
-  // Resolve geometry first: the arrange pass positions stack children (HStack/
-  // VStack); absolute nodes keep their own x/y. Widgets then read laid-out coords
-  // via r.attr transparently. (Recomputed each frame; dirty-tracking is a follow-up.)
-  layoutMap = computeLayout(scene, renderCtx);
-  // Content height = the lowest node bottom (absolute, pre-scroll); clamp scroll.
-  contentH = 0;
-  for (const rc of layoutMap.values()) contentH = Math.max(contentH, rc.y + rc.h);
   const cv = document.getElementById('gpu'); viewportH = cv ? cv.clientHeight : 0;
   const maxScroll = Math.max(0, contentH + 16 - viewportH);   // 16px bottom margin
   scrollY = Math.max(0, Math.min(scrollY, maxScroll));
-  // The sticky header band = the bottom of the pinned nodes (in screen space).
-  // Scrollable content is clipped to below it so scrolled text never bleeds over.
-  let headerH = 0;
-  for (const id of nodes.keys()) {
-    const n = nodes.get(id); if (!n || !n._pinned) continue;
-    const rc = layoutMap.get(id); if (rc) headerH = Math.max(headerH, rc.y + rc.h);
-  }
 
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
