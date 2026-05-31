@@ -205,5 +205,9 @@ export function sdfTexture(text, sizePx = 17) {
   }
   const tex = device.createTexture({ size: [w, h], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
   device.queue.writeTexture({ texture: tex }, bytes, { bytesPerRow: w }, [w, h]);
-  return { tex, view: tex.createView(), w: w / DPR, h: h / DPR };
+  // `pad` (CSS px) is the transparent SDF spread baked around the glyph ink on
+  // every side. Centered text ignores it (symmetric); left-aligned text + a
+  // caret must trim it so the ink starts at the box edge and the caret hugs the
+  // text. ink advance = w - 2*pad.
+  return { tex, view: tex.createView(), w: w / DPR, h: h / DPR, pad: spread / SS / DPR };
 }

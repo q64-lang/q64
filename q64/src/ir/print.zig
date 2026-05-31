@@ -174,6 +174,50 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, inner);
             try app(gpa, out, ")", .{});
         },
+        .str_len => |s| {
+            try app(gpa, out, "str_len(", .{});
+            try hirExpr(gpa, out, s);
+            try app(gpa, out, ")", .{});
+        },
+        .str_index => |si| {
+            try hirExpr(gpa, out, si.str);
+            try app(gpa, out, "[", .{});
+            try hirExpr(gpa, out, si.idx);
+            try app(gpa, out, "]", .{});
+        },
+        .str_eq => |se| {
+            try app(gpa, out, "str_eq(", .{});
+            try hirExpr(gpa, out, se.lhs);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, se.rhs);
+            try app(gpa, out, ")", .{});
+        },
+        .str_slice => |sl| {
+            try hirExpr(gpa, out, sl.str);
+            try app(gpa, out, ".slice(", .{});
+            try hirExpr(gpa, out, sl.start);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, sl.end);
+            try app(gpa, out, ")", .{});
+        },
+        .str_index_of => |m| {
+            try hirExpr(gpa, out, m.str);
+            try app(gpa, out, ".index_of(", .{});
+            try hirExpr(gpa, out, m.byte);
+            try app(gpa, out, ")", .{});
+        },
+        .str_starts_with => |m| {
+            try hirExpr(gpa, out, m.str);
+            try app(gpa, out, ".starts_with(", .{});
+            try hirExpr(gpa, out, m.prefix);
+            try app(gpa, out, ")", .{});
+        },
+        .str_contains => |m| {
+            try hirExpr(gpa, out, m.str);
+            try app(gpa, out, ".contains(", .{});
+            try hirExpr(gpa, out, m.sub);
+            try app(gpa, out, ")", .{});
+        },
     }
 }
 
@@ -269,6 +313,41 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .fmt_int_to_str => |inner| {
             try app(gpa, out, "fmt_int_to_str\n", .{});
             try mirInst(gpa, out, inner, depth + 1);
+        },
+        .str_len => |s| {
+            try app(gpa, out, "str_len\n", .{});
+            try mirInst(gpa, out, s, depth + 1);
+        },
+        .str_index => |si| {
+            try app(gpa, out, "str_index\n", .{});
+            try mirInst(gpa, out, si.str, depth + 1);
+            try mirInst(gpa, out, si.idx, depth + 1);
+        },
+        .str_eq => |se| {
+            try app(gpa, out, "str_eq\n", .{});
+            try mirInst(gpa, out, se.lhs, depth + 1);
+            try mirInst(gpa, out, se.rhs, depth + 1);
+        },
+        .str_slice => |sl| {
+            try app(gpa, out, "str_slice\n", .{});
+            try mirInst(gpa, out, sl.str, depth + 1);
+            try mirInst(gpa, out, sl.start, depth + 1);
+            try mirInst(gpa, out, sl.end, depth + 1);
+        },
+        .str_index_of => |m| {
+            try app(gpa, out, "str_index_of\n", .{});
+            try mirInst(gpa, out, m.str, depth + 1);
+            try mirInst(gpa, out, m.byte, depth + 1);
+        },
+        .str_starts_with => |m| {
+            try app(gpa, out, "str_starts_with\n", .{});
+            try mirInst(gpa, out, m.str, depth + 1);
+            try mirInst(gpa, out, m.prefix, depth + 1);
+        },
+        .str_contains => |m| {
+            try app(gpa, out, "str_contains\n", .{});
+            try mirInst(gpa, out, m.str, depth + 1);
+            try mirInst(gpa, out, m.sub, depth + 1);
         },
         .if_ => |iff| {
             try app(gpa, out, "if : {s}\n", .{@tagName(inst.ty)});

@@ -119,8 +119,11 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             } });
         },
         .host_call => |hc| {
+            // A `str`-valued argument lowers to a (ptr, len) str inst; any other
+            // is an i64. The backend reads each arg's `.ty` to push 2 or 1 wasm
+            // operands (and to declare the matching import param types).
             const args = try ctx.a.alloc(*mir.Inst, hc.args.len);
-            for (hc.args, 0..) |a, i| args[i] = try lowerExpr(ctx, a);
+            for (hc.args, 0..) |a, i| args[i] = if (isStrExpr(a)) try lowerStrExpr(ctx, a) else try lowerExpr(ctx, a);
             return mk(ctx.a, .void, .{ .host_call = .{ .name = hc.name, .args = args } });
         },
         .global_set => |gs| return mk(ctx.a, .void, .{ .global_set = .{ .idx = gs.idx, .value = try lowerExpr(ctx, gs.value) } }),
@@ -185,6 +188,18 @@ fn singleTail(body: *const hir.Stmt) ?*hir.Expr {
     };
 }
 
+/// Does this HIR expression yield a `str` value? Used to route host-call
+/// arguments to the str path (a (ptr, len) pair) vs the i64 path. A bare
+/// `local` is str only when its binding type is `str`; `fmt_int` is the str of
+/// an i64 (only appears inside concat today, but classify it as str for safety).
+fn isStrExpr(e: *const hir.Expr) bool {
+    return switch (e.*) {
+        .str_const, .concat, .str_binding, .fmt_int, .str_slice => true,
+        .local => |l| l.ty == .str,
+        else => false,
+    };
+}
+
 /// Lower a `str`-valued expression to a `str`-typed MIR instruction.
 fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
@@ -206,6 +221,8 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         },
         .str_binding => |sb| return mk(ctx.a, .str, .{ .str_binding = .{ .ptr_idx = sb.ptr_idx, .len_idx = sb.len_idx } }),
         .fmt_int => |inner| return mk(ctx.a, .str, .{ .fmt_int_to_str = try lowerExpr(ctx, inner) }),
+        // `s.slice(a, b)` -> str (ptr+a, b-a). str operand + two i64 bounds.
+        .str_slice => |sl| return mk(ctx.a, .str, .{ .str_slice = .{ .str = try lowerStrExpr(ctx, sl.str), .start = try lowerExpr(ctx, sl.start), .end = try lowerExpr(ctx, sl.end) } }),
         else => return error.Unsupported,
     }
 }
@@ -332,7 +349,18 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             // i32 for a `-> bool`), so it validates against the callee sig.
             return mk(ctx.a, mapType(ctx.funcs[cl.func].ret), .{ .call = .{ .func = cl.func, .args = args } });
         },
-        .str_const, .concat, .str_binding, .fmt_int => unreachable, // str values never reach the i64 path
+        // `s.len` — lower the str operand to its (ptr, len) value; the backend
+        // reads the len component and zero-extends it to i64.
+        .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
+        // `s[i]` — str operand to (ptr, len), idx to i64; backend loads the byte.
+        .str_index => |si| return mk(ctx.a, .i64, .{ .str_index = .{ .str = try lowerStrExpr(ctx, si.str), .idx = try lowerExpr(ctx, si.idx) } }),
+        // `a == b` on strs — both to (ptr, len); backend calls __str_eq -> i32.
+        .str_eq => |se| return mk(ctx.a, .i32, .{ .str_eq = .{ .lhs = try lowerStrExpr(ctx, se.lhs), .rhs = try lowerStrExpr(ctx, se.rhs) } }),
+        // str methods that yield i64/bool: index_of (i64), starts_with/contains (i32).
+        .str_index_of => |m| return mk(ctx.a, .i64, .{ .str_index_of = .{ .str = try lowerStrExpr(ctx, m.str), .byte = try lowerExpr(ctx, m.byte) } }),
+        .str_starts_with => |m| return mk(ctx.a, .i32, .{ .str_starts_with = .{ .str = try lowerStrExpr(ctx, m.str), .prefix = try lowerStrExpr(ctx, m.prefix) } }),
+        .str_contains => |m| return mk(ctx.a, .i32, .{ .str_contains = .{ .str = try lowerStrExpr(ctx, m.str), .sub = try lowerStrExpr(ctx, m.sub) } }),
+        .str_const, .concat, .str_binding, .fmt_int, .str_slice => unreachable, // str values never reach the i64 path
     }
 }
 
