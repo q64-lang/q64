@@ -271,6 +271,22 @@ fn main {
   qview.create(202, 4, 220)         // validation status
   qview.set_attr(202, 9, 1030)      // "no @ yet" initially
 
+  // ---- Multi-line text area: wraps + Enter inserts newlines. Placeholder is a
+  //      STRING arg; the handler reads the typed text (newlines included) as a
+  //      `str` param and shows its byte length. ----
+  qview.create(229, 13, 100)        // divider
+  qview.set_attr(229, 2, 348)
+  qview.set_attr(229, 3, 1)
+  qview.create(231, 4, 100)         // section label "Notes"
+  qview.set_attr(231, 9, 1031)
+  qview.create(230, 18, 100)        // the text area (kind 18)
+  qview.set_attr(230, 2, 340)
+  qview.set_attr(230, 3, 110)
+  qview.set_text(230, 1, "write a few lines")   // placeholder
+  qview.on(230, 2, 230)             // EVENT.input (2) -> on_230
+  qview.create(232, 4, 100)         // live byte length (incl newlines)
+  qview.set_attr(232, 9, 0)
+
   qview.present()
 }
 // One branchless handler per control (the on_<id> dispatch shape).
@@ -389,5 +405,11 @@ pub fn on_200(node: i64, event: i64, text: str) {
   } else {
     qview.set_attr(202, 9, 1030)
   }
+  qview.present()
+}
+// Text area: multi-line text (newlines included) reaches q64 as a str param too;
+// show its byte length in label 232.
+pub fn on_230(node: i64, event: i64, text: str) {
+  qview.set_attr(232, 9, text.len)
   qview.present()
 }

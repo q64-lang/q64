@@ -83,6 +83,7 @@ const CATALOG = [
   'chars',           // 28  suffix after the live length
   'has @',           // 29  validation status: contains '@'
   'no @ yet',        // 30  validation status: missing '@'
+  'Notes',           // 31  text_area section label
 ];
 
 // ---- the retained tree (generic, VALIDATED applier) --------------------------
@@ -464,18 +465,24 @@ function liftFocusedOnce() {
   kbScrolled = true;
 }
 
+// A text field (single-line input or multi-line area)?
+function isTextField(kind) { return kind === KIND.text_input || kind === KIND.text_area; }
+// The hidden capture element for a node: a <textarea> (newlines) for text_area,
+// else the single-line <input>. Both pinned top-left, invisible.
+function fieldEl(node) { return document.getElementById(node && node.kind === KIND.text_area ? 'kbdm' : 'kbd'); }
+
 function focusField(node) {
   focusedId = node.id;
   kbScrolled = false;
   startBlink();
-  // #kbd is pinned top-left (always visible) so iOS never auto-scrolls to it —
-  // we lift the drawn field ourselves. Just seed its value + focus (the focus()
-  // must run inside the tap gesture to raise the soft keyboard).
-  const kbd = document.getElementById('kbd');
-  if (kbd) {
-    kbd.value = renderCtx.textValue(node);
-    kbd.focus();
-    try { kbd.setSelectionRange(kbd.value.length, kbd.value.length); } catch {}
+  // The capture element is pinned top-left (always visible) so iOS never
+  // auto-scrolls to it — we lift the drawn field ourselves. Just seed its value
+  // + focus (focus() must run inside the tap gesture to raise the soft keyboard).
+  const el = fieldEl(node);
+  if (el) {
+    el.value = renderCtx.textValue(node);
+    el.focus();
+    try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
   }
   render();
   // The keyboard animates in over a few hundred ms; the visualViewport 'resize'
@@ -493,8 +500,8 @@ function blurField() {
   kbScrolled = false;
   stopBlink();
   kbInset = 0;                                   // keyboard closing; restore the normal bound
-  const kbd = document.getElementById('kbd');
-  if (kbd) kbd.blur();
+  const el = fieldEl(node);
+  if (el) el.blur();
   // Do NOT snap scrollY back to the new (smaller) bound — that yanks the view
   // down when the keyboard dismisses. Leave it where it is; if it's now past the
   // end, the next scroll rubber-bands it back smoothly (settleScroll/momentum).
@@ -720,7 +727,7 @@ async function main() {
     // anything else MAY dismiss it — but only on a real tap, decided at
     // pointerup (see endDrag). Do NOT blur here: a scroll gesture starts with a
     // pointerdown on empty space, and scrolling must keep the keyboard open.
-    if (hit && hit.kind === KIND.text_input) {
+    if (hit && isTextField(hit.kind)) {
       ev.preventDefault();
       focusField(hit);
       return;
@@ -844,21 +851,24 @@ async function main() {
     if (!openContextMenu(px, py)) render();
   });
 
-  // Hidden-input keystrokes drive the focused text field: the host owns the
+  // Hidden-element keystrokes drive the focused text field: the host owns the
   // value (so the field shows what's typed even if the handler ignores it), then
   // the handler gets an `input` event with the text. `blur` commits (`change`).
-  const kbd = document.getElementById('kbd');
-  if (kbd) {
-    kbd.addEventListener('input', () => {
-      if (focusedId === null) return;
-      const node = nodes.get(focusedId);
-      if (!node) return;
-      (node._text ??= {})[TEXTKEY.value] = kbd.value;
-      startBlink();                              // keep the caret solid while typing
-      dispatchText(node, EVENT.input, kbd.value);
-      render();
-    });
-    kbd.addEventListener('blur', () => { if (focusedId !== null) blurField(); });
+  // Both capture elements (#kbd input, #kbdm textarea) share the same handlers;
+  // only one is focused at a time, and we read the event target's value.
+  const onKbdInput = (e) => {
+    if (focusedId === null) return;
+    const node = nodes.get(focusedId);
+    if (!node) return;
+    (node._text ??= {})[TEXTKEY.value] = e.target.value;
+    startBlink();                                // keep the caret solid while typing
+    dispatchText(node, EVENT.input, e.target.value);
+    render();
+  };
+  const onKbdBlur = () => { if (focusedId !== null) blurField(); };
+  for (const id of ['kbd', 'kbdm']) {
+    const el = document.getElementById(id);
+    if (el) { el.addEventListener('input', onKbdInput); el.addEventListener('blur', onKbdBlur); }
   }
   // The soft keyboard shrinks the visual viewport; track that inset and keep the
   // focused field above it. (No-op on desktop, where visualViewport ~= layout.)
