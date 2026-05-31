@@ -662,10 +662,23 @@ async function main() {
     if (!openContextMenu(px, py)) render();
   });
 
-  // Re-fit on resize AND orientation change. iOS fires orientationchange before
-  // the viewport settles, so re-fit again on the next frame; reset scroll so the
-  // (now differently-tall) content isn't stuck past its new end.
-  const refit = () => { resize(); scrollY = Math.max(0, Math.min(scrollY, maxBound())); render(); };
+  // Re-fit on a viewport change: rebuild the backing store, refresh viewportH so
+  // maxBound() is computed against the NEW size (it would otherwise clamp scrollY
+  // with the stale height from the last render), clamp scroll into the new range,
+  // then redraw. stopMomentum so a glide in flight can't fling past the new edge.
+  const refit = () => {
+    resize();
+    viewportH = canvas.clientHeight;
+    stopMomentum();
+    scrollY = Math.max(0, Math.min(scrollY, maxBound()));
+    render();
+  };
+  // A ResizeObserver on the canvas is the RELIABLE signal: iPad Safari does not
+  // dependably fire window 'resize' for Stage Manager / split-view / multitasking
+  // size changes, but the observer fires whenever the element's box actually
+  // changes — so the canvas, scroll bounds, and centering always track the window.
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(refit).observe(canvas);
+  // Keep the window listeners too (older Safari, desktop) — refit is idempotent.
   window.addEventListener('resize', refit);
   window.addEventListener('orientationchange', () => { refit(); requestAnimationFrame(refit); });
 }
