@@ -49,8 +49,8 @@ for (const id of [20, 30, 40, 50, 52, 60, 80])
   ok(h.nodes.get(id)?.handlers.get(EVENT.press) === id, `node ${id} press -> handler ${id}`);
 
 ok(h.presents() === 1, 'one present() in _start');
-ok(h.nodes.get(60).attrs.get(ATTR.value) === 40, 'slider value starts 40');
-ok(h.nodes.get(70).attrs.get(ATTR.value) === 40, 'progress mirrors slider start');
+ok(h.nodes.get(60).attrs.get(ATTR.value) === 60, 'slider value starts at shared level 60');
+ok(h.nodes.get(70).attrs.get(ATTR.value) === 60, 'progress mirrors shared level 60');
 ok(h.nodes.get(50).attrs.get(ATTR.selected) === 1, 'radio A selected at start');
 ok(h.nodes.get(90)?.kind === KIND.box, 'material bar node 90 is a box');
 ok(h.nodes.get(90)?.attrs.get(ATTR.surface) === 1, 'bar carries surface=surface (opaque, 1)');
