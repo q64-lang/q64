@@ -355,15 +355,15 @@ function replaceSelection(node, repl) {
 // select gesture, since a drag fights the keyboard-open lift).
 function selectWordAt(node, idx) {
   const el = fieldEl(node);
-  if (!el) return false;
+  if (!el) return null;
   const v = el.value;
-  if (!v) return false;
+  if (!v) return null;
   let s = Math.min(idx, v.length), e = s;
   const word = (c) => c && /\S/.test(c);
   while (s > 0 && word(v[s - 1])) s--;
   while (e < v.length && word(v[e])) e++;
-  if (e > s) { try { el.setSelectionRange(s, e); } catch {} return true; }
-  return false;
+  if (e > s) { try { el.setSelectionRange(s, e); } catch {} return { start: s, end: e }; }
+  return null;
 }
 
 // Perform the chosen edit action (clipboard is async + gesture-gated).
@@ -866,16 +866,19 @@ async function main() {
       focusField(hit, px, py);
       textDrag = { node: hit, anchor, startX: px, startY: py };
       try { canvas.setPointerCapture(ev.pointerId); } catch {}
-      // Long-press selects the WORD under the finger and raises the edit menu —
-      // the reliable select gesture (a drag fights the keyboard-open lift). With
-      // no word (empty field) it's just the Paste / Select All menu.
+      // Long-press selects the WORD under the finger (the reliable select
+      // gesture — a drag fights the keyboard-open lift). It does NOT open the
+      // menu yet: while still holding, dragging adjusts the selection from the
+      // word bounds; the menu appears on release (see endDrag). Empty word → the
+      // release just shows the Paste / Select All menu.
       cancelLongPress();
       longPressXY = [px, py];
       longPressTimer = setTimeout(() => {
         longPressTimer = null;
         const idx = wt && wt.caretAt ? wt.caretAt(hit, px, py, renderCtx) : 0;
-        selectWordAt(hit, idx);
-        openEditMenu(hit, px, py);
+        const word = selectWordAt(hit, idx);
+        if (textDrag && word) textDrag.word = word;  // enter adjust mode
+        render();
       }, LONG_PRESS_MS);
       return;
     }
@@ -932,7 +935,18 @@ async function main() {
       const wt = widgetFor(textDrag.node.kind);
       const idx = wt && wt.caretAt ? wt.caretAt(textDrag.node, mx, my, renderCtx) : textDrag.anchor;
       const el = fieldEl(textDrag.node);
-      if (el) { try { el.setSelectionRange(Math.min(textDrag.anchor, idx), Math.max(textDrag.anchor, idx)); } catch {} }
+      if (el) {
+        let s, e;
+        if (textDrag.word) {
+          // Adjust mode (after a long-press word-select): the word stays
+          // selected; drag past either end to grow the selection that way.
+          const { start: ws, end: we } = textDrag.word;
+          if (idx < ws) { s = idx; e = we; } else if (idx > we) { s = ws; e = idx; } else { s = ws; e = we; }
+        } else {
+          s = Math.min(textDrag.anchor, idx); e = Math.max(textDrag.anchor, idx);
+        }
+        try { el.setSelectionRange(s, e); } catch {}
+      }
       render();
       return;
     }
@@ -1061,15 +1075,24 @@ async function main() {
     window.visualViewport.addEventListener('resize', onVV);
   }
 
-  // Re-fit on a viewport change: rebuild the backing store, refresh viewportH so
-  // maxBound() is computed against the NEW size (it would otherwise clamp scrollY
-  // with the stale height from the last render), clamp scroll into the new range,
-  // then redraw. stopMomentum so a glide in flight can't fling past the new edge.
+  // Re-fit on a viewport change: rebuild the backing store, refresh viewportH,
+  // clamp scroll into the new range, redraw. GUARDED against no-op size changes:
+  // resize() sets canvas.width/height (the drawing buffer), and a ResizeObserver
+  // can re-fire from that — so if the CSS box is unchanged we bail, breaking the
+  // feedback loop (the cause of the load-blank + scroll-vibration). During an
+  // active scroll/momentum we don't clamp (so a mid-scroll toolbar resize can't
+  // yank the position); we just track the size + redraw.
+  let lastCW = -1, lastCH = -1;
   const refit = () => {
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    if (cw === lastCW && ch === lastCH) return;   // no real change — don't loop
+    lastCW = cw; lastCH = ch;
     resize();
-    viewportH = canvas.clientHeight;
-    stopMomentum();
-    scrollY = Math.max(0, Math.min(scrollY, maxBound()));
+    viewportH = ch;
+    if (!scrollDrag && !momentumRAF) {
+      stopMomentum();
+      scrollY = Math.max(0, Math.min(scrollY, maxBound()));
+    }
     render();
   };
   // A ResizeObserver on the canvas is the RELIABLE signal: iPad Safari does not
