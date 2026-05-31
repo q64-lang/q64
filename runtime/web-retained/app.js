@@ -307,11 +307,9 @@ async function main() {
 
   instance.exports._start();   // builds the retained tree + first present()
 
-  // Pin the translucent top bar (+ its title) so it stays fixed while content
-  // scrolls beneath it. (The gallery's bar is nodes 90/91.) Everything else is in
-  // screen space already (r.attr subtracts scrollY), so hit-tests + the existing
-  // pointer math need no change — only scrollY moves.
-  for (const id of [90, 91]) { const n = nodes.get(id); if (n) n._pinned = true; }
+  // The "Widget gallery" bar is wasm-controlled content (nodes 90/91), so it
+  // scrolls WITH the scene like everything else — no nodes are pinned. (A node
+  // can opt out of scroll via n._pinned if a producer ever wants fixed chrome.)
 
   // A widget may expose value(node, px, py, r) -> i64 to turn a touch position
   // into a payload (e.g. a slider's value). If it does, the control is also
