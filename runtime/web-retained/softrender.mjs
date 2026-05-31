@@ -26,6 +26,7 @@ const H = Number(opt('height', 820));
 const THEME = themeFor(PLATFORM);
 
 // Host glyph catalog (mirror of app.js). Kept in sync by hand for now.
+const CATALOG_BASE = 1000;
 const CATALOG = [
   'Widget gallery', 'Label', 'Button', 'Checkbox', 'Switch', 'Radio A', 'Radio B',
   'Slider', 'Progress', 'Dropdown', 'Box', 'Tap +1', 'iOS', 'Android', 'Windows',
@@ -69,7 +70,7 @@ const esc = (s) => String(s).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;
 const glyph = (str) => { const b = textBox(str); return { w: b.w, h: b.h, _str: str }; };
 function glyphForCatalog(textId) {
   const n = Number(textId);
-  return glyph((n >= 0 && n < CATALOG.length) ? CATALOG[n] : String(n));
+  return glyph((n >= CATALOG_BASE && n - CATALOG_BASE < CATALOG.length) ? CATALOG[n - CATALOG_BASE] : String(n));
 }
 function glyphForNode(node) {
   const id = node.attrs.get(ATTR.text_id);

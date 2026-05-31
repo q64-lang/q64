@@ -85,10 +85,10 @@ handlerFires(60, [60, 70], 80); // a second drag position -> 80 (not 35)
 ok(h.nodes.get(60).attrs.get(ATTR.value) === 80, 'slider follows payload to 80 (absolute, not incremental)');
 // Dropdown: payload is the chosen option's catalog id (12..15). Selecting
 // 'Windows' (id 14) sets the field text_id=14 and selected index=14-12=2.
-ok(h.nodes.get(80).attrs.get(ATTR.min) === 12, 'dropdown options base = catalog id 12');
+ok(h.nodes.get(80).attrs.get(ATTR.min) === 1012, 'dropdown options base = catalog id 1012');
 ok(h.nodes.get(80).attrs.get(ATTR.max) === 4, 'dropdown has 4 options (iOS/Android/Windows/Linux)');
-handlerFires(80, [80], 14); // choose Windows
-ok(h.nodes.get(80).attrs.get(ATTR.text_id) === 14, 'dropdown field shows chosen option (Windows=14)');
+handlerFires(80, [80], 1014); // choose Windows
+ok(h.nodes.get(80).attrs.get(ATTR.text_id) === 1014, 'dropdown field shows chosen option (Windows=1014)');
 ok(h.nodes.get(80).attrs.get(ATTR.selected) === 2, 'dropdown selected index = 2');
 // Grouped child: checkbox 8 is parented to group 6, wired, and toggles.
 ok(h.nodes.get(8)?.kind === KIND.checkbox && h.nodes.get(8)?.parent === 6, 'checkbox 8 is a checkbox inside group 6');

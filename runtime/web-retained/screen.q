@@ -19,9 +19,9 @@ state toggled   = 0
 state choice    = 0
 state sliderVal = 40
 state taps      = 0
-state platform  = 12   // dropdown: catalog id of the selected option (12 = iOS)
+state platform  = 1012 // dropdown: catalog id of the selected option (12 = iOS)
 state grouped   = 1    // the checkbox inside the group widget
-state picked    = 20   // long-click menu: last picked item (20 = Copy)
+state picked    = 1020 // long-click menu: last picked item (20 = Copy)
 
 fn main {
   // Layout grid: a control column at x=24 and a name-label column at x=150,
@@ -43,16 +43,16 @@ fn main {
   qview.create(81, 4, 0)
   qview.set_attr(81, 0, 40)
   qview.set_attr(81, 1, 92)
-  qview.set_attr(81, 9, 9)
+  qview.set_attr(81, 9, 1009)
   qview.create(80, 12, 0)
   qview.set_attr(80, 0, 150)
   qview.set_attr(80, 1, 84)
   qview.set_attr(80, 2, 226)
   qview.set_attr(80, 3, 44)
-  qview.set_attr(80, 15, 12)
+  qview.set_attr(80, 15, 1012)
   qview.set_attr(80, 16, 4)
   qview.set_attr(80, 13, 0)
-  qview.set_attr(80, 9, 12)
+  qview.set_attr(80, 9, 1012)
   qview.on(80, 0, 80)
 
   // Thin divider (5) under the dropdown — separates the platform selector from
@@ -67,7 +67,7 @@ fn main {
   qview.create(10, 4, 0)
   qview.set_attr(10, 0, 40)
   qview.set_attr(10, 1, 168)
-  qview.set_attr(10, 9, 1)
+  qview.set_attr(10, 9, 1001)
 
   // Button (20) -> handler 20, name (21 taps count to its right)
   qview.create(20, 6, 0)
@@ -76,7 +76,7 @@ fn main {
   qview.set_attr(20, 2, 150)
   qview.set_attr(20, 3, 48)
   qview.set_attr(20, 4, 12)
-  qview.set_attr(20, 9, 11)
+  qview.set_attr(20, 9, 1011)
   qview.on(20, 0, 20)
   qview.create(21, 4, 0)
   qview.set_attr(21, 0, 210)
@@ -92,7 +92,7 @@ fn main {
   qview.create(31, 4, 0)
   qview.set_attr(31, 0, 80)
   qview.set_attr(31, 1, 254)
-  qview.set_attr(31, 9, 3)
+  qview.set_attr(31, 9, 1003)
 
   // Switch (40) -> handler 40, name (41)
   qview.create(40, 8, 0)
@@ -103,7 +103,7 @@ fn main {
   qview.create(41, 4, 0)
   qview.set_attr(41, 0, 108)
   qview.set_attr(41, 1, 306)
-  qview.set_attr(41, 9, 4)
+  qview.set_attr(41, 9, 1004)
 
   // Radio A (50) -> 50, name (51); Radio B (52) -> 52, name (53). group 1.
   // Each radio's w/h is a LARGE hit row (circle + label), the two halves of the
@@ -120,7 +120,7 @@ fn main {
   qview.create(51, 4, 0)
   qview.set_attr(51, 0, 72)
   qview.set_attr(51, 1, 374)
-  qview.set_attr(51, 9, 5)
+  qview.set_attr(51, 9, 1005)
   qview.create(52, 9, 0)
   qview.set_attr(52, 0, 208)
   qview.set_attr(52, 1, 356)
@@ -132,13 +132,13 @@ fn main {
   qview.create(53, 4, 0)
   qview.set_attr(53, 0, 248)
   qview.set_attr(53, 1, 374)
-  qview.set_attr(53, 9, 6)
+  qview.set_attr(53, 9, 1006)
 
   // Slider row: name (61) above the control (60).
   qview.create(61, 4, 0)
   qview.set_attr(61, 0, 40)
   qview.set_attr(61, 1, 408)
-  qview.set_attr(61, 9, 7)
+  qview.set_attr(61, 9, 1007)
   qview.create(60, 10, 0)
   qview.set_attr(60, 0, 40)
   qview.set_attr(60, 1, 434)
@@ -152,7 +152,7 @@ fn main {
   qview.create(71, 4, 0)
   qview.set_attr(71, 0, 40)
   qview.set_attr(71, 1, 486)
-  qview.set_attr(71, 9, 8)
+  qview.set_attr(71, 9, 1008)
   qview.create(70, 11, 0)
   qview.set_attr(70, 0, 40)
   qview.set_attr(70, 1, 512)
@@ -169,12 +169,12 @@ fn main {
   qview.set_attr(6, 1, 552)
   qview.set_attr(6, 2, 320)
   qview.set_attr(6, 3, 96)
-  qview.set_attr(6, 9, 16)
+  qview.set_attr(6, 9, 1016)
   // sub-label (7) inside the group
   qview.create(7, 4, 6)
   qview.set_attr(7, 0, 56)
   qview.set_attr(7, 1, 600)
-  qview.set_attr(7, 9, 17)
+  qview.set_attr(7, 9, 1017)
   // sub-checkbox (8) inside the group — wired to handler 8 to prove a grouped
   // child still receives touch.
   qview.create(8, 7, 6)
@@ -194,10 +194,10 @@ fn main {
   qview.set_attr(9, 3, 64)
   qview.set_attr(9, 4, 12)
   qview.set_attr(9, 5, 1)
-  qview.set_attr(9, 9, 18)
-  qview.set_attr(9, 15, 19)
+  qview.set_attr(9, 9, 1018)
+  qview.set_attr(9, 15, 1019)
   qview.set_attr(9, 16, 3)
-  qview.set_attr(9, 13, 20)
+  qview.set_attr(9, 13, 1020)
   qview.on(9, 1, 9)
 
   // Translucent material top bar (90), created LAST so it overlays nothing but
@@ -213,7 +213,7 @@ fn main {
   qview.create(91, 4, 0)
   qview.set_attr(91, 0, 16)
   qview.set_attr(91, 1, 18)
-  qview.set_attr(91, 9, 0)
+  qview.set_attr(91, 9, 1000)
 
   qview.present()
 }
@@ -260,7 +260,7 @@ pub fn on_60(node: i64, event: i64, value: i64) {
 pub fn on_80(node: i64, event: i64, value: i64) {
   platform = value
   qview.set_attr(80, 9, platform)
-  qview.set_attr(80, 13, platform - 12)
+  qview.set_attr(80, 13, platform - 1012)
   qview.present()
 }
 // Grouped checkbox: toggles like any other — proves a child of a group node
