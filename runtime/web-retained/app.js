@@ -43,7 +43,10 @@ const CATALOG = [
   'Dropdown',        // 9  (the row's name label)
   'Box',             // 10
   'Tap +1',          // 11
-  'Option one',      // 12 (the dropdown's selected value)
+  'iOS',             // 12  dropdown options (selected value shows in the field)
+  'Android',         // 13
+  'Windows',         // 14
+  'Linux',           // 15
 ];
 
 // ---- the retained tree -------------------------------------------------------
@@ -139,13 +142,33 @@ const renderCtx = {
     return lit === undefined ? dflt : unpackColor(lit);
   },
   textFor: (node) => glyphFor(node),
+  glyphForId: (textId) => glyphForCatalog(textId),
   isPressed: (id) => id === pressedId,
+  isOpen: (id) => id === openDropdownId,
 };
+
+// The dropdown currently showing its popup (one at a time), or null.
+let openDropdownId = null;
+
+// A glyph for a host-catalog id directly (popup option rows), cached.
+const idGlyphCache = new Map();
+function glyphForCatalog(textId) {
+  const n = Number(textId);
+  const str = (n >= 0 && n < CATALOG.length) ? CATALOG[n] : String(n);
+  if (!idGlyphCache.has(str)) idGlyphCache.set(str, sdfTexture(str));
+  return idGlyphCache.get(str);
+}
 
 function render() {
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
   walk(ROOT);
+  // Overlays last, on top of everything: the open dropdown's popup.
+  if (openDropdownId !== null) {
+    const n = nodes.get(openDropdownId);
+    const w = n && widgetFor(n.kind);
+    if (w && w.drawPopup) w.drawPopup(n, renderCtx);
+  }
   endFrame(frame);
 }
 function walk(id) {
@@ -230,9 +253,29 @@ async function main() {
 
   canvas.addEventListener('pointerdown', (ev) => {
     const [px, py] = localXY(ev);
+
+    // If a dropdown is open, its popup captures this tap first: pick an option
+    // (-> selection payload to the wasm) or dismiss on an outside tap.
+    if (openDropdownId !== null) {
+      const dd = nodes.get(openDropdownId);
+      const dw = dd && widgetFor(dd.kind);
+      const chosen = dw && dw.hitPopup ? dw.hitPopup(dd, px, py, renderCtx) : null;
+      const wasOpen = openDropdownId;
+      openDropdownId = null;                    // close either way
+      if (chosen !== null && chosen !== undefined) dispatch(dd, EVENT.change, chosen);
+      else render();                            // outside tap: just close + redraw
+      if (wasOpen) return;                      // consume this tap
+    }
+
     const hit = hitTest(px, py);
     if (!hit) return;
     const w = widgetFor(hit.kind);
+    // Dropdown field: toggle its popup open.
+    if (w && w.drawPopup) {
+      openDropdownId = hit.id;
+      render();
+      return;
+    }
     if (w && typeof w.value === 'function') {
       // Ranged control: set value to where you touched (down = jump-to), and arm
       // dragging so the thumb tracks the finger. preventDefault + pointer capture

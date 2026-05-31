@@ -83,6 +83,13 @@ handlerFires(60, [60, 70], 25); // payload 25 -> value 25
 ok(h.nodes.get(60).attrs.get(ATTR.value) === 25 && h.nodes.get(70).attrs.get(ATTR.value) === 25, 'slider+progress set to payload 25');
 handlerFires(60, [60, 70], 80); // a second drag position -> 80 (not 35)
 ok(h.nodes.get(60).attrs.get(ATTR.value) === 80, 'slider follows payload to 80 (absolute, not incremental)');
+// Dropdown: payload is the chosen option's catalog id (12..15). Selecting
+// 'Windows' (id 14) sets the field text_id=14 and selected index=14-12=2.
+ok(h.nodes.get(80).attrs.get(ATTR.min) === 12, 'dropdown options base = catalog id 12');
+ok(h.nodes.get(80).attrs.get(ATTR.max) === 4, 'dropdown has 4 options (iOS/Android/Windows/Linux)');
+handlerFires(80, [80], 14); // choose Windows
+ok(h.nodes.get(80).attrs.get(ATTR.text_id) === 14, 'dropdown field shows chosen option (Windows=14)');
+ok(h.nodes.get(80).attrs.get(ATTR.selected) === 2, 'dropdown selected index = 2');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
