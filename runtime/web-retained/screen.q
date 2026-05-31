@@ -76,25 +76,32 @@ fn main {
   qview.set_attr(41, 9, 4)
 
   // Radio A (50) -> 50, name (51); Radio B (52) -> 52, name (53). group 1.
+  // Each radio's w/h is a LARGE hit row (circle + label), the two halves of the
+  // line, non-overlapping. The circle draws anchored-left inside; the label sits
+  // within the same row so tapping anywhere on "Radio A" selects it.
   qview.create(50, 9, 0)
-  qview.set_attr(50, 0, 40)
-  qview.set_attr(50, 1, 300)
+  qview.set_attr(50, 0, 32)
+  qview.set_attr(50, 1, 290)
+  qview.set_attr(50, 2, 172)
+  qview.set_attr(50, 3, 56)
   qview.set_attr(50, 14, 1)
   qview.set_attr(50, 13, 1)
   qview.on(50, 0, 50)
   qview.create(51, 4, 0)
-  qview.set_attr(51, 0, 76)
-  qview.set_attr(51, 1, 300)
+  qview.set_attr(51, 0, 72)
+  qview.set_attr(51, 1, 308)
   qview.set_attr(51, 9, 5)
   qview.create(52, 9, 0)
-  qview.set_attr(52, 0, 200)
-  qview.set_attr(52, 1, 300)
+  qview.set_attr(52, 0, 208)
+  qview.set_attr(52, 1, 290)
+  qview.set_attr(52, 2, 172)
+  qview.set_attr(52, 3, 56)
   qview.set_attr(52, 14, 1)
   qview.set_attr(52, 13, 0)
   qview.on(52, 0, 52)
   qview.create(53, 4, 0)
-  qview.set_attr(53, 0, 236)
-  qview.set_attr(53, 1, 300)
+  qview.set_attr(53, 0, 248)
+  qview.set_attr(53, 1, 308)
   qview.set_attr(53, 9, 6)
 
   // Slider row: name (61) above the control (60).
