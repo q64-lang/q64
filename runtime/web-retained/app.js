@@ -496,10 +496,12 @@ function blurField() {
   focusedId = null;
   kbScrolled = false;
   stopBlink();
-  kbInset = 0;                                   // keyboard is closing; reclaim the room
+  kbInset = 0;                                   // keyboard closing; restore the normal bound
   const kbd = document.getElementById('kbd');
   if (kbd) kbd.blur();
-  scrollY = Math.max(0, Math.min(scrollY, maxBound()));
+  // Do NOT snap scrollY back to the new (smaller) bound — that yanks the view
+  // down when the keyboard dismisses. Leave it where it is; if it's now past the
+  // end, the next scroll rubber-bands it back smoothly (settleScroll/momentum).
   if (node) dispatchText(node, EVENT.change, renderCtx.textValue(node));
   render();
 }
