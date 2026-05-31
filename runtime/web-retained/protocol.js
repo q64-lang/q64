@@ -4,13 +4,15 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.1';
+export const PROTOCOL_VERSION = '1.2';
 
 // Node kinds (spec §"Node kinds"). 13 = text_input is RESERVED (deferred).
 export const KIND = {
   box: 0, row: 1, column: 2, stack: 3, label: 4, image: 5, button: 6,
   checkbox: 7, switch: 8, radio: 9, slider: 10, progress: 11, dropdown: 12,
-  // text_input: 13,  // reserved — focus/blur/key follow-up
+  divider: 13,   // thin separator line (hairline rule)
+  group: 14,     // titled container: a panel + heading that holds sub-widgets
+  // text_input: 15,  // reserved — focus/blur/key follow-up
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 

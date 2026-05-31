@@ -13,3 +13,5 @@ import './widgets/radio.js';
 import './widgets/slider.js';
 import './widgets/progress.js';
 import './widgets/dropdown.js';
+import './widgets/divider.js';
+import './widgets/group.js';
