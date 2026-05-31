@@ -20,3 +20,4 @@ import './widgets/knob.js';
 import './widgets/text_input.js';
 import './widgets/text_area.js';
 import './widgets/icon.js';
+import './widgets/spinner.js';
