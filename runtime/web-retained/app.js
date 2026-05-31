@@ -130,6 +130,7 @@ let kbScrolled = false;      // have we already lifted the focused field above t
 // header when the hidden input blurs, so we can read on iPhone what fired right
 // before the keyboard dropped. Remove once the iPhone keyboard issue is found.
 let evlog = [];
+let diagText = '';   // when set, render() draws it as a big on-canvas overlay (Snap-able)
 function logev(w) {
   evlog.push(Math.round(performance.now() % 100000) + ':' + w);
   if (evlog.length > 12) evlog.shift();
@@ -546,6 +547,18 @@ function render() {
   const spec = contextSpec ? withViewport(contextSpec) : openMenuSpec();
   if (spec) drawMenu(spec, renderCtx);
   if (editMenu) drawMenu(withViewport(editMenu), renderCtx);  // text-field edit menu, on top
+  // TEMP diagnostic overlay: the focus/keyboard event sequence, drawn big so it
+  // can be captured via Snap on iPhone. Cleared on the next focus.
+  if (diagText) {
+    setScissor(frame.pass, null);
+    const lines = diagText.split('\n');
+    const LH = 22, top = 60;
+    drawPrim(frame.pass, 0, top - 8, viewportW, lines.length * LH + 16, [0, 0, 0, 0.9], {});
+    lines.forEach((ln, i) => {
+      const g = glyphForStr(ln, 15);
+      if (g) drawPrim(frame.pass, 10, top + i * LH, g.w, g.h, [0.4, 1, 0.6, 1], { texView: g.view });
+    });
+  }
   endFrame(frame);
 }
 // walk with a `pinned` filter: false = draw only unpinned subtrees; true = only
@@ -654,6 +667,7 @@ function fieldEl(node) { return document.getElementById(node && node.kind === KI
 
 function focusField(node, px, py) {
   logev('focus');
+  diagText = '';                                 // clear the diagnostic overlay on a new focus
   const el = fieldEl(node);
   const w = widgetFor(node.kind);
   // Map the tap to a caret index (tap-to-position); fall back to end-of-text.
@@ -1138,12 +1152,11 @@ async function main() {
   };
   const onKbdBlur = () => {
     logev('BLUR');
-    // TEMP diagnostic: surface the event sequence leading to the keyboard drop,
-    // most-recent-first so the events right before BLUR aren't cut off by the
-    // header's right-ellipsis on iPhone.
-    const ttl = document.querySelector('header .ttl');
-    if (ttl) ttl.textContent = evlog.slice().reverse().join('  ');
+    // TEMP diagnostic: capture the event sequence (most-recent-first) as a big
+    // on-canvas overlay so it can be read via the Snap button on iPhone.
+    diagText = evlog.slice().reverse().join('\n');
     if (focusedId !== null) blurField();
+    else render();                               // ensure the overlay paints even if not focused
   };
   for (const id of ['kbd', 'kbdm']) {
     const el = document.getElementById(id);
