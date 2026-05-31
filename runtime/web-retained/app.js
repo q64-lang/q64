@@ -12,7 +12,7 @@ import { KIND, ATTR, EVENT, EVENT_NAME, SURFACE, unpackColor, PROTOCOL_VERSION }
 // a gitignored artifact, always present in a built/deployed bundle).
 let BUILD = 'dev';
 try { ({ BUILD } = await import('./version.js')); } catch {}
-import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, DPR } from './gpu.js';
+import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, setScissor, DPR } from './gpu.js';
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
 import { Scene } from './scene.js';
@@ -213,23 +213,38 @@ function render() {
   const cv = document.getElementById('gpu'); viewportH = cv ? cv.clientHeight : 0;
   const maxScroll = Math.max(0, contentH + 16 - viewportH);   // 16px bottom margin
   scrollY = Math.max(0, Math.min(scrollY, maxScroll));
+  // The sticky header band = the bottom of the pinned nodes (in screen space).
+  // Scrollable content is clipped to below it so scrolled text never bleeds over.
+  let headerH = 0;
+  for (const id of nodes.keys()) {
+    const n = nodes.get(id); if (!n || !n._pinned) continue;
+    const rc = layoutMap.get(id); if (rc) headerH = Math.max(headerH, rc.y + rc.h);
+  }
+
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
-  walk(ROOT);
+  // Pass 1: scrollable (unpinned) content, clipped below the header band.
+  if (headerH > 0) setScissor(frame.pass, { x: 0, y: headerH, w: 10000, h: Math.max(0, viewportH - headerH) });
+  walk(ROOT, false);
+  // Pass 2: pinned chrome (the sticky header), unclipped, on top.
+  setScissor(frame.pass, null);
+  if (headerH > 0) walk(ROOT, true);
   // Overlays last, on top of everything: the open menu or context menu (shared
   // popup primitive). Both get the viewport so they flip/clamp near edges.
   const spec = contextSpec ? withViewport(contextSpec) : openMenuSpec();
   if (spec) drawMenu(spec, renderCtx);
   endFrame(frame);
 }
-function walk(id) {
+// walk with a `pinned` filter: false = draw only unpinned subtrees; true = only
+// pinned nodes. A node's pinned-ness is inherited from its nearest pinned ancestor.
+function walk(id, wantPinned, pinned = false) {
   const n = nodes.get(id); if (!n) return;
-  if (id !== ROOT) {
+  const isPinned = pinned || !!n._pinned;
+  if (id !== ROOT && isPinned === wantPinned) {
     const w = widgetFor(n.kind);
     if (w && w.draw) w.draw(n, renderCtx);
-    else if (id !== ROOT) { /* unknown/undrawn kind: skip (e.g. pure layout in Stage 1) */ }
   }
-  for (const c of n.children) walk(c);
+  for (const c of n.children) walk(c, wantPinned, isPinned);
 }
 
 // ---- input: hit-test the tree, fire the wired handler via on_event -----------
@@ -307,9 +322,10 @@ async function main() {
 
   instance.exports._start();   // builds the retained tree + first present()
 
-  // The "Widget gallery" bar is wasm-controlled content (nodes 90/91), so it
-  // scrolls WITH the scene like everything else — no nodes are pinned. (A node
-  // can opt out of scroll via n._pinned if a producer ever wants fixed chrome.)
+  // Pin the title bar (nodes 90/91) so it sticks at the top while content scrolls
+  // beneath it. Scrollable content is CLIPPED to below the header (render() sets a
+  // scissor), so scrolled text never bleeds over the sticky bar.
+  for (const id of [90, 91]) { const n = nodes.get(id); if (n) n._pinned = true; }
 
   // A widget may expose value(node, px, py, r) -> i64 to turn a touch position
   // into a payload (e.g. a slider's value). If it does, the control is also
