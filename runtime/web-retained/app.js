@@ -305,6 +305,71 @@ let openDropdownId = null;
 // A context menu (long-press / right-click) raised at a point: its popup spec +
 // the node it belongs to. Separate from openDropdownId (anchored differently).
 let contextSpec = null, contextNode = null;
+// The text-field edit menu (Cut/Copy/Paste/Select All): its popup spec + the
+// field it acts on. Reuses the popup primitive but routes the choice to
+// clipboard actions (client-side), not a wasm dispatch.
+let editMenu = null, editNode = null;
+const EDIT = { cut: 1, copy: 2, paste: 3, selectAll: 4 };
+
+// Build the edit-menu items for a field: Cut/Copy only with a selection; Paste
+// always; Select All when there's text not already fully selected.
+function buildEditItems(node) {
+  const el = fieldEl(node);
+  const value = renderCtx.textValue(node);
+  const hasSel = el && el.selectionStart !== el.selectionEnd;
+  const allSel = el && el.selectionStart === 0 && el.selectionEnd === value.length;
+  const items = [];
+  if (hasSel) {
+    items.push({ id: EDIT.cut, glyph: glyphForStr('Cut') });
+    items.push({ id: EDIT.copy, glyph: glyphForStr('Copy') });
+  }
+  items.push({ id: EDIT.paste, glyph: glyphForStr('Paste') });
+  if (value && !allSel) items.push({ id: EDIT.selectAll, glyph: glyphForStr('Select All') });
+  return items;
+}
+
+// Open the edit menu anchored at (px, py) — the touch point, so it lands on the
+// field (above the keyboard) regardless of where the field scrolled.
+function openEditMenu(node, px, py) {
+  const items = buildEditItems(node);
+  if (!items.length) return;
+  editNode = node;
+  editMenu = { anchor: { x: px, y: py, w: 0, h: 0 }, items, width: 150 };
+  render();
+}
+
+// Replace the field's current selection with `repl` via the hidden element, then
+// sync the host value + notify the handler (an `input` event).
+function replaceSelection(node, repl) {
+  const el = fieldEl(node);
+  if (!el) return;
+  const s = Math.min(el.selectionStart ?? 0, el.selectionEnd ?? 0);
+  const e = Math.max(el.selectionStart ?? 0, el.selectionEnd ?? 0);
+  try { el.setRangeText(repl, s, e, 'end'); } catch { el.value = el.value.slice(0, s) + repl + el.value.slice(e); }
+  (node._text ??= {})[TEXTKEY.value] = el.value;
+  dispatchText(node, EVENT.input, el.value);
+}
+
+// Perform the chosen edit action (clipboard is async + gesture-gated).
+async function doEdit(id) {
+  const node = editNode;
+  editMenu = null; editNode = null;
+  if (!node) { render(); return; }
+  const el = fieldEl(node);
+  if (el) {
+    const s = Math.min(el.selectionStart, el.selectionEnd), e = Math.max(el.selectionStart, el.selectionEnd);
+    if (id === EDIT.cut || id === EDIT.copy) {
+      try { await navigator.clipboard.writeText(el.value.slice(s, e)); } catch {}
+      if (id === EDIT.cut) replaceSelection(node, '');
+    } else if (id === EDIT.paste) {
+      let t = ''; try { t = await navigator.clipboard.readText(); } catch {}
+      if (t) replaceSelection(node, t);
+    } else if (id === EDIT.selectAll) {
+      try { el.setSelectionRange(0, el.value.length); } catch {}
+    }
+  }
+  render();
+}
 
 // The menu spec for the currently-open node (or null) — built fresh each use so
 // it reflects current selection/geometry. The host injects the viewport (CSS px)
@@ -392,6 +457,7 @@ function render() {
   // popup primitive). Both get the viewport so they flip/clamp near edges.
   const spec = contextSpec ? withViewport(contextSpec) : openMenuSpec();
   if (spec) drawMenu(spec, renderCtx);
+  if (editMenu) drawMenu(withViewport(editMenu), renderCtx);  // text-field edit menu, on top
   endFrame(frame);
 }
 // walk with a `pinned` filter: false = draw only unpinned subtrees; true = only
@@ -743,6 +809,16 @@ async function main() {
     stopMomentum();                              // a new touch halts any scroll glide
     const [px, py] = localXY(ev);
 
+    // The edit menu captures the tap first: pick Cut/Copy/Paste/Select All, or
+    // dismiss on an outside tap (the field keeps focus either way).
+    if (editMenu) {
+      ev.preventDefault();
+      const chosen = hitMenu(withViewport(editMenu), px, py);
+      if (chosen != null) doEdit(chosen);
+      else { editMenu = null; editNode = null; render(); }
+      return;
+    }
+
     // If a menu is open, it captures this tap first (shared popup primitive):
     // pick an item (-> selection payload to the wasm) or dismiss on an outside tap.
     if (openDropdownId !== null || contextSpec) {
@@ -772,8 +848,13 @@ async function main() {
       // the selection from here.
       const anchor = wt && wt.caretAt ? wt.caretAt(hit, px, py, renderCtx) : 0;
       focusField(hit, px, py);
-      textDrag = { node: hit, anchor };
+      textDrag = { node: hit, anchor, startX: px, startY: py };
       try { canvas.setPointerCapture(ev.pointerId); } catch {}
+      // A long-press without dragging raises the edit menu at the finger (so you
+      // can Paste / Select All on a field with no selection).
+      cancelLongPress();
+      longPressXY = [px, py];
+      longPressTimer = setTimeout(() => { longPressTimer = null; openEditMenu(hit, px, py); }, LONG_PRESS_MS);
       return;
     }
 
@@ -824,6 +905,8 @@ async function main() {
     if (textDrag) {
       ev.preventDefault();
       const [mx, my] = localXY(ev);
+      // A real drag (beyond slop) cancels the pending long-press — it's a select.
+      if (longPressTimer && Math.hypot(mx - textDrag.startX, my - textDrag.startY) > LONG_PRESS_SLOP) cancelLongPress();
       const wt = widgetFor(textDrag.node.kind);
       const idx = wt && wt.caretAt ? wt.caretAt(textDrag.node, mx, my, renderCtx) : textDrag.anchor;
       const el = fieldEl(textDrag.node);
@@ -869,8 +952,16 @@ async function main() {
   const endDrag = (ev) => {
     cancelLongPress();                          // a lift before the hold elapsed = a tap, not long-press
     if (textDrag) {
+      cancelLongPress();
       try { canvas.releasePointerCapture(ev.pointerId); } catch {}
+      const node = textDrag.node;
       textDrag = null;                          // selection already set during the move
+      // A completed drag-select raises the edit menu at the finger (Cut/Copy).
+      const el = fieldEl(node);
+      if (el && el.selectionStart !== el.selectionEnd) {
+        const [ux, uy] = localXY(ev);
+        openEditMenu(node, ux, uy);
+      }
       return;
     }
     if (scrollDrag) {
