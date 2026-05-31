@@ -204,11 +204,15 @@ function hasSpinner() {
 }
 function spinTick() {
   spinRAF = 0;
+  // Pause the whole loop while a text field is focused: the continuous re-render
+  // disrupts the iOS soft keyboard (it dismisses on text entry). The spinner just
+  // freezes during typing — resumed by ensureSpin() on blur.
+  if (focusedId !== null) return;
   render();
   if (hasSpinner()) spinRAF = requestAnimationFrame(spinTick);
 }
 function ensureSpin() {
-  if (!spinRAF && hasSpinner()) spinRAF = requestAnimationFrame(spinTick);
+  if (!spinRAF && hasSpinner() && focusedId === null) spinRAF = requestAnimationFrame(spinTick);
 }
 
 // ATTR.surface role tag -> theme token key (the translucent material fills).
@@ -682,6 +686,7 @@ function blurField() {
   // end, the next scroll rubber-bands it back smoothly (settleScroll/momentum).
   if (node) dispatchText(node, EVENT.change, renderCtx.textValue(node));
   render();
+  ensureSpin();                                  // resume the animation loop (paused while focused)
 }
 
 // ---- Snap: the device captures its OWN WebGPU canvas + uploads it ------------
