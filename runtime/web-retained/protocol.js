@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.7';
+export const PROTOCOL_VERSION = '1.8';
 
 // Node kinds (spec §"Node kinds").
 export const KIND = {
@@ -16,6 +16,7 @@ export const KIND = {
   knob: 16,      // rotary control (pan, volume) — value on min..max, dragged to rotate
   text_input: 17, // single-line text field (host-owned editable value)
   text_area: 18,  // multi-line text field (wraps; Enter inserts a newline)
+  icon: 19,       // a vector icon (Lucide) rendered as an SDF, tinted by fg
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 
@@ -35,6 +36,9 @@ export const ATTR = {
   // ATTR.value). peak (24): peak-hold level for the left channel; peak2 (25) the
   // right. All on the min..max scale.
   value2: 23, peak: 24, peak2: 25,
+  // icon (26): the host ICONS catalog index of a vector icon to draw — on an
+  // `icon` node, or on a `button` (icon-only, or icon + label).
+  icon: 26,
 };
 export const ATTR_NAME = Object.fromEntries(Object.entries(ATTR).map(([k, v]) => [v, k]));
 
