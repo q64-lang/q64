@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<!-- user-scalable=no: no double-tap / pinch zoom; the app owns all gestures. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#07090d" />
+<title>QView · retained · q64 → wasm32 → WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  /* App-shell: the whole page is the app — no scroll, no bounce/overscroll, no
+     text selection or long-press callout anywhere. Gestures belong to the canvas. */
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
+    background: #07090d; color: #e6edf3;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    -webkit-touch-callout: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  body { display: flex; flex-direction: column; touch-action: none; }
+  header { padding: max(env(safe-area-inset-top), 0.75rem) 1rem 0; font: 600 0.8rem ui-monospace, monospace;
+    letter-spacing: 0.2em; text-transform: uppercase; color: #5fd4ff; }
+  /* The canvas owns all gestures (touch-action:none): no scroll-steal of a
+     slider drag, no long-press callout — every pointer event reaches our host. */
+  #gpu { flex: 1 1 auto; width: 100%; display: block; touch-action: none; }
+  #log { padding: 0.5rem 1rem calc(env(safe-area-inset-bottom) + 0.5rem); font: 0.8rem ui-monospace, monospace; color: #6b7484; }
+</style>
+</head>
+<body>
+  <header>QView · retained</header>
+  <canvas id="gpu"></canvas>
+  <div id="log">loading…</div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "qview-retained-src",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "render": "node softrender.mjs"
+  },
+  "devDependencies": { "@resvg/resvg-js": "^2.6.2" }
+}

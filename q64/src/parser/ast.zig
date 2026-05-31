@@ -1380,7 +1380,11 @@ pub const PathExpr = struct {
 
     fn isPathToken(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE => true,
+            // Keep in sync with Parser.isPathStart: keywords admissible as a
+            // path/field segment. `on` is needed so the host-face op
+            // `qview.on(...)` (spec/qview-protocol.md) reconstructs its dotted
+            // name including the `on` segment.
+            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON => true,
             else => false,
         };
     }

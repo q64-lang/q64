@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#07090d" />
+<title>QView · 3 platform looks side by side</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #07090d; color: #e6edf3;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  body { display: flex; flex-direction: column; height: 100%; }
+  header { padding: max(env(safe-area-inset-top), 0.6rem) 1rem 0.6rem;
+    font: 600 0.8rem ui-monospace, monospace; letter-spacing: 0.18em;
+    text-transform: uppercase; color: #5fd4ff; }
+  .row { flex: 1 1 auto; display: flex; gap: 1px; background: #1b2330; min-height: 0; }
+  .pane { flex: 1 1 0; display: flex; flex-direction: column; min-width: 0; background: #000; }
+  .pane > .cap { padding: 0.4rem 0.75rem; font: 600 0.72rem ui-monospace, monospace;
+    letter-spacing: 0.12em; text-transform: uppercase; color: #9eb0c7; background: #11161f; }
+  .pane > iframe { flex: 1 1 auto; width: 100%; border: 0; display: block; }
+  /* On a narrow screen (phone), stack vertically so each look is full-width. */
+  @media (max-width: 720px) { .row { flex-direction: column; } }
+</style>
+</head>
+<body>
+  <header>QView · self-drawn, per-platform look (iOS · Material · Desktop)</header>
+  <div class="row">
+    <div class="pane"><div class="cap">iOS</div><iframe src="./index.html?platform=ios" title="iOS look"></iframe></div>
+    <div class="pane"><div class="cap">Android · Material</div><iframe src="./index.html?platform=android" title="Material look"></iframe></div>
+    <div class="pane"><div class="cap">Desktop</div><iframe src="./index.html?platform=desktop" title="Desktop look"></iframe></div>
+  </div>
+</body>
+</html>

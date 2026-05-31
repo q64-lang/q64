@@ -1775,7 +1775,13 @@ const Parser = struct {
     /// `chan.in()` parse.
     fn isPathStart(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE => true,
+            // Keywords admissible as a field/path segment after `.`. `on` joins
+            // the list so a host-face call like `qview.on(node, event, handler)`
+            // (the QView retained Renderer op, spec/qview-protocol.md) parses as
+            // member access — the `on`-handler keyword only begins a member of a
+            // `screen { … }` block, a distinct parse position, so there is no
+            // ambiguity here.
+            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON => true,
             else => false,
         };
     }
