@@ -71,6 +71,8 @@ const CATALOG = [
   'Cut',             // 19  context-menu items
   'Copy',            // 20
   'Paste',           // 21
+  'Fader',           // 22
+  'Meter',           // 23
 ];
 
 // ---- the retained tree (generic, VALIDATED applier) --------------------------

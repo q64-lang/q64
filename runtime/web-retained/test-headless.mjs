@@ -96,5 +96,14 @@ ok(h.nodes.get(8)?.handlers.get(EVENT.press) === 8, 'grouped checkbox wired pres
 handlerFires(8, [8]); // toggle the grouped checkbox
 ok(h.nodes.get(8).attrs.get(ATTR.checked) === 0, 'grouped checkbox toggled off');
 
+// Fader drives the stereo peak meter: on_322(value) sets the meter (332)
+// value/value2/peak/peak2.
+ok(h.nodes.get(332)?.kind === KIND.meter, 'node 332 is a meter');
+const before322 = h.opLog.length;
+instance.exports.on_322(322n, BigInt(EVENT.press), 70n);
+const d322 = h.opLog.slice(before322).filter((o) => o[0] === 'set_attr' && o[1] === 332).map((o) => o[2]);
+ok(d322.includes(ATTR.value) && d322.includes(ATTR.value2) && d322.includes(ATTR.peak), 'fader updates meter value/value2/peak');
+ok(h.nodes.get(332).attrs.get(ATTR.value) === 70, 'meter left level = fader value (70)');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

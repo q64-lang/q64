@@ -23,8 +23,6 @@ state platform  = 1012 // dropdown: catalog id of the selected option (12 = iOS)
 state grouped   = 1    // the checkbox inside the group widget
 state picked    = 1020 // long-click menu: last picked item (20 = Copy)
 state stackVal  = 60   // the vertical slider in the stacks section
-state sChecked  = 1    // stacks-section checkbox
-state sToggled  = 0    // stacks-section switch
 
 fn main {
   // ---- pinned header (sticks; opaque solid bar) ----
@@ -182,24 +180,17 @@ fn main {
   qview.set_attr(9, 13, 1020)
   qview.on(9, 1, 9)
 
-  // Stacks demo (HStack 300): two VStacks — left controls, right a vertical slider.
+  // Fader + meter section (HStack 300): a VERTICAL slider on the LEFT drives a
+  // vertical STEREO PEAK METER on the right. Dragging the fader sets both meter
+  // channels + the peak hold. Each is a labeled VStack column.
   qview.create(300, 1, 100)
   qview.set_attr(300, 19, 28)
-  qview.create(310, 2, 300)
-  qview.set_attr(310, 19, 14)
-  qview.create(311, 4, 310)
-  qview.set_attr(311, 9, 1016)
-  qview.create(312, 7, 310)
-  qview.set_attr(312, 12, sChecked)
-  qview.on(312, 0, 312)
-  qview.create(313, 8, 310)
-  qview.set_attr(313, 12, sToggled)
-  qview.on(313, 0, 313)
+  // Left: "Fader" label over the vertical slider (322).
   qview.create(320, 2, 300)
   qview.set_attr(320, 19, 10)
   qview.set_attr(320, 21, 1)
   qview.create(321, 4, 320)
-  qview.set_attr(321, 9, 1007)
+  qview.set_attr(321, 9, 1022)
   qview.create(322, 10, 320)
   qview.set_attr(322, 2, 28)
   qview.set_attr(322, 3, 150)
@@ -207,6 +198,21 @@ fn main {
   qview.set_attr(322, 16, 100)
   qview.set_attr(322, 17, stackVal)
   qview.on(322, 0, 322)
+  // Right: "Meter" label over the vertical stereo peak meter (332).
+  qview.create(330, 2, 300)
+  qview.set_attr(330, 19, 10)
+  qview.set_attr(330, 21, 1)
+  qview.create(331, 4, 330)
+  qview.set_attr(331, 9, 1023)
+  qview.create(332, 15, 330)
+  qview.set_attr(332, 2, 28)
+  qview.set_attr(332, 3, 150)
+  qview.set_attr(332, 15, 0)
+  qview.set_attr(332, 16, 100)
+  qview.set_attr(332, 17, stackVal)
+  qview.set_attr(332, 23, stackVal)
+  qview.set_attr(332, 24, stackVal)
+  qview.set_attr(332, 25, stackVal)
 
   qview.present()
 }
@@ -269,18 +275,14 @@ pub fn on_9(node: i64, event: i64, value: i64) {
   qview.set_attr(9, 13, picked)
   qview.present()
 }
-pub fn on_312(node: i64, event: i64) {
-  sChecked = 1 - sChecked
-  qview.set_attr(312, 12, sChecked)
-  qview.present()
-}
-pub fn on_313(node: i64, event: i64) {
-  sToggled = 1 - sToggled
-  qview.set_attr(313, 12, sToggled)
-  qview.present()
-}
+// The fader drives the stereo peak meter: set both channels' level + peak hold
+// from the slider value. Right channel is offset a touch for a stereo feel.
 pub fn on_322(node: i64, event: i64, value: i64) {
   stackVal = value
   qview.set_attr(322, 17, stackVal)
+  qview.set_attr(332, 17, stackVal)
+  qview.set_attr(332, 23, stackVal * 9 / 10)
+  qview.set_attr(332, 24, stackVal)
+  qview.set_attr(332, 25, stackVal * 9 / 10)
   qview.present()
 }

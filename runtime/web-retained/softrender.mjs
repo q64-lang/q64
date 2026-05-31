@@ -34,7 +34,7 @@ const CATALOG_BASE = 1000;
 const CATALOG = [
   'Widget gallery', 'Label', 'Button', 'Checkbox', 'Switch', 'Radio A', 'Radio B',
   'Slider', 'Progress', 'Dropdown', 'Box', 'Tap +1', 'iOS', 'Android', 'Windows',
-  'Linux', 'Grouped', 'In a group', 'Long Click', 'Cut', 'Copy', 'Paste',
+  'Linux', 'Grouped', 'In a group', 'Long Click', 'Cut', 'Copy', 'Paste', 'Fader', 'Meter',
 ];
 
 // ---- build the retained tree from the real wasm -----------------------------
