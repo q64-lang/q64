@@ -150,6 +150,10 @@ const GEOM = { [ATTR.x]: 'x', [ATTR.y]: 'y', [ATTR.w]: 'w', [ATTR.h]: 'h' };
 // so content taller than the screen is reachable without native scroll fighting
 // the slider/long-press gestures. The pinned top bar opts out (drawn unshifted).
 let scrollY = 0, contentH = 0, viewportH = 0;
+// Horizontal centering: when the viewport is wider than the content (iPad,
+// landscape, desktop), shift everything right by offsetX so the UI sits centered
+// instead of hugging the left. 0 on a phone where content == viewport width.
+let offsetX = 0, contentW = 0;
 const SCROLL_BOTTOM_PAD = 40;   // extra room past content so the last widget fully clears
 const renderCtx = {
   pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
@@ -158,6 +162,7 @@ const renderCtx = {
     let v = lay ? lay[g] : node.attrs.get(a);
     v = v === undefined ? dflt : Number(v);
     if (a === ATTR.y && !node._pinned) v -= scrollY;     // translate scene up
+    if (a === ATTR.x) v += offsetX;                       // center horizontally
     return v;
   },
   color: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : unpackColor(v); },
@@ -236,9 +241,10 @@ function glyphForCatalog(textId) {
 let headerH = 0;            // bottom of the pinned header band (layout space)
 function layout() {
   layoutMap = computeLayout(scene, layoutCtx);
-  contentH = 0; headerH = 0;
+  contentH = 0; headerH = 0; contentW = 0;
   for (const [id, rc] of layoutMap) {
     contentH = Math.max(contentH, rc.y + rc.h);
+    contentW = Math.max(contentW, rc.x + rc.w);
     const n = nodes.get(id);
     if (n && n._pinned) headerH = Math.max(headerH, rc.y + rc.h);
   }
@@ -250,7 +256,12 @@ function layout() {
 // The GPU host and the soft renderer are two such paths over the same layout.
 // ===========================================================================
 function render() {
-  const cv = document.getElementById('gpu'); viewportH = cv ? cv.clientHeight : 0;
+  const cv = document.getElementById('gpu');
+  viewportH = cv ? cv.clientHeight : 0;
+  const viewportW = cv ? cv.clientWidth : 0;
+  // Center the content block when the viewport is wider than it (iPad/desktop);
+  // the layout was built left-anchored (x from 0), so this shifts the whole UI.
+  offsetX = Math.max(0, Math.round((viewportW - contentW) / 2));
   // Allow scrolling until the content bottom clears the viewport with a comfortable
   // bottom margin, so the last widget (e.g. the vertical fader) is never cut off.
   const maxScroll = Math.max(0, contentH + SCROLL_BOTTOM_PAD - viewportH);
