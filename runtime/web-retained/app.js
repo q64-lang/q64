@@ -73,6 +73,8 @@ const CATALOG = [
   'Paste',           // 21
   'Fader',           // 22
   'Meter',           // 23
+  'Pan',             // 24
+  'Volume',          // 25
 ];
 
 // ---- the retained tree (generic, VALIDATED applier) --------------------------

@@ -16,3 +16,4 @@ import './widgets/dropdown.js';
 import './widgets/divider.js';
 import './widgets/group.js';
 import './widgets/meter.js';
+import './widgets/knob.js';
