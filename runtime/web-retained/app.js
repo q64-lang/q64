@@ -230,7 +230,9 @@ async function main() {
     const w = widgetFor(hit.kind);
     if (w && typeof w.value === 'function') {
       // Ranged control: set value to where you touched (down = jump-to), and arm
-      // dragging so the thumb tracks the finger.
+      // dragging so the thumb tracks the finger. preventDefault + pointer capture
+      // keep the whole drag ours (no scroll-steal when it drifts vertically).
+      ev.preventDefault();
       dragNode = hit;
       try { canvas.setPointerCapture(ev.pointerId); } catch {}
       dispatch(hit, EVENT.input, w.value(hit, px, py, renderCtx));
@@ -239,14 +241,17 @@ async function main() {
     pressedId = hit.id; render();                       // immediate pressed-state flash
     dispatch(hit, EVENT.press);                         // wasm mutates + presents
     setTimeout(() => { pressedId = null; render(); }, 120);
-  });
+  }, { passive: false });
 
   canvas.addEventListener('pointermove', (ev) => {
     if (!dragNode) return;
+    ev.preventDefault();
+    // Only the x drives the value; vertical drift (e.g. toward a label) is
+    // ignored, so the drag holds anywhere on the canvas once captured.
     const [px, py] = localXY(ev);
     const w = widgetFor(dragNode.kind);
     dispatch(dragNode, EVENT.input, w.value(dragNode, px, py, renderCtx));
-  });
+  }, { passive: false });
 
   const endDrag = (ev) => {
     if (!dragNode) return;
