@@ -157,7 +157,6 @@ fn main {
   // Group section (group 6): a titled panel holding a label + checkbox column.
   qview.create(6, 14, 100)
   qview.set_attr(6, 2, 348)
-  qview.set_attr(6, 3, 92)
   qview.set_attr(6, 9, 1016)
   // its content VStack (190), offset below the heading.
   qview.create(190, 2, 6)
