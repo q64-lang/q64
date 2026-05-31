@@ -287,6 +287,31 @@ fn main {
   qview.create(232, 4, 100)         // live byte length (incl newlines)
   qview.set_attr(232, 9, 0)
 
+  // ---- Icons: Lucide vector icons (SDF). An icon+label button, an icon-only
+  //      button, and a standalone icon. Referenced by integer id (ATTR.icon=26),
+  //      so no strings needed. ----
+  qview.create(239, 13, 100)        // divider
+  qview.set_attr(239, 2, 348)
+  qview.set_attr(239, 3, 1)
+  qview.create(241, 4, 100)         // label "Icons"
+  qview.set_attr(241, 9, 1032)
+  qview.create(240, 1, 100)         // HStack
+  qview.set_attr(240, 19, 12)       // gap
+  qview.set_attr(240, 21, 1)        // align center
+  qview.create(242, 6, 240)         // button: search icon + "Search"
+  qview.set_attr(242, 26, 0)        // icon = search
+  qview.set_attr(242, 9, 1033)      // label "Search"
+  qview.on(242, 0, 242)
+  qview.create(243, 6, 240)         // icon-only button: trash
+  qview.set_attr(243, 26, 5)        // icon = trash
+  qview.create(244, 19, 240)        // standalone icon: heart
+  qview.set_attr(244, 2, 28)
+  qview.set_attr(244, 3, 28)
+  qview.set_attr(244, 26, 7)        // icon = heart
+  qview.create(245, 20, 240)        // animated wait cursor (spinner)
+  qview.set_attr(245, 2, 32)
+  qview.set_attr(245, 3, 32)
+
   qview.present()
 }
 // One branchless handler per control (the on_<id> dispatch shape).
@@ -411,5 +436,11 @@ pub fn on_200(node: i64, event: i64, text: str) {
 // show its byte length in label 232.
 pub fn on_230(node: i64, event: i64, text: str) {
   qview.set_attr(232, 9, text.len)
+  qview.present()
+}
+// Icon button (Search): bump the tap counter to show an icon button is wired.
+pub fn on_242(node: i64, event: i64) {
+  taps = taps + 1
+  qview.set_attr(21, 9, taps)
   qview.present()
 }

@@ -138,8 +138,13 @@ export function endFrame(frame) { frame.pass.end(); device.queue.submit([frame.e
 export function setScissor(pass, rect) {
   const cw = ctx.canvas.width, ch = ctx.canvas.height;
   if (!rect) { pass.setScissorRect(0, 0, cw, ch); return; }
-  const x = Math.max(0, Math.round(rect.x * DPR));
-  const y = Math.max(0, Math.round(rect.y * DPR));
+  // Clamp the ORIGIN to the target too, not just the size. WebGPU requires
+  // x+w ≤ width and y+h ≤ height; if a clip rect is off-screen (e.g. a text
+  // field scrolled below the viewport, y > height) an unclamped x/y makes the
+  // rect invalid → the render pass errors → a blank frame. Clamping x/y to
+  // [0, cw]/[0, ch] keeps it valid (a degenerate 0-size rect when off-screen).
+  const x = Math.max(0, Math.min(cw, Math.round(rect.x * DPR)));
+  const y = Math.max(0, Math.min(ch, Math.round(rect.y * DPR)));
   const w = Math.max(0, Math.min(cw - x, Math.round(rect.w * DPR)));
   const h = Math.max(0, Math.min(ch - y, Math.round(rect.h * DPR)));
   pass.setScissorRect(x, y, w, h);
@@ -171,24 +176,13 @@ function edt(seed, w, h) {
   return out;
 }
 
-export function sdfTexture(text, sizePx = 17) {
-  const SS = 3;
-  const fontPx = Math.round(sizePx * DPR) * SS;
-  const spread = Math.round(6 * DPR) * SS;
-  const oc = new OffscreenCanvas(8, 8);
-  let g = oc.getContext('2d');
-  g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
-  const hw = Math.ceil(g.measureText(text).width) + spread * 2;
-  const hh = fontPx + spread * 2;
-  oc.width = hw; oc.height = hh;
-  g = oc.getContext('2d');
-  g.clearRect(0, 0, hw, hh);
-  g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
-  g.fillStyle = '#fff'; g.textBaseline = 'top';
-  g.fillText(text, spread, spread);
-  const a = g.getImageData(0, 0, hw, hh).data;
-  const inside = new Uint8Array(hw * hh), outside = new Uint8Array(hw * hh);
-  for (let i = 0; i < hw * hh; i++) { const on = a[i * 4 + 3] > 127 ? 1 : 0; inside[i] = on; outside[i] = on ? 0 : 1; }
+// Turn a supersampled `inside` coverage mask (hw×hh) into a downsampled SDF
+// `r8unorm` texture (the signed distance to the shape edge, normalized around
+// 0.5). Shared by text glyphs and icons. `pad` (CSS px) is the spread baked
+// around the ink on every side. ink size = (w or h) - 2*pad.
+function buildSdf(inside, hw, hh, spread, SS) {
+  const outside = new Uint8Array(hw * hh);
+  for (let i = 0; i < hw * hh; i++) outside[i] = inside[i] ? 0 : 1;
   const dOut = edt(inside, hw, hh);
   const dIn = edt(outside, hw, hh);
   const sdfHi = new Float32Array(hw * hh);
@@ -205,9 +199,53 @@ export function sdfTexture(text, sizePx = 17) {
   }
   const tex = device.createTexture({ size: [w, h], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
   device.queue.writeTexture({ texture: tex }, bytes, { bytesPerRow: w }, [w, h]);
-  // `pad` (CSS px) is the transparent SDF spread baked around the glyph ink on
-  // every side. Centered text ignores it (symmetric); left-aligned text + a
-  // caret must trim it so the ink starts at the box edge and the caret hugs the
-  // text. ink advance = w - 2*pad.
   return { tex, view: tex.createView(), w: w / DPR, h: h / DPR, pad: spread / SS / DPR };
+}
+
+export function sdfTexture(text, sizePx = 17) {
+  const SS = 3;
+  const fontPx = Math.round(sizePx * DPR) * SS;
+  const spread = Math.round(6 * DPR) * SS;
+  const oc = new OffscreenCanvas(8, 8);
+  let g = oc.getContext('2d');
+  g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
+  const hw = Math.ceil(g.measureText(text).width) + spread * 2;
+  const hh = fontPx + spread * 2;
+  oc.width = hw; oc.height = hh;
+  g = oc.getContext('2d');
+  g.clearRect(0, 0, hw, hh);
+  g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
+  g.fillStyle = '#fff'; g.textBaseline = 'top';
+  g.fillText(text, spread, spread);
+  const a = g.getImageData(0, 0, hw, hh).data;
+  const inside = new Uint8Array(hw * hh);
+  for (let i = 0; i < hw * hh; i++) inside[i] = a[i * 4 + 3] > 127 ? 1 : 0;
+  return buildSdf(inside, hw, hh, spread, SS);
+}
+
+// Rasterize a Lucide-style icon (a list of stroked elements on a 24×24 viewBox,
+// stroke-2, round caps/joins) to an SDF texture at `sizePx`, reusing the glyph
+// pipeline — so an icon draws as a tinted quad and stays crisp when scaled.
+// `elements`: [['path', d] | ['circle', cx, cy, r] | ['line', x1, y1, x2, y2]].
+export function iconSdf(elements, sizePx = 22) {
+  const SS = 3;
+  const spread = Math.round(6 * DPR) * SS;
+  const S = Math.round(sizePx * DPR) * SS;       // icon ink size (supersampled device px)
+  const hw = S + spread * 2, hh = S + spread * 2;
+  const oc = new OffscreenCanvas(hw, hh);
+  const g = oc.getContext('2d');
+  g.clearRect(0, 0, hw, hh);
+  g.translate(spread, spread);
+  g.scale(S / 24, S / 24);                       // 24×24 viewBox → ink size
+  g.strokeStyle = '#fff';
+  g.lineWidth = 2; g.lineCap = 'round'; g.lineJoin = 'round';
+  for (const el of elements) {
+    if (el[0] === 'path') g.stroke(new Path2D(el[1]));
+    else if (el[0] === 'circle') { g.beginPath(); g.arc(el[1], el[2], el[3], 0, Math.PI * 2); g.stroke(); }
+    else if (el[0] === 'line') { g.beginPath(); g.moveTo(el[1], el[2]); g.lineTo(el[3], el[4]); g.stroke(); }
+  }
+  const a = g.getImageData(0, 0, hw, hh).data;
+  const inside = new Uint8Array(hw * hh);
+  for (let i = 0; i < hw * hh; i++) inside[i] = a[i * 4 + 3] > 110 ? 1 : 0;
+  return buildSdf(inside, hw, hh, spread, SS);
 }

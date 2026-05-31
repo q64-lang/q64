@@ -23,13 +23,34 @@ register(KIND.button, {
     const pressed = r.isPressed(node.id);
     const fill = pressed ? r.theme.accentDim : r.color(node, ATTR.fill, r.theme.accent);
     r.drawPrim(r.pass, x, y, w, h, fill, { radius, border: 0 });
+    const ink = r.theme.accentInk;
     const lbl = r.textFor(node);
-    if (lbl) r.drawPrim(r.pass, x + (w - lbl.w) / 2, y + (h - lbl.h) / 2, lbl.w, lbl.h, r.theme.accentInk, { texView: lbl.view });
+    const iconId = node.attrs.get(ATTR.icon);
+    const icon = iconId !== undefined ? r.iconGlyph(iconId, 20) : null;
+    if (icon && lbl) {
+      // Icon + label, centered as a group (icon left of the text).
+      const GAP = 8;
+      const total = icon.w + GAP + lbl.w;
+      let cx = x + (w - total) / 2;
+      r.drawPrim(r.pass, cx, y + (h - icon.h) / 2, icon.w, icon.h, ink, { texView: icon.view });
+      cx += icon.w + GAP;
+      r.drawPrim(r.pass, cx, y + (h - lbl.h) / 2, lbl.w, lbl.h, ink, { texView: lbl.view });
+    } else if (icon) {
+      r.drawPrim(r.pass, x + (w - icon.w) / 2, y + (h - icon.h) / 2, icon.w, icon.h, ink, { texView: icon.view });
+    } else if (lbl) {
+      r.drawPrim(r.pass, x + (w - lbl.w) / 2, y + (h - lbl.h) / 2, lbl.w, lbl.h, ink, { texView: lbl.view });
+    }
   },
   hit(node, px, py, r) {
     const x = r.attr(node, ATTR.x, 0), y = r.attr(node, ATTR.y, 0);
     const w = r.attr(node, ATTR.w, 0), h = r.attr(node, ATTR.h, 0);
     return px >= x && px <= x + w && py >= y && py <= y + h;
   },
-  measure(node, r) { const l = r.textFor(node); const w = l ? l.w + 40 : 120; return { w, h: 48 }; },
+  measure(node, r) {
+    const l = r.textFor(node);
+    const hasIcon = node.attrs.get(ATTR.icon) !== undefined;
+    if (l && hasIcon) return { w: 20 + 8 + l.w + 36, h: 48 };  // icon + gap + label + padding
+    if (hasIcon) return { w: 48, h: 48 };                      // icon-only square
+    return { w: l ? l.w + 40 : 120, h: 48 };
+  },
 });

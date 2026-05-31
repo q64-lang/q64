@@ -36,7 +36,12 @@
      canvas can never shrink below it — clientHeight stays pinned at the old big
      value, so maxBound() goes too small and the page can't scroll to the bottom
      after the window is made smaller. */
-  #gpu { flex: 1 1 auto; width: 100%; min-width: 0; min-height: 0; display: block; touch-action: none; }
+  /* flex-basis:0 (not auto) is essential: with `auto`, the flex basis is the
+     canvas's INTRINSIC height = its height ATTRIBUTE, which resize() rewrites
+     every frame — so a ResizeObserver re-fires from our own resize and loops
+     (load stays blank, scroll vibrates). basis:0 sizes the canvas purely from
+     the flex container, independent of the attribute. */
+  #gpu { flex: 1 1 0; width: 100%; min-width: 0; min-height: 0; display: block; touch-action: none; }
   /* Hidden text-capture input for text_input fields: invisible but focusable, so
      tapping a field can summon the iOS/Android soft keyboard + IME. We draw the
      text + caret ourselves; this only feeds keystrokes. font-size:16px avoids
@@ -44,8 +49,15 @@
      PINNED top-left (fixed, always in the visible viewport) so iOS never
      auto-scrolls the page to "reveal" the focused input — WE own the field's
      on-screen position via our scroll. 1px so it can't be seen or interacted. */
-  #kbd, #kbdm { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0;
-    pointer-events: none; border: 0; padding: 0; margin: 0; resize: none;
+  /* Invisible (transparent colors, not opacity:0) but a REAL, on-screen focus
+     target POSITIONED OVER THE FIELD by JS (positionKbd). iPhone Safari dismisses
+     the keyboard if the focused input isn't where the interaction is; pinning it
+     far away (top-left) made iOS bail once the keyboard settled. pointer-events:
+     none so taps still reach the canvas (we hit-test + place the caret). The
+     fixed top/left here are just a fallback before positionKbd runs. */
+  #kbd, #kbdm { position: fixed; top: 0; left: 0; width: 12px; height: 18px;
+    border: 0; padding: 0; margin: 0; resize: none; outline: none; pointer-events: none;
+    -webkit-appearance: none; appearance: none;
     background: transparent; color: transparent; caret-color: transparent; font-size: 16px; }
   /* Bring-up status line (host/wasm/WebGPU). Commented out — not user-facing.
      Re-enable with the #log div below to see load diagnostics on-screen. */
