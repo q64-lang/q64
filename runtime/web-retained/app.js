@@ -350,6 +350,22 @@ function replaceSelection(node, repl) {
   dispatchText(node, EVENT.input, el.value);
 }
 
+// Select the whitespace-delimited word around index `idx` in the field. Returns
+// true if a non-empty word was selected. Used by long-press (the reliable
+// select gesture, since a drag fights the keyboard-open lift).
+function selectWordAt(node, idx) {
+  const el = fieldEl(node);
+  if (!el) return false;
+  const v = el.value;
+  if (!v) return false;
+  let s = Math.min(idx, v.length), e = s;
+  const word = (c) => c && /\S/.test(c);
+  while (s > 0 && word(v[s - 1])) s--;
+  while (e < v.length && word(v[e])) e++;
+  if (e > s) { try { el.setSelectionRange(s, e); } catch {} return true; }
+  return false;
+}
+
 // Perform the chosen edit action (clipboard is async + gesture-gated).
 async function doEdit(id) {
   const node = editNode;
@@ -850,11 +866,17 @@ async function main() {
       focusField(hit, px, py);
       textDrag = { node: hit, anchor, startX: px, startY: py };
       try { canvas.setPointerCapture(ev.pointerId); } catch {}
-      // A long-press without dragging raises the edit menu at the finger (so you
-      // can Paste / Select All on a field with no selection).
+      // Long-press selects the WORD under the finger and raises the edit menu —
+      // the reliable select gesture (a drag fights the keyboard-open lift). With
+      // no word (empty field) it's just the Paste / Select All menu.
       cancelLongPress();
       longPressXY = [px, py];
-      longPressTimer = setTimeout(() => { longPressTimer = null; openEditMenu(hit, px, py); }, LONG_PRESS_MS);
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        const idx = wt && wt.caretAt ? wt.caretAt(hit, px, py, renderCtx) : 0;
+        selectWordAt(hit, idx);
+        openEditMenu(hit, px, py);
+      }, LONG_PRESS_MS);
       return;
     }
 
@@ -1022,18 +1044,21 @@ async function main() {
     const el = document.getElementById(id);
     if (el) { el.addEventListener('input', onKbdInput); el.addEventListener('blur', onKbdBlur); }
   }
-  // The soft keyboard shrinks the visual viewport; track that inset and keep the
-  // focused field above it. (No-op on desktop, where visualViewport ~= layout.)
+  // The soft keyboard shrinks the visual viewport. ONLY track the inset while a
+  // field is focused — otherwise iPad's dynamic toolbar makes visualViewport.height
+  // fluctuate during a normal scroll, which would oscillate kbInset -> maxBound()
+  // and vibrate the rubber-band. After the one-time lift, kbInset is frozen so
+  // maxBound() stays stable while scrolling with the keyboard up. No 'scroll'
+  // listener (it fires continuously on iPad and isn't needed).
   if (window.visualViewport) {
-      const onVV = () => {
-      kbInset = viewportInset();
-      // Lift the field only on the FIRST keyboard-open resize (latched); later
-      // resizes (predictive bar, etc.) just update the inset + redraw, no jump.
-      if (focusedId !== null && !kbScrolled && kbInset > 0) liftFocusedOnce();
-      else render();
+    const onVV = () => {
+      if (focusedId === null) { if (kbInset !== 0) { kbInset = 0; render(); } return; }
+      if (!kbScrolled) {
+        kbInset = viewportInset();
+        if (kbInset > 0) liftFocusedOnce(); else render();
+      }
     };
     window.visualViewport.addEventListener('resize', onVV);
-    window.visualViewport.addEventListener('scroll', onVV);
   }
 
   // Re-fit on a viewport change: rebuild the backing store, refresh viewportH so
@@ -1055,5 +1080,13 @@ async function main() {
   // Keep the window listeners too (older Safari, desktop) — refit is idempotent.
   window.addEventListener('resize', refit);
   window.addEventListener('orientationchange', () => { refit(); requestAnimationFrame(refit); });
+
+  // First-paint insurance: the initial present() can render before the canvas
+  // has its final laid-out size on iPad (blank until a touch nudged a redraw).
+  // Re-fit on the next frame, after load, and a beat later so the first frame is
+  // drawn at the real size without needing a touch.
+  requestAnimationFrame(refit);
+  window.addEventListener('load', refit);
+  setTimeout(refit, 120);
 }
 main();
