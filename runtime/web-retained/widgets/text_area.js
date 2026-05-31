@@ -85,28 +85,41 @@ register(KIND.text_area, {
     const maxLines = Math.max(1, Math.floor((g.h - 2 * PADV) / LINE));
 
     const lines = showStr ? wrap(r, showStr, innerW) : [{ text: '', start: 0 }];
+    const sel = focused ? r.selRange(node) : null;
+    const hasSel = sel && sel.end > sel.start && value;
+    const hl = hasSel ? [r.theme.accent[0], r.theme.accent[1], r.theme.accent[2], 0.3] : null;
+
     r.clip({ x: g.x, y: g.y, w: g.w, h: g.h });
     for (let i = 0; i < lines.length && i < maxLines; i++) {
-      const line = lines[i].text;
-      if (!line) continue;
-      const glyph = r.glyphForStr(line, FONT);
+      const li = lines[i];
+      const ly = g.y + PADV + i * LINE;
+      // Per-row selection highlight (the slice of this line within the range).
+      if (hasSel) {
+        const rs = Math.max(sel.start, li.start);
+        const re = Math.min(sel.end, li.start + li.text.length);
+        if (re > rs) {
+          const hx0 = innerLeft + advance(r, li.text.slice(0, rs - li.start));
+          const hx1 = innerLeft + advance(r, li.text.slice(0, re - li.start));
+          r.drawPrim(r.pass, hx0, ly + (LINE - FONT) / 2 - 1, Math.max(1, hx1 - hx0), FONT + 2, hl, { radius: 2 });
+        }
+      }
+      if (!li.text) continue;
+      const glyph = r.glyphForStr(li.text, FONT);
       if (!glyph) continue;
       const pad = glyph.pad ?? 0;
-      const ly = g.y + PADV + i * LINE;
       r.drawPrim(r.pass, innerLeft - pad, ly + (LINE - glyph.h) / 2, glyph.w, glyph.h, ink, { texView: glyph.view });
     }
     r.unclip();
 
-    // Caret at the element's selectionStart (mapped to row + x), else end.
-    if (focused && r.caretVisible()) {
-      const sel = r.selStart(node);
-      const idx = sel != null ? Math.min(sel, value.length) : value.length;
+    // Caret at the element's selectionStart (row + x), hidden while selecting.
+    if (focused && !hasSel && r.caretVisible()) {
+      const s = r.selStart(node);
+      const idx = s != null ? Math.min(s, value.length) : value.length;
       const row = value ? Math.min(rowOf(lines, idx), maxLines - 1) : 0;
       const colX = value ? advance(r, value.slice(lines[row].start, idx)) : 0;
       const cx = innerLeft + colX;
       const cy = g.y + PADV + row * LINE;
-      const ch = FONT;
-      r.drawPrim(r.pass, cx, cy + (LINE - ch) / 2, 2, ch, r.theme.fg, {});
+      r.drawPrim(r.pass, cx, cy + (LINE - FONT) / 2, 2, FONT, r.theme.fg, {});
     }
   },
   hit(node, px, py, r) {

@@ -15,7 +15,7 @@ try { ({ BUILD } = await import('./version.js')); } catch {}
 // Snap upload config (api origin + snap:create token), filled by the deploy.
 let SNAP = { api: '', token: '' };
 try { ({ SNAP } = await import('./snap-config.js')); } catch {}
-import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, setScissor, DPR } from './gpu.js';
+import { initGPU, drawPrim, sdfTexture, iconSdf, beginFrame, endFrame, setScissor, DPR } from './gpu.js';
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
 import { Scene } from './scene.js';
@@ -84,6 +84,27 @@ const CATALOG = [
   'has @',           // 29  validation status: contains '@'
   'no @ yet',        // 30  validation status: missing '@'
   'Notes',           // 31  text_area section label
+  'Icons',           // 32  icon section label
+  'Search',          // 33  icon button label
+];
+
+// Vector-icon catalog (Lucide path data, ISC). Referenced by integer id via
+// ATTR.icon — no strings cross the wasm boundary. Each icon is a 24×24-viewBox
+// list of stroked elements; iconSdf rasterizes + SDFs it (see gpu.js). Only the
+// icons the app uses are bundled (curated starter set; grow as needed).
+//   0 search  1 x  2 check  3 chevron-down  4 plus  5 trash  6 settings
+//   7 heart   8 menu  9 arrow-left
+const ICONS = [
+  [['circle', 11, 11, 8], ['line', 21, 21, 16.65, 16.65]],
+  [['line', 18, 6, 6, 18], ['line', 6, 6, 18, 18]],
+  [['path', 'M20 6 9 17l-5-5']],
+  [['path', 'm6 9 6 6 6-6']],
+  [['line', 5, 12, 19, 12], ['line', 12, 5, 12, 19]],
+  [['line', 3, 6, 21, 6], ['path', 'M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'], ['path', 'M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2']],
+  [['path', 'M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z'], ['circle', 12, 12, 3]],
+  [['path', 'M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z']],
+  [['line', 4, 12, 20, 12], ['line', 4, 6, 20, 6], ['line', 4, 18, 20, 18]],
+  [['line', 19, 12, 5, 12], ['path', 'm12 19-7-7 7-7']],
 ];
 
 // ---- the retained tree (generic, VALIDATED applier) --------------------------
@@ -104,6 +125,22 @@ let focusedId = null;        // the text_input node id with keyboard focus, or n
 let caretOn = true;          // caret blink phase (visible) while a field is focused
 let blinkTimer = null;       // setInterval handle driving the blink
 let kbScrolled = false;      // have we already lifted the focused field above the keyboard?
+
+// --- TEMP diagnostic: a small ring log of focus-related events, dumped into the
+// header when the hidden input blurs, so we can read on iPhone what fired right
+// before the keyboard dropped. Remove once the iPhone keyboard issue is found.
+// iPhone soft-keyboard diagnostic (the keyboard drops ~350ms after focus on
+// iPhone; root cause still open). Flip DIAG = true to re-enable: logev() records
+// focus events into a ring buffer and onKbdBlur paints them as a big on-canvas
+// overlay (Snap-able) so the sequence before the drop is readable on-device.
+const DIAG = false;
+let evlog = [];
+let diagText = '';   // when set (DIAG), render() draws it as a big on-canvas overlay
+function logev(w) {
+  if (!DIAG) return;
+  evlog.push(Math.round(performance.now() % 100000) + ':' + w);
+  if (evlog.length > 12) evlog.shift();
+}
 let instance;
 
 // Host→app text scratch: when the user types, the host writes the field's UTF-8
@@ -141,6 +178,7 @@ function ops() {
     // present() = the tree just changed -> relayout (Phase 1) then render (Phase 2).
     layout();
     render();
+    ensureSpin();                 // a spinner may have just appeared -> start the RAF loop
     const m = scene.drainMuts();
     if (m.length) log('mutate: ' + m.join(', '));
   });
@@ -167,6 +205,30 @@ function ops() {
 const decoder = new TextDecoder();
 function readUtf8(ptr, len) {
   return decoder.decode(new Uint8Array(instance.exports.memory.buffer, Number(ptr), Number(len)));
+}
+
+// ---- animation loop -------------------------------------------------------
+// The retained renderer is event-driven; a spinner needs continuous frames.
+// While any spinner node is in the tree, run a requestAnimationFrame loop that
+// re-renders (render() stamps renderCtx.now). It self-stops when none remain, so
+// the page idles when nothing is animating. ensureSpin() (re)starts it after a
+// present() in case a spinner was just added.
+let spinRAF = 0;
+function hasSpinner() {
+  for (const n of nodes.values()) if (n.kind === KIND.spinner) return true;
+  return false;
+}
+function spinTick() {
+  spinRAF = 0;
+  // Pause the whole loop while a text field is focused: the continuous re-render
+  // disrupts the iOS soft keyboard (it dismisses on text entry). The spinner just
+  // freezes during typing — resumed by ensureSpin() on blur.
+  if (focusedId !== null) return;
+  render();
+  if (hasSpinner()) spinRAF = requestAnimationFrame(spinTick);
+}
+function ensureSpin() {
+  if (!spinRAF && hasSpinner() && focusedId === null) spinRAF = requestAnimationFrame(spinTick);
 }
 
 // ATTR.surface role tag -> theme token key (the translucent material fills).
@@ -209,6 +271,7 @@ function viewportInset() {
 // Scroll the focused field above the keyboard (into the visible region). Called
 // on focus and whenever the visual viewport changes (keyboard open/close).
 function ensureFocusedVisible() {
+  logev('lift');
   if (focusedId === null) return;
   const cv = document.getElementById('gpu');
   const rc = layoutMap.get(focusedId);
@@ -220,6 +283,8 @@ function ensureFocusedVisible() {
   if (fieldBottom > visibleBottom - margin) {
     scrollY = Math.max(0, Math.min(scrollY + fieldBottom - (visibleBottom - margin), maxBound()));
   }
+  const fn = nodes.get(focusedId);
+  if (fn) positionKbd(fn);                        // keep the hidden input over the lifted field
   render();
 }
 const renderCtx = {
@@ -247,6 +312,7 @@ const renderCtx = {
   },
   textFor: (node) => glyphFor(node),
   glyphForId: (textId) => glyphForCatalog(textId),
+  iconGlyph: (iconId, sizePx) => iconGlyph(iconId, sizePx),
   isPressed: (id) => id === pressedId,
   isOpen: (id) => id === openDropdownId,
   // --- text_input helpers (host owns the editable value) ---
@@ -261,6 +327,14 @@ const renderCtx = {
     if (node.id !== focusedId) return null;
     const el = fieldEl(node);
     return el && el.selectionStart != null ? el.selectionStart : null;
+  },
+  // The normalized selection range {start, end} of the focused field, or null.
+  // Collapsed (start === end) means just a caret, no highlight.
+  selRange: (node) => {
+    if (node.id !== focusedId) return null;
+    const el = fieldEl(node);
+    if (!el || el.selectionStart == null || el.selectionEnd == null) return null;
+    return { start: Math.min(el.selectionStart, el.selectionEnd), end: Math.max(el.selectionStart, el.selectionEnd) };
   },
   // Clip subsequent draws to `rect` (CSS px, screen coords) intersected with the
   // current scroll-region clip; call unclip() to restore. Lets a field clip its
@@ -297,6 +371,87 @@ let openDropdownId = null;
 // A context menu (long-press / right-click) raised at a point: its popup spec +
 // the node it belongs to. Separate from openDropdownId (anchored differently).
 let contextSpec = null, contextNode = null;
+// The text-field edit menu (Cut/Copy/Paste/Select All): its popup spec + the
+// field it acts on. Reuses the popup primitive but routes the choice to
+// clipboard actions (client-side), not a wasm dispatch.
+let editMenu = null, editNode = null;
+const EDIT = { cut: 1, copy: 2, paste: 3, selectAll: 4 };
+
+// Build the edit-menu items for a field: Cut/Copy only with a selection; Paste
+// always; Select All when there's text not already fully selected.
+function buildEditItems(node) {
+  const el = fieldEl(node);
+  const value = renderCtx.textValue(node);
+  const hasSel = el && el.selectionStart !== el.selectionEnd;
+  const allSel = el && el.selectionStart === 0 && el.selectionEnd === value.length;
+  const items = [];
+  if (hasSel) {
+    items.push({ id: EDIT.cut, glyph: glyphForStr('Cut') });
+    items.push({ id: EDIT.copy, glyph: glyphForStr('Copy') });
+  }
+  items.push({ id: EDIT.paste, glyph: glyphForStr('Paste') });
+  if (value && !allSel) items.push({ id: EDIT.selectAll, glyph: glyphForStr('Select All') });
+  return items;
+}
+
+// Open the edit menu anchored at (px, py) — the touch point, so it lands on the
+// field (above the keyboard) regardless of where the field scrolled.
+function openEditMenu(node, px, py) {
+  const items = buildEditItems(node);
+  if (!items.length) return;
+  editNode = node;
+  editMenu = { anchor: { x: px, y: py, w: 0, h: 0 }, items, width: 150 };
+  render();
+}
+
+// Replace the field's current selection with `repl` via the hidden element, then
+// sync the host value + notify the handler (an `input` event).
+function replaceSelection(node, repl) {
+  const el = fieldEl(node);
+  if (!el) return;
+  const s = Math.min(el.selectionStart ?? 0, el.selectionEnd ?? 0);
+  const e = Math.max(el.selectionStart ?? 0, el.selectionEnd ?? 0);
+  try { el.setRangeText(repl, s, e, 'end'); } catch { el.value = el.value.slice(0, s) + repl + el.value.slice(e); }
+  (node._text ??= {})[TEXTKEY.value] = el.value;
+  dispatchText(node, EVENT.input, el.value);
+}
+
+// Select the whitespace-delimited word around index `idx` in the field. Returns
+// true if a non-empty word was selected. Used by long-press (the reliable
+// select gesture, since a drag fights the keyboard-open lift).
+function selectWordAt(node, idx) {
+  const el = fieldEl(node);
+  if (!el) return null;
+  const v = el.value;
+  if (!v) return null;
+  let s = Math.min(idx, v.length), e = s;
+  const word = (c) => c && /\S/.test(c);
+  while (s > 0 && word(v[s - 1])) s--;
+  while (e < v.length && word(v[e])) e++;
+  if (e > s) { try { el.setSelectionRange(s, e); } catch {} return { start: s, end: e }; }
+  return null;
+}
+
+// Perform the chosen edit action (clipboard is async + gesture-gated).
+async function doEdit(id) {
+  const node = editNode;
+  editMenu = null; editNode = null;
+  if (!node) { render(); return; }
+  const el = fieldEl(node);
+  if (el) {
+    const s = Math.min(el.selectionStart, el.selectionEnd), e = Math.max(el.selectionStart, el.selectionEnd);
+    if (id === EDIT.cut || id === EDIT.copy) {
+      try { await navigator.clipboard.writeText(el.value.slice(s, e)); } catch {}
+      if (id === EDIT.cut) replaceSelection(node, '');
+    } else if (id === EDIT.paste) {
+      let t = ''; try { t = await navigator.clipboard.readText(); } catch {}
+      if (t) replaceSelection(node, t);
+    } else if (id === EDIT.selectAll) {
+      try { el.setSelectionRange(0, el.value.length); } catch {}
+    }
+  }
+  render();
+}
 
 // The menu spec for the currently-open node (or null) — built fresh each use so
 // it reflects current selection/geometry. The host injects the viewport (CSS px)
@@ -338,6 +493,17 @@ function glyphForStr(str, sizePx = 17) {
   return strGlyphCache.get(key);
 }
 
+// An icon's SDF texture, cached by "iconId:size". Returns null for an unknown
+// id. Drawn as a tinted quad (like a glyph); resolution-independent.
+const iconGlyphCache = new Map();
+function iconGlyph(iconId, sizePx = 22) {
+  const n = Number(iconId);
+  if (!(n >= 0 && n < ICONS.length)) return null;
+  const key = `${n}:${sizePx}`;
+  if (!iconGlyphCache.has(key)) iconGlyphCache.set(key, iconSdf(ICONS[n], sizePx));
+  return iconGlyphCache.get(key);
+}
+
 // ===========================================================================
 // Phase 1 — LAYOUT (one pure pass, SwiftUI-style). Geometry only: measure +
 // arrange the tree into resolved rects (layoutMap). No scroll, no GPU, no clip.
@@ -362,6 +528,10 @@ function layout() {
 // The GPU host and the soft renderer are two such paths over the same layout.
 // ===========================================================================
 function render() {
+  // Frame timestamp for time-based animation (spinner). FROZEN while a field is
+  // focused so the spinner holds — the caret-blink/keystroke renders that still
+  // run during text entry won't keep stepping it forward.
+  if (focusedId === null) renderCtx.now = performance.now();
   const cv = document.getElementById('gpu');
   viewportH = cv ? cv.clientHeight : 0;
   const viewportW = cv ? cv.clientWidth : 0;
@@ -384,6 +554,19 @@ function render() {
   // popup primitive). Both get the viewport so they flip/clamp near edges.
   const spec = contextSpec ? withViewport(contextSpec) : openMenuSpec();
   if (spec) drawMenu(spec, renderCtx);
+  if (editMenu) drawMenu(withViewport(editMenu), renderCtx);  // text-field edit menu, on top
+  // Diagnostic overlay (DIAG): the focus/keyboard event sequence, drawn big so it
+  // can be captured via Snap on iPhone. Cleared on the next focus.
+  if (DIAG && diagText) {
+    setScissor(frame.pass, null);
+    const lines = diagText.split('\n');
+    const LH = 22, top = 60;
+    drawPrim(frame.pass, 0, top - 8, viewportW, lines.length * LH + 16, [0, 0, 0, 0.9], {});
+    lines.forEach((ln, i) => {
+      const g = glyphForStr(ln, 15);
+      if (g) drawPrim(frame.pass, 10, top + i * LH, g.w, g.h, [0.4, 1, 0.6, 1], { texView: g.view });
+    });
+  }
   endFrame(frame);
 }
 // walk with a `pinned` filter: false = draw only unpinned subtrees; true = only
@@ -468,7 +651,7 @@ function dispatchText(node, event, str) {
 function startBlink() {
   caretOn = true;
   if (blinkTimer) clearInterval(blinkTimer);
-  blinkTimer = setInterval(() => { caretOn = !caretOn; if (focusedId !== null) render(); }, 530);
+  blinkTimer = setInterval(() => { caretOn = !caretOn; if (focusedId !== null) { logev('blink'); render(); } }, 530);
 }
 function stopBlink() { if (blinkTimer) clearInterval(blinkTimer); blinkTimer = null; caretOn = true; }
 
@@ -484,6 +667,20 @@ function liftFocusedOnce() {
   kbScrolled = true;
 }
 
+// Position the hidden capture element OVER the field's current on-screen rect,
+// so iOS sees the focused input where the interaction is (and won't dismiss the
+// keyboard). pointer-events:none keeps taps flowing to the canvas. Re-run after
+// the field lifts (its screen position changes).
+function positionKbd(node) {
+  const el = fieldEl(node), cv = document.getElementById('gpu'), rc = layoutMap.get(node.id);
+  if (!el || !cv || !rc) return;
+  const r = cv.getBoundingClientRect();
+  el.style.left = `${r.left + offsetX + rc.x}px`;
+  el.style.top = `${r.top + rc.y - scrollY}px`;
+  el.style.width = `${rc.w}px`;
+  el.style.height = `${rc.h}px`;
+}
+
 // A text field (single-line input or multi-line area)?
 function isTextField(kind) { return kind === KIND.text_input || kind === KIND.text_area; }
 // The hidden capture element for a node: a <textarea> (newlines) for text_area,
@@ -491,6 +688,8 @@ function isTextField(kind) { return kind === KIND.text_input || kind === KIND.te
 function fieldEl(node) { return document.getElementById(node && node.kind === KIND.text_area ? 'kbdm' : 'kbd'); }
 
 function focusField(node, px, py) {
+  logev('focus');
+  diagText = '';                                 // clear the diagnostic overlay on a new focus
   const el = fieldEl(node);
   const w = widgetFor(node.kind);
   // Map the tap to a caret index (tap-to-position); fall back to end-of-text.
@@ -504,12 +703,14 @@ function focusField(node, px, py) {
   }
   focusedId = node.id;
   kbScrolled = false;
+  if (spinRAF) { cancelAnimationFrame(spinRAF); spinRAF = 0; }  // stop animation now (don't wait a frame)
   startBlink();
   // The capture element is pinned top-left (always visible) so iOS never
   // auto-scrolls to it — we lift the drawn field ourselves. Seed its value +
   // focus (focus() must run inside the tap gesture to raise the soft keyboard)
   // and place the caret where the user tapped.
   if (el) {
+    positionKbd(node);                           // place the input over the field BEFORE focusing
     el.value = renderCtx.textValue(node);
     el.focus();
     try { el.setSelectionRange(idx, idx); } catch {}
@@ -537,6 +738,7 @@ function blurField() {
   // end, the next scroll rubber-bands it back smoothly (settleScroll/momentum).
   if (node) dispatchText(node, EVENT.change, renderCtx.textValue(node));
   render();
+  ensureSpin();                                  // resume the animation loop (paused while focused)
 }
 
 // ---- Snap: the device captures its OWN WebGPU canvas + uploads it ------------
@@ -624,8 +826,15 @@ async function canvasToPng(canvas) {
 async function main() {
   // Stamp the build into the header title span (not the whole header — that holds
   // the Snap button too) so you can confirm you're on the latest deploy.
+  // Lead the title with the short git sha so it stays visible even when the
+  // header ellipsizes on a narrow iPhone (the long full stamp is cut from the
+  // right). e.g. "build 5530203 · QView retained".
   const ttl = document.querySelector('header .ttl');
-  if (ttl) ttl.textContent = `QView · retained · build ${BUILD}`;
+  if (ttl) {
+    const sha = (BUILD.match(/\(([^)]+)\)/) || [, BUILD])[1];
+    ttl.textContent = `build ${sha} · QView retained`;
+    ttl.title = BUILD;   // full stamp on long-press / desktop hover
+  }
   wireSnapButton();
 
   // Fully suppress the browser's default touch/gesture behaviour — the app owns
@@ -664,7 +873,7 @@ async function main() {
   // into a payload (e.g. a slider's value). If it does, the control is also
   // DRAGGABLE: we track the pointer and re-dispatch as it moves, so the thumb
   // follows the finger (EVENT.input during drag, EVENT.change implied on press).
-  let dragNode = null, scrollDrag = null;
+  let dragNode = null, scrollDrag = null, textDrag = null;
 
   const localXY = (ev) => { const r = canvas.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
 
@@ -735,6 +944,16 @@ async function main() {
     stopMomentum();                              // a new touch halts any scroll glide
     const [px, py] = localXY(ev);
 
+    // The edit menu captures the tap first: pick Cut/Copy/Paste/Select All, or
+    // dismiss on an outside tap (the field keeps focus either way).
+    if (editMenu) {
+      ev.preventDefault();
+      const chosen = hitMenu(withViewport(editMenu), px, py);
+      if (chosen != null) doEdit(chosen);
+      else { editMenu = null; editNode = null; render(); }
+      return;
+    }
+
     // If a menu is open, it captures this tap first (shared popup primitive):
     // pick an item (-> selection payload to the wasm) or dismiss on an outside tap.
     if (openDropdownId !== null || contextSpec) {
@@ -759,7 +978,27 @@ async function main() {
     // pointerdown on empty space, and scrolling must keep the keyboard open.
     if (hit && isTextField(hit.kind)) {
       ev.preventDefault();
+      const wt = widgetFor(hit.kind);
+      // Focus + place the caret at the tap (the drag anchor); dragging extends
+      // the selection from here.
+      const anchor = wt && wt.caretAt ? wt.caretAt(hit, px, py, renderCtx) : 0;
       focusField(hit, px, py);
+      textDrag = { node: hit, anchor, startX: px, startY: py };
+      try { canvas.setPointerCapture(ev.pointerId); } catch {}
+      // Long-press selects the WORD under the finger (the reliable select
+      // gesture — a drag fights the keyboard-open lift). It does NOT open the
+      // menu yet: while still holding, dragging adjusts the selection from the
+      // word bounds; the menu appears on release (see endDrag). Empty word → the
+      // release just shows the Paste / Select All menu.
+      cancelLongPress();
+      longPressXY = [px, py];
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        const idx = wt && wt.caretAt ? wt.caretAt(hit, px, py, renderCtx) : 0;
+        const word = selectWordAt(hit, idx);
+        if (textDrag && word) textDrag.word = word;  // enter adjust mode
+        render();
+      }, LONG_PRESS_MS);
       return;
     }
 
@@ -805,6 +1044,31 @@ async function main() {
   }, { passive: false });
 
   canvas.addEventListener('pointermove', (ev) => {
+    // Text selection drag: extend the field's selection from the anchor to the
+    // character under the finger.
+    if (textDrag) {
+      ev.preventDefault();
+      const [mx, my] = localXY(ev);
+      // A real drag (beyond slop) cancels the pending long-press — it's a select.
+      if (longPressTimer && Math.hypot(mx - textDrag.startX, my - textDrag.startY) > LONG_PRESS_SLOP) cancelLongPress();
+      const wt = widgetFor(textDrag.node.kind);
+      const idx = wt && wt.caretAt ? wt.caretAt(textDrag.node, mx, my, renderCtx) : textDrag.anchor;
+      const el = fieldEl(textDrag.node);
+      if (el) {
+        let s, e;
+        if (textDrag.word) {
+          // Adjust mode (after a long-press word-select): the word stays
+          // selected; drag past either end to grow the selection that way.
+          const { start: ws, end: we } = textDrag.word;
+          if (idx < ws) { s = idx; e = we; } else if (idx > we) { s = ws; e = idx; } else { s = ws; e = we; }
+        } else {
+          s = Math.min(textDrag.anchor, idx); e = Math.max(textDrag.anchor, idx);
+        }
+        try { el.setSelectionRange(s, e); } catch {}
+      }
+      render();
+      return;
+    }
     // Scroll drag: translate the scene by the finger's vertical delta, tracking
     // velocity (last-frame px delta) so release can launch momentum.
     if (scrollDrag) {
@@ -842,6 +1106,19 @@ async function main() {
 
   const endDrag = (ev) => {
     cancelLongPress();                          // a lift before the hold elapsed = a tap, not long-press
+    if (textDrag) {
+      cancelLongPress();
+      try { canvas.releasePointerCapture(ev.pointerId); } catch {}
+      const node = textDrag.node;
+      textDrag = null;                          // selection already set during the move
+      // A completed drag-select raises the edit menu at the finger (Cut/Copy).
+      const el = fieldEl(node);
+      if (el && el.selectionStart !== el.selectionEnd) {
+        const [ux, uy] = localXY(ev);
+        openEditMenu(node, ux, uy);
+      }
+      return;
+    }
     if (scrollDrag) {
       try { canvas.releasePointerCapture(ev.pointerId); } catch {}
       const v = scrollDrag.vel || 0;
@@ -887,6 +1164,7 @@ async function main() {
   // Both capture elements (#kbd input, #kbdm textarea) share the same handlers;
   // only one is focused at a time, and we read the event target's value.
   const onKbdInput = (e) => {
+    logev('key');
     if (focusedId === null) return;
     const node = nodes.get(focusedId);
     if (!node) return;
@@ -895,34 +1173,58 @@ async function main() {
     dispatchText(node, EVENT.input, e.target.value);
     render();
   };
-  const onKbdBlur = () => { if (focusedId !== null) blurField(); };
+  const onKbdBlur = () => {
+    if (DIAG) { logev('BLUR'); diagText = evlog.slice().reverse().join('\n'); }
+    if (focusedId !== null) blurField();
+    else if (DIAG) render();                     // paint the diagnostic overlay even if not focused
+  };
   for (const id of ['kbd', 'kbdm']) {
     const el = document.getElementById(id);
     if (el) { el.addEventListener('input', onKbdInput); el.addEventListener('blur', onKbdBlur); }
   }
-  // The soft keyboard shrinks the visual viewport; track that inset and keep the
-  // focused field above it. (No-op on desktop, where visualViewport ~= layout.)
+  // The soft keyboard shrinks the visual viewport. ONLY track the inset while a
+  // field is focused — otherwise iPad's dynamic toolbar makes visualViewport.height
+  // fluctuate during a normal scroll, which would oscillate kbInset -> maxBound()
+  // and vibrate the rubber-band. After the one-time lift, kbInset is frozen so
+  // maxBound() stays stable while scrolling with the keyboard up. No 'scroll'
+  // listener (it fires continuously on iPad and isn't needed).
   if (window.visualViewport) {
-      const onVV = () => {
-      kbInset = viewportInset();
-      // Lift the field only on the FIRST keyboard-open resize (latched); later
-      // resizes (predictive bar, etc.) just update the inset + redraw, no jump.
-      if (focusedId !== null && !kbScrolled && kbInset > 0) liftFocusedOnce();
-      else render();
+    const onVV = () => {
+      logev('vv' + (kbScrolled ? '.L' : '') + ':' + Math.round(window.visualViewport.height));
+      if (focusedId === null) { if (kbInset !== 0) { kbInset = 0; render(); } return; }
+      if (!kbScrolled) {
+        kbInset = viewportInset();
+        if (kbInset > 0) liftFocusedOnce(); else render();
+      }
     };
     window.visualViewport.addEventListener('resize', onVV);
-    window.visualViewport.addEventListener('scroll', onVV);
   }
 
-  // Re-fit on a viewport change: rebuild the backing store, refresh viewportH so
-  // maxBound() is computed against the NEW size (it would otherwise clamp scrollY
-  // with the stale height from the last render), clamp scroll into the new range,
-  // then redraw. stopMomentum so a glide in flight can't fling past the new edge.
+  // Re-fit on a viewport change: rebuild the backing store, refresh viewportH,
+  // clamp scroll into the new range, redraw. GUARDED against no-op size changes:
+  // resize() sets canvas.width/height (the drawing buffer), and a ResizeObserver
+  // can re-fire from that — so if the CSS box is unchanged we bail, breaking the
+  // feedback loop (the cause of the load-blank + scroll-vibration). During an
+  // active scroll/momentum we don't clamp (so a mid-scroll toolbar resize can't
+  // yank the position); we just track the size + redraw.
+  let lastCW = -1, lastCH = -1;
   const refit = () => {
+    // While a text field is focused, treat the keyboard as a pure overlay: do
+    // NOT resize the canvas. On iPhone the keyboard/toolbar shrinks the layout
+    // viewport, which fires the ResizeObserver during focus; resizing the canvas
+    // backing store mid-keyboard dismisses the keyboard there. We handle keyboard
+    // occlusion via the scroll-lift (kbInset), not a canvas resize.
+    if (focusedId !== null) { logev('refit.skip'); return; }
+    logev('refit');
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    if (cw === lastCW && ch === lastCH) return;   // no real change — don't loop
+    lastCW = cw; lastCH = ch;
     resize();
-    viewportH = canvas.clientHeight;
-    stopMomentum();
-    scrollY = Math.max(0, Math.min(scrollY, maxBound()));
+    viewportH = ch;
+    if (!scrollDrag && !momentumRAF) {
+      stopMomentum();
+      scrollY = Math.max(0, Math.min(scrollY, maxBound()));
+    }
     render();
   };
   // A ResizeObserver on the canvas is the RELIABLE signal: iPad Safari does not
@@ -933,5 +1235,13 @@ async function main() {
   // Keep the window listeners too (older Safari, desktop) — refit is idempotent.
   window.addEventListener('resize', refit);
   window.addEventListener('orientationchange', () => { refit(); requestAnimationFrame(refit); });
+
+  // First-paint insurance: the initial present() can render before the canvas
+  // has its final laid-out size on iPad (blank until a touch nudged a redraw).
+  // Re-fit on the next frame, after load, and a beat later so the first frame is
+  // drawn at the real size without needing a touch.
+  requestAnimationFrame(refit);
+  window.addEventListener('load', refit);
+  setTimeout(refit, 120);
 }
 main();
