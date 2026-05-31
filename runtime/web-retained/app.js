@@ -125,6 +125,15 @@ let focusedId = null;        // the text_input node id with keyboard focus, or n
 let caretOn = true;          // caret blink phase (visible) while a field is focused
 let blinkTimer = null;       // setInterval handle driving the blink
 let kbScrolled = false;      // have we already lifted the focused field above the keyboard?
+
+// --- TEMP diagnostic: a small ring log of focus-related events, dumped into the
+// header when the hidden input blurs, so we can read on iPhone what fired right
+// before the keyboard dropped. Remove once the iPhone keyboard issue is found.
+let evlog = [];
+function logev(w) {
+  evlog.push(Math.round(performance.now() % 100000) + ':' + w);
+  if (evlog.length > 12) evlog.shift();
+}
 let instance;
 
 // Host→app text scratch: when the user types, the host writes the field's UTF-8
@@ -255,6 +264,7 @@ function viewportInset() {
 // Scroll the focused field above the keyboard (into the visible region). Called
 // on focus and whenever the visual viewport changes (keyboard open/close).
 function ensureFocusedVisible() {
+  logev('lift');
   if (focusedId === null) return;
   const cv = document.getElementById('gpu');
   const rc = layoutMap.get(focusedId);
@@ -620,7 +630,7 @@ function dispatchText(node, event, str) {
 function startBlink() {
   caretOn = true;
   if (blinkTimer) clearInterval(blinkTimer);
-  blinkTimer = setInterval(() => { caretOn = !caretOn; if (focusedId !== null) render(); }, 530);
+  blinkTimer = setInterval(() => { caretOn = !caretOn; if (focusedId !== null) { logev('blink'); render(); } }, 530);
 }
 function stopBlink() { if (blinkTimer) clearInterval(blinkTimer); blinkTimer = null; caretOn = true; }
 
@@ -643,6 +653,7 @@ function isTextField(kind) { return kind === KIND.text_input || kind === KIND.te
 function fieldEl(node) { return document.getElementById(node && node.kind === KIND.text_area ? 'kbdm' : 'kbd'); }
 
 function focusField(node, px, py) {
+  logev('focus');
   const el = fieldEl(node);
   const w = widgetFor(node.kind);
   // Map the tap to a caret index (tap-to-position); fall back to end-of-text.
@@ -1116,6 +1127,7 @@ async function main() {
   // Both capture elements (#kbd input, #kbdm textarea) share the same handlers;
   // only one is focused at a time, and we read the event target's value.
   const onKbdInput = (e) => {
+    logev('key');
     if (focusedId === null) return;
     const node = nodes.get(focusedId);
     if (!node) return;
@@ -1124,7 +1136,15 @@ async function main() {
     dispatchText(node, EVENT.input, e.target.value);
     render();
   };
-  const onKbdBlur = () => { if (focusedId !== null) blurField(); };
+  const onKbdBlur = () => {
+    logev('BLUR');
+    // TEMP diagnostic: surface the event sequence leading to the keyboard drop,
+    // most-recent-first so the events right before BLUR aren't cut off by the
+    // header's right-ellipsis on iPhone.
+    const ttl = document.querySelector('header .ttl');
+    if (ttl) ttl.textContent = evlog.slice().reverse().join('  ');
+    if (focusedId !== null) blurField();
+  };
   for (const id of ['kbd', 'kbdm']) {
     const el = document.getElementById(id);
     if (el) { el.addEventListener('input', onKbdInput); el.addEventListener('blur', onKbdBlur); }
@@ -1137,6 +1157,7 @@ async function main() {
   // listener (it fires continuously on iPad and isn't needed).
   if (window.visualViewport) {
     const onVV = () => {
+      logev('vv' + (kbScrolled ? '.L' : '') + ':' + Math.round(window.visualViewport.height));
       if (focusedId === null) { if (kbInset !== 0) { kbInset = 0; render(); } return; }
       if (!kbScrolled) {
         kbInset = viewportInset();
@@ -1160,7 +1181,8 @@ async function main() {
     // viewport, which fires the ResizeObserver during focus; resizing the canvas
     // backing store mid-keyboard dismisses the keyboard there. We handle keyboard
     // occlusion via the scroll-lift (kbInset), not a canvas resize.
-    if (focusedId !== null) return;
+    if (focusedId !== null) { logev('refit.skip'); return; }
+    logev('refit');
     const cw = canvas.clientWidth, ch = canvas.clientHeight;
     if (cw === lastCW && ch === lastCH) return;   // no real change — don't loop
     lastCW = cw; lastCH = ch;
