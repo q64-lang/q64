@@ -132,12 +132,19 @@ const SURFACE_KEY = { [SURFACE.none]: 'none', [SURFACE.surface]: 'surface', [SUR
 // way whether they're absolute or inside an HStack/VStack.
 let layoutMap = new Map();
 const GEOM = { [ATTR.x]: 'x', [ATTR.y]: 'y', [ATTR.w]: 'w', [ATTR.h]: 'h' };
+// Host-managed vertical scroll: the canvas stays viewport-sized; the whole scene
+// is translated up by scrollY at draw time (and touches translated down to match),
+// so content taller than the screen is reachable without native scroll fighting
+// the slider/long-press gestures. The pinned top bar opts out (drawn unshifted).
+let scrollY = 0, contentH = 0, viewportH = 0;
 const renderCtx = {
   pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
   attr: (node, a, dflt) => {
     const g = GEOM[a]; const lay = g && layoutMap.get(node.id);
-    if (lay) return lay[g];
-    const v = node.attrs.get(a); return v === undefined ? dflt : Number(v);
+    let v = lay ? lay[g] : node.attrs.get(a);
+    v = v === undefined ? dflt : Number(v);
+    if (a === ATTR.y && !node._pinned) v -= scrollY;     // translate scene up
+    return v;
   },
   color: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : unpackColor(v); },
   // Resolve a node's fill, honoring a semantic ATTR.surface role (theme-resolved
@@ -200,6 +207,12 @@ function render() {
   // VStack); absolute nodes keep their own x/y. Widgets then read laid-out coords
   // via r.attr transparently. (Recomputed each frame; dirty-tracking is a follow-up.)
   layoutMap = computeLayout(scene, renderCtx);
+  // Content height = the lowest node bottom (absolute, pre-scroll); clamp scroll.
+  contentH = 0;
+  for (const rc of layoutMap.values()) contentH = Math.max(contentH, rc.y + rc.h);
+  const cv = document.getElementById('gpu'); viewportH = cv ? cv.clientHeight : 0;
+  const maxScroll = Math.max(0, contentH + 16 - viewportH);   // 16px bottom margin
+  scrollY = Math.max(0, Math.min(scrollY, maxScroll));
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
   walk(ROOT);
@@ -294,11 +307,17 @@ async function main() {
 
   instance.exports._start();   // builds the retained tree + first present()
 
+  // Pin the translucent top bar (+ its title) so it stays fixed while content
+  // scrolls beneath it. (The gallery's bar is nodes 90/91.) Everything else is in
+  // screen space already (r.attr subtracts scrollY), so hit-tests + the existing
+  // pointer math need no change — only scrollY moves.
+  for (const id of [90, 91]) { const n = nodes.get(id); if (n) n._pinned = true; }
+
   // A widget may expose value(node, px, py, r) -> i64 to turn a touch position
   // into a payload (e.g. a slider's value). If it does, the control is also
   // DRAGGABLE: we track the pointer and re-dispatch as it moves, so the thumb
   // follows the finger (EVENT.input during drag, EVENT.change implied on press).
-  let dragNode = null;
+  let dragNode = null, scrollDrag = null;
 
   const localXY = (ev) => { const r = canvas.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
 
@@ -343,8 +362,17 @@ async function main() {
     }
 
     const hit = hitTest(px, py);
-    if (!hit) return;
-    const w = widgetFor(hit.kind);
+    const w = hit && widgetFor(hit.kind);
+
+    // No interactive target under the finger -> arm a SCROLL drag (when content
+    // overflows the viewport). A vertical drag on empty space / a label scrolls.
+    if (!w || (!w.hit && !w.value && !w.menuSpec && !w.contextMenu)) {
+      if (contentH + 16 > viewportH) {
+        scrollDrag = { startY: py, startScroll: scrollY, moved: false };
+        try { canvas.setPointerCapture(ev.pointerId); } catch {}
+      }
+      return;
+    }
 
     // Arm long-press if this node has a context menu (touch raises it after a hold).
     if (w && w.contextMenu) {
@@ -378,6 +406,16 @@ async function main() {
   }, { passive: false });
 
   canvas.addEventListener('pointermove', (ev) => {
+    // Scroll drag: translate the scene by the finger's vertical delta.
+    if (scrollDrag) {
+      ev.preventDefault();
+      const [, py] = localXY(ev);
+      const dy = py - scrollDrag.startY;
+      if (Math.abs(dy) > 4) scrollDrag.moved = true;
+      scrollY = scrollDrag.startScroll - dy;            // drag down -> content moves down
+      render();                                          // render() clamps scrollY
+      return;
+    }
     // Cancel a pending long-press only if the finger moves beyond the slop radius
     // (a real hold always wobbles a few px; a true drag/scroll exceeds slop).
     if (longPressTimer && longPressXY) {
@@ -396,12 +434,21 @@ async function main() {
 
   const endDrag = (ev) => {
     cancelLongPress();                          // a lift before the hold elapsed = a tap, not long-press
+    if (scrollDrag) { try { canvas.releasePointerCapture(ev.pointerId); } catch {} scrollDrag = null; return; }
     if (!dragNode) return;
     try { canvas.releasePointerCapture(ev.pointerId); } catch {}
     dragNode = null;
   };
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', endDrag);
+
+  // Wheel / trackpad scroll (desktop).
+  canvas.addEventListener('wheel', (ev) => {
+    if (contentH + 16 <= viewportH) return;
+    ev.preventDefault();
+    scrollY += ev.deltaY;
+    render();                                    // clamps
+  }, { passive: false });
 
   // Right-click (desktop) -> the same context menu, anchored at the pointer.
   canvas.addEventListener('contextmenu', (ev) => {
