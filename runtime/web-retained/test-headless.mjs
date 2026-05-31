@@ -37,7 +37,7 @@ instance.exports._start();
 
 // --- the gallery tree (matches screen.q) ---
 const expectKind = {
-  91: KIND.label, 2: KIND.box, 10: KIND.label, 20: KIND.button, 21: KIND.label,
+  91: KIND.label, 100: KIND.column, 10: KIND.label, 20: KIND.button, 21: KIND.label,
   30: KIND.checkbox, 40: KIND.switch, 50: KIND.radio, 52: KIND.radio,
   60: KIND.slider, 70: KIND.progress, 80: KIND.dropdown,
 };
@@ -91,7 +91,7 @@ handlerFires(80, [80], 1014); // choose Windows
 ok(h.nodes.get(80).attrs.get(ATTR.text_id) === 1014, 'dropdown field shows chosen option (Windows=1014)');
 ok(h.nodes.get(80).attrs.get(ATTR.selected) === 2, 'dropdown selected index = 2');
 // Grouped child: checkbox 8 is parented to group 6, wired, and toggles.
-ok(h.nodes.get(8)?.kind === KIND.checkbox && h.nodes.get(8)?.parent === 6, 'checkbox 8 is a checkbox inside group 6');
+ok(h.nodes.get(8)?.kind === KIND.checkbox && h.nodes.get(190)?.parent === 6, 'checkbox 8 is in the group content VStack (190) under group 6');
 ok(h.nodes.get(8)?.handlers.get(EVENT.press) === 8, 'grouped checkbox wired press -> handler 8');
 handlerFires(8, [8]); // toggle the grouped checkbox
 ok(h.nodes.get(8).attrs.get(ATTR.checked) === 0, 'grouped checkbox toggled off');

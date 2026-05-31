@@ -27,29 +27,34 @@ state sChecked  = 1    // stacks-section checkbox
 state sToggled  = 0    // stacks-section switch
 
 fn main {
-  // Layout grid: a control column at x=24 and a name-label column at x=150,
-  // rows spaced ~52px starting under the 56px top bar. Labels are ~17px now.
+  // ---- pinned header (sticks; opaque solid bar) ----
+  qview.create(90, 0, 0)
+  qview.set_attr(90, 0, 0)
+  qview.set_attr(90, 1, 0)
+  qview.set_attr(90, 2, 412)
+  qview.set_attr(90, 3, 56)
+  qview.set_attr(90, 20, 1)
+  qview.create(91, 4, 90)
+  qview.set_attr(91, 0, 16)
+  qview.set_attr(91, 1, 18)
+  qview.set_attr(91, 9, 1000)
 
-  // Backing box panel (2) — sits below the bar.
-  qview.create(2, 0, 0)
-  qview.set_attr(2, 0, 16)
-  qview.set_attr(2, 1, 72)
-  qview.set_attr(2, 2, 380)
-  qview.set_attr(2, 3, 860)
-  qview.set_attr(2, 4, 18)
-  qview.set_attr(2, 5, 1)
+  // ---- the body: ONE outer VStack (column 100). It measures all its sections
+  //      and computes the total height — nothing can fall off-frame unaccounted.
+  //      pad 16 inside; gap 18 between sections; starts just below the header. ----
+  qview.create(100, 2, 0)
+  qview.set_attr(100, 0, 16)
+  qview.set_attr(100, 1, 72)
+  qview.set_attr(100, 19, 18)
+  qview.set_attr(100, 22, 0)
 
-  // Platform dropdown at the TOP (80) + name (81). Options are catalog ids
-  // 12..15 = iOS / Android / Windows / Linux. min=base id, max=count, selected
-  // index. The field text_id = 12 + selected, so it shows the chosen platform.
-  // (Popup overlays everything, so the field can sit at the top.)
-  qview.create(81, 4, 0)
-  qview.set_attr(81, 0, 40)
-  qview.set_attr(81, 1, 92)
+  // Platform row (HStack 110): "Dropdown" label + the dropdown field.
+  qview.create(110, 1, 100)
+  qview.set_attr(110, 19, 16)
+  qview.set_attr(110, 21, 1)
+  qview.create(81, 4, 110)
   qview.set_attr(81, 9, 1009)
-  qview.create(80, 12, 0)
-  qview.set_attr(80, 0, 150)
-  qview.set_attr(80, 1, 84)
+  qview.create(80, 12, 110)
   qview.set_attr(80, 2, 226)
   qview.set_attr(80, 3, 44)
   qview.set_attr(80, 15, 1012)
@@ -58,142 +63,116 @@ fn main {
   qview.set_attr(80, 9, 1012)
   qview.on(80, 0, 80)
 
-  // Thin divider (5) under the dropdown — separates the platform selector from
-  // the widget list. kind divider=13; h = thickness (1px).
-  qview.create(5, 13, 0)
-  qview.set_attr(5, 0, 40)
-  qview.set_attr(5, 1, 144)
-  qview.set_attr(5, 2, 336)
+  // Divider.
+  qview.create(5, 13, 100)
+  qview.set_attr(5, 2, 348)
   qview.set_attr(5, 3, 1)
 
-  // Label demo (10) — the "Label" widget, just below the divider.
-  qview.create(10, 4, 0)
-  qview.set_attr(10, 0, 40)
-  qview.set_attr(10, 1, 168)
+  // Label row (HStack 120): the Label widget + a name.
+  qview.create(120, 1, 100)
+  qview.set_attr(120, 19, 12)
+  qview.set_attr(120, 21, 1)
+  qview.create(10, 4, 120)
   qview.set_attr(10, 9, 1001)
 
-  // Button (20) -> handler 20, name (21 taps count to its right)
-  qview.create(20, 6, 0)
-  qview.set_attr(20, 0, 40)
-  qview.set_attr(20, 1, 196)
+  // Button row (HStack 130): button + taps count.
+  qview.create(130, 1, 100)
+  qview.set_attr(130, 19, 16)
+  qview.set_attr(130, 21, 1)
+  qview.create(20, 6, 130)
   qview.set_attr(20, 2, 150)
   qview.set_attr(20, 3, 48)
   qview.set_attr(20, 4, 12)
   qview.set_attr(20, 9, 1011)
   qview.on(20, 0, 20)
-  qview.create(21, 4, 0)
-  qview.set_attr(21, 0, 210)
-  qview.set_attr(21, 1, 210)
+  qview.create(21, 4, 130)
   qview.set_attr(21, 9, taps)
 
-  // Checkbox (30) -> handler 30, name (31)
-  qview.create(30, 7, 0)
-  qview.set_attr(30, 0, 40)
-  qview.set_attr(30, 1, 252)
-  qview.on(30, 0, 30)
+  // Checkbox row (HStack 140): checkbox + name.
+  qview.create(140, 1, 100)
+  qview.set_attr(140, 19, 12)
+  qview.set_attr(140, 21, 1)
+  qview.create(30, 7, 140)
   qview.set_attr(30, 12, checked)
-  qview.create(31, 4, 0)
-  qview.set_attr(31, 0, 80)
-  qview.set_attr(31, 1, 254)
+  qview.on(30, 0, 30)
+  qview.create(31, 4, 140)
   qview.set_attr(31, 9, 1003)
 
-  // Switch (40) -> handler 40, name (41)
-  qview.create(40, 8, 0)
-  qview.set_attr(40, 0, 40)
-  qview.set_attr(40, 1, 304)
-  qview.on(40, 0, 40)
+  // Switch row (HStack 150): switch + name.
+  qview.create(150, 1, 100)
+  qview.set_attr(150, 19, 12)
+  qview.set_attr(150, 21, 1)
+  qview.create(40, 8, 150)
   qview.set_attr(40, 12, toggled)
-  qview.create(41, 4, 0)
-  qview.set_attr(41, 0, 108)
-  qview.set_attr(41, 1, 306)
+  qview.on(40, 0, 40)
+  qview.create(41, 4, 150)
   qview.set_attr(41, 9, 1004)
 
-  // Radio A (50) -> 50, name (51); Radio B (52) -> 52, name (53). group 1.
-  // Each radio's w/h is a LARGE hit row (circle + label), the two halves of the
-  // line, non-overlapping. The circle draws anchored-left inside; the label sits
-  // within the same row so tapping anywhere on "Radio A" selects it.
-  qview.create(50, 9, 0)
-  qview.set_attr(50, 0, 32)
-  qview.set_attr(50, 1, 356)
-  qview.set_attr(50, 2, 172)
-  qview.set_attr(50, 3, 56)
+  // Radio row (HStack 160): Radio A + Radio B (each its own labeled hit row).
+  qview.create(160, 1, 100)
+  qview.set_attr(160, 19, 4)
+  qview.set_attr(160, 21, 1)
+  qview.create(50, 9, 160)
+  qview.set_attr(50, 2, 92)
+  qview.set_attr(50, 3, 44)
   qview.set_attr(50, 14, 1)
   qview.set_attr(50, 13, 1)
   qview.on(50, 0, 50)
-  qview.create(51, 4, 0)
-  qview.set_attr(51, 0, 72)
-  qview.set_attr(51, 1, 374)
+  qview.create(51, 4, 160)
   qview.set_attr(51, 9, 1005)
-  qview.create(52, 9, 0)
-  qview.set_attr(52, 0, 208)
-  qview.set_attr(52, 1, 356)
-  qview.set_attr(52, 2, 172)
-  qview.set_attr(52, 3, 56)
+  qview.create(52, 9, 160)
+  qview.set_attr(52, 2, 92)
+  qview.set_attr(52, 3, 44)
   qview.set_attr(52, 14, 1)
   qview.set_attr(52, 13, 0)
   qview.on(52, 0, 52)
-  qview.create(53, 4, 0)
-  qview.set_attr(53, 0, 248)
-  qview.set_attr(53, 1, 374)
+  qview.create(53, 4, 160)
   qview.set_attr(53, 9, 1006)
 
-  // Slider row: name (61) above the control (60).
-  qview.create(61, 4, 0)
-  qview.set_attr(61, 0, 40)
-  qview.set_attr(61, 1, 408)
+  // Slider section (VStack 170): name above the control.
+  qview.create(170, 2, 100)
+  qview.set_attr(170, 19, 6)
+  qview.create(61, 4, 170)
   qview.set_attr(61, 9, 1007)
-  qview.create(60, 10, 0)
-  qview.set_attr(60, 0, 40)
-  qview.set_attr(60, 1, 434)
-  qview.set_attr(60, 2, 320)
+  qview.create(60, 10, 170)
+  qview.set_attr(60, 2, 348)
+  qview.set_attr(60, 3, 28)
   qview.set_attr(60, 15, 0)
   qview.set_attr(60, 16, 100)
   qview.set_attr(60, 17, sliderVal)
   qview.on(60, 0, 60)
 
-  // Progress row: name (71) above the control (70).
-  qview.create(71, 4, 0)
-  qview.set_attr(71, 0, 40)
-  qview.set_attr(71, 1, 486)
+  // Progress section (VStack 180): name above the control (tracks the slider).
+  qview.create(180, 2, 100)
+  qview.set_attr(180, 19, 6)
+  qview.create(71, 4, 180)
   qview.set_attr(71, 9, 1008)
-  qview.create(70, 11, 0)
-  qview.set_attr(70, 0, 40)
-  qview.set_attr(70, 1, 512)
-  qview.set_attr(70, 2, 320)
+  qview.create(70, 11, 180)
+  qview.set_attr(70, 2, 348)
+  qview.set_attr(70, 3, 10)
   qview.set_attr(70, 15, 0)
   qview.set_attr(70, 16, 100)
   qview.set_attr(70, 17, sliderVal)
 
-  // Group widget (6): a titled panel holding sub-widgets. kind group=14;
-  // text_id 16 = "Grouped". Its children (a label + a checkbox) are positioned
-  // inside it and drawn on top by the tree walk — any widget can be grouped.
-  qview.create(6, 14, 0)
-  qview.set_attr(6, 0, 40)
-  qview.set_attr(6, 1, 552)
-  qview.set_attr(6, 2, 320)
-  qview.set_attr(6, 3, 96)
+  // Group section (group 6): a titled panel holding a label + checkbox column.
+  qview.create(6, 14, 100)
+  qview.set_attr(6, 2, 348)
+  qview.set_attr(6, 3, 92)
   qview.set_attr(6, 9, 1016)
-  // sub-label (7) inside the group
-  qview.create(7, 4, 6)
-  qview.set_attr(7, 0, 56)
-  qview.set_attr(7, 1, 600)
+  // its content VStack (190), offset below the heading.
+  qview.create(190, 2, 6)
+  qview.set_attr(190, 0, 14)
+  qview.set_attr(190, 1, 44)
+  qview.set_attr(190, 19, 8)
+  qview.create(7, 4, 190)
   qview.set_attr(7, 9, 1017)
-  // sub-checkbox (8) inside the group — wired to handler 8 to prove a grouped
-  // child still receives touch.
-  qview.create(8, 7, 6)
-  qview.set_attr(8, 0, 280)
-  qview.set_attr(8, 1, 596)
+  qview.create(8, 7, 190)
   qview.set_attr(8, 12, grouped)
   qview.on(8, 0, 8)
 
-  // "Long Click" context-menu area (9): a box that declares an option range
-  // (min=19 base catalog id Cut/Copy/Paste, max=3). Long-press or right-click
-  // raises a context menu of those items (shared popup). text_id 18 = "Long
-  // Click" label centered in the box. selected=20 (Copy) for the check mark.
-  qview.create(9, 0, 0)
-  qview.set_attr(9, 0, 40)
-  qview.set_attr(9, 1, 664)
-  qview.set_attr(9, 2, 320)
+  // Long-click box (9): context-menu surface with a centered label.
+  qview.create(9, 0, 100)
+  qview.set_attr(9, 2, 348)
   qview.set_attr(9, 3, 64)
   qview.set_attr(9, 4, 12)
   qview.set_attr(9, 5, 1)
@@ -203,15 +182,9 @@ fn main {
   qview.set_attr(9, 13, 1020)
   qview.on(9, 1, 9)
 
-  // Layout (stacks) section: an HStack (row, node 300) at (40, 748) auto-arranges
-  // its children — NO x/y on them, the stack positions them. gap 28, align start.
-  // Left: a VStack (column 310) of a label + checkbox + switch. Right: a label
-  // over a VERTICAL slider (320). Demonstrates HStack/VStack + vertical slider.
-  qview.create(300, 1, 0)
-  qview.set_attr(300, 0, 40)
-  qview.set_attr(300, 1, 748)
+  // Stacks demo (HStack 300): two VStacks — left controls, right a vertical slider.
+  qview.create(300, 1, 100)
   qview.set_attr(300, 19, 28)
-  // left VStack (column 310), gap 14
   qview.create(310, 2, 300)
   qview.set_attr(310, 19, 14)
   qview.create(311, 4, 310)
@@ -222,7 +195,6 @@ fn main {
   qview.create(313, 8, 310)
   qview.set_attr(313, 12, sToggled)
   qview.on(313, 0, 313)
-  // right VStack (column 320), centered, label over a vertical slider (322)
   qview.create(320, 2, 300)
   qview.set_attr(320, 19, 10)
   qview.set_attr(320, 21, 1)
@@ -236,25 +208,8 @@ fn main {
   qview.set_attr(322, 17, stackVal)
   qview.on(322, 0, 322)
 
-  // Title bar (90): now scrolls with the content, so it's an OPAQUE solid header
-  // (surface=1) rather than the translucent material — there's nothing passing
-  // behind it to frost anymore. (Translucent material is for pinned/overlay chrome.)
-  qview.create(90, 0, 0)
-  qview.set_attr(90, 0, 0)
-  qview.set_attr(90, 1, 0)
-  qview.set_attr(90, 2, 412)
-  qview.set_attr(90, 3, 56)
-  qview.set_attr(90, 4, 0)
-  qview.set_attr(90, 20, 1)
-  // Bar title (91).
-  qview.create(91, 4, 0)
-  qview.set_attr(91, 0, 16)
-  qview.set_attr(91, 1, 18)
-  qview.set_attr(91, 9, 1000)
-
   qview.present()
 }
-
 // One branchless handler per control (the on_<id> dispatch shape).
 pub fn on_20(node: i64, event: i64) {
   taps = taps + 1

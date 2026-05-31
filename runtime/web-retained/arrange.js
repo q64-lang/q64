@@ -93,13 +93,15 @@ export function arrange(scene, node, self, r, out) {
     return;
   }
 
-  // Plain container / leaf: children keep their own absolute x/y (Stage-1 mode),
-  // sized intrinsically. This lets stacks and absolute layout coexist.
+  // Plain container (box/group): a child's x/y is an OFFSET relative to the
+  // parent's origin (so a group's content sits inside it, not at page 0,0). A
+  // child without x/y sits at the parent origin. (ROOT is the exception — its
+  // children are absolute page coords; see computeLayout.)
   for (const id of node.children) {
     const k = scene.get(id); if (!k) continue;
     const ks = measure(scene, k, r);
-    const kx = has(k, ATTR.x) ? attr(k, ATTR.x, 0) : self.x;
-    const ky = has(k, ATTR.y) ? attr(k, ATTR.y, 0) : self.y;
+    const kx = self.x + (has(k, ATTR.x) ? attr(k, ATTR.x, 0) : 0);
+    const ky = self.y + (has(k, ATTR.y) ? attr(k, ATTR.y, 0) : 0);
     arrange(scene, k, { x: kx, y: ky, w: ks.w, h: ks.h }, r, out);
   }
 }
