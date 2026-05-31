@@ -14,25 +14,49 @@
 //                                    //   zero-size rect at a point, for context)
 //     items: [{ id, glyph, selected?, enabled? }],  // glyph: an SDF texture
 //     width?: number,                // defaults to the anchor width (min 120)
+//     viewport?: { w, h },           // CSS px of the surface, for edge-flip/clamp
 //     onSelect: (id) => void,        // chosen item id
 //   }
 //
-// The primitive computes item rects, draws the panel + rows, and hit-tests.
-// Edge-flip + scroll for off-screen menus is a follow-up (noted below).
+// The primitive computes item rects (edge-aware: flips above the anchor when it
+// would overflow the bottom, clamps x to stay on-screen), draws the panel +
+// rows, and hit-tests. Both draw and hit go through the SAME placement, so they
+// always agree. (Scrolling a list taller than the viewport: a later follow-up.)
 
 export const ROW_H = 44;          // item row height (touch target)
 const PAD = 12;                   // horizontal text padding
 const GAP = 4;                    // gap between anchor and panel
 const MIN_W = 120;
+const MARGIN = 8;                 // keep this far from the viewport edges
 
+// Place the panel relative to the anchor, flipping/clamping to the viewport so
+// it's always fully visible. `placedAbove` lets callers know which way it went.
 function panelRect(spec) {
   const a = spec.anchor;
+  const vp = spec.viewport;
   const w = Math.max(spec.width ?? a.w, MIN_W);
-  // Default placement: directly below the anchor. (Edge-flip/clamp: follow-up.)
-  const x = a.x;
-  const y = a.y + a.h + GAP;
   const h = spec.items.length * ROW_H;
-  return { x, y, w, h };
+
+  // Vertical: prefer below the anchor; flip above if it'd overflow the bottom
+  // and there's more room above. Then clamp into [MARGIN, vp.h - h - MARGIN].
+  const below = a.y + a.h + GAP;
+  let y = below;
+  let placedAbove = false;
+  if (vp) {
+    const roomBelow = vp.h - (a.y + a.h) - GAP;
+    const roomAbove = a.y - GAP;
+    if (h > roomBelow && roomAbove > roomBelow) {
+      y = a.y - GAP - h;             // flip: panel sits above the anchor
+      placedAbove = true;
+    }
+    y = Math.max(MARGIN, Math.min(y, vp.h - h - MARGIN));
+  }
+
+  // Horizontal: left-aligned to the anchor, clamped so the panel stays on-screen.
+  let x = a.x;
+  if (vp) x = Math.max(MARGIN, Math.min(x, vp.w - w - MARGIN));
+
+  return { x, y, w, h, placedAbove };
 }
 
 export function itemRect(spec, i) {
