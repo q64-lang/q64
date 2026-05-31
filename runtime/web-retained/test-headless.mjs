@@ -53,7 +53,7 @@ ok(h.nodes.get(60).attrs.get(ATTR.value) === 40, 'slider value starts 40');
 ok(h.nodes.get(70).attrs.get(ATTR.value) === 40, 'progress mirrors slider start');
 ok(h.nodes.get(50).attrs.get(ATTR.selected) === 1, 'radio A selected at start');
 ok(h.nodes.get(90)?.kind === KIND.box, 'material bar node 90 is a box');
-ok(h.nodes.get(90)?.attrs.get(ATTR.surface) === 3, 'bar carries surface=materialThin (3)');
+ok(h.nodes.get(90)?.attrs.get(ATTR.surface) === 1, 'bar carries surface=surface (opaque, 1)');
 
 // --- per-handler surgical mutations via the on_<id> exports ---
 // Handlers take (node, event, payload) i64. payload is the host-computed value
