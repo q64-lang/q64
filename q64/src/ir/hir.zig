@@ -283,4 +283,24 @@ pub const Expr = union(enum) {
     /// as the value of an `env.out(<i64>)` would be — but `host_out_int` is the
     /// shorter path for the latter, so `fmt_int` only appears inside `concat`.
     fmt_int: *Expr,
+    /// The byte length of a `str` value as an i64 (`s.len`). The operand is a
+    /// str-valued expression; lowering reads its `(ptr, len)` len component and
+    /// zero-extends it to i64.
+    str_len: *Expr,
+    /// The unsigned byte at index `idx` of a `str` value as an i64 (`s[i]`). No
+    /// bounds check today — out-of-range reads other memory (caller guards with
+    /// `s.len`). `str` is str-valued, `idx` is i64.
+    str_index: struct { str: *Expr, idx: *Expr },
+    /// Byte-wise equality of two `str` values (`a == b`) as a bool (i32 0/1).
+    /// `!=` is this wrapped in `un{.not}`. Lowers to a `__str_eq` helper call.
+    str_eq: struct { lhs: *Expr, rhs: *Expr },
+    /// `s.slice(start, end)` — a str sub-view (ptr+start, end-start). No bounds
+    /// check; caller guards with `s.len`. `start`/`end` are i64. str-valued.
+    str_slice: struct { str: *Expr, start: *Expr, end: *Expr },
+    /// `s.index_of(byte)` — index of the first byte == `byte` (i64), or -1. i64.
+    str_index_of: struct { str: *Expr, byte: *Expr },
+    /// `s.starts_with(prefix)` — does `s` begin with `prefix`? bool (i32 0/1).
+    str_starts_with: struct { str: *Expr, prefix: *Expr },
+    /// `s.contains(sub)` — does `sub` occur anywhere in `s`? bool (i32 0/1).
+    str_contains: struct { str: *Expr, sub: *Expr },
 };
