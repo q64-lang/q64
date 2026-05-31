@@ -2493,8 +2493,14 @@ fn cmdPodDeploy(
         }
     } else if (extractStringField(raw, "\"wasm\"")) |wasm_rel| {
         try wasm_norms.append(gpa, stripDotSlash(wasm_rel));
+    } else if (extractStringField(raw, "\"module\"")) |mod_rel| {
+        // A JS-module component (`component.module`): the API bundler accepts a
+        // `.js` entry as well as wasm (apps/api/src/bundle.ts), so a stateless JS
+        // qube (e.g. a static-PWA handler) deploys the same way — the packer just
+        // stages the named entry file alongside the manifest + assets.
+        try wasm_norms.append(gpa, stripDotSlash(mod_rel));
     } else {
-        try writeStderr(io, "qube pod deploy: manifest has no component.wasm or component.variants\n");
+        try writeStderr(io, "qube pod deploy: manifest has no component.wasm, component.module, or component.variants\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     }
 
