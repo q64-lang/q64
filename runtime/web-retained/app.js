@@ -7,7 +7,17 @@
 // node_id, preserved across frames — never a blind full re-emit.
 import { KIND, ATTR, EVENT, EVENT_NAME, unpackColor, PROTOCOL_VERSION } from './protocol.js';
 import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, DPR } from './gpu.js';
-import { widgetFor, THEME } from './widgets.js';
+import { widgetFor } from './widgets.js';
+import { resolvePlatform } from './platform.js';
+import { themeFor } from './theme.js';
+
+// One self-drawn renderer, three looks: iOS-ish on iOS, Material-ish on Android,
+// a neutral house look on desktop. The platform is resolved once (sniff +
+// ?platform= override); the per-platform theme tokens flow to every widget via
+// r.platform / r.theme. Shaders and the protocol are unchanged — only tokens and
+// (for structurally-different controls) per-platform draw variants differ.
+const PLATFORM = resolvePlatform();
+const THEME = themeFor(PLATFORM);
 
 const log = (m) => { const el = document.getElementById('log'); if (el) el.textContent = m; console.log('[qview]', m); };
 
@@ -103,7 +113,7 @@ const attrName = (a) => Object.keys(ATTR).find((n) => ATTR[n] === a) ?? `attr${a
 
 // ---- render: walk the retained tree, dispatch each node to its widget --------
 const renderCtx = {
-  pass: null, drawPrim, sdfText: sdfTexture, theme: THEME,
+  pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
   attr: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : Number(v); },
   color: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : unpackColor(v); },
   textFor: (node) => glyphFor(node),
@@ -111,7 +121,7 @@ const renderCtx = {
 };
 
 function render() {
-  const frame = beginFrame();
+  const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
   walk(ROOT);
   endFrame(frame);
