@@ -285,8 +285,9 @@ async function main() {
   // point, for any node whose widget exposes contextMenu(node, r). Reuses the
   // shared popup primitive (so it flips/clamps near edges too).
   const LONG_PRESS_MS = 500;
-  let longPressTimer = null, longPressFired = false;
-  const cancelLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } };
+  const LONG_PRESS_SLOP = 10;   // px the finger may wobble during a hold
+  let longPressTimer = null, longPressFired = false, longPressXY = null;
+  const cancelLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } longPressXY = null; };
 
   // Open a context menu for the node at (px,py), anchored at the point. Returns
   // true if a menu was raised.
@@ -325,6 +326,7 @@ async function main() {
     if (w && w.contextMenu) {
       longPressFired = false;
       cancelLongPress();
+      longPressXY = [px, py];
       longPressTimer = setTimeout(() => { longPressTimer = null; longPressFired = openContextMenu(px, py); }, LONG_PRESS_MS);
     }
     // A widget that can raise a menu (dropdown): toggle it open.
@@ -352,8 +354,13 @@ async function main() {
   }, { passive: false });
 
   canvas.addEventListener('pointermove', (ev) => {
-    // A finger that moves cancels a pending long-press (it's a drag/scroll, not a hold).
-    if (longPressTimer) cancelLongPress();
+    // Cancel a pending long-press only if the finger moves beyond the slop radius
+    // (a real hold always wobbles a few px; a true drag/scroll exceeds slop).
+    if (longPressTimer && longPressXY) {
+      const [sx, sy] = longPressXY;
+      const [mx, my] = localXY(ev);
+      if (Math.hypot(mx - sx, my - sy) > LONG_PRESS_SLOP) cancelLongPress();
+    }
     if (!dragNode) return;
     ev.preventDefault();
     // Only the x drives the value; vertical drift (e.g. toward a label) is

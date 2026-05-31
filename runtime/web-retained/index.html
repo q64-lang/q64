@@ -15,7 +15,10 @@
   /* touch-action:none — the canvas owns all gestures; without it the browser
      treats a vertical-ish drag (e.g. drifting toward a label) as a scroll and
      fires pointercancel, dropping a slider drag. */
-  #gpu { flex: 1 1 auto; width: 100%; display: block; touch-action: none; }
+  /* Also suppress the iOS long-press callout / text selection so a hold reaches
+     our long-press handler instead of Safari's selection UI. */
+  #gpu { flex: 1 1 auto; width: 100%; display: block; touch-action: none;
+    -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
   #log { padding: 0.5rem 1rem calc(env(safe-area-inset-bottom) + 0.5rem); font: 0.8rem ui-monospace, monospace; color: #6b7484; }
 </style>
 </head>
