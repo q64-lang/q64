@@ -181,6 +181,15 @@ pub const Op = union(enum) {
     /// Byte-wise equality of two str values as i32 (0/1). Both are str-typed
     /// insts; lowers to a `__str_eq(pa, la, pb, lb)` helper call.
     str_eq: struct { lhs: *Inst, rhs: *Inst },
+    /// `s.slice(start, end)` -> str (ptr+start, end-start). `str` is str-typed;
+    /// `start`/`end` are i64. Lowers inline to a (ptr, len) pair.
+    str_slice: struct { str: *Inst, start: *Inst, end: *Inst },
+    /// `s.index_of(byte)` -> i64. `str` str-typed, `byte` i64. __str_index_of.
+    str_index_of: struct { str: *Inst, byte: *Inst },
+    /// `s.starts_with(prefix)` -> i32. Both str-typed. __str_starts_with.
+    str_starts_with: struct { str: *Inst, prefix: *Inst },
+    /// `s.contains(sub)` -> i32. Both str-typed. __str_contains.
+    str_contains: struct { str: *Inst, sub: *Inst },
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the

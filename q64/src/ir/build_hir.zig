@@ -689,6 +689,24 @@ fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir
 /// Build a `str`-valued expression: a constant string literal (no runtime
 /// interpolation), a passthrough parameter reference, or a call to a str
 /// function (whose arguments are themselves str values).
+/// If `name` resolves to a `str` value (a scope local/param or a runtime str
+/// binding), build a str_binding expr for it; else null. Used to recognize a
+/// str-method receiver in `<recv>.<method>(…)`, which parses as a dotted call.
+fn strReceiver(b: *Builder, name: []const u8, scope: *Scope, rt: ?*const RtMap) BuildError!?*hir.Expr {
+    if (scope.find(name)) |loc| {
+        if (loc.ty != .str) return null;
+        const e = try b.a.create(hir.Expr);
+        e.* = .{ .str_binding = .{ .ptr_idx = loc.idx, .len_idx = loc.idx + 1 } };
+        return e;
+    }
+    if (rtBinding(rt, name)) |bnd| {
+        const e = try b.a.create(hir.Expr);
+        e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+        return e;
+    }
+    return null;
+}
+
 fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) BuildError!*hir.Expr {
     const out = try b.a.create(hir.Expr);
     switch (expr) {
@@ -725,6 +743,19 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // `<str>.slice(start, end)` parses as a call with a dotted path callee
+            // (like `qview.set_attr(…)`). The str-VALUED method.
+            if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
+                if (std.mem.eql(u8, cname[dot + 1 ..], "slice")) {
+                    if (try strReceiver(b, cname[0..dot], scope, rt)) |sval| {
+                        var sit = cc.args();
+                        const start = try buildIntExpr(b, sit.next() orelse return error.Unsupported, scope);
+                        const end = try buildIntExpr(b, sit.next() orelse return error.Unsupported, scope);
+                        out.* = .{ .str_slice = .{ .str = sval, .start = start, .end = end } };
+                        return out;
+                    }
+                }
+            }
             const id = try registerFunc(b, cname);
             if (b.funcs.items[id].ret != .str) return error.Unsupported;
             var args: std.ArrayList(*hir.Expr) = .empty;
@@ -732,6 +763,17 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             while (ait.next()) |a| try args.append(b.a, try buildStrArg(b, a, scope, rt));
             if (args.items.len != b.funcs.items[id].params.len) return reject(b, .unsupported_call);
             out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
+        },
+        .method => |me| {
+            // `s.slice(start, end)` — the only str-VALUED method. (index_of /
+            // starts_with / contains are i64/bool, handled in buildIntExpr.)
+            const mname = (me.method() orelse return error.Unsupported).text;
+            if (!std.mem.eql(u8, mname, "slice")) return error.Unsupported;
+            const sval = try buildStrExpr(b, me.receiver() orelse return error.Unsupported, scope, rt);
+            var ait = me.args();
+            const start = try buildIntExpr(b, ait.next() orelse return error.Unsupported, scope);
+            const end = try buildIntExpr(b, ait.next() orelse return error.Unsupported, scope);
+            out.* = .{ .str_slice = .{ .str = sval, .start = start, .end = end } };
         },
         else => return error.Unsupported,
     }
@@ -1237,6 +1279,26 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // i64/bool str methods parse as dotted calls: `<str>.index_of(byte)`
+            // -> i64, `<str>.starts_with(p)` / `<str>.contains(sub)` -> bool.
+            if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
+                const method = cname[dot + 1 ..];
+                const is_method = std.mem.eql(u8, method, "index_of") or std.mem.eql(u8, method, "starts_with") or std.mem.eql(u8, method, "contains");
+                if (is_method) {
+                    if (try strReceiver(b, cname[0..dot], scope, null)) |sval| {
+                        var mit = cc.args();
+                        const a0 = mit.next() orelse return error.Unsupported;
+                        if (std.mem.eql(u8, method, "index_of")) {
+                            out.* = .{ .str_index_of = .{ .str = sval, .byte = try buildIntExpr(b, a0, scope) } };
+                        } else if (std.mem.eql(u8, method, "starts_with")) {
+                            out.* = .{ .str_starts_with = .{ .str = sval, .prefix = try buildStrExpr(b, a0, scope, null) } };
+                        } else {
+                            out.* = .{ .str_contains = .{ .str = sval, .sub = try buildStrExpr(b, a0, scope, null) } };
+                        }
+                        return out;
+                    }
+                }
+            }
             const id = try registerFunc(b, cname);
             // An i64 or bool (i32 0/1) callee produces a value usable here; a
             // str callee does not belong in an i64/bool expression.
@@ -1283,6 +1345,24 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
             out.* = .{ .str_index = .{ .str = sval, .idx = idx } };
+        },
+        .method => |me| {
+            // i64/bool str methods: `index_of(byte)` -> i64, `starts_with(p)` /
+            // `contains(sub)` -> bool. (`slice` is str-valued — see buildStrExpr.)
+            const mname = (me.method() orelse return error.Unsupported).text;
+            const sval = buildStrExpr(b, me.receiver() orelse return error.Unsupported, scope, null) catch |e| switch (e) {
+                error.Unsupported => return error.Unsupported, // method on a non-str
+                else => return e,
+            };
+            var ait = me.args();
+            const a0 = ait.next() orelse return error.Unsupported;
+            if (std.mem.eql(u8, mname, "index_of")) {
+                out.* = .{ .str_index_of = .{ .str = sval, .byte = try buildIntExpr(b, a0, scope) } };
+            } else if (std.mem.eql(u8, mname, "starts_with")) {
+                out.* = .{ .str_starts_with = .{ .str = sval, .prefix = try buildStrExpr(b, a0, scope, null) } };
+            } else if (std.mem.eql(u8, mname, "contains")) {
+                out.* = .{ .str_contains = .{ .str = sval, .sub = try buildStrExpr(b, a0, scope, null) } };
+            } else return error.Unsupported;
         },
         else => return error.Unsupported,
     }

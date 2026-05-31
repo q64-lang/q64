@@ -166,6 +166,23 @@ fn collectExpr(
             try collectExpr(a, se.lhs, d, e);
             try collectExpr(a, se.rhs, d, e);
         },
+        .str_slice => |sl| {
+            try collectExpr(a, sl.str, d, e);
+            try collectExpr(a, sl.start, d, e);
+            try collectExpr(a, sl.end, d, e);
+        },
+        .str_index_of => |m| {
+            try collectExpr(a, m.str, d, e);
+            try collectExpr(a, m.byte, d, e);
+        },
+        .str_starts_with => |m| {
+            try collectExpr(a, m.str, d, e);
+            try collectExpr(a, m.prefix, d, e);
+        },
+        .str_contains => |m| {
+            try collectExpr(a, m.str, d, e);
+            try collectExpr(a, m.sub, d, e);
+        },
         // Leaves: no calls, no faces.
         .str_const, .int_const, .bool_const, .local, .global_get, .str_binding => {},
     }
