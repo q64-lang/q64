@@ -135,6 +135,23 @@ encoding** column.
 | `17` | `value` | slider, progress | current value (clamped to `[min,max]`; `-1` = indeterminate for progress) |
 | `18` | `z` | all | stacking order within parent (default = creation order) |
 | `19` | `gap` | row, column | inter-child spacing px |
+| `20` | `surface` | box, containers | **semantic** fill role resolved against the platform theme (a `SURFACE` enum), taking precedence over a literal `fill`. See [§Per-platform look](#per-platform-look--themes). |
+
+**`SURFACE` roles** (the `surface` attr value) — theme-resolved translucent
+fills, so a producer asks for "a frosted bar" and the host paints the platform's
+material (iOS material / Material 3 surface tint / desktop frosted) without the
+producer naming a color:
+
+| value | role | use |
+|---|---|---|
+| `0` | `none` | no background (draw border only, or nothing) |
+| `1` | `surface` | the opaque platform surface color |
+| `2` | `material` | frosted card/sheet tint (alpha) |
+| `3` | `material_thin` | lighter bar/chrome tint (alpha) |
+| `4` | `scrim` | full-screen modal dim |
+
+Materials are **alpha tints today** (`drawPrim` blends src-alpha); true backdrop
+**blur** is a deferred renderer pass — see [§Per-platform look](#per-platform-look--themes).
 
 **Color** is a packed `i64` `0x00000000AARRGGBB` (high 32 bits zero). **Geometry**
 is integer px in a device-independent coordinate space; the host scales by DPR
@@ -183,6 +200,40 @@ label without first solving the string ABI. **Producer-owned strings** (a wasm32
 `(ptr,len)` read by the host, per the wasm32 string-ABI work) land alongside
 `text_input`, since both need it. Until then, dynamic text uses `number` semantics
 (the host renders an integer) as the POC does.
+
+## Per-platform look & themes
+
+The renderer is **self-drawn everywhere** — one WebGPU/SDF shader, one protocol —
+but the **look adapts per OS**: iOS-ish on iOS, Material-ish on Android, a neutral
+house look on desktop. This is a PWA goal (no native/JSI controls); the adaptation
+is **not** a shader or protocol concern. It lives in two host-side layers:
+
+1. **Theme tokens** — the host resolves the platform once (sniff + a `?platform=`
+   override) and exposes a per-platform token set to every widget via the render
+   context (`r.theme`, `r.platform`): colors *and* shape tokens (button shape/
+   radius, switch variant, check shape, font, background, the `SURFACE`
+   materials). Same draw code, different constants.
+2. **Per-widget draw variants** — controls whose *shape* genuinely differs by
+   platform (the **switch**: iOS full-height knob + colored track vs Material 3
+   small-thumb-grows-to-large + outline track) branch on `r.platform` and compose
+   the *same* SDF primitives differently. Still one shader.
+
+The `ATTR.surface` roles above are how a producer requests a **theme material**
+(frosted bar/sheet/scrim) without naming a color — the host paints the platform's
+material. Fidelity note: **Material 3 is publicly specified** (material.io: exact
+dp, tonal color roles, state-layer opacities) and can be matched to spec; **iOS
+has no exact public control spec** (HIG + SF Symbols/San Francisco only), so the
+iOS look is *convincingly close*, not byte-exact (e.g. Apple's continuous-curvature
+"squircle" corners need a superellipse SDF — a later upgrade over our circular-arc
+rounded-rect).
+
+**Deferred — true backdrop blur.** Materials are **alpha tints** today: a
+translucent fill that composites over whatever is behind it (correct color/alpha,
+no blur). Real iOS `UIBlurEffect` / Material translucency *samples and Gaussian-
+blurs the content behind* the panel — a **two-phase renderer pass** (draw the scene
+to an offscreen target, then a blur pipeline samples it under the translucent
+node). That is a bounded, queued renderer feature; it does not touch the protocol
+or the `SURFACE` enum (the same roles light up once the blur pass exists).
 
 ## The `@ui` effect
 

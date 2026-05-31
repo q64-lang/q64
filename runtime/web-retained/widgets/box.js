@@ -10,12 +10,15 @@ register(KIND.box, {
     const w = r.attr(node, ATTR.w, 120), h = r.attr(node, ATTR.h, 80);
     const radius = r.attr(node, ATTR.radius, 12);
     const borderW = r.attr(node, ATTR.border_w, 0);
-    const fill = r.color(node, ATTR.fill, r.theme.surface);
+    // surfaceFill honors a semantic ATTR.surface role (theme material/scrim)
+    // over a literal ATTR.fill; a 'none' role means draw no background.
+    const fill = r.surfaceFill(node, r.theme.surface);
+    if (fill === null) { if (borderW <= 0) return; }
     const opts = { radius };
     if (borderW > 0) {
       opts.border = borderW;
       opts.borderColor = r.color(node, ATTR.border, r.theme.border);
     }
-    r.drawPrim(r.pass, x, y, w, h, fill, opts);
+    r.drawPrim(r.pass, x, y, w, h, fill ?? [0, 0, 0, 0], opts);
   },
 });
