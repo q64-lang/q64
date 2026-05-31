@@ -100,6 +100,8 @@ let glyphCache = new Map();  // nodeId -> {tex,view,w,h}; rebuilt only when text
 let glyphKey = new Map();    // nodeId -> last text string used, to skip rebuilds
 let pressedId = null;
 let focusedId = null;        // the text_input node id with keyboard focus, or null
+let caretOn = true;          // caret blink phase (visible) while a field is focused
+let blinkTimer = null;       // setInterval handle driving the blink
 let instance;
 
 // Host→app text scratch: when the user types, the host writes the field's UTF-8
@@ -185,6 +187,39 @@ let scrollY = 0, contentH = 0, viewportH = 0;
 // instead of hugging the left. 0 on a phone where content == viewport width.
 let offsetX = 0, contentW = 0;
 const SCROLL_BOTTOM_PAD = 40;   // extra room past content so the last widget fully clears
+// Soft-keyboard inset (CSS px): how much of the canvas the iOS/Android keyboard
+// overlays while a text field is focused. Detected via visualViewport. It both
+// extends the scroll range (so a bottom field can rise above the keyboard) and
+// defines the visible region we scroll the focused field into.
+let kbInset = 0;
+// The true scroll limit. Includes kbInset so content can scroll up past the
+// keyboard when one is open. Module-scoped so focus/keyboard logic can use it.
+function maxBound() { return Math.max(0, contentH + SCROLL_BOTTOM_PAD + kbInset - viewportH); }
+// Current keyboard inset from the visual viewport: the canvas area below the
+// shrunken visible region. ~0 when no keyboard is up.
+function viewportInset() {
+  const vv = window.visualViewport;
+  const cv = document.getElementById('gpu');
+  if (!vv || !cv) return 0;
+  const r = cv.getBoundingClientRect();
+  return Math.max(0, r.top + cv.clientHeight - vv.height);
+}
+// Scroll the focused field above the keyboard (into the visible region). Called
+// on focus and whenever the visual viewport changes (keyboard open/close).
+function ensureFocusedVisible() {
+  if (focusedId === null) return;
+  const cv = document.getElementById('gpu');
+  const rc = layoutMap.get(focusedId);
+  if (!cv || !rc) return;
+  kbInset = viewportInset();
+  const visibleBottom = cv.clientHeight - kbInset;
+  const fieldBottom = rc.y - scrollY + rc.h;     // field's on-screen bottom (canvas-local)
+  const margin = 16;
+  if (fieldBottom > visibleBottom - margin) {
+    scrollY = Math.max(0, Math.min(scrollY + fieldBottom - (visibleBottom - margin), maxBound()));
+  }
+  render();
+}
 const renderCtx = {
   pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
   attr: (node, a, dflt) => {
@@ -217,6 +252,7 @@ const renderCtx = {
   textValue: (node) => node._text?.[TEXTKEY.value] ?? '',
   textPlaceholder: (node) => node._text?.[TEXTKEY.placeholder] ?? '',
   isFocused: (id) => id === focusedId,
+  caretVisible: () => caretOn,
   // An SDF for an arbitrary string, cached by (string + size) — for field text
   // that changes per keystroke (no per-node glyph slot).
   glyphForStr: (str, sizePx) => glyphForStr(str, sizePx),
@@ -406,8 +442,18 @@ function dispatchText(node, event, str) {
 // keeps it on-screen + scrolls to it), seed its value, and focus() — which must
 // run inside the tap gesture to raise the soft keyboard. We draw the text/caret;
 // the input only captures keystrokes.
+// Start/refresh the caret blink (visible now, then toggle ~every 530ms). Called
+// on focus and reset on each keystroke so the caret stays solid while typing.
+function startBlink() {
+  caretOn = true;
+  if (blinkTimer) clearInterval(blinkTimer);
+  blinkTimer = setInterval(() => { caretOn = !caretOn; if (focusedId !== null) render(); }, 530);
+}
+function stopBlink() { if (blinkTimer) clearInterval(blinkTimer); blinkTimer = null; caretOn = true; }
+
 function focusField(node) {
   focusedId = node.id;
+  startBlink();
   const kbd = document.getElementById('kbd');
   const cv = document.getElementById('gpu');
   const rc = layoutMap.get(node.id);
@@ -422,6 +468,11 @@ function focusField(node) {
     try { kbd.setSelectionRange(kbd.value.length, kbd.value.length); } catch {}
   }
   render();
+  // The keyboard animates in over a few hundred ms; visualViewport 'resize'
+  // fires when it settles (the listener re-runs this), but try now + shortly
+  // after too so the field rises above the keyboard promptly.
+  ensureFocusedVisible();
+  setTimeout(ensureFocusedVisible, 300);
 }
 
 // Drop keyboard focus and commit (a `change` event to the handler).
@@ -429,8 +480,11 @@ function blurField() {
   if (focusedId === null) return;
   const node = nodes.get(focusedId);
   focusedId = null;
+  stopBlink();
+  kbInset = 0;                                   // keyboard is closing; reclaim the room
   const kbd = document.getElementById('kbd');
   if (kbd) kbd.blur();
+  scrollY = Math.max(0, Math.min(scrollY, maxBound()));
   if (node) dispatchText(node, EVENT.change, renderCtx.textValue(node));
   render();
 }
@@ -573,7 +627,7 @@ async function main() {
   const MIN_V = 0.4;           // stop below this speed
   const RUBBER = 0.55;         // overscroll resistance (lower = stiffer past the edge)
   const SPRING = 0.22;         // spring-back stiffness toward the edge
-  const maxBound = () => Math.max(0, contentH + SCROLL_BOTTOM_PAD - viewportH);
+  // maxBound() is module-scoped (keyboard-inset aware); see above.
   // How far past an edge scrollY currently is (signed: <0 past top, >0 past bottom).
   const overshoot = () => (scrollY < 0 ? scrollY : scrollY > maxBound() ? scrollY - maxBound() : 0);
   function stopMomentum() { if (momentumRAF) { cancelAnimationFrame(momentumRAF); momentumRAF = 0; } momentum = 0; }
@@ -782,10 +836,18 @@ async function main() {
       const node = nodes.get(focusedId);
       if (!node) return;
       (node._text ??= {})[TEXTKEY.value] = kbd.value;
+      startBlink();                              // keep the caret solid while typing
       dispatchText(node, EVENT.input, kbd.value);
       render();
     });
     kbd.addEventListener('blur', () => { if (focusedId !== null) blurField(); });
+  }
+  // The soft keyboard shrinks the visual viewport; track that inset and keep the
+  // focused field above it. (No-op on desktop, where visualViewport ~= layout.)
+  if (window.visualViewport) {
+    const onVV = () => { kbInset = viewportInset(); if (focusedId !== null) ensureFocusedVisible(); else render(); };
+    window.visualViewport.addEventListener('resize', onVV);
+    window.visualViewport.addEventListener('scroll', onVV);
   }
 
   // Re-fit on a viewport change: rebuild the backing store, refresh viewportH so

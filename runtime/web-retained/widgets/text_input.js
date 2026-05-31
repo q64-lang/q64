@@ -27,20 +27,24 @@ register(KIND.text_input, {
     const borderColor = focused ? r.theme.accent : r.theme.border;
     r.drawPrim(r.pass, g.x, g.y, g.w, g.h, bg, { radius, border: focused ? 2 : 1, borderColor });
 
-    // Value if present, else the dimmed placeholder.
+    // Value if present, else the dimmed placeholder. Draw the glyph shifted left
+    // by its spread-pad so the INK starts exactly at the box's inner-left; the
+    // ink advance is glyph.w - 2*pad, so the caret hugs the text (no phantom gap).
     const value = r.textValue(node);
     const placeholder = r.textPlaceholder(node);
     const str = value || placeholder;
     const glyph = str ? r.glyphForStr(str, FONT) : null;
-    let caretX = g.x + PAD;
+    const innerLeft = g.x + PAD;
+    let caretX = innerLeft;
     if (glyph) {
+      const pad = glyph.pad ?? 0;
       const ty = g.y + (g.h - glyph.h) / 2;
       const ink = value ? r.theme.fg : r.theme.track;     // placeholder = muted
-      r.drawPrim(r.pass, g.x + PAD, ty, glyph.w, glyph.h, ink, { texView: glyph.view });
-      if (value) caretX = g.x + PAD + glyph.w;
+      r.drawPrim(r.pass, innerLeft - pad, ty, glyph.w, glyph.h, ink, { texView: glyph.view });
+      if (value) caretX = innerLeft + (glyph.w - 2 * pad);
     }
-    // A steady caret bar after the value while focused (no blink in v1).
-    if (focused) {
+    // A blinking caret bar at the end of the value while focused.
+    if (focused && r.caretVisible()) {
       const ch = Math.round(g.h * 0.5);
       r.drawPrim(r.pass, caretX + 1, g.y + (g.h - ch) / 2, 2, ch, r.theme.accent, {});
     }
