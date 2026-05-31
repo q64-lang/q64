@@ -24,6 +24,7 @@ const out = args.find((a) => a.endsWith('.png')) || 'gallery.png';
 const opt = (name, dflt) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : dflt; };
 const PLATFORM = opt('platform', 'ios');
 const SCREEN = opt('screen', 'screen.wasm');
+const SCROLL = Number(opt('scroll', 0));
 const W = Number(opt('width', 412));
 const H = Number(opt('height', 820));
 const THEME = themeFor(PLATFORM);
@@ -86,8 +87,10 @@ const r = {
   theme: THEME, platform: PLATFORM, pass: null,
   attr: (n, a, d) => {
     const g = GEOM[a]; const lay = g && layoutMap.get(n.id);
-    if (lay) return lay[g];
-    const v = n.attrs.get(a); return v === undefined ? d : Number(v);
+    let v = lay ? lay[g] : n.attrs.get(a);
+    v = v === undefined ? d : Number(v);
+    if (a === ATTR.y && !n._pinned) v -= SCROLL;
+    return v;
   },
   color: (n, a, d) => { const v = n.attrs.get(a); return v === undefined ? d : unpackColor(v); },
   surfaceFill: (n, d) => {

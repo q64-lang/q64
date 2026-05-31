@@ -143,6 +143,7 @@ const GEOM = { [ATTR.x]: 'x', [ATTR.y]: 'y', [ATTR.w]: 'w', [ATTR.h]: 'h' };
 // so content taller than the screen is reachable without native scroll fighting
 // the slider/long-press gestures. The pinned top bar opts out (drawn unshifted).
 let scrollY = 0, contentH = 0, viewportH = 0;
+const SCROLL_BOTTOM_PAD = 40;   // extra room past content so the last widget fully clears
 const renderCtx = {
   pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
   attr: (node, a, dflt) => {
@@ -243,7 +244,9 @@ function layout() {
 // ===========================================================================
 function render() {
   const cv = document.getElementById('gpu'); viewportH = cv ? cv.clientHeight : 0;
-  const maxScroll = Math.max(0, contentH + 16 - viewportH);   // 16px bottom margin
+  // Allow scrolling until the content bottom clears the viewport with a comfortable
+  // bottom margin, so the last widget (e.g. the vertical fader) is never cut off.
+  const maxScroll = Math.max(0, contentH + SCROLL_BOTTOM_PAD - viewportH);
   scrollY = Math.max(0, Math.min(scrollY, maxScroll));
 
   const frame = beginFrame(THEME.bg);
