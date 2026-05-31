@@ -259,6 +259,19 @@ async function main() {
   const hdr = document.querySelector('header');
   if (hdr) hdr.textContent = `QView · retained · build ${BUILD}`;
 
+  // Fully suppress the browser's default touch/gesture behaviour — the app owns
+  // every gesture. Block iOS pinch-zoom (gesturestart), the page context menu,
+  // and double-tap-zoom (a fast second tap). CSS handles scroll/callout/select.
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
+  document.addEventListener('gesturechange', (e) => e.preventDefault());
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+  let lastTouchEnd = 0;
+  document.addEventListener('touchend', (e) => {
+    const now = Date.now();
+    if (now - lastTouchEnd < 300) e.preventDefault();   // kill double-tap zoom
+    lastTouchEnd = now;
+  }, { passive: false });
+
   const canvas = document.getElementById('gpu');
   const resize = () => { canvas.width = Math.round(canvas.clientWidth * DPR); canvas.height = Math.round(canvas.clientHeight * DPR); };
   try { await initGPU(canvas); }
