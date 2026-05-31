@@ -138,8 +138,13 @@ export function endFrame(frame) { frame.pass.end(); device.queue.submit([frame.e
 export function setScissor(pass, rect) {
   const cw = ctx.canvas.width, ch = ctx.canvas.height;
   if (!rect) { pass.setScissorRect(0, 0, cw, ch); return; }
-  const x = Math.max(0, Math.round(rect.x * DPR));
-  const y = Math.max(0, Math.round(rect.y * DPR));
+  // Clamp the ORIGIN to the target too, not just the size. WebGPU requires
+  // x+w ≤ width and y+h ≤ height; if a clip rect is off-screen (e.g. a text
+  // field scrolled below the viewport, y > height) an unclamped x/y makes the
+  // rect invalid → the render pass errors → a blank frame. Clamping x/y to
+  // [0, cw]/[0, ch] keeps it valid (a degenerate 0-size rect when off-screen).
+  const x = Math.max(0, Math.min(cw, Math.round(rect.x * DPR)));
+  const y = Math.max(0, Math.min(ch, Math.round(rect.y * DPR)));
   const w = Math.max(0, Math.min(cw - x, Math.round(rect.w * DPR)));
   const h = Math.max(0, Math.min(ch - y, Math.round(rect.h * DPR)));
   pass.setScissorRect(x, y, w, h);
