@@ -865,6 +865,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .global_set => |gs| bodyHasOut(gs.value, want_int),
         .str_len => |s| bodyHasOut(s, want_int),
+        .str_index => |si| bodyHasOut(si.str, want_int) or bodyHasOut(si.idx, want_int),
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -965,6 +966,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         .host_call => |hc| for (hc.args) |a| scanScratch(a, s),
         .global_set => |gs| scanScratch(gs.value, s),
         .str_len => |inner| scanScratch(inner, s),
+        .str_index => |si| {
+            scanScratch(si.str, s);
+            scanScratch(si.idx, s);
+        },
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
@@ -1140,6 +1145,16 @@ const Lowerer = struct {
                 // are i64, so zero-extend the address-width len on wasm32.
                 const len = c.BinaryenTupleExtract(module, try self.inst(s), 1);
                 return if (self.ptr_type == self.i64_type) len else c.BinaryenUnary(module, c.BinaryenExtendUInt32(), len);
+            },
+            .str_index => |si| {
+                // ptr (element 0) + idx → load one unsigned byte → i64. idx is
+                // i64; on wasm32 wrap it to the i32 address width for the add.
+                const base = c.BinaryenTupleExtract(module, try self.inst(si.str), 0);
+                const idx64 = try self.inst(si.idx);
+                const idxp = if (self.ptr_type == self.i64_type) idx64 else c.BinaryenUnary(module, c.BinaryenWrapInt64(), idx64);
+                const addr = self.ptrAdd(base, idxp);
+                const byte = c.BinaryenLoad(module, 1, false, 0, 1, self.i32_type, addr, "0");
+                return c.BinaryenUnary(module, c.BinaryenExtendUInt32(), byte);
             },
             .if_ => |iff| {
                 const cond = try self.inst(iff.cond);

@@ -287,4 +287,8 @@ pub const Expr = union(enum) {
     /// str-valued expression; lowering reads its `(ptr, len)` len component and
     /// zero-extends it to i64.
     str_len: *Expr,
+    /// The unsigned byte at index `idx` of a `str` value as an i64 (`s[i]`). No
+    /// bounds check today — out-of-range reads other memory (caller guards with
+    /// `s.len`). `str` is str-valued, `idx` is i64.
+    str_index: struct { str: *Expr, idx: *Expr },
 };
