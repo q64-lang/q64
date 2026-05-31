@@ -1,11 +1,9 @@
-// text_input (kind 17): a single-line text field. The VALUE is host-owned — the
-// host captures keystrokes via a hidden <input> (for the iOS/Android soft
-// keyboard + IME) and stores the string on the node (set_text op / live edits);
-// q64 reads it back as a `text: str` handler param to validate. We draw the
-// box, the value (or a dimmed placeholder), and a caret when focused.
-//
-// v1 scope: left-aligned, no horizontal scroll or mid-text caret — the caret
-// sits after the value. Long text overflows the field (revisit with clipping).
+// text_input (kind 17): a single-line text field. The VALUE and the caret/
+// selection are host-captured via a hidden <input> (for the soft keyboard +
+// IME); q64 reads the value back as a `text: str` param. We draw the box, the
+// value (or a dimmed placeholder), and the caret at the element's selectionStart
+// while focused. The text scrolls horizontally to keep the caret in view and is
+// clipped to the box. Tap-to-position is provided via caretAt().
 import { KIND, ATTR } from '../protocol.js';
 import { register } from '../registry.js';
 
@@ -17,41 +15,83 @@ const geom = (node, r) => ({
   w: r.attr(node, ATTR.w, 240), h: r.attr(node, ATTR.h, 44),
 });
 
+// Ink advance width (not the padded SDF quad) of a string at FONT.
+function advance(r, s) {
+  if (!s) return 0;
+  const g = r.glyphForStr(s, FONT);
+  return g ? g.w - 2 * (g.pad || 0) : 0;
+}
+
+// The character index whose boundary is nearest x (px from the text's start).
+function indexForX(r, value, x) {
+  if (x <= 0) return 0;
+  let prev = 0;
+  for (let i = 1; i <= value.length; i++) {
+    const adv = advance(r, value.slice(0, i));
+    if (x < (prev + adv) / 2) return i - 1;
+    prev = adv;
+  }
+  return value.length;
+}
+
 register(KIND.text_input, {
   draw(node, r) {
     const g = geom(node, r);
     const focused = r.isFocused(node.id);
     const radius = Number(node.attrs.get(ATTR.radius) ?? r.theme.buttonRadius ?? 10);
-    // Field background + border (accent + thicker when focused).
     const bg = r.surfaceFill(node, r.theme.surface) ?? r.theme.surface;
     const borderColor = focused ? r.theme.accent : r.theme.border;
     r.drawPrim(r.pass, g.x, g.y, g.w, g.h, bg, { radius, border: focused ? 2 : 1, borderColor });
 
-    // Value if present, else the dimmed placeholder. Draw the glyph shifted left
-    // by its spread-pad so the INK starts exactly at the box's inner-left; the
-    // ink advance is glyph.w - 2*pad, so the caret hugs the text (no phantom gap).
     const value = r.textValue(node);
     const placeholder = r.textPlaceholder(node);
+    const innerLeft = g.x + PAD;
+    const innerW = g.w - 2 * PAD;
+
+    // Caret index from the hidden element (else end); its x within the text.
+    const sel = r.selStart(node);
+    const caretIdx = focused && sel != null ? Math.min(sel, value.length) : value.length;
+    const caretAdv = advance(r, value.slice(0, caretIdx));
+    const totalAdv = advance(r, value);
+
+    // Horizontal scroll: keep the caret inside the inner box; never scroll past
+    // the text end + a small margin. Only the value scrolls (placeholder = 0).
+    let sx = node._sx || 0;
+    const M = 2;
+    if (caretAdv - sx > innerW - M) sx = caretAdv - innerW + M;
+    if (caretAdv - sx < 0) sx = caretAdv;
+    sx = Math.max(0, Math.min(sx, Math.max(0, totalAdv - innerW + M)));
+    if (!focused) sx = 0;
+    node._sx = sx;
+
+    // Text (value or placeholder), clipped to the inner box, shifted by -sx.
     const str = value || placeholder;
     const glyph = str ? r.glyphForStr(str, FONT) : null;
-    const innerLeft = g.x + PAD;
-    let caretX = innerLeft;
     if (glyph) {
       const pad = glyph.pad ?? 0;
       const ty = g.y + (g.h - glyph.h) / 2;
-      const ink = value ? r.theme.fg : r.theme.track;     // placeholder = muted
-      r.drawPrim(r.pass, innerLeft - pad, ty, glyph.w, glyph.h, ink, { texView: glyph.view });
-      if (value) caretX = innerLeft + (glyph.w - 2 * pad);
+      const ink = value ? r.theme.fg : r.theme.track;
+      r.clip({ x: innerLeft, y: g.y, w: innerW, h: g.h });
+      r.drawPrim(r.pass, innerLeft - pad - (value ? sx : 0), ty, glyph.w, glyph.h, ink, { texView: glyph.view });
+      r.unclip();
     }
-    // A blinking caret bar at the end of the value while focused (text color).
+    // Blinking caret at the caret index (text color).
     if (focused && r.caretVisible()) {
+      const cx = innerLeft + caretAdv - sx;
       const ch = Math.round(g.h * 0.5);
-      r.drawPrim(r.pass, caretX + 1, g.y + (g.h - ch) / 2, 2, ch, r.theme.fg, {});
+      r.drawPrim(r.pass, cx, g.y + (g.h - ch) / 2, 2, ch, r.theme.fg, {});
     }
   },
   hit(node, px, py, r) {
     const g = geom(node, r);
     return px >= g.x && px <= g.x + g.w && py >= g.y && py <= g.y + g.h;
+  },
+  // Map a tap to a caret index (the host sets the hidden element's selection).
+  caretAt(node, px, py, r) {
+    const g = geom(node, r);
+    const value = r.textValue(node);
+    const localX = px - (g.x + PAD) + (node._sx || 0);
+    return indexForX(r, value, localX);
   },
   measure(node) {
     return { w: Number(node.attrs.get(ATTR.w) ?? 240), h: Number(node.attrs.get(ATTR.h) ?? 44) };

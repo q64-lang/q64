@@ -255,6 +255,25 @@ const renderCtx = {
   textPlaceholder: (node) => node._text?.[TEXTKEY.placeholder] ?? '',
   isFocused: (id) => id === focusedId,
   caretVisible: () => caretOn,
+  // The caret index (selectionStart of the focused field's hidden element), or
+  // null when this node isn't focused. The element owns caret/selection state.
+  selStart: (node) => {
+    if (node.id !== focusedId) return null;
+    const el = fieldEl(node);
+    return el && el.selectionStart != null ? el.selectionStart : null;
+  },
+  // Clip subsequent draws to `rect` (CSS px, screen coords) intersected with the
+  // current scroll-region clip; call unclip() to restore. Lets a field clip its
+  // text so a horizontally-scrolled value doesn't spill past the box.
+  clip: (rect) => {
+    const top = Math.max(rect.y, headerH);
+    const bottom = Math.min(rect.y + rect.h, viewportH);
+    setScissor(renderCtx.pass, { x: rect.x, y: top, w: rect.w, h: Math.max(0, bottom - top) });
+  },
+  unclip: () => {
+    if (headerH > 0) setScissor(renderCtx.pass, { x: 0, y: headerH, w: 10000, h: Math.max(0, viewportH - headerH) });
+    else setScissor(renderCtx.pass, null);
+  },
   // An SDF for an arbitrary string, cached by (string + size) — for field text
   // that changes per keystroke (no per-node glyph slot).
   glyphForStr: (str, sizePx) => glyphForStr(str, sizePx),
@@ -471,18 +490,29 @@ function isTextField(kind) { return kind === KIND.text_input || kind === KIND.te
 // else the single-line <input>. Both pinned top-left, invisible.
 function fieldEl(node) { return document.getElementById(node && node.kind === KIND.text_area ? 'kbdm' : 'kbd'); }
 
-function focusField(node) {
+function focusField(node, px, py) {
+  const el = fieldEl(node);
+  const w = widgetFor(node.kind);
+  // Map the tap to a caret index (tap-to-position); fall back to end-of-text.
+  const idx = (w && w.caretAt && px != null) ? w.caretAt(node, px, py, renderCtx) : renderCtx.textValue(node).length;
+  // Already focused → just move the caret (no re-focus, no keyboard flicker).
+  if (focusedId === node.id) {
+    if (el) { try { el.setSelectionRange(idx, idx); } catch {} }
+    startBlink();
+    render();
+    return;
+  }
   focusedId = node.id;
   kbScrolled = false;
   startBlink();
   // The capture element is pinned top-left (always visible) so iOS never
-  // auto-scrolls to it — we lift the drawn field ourselves. Just seed its value
-  // + focus (focus() must run inside the tap gesture to raise the soft keyboard).
-  const el = fieldEl(node);
+  // auto-scrolls to it — we lift the drawn field ourselves. Seed its value +
+  // focus (focus() must run inside the tap gesture to raise the soft keyboard)
+  // and place the caret where the user tapped.
   if (el) {
     el.value = renderCtx.textValue(node);
     el.focus();
-    try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
+    try { el.setSelectionRange(idx, idx); } catch {}
   }
   render();
   // The keyboard animates in over a few hundred ms; the visualViewport 'resize'
@@ -729,7 +759,7 @@ async function main() {
     // pointerdown on empty space, and scrolling must keep the keyboard open.
     if (hit && isTextField(hit.kind)) {
       ev.preventDefault();
-      focusField(hit);
+      focusField(hit, px, py);
       return;
     }
 
