@@ -1,0 +1,17 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "rpc-server",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "library",
+  "entry": "lib.q",
+
+  // RPC rides the component world, so component emission is required.
+  "component": {
+    "emit": true,
+    "world": "rpc-server",
+  },
+  "rpc": {
+    "export": true,
+  },
+}

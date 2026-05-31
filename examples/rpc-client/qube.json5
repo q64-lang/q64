@@ -1,0 +1,18 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "rpc-client",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "main.q",
+
+  // Calling an imported remote qube adds @wire to the caller's effect set.
+  "rpc": {
+    "import": {
+      "greeter": "wrpc://localhost:8080",
+    },
+  },
+  "effects": {
+    "declared": ["@wire", "@stdout"],
+  },
+}

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#07090d" />
+<title>QView · q64 → wasm32 → WebGPU</title>
+<link rel="manifest" href="./manifest.webmanifest" />
+<link rel="apple-touch-icon" href="./icon.svg" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #07090d; color: #e6edf3;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { padding: env(safe-area-inset-top) 1rem 0; font: 600 0.8rem ui-monospace, monospace;
+    letter-spacing: 0.2em; text-transform: uppercase; color: #5fd4ff; padding-top: max(env(safe-area-inset-top), 0.75rem); }
+  #gpu { flex: 1 1 auto; width: 100%; display: block; touch-action: manipulation; }
+  #log { padding: 0.5rem 1rem calc(env(safe-area-inset-bottom) + 0.5rem); font: 0.8rem ui-monospace, monospace; color: #6b7484; }
+</style>
+</head>
+<body>
+  <header>QView · q64 → wasm32 → WebGPU</header>
+  <canvas id="gpu"></canvas>
+  <div id="log">loading…</div>
+  <script type="module" src="./app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
+    }
+  </script>
+</body>
+</html>

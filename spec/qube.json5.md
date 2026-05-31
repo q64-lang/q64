@@ -1,0 +1,451 @@
+# qube.json5 — Manifest reference
+
+The manifest file that describes a qube. Every qube has one at its root.
+
+> **Status: draft (v0).** This spec moves with the language. Breaking
+> changes are still possible. The formal JSON Schema lives next to this
+> file at [`qube.json5.schema.json`](./qube.json5.schema.json).
+
+## Format
+
+JSON5 — JSON with comments, trailing commas, unquoted keys, and single-quoted
+strings. The manifest filename is always literally `qube.json5`.
+
+Every manifest should begin with a `$schema` reference for editor tooling
+(autocomplete, validation, hover docs):
+
+```json5
+{
+  $schema: "https://q64.dev/schema/qube.json5",
+  // ...
+}
+```
+
+## Minimal example (library qube)
+
+```json5
+{
+  $schema: "https://q64.dev/schema/qube.json5",
+  name:    "audio-filters",
+  version: "0.1.0",
+  license: "MIT OR Apache-2.0",
+}
+```
+
+That is a complete, publishable library qube. The default `entry` is
+`src/lib.q`; the default `type` is `library`; everything else is optional.
+
+## Full example (application qube)
+
+```json5
+{
+  $schema: "https://q64.dev/schema/qube.json5",
+
+  // Identity
+  name:        "voice-agent",
+  version:     "0.2.0",
+  license:     "MIT OR Apache-2.0",
+  description: "Real-time microphone → ASR → LLM → TTS → speaker pipeline.",
+  authors:     ["Alice Example <alice@example.com>"],
+  repository:  "https://github.com/example/voice-agent",
+  keywords:    ["audio", "ai", "real-time"],
+
+  // Code shape
+  type:  "application",
+  entry: "src/main.q",
+
+  // Dependencies. Keys are full qube names (= module paths). Core stdlib
+  // (`q64.*`, e.g. `q64.net`) is built in and never listed here.
+  dependencies: {
+    "dev.q64.audio":      "^0.3",
+    "dev.q64.ai":         "^0.3",
+    "com.openai.whisper": { version: "^1.0", features: ["en"] },
+    "dev.example.llm":    { path: "../llm" },
+  },
+
+  // Build targets
+  targets: {
+    desktop: {
+      host: "wasmtime",
+      optimize: "speed",
+    },
+    browser: {
+      host: "browser",
+      browser: {
+        coop: "same-origin",
+        coep: "require-corp",
+      },
+    },
+    plugin: {
+      host: "audio-host",
+      "audio-host": {
+        formats: ["vst3", "au"],
+      },
+    },
+  },
+
+  // Effect disclosure
+  effects: {
+    declared: ["@realtime", "@io", "@network"],
+    deny:     ["@unrestricted_fs"],
+  },
+
+  // Capability disclosure (cross-checked at publish; see env.md ENV040)
+  capabilities: ["Net", "Audio", "Stdout"],
+}
+```
+
+## Field reference
+
+### Identity
+
+| Field         | Type     | Required | Notes                                                                    |
+|---------------|----------|----------|--------------------------------------------------------------------------|
+| `$schema`     | string   | no       | Schema URL. Recommended at the top of every manifest.                    |
+| `name`        | string   | **yes**  | Dotted path; each segment a lowercase identifier `[a-z][a-z0-9_]*` (snake_case, no dashes), `.`-separated. The name **is** the module path (no transform) — see [`modules.md`](./modules.md). Publishable qubes (library/application) must use a reverse-DNS form with ≥2 segments (enforced at publish); a workspace root may use a single-segment label. `q64.*` is reserved for the built-in stdlib. Max 128 chars. e.g. `dev.q64.webmcp_client`, `com.acme.widget`. |
+| `version`     | string   | **yes**  | Semver.                                                                  |
+| `license`     | string   | **yes**  | SPDX expression. Use `"MIT OR Apache-2.0"` for the q64 ecosystem default.|
+| `description` | string   | no       | One-line summary, max 280 chars, shown on the registry.                  |
+| `authors`     | string[] | no       | Each entry is `"Name"` or `"Name <email>"`.                              |
+| `repository`  | URL      | no       | Source repository.                                                       |
+| `homepage`    | URL      | no       | Project homepage.                                                        |
+| `documentation` | URL    | no       | Hosted docs.                                                             |
+| `readme`      | string   | no       | Path to README rendered on registry. Defaults to `README.md` if present. |
+| `keywords`    | string[] | no       | Up to 8 short, kebab-case keywords for registry search.                  |
+| `categories`  | string[] | no       | Up to 5; closed vocabulary published by the registry.                    |
+
+### Code shape
+
+| Field   | Type   | Default                                                                       | Notes                                                          |
+|---------|--------|-------------------------------------------------------------------------------|----------------------------------------------------------------|
+| `type`  | enum   | inferred from `entry`                                                         | One of `"library"`, `"application"`, `"workspace"`.            |
+| `entry` | string | `src/lib.q` for libraries, `src/main.q` for applications                      | Path to the main `.q` source file.                             |
+| `build` | string | none                                                                          | Optional path to `build.q` for computed configuration.         |
+
+Static configuration lives in `qube.json5`; `build.q` is the imperative escape
+hatch for projects that need to compute target configuration at build time.
+
+### Dependencies
+
+Three sibling maps:
+
+| Field                  | Purpose                                                          |
+|------------------------|------------------------------------------------------------------|
+| `dependencies`         | Required at runtime by this qube.                                |
+| `dev-dependencies`     | Required for `qube test` / local dev, not shipped to consumers.  |
+| `build-dependencies`   | Required by `build.q` if present; not shipped, not test-time.    |
+
+Each map is `{ "qube-name": VersionSpec }`. A `VersionSpec` is either a
+**string** (semver range) or an **object**:
+
+```json5
+// String form — semver range
+{ "audio-utils": "^0.4.2" }
+
+// Object form
+{
+  "audio-utils": {
+    version:  "^0.4.2",        // omit when 'path' or 'git' is set
+    registry: "https://...",   // optional; override default registry
+    path:     "../audio-utils", // local path (mutually exclusive with version/git)
+    git:      "https://...",   // git source (mutually exclusive with version/path)
+    branch:   "main",
+    tag:      "v0.4.2",
+    rev:      "abc123…",
+    features: ["fft", "mp3"],  // feature flags on the dependency
+    "default-features": true,  // default true; set false to skip defaults
+    optional: false,           // default false
+  }
+}
+```
+
+`features` and `optional` mirror Cargo's model. Exactly one of `version`,
+`path`, or `git` must be set in the object form.
+
+### Workspace
+
+When `type` is `"workspace"`, the manifest binds multiple member qubes:
+
+```json5
+{
+  $schema: "https://q64.dev/schema/qube.json5",
+  name:    "stdlib",
+  version: "0.0.0",
+  license: "MIT OR Apache-2.0",
+  type:    "workspace",
+  workspace: {
+    members: ["math", "anim", "ai", "net", "audio", "gfx", "video", "fs"],
+    // exclude: ["scratch", "experimental"]
+  },
+}
+```
+
+`members` accepts glob patterns. `qube build` from a workspace root walks
+all members; from inside a member it builds just that qube.
+
+### Targets
+
+```json5
+targets: {
+  "<name>": {
+    host:         "browser" | "wasmtime" | "wasmer" | "audio-host" | "custom",
+    addressSpace: "wasm32" | "wasm64",       // REQUIRED — no default (see below)
+    optimize:     "debug" | "size" | "speed",   // default "speed"
+    wasm: {
+      // memory64 / table64 are NOT free toggles: they follow `addressSpace`
+      // (wasm64 ⇒ on, wasm32 ⇒ off). Listing them is redundant; contradicting
+      // `addressSpace` (e.g. memory64: true under wasm32) is an error.
+      "multi-memory":    true,
+      gc:                true,
+      threads:           true,
+      "stack-switching": true,
+      simd:              true,
+    },
+    // Host-specific blocks (only the matching one is used):
+    browser: {
+      coop: "same-origin",            // default
+      coep: "require-corp",           // default
+      "dev-server-port": 5173,
+    },
+    wasmtime: { wasi: "preview3" },   // default "preview3" (WASIp3 RC); "preview1" for legacy core-module hosts
+    wasmer:   { wasi: "preview3" },   // or "preview1" (legacy core module), "wasix"
+    "audio-host": {
+      formats: ["vst3", "au", "aax", "clap"],
+    },
+  }
+}
+```
+
+Every target **must** set `addressSpace` — there is no default. It selects
+the linear-memory address space the build is compiled for:
+
+- **`wasm32`** — 32-bit linear memory (`i32` pointers, ≤ 4 GiB). The
+  universal baseline; the only address space Apple WebKit (Safari and every
+  iPad/iOS browser) runs as of 2026, and the **safe fallback** a deploy host
+  serves when it can't confirm 64-bit support.
+- **`wasm64`** — 64-bit linear memory (Memory64 + Table64, `i64` pointers).
+  Unlocks > 4 GiB but does **not** run on WebKit.
+
+`qube build` errors (with a diagnostic, see [`qube-cli.md`](./qube-cli.md)) if
+the selected target has no `addressSpace`, or if `--addr` is also absent. To
+ship a qube that runs everywhere *and* exploits 64-bit where available,
+declare two targets (one per address space) and publish **both** artifacts —
+the deploy host then probes the client and serves the match, falling back to
+`wasm32`. On qubepods this is the QubePod manifest's `component.variants` map.
+See [`memory.md` §"The platform"](./memory.md) for the full rationale.
+
+The other `wasm.*` flags are Wasm 3.0 feature toggles that default to `true`.
+Setting one `false` is an explicit narrowing — `qube build` errors if any
+source uses a disabled feature. `memory64` and `table64` are **not** set here
+directly; they follow `addressSpace`.
+
+User-defined target names are kebab-case (`browser`, `desktop`, `plugin`,
+`edge-worker`, etc.) — the name is just a label; `host` and `addressSpace`
+decide everything.
+
+### Effects
+
+```json5
+effects: {
+  declared: ["@io", "@network"],
+  deny:     ["@unrestricted_fs"],
+}
+```
+
+| Field      | Purpose                                                                                    |
+|------------|--------------------------------------------------------------------------------------------|
+| `declared` | Effects this qube is allowed to use. The compiler verifies that source matches this set; declaring `@network` here while using only `@io` is a warning. |
+| `deny`     | Effects this qube refuses to transitively pull in. Build fails if any dependency requires a denied effect. |
+
+Core effect markers (per [`effects.md`](./effects.md), with
+`@cancel` / `@uncancellable` per [`concurrency.md`](./concurrency.md)):
+
+| Marker         | Meaning                                                       |
+|----------------|---------------------------------------------------------------|
+| `@realtime`    | Bounded execution, no alloc, no blocking, no suspending.      |
+| `@no_alloc`    | No heap allocation (linear or managed).                       |
+| `@no_suspend`  | Cannot yield to the scheduler.                                |
+| `@no_panic`    | Does not invoke `panic`.                                      |
+| `@no_trap`     | Does not invoke `trap`.                                       |
+| `@send`        | Safe to transfer across thread boundaries.                    |
+| `@pure`        | No mutation, no observable side effects.                      |
+| `@io`          | Performs I/O.                                                 |
+| `@network`     | Performs network operations. Implies `@io`.                   |
+| `@fs`          | Performs filesystem operations. Implies `@io`.                |
+| `@stdout`      | Writes to stdout. Implies `@io`.                              |
+| `@stderr`      | Writes to stderr. Implies `@io`.                              |
+| `@audio`       | Performs audio I/O.                                           |
+| `@midi`        | Performs MIDI I/O.                                            |
+| `@ui`          | Reads UI input events; writes frames.                         |
+| `@inference`   | Performs AI model load or inference.                          |
+| `@time`        | Reads clock time.                                             |
+| `@random`      | Reads from the system RNG.                                    |
+| `@exit`        | Terminates the program via `env.exit(…)`.                     |
+| `@envvars`     | Reads process environment variables.                          |
+| `@wire`        | Performs a remote (RPC) call. Implies `@io`. (Per `rpc.md`.)  |
+| `@cancel`      | Function observes `ctx.cancelled()`. (Per `concurrency.md`.) |
+| `@uncancellable`| Function cannot be interrupted by cancellation.              |
+
+User-defined effects follow the same shape (`^@[a-z][a-z_]*$`). The
+registry surfaces the union of declared effects per qube as part of the
+capability disclosure UI.
+
+### Capabilities
+
+```json5
+capabilities: ["Net", "Fs", "Stdout"]
+```
+
+The `capabilities` field is the developer-asserted summary of
+which runtime capabilities (per [`env.md`](./env.md)) this qube
+reaches. It is **cross-checked** at `qube publish` against the
+compiler-derived set computed from the effect graph; mismatch is
+`ENV040` and blocks publication.
+
+The two records exist because they serve different audiences:
+
+- The **manifest declaration** is human-readable and visible at
+  the top of the file; reviewers and registry users see it
+  immediately.
+- The **compiler-derived set** is emitted into a Wasm custom
+  section (`q64.capabilities`) and is the ground truth used by
+  the registry's installation prompt.
+
+The mapping from effect markers to capability names (per
+`env.md` §"Capability disclosure") is 1:1 — every capability
+reachable through `Env` is gated by exactly one effect marker:
+
+| Effect       | Implies capability   |
+|--------------|----------------------|
+| `@network`   | `Net`                |
+| `@fs`        | `Fs`                 |
+| `@audio`     | `Audio`              |
+| `@midi`      | `Midi`               |
+| `@ui`        | `Ui`                 |
+| `@inference` | `AiEnv`              |
+| `@time`      | `Clock`              |
+| `@random`    | `Rng`                |
+| `@stdout`    | `Stdout`             |
+| `@stderr`    | `Stderr`             |
+| `@exit`      | `ExitFn`             |
+| `@envvars`   | `EnvVars`            |
+
+Capability names are PascalCase (matching the face names in
+`env.md`). Listing a capability not used by the source is
+`ENV041` at publish (warning). Listing a capability the source
+*does* use, and one it *doesn't*, both raise — `ENV040` for the
+missing entry, `ENV041` for the extraneous one — so the developer
+gets one clean fix on each publish attempt.
+
+User-defined capabilities (introduced by `fit MyAdapter : Net`
+or by user-defined effect markers) are listed by the
+PascalCase name of the underlying face.
+
+### Component
+
+Opt-in WebAssembly Component Model emission. The default build produces a
+**core module**; this block requests an additional **component** wrapper
+(per [`modules.md` §"The qube as a component"](./modules.md) and
+[`README.md` §"Wasm 3.0 is the platform"](./README.md)).
+
+```json5
+component: {
+  emit:   false,        // default — primary artifact stays a core module
+  world:  "my-app",     // synthesized world name; default = qube name
+  worlds: [],           // additional WIT worlds to target, e.g. "wasi:http/proxy"
+  // WASI version is not pinned here; it tracks targets.<name>.wasmtime.wasi
+  // (default "preview3" — the WASIp3 RC snapshot q64 tracks, per env.md).
+}
+```
+
+| Field    | Type     | Default       | Notes                                                             |
+|----------|----------|---------------|-------------------------------------------------------------------|
+| `emit`   | bool     | `false`       | When `true`, `qube build` also emits `target/<host>/<name>.component.wasm` alongside the core module. The core module remains the primary artifact. |
+| `world`  | string   | qube name     | Name of the synthesized WIT world (exports = public surface, imports = derived capability set). |
+| `worlds` | string[] | `[]`          | Additional standard worlds the component targets, e.g. `"wasi:cli/command"`, `"wasi:http/proxy"`. |
+
+Equivalent to `component.emit: true` for a one-off build:
+`qube build --component` (which delegates to `q64 build --component`).
+
+An HTTP-serving qube (per [`env.md` §"HTTP service entry point"](./env.md))
+opts in with:
+
+```json5
+component: { emit: true, world: "my-api", worlds: ["wasi:http/proxy"] }
+```
+
+This makes the qube a drop-in **qubepods** endpoint runnable under generic
+Component Model HTTP lifting, with no qubepods-specific ABI.
+
+### RPC
+
+Qube-to-qube remote calls over the synthesized world (full semantics in
+[`rpc.md`](./rpc.md)). Requires `component.emit: true` — RPC rides the
+component's WIT world.
+
+```json5
+rpc: {
+  export: true,                          // expose this qube's world as a wRPC service
+  import: {                              // remote qubes this qube calls
+    "billing": "wrpc://billing.example.com",
+  },
+}
+```
+
+| Field    | Type            | Default | Notes                                                                       |
+|----------|-----------------|---------|-----------------------------------------------------------------------------|
+| `export` | bool            | `false` | When `true`, the component's exports are served over wRPC by the host adapter. |
+| `import` | { name: addr }  | `{}`    | Maps a remote qube's local binding name to its wRPC address (a qubepods endpoint or continuum-resolved address). Calls into an imported remote function carry the `@wire` effect. |
+
+A remote address may be a literal `wrpc://…` URL or a continuum-registered
+qube name resolved at build/deploy time (see
+[`continuum-api.md`](./continuum-api.md)). Importing a remote qube adds
+`@wire` to the caller's effect set and the remote world to the component's
+imports, so the dependency is disclosed in `qube audit` like any capability.
+
+### Publishing
+
+| Field      | Type     | Default                                       | Notes                                                                  |
+|------------|----------|-----------------------------------------------|------------------------------------------------------------------------|
+| `publish`  | boolean  | `true`                                        | Set `false` to prevent `qube publish` from ever uploading.             |
+| `registry` | URL      | continuum production URL                      | Override per-qube (private or alternate registries).                   |
+| `include`  | string[] | omitted ⇒ default file set (see below)        | Globs **added to** the default set; never replaces it.                 |
+| `exclude`  | string[] | none                                          | Globs excluded; applied after include resolution. May drop defaults.   |
+
+The default archive file set (when `include` is omitted) is
+specified in [`continuum-api.md` §Archive format](./continuum-api.md):
+`qube.json5`, `src/**`, `tests/**`, `examples/**` (and a top-level
+`example/`), the README, and `LICENSE-*` files at the root. Examples
+ship so an installed qube carries runnable usage guidance for humans
+and coding agents. `include` adds files on top; it does not replace
+the default. To drop a default file, use `exclude`.
+
+## Versioning policy for the schema
+
+The schema itself follows semver, surfaced as the path of the `$schema`
+URL: `https://q64.dev/schema/qube.json5` is the latest minor release of
+the current major version. A breaking change moves the schema to a new
+URL (`/schema/v2/qube.json5`), and the `qube` CLI accepts both for one
+major version's grace period.
+
+While the language is pre-1.0, the schema is also pre-1.0 — fields can be
+added, removed, or renamed between minor releases. Pin schema and CLI
+versions together until 1.0.
+
+## Related
+
+- [`effects.md`](./effects.md) — the formal effect-marker registry;
+  `effects.declared` and `effects.deny` semantics; the cross-check that
+  produces `EFF130` / `EFF131` at publish.
+- [`env.md`](./env.md) — capability model and the `ENV040` /
+  `ENV041` publish cross-checks for the `capabilities` field.
+- [`concurrency.md`](./concurrency.md) — `@cancel` / `@uncancellable`
+  semantics and the M:N task model that `@realtime` pins on.
+- [`continuum-api.md`](./continuum-api.md) — how the registry
+  surfaces declared + detected effects and capabilities at
+  install.
+- [`q64-cli.md`](./q64-cli.md) — `q64 show effects <qube>` and
+  `q64 show capabilities <qube>` introspection.
+- The built-in `q64.*` stdlib namespaces (`q64.math`, `q64.net`, etc.)
+  are reserved and shipped with the toolchain, so they never appear in
+  `dependencies`.

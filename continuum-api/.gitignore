@@ -1,0 +1,9 @@
+node_modules/
+.dev.vars
+.wrangler/
+dist/
+*.log
+
+# wrangler.jsonc contains Cloudflare resource IDs (D1, KV) and account-specific
+# config. Commit wrangler.example.jsonc with placeholders instead.
+wrangler.jsonc

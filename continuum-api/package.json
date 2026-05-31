@@ -1,0 +1,23 @@
+{
+  "name": "q64-continuum-api",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply q64-continuum --local",
+    "db:migrate:remote": "wrangler d1 migrations apply q64-continuum --remote",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.12.22",
+    "json5": "^2.2.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260523.1",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.94.0"
+  }
+}

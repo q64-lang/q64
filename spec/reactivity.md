@@ -1,0 +1,283 @@
+# QView reactivity & redraw — design note
+
+> **Status: design note / draft.** Captures the model choice for reactive `state`
+> in the QView UI surface and *how QView decides what to redraw*. Pairs with
+> [`stdlib/reactive`](../stdlib/reactive), [`stdlib/view`](../stdlib/view)
+> (`Renderer` face), [`env.md`](./env.md) (`@ui`/`@kv` effects), and the
+> `state` / `@state` distinction. Not yet normative; the recommendation + staged
+> path at the end is what we intend to build.
+
+## The question
+
+A UI is `view = f(state)`. When `state` changes, *what do we re-execute, and what
+do we repaint?* The cheaper and more surgical that decision, the better the UI
+scales (lists, animation, input focus, battery). This note surveys the modern
+options and picks one for QView.
+
+## The landscape — five ways to decide what to redraw
+
+1. **Immediate mode** (Dear ImGui; our current POC). Re-run the whole UI function
+   and repaint everything, every frame/interaction. *Zero bookkeeping; trivially
+   correct.* But it re-executes + repaints unrelated UI and **loses node identity**
+   (focus, scroll, caret, in-flight animation). Fine to prove a pipeline; wrong for
+   app UIs. **This is where QView is today** (`present(full scene)` + full WebGPU pass).
+
+2. **Retained + Virtual-DOM diff** (React, classic). Re-run components to build a
+   *new* virtual tree, **diff** it against the previous one, reconcile to real nodes.
+   *Simple model (`UI = f(state)`), portable.* But the diff is runtime work O(tree),
+   components re-run, and you "render then throw most of it away." Mitigated with
+   `memo`/keys/concurrent scheduling — and, tellingly, React's own 2024+ **compiler**
+   auto-memoizes to avoid re-running/diffing unchanged parts. The VDOM is now seen as
+   overhead, not an asset.
+
+3. **Compiled reactivity** (Svelte). The **compiler** analyzes which DOM nodes depend
+   on which variables and emits *imperative, surgical update code* at build time. A
+   write to a reactive variable marks it dirty and runs the generated update for just
+   the affected bindings. **No VDOM, no runtime diff** — the compiler "pre-computes the
+   diff." Tiny runtime, fast updates.
+
+4. **Fine-grained signals** (Solid, Angular signals, Vue refs, Preact, Qwik; the TC39
+   **Signals** proposal). Components run **once**; reading a signal inside a tracked
+   scope **auto-subscribes**; writing a signal notifies **exactly** the computations /
+   bindings that read it. **No VDOM, no re-run, no tree diff** — update cost is
+   **O(number of changed bindings)**, not O(tree). The runtime is the signal graph
+   (subscriber lists + a tracking context + a scheduler).
+
+5. **Server-driven diffs** (Phoenix LiveView, Qwik resumability, islands). State lives
+   on the server; a change computes a **diff on the server** and ships **mutation ops**
+   over a socket to a thin client that applies them. Directly relevant to **`@state`**
+   (remote): the qubepods backend is the "server" and our WebSocket channel is the wire.
+
+## The modern redraw concept (the synthesis)
+
+The 2024–2026 consensus has moved **off the VDOM** toward **fine-grained signals +
+compiler assistance**, with one clean separation:
+
+- **"What changed" is tracked at the data layer** — signal reads build a precise
+  dependency graph; a write touches only its dependents. (Cost ∝ change, not tree size.)
+- **"How to apply it" is a surgical mutation** to a *retained* node tree — `set_attr`
+  on the exact node, not a re-rendered subtree.
+- **The compiler does as much as possible ahead of time** (Svelte; React Forget; Vue
+  Vapor), so the runtime stays tiny.
+
+So: **signals decide *what*, a retained mutation protocol applies *how*, and the
+compiler removes runtime bookkeeping wherever dependencies are statically knowable.**
+VDOM diffing is the previous generation.
+
+## q64's opportunity
+
+q64 is unusually well-placed, because it is an **AOT compiler with an effect system**
+emitting to wasm — exactly the Svelte/Solid-compiler sweet spot. It can do at
+*compile time* what JS frameworks do at runtime:
+
+- **Statically derive the dependency graph.** The compiler can see which `state` each
+  piece of `draw` reads and emit, per state field, a **mutation function** —
+  `on count change → qview.set_attr(numberNode, count)` — skipping both the VDOM and a
+  runtime signal graph for the *static* cases. (Svelte-style, but AOT to wasm.)
+- **Fall back to runtime signals** only for genuinely dynamic dependencies
+  (conditionals, lists, computed keys) — Solid-style — which is the part that needs
+  closures + heap aggregates in the IR.
+- **The `Renderer` face is the mutation protocol.** `create_node / set_attr /
+  mutate(diff) / present` against a **retained** host node tree is host-agnostic — DOM,
+  WebGPU, UIKit, Compose all consume the same op stream. q64 emits **mutations, not
+  re-rendered trees.**
+- **`state` and `@state` converge on one protocol.** Local `state` produces mutations
+  *in the wasm*; remote `@state` produces the *same* mutations from the **qubepods
+  backend** (LiveView-style) over the WebSocket channel. The client applies one kind of
+  diff regardless of origin; the only difference is where it's computed and the `@kv`
+  effect that surfaces remote state in the qube manifest.
+
+## `state` vs `@state` (decision)
+
+**Decided — the surface distinction is the `@` effect sigil:**
+
+- **`state x: T = v`** → **local**: an in-memory reactive signal, lives in the instance
+  (wasm), **pure** (no effect). Lost on reload. Lowers to a wasm global/cell + a
+  `q64.reactive` signal.
+- **`@state x: T = v`** → **remote/persisted**: the *same* reactive signal, but its
+  read/write go through an `env` capability, so they carry an **effect** (`@kv`/`@db`).
+  The `@` is q64's existing effect marker — `@state` is self-documenting ("this state
+  crosses a boundary"). It **desugars** to `state x = env.kv("x", v)`, so the `@kv`
+  effect is inferred exactly like any `env.kv` call and **propagates into the qube's
+  capability set → the QubePod manifest `imports` → QAD/AI-visibility**. Local `state`
+  adds nothing to the manifest; remote `@state` shows up automatically. Both share the
+  same reactive semantics and the same `Renderer` mutation protocol — local diffs
+  originate in the wasm, remote diffs from the qubepods backend over the gate socket.
+
+## State scopes & twins (decision)
+
+Two **orthogonal** axes — keep them separate in the syntax:
+
+- **Synced?** — the `@` sigil. `state` = pure/local; `@state` = synced/persisted (carries
+  the `@kv`/`@db` effect → manifest/AI-visibility). *Do not stack `@` for scope* (`@@`
+  conflates the axes and doesn't generalize past two scopes).
+- **Scope** — a *qualifier* on `@state` (default `user`):
+
+```
+state        draftText = ""        // local: this device, ephemeral (wasm local)
+@state       unreadCount = 0       // user twin: this user, synced across their devices
+@state(app)  feed = []             // app twin: one singleton shared by everyone (news feed)
+@state(room r) messages = []       // room twin: shared within room r
+```
+
+**How it lowers — a graph of twins (actors), the developer just uses the name:**
+
+| Scope | Backing instance | Read = | Write = |
+|---|---|---|---|
+| local | wasm global/cell | direct | direct |
+| `user` | per-user instance (DO), persisted | subscribe | command → diff fan-out |
+| `app` | one singleton instance (DO) | subscribe | command → diff fan-out |
+| `room r` | per-room instance (DO) | subscribe | command → diff fan-out |
+
+A twin = an actor backed by a **Durable Object**, and **the scope *is* the DO address**:
+the scope *kind* selects the DO **namespace** (a declared DO binding/class —
+`USER_TWIN` / `APP_TWIN` / `ROOM_TWIN`, or one `TWIN` namespace), and the scope's *id*
+selects the **instance** within it (`namespace.idFromName(id)`):
+
+| Scope | DO namespace | DO instance id |
+|---|---|---|
+| `user` | user-twin NS | the user id |
+| `app` | app NS | a fixed singleton (`"app"` / the qube id) |
+| `room r` | room NS | `r` |
+
+This extends the addressing qubepods already uses — the gate routes the
+account/project/app/env tuple to a per-deployment container DO; a twin is the same idea,
+keyed by scope id. The DO holds state + a subscriber set, serializes writes (DO
+single-thread = the consistency boundary), and pushes **state diffs** to subscribers using
+the *same* `mutate` protocol as local reactivity. **Reading a scoped name
+in `draw` subscribes the view; writing it fans a diff out to all subscribers.** No sockets/
+DOs/fetch in source — the scope qualifier + compiler/runtime route it.
+
+**Cross-scope access is a capability, not ambient.** A qube reaching another twin (a user
+twin reading the app feed) declares it as an `imports` capability → effect-tracked →
+disclosed in the manifest/QAD (agent-discoverable). A `draw` may compose several
+subscriptions (local `state` + user `@state` + `@state(app)`); a diff from any updates it.
+
+**External events (webhooks/sensors/cron) are just another writer.** An `exports.http`
+(or `@on_http("/hooks/…")`) handler mutates the scoped name; same command → diff → fan-out:
+
+```
+@on_http("/hooks/news")
+fn news(req: Request) { feed.prepend(Post.from(req)) }   // → diff pushed to every view
+```
+
+```
+external (webhooks/sensors/cron) ─┐
+                                  ▼
+   views ──subscribe──▶ user twins ──subscribe──▶ app/room twins
+     ▲  intents ───────────┘  commands ────────────┘
+     └───────────── state diffs pushed back ◀───────────────┘
+```
+
+**Open (defaulted, refinable):** the per-store naming under a scope — default keyed by field
+name in the scope's store; `@state(db "table") …` to name a backing table. This doesn't
+change the surface distinction.
+
+## Rendering substrate: WebGPU-only (decision)
+
+**QView targets WebGPU; we do not support old browsers or a DOM/canvas2d fallback.**
+Baseline is iPadOS 18+ Safari and modern Chrome/Firefox (where WebGPU + wasm32 both
+run). If `navigator.gpu` is absent we show a labeled "unsupported" message — we never
+fall back to a second renderer. Consequences for this design:
+
+- The retained tree the protocol mutates is a **GPU scene graph**, not a DOM:
+  `node_id → draw record` (a quad/glyph-run with transform, color, clip, z). `set_attr`
+  edits a draw record; `present` re-encodes **only the changed draws** into the command
+  buffer. The "diff" is over GPU draw state, not DOM nodes — but the *decision concept*
+  (signals decide what; surgical mutation applies how) is identical.
+- **One renderer, everywhere.** WebGPU on the web and `wgpu`/Dawn → Metal/Vulkan/D3D12
+  on native (per [`stdlib/gfx`](../stdlib/gfx)) means the same scene graph + mutation
+  protocol serve web *and* the future native/JSI targets — no DOM-vs-native split.
+- **Text** is a persistent **glyph atlas** (rasterized once, sampled in WebGPU);
+  later, GPU-native/SDF glyphs. No DOM text, ever.
+- It frees us from DOM reconciliation semantics (keys-as-DOM-identity, hydration);
+  node identity is just our `node_id → GPU object` map.
+
+## Rendering model: widgets as SDF shaders (decision)
+
+**Widgets are drawn procedurally in shaders via signed-distance fields (SDF), not
+textured quads or tessellated meshes.** A widget is one quad whose fragment shader
+evaluates an SDF (rounded-rect, circle, capsule, line) → crisp fill, border, shadow,
+gradient — all analytic. This is the modern GPU-UI approach (Zed's GPUI, Rive, game
+UIs; SDF/MSDF text after Valve/msdfgen). It composes with everything above:
+
+- **Resolution-independent** → crisp at any DPR, scale, and **under 3D/perspective**
+  (the floating-layers payoff): an SDF button in a transformed layer stays razor-sharp;
+  a textured one pixelates.
+- **The retained scene = an instance buffer of widget params** (transform, rect, radius,
+  border, fill/border color, shadow, z). `set_attr` updates one instance; `present`
+  re-uploads only changed instances and re-encodes. **Mutation is a param write, never a
+  geometry rebuild** — a perfect fit for the reactivity model and the `Renderer` face.
+- **Instanced** → thousands of widgets per draw call; **analytic anti-aliasing** for free
+  (smoothstep on the distance).
+- **Authored in q64.** `q64.gfx` compiles shaders from q64 → WGSL/SPIR-V, so the SDF
+  widget library is q64 code, not hand-WGSL.
+
+**Coverage (≈ the visual MVP):** rounded-rect SDF → `box`/`button`/`input`/`card`/`stack`
+backgrounds; circle/capsule; SDF `icon`s; **MSDF** atlas → scalable crisp `text`/`number`.
+`image` is a textured quad; `row/column/stack/scroll` are layout/clip+transform, not
+rendering. So one instanced SDF pipeline + an MSDF text pipeline covers the kit.
+
+**Caveats (scope it right):** arbitrary **vector paths** (complex SVG, charts) aren't a
+single SDF — those need a **compute vector renderer** (Vello/piet-gpu style), deferred;
+**MSDF text** needs a glyph-SDF atlas pipeline (solved, but real work); **backdrop blur**
+is an extra sampling pass, not one SDF. The current POC's textured-quad + canvas2d-glyph
+host is a scaffold to be replaced by the SDF pipeline (rounded-rect first, MSDF text next).
+
+## Recommended model + staged path
+
+Target: **signal-decides-what + retained-mutation-applies-how**, with the **compiler
+generating the bindings** where it can. Get there in stages, each shippable:
+
+- **Stage 0 — immediate mode (done).** Full re-emit + full WebGPU repaint. Proves the
+  seam; the throwaway-able front.
+- **Stage 1 — wasm-owned `state` + host-side diff (small).** Lower `state x = v` to a
+  wasm **global** (+ get/set) and export `on_press` to mutate it; give each `qview`
+  widget a **stable id**; the host keeps the previous scene and emits only `set_attr`
+  for changed fields instead of repainting. → retained node identity + minimal updates,
+  with almost no new language features. This is "React semantics without VDOM overhead
+  at our scale," and it already exercises the `Renderer`-face shape.
+- **Stage 2 — compiled reactivity (Svelte-style; the q64-native win).** A compiler pass
+  derives `state → binding` dependencies from `draw` and emits a mutation per state
+  field, dropping the re-run-`draw` step for static bindings. Needs: the dependency
+  analysis pass + a stable node-id model in codegen + the retained `Renderer` face.
+- **Stage 3 — fine-grained signals (Solid-style; later).** Runtime `Signal/Memo/Watch`
+  (`stdlib/reactive`) for dynamic dependencies. Gated on the bigger language lift:
+  **closures/effects + heap aggregates (records/arrays/ADTs) + an allocator** exposed to
+  user code, plus a scheduler.
+
+**Cross-cutting (all stages):** batch writes per event/frame (coalesce to one redraw);
+**keyed reconciliation** for lists (identity + minimal moves); a tiny **scheduler**
+(run dirty work after the handler returns). Keep reactivity **in the wasm** (the
+language owns `state`; the host only applies mutations) so the same model serves the
+future native/JSI renderers.
+
+## The mutation protocol (where Stage 1→2 lead)
+
+Grow the `qview` host face from "`present(full scene)`" into the retained `Renderer`
+contract, all ops over i64 ids/values (wasm32-clean):
+
+```
+qview.create(node_id, kind, parent_id)      // kind: text|number|box|button|…
+qview.set_attr(node_id, attr_id, value)     // x|y|w|h|color|label_id|number|enabled…
+qview.remove(node_id)
+qview.on(node_id, event_id, handler_export)  // wire input → an exported wasm handler
+qview.present()                              // commit the frame's mutations
+```
+
+> This op set is **producer-agnostic** — a q64 compiler emits it, and so can an AI
+> agent. It is therefore both the compiler target *and* an agent-facing API; see
+> [`agent-ui.md`](./agent-ui.md) (command vocabulary as a versioned contract,
+> safe-by-capability).
+
+The host keeps a `node_id → GPU draw record` map (identity preserved). Stage 1 can emit
+`create` once and then only `set_attr` on change; Stage 2 has the compiler emit exactly
+those `set_attr`s per state write. Remote `@state` emits the same ops from the backend.
+
+## Open decisions
+
+- **Granularity of Stage 2 dependency analysis** (per-field vs per-node vs per-subtree).
+- **List reconciliation key source** (explicit `key:` in the DSL vs positional).
+- **Scheduling** (sync after handler vs rAF-batched; priority for `@state` network diffs).
+- **`@state` transport** (reuse the gate WebSocket; diff format = the same `mutate` ops).
+- **How much stays runtime vs compiled** once closures/aggregates land (Stage 3 scope).

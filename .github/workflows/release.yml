@@ -1,0 +1,214 @@
+# Builds the `q64` and `qube` binaries for linux/{amd64,arm64} and publishes
+# them as GitHub Releases on this repo. The qubepods builder container reads
+# `manifest.json` from a release to discover the binary URLs + sha256s.
+#
+# This is a MANUAL release action — it never runs on a routine push to main
+# (we push far more often than we release). Triggers:
+#   - workflow_dispatch  -> manual `nightly` refresh (run it on `main`); on any
+#                           other branch it builds but does not publish
+#   - tag `v*`           -> immutable stable release at that tag
+
+name: release
+
+on:
+  # Manual button (run on `main` to refresh `nightly`) + version tags only.
+  # NOT on push to main and NOT on pull_request.
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+# Least-privilege default for a public repo: the build job runs read-only
+# (it doesn't need to push, tag, or release), and only the release job
+# elevates to `contents: write`. No PAT, no action secrets -- the ambient
+# GITHUB_TOKEN is per-run and scoped to this repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # CI builds linux-amd64 only — no hosted macOS/arm runners are available.
+    # The qubepods builder container (Cloudflare Containers, x86_64 linux)
+    # consumes this via manifest.json. The matrix is kept generic (os+arch) so
+    # darwin/arm entries can be added if self-hosted runners appear; until then
+    # macOS binaries are built on a Mac and attached to the release with
+    # `scripts/release-mac.sh`.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # vendor/ is populated by ./init.sh: Zig toolchain, wasmtime C API,
+      # and a from-source Binaryen static lib. Binaryen is the slow step
+      # (~3-5 min). Key includes the OS+arch (the Binaryen archive is host
+      # toolchain-specific) and init.sh so a version bump invalidates.
+      - name: Cache vendored toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/zig
+            vendor/wasmtime
+            vendor/binaryen
+          key: vendor-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('init.sh') }}
+
+      - name: init.sh (Zig + wasmtime + Binaryen)
+        env:
+          # Empty on linux (init.sh uses its pinned sha); skip the unpinned
+          # wasmtime verification on macOS — it isn't on the q64/qube build path.
+          WASMTIME_SHA256: ${{ matrix.os == 'darwin' && 'skip' || '' }}
+        run: ./init.sh
+
+      - name: Build q64 (ReleaseFast)
+        working-directory: q64
+        run: ../vendor/zig/zig build -Doptimize=ReleaseFast
+
+      - name: Build qube (ReleaseFast)
+        working-directory: qube
+        run: ../vendor/zig/zig build -Doptimize=ReleaseFast
+
+      # Stage binaries under a per-platform name so the release job can merge
+      # the matrix outputs by simply downloading every artifact.
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          plat="${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p out
+          cp q64/zig-out/bin/q64   "out/q64-${plat}"
+          cp qube/zig-out/bin/qube "out/qube-${plat}"
+          ( cd out && shasum -a 256 "q64-${plat}" "qube-${plat}" > "SHA256SUMS-${plat}" )
+          ls -la out
+
+      # The documentation index (keywords, builtin types, diagnostics) the
+      # docs.q64.dev site renders — see q64-docs/. Architecture-independent, so
+      # only the linux entry produces it; the docs deploy downloads this release
+      # asset (no Zig toolchain needed to ship a docs change).
+      - name: Generate doc.json
+        if: matrix.os == 'linux'
+        run: ./q64/zig-out/bin/q64 doc --json > out/doc.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    # Only publish from main or a tag; manual dispatch on a feature branch
+    # builds + uploads workflow artifacts but does not cut a release.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: Assemble release dir
+        id: assemble
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Every per-platform binary the matrix produced, plus the one doc.json.
+          cp artifacts/q64-*  release/
+          cp artifacts/qube-* release/
+          cp artifacts/doc.json release/
+          # Drop the per-platform SHA files staged by the build job; we recompute
+          # one combined SHA256SUMS over the published binaries below.
+          rm -f release/SHA256SUMS-*
+
+          ( cd release && sha256sum q64-* qube-* > SHA256SUMS )
+
+          # Resolve release name + whether this is a prerelease.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            prerelease=false
+          else
+            tag="nightly"
+            prerelease=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+
+          # manifest.json: the contract the qubepods builder container reads on
+          # cold start to pick (and verify) the right binaries. Generated from
+          # whatever platforms are present, so adding a matrix entry is enough.
+          # The container keys on linux-amd64; the darwin entries are additive.
+          TAG="$tag" COMMIT="$GITHUB_SHA" BUILT_AT="$built_at" BASE_URL="$base_url" \
+            python3 - <<'PY'
+          import json, os, pathlib
+          rel = pathlib.Path("release")
+          sums = {}
+          for line in (rel / "SHA256SUMS").read_text().splitlines():
+              sha, name = line.split()
+              sums[name] = sha
+          bins = {"q64": {}, "qube": {}}
+          for name in sums:
+              tool, _, plat = name.partition("-")  # q64-linux-amd64 -> q64, linux-amd64
+              if tool in bins:
+                  bins[tool][plat] = {
+                      "url": f"{os.environ['BASE_URL']}/{name}",
+                      "sha256": sums[name],
+                  }
+          manifest = {
+              "version": os.environ["TAG"],
+              "commit": os.environ["COMMIT"],
+              "builtAt": os.environ["BUILT_AT"],
+              "binaries": bins,
+          }
+          (rel / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+
+          ls -la release
+          cat release/manifest.json
+
+      - name: Publish / update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.assemble.outputs.tag }}"
+          notes="q64 + qube linux binaries built from ${GITHUB_SHA}.
+
+          Consumed by the qubepods builder container via \`manifest.json\`.
+          macOS binaries (if any) are attached separately via scripts/release-mac.sh."
+          assets=(release/q64-* release/qube-* release/SHA256SUMS release/manifest.json release/doc.json)
+
+          if [ "${{ steps.assemble.outputs.prerelease }}" = "true" ]; then
+            # `nightly` is a moving target. We never DELETE it — we update the
+            # target/notes and clobber-upload only the files this build produced.
+            # Assets added out-of-band (the darwin binaries from
+            # scripts/release-mac.sh) are NOT in the upload set, so they survive
+            # across pushes.
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --target "${GITHUB_SHA}" --notes "$notes" --prerelease
+            else
+              gh release create "$tag" --target "${GITHUB_SHA}" --title "$tag" --notes "$notes" --prerelease
+            fi
+            gh release upload "$tag" --clobber "${assets[@]}"
+          else
+            # Tag releases (vX.Y.Z) are immutable: create fails if the tag
+            # already has a release, which is the behaviour we want.
+            gh release create "$tag" --target "${GITHUB_SHA}" --title "$tag" --notes "$notes" "${assets[@]}"
+          fi

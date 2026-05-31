@@ -1,0 +1,85 @@
+// Cloudflare Worker config for q64.dev.
+//
+// Workers + Static Assets model: this Worker serves the Astro static
+// build from ./dist/ via the ASSETS binding, with `run_worker_first`
+// so the Worker fetch handler sees every request (needed for the
+// www.q64.dev -> q64.dev redirect).
+//
+// Scope is intentionally narrow: this Worker serves the *site*.
+// ../continuum (registry API) stays as a
+// separate Workers — blast radius isolation. Cross-Worker calls
+// happen via service bindings (commented stubs below).
+//
+// Picked up by `wrangler deploy` (CLI) and the Workers Builds CI/CD
+// pipeline. Custom domains (q64.dev, www.q64.dev) attach via the
+// routes block below — uncomment after the zone is added in the
+// Cloudflare dashboard.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "q64-web",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "html_handling": "auto-trailing-slash",
+    "run_worker_first": ["/*"]
+  },
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  // -------- custom domains (uncomment once attached in dashboard) --------
+  // "routes": [
+  //   { "pattern": "q64.dev",     "custom_domain": true },
+  //   { "pattern": "www.q64.dev", "custom_domain": true }
+  // ],
+
+  // -------- bindings (uncomment + fill in as needed) --------
+
+  // Plaintext env vars available to the Worker.
+  // "vars": {
+  //   "CONTINUUM_API": "https://api.q64.dev"
+  // },
+
+  // R2 buckets — qube tarballs, brand assets, etc.
+  // "r2_buckets": [
+  //   { "binding": "QUBE_TARBALLS", "bucket_name": "q64-qubes" }
+  // ],
+
+  // KV namespaces — short-TTL caches, feature flags.
+  // "kv_namespaces": [
+  //   { "binding": "CACHE", "id": "<kv-id>" }
+  // ],
+
+  // D1 databases — registry metadata (pairs with ../continuum).
+  // "d1_databases": [
+  //   { "binding": "CONTINUUM_DB", "database_name": "continuum", "database_id": "<d1-id>" }
+  // ],
+
+  // Durable Objects — per-session compile state for the playground,
+  // multiplayer registry browsing, etc.
+  // "durable_objects": {
+  //   "bindings": [
+  //     { "name": "PLAYGROUND_SESSION", "class_name": "PlaygroundSession" }
+  //   ]
+  // },
+  // "migrations": [
+  //   { "tag": "v1", "new_classes": ["PlaygroundSession"] }
+  // ],
+
+  // Service bindings — call sibling Workers (../continuum)
+  // without crossing the public network. Zero-cost intra-CF.
+  // "services": [
+  //   { "binding": "CONTINUUM", "service": "continuum" }
+  // ],
+
+  // Workers AI — only if the site itself needs it. API surfaces
+  // belong on continuum, not here.
+  // "ai": { "binding": "AI" }
+}

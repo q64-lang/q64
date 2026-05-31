@@ -1,0 +1,6 @@
+{
+  "ok": false,
+  "diagnostics": [
+    { "code": "CONC020", "severity": "error" }
+  ]
+}

@@ -1,0 +1,28 @@
+---
+import Default from '@astrojs/starlight/components/Footer.astro';
+const year = new Date().getFullYear();
+---
+
+<Default><slot /></Default>
+
+<div class="site-footer">
+  <p>
+    &copy; {year} q64. &middot;
+    <a href="https://q64.dev">q64.dev</a> &middot;
+    <a href="mailto:info@q64.dev">info@q64.dev</a>
+  </p>
+</div>
+
+<style>
+  .site-footer {
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--sl-color-hairline);
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+    text-align: center;
+  }
+  .site-footer a {
+    color: inherit;
+  }
+</style>
