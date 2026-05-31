@@ -321,6 +321,31 @@ async function main() {
 
   const localXY = (ev) => { const r = canvas.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
 
+  // ---- scroll momentum (inertia) ----------------------------------------------
+  // On release, the scroll keeps gliding at the finger's last velocity and decays
+  // exponentially (iOS-like). A drag/wheel/tap cancels any running glide.
+  let momentum = 0;            // px/frame velocity
+  let momentumRAF = 0;
+  const FRICTION = 0.94;       // per-frame decay (higher = longer glide)
+  const MIN_V = 0.4;           // stop below this speed
+  const maxScroll = () => Math.max(0, contentH + 16 - viewportH);
+  function stopMomentum() { if (momentumRAF) { cancelAnimationFrame(momentumRAF); momentumRAF = 0; } momentum = 0; }
+  function startMomentum(v0) {
+    stopMomentum();
+    momentum = v0;
+    const step = () => {
+      momentum *= FRICTION;
+      scrollY += momentum;
+      // Stop at the edges (no rubber-band overshoot — render() clamps scrollY).
+      const m = maxScroll();
+      if (scrollY <= 0 || scrollY >= m) { scrollY = Math.max(0, Math.min(scrollY, m)); render(); stopMomentum(); return; }
+      render();
+      if (Math.abs(momentum) < MIN_V) { stopMomentum(); return; }
+      momentumRAF = requestAnimationFrame(step);
+    };
+    momentumRAF = requestAnimationFrame(step);
+  }
+
   // Long-press (touch) / right-click (mouse) -> a context menu anchored at the
   // point, for any node whose widget exposes contextMenu(node, r). Reuses the
   // shared popup primitive (so it flips/clamps near edges too).
@@ -344,6 +369,7 @@ async function main() {
   }
 
   canvas.addEventListener('pointerdown', (ev) => {
+    stopMomentum();                              // a new touch halts any scroll glide
     const [px, py] = localXY(ev);
 
     // If a menu is open, it captures this tap first (shared popup primitive):
@@ -406,13 +432,16 @@ async function main() {
   }, { passive: false });
 
   canvas.addEventListener('pointermove', (ev) => {
-    // Scroll drag: translate the scene by the finger's vertical delta.
+    // Scroll drag: translate the scene by the finger's vertical delta, tracking
+    // velocity (last-frame px delta) so release can launch momentum.
     if (scrollDrag) {
       ev.preventDefault();
       const [, py] = localXY(ev);
       const dy = py - scrollDrag.startY;
       if (Math.abs(dy) > 4) scrollDrag.moved = true;
+      const prev = scrollY;
       scrollY = scrollDrag.startScroll - dy;            // drag down -> content moves down
+      scrollDrag.vel = scrollY - prev;                  // px since last move = velocity
       render();                                          // render() clamps scrollY
       return;
     }
@@ -434,7 +463,13 @@ async function main() {
 
   const endDrag = (ev) => {
     cancelLongPress();                          // a lift before the hold elapsed = a tap, not long-press
-    if (scrollDrag) { try { canvas.releasePointerCapture(ev.pointerId); } catch {} scrollDrag = null; return; }
+    if (scrollDrag) {
+      try { canvas.releasePointerCapture(ev.pointerId); } catch {}
+      const v = scrollDrag.vel || 0;
+      scrollDrag = null;
+      if (Math.abs(v) > 1) startMomentum(v);    // flick -> glide
+      return;
+    }
     if (!dragNode) return;
     try { canvas.releasePointerCapture(ev.pointerId); } catch {}
     dragNode = null;
@@ -446,6 +481,7 @@ async function main() {
   canvas.addEventListener('wheel', (ev) => {
     if (contentH + 16 <= viewportH) return;
     ev.preventDefault();
+    stopMomentum();
     scrollY += ev.deltaY;
     render();                                    // clamps
   }, { passive: false });
