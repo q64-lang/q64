@@ -21,6 +21,7 @@ state sliderVal = 40
 state taps      = 0
 state platform  = 12   // dropdown: catalog id of the selected option (12 = iOS)
 state grouped   = 1    // the checkbox inside the group widget
+state picked    = 20   // long-click menu: last picked item (20 = Copy)
 
 fn main {
   // Layout grid: a control column at x=24 and a name-label column at x=150,
@@ -31,7 +32,7 @@ fn main {
   qview.set_attr(2, 0, 16)
   qview.set_attr(2, 1, 72)
   qview.set_attr(2, 2, 380)
-  qview.set_attr(2, 3, 600)
+  qview.set_attr(2, 3, 664)
   qview.set_attr(2, 4, 18)
   qview.set_attr(2, 5, 1)
 
@@ -182,6 +183,23 @@ fn main {
   qview.set_attr(8, 12, grouped)
   qview.on(8, 0, 8)
 
+  // "Long Click" context-menu area (9): a box that declares an option range
+  // (min=19 base catalog id Cut/Copy/Paste, max=3). Long-press or right-click
+  // raises a context menu of those items (shared popup). text_id 18 = "Long
+  // Click" label centered in the box. selected=20 (Copy) for the check mark.
+  qview.create(9, 0, 0)
+  qview.set_attr(9, 0, 40)
+  qview.set_attr(9, 1, 664)
+  qview.set_attr(9, 2, 320)
+  qview.set_attr(9, 3, 64)
+  qview.set_attr(9, 4, 12)
+  qview.set_attr(9, 5, 1)
+  qview.set_attr(9, 9, 18)
+  qview.set_attr(9, 15, 19)
+  qview.set_attr(9, 16, 3)
+  qview.set_attr(9, 13, 20)
+  qview.on(9, 1, 9)
+
   // Translucent material top bar (90), created LAST so it overlays nothing but
   // the panel's top edge — showing the platform material. surface=3 materialThin.
   qview.create(90, 0, 0)
@@ -250,5 +268,12 @@ pub fn on_80(node: i64, event: i64, value: i64) {
 pub fn on_8(node: i64, event: i64) {
   grouped = 1 - grouped
   qview.set_attr(8, 12, grouped)
+  qview.present()
+}
+// Long-click area: the context menu passes the chosen item's catalog id (19..21
+// = Cut/Copy/Paste) as `value`. Mark it selected (checkmark) for next time.
+pub fn on_9(node: i64, event: i64, value: i64) {
+  picked = value
+  qview.set_attr(9, 13, picked)
   qview.present()
 }
