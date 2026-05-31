@@ -459,40 +459,7 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
 
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
     var it = (fd.body() orelse return error.Unsupported).statements();
-    while (it.next()) |stmt| switch (stmt) {
-        .expr_stmt => |es| {
-            const call = switch (es.expression() orelse return error.Unsupported) {
-                .call => |cc| cc,
-                else => return error.Unsupported,
-            };
-            const fname = (try hostFaceName(b, call)) orelse return error.Unsupported;
-            // All params (i64/bool/str) resolve via `scope`; no RtMap needed.
-            try stmts.append(b.a, try buildHostCall(b, fname, call, &scope, null));
-        },
-        .assign_stmt => |as| {
-            const tgt = switch (as.target() orelse return error.Unsupported) {
-                .path => |p| p,
-                else => return error.Unsupported,
-            };
-            const tname = try tgt.text(b.a);
-            defer b.a.free(tname);
-            const gi = b.globals.get(tname) orelse return error.Unsupported; // global assign only
-            const rhs = try buildIntExpr(b, as.value() orelse return error.Unsupported, &scope);
-            const op = as.op() orelse return error.Unsupported;
-            const value = if (op.kind == .EQ) rhs else blk: {
-                const k = compoundOp(op) orelse return error.Unsupported;
-                const lhs = try b.a.create(hir.Expr);
-                lhs.* = .{ .global_get = gi };
-                const bx = try b.a.create(hir.Expr);
-                bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
-                break :blk bx;
-            };
-            const st = try b.a.create(hir.Stmt);
-            st.* = .{ .global_set = .{ .idx = gi, .value = value } };
-            try stmts.append(b.a, st);
-        },
-        else => return error.Unsupported,
-    };
+    while (it.next()) |stmt| try buildScreenStmt(b, stmt, &scope, &stmts);
 
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
@@ -514,6 +481,76 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
         .visibility = vis,
         .is_screen = true,
     });
+}
+
+/// Build one screen-function statement (a handler body): a host call, a `state`
+/// global assignment, or an `if`/`else` (recursing). Params (i64/bool/str) live
+/// in `scope`. No `let`/`while` yet — handlers stay simple.
+fn buildScreenStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    switch (stmt) {
+        .expr_stmt => |es| {
+            const call = switch (es.expression() orelse return error.Unsupported) {
+                .call => |cc| cc,
+                else => return error.Unsupported,
+            };
+            const fname = (try hostFaceName(b, call)) orelse return error.Unsupported;
+            try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
+        },
+        .assign_stmt => |as| {
+            const tgt = switch (as.target() orelse return error.Unsupported) {
+                .path => |p| p,
+                else => return error.Unsupported,
+            };
+            const tname = try tgt.text(b.a);
+            defer b.a.free(tname);
+            const gi = b.globals.get(tname) orelse return error.Unsupported; // global assign only
+            const rhs = try buildIntExpr(b, as.value() orelse return error.Unsupported, scope);
+            const op = as.op() orelse return error.Unsupported;
+            const value = if (op.kind == .EQ) rhs else blk: {
+                const k = compoundOp(op) orelse return error.Unsupported;
+                const lhs = try b.a.create(hir.Expr);
+                lhs.* = .{ .global_get = gi };
+                const bx = try b.a.create(hir.Expr);
+                bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
+                break :blk bx;
+            };
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .global_set = .{ .idx = gi, .value = value } };
+            try out.append(b.a, st);
+        },
+        .if_stmt => |is| try out.append(b.a, try buildScreenIf(b, is, scope)),
+        else => return error.Unsupported,
+    }
+}
+
+/// Build a screen-function block (the body of an `if`/`else` branch) as a HIR
+/// block of screen statements.
+fn buildScreenBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.Stmt {
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    var it = block.statements();
+    while (it.next()) |s| try buildScreenStmt(b, s, scope, &items);
+    const blk = try b.a.create(hir.Stmt);
+    blk.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return blk;
+}
+
+/// Build a screen-function `if`/`else(-if)` chain. The condition is an i64/bool
+/// expression (incl. `str_eq`, `text.len > 0`); branches hold screen statements.
+fn buildScreenIf(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.Stmt {
+    const cond = try buildIntExpr(b, is.condition() orelse return error.Unsupported, scope);
+    const then_ = try buildScreenBlock(b, is.thenBody() orelse return error.Unsupported, scope);
+    const else_: ?*hir.Stmt = if (is.elseIf()) |eif| blk: {
+        const inner = try buildScreenIf(b, eif, scope);
+        const wrap = try b.a.create(hir.Stmt);
+        wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+        break :blk wrap;
+    } else if (is.elseBody()) |eb|
+        try buildScreenBlock(b, eb, scope)
+    else
+        null;
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
+    return st;
 }
 
 /// Build one host-call argument. Prefer the `str` path — a string literal, a
