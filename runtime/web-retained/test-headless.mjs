@@ -90,6 +90,11 @@ ok(h.nodes.get(80).attrs.get(ATTR.max) === 4, 'dropdown has 4 options (iOS/Andro
 handlerFires(80, [80], 14); // choose Windows
 ok(h.nodes.get(80).attrs.get(ATTR.text_id) === 14, 'dropdown field shows chosen option (Windows=14)');
 ok(h.nodes.get(80).attrs.get(ATTR.selected) === 2, 'dropdown selected index = 2');
+// Grouped child: checkbox 8 is parented to group 6, wired, and toggles.
+ok(h.nodes.get(8)?.kind === KIND.checkbox && h.nodes.get(8)?.parent === 6, 'checkbox 8 is a checkbox inside group 6');
+ok(h.nodes.get(8)?.handlers.get(EVENT.press) === 8, 'grouped checkbox wired press -> handler 8');
+handlerFires(8, [8]); // toggle the grouped checkbox
+ok(h.nodes.get(8).attrs.get(ATTR.checked) === 0, 'grouped checkbox toggled off');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
