@@ -275,14 +275,15 @@ pub fn on_9(node: i64, event: i64, value: i64) {
   qview.set_attr(9, 13, picked)
   qview.present()
 }
-// The fader drives the stereo peak meter: set both channels' level + peak hold
-// from the slider value. Right channel is offset a touch for a stereo feel.
+// The fader drives the stereo peak meter. The right LEVEL is dimmed a touch for
+// a stereo feel, but BOTH peak-holds reach the full fader value (a peak marker
+// sits at the recent max, not the dimmed level) — so both peaks hit the top.
 pub fn on_322(node: i64, event: i64, value: i64) {
   stackVal = value
   qview.set_attr(322, 17, stackVal)
   qview.set_attr(332, 17, stackVal)
   qview.set_attr(332, 23, stackVal * 9 / 10)
   qview.set_attr(332, 24, stackVal)
-  qview.set_attr(332, 25, stackVal * 9 / 10)
+  qview.set_attr(332, 25, stackVal)
   qview.present()
 }
