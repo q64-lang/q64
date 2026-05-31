@@ -37,7 +37,7 @@ instance.exports._start();
 
 // --- the gallery tree (matches screen.q) ---
 const expectKind = {
-  1: KIND.label, 2: KIND.box, 10: KIND.label, 20: KIND.button, 21: KIND.label,
+  91: KIND.label, 2: KIND.box, 10: KIND.label, 20: KIND.button, 21: KIND.label,
   30: KIND.checkbox, 40: KIND.switch, 50: KIND.radio, 52: KIND.radio,
   60: KIND.slider, 70: KIND.progress, 80: KIND.dropdown,
 };

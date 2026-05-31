@@ -34,9 +34,10 @@ const CATALOG = [
   'Radio B',         // 6
   'Slider',          // 7
   'Progress',        // 8
-  'Option one',      // 9
+  'Dropdown',        // 9  (the row's name label)
   'Box',             // 10
   'Tap +1',          // 11
+  'Option one',      // 12 (the dropdown's selected value)
 ];
 
 // ---- the retained tree -------------------------------------------------------

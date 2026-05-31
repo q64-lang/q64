@@ -153,10 +153,10 @@ function edt(seed, w, h) {
   return out;
 }
 
-export function sdfTexture(text) {
+export function sdfTexture(text, sizePx = 17) {
   const SS = 3;
-  const fontPx = Math.round(30 * DPR) * SS;
-  const spread = Math.round(8 * DPR) * SS;
+  const fontPx = Math.round(sizePx * DPR) * SS;
+  const spread = Math.round(6 * DPR) * SS;
   const oc = new OffscreenCanvas(8, 8);
   let g = oc.getContext('2d');
   g.font = `${fontPx}px system-ui, -apple-system, sans-serif`;
