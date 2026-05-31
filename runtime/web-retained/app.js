@@ -129,9 +129,15 @@ let kbScrolled = false;      // have we already lifted the focused field above t
 // --- TEMP diagnostic: a small ring log of focus-related events, dumped into the
 // header when the hidden input blurs, so we can read on iPhone what fired right
 // before the keyboard dropped. Remove once the iPhone keyboard issue is found.
+// iPhone soft-keyboard diagnostic (the keyboard drops ~350ms after focus on
+// iPhone; root cause still open). Flip DIAG = true to re-enable: logev() records
+// focus events into a ring buffer and onKbdBlur paints them as a big on-canvas
+// overlay (Snap-able) so the sequence before the drop is readable on-device.
+const DIAG = false;
 let evlog = [];
-let diagText = '';   // when set, render() draws it as a big on-canvas overlay (Snap-able)
+let diagText = '';   // when set (DIAG), render() draws it as a big on-canvas overlay
 function logev(w) {
+  if (!DIAG) return;
   evlog.push(Math.round(performance.now() % 100000) + ':' + w);
   if (evlog.length > 12) evlog.shift();
 }
@@ -549,9 +555,9 @@ function render() {
   const spec = contextSpec ? withViewport(contextSpec) : openMenuSpec();
   if (spec) drawMenu(spec, renderCtx);
   if (editMenu) drawMenu(withViewport(editMenu), renderCtx);  // text-field edit menu, on top
-  // TEMP diagnostic overlay: the focus/keyboard event sequence, drawn big so it
+  // Diagnostic overlay (DIAG): the focus/keyboard event sequence, drawn big so it
   // can be captured via Snap on iPhone. Cleared on the next focus.
-  if (diagText) {
+  if (DIAG && diagText) {
     setScissor(frame.pass, null);
     const lines = diagText.split('\n');
     const LH = 22, top = 60;
@@ -1168,12 +1174,9 @@ async function main() {
     render();
   };
   const onKbdBlur = () => {
-    logev('BLUR');
-    // TEMP diagnostic: capture the event sequence (most-recent-first) as a big
-    // on-canvas overlay so it can be read via the Snap button on iPhone.
-    diagText = evlog.slice().reverse().join('\n');
+    if (DIAG) { logev('BLUR'); diagText = evlog.slice().reverse().join('\n'); }
     if (focusedId !== null) blurField();
-    else render();                               // ensure the overlay paints even if not focused
+    else if (DIAG) render();                     // paint the diagnostic overlay even if not focused
   };
   for (const id of ['kbd', 'kbdm']) {
     const el = document.getElementById(id);
