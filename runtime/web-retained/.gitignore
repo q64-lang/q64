@@ -5,3 +5,4 @@ node_modules/
 *.png
 bun.lock
 *.wasm
+snap-config.js
