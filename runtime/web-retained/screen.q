@@ -17,14 +17,12 @@
 state checked   = 1
 state toggled   = 0
 state choice    = 0
-state sliderVal = 40
+state level     = 60   // SHARED: slider 60 + progress 70 + fader 322 + volume 420 + meter
 state taps      = 0
 state platform  = 1012 // dropdown: catalog id of the selected option (12 = iOS)
 state grouped   = 1    // the checkbox inside the group widget
 state picked    = 1020 // long-click menu: last picked item (20 = Copy)
-state stackVal  = 60   // the vertical fader
-state pan       = 100  // pan knob: 0..200, center 100 = balanced
-state vol       = 100  // volume knob: 0..100
+state pan       = 0    // pan knob: -100..+100, 0 = center (balance only)
 
 fn main {
   // ---- pinned header (sticks; opaque solid bar) ----
@@ -139,7 +137,7 @@ fn main {
   qview.set_attr(60, 3, 28)
   qview.set_attr(60, 15, 0)
   qview.set_attr(60, 16, 100)
-  qview.set_attr(60, 17, sliderVal)
+  qview.set_attr(60, 17, level)
   qview.on(60, 0, 60)
 
   // Progress section (VStack 180): name above the control (tracks the slider).
@@ -152,7 +150,7 @@ fn main {
   qview.set_attr(70, 3, 10)
   qview.set_attr(70, 15, 0)
   qview.set_attr(70, 16, 100)
-  qview.set_attr(70, 17, sliderVal)
+  qview.set_attr(70, 17, level)
 
   // Group section (group 6): a titled panel holding a label + checkbox column.
   qview.create(6, 14, 100)
@@ -198,7 +196,7 @@ fn main {
   qview.set_attr(322, 3, 150)
   qview.set_attr(322, 15, 0)
   qview.set_attr(322, 16, 100)
-  qview.set_attr(322, 17, stackVal)
+  qview.set_attr(322, 17, level)
   qview.on(322, 0, 322)
   // Col 2: "Meter" label over the vertical stereo peak meter (332).
   qview.create(330, 2, 300)
@@ -211,15 +209,16 @@ fn main {
   qview.set_attr(332, 3, 150)
   qview.set_attr(332, 15, 0)
   qview.set_attr(332, 16, 100)
-  qview.set_attr(332, 17, stackVal)
-  qview.set_attr(332, 23, stackVal)
-  qview.set_attr(332, 24, stackVal)
-  qview.set_attr(332, 25, stackVal)
+  qview.set_attr(332, 17, level)
+  qview.set_attr(332, 23, level)
+  qview.set_attr(332, 24, level)
+  qview.set_attr(332, 25, level)
   // Col 3: pots VStack (340) to the RIGHT of the meter — Pan over Volume.
   qview.create(340, 2, 300)
   qview.set_attr(340, 19, 18)
   qview.set_attr(340, 21, 1)
-  // Pan: label over knob (410).
+  // Pan: label over knob (410). BIPOLAR — min -100 (L) .. max +100 (R), center 0.
+  // checked=1 marks it bipolar so the arc grows from center toward the pan side.
   qview.create(405, 2, 340)
   qview.set_attr(405, 19, 8)
   qview.set_attr(405, 21, 1)
@@ -228,8 +227,9 @@ fn main {
   qview.create(410, 16, 405)
   qview.set_attr(410, 2, 56)
   qview.set_attr(410, 3, 56)
-  qview.set_attr(410, 15, 0)
-  qview.set_attr(410, 16, 200)
+  qview.set_attr(410, 15, -100)
+  qview.set_attr(410, 16, 100)
+  qview.set_attr(410, 12, 1)
   qview.set_attr(410, 17, pan)
   qview.on(410, 0, 410)
   // Volume: label over knob (420).
@@ -243,7 +243,7 @@ fn main {
   qview.set_attr(420, 3, 56)
   qview.set_attr(420, 15, 0)
   qview.set_attr(420, 16, 100)
-  qview.set_attr(420, 17, vol)
+  qview.set_attr(420, 17, level)
   qview.on(420, 0, 420)
 
   qview.present()
@@ -277,11 +277,18 @@ pub fn on_52(node: i64, event: i64) {
   qview.present()
 }
 // Slider: the host passes the value computed from the touch/drag position as
-// `value` (the event payload). Set state to it; progress (70) mirrors it.
+// Horizontal slider: it shares `level` with the fader + volume knob + meter, so
+// moving it moves them all. Sets level, then updates every level-bound widget.
 pub fn on_60(node: i64, event: i64, value: i64) {
-  sliderVal = value
-  qview.set_attr(60, 17, sliderVal)
-  qview.set_attr(70, 17, sliderVal)
+  level = value
+  qview.set_attr(60, 17, level)
+  qview.set_attr(70, 17, level)
+  qview.set_attr(322, 17, level)
+  qview.set_attr(420, 17, level)
+  qview.set_attr(332, 17, level * (100 - pan) / 100)
+  qview.set_attr(332, 23, level * (100 + pan) / 100)
+  qview.set_attr(332, 24, level * (100 - pan) / 100)
+  qview.set_attr(332, 25, level * (100 + pan) / 100)
   qview.present()
 }
 // Dropdown: the host passes the chosen option's catalog id (12..15) as `value`.
@@ -307,38 +314,43 @@ pub fn on_9(node: i64, event: i64, value: i64) {
   qview.set_attr(9, 13, picked)
   qview.present()
 }
-// The meter level = fader * volume, balanced by pan. Computed inline in each of
-// the three control handlers (q64 handlers can't call a shared helper). pan is
-// 0..200, center 100: leftGain=(200-pan), rightGain=pan (over 100). The meter
-// widget clamps each channel to its range, so unclamped over-unity is fine.
-//   L = fader * vol/100 * (200-pan)/100 ; R = fader * vol/100 * pan/100
+// Shared level: the fader, the horizontal slider, and the volume knob all read
+// + write one `level` state, so moving any moves the others — and all drive the
+// meter, balanced by pan (pan -100..+100, 0=center: Lgain=100-pan, Rgain=100+pan
+// over 100; the meter clamps each channel, so over-unity is fine).
 // Fader:
 pub fn on_322(node: i64, event: i64, value: i64) {
-  stackVal = value
-  qview.set_attr(322, 17, stackVal)
-  qview.set_attr(332, 17, stackVal * vol / 100 * (200 - pan) / 100)
-  qview.set_attr(332, 23, stackVal * vol / 100 * pan / 100)
-  qview.set_attr(332, 24, stackVal * vol / 100 * (200 - pan) / 100)
-  qview.set_attr(332, 25, stackVal * vol / 100 * pan / 100)
+  level = value
+  qview.set_attr(322, 17, level)
+  qview.set_attr(60, 17, level)
+  qview.set_attr(70, 17, level)
+  qview.set_attr(420, 17, level)
+  qview.set_attr(332, 17, level * (100 - pan) / 100)
+  qview.set_attr(332, 23, level * (100 + pan) / 100)
+  qview.set_attr(332, 24, level * (100 - pan) / 100)
+  qview.set_attr(332, 25, level * (100 + pan) / 100)
   qview.present()
 }
-// Pan knob: rebalances the meter (left louder when panned left).
+// Pan knob: rebalances the meter only (does not change level).
 pub fn on_410(node: i64, event: i64, value: i64) {
   pan = value
   qview.set_attr(410, 17, pan)
-  qview.set_attr(332, 17, stackVal * vol / 100 * (200 - pan) / 100)
-  qview.set_attr(332, 23, stackVal * vol / 100 * pan / 100)
-  qview.set_attr(332, 24, stackVal * vol / 100 * (200 - pan) / 100)
-  qview.set_attr(332, 25, stackVal * vol / 100 * pan / 100)
+  qview.set_attr(332, 17, level * (100 - pan) / 100)
+  qview.set_attr(332, 23, level * (100 + pan) / 100)
+  qview.set_attr(332, 24, level * (100 - pan) / 100)
+  qview.set_attr(332, 25, level * (100 + pan) / 100)
   qview.present()
 }
-// Volume knob: scales both channels.
+// Volume knob: shares `level` with the fader + slider — moving it moves them too.
 pub fn on_420(node: i64, event: i64, value: i64) {
-  vol = value
-  qview.set_attr(420, 17, vol)
-  qview.set_attr(332, 17, stackVal * vol / 100 * (200 - pan) / 100)
-  qview.set_attr(332, 23, stackVal * vol / 100 * pan / 100)
-  qview.set_attr(332, 24, stackVal * vol / 100 * (200 - pan) / 100)
-  qview.set_attr(332, 25, stackVal * vol / 100 * pan / 100)
+  level = value
+  qview.set_attr(420, 17, level)
+  qview.set_attr(322, 17, level)
+  qview.set_attr(60, 17, level)
+  qview.set_attr(70, 17, level)
+  qview.set_attr(332, 17, level * (100 - pan) / 100)
+  qview.set_attr(332, 23, level * (100 + pan) / 100)
+  qview.set_attr(332, 24, level * (100 - pan) / 100)
+  qview.set_attr(332, 25, level * (100 + pan) / 100)
   qview.present()
 }

@@ -12,6 +12,9 @@ import { KIND, ATTR, EVENT, EVENT_NAME, SURFACE, unpackColor, PROTOCOL_VERSION }
 // a gitignored artifact, always present in a built/deployed bundle).
 let BUILD = 'dev';
 try { ({ BUILD } = await import('./version.js')); } catch {}
+// Snap upload config (api origin + snap:create token), filled by the deploy.
+let SNAP = { api: '', token: '' };
+try { ({ SNAP } = await import('./snap-config.js')); } catch {}
 import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, setScissor, DPR } from './gpu.js';
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
@@ -147,6 +150,10 @@ const GEOM = { [ATTR.x]: 'x', [ATTR.y]: 'y', [ATTR.w]: 'w', [ATTR.h]: 'h' };
 // so content taller than the screen is reachable without native scroll fighting
 // the slider/long-press gestures. The pinned top bar opts out (drawn unshifted).
 let scrollY = 0, contentH = 0, viewportH = 0;
+// Horizontal centering: when the viewport is wider than the content (iPad,
+// landscape, desktop), shift everything right by offsetX so the UI sits centered
+// instead of hugging the left. 0 on a phone where content == viewport width.
+let offsetX = 0, contentW = 0;
 const SCROLL_BOTTOM_PAD = 40;   // extra room past content so the last widget fully clears
 const renderCtx = {
   pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
@@ -155,6 +162,7 @@ const renderCtx = {
     let v = lay ? lay[g] : node.attrs.get(a);
     v = v === undefined ? dflt : Number(v);
     if (a === ATTR.y && !node._pinned) v -= scrollY;     // translate scene up
+    if (a === ATTR.x) v += offsetX;                       // center horizontally
     return v;
   },
   color: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : unpackColor(v); },
@@ -233,9 +241,10 @@ function glyphForCatalog(textId) {
 let headerH = 0;            // bottom of the pinned header band (layout space)
 function layout() {
   layoutMap = computeLayout(scene, layoutCtx);
-  contentH = 0; headerH = 0;
+  contentH = 0; headerH = 0; contentW = 0;
   for (const [id, rc] of layoutMap) {
     contentH = Math.max(contentH, rc.y + rc.h);
+    contentW = Math.max(contentW, rc.x + rc.w);
     const n = nodes.get(id);
     if (n && n._pinned) headerH = Math.max(headerH, rc.y + rc.h);
   }
@@ -247,11 +256,15 @@ function layout() {
 // The GPU host and the soft renderer are two such paths over the same layout.
 // ===========================================================================
 function render() {
-  const cv = document.getElementById('gpu'); viewportH = cv ? cv.clientHeight : 0;
-  // Allow scrolling until the content bottom clears the viewport with a comfortable
-  // bottom margin, so the last widget (e.g. the vertical fader) is never cut off.
-  const maxScroll = Math.max(0, contentH + SCROLL_BOTTOM_PAD - viewportH);
-  scrollY = Math.max(0, Math.min(scrollY, maxScroll));
+  const cv = document.getElementById('gpu');
+  viewportH = cv ? cv.clientHeight : 0;
+  const viewportW = cv ? cv.clientWidth : 0;
+  // Center the content block when the viewport is wider than it (iPad/desktop);
+  // the layout was built left-anchored (x from 0), so this shifts the whole UI.
+  offsetX = Math.max(0, Math.round((viewportW - contentW) / 2));
+  // NB: scrollY is NOT hard-clamped here — it may sit slightly past the edges
+  // during an iOS-style rubber-band overscroll; the drag applies resistance and
+  // release springs it back (see settleScroll). maxBound() is the true limit.
 
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
@@ -321,11 +334,94 @@ function dispatch(node, event, payload = 0) {
   else log(`wasm exports no on_${handler} or on_event`);
 }
 
+// ---- Snap: the device captures its OWN WebGPU canvas + uploads it ------------
+// This is the scaling story: rendering + capture happen on the customer's device
+// (their GPU), the server only stores bytes. We render a fresh frame, grab the
+// canvas as a PNG blob, and POST it to the api's /api/snap with the deploy's
+// snap:create token; the api stores it in R2 and returns a public URL.
+let lastSnapUrl = '';
+function wireSnapButton() {
+  const btn = document.getElementById('snap');
+  const copyBtn = document.getElementById('copy');
+  if (!btn) return;
+  if (!SNAP.api || !SNAP.token) { btn.disabled = true; btn.title = 'snap not configured'; if (copyBtn) copyBtn.disabled = true; return; }
+  btn.addEventListener('click', async () => {
+    btn.disabled = true; const label = btn.textContent; btn.textContent = '…';
+    try {
+      const url = await captureAndUpload();
+      lastSnapUrl = url;
+      // Auto-copy the URL to the clipboard so it's ready to paste immediately
+      // (the click is a user gesture, so clipboard write is permitted).
+      let copied = false;
+      try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(url); copied = true; } } catch {}
+      btn.textContent = '✓';
+      if (copyBtn) copyBtn.disabled = false;
+      const el = document.getElementById('log');
+      if (el) { el.textContent = copied ? 'snap (copied): ' : 'snap: '; const a = document.createElement('a');
+        a.href = url; a.textContent = url; a.target = '_blank'; a.style.color = '#5fd4ff'; el.appendChild(a); }
+    } catch (e) {
+      btn.textContent = '✗'; log('snap failed: ' + (e?.message || e));
+    } finally {
+      setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 1500);
+    }
+  });
+  // Copy: put the last snap URL on the clipboard (fast paste). Falls back to a
+  // hidden textarea+execCommand if the async clipboard API is unavailable.
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    if (!lastSnapUrl) return;
+    const label = copyBtn.textContent;
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(lastSnapUrl);
+      else {
+        const ta = document.createElement('textarea'); ta.value = lastSnapUrl;
+        ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta);
+        ta.focus(); ta.select(); document.execCommand('copy'); ta.remove();
+      }
+      copyBtn.textContent = '✓';
+    } catch { copyBtn.textContent = '✗'; }
+    setTimeout(() => { copyBtn.textContent = label; }, 1200);
+  });
+}
+
+async function captureAndUpload() {
+  const canvas = document.getElementById('gpu');
+  // Render a fresh frame so the WebGPU drawing buffer is populated. We must read
+  // it back in the SAME turn (the buffer is cleared at the next present()).
+  render();
+  // Grab the canvas as a PNG blob. WebGPU canvas readback is finicky on Safari,
+  // so try createImageBitmap -> 2D canvas -> blob first (forces a sync read of
+  // the live buffer), then fall back to OffscreenCanvas.convertToBlob / toBlob.
+  const blob = await canvasToPng(canvas);
+  if (!blob) throw new Error('canvas capture returned empty (WebGPU readback failed)');
+  const res = await fetch(`${SNAP.api}/api/snap`, {
+    method: 'POST',
+    headers: { 'authorization': `Bearer ${SNAP.token}`, 'content-type': 'image/png' },
+    body: blob,
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error || `api ${res.status}`);
+  return j.url;
+}
+
+async function canvasToPng(canvas) {
+  // Path A: copy the live WebGPU buffer into a 2D canvas via an ImageBitmap.
+  try {
+    const bmp = await createImageBitmap(canvas);
+    const off = new OffscreenCanvas(bmp.width, bmp.height);
+    off.getContext('2d').drawImage(bmp, 0, 0);
+    bmp.close?.();
+    if (off.convertToBlob) return await off.convertToBlob({ type: 'image/png' });
+  } catch {}
+  // Path B: direct toBlob on the canvas (works once COPY_SRC is configured).
+  return await new Promise((r) => canvas.toBlob(r, 'image/png'));
+}
+
 async function main() {
-  // Stamp the build into the header so you can confirm you're on the latest
-  // deploy (regenerated by the build step; falls back to 'dev' locally).
-  const hdr = document.querySelector('header');
-  if (hdr) hdr.textContent = `QView · retained · build ${BUILD}`;
+  // Stamp the build into the header title span (not the whole header — that holds
+  // the Snap button too) so you can confirm you're on the latest deploy.
+  const ttl = document.querySelector('header .ttl');
+  if (ttl) ttl.textContent = `QView · retained · build ${BUILD}`;
+  wireSnapButton();
 
   // Fully suppress the browser's default touch/gesture behaviour — the app owns
   // every gesture. Block iOS pinch-zoom (gesturestart), the page context menu,
@@ -374,23 +470,39 @@ async function main() {
   let momentumRAF = 0;
   const FRICTION = 0.94;       // per-frame decay (higher = longer glide)
   const MIN_V = 0.4;           // stop below this speed
-  const maxScroll = () => Math.max(0, contentH + 16 - viewportH);
+  const RUBBER = 0.55;         // overscroll resistance (lower = stiffer past the edge)
+  const SPRING = 0.22;         // spring-back stiffness toward the edge
+  const maxBound = () => Math.max(0, contentH + SCROLL_BOTTOM_PAD - viewportH);
+  // How far past an edge scrollY currently is (signed: <0 past top, >0 past bottom).
+  const overshoot = () => (scrollY < 0 ? scrollY : scrollY > maxBound() ? scrollY - maxBound() : 0);
   function stopMomentum() { if (momentumRAF) { cancelAnimationFrame(momentumRAF); momentumRAF = 0; } momentum = 0; }
+
+  // One rAF loop that does both fling momentum AND spring-back, iOS-style: while
+  // in-bounds it glides with friction; once past an edge it ignores momentum and
+  // springs back to the boundary; when settled, stops.
   function startMomentum(v0) {
     stopMomentum();
     momentum = v0;
     const step = () => {
-      momentum *= FRICTION;
-      scrollY += momentum;
-      // Stop at the edges (no rubber-band overshoot — render() clamps scrollY).
-      const m = maxScroll();
-      if (scrollY <= 0 || scrollY >= m) { scrollY = Math.max(0, Math.min(scrollY, m)); render(); stopMomentum(); return; }
+      const over = overshoot();
+      if (over !== 0) {
+        // Past an edge: spring toward it, kill fling velocity.
+        momentum = 0;
+        scrollY -= over * SPRING;
+        if (Math.abs(over) < 0.5) { scrollY = scrollY < 0 ? 0 : maxBound(); render(); stopMomentum(); return; }
+      } else {
+        momentum *= FRICTION;
+        scrollY += momentum;
+        if (Math.abs(momentum) < MIN_V) { stopMomentum(); return; }
+      }
       render();
-      if (Math.abs(momentum) < MIN_V) { stopMomentum(); return; }
       momentumRAF = requestAnimationFrame(step);
     };
     momentumRAF = requestAnimationFrame(step);
   }
+  // Spring back to the nearest edge if currently overscrolled (used on release
+  // when there's no fling). A no-op when in-bounds.
+  function settleScroll() { if (overshoot() !== 0) startMomentum(0); }
 
   // Long-press (touch) / right-click (mouse) -> a context menu anchored at the
   // point, for any node whose widget exposes contextMenu(node, r). Reuses the
@@ -486,9 +598,15 @@ async function main() {
       const dy = py - scrollDrag.startY;
       if (Math.abs(dy) > 4) scrollDrag.moved = true;
       const prev = scrollY;
-      scrollY = scrollDrag.startScroll - dy;            // drag down -> content moves down
-      scrollDrag.vel = scrollY - prev;                  // px since last move = velocity
-      render();                                          // render() clamps scrollY
+      let target = scrollDrag.startScroll - dy;          // drag down -> content moves down
+      // iOS rubber-band: past an edge, the content follows the finger with
+      // resistance (only RUBBER of the overscroll distance) instead of 1:1.
+      const max = maxBound();
+      if (target < 0) target = target * RUBBER;
+      else if (target > max) target = max + (target - max) * RUBBER;
+      scrollY = target;
+      scrollDrag.vel = scrollY - prev;                   // px since last move = velocity
+      render();
       return;
     }
     // Cancel a pending long-press only if the finger moves beyond the slop radius
@@ -513,7 +631,10 @@ async function main() {
       try { canvas.releasePointerCapture(ev.pointerId); } catch {}
       const v = scrollDrag.vel || 0;
       scrollDrag = null;
-      if (Math.abs(v) > 1) startMomentum(v);    // flick -> glide
+      // Flick -> glide (momentum also springs back if it hits an edge); otherwise
+      // if we were left overscrolled, spring back to the boundary.
+      if (Math.abs(v) > 1) startMomentum(v);
+      else settleScroll();
       return;
     }
     if (!dragNode) return;
@@ -523,13 +644,13 @@ async function main() {
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', endDrag);
 
-  // Wheel / trackpad scroll (desktop).
+  // Wheel / trackpad scroll (desktop) — clamps hard (no rubber-band for a wheel).
   canvas.addEventListener('wheel', (ev) => {
-    if (contentH + 16 <= viewportH) return;
+    if (maxBound() <= 0) return;
     ev.preventDefault();
     stopMomentum();
-    scrollY += ev.deltaY;
-    render();                                    // clamps
+    scrollY = Math.max(0, Math.min(scrollY + ev.deltaY, maxBound()));
+    render();
   }, { passive: false });
 
   // Right-click (desktop) -> the same context menu, anchored at the pointer.
@@ -541,10 +662,23 @@ async function main() {
     if (!openContextMenu(px, py)) render();
   });
 
-  // Re-fit on resize AND orientation change. iOS fires orientationchange before
-  // the viewport settles, so re-fit again on the next frame; reset scroll so the
-  // (now differently-tall) content isn't stuck past its new end.
-  const refit = () => { resize(); scrollY = Math.min(scrollY, maxScroll()); render(); };
+  // Re-fit on a viewport change: rebuild the backing store, refresh viewportH so
+  // maxBound() is computed against the NEW size (it would otherwise clamp scrollY
+  // with the stale height from the last render), clamp scroll into the new range,
+  // then redraw. stopMomentum so a glide in flight can't fling past the new edge.
+  const refit = () => {
+    resize();
+    viewportH = canvas.clientHeight;
+    stopMomentum();
+    scrollY = Math.max(0, Math.min(scrollY, maxBound()));
+    render();
+  };
+  // A ResizeObserver on the canvas is the RELIABLE signal: iPad Safari does not
+  // dependably fire window 'resize' for Stage Manager / split-view / multitasking
+  // size changes, but the observer fires whenever the element's box actually
+  // changes — so the canvas, scroll bounds, and centering always track the window.
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(refit).observe(canvas);
+  // Keep the window listeners too (older Safari, desktop) — refit is idempotent.
   window.addEventListener('resize', refit);
   window.addEventListener('orientationchange', () => { refit(); requestAnimationFrame(refit); });
 }
