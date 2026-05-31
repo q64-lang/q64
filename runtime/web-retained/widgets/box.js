@@ -25,9 +25,13 @@ register(KIND.box, {
     const opts = { radius };
     if (borderW > 0) { opts.border = borderW; opts.borderColor = r.color(node, ATTR.border, r.theme.border); }
     if (hasFill) r.drawPrim(r.pass, x, y, w, h, fill ?? [0, 0, 0, 0], opts);
-    // Optional centered label (e.g. a "Long Click" hint).
+    // Optional centered label (e.g. a "Long Click" hint). A context-menu box
+    // shows it in the accent (clearly tappable); a plain box in fg.
     const lbl = r.textFor(node);
-    if (lbl) r.drawPrim(r.pass, x + (w - lbl.w) / 2, y + (h - lbl.h) / 2, lbl.w, lbl.h, r.theme.muted, { texView: lbl.view });
+    if (lbl) {
+      const col = hasMenu(node, r) ? r.theme.accent : r.theme.fg;
+      r.drawPrim(r.pass, x + (w - lbl.w) / 2, y + (h - lbl.h) / 2, lbl.w, lbl.h, col, { texView: lbl.view });
+    }
   },
 
   // Only hit-testable when it can raise a context menu (otherwise a plain panel).
