@@ -262,10 +262,9 @@ function render() {
   // Center the content block when the viewport is wider than it (iPad/desktop);
   // the layout was built left-anchored (x from 0), so this shifts the whole UI.
   offsetX = Math.max(0, Math.round((viewportW - contentW) / 2));
-  // Allow scrolling until the content bottom clears the viewport with a comfortable
-  // bottom margin, so the last widget (e.g. the vertical fader) is never cut off.
-  const maxScroll = Math.max(0, contentH + SCROLL_BOTTOM_PAD - viewportH);
-  scrollY = Math.max(0, Math.min(scrollY, maxScroll));
+  // NB: scrollY is NOT hard-clamped here — it may sit slightly past the edges
+  // during an iOS-style rubber-band overscroll; the drag applies resistance and
+  // release springs it back (see settleScroll). maxBound() is the true limit.
 
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
@@ -471,23 +470,39 @@ async function main() {
   let momentumRAF = 0;
   const FRICTION = 0.94;       // per-frame decay (higher = longer glide)
   const MIN_V = 0.4;           // stop below this speed
-  const maxScroll = () => Math.max(0, contentH + 16 - viewportH);
+  const RUBBER = 0.55;         // overscroll resistance (lower = stiffer past the edge)
+  const SPRING = 0.22;         // spring-back stiffness toward the edge
+  const maxBound = () => Math.max(0, contentH + SCROLL_BOTTOM_PAD - viewportH);
+  // How far past an edge scrollY currently is (signed: <0 past top, >0 past bottom).
+  const overshoot = () => (scrollY < 0 ? scrollY : scrollY > maxBound() ? scrollY - maxBound() : 0);
   function stopMomentum() { if (momentumRAF) { cancelAnimationFrame(momentumRAF); momentumRAF = 0; } momentum = 0; }
+
+  // One rAF loop that does both fling momentum AND spring-back, iOS-style: while
+  // in-bounds it glides with friction; once past an edge it ignores momentum and
+  // springs back to the boundary; when settled, stops.
   function startMomentum(v0) {
     stopMomentum();
     momentum = v0;
     const step = () => {
-      momentum *= FRICTION;
-      scrollY += momentum;
-      // Stop at the edges (no rubber-band overshoot — render() clamps scrollY).
-      const m = maxScroll();
-      if (scrollY <= 0 || scrollY >= m) { scrollY = Math.max(0, Math.min(scrollY, m)); render(); stopMomentum(); return; }
+      const over = overshoot();
+      if (over !== 0) {
+        // Past an edge: spring toward it, kill fling velocity.
+        momentum = 0;
+        scrollY -= over * SPRING;
+        if (Math.abs(over) < 0.5) { scrollY = scrollY < 0 ? 0 : maxBound(); render(); stopMomentum(); return; }
+      } else {
+        momentum *= FRICTION;
+        scrollY += momentum;
+        if (Math.abs(momentum) < MIN_V) { stopMomentum(); return; }
+      }
       render();
-      if (Math.abs(momentum) < MIN_V) { stopMomentum(); return; }
       momentumRAF = requestAnimationFrame(step);
     };
     momentumRAF = requestAnimationFrame(step);
   }
+  // Spring back to the nearest edge if currently overscrolled (used on release
+  // when there's no fling). A no-op when in-bounds.
+  function settleScroll() { if (overshoot() !== 0) startMomentum(0); }
 
   // Long-press (touch) / right-click (mouse) -> a context menu anchored at the
   // point, for any node whose widget exposes contextMenu(node, r). Reuses the
@@ -583,9 +598,15 @@ async function main() {
       const dy = py - scrollDrag.startY;
       if (Math.abs(dy) > 4) scrollDrag.moved = true;
       const prev = scrollY;
-      scrollY = scrollDrag.startScroll - dy;            // drag down -> content moves down
-      scrollDrag.vel = scrollY - prev;                  // px since last move = velocity
-      render();                                          // render() clamps scrollY
+      let target = scrollDrag.startScroll - dy;          // drag down -> content moves down
+      // iOS rubber-band: past an edge, the content follows the finger with
+      // resistance (only RUBBER of the overscroll distance) instead of 1:1.
+      const max = maxBound();
+      if (target < 0) target = target * RUBBER;
+      else if (target > max) target = max + (target - max) * RUBBER;
+      scrollY = target;
+      scrollDrag.vel = scrollY - prev;                   // px since last move = velocity
+      render();
       return;
     }
     // Cancel a pending long-press only if the finger moves beyond the slop radius
@@ -610,7 +631,10 @@ async function main() {
       try { canvas.releasePointerCapture(ev.pointerId); } catch {}
       const v = scrollDrag.vel || 0;
       scrollDrag = null;
-      if (Math.abs(v) > 1) startMomentum(v);    // flick -> glide
+      // Flick -> glide (momentum also springs back if it hits an edge); otherwise
+      // if we were left overscrolled, spring back to the boundary.
+      if (Math.abs(v) > 1) startMomentum(v);
+      else settleScroll();
       return;
     }
     if (!dragNode) return;
@@ -620,13 +644,13 @@ async function main() {
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', endDrag);
 
-  // Wheel / trackpad scroll (desktop).
+  // Wheel / trackpad scroll (desktop) — clamps hard (no rubber-band for a wheel).
   canvas.addEventListener('wheel', (ev) => {
-    if (contentH + 16 <= viewportH) return;
+    if (maxBound() <= 0) return;
     ev.preventDefault();
     stopMomentum();
-    scrollY += ev.deltaY;
-    render();                                    // clamps
+    scrollY = Math.max(0, Math.min(scrollY + ev.deltaY, maxBound()));
+    render();
   }, { passive: false });
 
   // Right-click (desktop) -> the same context menu, anchored at the pointer.
@@ -641,7 +665,7 @@ async function main() {
   // Re-fit on resize AND orientation change. iOS fires orientationchange before
   // the viewport settles, so re-fit again on the next frame; reset scroll so the
   // (now differently-tall) content isn't stuck past its new end.
-  const refit = () => { resize(); scrollY = Math.min(scrollY, maxScroll()); render(); };
+  const refit = () => { resize(); scrollY = Math.max(0, Math.min(scrollY, maxBound())); render(); };
   window.addEventListener('resize', refit);
   window.addEventListener('orientationchange', () => { refit(); requestAnimationFrame(refit); });
 }
