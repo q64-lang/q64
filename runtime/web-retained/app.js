@@ -15,7 +15,7 @@ try { ({ BUILD } = await import('./version.js')); } catch {}
 // Snap upload config (api origin + snap:create token), filled by the deploy.
 let SNAP = { api: '', token: '' };
 try { ({ SNAP } = await import('./snap-config.js')); } catch {}
-import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, setScissor, DPR } from './gpu.js';
+import { initGPU, drawPrim, sdfTexture, iconSdf, beginFrame, endFrame, setScissor, DPR } from './gpu.js';
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
 import { Scene } from './scene.js';
@@ -84,6 +84,27 @@ const CATALOG = [
   'has @',           // 29  validation status: contains '@'
   'no @ yet',        // 30  validation status: missing '@'
   'Notes',           // 31  text_area section label
+  'Icons',           // 32  icon section label
+  'Search',          // 33  icon button label
+];
+
+// Vector-icon catalog (Lucide path data, ISC). Referenced by integer id via
+// ATTR.icon — no strings cross the wasm boundary. Each icon is a 24×24-viewBox
+// list of stroked elements; iconSdf rasterizes + SDFs it (see gpu.js). Only the
+// icons the app uses are bundled (curated starter set; grow as needed).
+//   0 search  1 x  2 check  3 chevron-down  4 plus  5 trash  6 settings
+//   7 heart   8 menu  9 arrow-left
+const ICONS = [
+  [['circle', 11, 11, 8], ['line', 21, 21, 16.65, 16.65]],
+  [['line', 18, 6, 6, 18], ['line', 6, 6, 18, 18]],
+  [['path', 'M20 6 9 17l-5-5']],
+  [['path', 'm6 9 6 6 6-6']],
+  [['line', 5, 12, 19, 12], ['line', 12, 5, 12, 19]],
+  [['line', 3, 6, 21, 6], ['path', 'M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'], ['path', 'M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2']],
+  [['path', 'M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z'], ['circle', 12, 12, 3]],
+  [['path', 'M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z']],
+  [['line', 4, 12, 20, 12], ['line', 4, 6, 20, 6], ['line', 4, 18, 20, 18]],
+  [['line', 19, 12, 5, 12], ['path', 'm12 19-7-7 7-7']],
 ];
 
 // ---- the retained tree (generic, VALIDATED applier) --------------------------
@@ -247,6 +268,7 @@ const renderCtx = {
   },
   textFor: (node) => glyphFor(node),
   glyphForId: (textId) => glyphForCatalog(textId),
+  iconGlyph: (iconId, sizePx) => iconGlyph(iconId, sizePx),
   isPressed: (id) => id === pressedId,
   isOpen: (id) => id === openDropdownId,
   // --- text_input helpers (host owns the editable value) ---
@@ -425,6 +447,17 @@ function glyphForStr(str, sizePx = 17) {
   const key = `${sizePx}:${str}`;
   if (!strGlyphCache.has(key)) strGlyphCache.set(key, sdfTexture(str, sizePx));
   return strGlyphCache.get(key);
+}
+
+// An icon's SDF texture, cached by "iconId:size". Returns null for an unknown
+// id. Drawn as a tinted quad (like a glyph); resolution-independent.
+const iconGlyphCache = new Map();
+function iconGlyph(iconId, sizePx = 22) {
+  const n = Number(iconId);
+  if (!(n >= 0 && n < ICONS.length)) return null;
+  const key = `${n}:${sizePx}`;
+  if (!iconGlyphCache.has(key)) iconGlyphCache.set(key, iconSdf(ICONS[n], sizePx));
+  return iconGlyphCache.get(key);
 }
 
 // ===========================================================================
