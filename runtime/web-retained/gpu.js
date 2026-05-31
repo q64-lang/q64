@@ -20,7 +20,13 @@ export async function initGPU(canvas) {
   device = await adapter.requestDevice();
   ctx = canvas.getContext('webgpu');
   format = navigator.gpu.getPreferredCanvasFormat();
-  ctx.configure({ device, format, alphaMode: 'opaque' });
+  // COPY_SRC on the canvas texture so the drawing buffer can be read back for
+  // snapshots (canvas.toBlob/convertToBlob); without it WebGPU canvas capture
+  // returns a blank/null image on Safari.
+  ctx.configure({
+    device, format, alphaMode: 'opaque',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
 
   uniformBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });

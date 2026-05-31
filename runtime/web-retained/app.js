@@ -373,26 +373,37 @@ function wireSnapButton() {
   });
 }
 
-function captureAndUpload() {
+async function captureAndUpload() {
   const canvas = document.getElementById('gpu');
-  // Render a fresh frame so the WebGPU drawing buffer is populated, then grab it
-  // in the same task (the buffer persists until the next present()).
+  // Render a fresh frame so the WebGPU drawing buffer is populated. We must read
+  // it back in the SAME turn (the buffer is cleared at the next present()).
   render();
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(async (blob) => {
-      if (!blob) return reject(new Error('canvas capture returned null (WebGPU buffer not readable)'));
-      try {
-        const res = await fetch(`${SNAP.api}/api/snap`, {
-          method: 'POST',
-          headers: { 'authorization': `Bearer ${SNAP.token}`, 'content-type': 'image/png' },
-          body: blob,
-        });
-        const j = await res.json().catch(() => ({}));
-        if (!res.ok) return reject(new Error(j.error || `api ${res.status}`));
-        resolve(j.url);
-      } catch (e) { reject(e); }
-    }, 'image/png');
+  // Grab the canvas as a PNG blob. WebGPU canvas readback is finicky on Safari,
+  // so try createImageBitmap -> 2D canvas -> blob first (forces a sync read of
+  // the live buffer), then fall back to OffscreenCanvas.convertToBlob / toBlob.
+  const blob = await canvasToPng(canvas);
+  if (!blob) throw new Error('canvas capture returned empty (WebGPU readback failed)');
+  const res = await fetch(`${SNAP.api}/api/snap`, {
+    method: 'POST',
+    headers: { 'authorization': `Bearer ${SNAP.token}`, 'content-type': 'image/png' },
+    body: blob,
   });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error || `api ${res.status}`);
+  return j.url;
+}
+
+async function canvasToPng(canvas) {
+  // Path A: copy the live WebGPU buffer into a 2D canvas via an ImageBitmap.
+  try {
+    const bmp = await createImageBitmap(canvas);
+    const off = new OffscreenCanvas(bmp.width, bmp.height);
+    off.getContext('2d').drawImage(bmp, 0, 0);
+    bmp.close?.();
+    if (off.convertToBlob) return await off.convertToBlob({ type: 'image/png' });
+  } catch {}
+  // Path B: direct toBlob on the canvas (works once COPY_SRC is configured).
+  return await new Promise((r) => canvas.toBlob(r, 'image/png'));
 }
 
 async function main() {
