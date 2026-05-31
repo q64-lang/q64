@@ -277,6 +277,8 @@ function ensureFocusedVisible() {
   if (fieldBottom > visibleBottom - margin) {
     scrollY = Math.max(0, Math.min(scrollY + fieldBottom - (visibleBottom - margin), maxBound()));
   }
+  const fn = nodes.get(focusedId);
+  if (fn) positionKbd(fn);                        // keep the hidden input over the lifted field
   render();
 }
 const renderCtx = {
@@ -659,6 +661,20 @@ function liftFocusedOnce() {
   kbScrolled = true;
 }
 
+// Position the hidden capture element OVER the field's current on-screen rect,
+// so iOS sees the focused input where the interaction is (and won't dismiss the
+// keyboard). pointer-events:none keeps taps flowing to the canvas. Re-run after
+// the field lifts (its screen position changes).
+function positionKbd(node) {
+  const el = fieldEl(node), cv = document.getElementById('gpu'), rc = layoutMap.get(node.id);
+  if (!el || !cv || !rc) return;
+  const r = cv.getBoundingClientRect();
+  el.style.left = `${r.left + offsetX + rc.x}px`;
+  el.style.top = `${r.top + rc.y - scrollY}px`;
+  el.style.width = `${rc.w}px`;
+  el.style.height = `${rc.h}px`;
+}
+
 // A text field (single-line input or multi-line area)?
 function isTextField(kind) { return kind === KIND.text_input || kind === KIND.text_area; }
 // The hidden capture element for a node: a <textarea> (newlines) for text_area,
@@ -688,6 +704,7 @@ function focusField(node, px, py) {
   // focus (focus() must run inside the tap gesture to raise the soft keyboard)
   // and place the caret where the user tapped.
   if (el) {
+    positionKbd(node);                           // place the input over the field BEFORE focusing
     el.value = renderCtx.textValue(node);
     el.focus();
     try { el.setSelectionRange(idx, idx); } catch {}
