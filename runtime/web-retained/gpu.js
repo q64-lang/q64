@@ -127,6 +127,18 @@ export function beginFrame(bg = [0.027, 0.035, 0.05, 1]) {
 }
 export function endFrame(frame) { frame.pass.end(); device.queue.submit([frame.enc.finish()]); }
 
+// Clip subsequent draws to a rect (CSS px; scaled by DPR). Pass null to reset to
+// the full surface. Used to keep scrolled content from bleeding over a sticky bar.
+export function setScissor(pass, rect) {
+  const cw = ctx.canvas.width, ch = ctx.canvas.height;
+  if (!rect) { pass.setScissorRect(0, 0, cw, ch); return; }
+  const x = Math.max(0, Math.round(rect.x * DPR));
+  const y = Math.max(0, Math.round(rect.y * DPR));
+  const w = Math.max(0, Math.min(cw - x, Math.round(rect.w * DPR)));
+  const h = Math.max(0, Math.min(ch - y, Math.round(rect.h * DPR)));
+  pass.setScissorRect(x, y, w, h);
+}
+
 // ---- SDF text (8SSEDT). Identical algorithm to runtime/web/app.js. ----
 function edt(seed, w, h) {
   const INF = 1e9;
