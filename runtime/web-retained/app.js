@@ -102,6 +102,7 @@ let pressedId = null;
 let focusedId = null;        // the text_input node id with keyboard focus, or null
 let caretOn = true;          // caret blink phase (visible) while a field is focused
 let blinkTimer = null;       // setInterval handle driving the blink
+let kbScrolled = false;      // have we already lifted the focused field above the keyboard?
 let instance;
 
 // Host→app text scratch: when the user types, the host writes the field's UTF-8
@@ -451,8 +452,21 @@ function startBlink() {
 }
 function stopBlink() { if (blinkTimer) clearInterval(blinkTimer); blinkTimer = null; caretOn = true; }
 
+// Lift the focused field above the keyboard exactly ONCE per focus session.
+// iOS fires extra visualViewport resizes (e.g. the predictive bar appears on the
+// first keystroke) that would otherwise re-scroll and make the field jump again;
+// the latch keeps the lift to the single keyboard-open event.
+function liftFocusedOnce() {
+  if (focusedId === null || kbScrolled) return;
+  kbInset = viewportInset();
+  if (kbInset <= 0) return;                      // keyboard not up yet — wait for the resize
+  ensureFocusedVisible();
+  kbScrolled = true;
+}
+
 function focusField(node) {
   focusedId = node.id;
+  kbScrolled = false;
   startBlink();
   const kbd = document.getElementById('kbd');
   const cv = document.getElementById('gpu');
@@ -468,11 +482,11 @@ function focusField(node) {
     try { kbd.setSelectionRange(kbd.value.length, kbd.value.length); } catch {}
   }
   render();
-  // The keyboard animates in over a few hundred ms; visualViewport 'resize'
-  // fires when it settles (the listener re-runs this), but try now + shortly
-  // after too so the field rises above the keyboard promptly.
-  ensureFocusedVisible();
-  setTimeout(ensureFocusedVisible, 300);
+  // The keyboard animates in over a few hundred ms; the visualViewport 'resize'
+  // (keyboard appearing) lifts the field and latches it. This timeout is a
+  // fallback if that event doesn't fire; both go through liftFocusedOnce so the
+  // field is lifted exactly once (no second jump on the first keystroke).
+  setTimeout(liftFocusedOnce, 350);
 }
 
 // Drop keyboard focus and commit (a `change` event to the handler).
@@ -480,6 +494,7 @@ function blurField() {
   if (focusedId === null) return;
   const node = nodes.get(focusedId);
   focusedId = null;
+  kbScrolled = false;
   stopBlink();
   kbInset = 0;                                   // keyboard is closing; reclaim the room
   const kbd = document.getElementById('kbd');
@@ -845,7 +860,13 @@ async function main() {
   // The soft keyboard shrinks the visual viewport; track that inset and keep the
   // focused field above it. (No-op on desktop, where visualViewport ~= layout.)
   if (window.visualViewport) {
-    const onVV = () => { kbInset = viewportInset(); if (focusedId !== null) ensureFocusedVisible(); else render(); };
+      const onVV = () => {
+      kbInset = viewportInset();
+      // Lift the field only on the FIRST keyboard-open resize (latched); later
+      // resizes (predictive bar, etc.) just update the inset + redraw, no jump.
+      if (focusedId !== null && !kbScrolled && kbInset > 0) liftFocusedOnce();
+      else render();
+    };
     window.visualViewport.addEventListener('resize', onVV);
     window.visualViewport.addEventListener('scroll', onVV);
   }

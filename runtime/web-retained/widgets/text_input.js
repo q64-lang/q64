@@ -43,10 +43,10 @@ register(KIND.text_input, {
       r.drawPrim(r.pass, innerLeft - pad, ty, glyph.w, glyph.h, ink, { texView: glyph.view });
       if (value) caretX = innerLeft + (glyph.w - 2 * pad);
     }
-    // A blinking caret bar at the end of the value while focused.
+    // A blinking caret bar at the end of the value while focused (text color).
     if (focused && r.caretVisible()) {
       const ch = Math.round(g.h * 0.5);
-      r.drawPrim(r.pass, caretX + 1, g.y + (g.h - ch) / 2, 2, ch, r.theme.accent, {});
+      r.drawPrim(r.pass, caretX + 1, g.y + (g.h - ch) / 2, 2, ch, r.theme.fg, {});
     }
   },
   hit(node, px, py, r) {
