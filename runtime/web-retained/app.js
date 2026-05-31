@@ -468,15 +468,11 @@ function focusField(node) {
   focusedId = node.id;
   kbScrolled = false;
   startBlink();
+  // #kbd is pinned top-left (always visible) so iOS never auto-scrolls to it —
+  // we lift the drawn field ourselves. Just seed its value + focus (the focus()
+  // must run inside the tap gesture to raise the soft keyboard).
   const kbd = document.getElementById('kbd');
-  const cv = document.getElementById('gpu');
-  const rc = layoutMap.get(node.id);
-  if (kbd && cv && rc) {
-    const r = cv.getBoundingClientRect();
-    kbd.style.left = `${r.left + offsetX + rc.x}px`;
-    kbd.style.top = `${r.top + rc.y - scrollY}px`;
-    kbd.style.width = `${rc.w}px`;
-    kbd.style.height = `${rc.h}px`;
+  if (kbd) {
     kbd.value = renderCtx.textValue(node);
     kbd.focus();
     try { kbd.setSelectionRange(kbd.value.length, kbd.value.length); } catch {}
