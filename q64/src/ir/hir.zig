@@ -294,4 +294,13 @@ pub const Expr = union(enum) {
     /// Byte-wise equality of two `str` values (`a == b`) as a bool (i32 0/1).
     /// `!=` is this wrapped in `un{.not}`. Lowers to a `__str_eq` helper call.
     str_eq: struct { lhs: *Expr, rhs: *Expr },
+    /// `s.slice(start, end)` — a str sub-view (ptr+start, end-start). No bounds
+    /// check; caller guards with `s.len`. `start`/`end` are i64. str-valued.
+    str_slice: struct { str: *Expr, start: *Expr, end: *Expr },
+    /// `s.index_of(byte)` — index of the first byte == `byte` (i64), or -1. i64.
+    str_index_of: struct { str: *Expr, byte: *Expr },
+    /// `s.starts_with(prefix)` — does `s` begin with `prefix`? bool (i32 0/1).
+    str_starts_with: struct { str: *Expr, prefix: *Expr },
+    /// `s.contains(sub)` — does `sub` occur anywhere in `s`? bool (i32 0/1).
+    str_contains: struct { str: *Expr, sub: *Expr },
 };

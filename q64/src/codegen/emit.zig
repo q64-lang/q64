@@ -641,6 +641,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_fmt = false;
     var needs_arena = false;
     var needs_str_eq = false;
+    var needs_index_of = false;
+    var needs_starts_with = false;
+    var needs_contains = false;
     for (m.funcs) |f| {
         const inst = switch (f.body) {
             .structured => |x| x,
@@ -651,6 +654,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         scanScratch(inst, &sc);
         if (sc.has_concat) needs_arena = true;
         if (sc.has_str_eq) needs_str_eq = true;
+        if (sc.has_index_of) needs_index_of = true;
+        if (sc.has_starts_with) needs_starts_with = true;
+        if (sc.has_contains) needs_contains = true;
     }
     if (needs_fmt) needs_arena = true;
     if (needs_arena) {
@@ -666,6 +672,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
     if (needs_str_eq) try emitStrEq(module, allocator, i32_type, ptr_type, mem64);
+    if (needs_index_of) try emitStrIndexOf(module, allocator, i64_type, i32_type, ptr_type, mem64);
+    // `contains` is implemented on top of `starts_with`, so emit the latter when
+    // either is used.
+    if (needs_starts_with or needs_contains) try emitStrStartsWith(module, allocator, i32_type, ptr_type, mem64);
+    if (needs_contains) try emitStrContains(module, allocator, i32_type, ptr_type, mem64);
 
     // Host-face imports (e.g. `qview.text`): declare one wasm import per distinct
     // host_call name. All args are i64 (valid on wasm32); the import returns void.
@@ -870,6 +881,10 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .str_len => |s| bodyHasOut(s, want_int),
         .str_index => |si| bodyHasOut(si.str, want_int) or bodyHasOut(si.idx, want_int),
         .str_eq => |se| bodyHasOut(se.lhs, want_int) or bodyHasOut(se.rhs, want_int),
+        .str_slice => |sl| bodyHasOut(sl.str, want_int) or bodyHasOut(sl.start, want_int) or bodyHasOut(sl.end, want_int),
+        .str_index_of => |m| bodyHasOut(m.str, want_int) or bodyHasOut(m.byte, want_int),
+        .str_starts_with => |m| bodyHasOut(m.str, want_int) or bodyHasOut(m.prefix, want_int),
+        .str_contains => |m| bodyHasOut(m.str, want_int) or bodyHasOut(m.sub, want_int),
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -920,7 +935,15 @@ fn instUsesEnvOut(inst: *const ir.mir.Inst) bool {
     return false;
 }
 
-const Scratch = struct { host_out: bool = false, has_concat: bool = false, max_tuples: u32 = 0, has_str_eq: bool = false };
+const Scratch = struct {
+    host_out: bool = false,
+    has_concat: bool = false,
+    max_tuples: u32 = 0,
+    has_str_eq: bool = false,
+    has_index_of: bool = false,
+    has_starts_with: bool = false,
+    has_contains: bool = false,
+};
 
 fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
     switch (inst.op) {
@@ -978,6 +1001,26 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_str_eq = true;
             scanScratch(se.lhs, s);
             scanScratch(se.rhs, s);
+        },
+        .str_slice => |sl| {
+            scanScratch(sl.str, s);
+            scanScratch(sl.start, s);
+            scanScratch(sl.end, s);
+        },
+        .str_index_of => |m| {
+            s.has_index_of = true;
+            scanScratch(m.str, s);
+            scanScratch(m.byte, s);
+        },
+        .str_starts_with => |m| {
+            s.has_starts_with = true;
+            scanScratch(m.str, s);
+            scanScratch(m.prefix, s);
+        },
+        .str_contains => |m| {
+            s.has_contains = true;
+            scanScratch(m.str, s);
+            scanScratch(m.sub, s);
         },
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
@@ -1174,6 +1217,41 @@ const Lowerer = struct {
                 try self.strOperands(se.rhs, &operands);
                 return c.BinaryenCall(module, "__str_eq", operands.items.ptr, @intCast(operands.items.len), self.i32_type);
             },
+            .str_slice => |sl| {
+                // (ptr + start, end - start). start/end are i64; wrap to the
+                // address width on wasm32. No bounds check (caller guards). Each
+                // operand is built as its own expr tree (Binaryen refs aren't
+                // shared), so `start` is emitted fresh in both halves.
+                const base = c.BinaryenTupleExtract(module, try self.inst(sl.str), 0);
+                const sub = if (self.ptr_type == self.i64_type) c.BinaryenSubInt64() else c.BinaryenSubInt32();
+                var elems = [_]c.BinaryenExpressionRef{
+                    self.ptrAdd(base, self.toPtr(try self.inst(sl.start))),
+                    c.BinaryenBinary(module, sub, self.toPtr(try self.inst(sl.end)), self.toPtr(try self.inst(sl.start))),
+                };
+                return c.BinaryenTupleMake(module, @ptrCast(&elems), elems.len);
+            },
+            .str_index_of => |m| {
+                // __str_index_of(ps, ls, byte) -> i64 (index or -1).
+                var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer operands.deinit(self.allocator);
+                try self.strOperands(m.str, &operands);
+                try operands.append(self.allocator, try self.inst(m.byte));
+                return c.BinaryenCall(module, "__str_index_of", operands.items.ptr, @intCast(operands.items.len), self.i64_type);
+            },
+            .str_starts_with => |m| {
+                var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer operands.deinit(self.allocator);
+                try self.strOperands(m.str, &operands);
+                try self.strOperands(m.prefix, &operands);
+                return c.BinaryenCall(module, "__str_starts_with", operands.items.ptr, @intCast(operands.items.len), self.i32_type);
+            },
+            .str_contains => |m| {
+                var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer operands.deinit(self.allocator);
+                try self.strOperands(m.str, &operands);
+                try self.strOperands(m.sub, &operands);
+                return c.BinaryenCall(module, "__str_contains", operands.items.ptr, @intCast(operands.items.len), self.i32_type);
+            },
             .if_ => |iff| {
                 const cond = try self.inst(iff.cond);
                 const then_ = try self.inst(iff.then_);
@@ -1301,6 +1379,11 @@ const Lowerer = struct {
         const op = if (self.ptr_type == self.i32_type) c.BinaryenAddInt32() else c.BinaryenAddInt64();
         return c.BinaryenBinary(self.module, op, a, b);
     }
+    // Narrow an i64 value to the address width (identity on wasm64, wrap on
+    // wasm32) — for using an i64 index/bound in pointer arithmetic.
+    fn toPtr(self: *Lowerer, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        return if (self.ptr_type == self.i64_type) v else c.BinaryenUnary(self.module, c.BinaryenWrapInt64(), v);
+    }
 
     /// Write a `(ptr, len)` pair value to env.out, then the newline byte:
     /// stash the pair in the scratch local, extract both halves, env.out them,
@@ -1427,6 +1510,14 @@ const Lowerer = struct {
             .str_binding => |sb| {
                 try out.append(self.allocator, self.ptrGet(sb.ptr_idx));
                 try out.append(self.allocator, self.ptrGet(sb.len_idx));
+            },
+            .str_slice => |sl| {
+                // ptr = base.ptr + start; len = end - start. Built as two fresh
+                // trees (no shared refs); `start` is emitted once per half.
+                const base = c.BinaryenTupleExtract(self.module, try self.inst(sl.str), 0);
+                const sub = if (self.ptr_type == self.i64_type) c.BinaryenSubInt64() else c.BinaryenSubInt32();
+                try out.append(self.allocator, self.ptrAdd(base, self.toPtr(try self.inst(sl.start))));
+                try out.append(self.allocator, c.BinaryenBinary(self.module, sub, self.toPtr(try self.inst(sl.end)), self.toPtr(try self.inst(sl.start))));
             },
             else => return Error.UnsupportedCall,
         }
@@ -1687,6 +1778,144 @@ fn emitStrEq(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i32_type
     const ptype = c.BinaryenTypeCreate(&params, params.len);
     var var_types = [_]c.BinaryenType{ptr_type}; // I
     _ = c.BinaryenAddFunction(module, "__str_eq", ptype, i32_type, @ptrCast(&var_types), var_types.len, body);
+}
+
+// Shared little const/get helpers for the str runtime helpers below.
+const K = struct {
+    fn get(m: c.BinaryenModuleRef, idx: c.BinaryenIndex, t: c.BinaryenType) c.BinaryenExpressionRef {
+        return c.BinaryenLocalGet(m, idx, t);
+    }
+    fn ptrc(m: c.BinaryenModuleRef, m64: bool, v: i64) c.BinaryenExpressionRef {
+        return if (m64) c.BinaryenConst(m, c.BinaryenLiteralInt64(v)) else c.BinaryenConst(m, c.BinaryenLiteralInt32(@intCast(v)));
+    }
+    fn i64c(m: c.BinaryenModuleRef, v: i64) c.BinaryenExpressionRef {
+        return c.BinaryenConst(m, c.BinaryenLiteralInt64(v));
+    }
+    fn i32c(m: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+        return c.BinaryenConst(m, c.BinaryenLiteralInt32(v));
+    }
+    fn load8(m: c.BinaryenModuleRef, i32_type: c.BinaryenType, addr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        return c.BinaryenLoad(m, 1, false, 0, 1, i32_type, addr, "0");
+    }
+};
+
+/// `__str_index_of(ps, ls, byte) -> i64`: the index of the first byte equal to
+/// `byte` (low 8 bits), or -1. Params: ptr, len (address-width), byte (i64).
+fn emitStrIndexOf(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_type: c.BinaryenType, i32_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
+    const none = c.BinaryenTypeNone();
+    const PS: c.BinaryenIndex = 0;
+    const LS: c.BinaryenIndex = 1;
+    const BYTE: c.BinaryenIndex = 2;
+    const I: c.BinaryenIndex = 3;
+    const add_p = if (mem64) c.BinaryenAddInt64() else c.BinaryenAddInt32();
+    const geu_p = if (mem64) c.BinaryenGeUInt64() else c.BinaryenGeUInt32();
+
+    var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer stmts.deinit(allocator);
+    try stmts.append(allocator, c.BinaryenLocalSet(module, I, K.ptrc(module, mem64, 0)));
+
+    var lp: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer lp.deinit(allocator);
+    // if I >= ls: return -1
+    try lp.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, geu_p, K.get(module, I, ptr_type), K.get(module, LS, ptr_type)), c.BinaryenReturn(module, K.i64c(module, -1)), null));
+    // if mem[ps+I] == (byte as i32): return I (as i64)
+    const byte_at = K.load8(module, i32_type, c.BinaryenBinary(module, add_p, K.get(module, PS, ptr_type), K.get(module, I, ptr_type)));
+    const want = c.BinaryenUnary(module, c.BinaryenWrapInt64(), K.get(module, BYTE, i64_type));
+    const idx_i64 = if (mem64) K.get(module, I, ptr_type) else c.BinaryenUnary(module, c.BinaryenExtendUInt32(), K.get(module, I, ptr_type));
+    try lp.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, c.BinaryenEqInt32(), byte_at, want), c.BinaryenReturn(module, idx_i64), null));
+    try lp.append(allocator, c.BinaryenLocalSet(module, I, c.BinaryenBinary(module, add_p, K.get(module, I, ptr_type), K.ptrc(module, mem64, 1))));
+    try lp.append(allocator, c.BinaryenBreak(module, "iol", null, null));
+    try stmts.append(allocator, c.BinaryenLoop(module, "iol", c.BinaryenBlock(module, null, @ptrCast(lp.items.ptr), @intCast(lp.items.len), none)));
+    try stmts.append(allocator, c.BinaryenUnreachable(module));
+
+    const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), i64_type);
+    var params = [_]c.BinaryenType{ ptr_type, ptr_type, i64_type };
+    const ptype = c.BinaryenTypeCreate(&params, params.len);
+    var var_types = [_]c.BinaryenType{ptr_type};
+    _ = c.BinaryenAddFunction(module, "__str_index_of", ptype, i64_type, @ptrCast(&var_types), var_types.len, body);
+}
+
+/// `__str_starts_with(ps, ls, pp, lp) -> i32`: does s begin with the prefix?
+fn emitStrStartsWith(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i32_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
+    const none = c.BinaryenTypeNone();
+    const PS: c.BinaryenIndex = 0;
+    const LS: c.BinaryenIndex = 1;
+    const PP: c.BinaryenIndex = 2;
+    const LP: c.BinaryenIndex = 3;
+    const I: c.BinaryenIndex = 4;
+    const add_p = if (mem64) c.BinaryenAddInt64() else c.BinaryenAddInt32();
+    const gtu_p = if (mem64) c.BinaryenGtUInt64() else c.BinaryenGtUInt32();
+    const geu_p = if (mem64) c.BinaryenGeUInt64() else c.BinaryenGeUInt32();
+
+    var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer stmts.deinit(allocator);
+    // if lp > ls: return 0 (prefix can't fit)
+    try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, gtu_p, K.get(module, LP, ptr_type), K.get(module, LS, ptr_type)), c.BinaryenReturn(module, K.i32c(module, 0)), null));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, I, K.ptrc(module, mem64, 0)));
+
+    var lp: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer lp.deinit(allocator);
+    try lp.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, geu_p, K.get(module, I, ptr_type), K.get(module, LP, ptr_type)), c.BinaryenReturn(module, K.i32c(module, 1)), null));
+    const a = K.load8(module, i32_type, c.BinaryenBinary(module, add_p, K.get(module, PS, ptr_type), K.get(module, I, ptr_type)));
+    const b = K.load8(module, i32_type, c.BinaryenBinary(module, add_p, K.get(module, PP, ptr_type), K.get(module, I, ptr_type)));
+    try lp.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, c.BinaryenNeInt32(), a, b), c.BinaryenReturn(module, K.i32c(module, 0)), null));
+    try lp.append(allocator, c.BinaryenLocalSet(module, I, c.BinaryenBinary(module, add_p, K.get(module, I, ptr_type), K.ptrc(module, mem64, 1))));
+    try lp.append(allocator, c.BinaryenBreak(module, "swl", null, null));
+    try stmts.append(allocator, c.BinaryenLoop(module, "swl", c.BinaryenBlock(module, null, @ptrCast(lp.items.ptr), @intCast(lp.items.len), none)));
+    try stmts.append(allocator, c.BinaryenUnreachable(module));
+
+    const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), i32_type);
+    var params = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type, ptr_type };
+    const ptype = c.BinaryenTypeCreate(&params, params.len);
+    var var_types = [_]c.BinaryenType{ptr_type};
+    _ = c.BinaryenAddFunction(module, "__str_starts_with", ptype, i32_type, @ptrCast(&var_types), var_types.len, body);
+}
+
+/// `__str_contains(ps, ls, pp, lp) -> i32`: does sub occur in s? Tries each
+/// start offset via `__str_starts_with`. Empty sub matches.
+fn emitStrContains(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i32_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
+    const none = c.BinaryenTypeNone();
+    const PS: c.BinaryenIndex = 0;
+    const LS: c.BinaryenIndex = 1;
+    const PP: c.BinaryenIndex = 2;
+    const LP: c.BinaryenIndex = 3;
+    const I: c.BinaryenIndex = 4;
+    const add_p = if (mem64) c.BinaryenAddInt64() else c.BinaryenAddInt32();
+    const sub_p = if (mem64) c.BinaryenSubInt64() else c.BinaryenSubInt32();
+    const gtu_p = if (mem64) c.BinaryenGtUInt64() else c.BinaryenGtUInt32();
+    const eq_p = if (mem64) c.BinaryenEqInt64() else c.BinaryenEqInt32();
+
+    var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer stmts.deinit(allocator);
+    // if lp == 0: return 1 (empty substring)
+    try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, eq_p, K.get(module, LP, ptr_type), K.ptrc(module, mem64, 0)), c.BinaryenReturn(module, K.i32c(module, 1)), null));
+    // if lp > ls: return 0
+    try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, gtu_p, K.get(module, LP, ptr_type), K.get(module, LS, ptr_type)), c.BinaryenReturn(module, K.i32c(module, 0)), null));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, I, K.ptrc(module, mem64, 0)));
+
+    var lp: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer lp.deinit(allocator);
+    // if I + lp > ls: return 0 (no room left)
+    try lp.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, gtu_p, c.BinaryenBinary(module, add_p, K.get(module, I, ptr_type), K.get(module, LP, ptr_type)), K.get(module, LS, ptr_type)), c.BinaryenReturn(module, K.i32c(module, 0)), null));
+    // if __str_starts_with(ps+I, ls-I, pp, lp): return 1
+    var sw_args = [_]c.BinaryenExpressionRef{
+        c.BinaryenBinary(module, add_p, K.get(module, PS, ptr_type), K.get(module, I, ptr_type)),
+        c.BinaryenBinary(module, sub_p, K.get(module, LS, ptr_type), K.get(module, I, ptr_type)),
+        K.get(module, PP, ptr_type),
+        K.get(module, LP, ptr_type),
+    };
+    const sw = c.BinaryenCall(module, "__str_starts_with", @ptrCast(&sw_args), sw_args.len, i32_type);
+    try lp.append(allocator, c.BinaryenIf(module, sw, c.BinaryenReturn(module, K.i32c(module, 1)), null));
+    try lp.append(allocator, c.BinaryenLocalSet(module, I, c.BinaryenBinary(module, add_p, K.get(module, I, ptr_type), K.ptrc(module, mem64, 1))));
+    try lp.append(allocator, c.BinaryenBreak(module, "cnl", null, null));
+    try stmts.append(allocator, c.BinaryenLoop(module, "cnl", c.BinaryenBlock(module, null, @ptrCast(lp.items.ptr), @intCast(lp.items.len), none)));
+    try stmts.append(allocator, c.BinaryenUnreachable(module));
+
+    const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), i32_type);
+    var params = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type, ptr_type };
+    const ptype = c.BinaryenTypeCreate(&params, params.len);
+    var var_types = [_]c.BinaryenType{ptr_type};
+    _ = c.BinaryenAddFunction(module, "__str_contains", ptype, i32_type, @ptrCast(&var_types), var_types.len, body);
 }
 
 // =====================================================================

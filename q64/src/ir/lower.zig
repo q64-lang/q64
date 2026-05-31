@@ -194,7 +194,7 @@ fn singleTail(body: *const hir.Stmt) ?*hir.Expr {
 /// an i64 (only appears inside concat today, but classify it as str for safety).
 fn isStrExpr(e: *const hir.Expr) bool {
     return switch (e.*) {
-        .str_const, .concat, .str_binding, .fmt_int => true,
+        .str_const, .concat, .str_binding, .fmt_int, .str_slice => true,
         .local => |l| l.ty == .str,
         else => false,
     };
@@ -221,6 +221,8 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         },
         .str_binding => |sb| return mk(ctx.a, .str, .{ .str_binding = .{ .ptr_idx = sb.ptr_idx, .len_idx = sb.len_idx } }),
         .fmt_int => |inner| return mk(ctx.a, .str, .{ .fmt_int_to_str = try lowerExpr(ctx, inner) }),
+        // `s.slice(a, b)` -> str (ptr+a, b-a). str operand + two i64 bounds.
+        .str_slice => |sl| return mk(ctx.a, .str, .{ .str_slice = .{ .str = try lowerStrExpr(ctx, sl.str), .start = try lowerExpr(ctx, sl.start), .end = try lowerExpr(ctx, sl.end) } }),
         else => return error.Unsupported,
     }
 }
@@ -354,7 +356,11 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .str_index => |si| return mk(ctx.a, .i64, .{ .str_index = .{ .str = try lowerStrExpr(ctx, si.str), .idx = try lowerExpr(ctx, si.idx) } }),
         // `a == b` on strs — both to (ptr, len); backend calls __str_eq -> i32.
         .str_eq => |se| return mk(ctx.a, .i32, .{ .str_eq = .{ .lhs = try lowerStrExpr(ctx, se.lhs), .rhs = try lowerStrExpr(ctx, se.rhs) } }),
-        .str_const, .concat, .str_binding, .fmt_int => unreachable, // str values never reach the i64 path
+        // str methods that yield i64/bool: index_of (i64), starts_with/contains (i32).
+        .str_index_of => |m| return mk(ctx.a, .i64, .{ .str_index_of = .{ .str = try lowerStrExpr(ctx, m.str), .byte = try lowerExpr(ctx, m.byte) } }),
+        .str_starts_with => |m| return mk(ctx.a, .i32, .{ .str_starts_with = .{ .str = try lowerStrExpr(ctx, m.str), .prefix = try lowerStrExpr(ctx, m.prefix) } }),
+        .str_contains => |m| return mk(ctx.a, .i32, .{ .str_contains = .{ .str = try lowerStrExpr(ctx, m.str), .sub = try lowerStrExpr(ctx, m.sub) } }),
+        .str_const, .concat, .str_binding, .fmt_int, .str_slice => unreachable, // str values never reach the i64 path
     }
 }
 
