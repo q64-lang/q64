@@ -49,13 +49,14 @@
      PINNED top-left (fixed, always in the visible viewport) so iOS never
      auto-scrolls the page to "reveal" the focused input — WE own the field's
      on-screen position via our scroll. 1px so it can't be seen or interacted. */
-  /* Made INVISIBLE via transparent colors (not opacity:0) and a real (small)
-     size with interaction left on — iPhone Safari blurs a 0-opacity / 1px /
-     pointer-events:none focused input shortly after the keyboard opens, which
-     was dismissing our keyboard. Transparent + tiny keeps it unseen but a valid
-     focus target. font-size:16px avoids iOS zoom-on-focus. */
+  /* Invisible (transparent colors, not opacity:0) but a REAL, on-screen focus
+     target POSITIONED OVER THE FIELD by JS (positionKbd). iPhone Safari dismisses
+     the keyboard if the focused input isn't where the interaction is; pinning it
+     far away (top-left) made iOS bail once the keyboard settled. pointer-events:
+     none so taps still reach the canvas (we hit-test + place the caret). The
+     fixed top/left here are just a fallback before positionKbd runs. */
   #kbd, #kbdm { position: fixed; top: 0; left: 0; width: 12px; height: 18px;
-    border: 0; padding: 0; margin: 0; resize: none; outline: none;
+    border: 0; padding: 0; margin: 0; resize: none; outline: none; pointer-events: none;
     -webkit-appearance: none; appearance: none;
     background: transparent; color: transparent; caret-color: transparent; font-size: 16px; }
   /* Bring-up status line (host/wasm/WebGPU). Commented out — not user-facing.
