@@ -2401,7 +2401,10 @@ const pod_pack_script =
     \\STAGE="$(mktemp -d)"
     \\mkdir -p "$(dirname "$OUT")"
     \\cd "$PROJECT"
-    \\cp qubepod.jsonc "$STAGE/qubepod.jsonc"
+    \\# Strip the CLI-only `build` field from the packed manifest — it is a
+    \\# deploy-time hook (run above), not part of the deployed artifact, and older
+    \\# server schemas reject unknown keys. Drops a single-line "build": … entry.
+    \\grep -v '^[[:space:]]*"build"[[:space:]]*:' qubepod.jsonc > "$STAGE/qubepod.jsonc" || cp qubepod.jsonc "$STAGE/qubepod.jsonc"
     \\for WASM in "$@"; do
     \\  mkdir -p "$STAGE/$(dirname "$WASM")"
     \\  cp "$WASM" "$STAGE/$WASM"
@@ -2421,14 +2424,16 @@ fn podDeployHelp(io: std.Io) !void {
     try writeStdout(io,
         \\usage: qube pod deploy [flags]
         \\
-        \\Pack the QubePod bundle (qubepod.jsonc + the component wasm + the asset
-        \\tree named by assets.directory) into target/deploy/<name>.zip and upload
-        \\it to qubepods. Run from the directory holding qubepod.jsonc.
+        \\If the manifest has a `build` command, run it first (cwd = manifest dir),
+        \\then pack the QubePod bundle (qubepod.jsonc + the component wasm + the
+        \\asset tree named by assets.directory) into target/deploy/<name>.zip and
+        \\upload it to qubepods. Run from the directory holding qubepod.jsonc.
         \\
         \\Flags:
         \\  --env <name>     Target environment (default: production).
         \\  --url <origin>   API origin (default: https://api-stage.qubepods.com).
         \\  --token <jwt>    Bearer token (or set QUBEPODS_TOKEN).
+        \\  --no-build       Skip the manifest `build` command; pack on-disk bytes.
         \\
     );
 }
@@ -2442,6 +2447,7 @@ fn cmdPodDeploy(
     var api_url: []const u8 = default_pods_api;
     var environment_name: []const u8 = "production";
     var token_flag: ?[]const u8 = null;
+    var skip_build = false;
     while (args_it.next()) |a| {
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             try podDeployHelp(io);
@@ -2452,6 +2458,8 @@ fn cmdPodDeploy(
             environment_name = try flagValue(io, args_it, "--env");
         } else if (std.mem.eql(u8, a, "--token")) {
             token_flag = try flagValue(io, args_it, "--token");
+        } else if (std.mem.eql(u8, a, "--no-build")) {
+            skip_build = true;
         } else {
             try printStderr(io, "qube pod deploy: unknown flag: {s}\n", .{a});
             std.process.exit(@intFromEnum(ExitCode.usage));
@@ -2475,6 +2483,26 @@ fn cmdPodDeploy(
         try writeStderr(io, "qube pod deploy: manifest has no \"name\" field\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
+
+    // Optional `build` command: run it (cwd = manifest dir) BEFORE packing, so the
+    // bundle ships freshly-compiled wasm/assets rather than stale on-disk bytes.
+    // String form only for now (run via `sh -c`); an array form (argv) is a
+    // follow-up. `--no-build` skips it.
+    if (!skip_build) {
+        if (extractStringField(raw, "\"build\"")) |build_cmd| {
+            try printStdout(io, "qube pod deploy: build: {s}\n", .{build_cmd});
+            // cwd is already the manifest dir (we read qubepod.jsonc from cwd).
+            const argv = [_][]const u8{ "sh", "-c", build_cmd };
+            const term = spawnInherit(io, &argv) catch |err| {
+                try printStderr(io, "qube pod deploy: cannot run build: {s}\n", .{@errorName(err)});
+                std.process.exit(@intFromEnum(ExitCode.internal));
+            };
+            if (termCode(term) != 0) {
+                try writeStderr(io, "qube pod deploy: build command failed\n");
+                std.process.exit(@intFromEnum(ExitCode.internal));
+            }
+        }
+    }
 
     // Component wasm path(s): a `variants` map ships one per address space
     // (wasm32 / wasm64); a legacy manifest has a single `component.wasm`.
