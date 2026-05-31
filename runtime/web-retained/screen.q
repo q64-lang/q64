@@ -236,15 +236,16 @@ fn main {
   qview.set_attr(322, 17, stackVal)
   qview.on(322, 0, 322)
 
-  // Translucent material top bar (90), created LAST so it overlays nothing but
-  // the panel's top edge — showing the platform material. surface=3 materialThin.
+  // Title bar (90): now scrolls with the content, so it's an OPAQUE solid header
+  // (surface=1) rather than the translucent material — there's nothing passing
+  // behind it to frost anymore. (Translucent material is for pinned/overlay chrome.)
   qview.create(90, 0, 0)
   qview.set_attr(90, 0, 0)
   qview.set_attr(90, 1, 0)
   qview.set_attr(90, 2, 412)
   qview.set_attr(90, 3, 56)
   qview.set_attr(90, 4, 0)
-  qview.set_attr(90, 20, 3)
+  qview.set_attr(90, 20, 1)
   // Bar title (91).
   qview.create(91, 4, 0)
   qview.set_attr(91, 0, 16)
