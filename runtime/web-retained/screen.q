@@ -191,8 +191,10 @@ pub fn on_52(node: i64, event: i64) {
   qview.set_attr(52, 13, 1)
   qview.present()
 }
-pub fn on_60(node: i64, event: i64) {
-  sliderVal = (sliderVal + 10) % 110
+// Slider: the host passes the value computed from the touch/drag position as
+// `value` (the event payload). Set state to it; progress (70) mirrors it.
+pub fn on_60(node: i64, event: i64, value: i64) {
+  sliderVal = value
   qview.set_attr(60, 17, sliderVal)
   qview.set_attr(70, 17, sliderVal)
   qview.present()

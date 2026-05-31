@@ -169,7 +169,7 @@ function hitTest(px, py) {
   return found;
 }
 
-function dispatch(node, event) {
+function dispatch(node, event, payload = 0) {
   const handler = node.handlers.get(event);
   if (handler === undefined) return;
   // Stage-1 dispatch (spec/qview-protocol.md §Events). The wasm handler reads
@@ -177,10 +177,12 @@ function dispatch(node, event) {
   //   1. per-handler export `on_<id>` (the handler id from qview.on) — branchless,
   //      one export per wired control; what the compiler emits cleanly today.
   //   2. single dispatcher `on_event(node, event)` — fallback when no on_<id>.
-  // Both take (node, event) i64 args so a handler can still tell what fired.
+  // All take (node, event, payload) i64 args: `payload` is a widget-computed
+  // value (e.g. a slider's value from the touch position) — the event-payload
+  // shape from the spec. Handlers that ignore it just take fewer params.
   const perHandler = instance.exports[`on_${handler}`];
   const fn = typeof perHandler === 'function' ? perHandler : instance.exports.on_event;
-  if (typeof fn === 'function') fn(BigInt(node.id), BigInt(event));
+  if (typeof fn === 'function') fn(BigInt(node.id), BigInt(event), BigInt(Math.trunc(payload)));
   else log(`wasm exports no on_${handler} or on_event`);
 }
 
@@ -199,14 +201,47 @@ async function main() {
 
   instance.exports._start();   // builds the retained tree + first present()
 
+  // A widget may expose value(node, px, py, r) -> i64 to turn a touch position
+  // into a payload (e.g. a slider's value). If it does, the control is also
+  // DRAGGABLE: we track the pointer and re-dispatch as it moves, so the thumb
+  // follows the finger (EVENT.input during drag, EVENT.change implied on press).
+  let dragNode = null;
+
+  const localXY = (ev) => { const r = canvas.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
+
   canvas.addEventListener('pointerdown', (ev) => {
-    const r = canvas.getBoundingClientRect();
-    const hit = hitTest(ev.clientX - r.left, ev.clientY - r.top);
+    const [px, py] = localXY(ev);
+    const hit = hitTest(px, py);
     if (!hit) return;
+    const w = widgetFor(hit.kind);
+    if (w && typeof w.value === 'function') {
+      // Ranged control: set value to where you touched (down = jump-to), and arm
+      // dragging so the thumb tracks the finger.
+      dragNode = hit;
+      try { canvas.setPointerCapture(ev.pointerId); } catch {}
+      dispatch(hit, EVENT.input, w.value(hit, px, py, renderCtx));
+      return;
+    }
     pressedId = hit.id; render();                       // immediate pressed-state flash
     dispatch(hit, EVENT.press);                         // wasm mutates + presents
     setTimeout(() => { pressedId = null; render(); }, 120);
   });
+
+  canvas.addEventListener('pointermove', (ev) => {
+    if (!dragNode) return;
+    const [px, py] = localXY(ev);
+    const w = widgetFor(dragNode.kind);
+    dispatch(dragNode, EVENT.input, w.value(dragNode, px, py, renderCtx));
+  });
+
+  const endDrag = (ev) => {
+    if (!dragNode) return;
+    try { canvas.releasePointerCapture(ev.pointerId); } catch {}
+    dragNode = null;
+  };
+  canvas.addEventListener('pointerup', endDrag);
+  canvas.addEventListener('pointercancel', endDrag);
+
   window.addEventListener('resize', () => { resize(); render(); });
 }
 main();
