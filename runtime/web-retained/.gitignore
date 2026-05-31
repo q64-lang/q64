@@ -3,3 +3,4 @@ version.js
 # soft-renderer deps + output (dev tool; not shipped)
 node_modules/
 *.png
+bun.lock
