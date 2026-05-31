@@ -495,6 +495,11 @@ async function main() {
     if (!openContextMenu(px, py)) render();
   });
 
-  window.addEventListener('resize', () => { resize(); render(); });
+  // Re-fit on resize AND orientation change. iOS fires orientationchange before
+  // the viewport settles, so re-fit again on the next frame; reset scroll so the
+  // (now differently-tall) content isn't stuck past its new end.
+  const refit = () => { resize(); scrollY = Math.min(scrollY, maxScroll()); render(); };
+  window.addEventListener('resize', refit);
+  window.addEventListener('orientationchange', () => { refit(); requestAnimationFrame(refit); });
 }
 main();
