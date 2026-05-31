@@ -51,6 +51,19 @@ export function measure(scene, node, r) {
     return { w: mw ?? (natW + pad * 2), h: mh ?? (natH + pad * 2) };
   }
 
+  // A group auto-sizes to wrap its children (heading + content), so the panel
+  // always contains them regardless of text-metric differences between renderers.
+  // Its children carry their own offsets (heading inset); bound their extents.
+  if (node.kind === KIND.group && mh === null) {
+    let bottom = 0;
+    for (const k of node.children.map((id) => scene.get(id)).filter(Boolean)) {
+      const ks = measure(scene, k, r);
+      const oy = has(k, ATTR.y) ? attr(k, ATTR.y, 0) : 0;
+      bottom = Math.max(bottom, oy + ks.h);
+    }
+    mh = bottom + 14;            // bottom padding to match the content inset
+  }
+
   // A widget may declare its natural size.
   if ((mw === null || mh === null) && w && w.measure) {
     const nat = w.measure(node, r) || {};
