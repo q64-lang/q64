@@ -329,25 +329,47 @@ function dispatch(node, event, payload = 0) {
 // (their GPU), the server only stores bytes. We render a fresh frame, grab the
 // canvas as a PNG blob, and POST it to the api's /api/snap with the deploy's
 // snap:create token; the api stores it in R2 and returns a public URL.
+let lastSnapUrl = '';
 function wireSnapButton() {
   const btn = document.getElementById('snap');
+  const copyBtn = document.getElementById('copy');
   if (!btn) return;
-  if (!SNAP.api || !SNAP.token) { btn.disabled = true; btn.title = 'snap not configured'; return; }
+  if (!SNAP.api || !SNAP.token) { btn.disabled = true; btn.title = 'snap not configured'; if (copyBtn) copyBtn.disabled = true; return; }
   btn.addEventListener('click', async () => {
     btn.disabled = true; const label = btn.textContent; btn.textContent = '…';
     try {
       const url = await captureAndUpload();
+      lastSnapUrl = url;
+      // Auto-copy the URL to the clipboard so it's ready to paste immediately
+      // (the click is a user gesture, so clipboard write is permitted).
+      let copied = false;
+      try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(url); copied = true; } } catch {}
       btn.textContent = '✓';
-      log('snap uploaded: ' + url);
-      // Drop a tappable link in the log so it can be opened/copied.
+      if (copyBtn) copyBtn.disabled = false;
       const el = document.getElementById('log');
-      if (el) { el.textContent = 'snap: '; const a = document.createElement('a');
+      if (el) { el.textContent = copied ? 'snap (copied): ' : 'snap: '; const a = document.createElement('a');
         a.href = url; a.textContent = url; a.target = '_blank'; a.style.color = '#5fd4ff'; el.appendChild(a); }
     } catch (e) {
       btn.textContent = '✗'; log('snap failed: ' + (e?.message || e));
     } finally {
       setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 1500);
     }
+  });
+  // Copy: put the last snap URL on the clipboard (fast paste). Falls back to a
+  // hidden textarea+execCommand if the async clipboard API is unavailable.
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    if (!lastSnapUrl) return;
+    const label = copyBtn.textContent;
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(lastSnapUrl);
+      else {
+        const ta = document.createElement('textarea'); ta.value = lastSnapUrl;
+        ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta);
+        ta.focus(); ta.select(); document.execCommand('copy'); ta.remove();
+      }
+      copyBtn.textContent = '✓';
+    } catch { copyBtn.textContent = '✗'; }
+    setTimeout(() => { copyBtn.textContent = label; }, 1200);
   });
 }
 
