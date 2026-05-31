@@ -291,4 +291,7 @@ pub const Expr = union(enum) {
     /// bounds check today — out-of-range reads other memory (caller guards with
     /// `s.len`). `str` is str-valued, `idx` is i64.
     str_index: struct { str: *Expr, idx: *Expr },
+    /// Byte-wise equality of two `str` values (`a == b`) as a bool (i32 0/1).
+    /// `!=` is this wrapped in `un{.not}`. Lowers to a `__str_eq` helper call.
+    str_eq: struct { lhs: *Expr, rhs: *Expr },
 };

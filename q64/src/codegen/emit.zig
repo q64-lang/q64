@@ -640,6 +640,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // the scope-arena bump global (`sp`).
     var needs_fmt = false;
     var needs_arena = false;
+    var needs_str_eq = false;
     for (m.funcs) |f| {
         const inst = switch (f.body) {
             .structured => |x| x,
@@ -649,6 +650,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var sc = Scratch{};
         scanScratch(inst, &sc);
         if (sc.has_concat) needs_arena = true;
+        if (sc.has_str_eq) needs_str_eq = true;
     }
     if (needs_fmt) needs_arena = true;
     if (needs_arena) {
@@ -663,6 +665,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         _ = c.BinaryenAddGlobal(module, "sp", ptr_type, true, sp_init);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
+    if (needs_str_eq) try emitStrEq(module, allocator, i32_type, ptr_type, mem64);
 
     // Host-face imports (e.g. `qview.text`): declare one wasm import per distinct
     // host_call name. All args are i64 (valid on wasm32); the import returns void.
@@ -866,6 +869,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .global_set => |gs| bodyHasOut(gs.value, want_int),
         .str_len => |s| bodyHasOut(s, want_int),
         .str_index => |si| bodyHasOut(si.str, want_int) or bodyHasOut(si.idx, want_int),
+        .str_eq => |se| bodyHasOut(se.lhs, want_int) or bodyHasOut(se.rhs, want_int),
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -916,7 +920,7 @@ fn instUsesEnvOut(inst: *const ir.mir.Inst) bool {
     return false;
 }
 
-const Scratch = struct { host_out: bool = false, has_concat: bool = false, max_tuples: u32 = 0 };
+const Scratch = struct { host_out: bool = false, has_concat: bool = false, max_tuples: u32 = 0, has_str_eq: bool = false };
 
 fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
     switch (inst.op) {
@@ -969,6 +973,11 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         .str_index => |si| {
             scanScratch(si.str, s);
             scanScratch(si.idx, s);
+        },
+        .str_eq => |se| {
+            s.has_str_eq = true;
+            scanScratch(se.lhs, s);
+            scanScratch(se.rhs, s);
         },
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
@@ -1155,6 +1164,15 @@ const Lowerer = struct {
                 const addr = self.ptrAdd(base, idxp);
                 const byte = c.BinaryenLoad(module, 1, false, 0, 1, self.i32_type, addr, "0");
                 return c.BinaryenUnary(module, c.BinaryenExtendUInt32(), byte);
+            },
+            .str_eq => |se| {
+                // __str_eq(pa, la, pb, lb) -> i32 (0/1). Each str expands to its
+                // (ptr, len) operands, exactly like a call/host-call str arg.
+                var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer operands.deinit(self.allocator);
+                try self.strOperands(se.lhs, &operands);
+                try self.strOperands(se.rhs, &operands);
+                return c.BinaryenCall(module, "__str_eq", operands.items.ptr, @intCast(operands.items.len), self.i32_type);
             },
             .if_ => |iff| {
                 const cond = try self.inst(iff.cond);
@@ -1615,6 +1633,60 @@ fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
     const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), pair_type);
     var var_types = [_]c.BinaryenType{ i64_type, ptr_type, ptr_type, i32_type };
     _ = c.BinaryenAddFunction(module, "__fmt_i64", i64_type, pair_type, @ptrCast(&var_types), var_types.len, body);
+}
+
+/// Emit `__str_eq(pa, la, pb, lb) -> i32`: byte-wise equality of two strings.
+/// Params are address-width (ptr, len, ptr, len); the result is i32 0/1. Lengths
+/// differ → 0; otherwise compare bytes until the end → 1, or a mismatch → 0.
+fn emitStrEq(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i32_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
+    const none = c.BinaryenTypeNone();
+    const PA: c.BinaryenIndex = 0;
+    const LA: c.BinaryenIndex = 1;
+    const PB: c.BinaryenIndex = 2;
+    const LB: c.BinaryenIndex = 3;
+    const I: c.BinaryenIndex = 4; // loop cursor (address-width)
+    const add_p = if (mem64) c.BinaryenAddInt64() else c.BinaryenAddInt32();
+    const ne_p = if (mem64) c.BinaryenNeInt64() else c.BinaryenNeInt32();
+    const geu_p = if (mem64) c.BinaryenGeUInt64() else c.BinaryenGeUInt32();
+    const k = struct {
+        fn get(m: c.BinaryenModuleRef, idx: c.BinaryenIndex, t: c.BinaryenType) c.BinaryenExpressionRef {
+            return c.BinaryenLocalGet(m, idx, t);
+        }
+        fn ptrc(m: c.BinaryenModuleRef, m64: bool, v: i64) c.BinaryenExpressionRef {
+            return if (m64) c.BinaryenConst(m, c.BinaryenLiteralInt64(v)) else c.BinaryenConst(m, c.BinaryenLiteralInt32(@intCast(v)));
+        }
+        fn i32c(m: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+            return c.BinaryenConst(m, c.BinaryenLiteralInt32(v));
+        }
+    };
+
+    var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer stmts.deinit(allocator);
+
+    // if la != lb: return 0
+    try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, ne_p, k.get(module, LA, ptr_type), k.get(module, LB, ptr_type)), c.BinaryenReturn(module, k.i32c(module, 0)), null));
+    // I = 0
+    try stmts.append(allocator, c.BinaryenLocalSet(module, I, k.ptrc(module, mem64, 0)));
+
+    // loop $streq { if I>=la return 1; if mem[pa+I]!=mem[pb+I] return 0; I++; br }
+    var lp: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer lp.deinit(allocator);
+    try lp.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, geu_p, k.get(module, I, ptr_type), k.get(module, LA, ptr_type)), c.BinaryenReturn(module, k.i32c(module, 1)), null));
+    const byte_a = c.BinaryenLoad(module, 1, false, 0, 1, i32_type, c.BinaryenBinary(module, add_p, k.get(module, PA, ptr_type), k.get(module, I, ptr_type)), "0");
+    const byte_b = c.BinaryenLoad(module, 1, false, 0, 1, i32_type, c.BinaryenBinary(module, add_p, k.get(module, PB, ptr_type), k.get(module, I, ptr_type)), "0");
+    try lp.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, c.BinaryenNeInt32(), byte_a, byte_b), c.BinaryenReturn(module, k.i32c(module, 0)), null));
+    try lp.append(allocator, c.BinaryenLocalSet(module, I, c.BinaryenBinary(module, add_p, k.get(module, I, ptr_type), k.ptrc(module, mem64, 1))));
+    try lp.append(allocator, c.BinaryenBreak(module, "streq", null, null));
+    const lp_block = c.BinaryenBlock(module, null, @ptrCast(lp.items.ptr), @intCast(lp.items.len), none);
+    try stmts.append(allocator, c.BinaryenLoop(module, "streq", lp_block));
+    // The loop only exits via `return`; this satisfies the i32 result type.
+    try stmts.append(allocator, c.BinaryenUnreachable(module));
+
+    const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), i32_type);
+    var params = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type, ptr_type };
+    const ptype = c.BinaryenTypeCreate(&params, params.len);
+    var var_types = [_]c.BinaryenType{ptr_type}; // I
+    _ = c.BinaryenAddFunction(module, "__str_eq", ptype, i32_type, @ptrCast(&var_types), var_types.len, body);
 }
 
 // =====================================================================

@@ -178,6 +178,9 @@ pub const Op = union(enum) {
     /// str-typed inst (its ptr component is the base); `idx` is an i64 offset.
     /// Lowers to an `i32.load8_u` at `ptr + idx`, zero-extended to i64.
     str_index: struct { str: *Inst, idx: *Inst },
+    /// Byte-wise equality of two str values as i32 (0/1). Both are str-typed
+    /// insts; lowers to a `__str_eq(pa, la, pb, lb)` helper call.
+    str_eq: struct { lhs: *Inst, rhs: *Inst },
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the

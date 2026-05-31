@@ -352,6 +352,8 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
         // `s[i]` — str operand to (ptr, len), idx to i64; backend loads the byte.
         .str_index => |si| return mk(ctx.a, .i64, .{ .str_index = .{ .str = try lowerStrExpr(ctx, si.str), .idx = try lowerExpr(ctx, si.idx) } }),
+        // `a == b` on strs — both to (ptr, len); backend calls __str_eq -> i32.
+        .str_eq => |se| return mk(ctx.a, .i32, .{ .str_eq = .{ .lhs = try lowerStrExpr(ctx, se.lhs), .rhs = try lowerStrExpr(ctx, se.rhs) } }),
         .str_const, .concat, .str_binding, .fmt_int => unreachable, // str values never reach the i64 path
     }
 }

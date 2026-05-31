@@ -162,6 +162,10 @@ fn collectExpr(
             try collectExpr(a, si.str, d, e);
             try collectExpr(a, si.idx, d, e);
         },
+        .str_eq => |se| {
+            try collectExpr(a, se.lhs, d, e);
+            try collectExpr(a, se.rhs, d, e);
+        },
         // Leaves: no calls, no faces.
         .str_const, .int_const, .bool_const, .local, .global_get, .str_binding => {},
     }

@@ -1163,6 +1163,24 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
         },
         .bin => |bx| {
             const op_tok = bx.op() orelse return error.Unsupported;
+            // String equality: `==`/`!=` on str values compares bytes. Detected
+            // by the LHS building as a str; if it doesn't, fall to the numeric
+            // path. `!=` is `==` wrapped in a logical not.
+            if (binKind(op_tok)) |bk| if (bk == .eq or bk == .ne) {
+                if (buildStrExpr(b, bx.lhs() orelse return error.Unsupported, scope, null)) |lhs_s| {
+                    const rhs_s = try buildStrExpr(b, bx.rhs() orelse return error.Unsupported, scope, null);
+                    const eq = try b.a.create(hir.Expr);
+                    eq.* = .{ .str_eq = .{ .lhs = lhs_s, .rhs = rhs_s } };
+                    if (bk == .ne) {
+                        out.* = .{ .un = .{ .kind = .not, .operand = eq } };
+                        return out;
+                    }
+                    return eq;
+                } else |e| switch (e) {
+                    error.Unsupported => {}, // LHS isn't a str — numeric compare
+                    else => return e,
+                }
+            };
             const lhs = try buildIntExpr(b, bx.lhs() orelse return error.Unsupported, scope);
             const rhs = try buildIntExpr(b, bx.rhs() orelse return error.Unsupported, scope);
             if (logicalKind(op_tok)) |lk| {
