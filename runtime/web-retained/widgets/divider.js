@@ -12,4 +12,5 @@ register(KIND.divider, {
     const col = r.color(node, ATTR.fg, r.theme.border);
     r.drawPrim(r.pass, x, y, w, t, col, { radius: t / 2 });
   },
+  measure(node, r) { return { w: 200, h: Math.max(1, r.attr(node, 3, 1)) }; },
 });

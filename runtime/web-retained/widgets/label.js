@@ -11,4 +11,5 @@ register(KIND.label, {
     const fg = r.color(node, ATTR.fg, r.theme.fg);
     r.drawPrim(r.pass, x, y, lbl.w, lbl.h, fg, { texView: lbl.view });
   },
+  measure(node, r) { const l = r.textFor(node); return l ? { w: l.w, h: l.h } : { w: 0, h: 0 }; },
 });

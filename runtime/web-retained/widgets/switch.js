@@ -45,4 +45,5 @@ register(KIND.switch, {
     const { x, y, w, h } = geom(node, r);
     return px >= x && px <= x + w && py >= y && py <= y + h;
   },
+  measure(node, r) { return { w: 51, h: 31 }; },
 });

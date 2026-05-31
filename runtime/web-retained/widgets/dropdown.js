@@ -55,4 +55,5 @@ register(KIND.dropdown, {
     }));
     return { anchor: { x, y, w, h }, items, width: w };
   },
+  measure(node, r) { return { w: 220, h: 44 }; },
 });

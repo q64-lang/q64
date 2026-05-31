@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.2';
+export const PROTOCOL_VERSION = '1.3';
 
 // Node kinds (spec §"Node kinds"). 13 = text_input is RESERVED (deferred).
 export const KIND = {
@@ -25,6 +25,9 @@ export const ATTR = {
   // instead of a literal AARRGGBB `fill`. Lets a producer say "this is a frosted
   // bar" and get the iOS/Material/desktop material automatically. Values = SURFACE.
   surface: 20,
+  // align (21): cross-axis alignment of a stack's children (a row aligns on y, a
+  // column on x). Values = ALIGN. pad (22): inner padding of a stack/group.
+  align: 21, pad: 22,
 };
 export const ATTR_NAME = Object.fromEntries(Object.entries(ATTR).map(([k, v]) => [v, k]));
 
@@ -32,6 +35,11 @@ export const ATTR_NAME = Object.fromEntries(Object.entries(ATTR).map(([k, v]) =>
 // material today; true backdrop blur is a deferred renderer pass.
 export const SURFACE = {
   none: 0, surface: 1, material: 2, materialThin: 3, scrim: 4,
+};
+
+// Cross-axis alignment for stack children (ATTR.align). SwiftUI-style.
+export const ALIGN = {
+  start: 0, center: 1, end: 2, stretch: 3,
 };
 
 // Events (spec §"Events"). 4..6 reserved for text_input.

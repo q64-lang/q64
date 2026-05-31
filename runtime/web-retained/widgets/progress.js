@@ -29,4 +29,5 @@ register(KIND.progress, {
       r.drawPrim(r.pass, segX, y, segW, h, r.theme.accent, { radius });
     }
   },
+  measure(node, r) { return { w: 200, h: 10 }; },
 });

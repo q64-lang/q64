@@ -16,6 +16,7 @@ import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, DPR } from './gpu.
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
 import { Scene } from './scene.js';
+import { computeLayout } from './arrange.js';
 import { resolvePlatform } from './platform.js';
 import { themeFor } from './theme.js';
 
@@ -125,9 +126,19 @@ function ops() {
 const SURFACE_KEY = { [SURFACE.none]: 'none', [SURFACE.surface]: 'surface', [SURFACE.material]: 'material', [SURFACE.materialThin]: 'materialThin', [SURFACE.scrim]: 'scrim' };
 
 // ---- render: walk the retained tree, dispatch each node to its widget --------
+// `layoutMap` (id -> {x,y,w,h}) holds resolved geometry from the arrange pass
+// (stacks own their children's coords). When a node has a layout entry, r.attr
+// returns its laid-out x/y/w/h transparently — widgets read geometry the same
+// way whether they're absolute or inside an HStack/VStack.
+let layoutMap = new Map();
+const GEOM = { [ATTR.x]: 'x', [ATTR.y]: 'y', [ATTR.w]: 'w', [ATTR.h]: 'h' };
 const renderCtx = {
   pass: null, drawPrim, sdfText: sdfTexture, theme: THEME, platform: PLATFORM,
-  attr: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : Number(v); },
+  attr: (node, a, dflt) => {
+    const g = GEOM[a]; const lay = g && layoutMap.get(node.id);
+    if (lay) return lay[g];
+    const v = node.attrs.get(a); return v === undefined ? dflt : Number(v);
+  },
   color: (node, a, dflt) => { const v = node.attrs.get(a); return v === undefined ? dflt : unpackColor(v); },
   // Resolve a node's fill, honoring a semantic ATTR.surface role (theme-resolved
   // translucent material) over a literal ATTR.fill over the given default.
@@ -185,6 +196,10 @@ function glyphForCatalog(textId) {
 }
 
 function render() {
+  // Resolve geometry first: the arrange pass positions stack children (HStack/
+  // VStack); absolute nodes keep their own x/y. Widgets then read laid-out coords
+  // via r.attr transparently. (Recomputed each frame; dirty-tracking is a follow-up.)
+  layoutMap = computeLayout(scene, renderCtx);
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
   walk(ROOT);

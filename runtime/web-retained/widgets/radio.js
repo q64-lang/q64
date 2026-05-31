@@ -42,4 +42,5 @@ register(KIND.radio, {
     const { x, y, w, h } = box(node, r);
     return px >= x && px <= x + w && py >= y && py <= y + h;
   },
+  measure(node, r) { return { w: 120, h: 44 }; },
 });

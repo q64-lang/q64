@@ -16,12 +16,14 @@ import { Resvg } from '@resvg/resvg-js';
 import { KIND, ATTR, SURFACE, unpackColor } from './protocol.js';
 import { widgetFor } from './widgets.js';
 import { Scene } from './scene.js';
+import { computeLayout } from './arrange.js';
 import { themeFor } from './theme.js';
 
 const args = process.argv.slice(2);
 const out = args.find((a) => a.endsWith('.png')) || 'gallery.png';
 const opt = (name, dflt) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : dflt; };
 const PLATFORM = opt('platform', 'ios');
+const SCREEN = opt('screen', 'screen.wasm');
 const W = Number(opt('width', 412));
 const H = Number(opt('height', 820));
 const THEME = themeFor(PLATFORM);
@@ -78,9 +80,15 @@ function glyphForNode(node) {
 
 // The render context: same shape as the GPU host's, but drawPrim -> SVG.
 const SURFACE_KEY = { [SURFACE.none]: 'none', [SURFACE.surface]: 'surface', [SURFACE.material]: 'material', [SURFACE.materialThin]: 'materialThin', [SURFACE.scrim]: 'scrim' };
+let layoutMap = new Map();
+const GEOM = { [ATTR.x]: 'x', [ATTR.y]: 'y', [ATTR.w]: 'w', [ATTR.h]: 'h' };
 const r = {
   theme: THEME, platform: PLATFORM, pass: null,
-  attr: (n, a, d) => { const v = n.attrs.get(a); return v === undefined ? d : Number(v); },
+  attr: (n, a, d) => {
+    const g = GEOM[a]; const lay = g && layoutMap.get(n.id);
+    if (lay) return lay[g];
+    const v = n.attrs.get(a); return v === undefined ? d : Number(v);
+  },
   color: (n, a, d) => { const v = n.attrs.get(a); return v === undefined ? d : unpackColor(v); },
   surfaceFill: (n, d) => {
     const role = n.attrs.get(ATTR.surface);
@@ -102,11 +110,12 @@ const r = {
 function patchGlyph(g) { if (g) g.view = g._str; return g; }
 
 // ---- run ---------------------------------------------------------------------
-const bytes = readFileSync(new URL('./screen.wasm', import.meta.url));
+const bytes = readFileSync(new URL('./' + SCREEN, import.meta.url));
 const { instance } = await WebAssembly.instantiate(bytes, ops());
 instance.exports._start();
 
-// Background + walk the tree (same order as the host).
+// Resolve layout (arrange stacks), then walk the tree.
+layoutMap = computeLayout(scene, r);
 svg.length = 0;
 function walk(id) {
   const n = nodes.get(id); if (!n) return;
