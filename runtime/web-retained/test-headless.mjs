@@ -56,11 +56,13 @@ ok(h.nodes.get(90)?.kind === KIND.box, 'material bar node 90 is a box');
 ok(h.nodes.get(90)?.attrs.get(ATTR.surface) === 3, 'bar carries surface=materialThin (3)');
 
 // --- per-handler surgical mutations via the on_<id> exports ---
-const handlerFires = (id, expectSets) => {
+// Handlers take (node, event, payload) i64. payload is the host-computed value
+// (the slider's value from the touch position); others ignore it.
+const handlerFires = (id, expectSets, payload = 0) => {
   const fn = instance.exports[`on_${id}`];
   ok(typeof fn === 'function', `export on_${id} exists`);
   const before = h.opLog.length;
-  fn(BigInt(id), BigInt(EVENT.press));
+  fn(BigInt(id), BigInt(EVENT.press), BigInt(payload));
   const delta = h.opLog.slice(before);
   ok(delta.filter((o) => o[0] === 'create').length === 0, `on_${id}: no re-create (surgical)`);
   ok(delta.filter((o) => o[0] === 'present').length === 1, `on_${id}: one present`);
@@ -76,8 +78,11 @@ handlerFires(40, [40]);   // switch toggles itself
 ok(h.nodes.get(40).attrs.get(ATTR.checked) === 1, 'switch toggled on');
 handlerFires(52, [50, 52]); // radio B selects -> A clears, B sets
 ok(h.nodes.get(50).attrs.get(ATTR.selected) === 0 && h.nodes.get(52).attrs.get(ATTR.selected) === 1, 'radio moved to B');
-handlerFires(60, [60, 70]); // slider advances -> progress mirrors
-ok(h.nodes.get(60).attrs.get(ATTR.value) === 50 && h.nodes.get(70).attrs.get(ATTR.value) === 50, 'slider+progress -> 50');
+// Slider: the value payload becomes the value (NOT +10) — tap-position driven.
+handlerFires(60, [60, 70], 25); // payload 25 -> value 25
+ok(h.nodes.get(60).attrs.get(ATTR.value) === 25 && h.nodes.get(70).attrs.get(ATTR.value) === 25, 'slider+progress set to payload 25');
+handlerFires(60, [60, 70], 80); // a second drag position -> 80 (not 35)
+ok(h.nodes.get(60).attrs.get(ATTR.value) === 80, 'slider follows payload to 80 (absolute, not incremental)');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
