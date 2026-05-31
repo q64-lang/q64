@@ -262,6 +262,14 @@ const renderCtx = {
     const el = fieldEl(node);
     return el && el.selectionStart != null ? el.selectionStart : null;
   },
+  // The normalized selection range {start, end} of the focused field, or null.
+  // Collapsed (start === end) means just a caret, no highlight.
+  selRange: (node) => {
+    if (node.id !== focusedId) return null;
+    const el = fieldEl(node);
+    if (!el || el.selectionStart == null || el.selectionEnd == null) return null;
+    return { start: Math.min(el.selectionStart, el.selectionEnd), end: Math.max(el.selectionStart, el.selectionEnd) };
+  },
   // Clip subsequent draws to `rect` (CSS px, screen coords) intersected with the
   // current scroll-region clip; call unclip() to restore. Lets a field clip its
   // text so a horizontally-scrolled value doesn't spill past the box.
@@ -664,7 +672,7 @@ async function main() {
   // into a payload (e.g. a slider's value). If it does, the control is also
   // DRAGGABLE: we track the pointer and re-dispatch as it moves, so the thumb
   // follows the finger (EVENT.input during drag, EVENT.change implied on press).
-  let dragNode = null, scrollDrag = null;
+  let dragNode = null, scrollDrag = null, textDrag = null;
 
   const localXY = (ev) => { const r = canvas.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
 
@@ -759,7 +767,13 @@ async function main() {
     // pointerdown on empty space, and scrolling must keep the keyboard open.
     if (hit && isTextField(hit.kind)) {
       ev.preventDefault();
+      const wt = widgetFor(hit.kind);
+      // Focus + place the caret at the tap (the drag anchor); dragging extends
+      // the selection from here.
+      const anchor = wt && wt.caretAt ? wt.caretAt(hit, px, py, renderCtx) : 0;
       focusField(hit, px, py);
+      textDrag = { node: hit, anchor };
+      try { canvas.setPointerCapture(ev.pointerId); } catch {}
       return;
     }
 
@@ -805,6 +819,18 @@ async function main() {
   }, { passive: false });
 
   canvas.addEventListener('pointermove', (ev) => {
+    // Text selection drag: extend the field's selection from the anchor to the
+    // character under the finger.
+    if (textDrag) {
+      ev.preventDefault();
+      const [mx, my] = localXY(ev);
+      const wt = widgetFor(textDrag.node.kind);
+      const idx = wt && wt.caretAt ? wt.caretAt(textDrag.node, mx, my, renderCtx) : textDrag.anchor;
+      const el = fieldEl(textDrag.node);
+      if (el) { try { el.setSelectionRange(Math.min(textDrag.anchor, idx), Math.max(textDrag.anchor, idx)); } catch {} }
+      render();
+      return;
+    }
     // Scroll drag: translate the scene by the finger's vertical delta, tracking
     // velocity (last-frame px delta) so release can launch momentum.
     if (scrollDrag) {
@@ -842,6 +868,11 @@ async function main() {
 
   const endDrag = (ev) => {
     cancelLongPress();                          // a lift before the hold elapsed = a tap, not long-press
+    if (textDrag) {
+      try { canvas.releasePointerCapture(ev.pointerId); } catch {}
+      textDrag = null;                          // selection already set during the move
+      return;
+    }
     if (scrollDrag) {
       try { canvas.releasePointerCapture(ev.pointerId); } catch {}
       const v = scrollDrag.vel || 0;
