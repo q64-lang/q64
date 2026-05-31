@@ -19,6 +19,7 @@ state toggled   = 0
 state choice    = 0
 state sliderVal = 40
 state taps      = 0
+state platform  = 12   // dropdown: catalog id of the selected option (12 = iOS)
 
 fn main {
   // Layout grid: a control column at x=24 and a name-label column at x=150,
@@ -33,10 +34,29 @@ fn main {
   qview.set_attr(2, 4, 18)
   qview.set_attr(2, 5, 1)
 
+  // Platform dropdown at the TOP (80) + name (81). Options are catalog ids
+  // 12..15 = iOS / Android / Windows / Linux. min=base id, max=count, selected
+  // index. The field text_id = 12 + selected, so it shows the chosen platform.
+  // (Popup overlays everything, so the field can sit at the top.)
+  qview.create(81, 4, 0)
+  qview.set_attr(81, 0, 40)
+  qview.set_attr(81, 1, 92)
+  qview.set_attr(81, 9, 9)
+  qview.create(80, 12, 0)
+  qview.set_attr(80, 0, 150)
+  qview.set_attr(80, 1, 84)
+  qview.set_attr(80, 2, 226)
+  qview.set_attr(80, 3, 44)
+  qview.set_attr(80, 15, 12)
+  qview.set_attr(80, 16, 4)
+  qview.set_attr(80, 13, 0)
+  qview.set_attr(80, 9, 12)
+  qview.on(80, 0, 80)
+
   // Label row (10 control, 11 name)
   qview.create(10, 4, 0)
   qview.set_attr(10, 0, 40)
-  qview.set_attr(10, 1, 96)
+  qview.set_attr(10, 1, 150)
   qview.set_attr(10, 9, 1)
 
   // Button (20) -> handler 20, name (21 taps count to its right)
@@ -131,19 +151,7 @@ fn main {
   qview.set_attr(70, 16, 100)
   qview.set_attr(70, 17, sliderVal)
 
-  // Dropdown row: name (81) above the control (80). Value text_id = 12.
-  qview.create(81, 4, 0)
-  qview.set_attr(81, 0, 40)
-  qview.set_attr(81, 1, 488)
-  qview.set_attr(81, 9, 9)
-  qview.create(80, 12, 0)
-  qview.set_attr(80, 0, 40)
-  qview.set_attr(80, 1, 514)
-  qview.set_attr(80, 2, 320)
-  qview.set_attr(80, 3, 40)
-  qview.set_attr(80, 13, 0)
-  qview.set_attr(80, 9, 12)
-  qview.on(80, 0, 80)
+  // (The platform dropdown is at the top — see node 80 above.)
 
   // Translucent material top bar (90), created LAST so it overlays nothing but
   // the panel's top edge — showing the platform material. surface=3 materialThin.
@@ -199,6 +207,12 @@ pub fn on_60(node: i64, event: i64, value: i64) {
   qview.set_attr(70, 17, sliderVal)
   qview.present()
 }
-pub fn on_80(node: i64, event: i64) {
+// Dropdown: the host passes the chosen option's catalog id (12..15) as `value`.
+// Set the field's text_id to it (shows the platform) and selected index to the
+// offset from the base (12). min/max stay the option base/count.
+pub fn on_80(node: i64, event: i64, value: i64) {
+  platform = value
+  qview.set_attr(80, 9, platform)
+  qview.set_attr(80, 13, platform - 12)
   qview.present()
 }
