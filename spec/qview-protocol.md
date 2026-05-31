@@ -158,16 +158,21 @@ node to an exported wasm handler.
 
 **Handler binding.** `handler` is a **handler id** the producer assigns; the host
 calls back into the wasm by invoking the matching **exported function** named by
-convention `on_<handler_id>` (e.g. handler `1` ⇒ export `on_1`). This keeps the
-callback path integer-only and avoids funcrefs crossing the boundary in Stage 1.
-The handler reads/writes `state`, re-emits the changed nodes, and calls
-`present()`. (The POC's single `on_press(id)` export is the degenerate case.)
+convention `on_<handler_id>` (e.g. handler `20` ⇒ export `on_20`), passing
+`(node_id, event)` as `i64` args so a shared handler can still tell what fired.
+This keeps the callback path integer-only and avoids funcrefs crossing the
+boundary in Stage 1. The handler reads/writes `state`, mutates the changed
+nodes via `set_attr`, and calls `present()`. A host MAY fall back to a single
+`on_event(node_id, event)` dispatcher when no `on_<handler_id>` export exists —
+both shapes are supported; the per-handler form is what the q64 compiler emits
+cleanly today (one branchless function per wired control, no in-handler
+branching). This is the shape the gallery (`runtime/web-retained`) uses.
 
-**Event payloads.** Stage 1 handlers are nullary by convention (state lives in
-wasm globals; the host already knows which node fired). Carrying a payload
-(e.g. the new slider value, a key code) is an [open question](#open-questions);
-the likely shape is a host-set wasm global the handler reads, keeping the call
-arg-free.
+**Event payloads.** Stage 1 handlers receive `(node_id, event)` but carry no
+value payload (state lives in wasm globals; the host knows which node fired).
+Carrying a value (e.g. the new slider position, a key code) is an
+[open question](#open-questions); the likely shape is a host-set wasm global the
+handler reads, keeping the arg list fixed.
 
 ## Text in Stage 1
 
@@ -224,8 +229,10 @@ A host applying an op stream — especially an **agent**-produced one — MUST:
 
 - **Event payloads** — host-set wasm global vs widening the handler ABI to carry
   args (slider value, key code, drag delta).
-- **Handler naming** — `on_<id>` exports vs a single dispatcher export
-  `on_event(node_id, event_id)` the host calls (one export, host passes context).
+- **Handler naming** — *(resolved for Stage 1)* the host tries `on_<id>` first,
+  then falls back to a single `on_event(node_id, event)` dispatcher. The
+  per-handler form wins because the compiler emits branchless `on_<id>` functions
+  today (in-handler `if` branching on `node_id` is a later compiler lift).
 - **Node-id allocation for lists/conditionals** — explicit `key:` in the `draw`
   DSL vs positional; the source of stable ids under dynamic children.
 - **Coordinate space** — keep integer px (Stage 1) vs fixed-point sub-pixel for

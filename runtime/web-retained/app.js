@@ -14,7 +14,20 @@ const log = (m) => { const el = document.getElementById('log'); if (el) el.textC
 // Host-owned glyph catalog (Stage-1 text-by-id; no strings cross wasm). A label
 // whose text_id < CATALOG.length shows that string; otherwise the id is rendered
 // as an integer (the POC's `number` path — live counters etc.).
-const CATALOG = ['Taps', 'Tap +1'];
+const CATALOG = [
+  'Widget gallery',  // 0
+  'Label',           // 1
+  'Button',          // 2
+  'Checkbox',        // 3
+  'Switch',          // 4
+  'Radio A',         // 5
+  'Radio B',         // 6
+  'Slider',          // 7
+  'Progress',        // 8
+  'Option one',      // 9
+  'Box',             // 10
+  'Tap +1',          // 11
+];
 
 // ---- the retained tree -------------------------------------------------------
 // id -> { id, kind, parent, attrs:Map<attr,i64>, children:[id], handlers:Map<event,handlerId> }
@@ -133,12 +146,16 @@ function hitTest(px, py) {
 function dispatch(node, event) {
   const handler = node.handlers.get(event);
   if (handler === undefined) return;
-  // Stage-1 dispatcher contract: the wasm exports on_event(node, event); it reads
-  // state, mutates the exact node(s), and calls present(). (handler id is reserved
-  // for future multiplexing; the single on_event export is the v1 shape.)
-  const fn = instance.exports.on_event;
+  // Stage-1 dispatch (spec/qview-protocol.md §Events). The wasm handler reads
+  // state, mutates the exact node(s), and calls present(). Two shapes, in order:
+  //   1. per-handler export `on_<id>` (the handler id from qview.on) — branchless,
+  //      one export per wired control; what the compiler emits cleanly today.
+  //   2. single dispatcher `on_event(node, event)` — fallback when no on_<id>.
+  // Both take (node, event) i64 args so a handler can still tell what fired.
+  const perHandler = instance.exports[`on_${handler}`];
+  const fn = typeof perHandler === 'function' ? perHandler : instance.exports.on_event;
   if (typeof fn === 'function') fn(BigInt(node.id), BigInt(event));
-  else log('wasm exports no on_event(node,event)');
+  else log(`wasm exports no on_${handler} or on_event`);
 }
 
 async function main() {
