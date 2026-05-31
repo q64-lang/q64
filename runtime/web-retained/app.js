@@ -15,6 +15,7 @@ try { ({ BUILD } = await import('./version.js')); } catch {}
 import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, DPR } from './gpu.js';
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
+import { Scene } from './scene.js';
 import { resolvePlatform } from './platform.js';
 import { themeFor } from './theme.js';
 
@@ -67,16 +68,20 @@ const CATALOG = [
   'Paste',           // 21
 ];
 
-// ---- the retained tree -------------------------------------------------------
-// id -> { id, kind, parent, attrs:Map<attr,i64>, children:[id], handlers:Map<event,handlerId> }
-const nodes = new Map();
-const ROOT = 0;
-nodes.set(ROOT, { id: ROOT, kind: -1, parent: -1, attrs: new Map(), children: [], handlers: new Map() });
+// ---- the retained tree (generic, VALIDATED applier) --------------------------
+// Scene owns the node tree + the five ops, schema-validating each before it
+// touches the tree (spec §"Host obligations"). This host is one backend over it;
+// the soft renderer is another. nodes/ROOT alias into the scene so the render +
+// input code below reads unchanged.
+const scene = new Scene({ onReject: (m) => log('drop: ' + m) });
+const nodes = scene.nodes;
+const ROOT = scene.ROOT;
+// Evict glyph caches when the scene removes a node.
+scene.onNodeRemoved = (id) => { glyphCache.delete(id); glyphKey.delete(id); };
 
 let glyphCache = new Map();  // nodeId -> {tex,view,w,h}; rebuilt only when text changes
 let glyphKey = new Map();    // nodeId -> last text string used, to skip rebuilds
 let pressedId = null;
-let pendingMuts = [];        // mutation log for the current frame (diagnostics)
 let instance;
 
 function textStringFor(node) {
@@ -97,49 +102,24 @@ function glyphFor(node) {
   return glyphCache.get(node.id);
 }
 
-// ---- the five ops (the wasm import face) ------------------------------------
+// ---- the wasm import face: the validated Scene ops + a backend present() -----
+// Scene.face wires create/set_attr/remove/on to the validated applier; present()
+// is this backend's frame commit (render + drain the mutation log). A set_attr
+// may change a node's text, so we evict its glyph key around the applier.
 function ops() {
+  const sceneFace = scene.face(() => {
+    render();
+    const m = scene.drainMuts();
+    if (m.length) log('mutate: ' + m.join(', '));
+  });
   return {
     env: { out: () => {} },
     qview: {
-      create: (id, kind, parent) => {
-        id = Number(id); kind = Number(kind); parent = Number(parent);
-        if (nodes.has(id)) { const n = nodes.get(id); if (n.kind !== kind) log(`proto error: create #${id} kind conflict`); return; }
-        const p = nodes.get(parent) ?? nodes.get(ROOT);
-        const node = { id, kind, parent: p.id, attrs: new Map(), children: [], handlers: new Map() };
-        nodes.set(id, node); p.children.push(id);
-        pendingMuts.push(`create #${id} ${kindName(kind)}`);
-      },
-      set_attr: (id, attr, value) => {
-        const n = nodes.get(Number(id)); if (!n) { log(`proto error: set_attr on unknown #${id}`); return; }
-        n.attrs.set(Number(attr), value);            // keep raw i64 (BigInt); readers Number()/unpack
-        pendingMuts.push(`set_attr #${Number(id)} ${attrName(attr)}`);
-        glyphKey.delete(Number(id));                 // text may have changed; force re-eval on draw
-      },
-      remove: (id) => {
-        id = Number(id); const n = nodes.get(id); if (!n) return;
-        removeSubtree(id);
-        pendingMuts.push(`remove #${id}`);
-      },
-      on: (id, event, handler) => {
-        const n = nodes.get(Number(id)); if (!n) return;
-        if (Number(handler) === 0) n.handlers.delete(Number(event));
-        else n.handlers.set(Number(event), Number(handler));
-      },
-      present: () => { render(); if (pendingMuts.length) { log('mutate: ' + pendingMuts.join(', ')); pendingMuts = []; } },
+      ...sceneFace,
+      set_attr: (id, attr, value) => { glyphKey.delete(Number(id)); sceneFace.set_attr(id, attr, value); },
     },
   };
 }
-
-function removeSubtree(id) {
-  const n = nodes.get(id); if (!n) return;
-  for (const c of [...n.children]) removeSubtree(c);
-  const p = nodes.get(n.parent); if (p) p.children = p.children.filter((c) => c !== id);
-  nodes.delete(id); glyphCache.delete(id); glyphKey.delete(id);
-}
-
-const kindName = (k) => Object.keys(KIND).find((n) => KIND[n] === k) ?? `kind${k}`;
-const attrName = (a) => Object.keys(ATTR).find((n) => ATTR[n] === a) ?? `attr${a}`;
 
 // ATTR.surface role tag -> theme token key (the translucent material fills).
 const SURFACE_KEY = { [SURFACE.none]: 'none', [SURFACE.surface]: 'surface', [SURFACE.material]: 'material', [SURFACE.materialThin]: 'materialThin', [SURFACE.scrim]: 'scrim' };

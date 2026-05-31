@@ -15,6 +15,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { Resvg } from '@resvg/resvg-js';
 import { KIND, ATTR, SURFACE, unpackColor } from './protocol.js';
 import { widgetFor } from './widgets.js';
+import { Scene } from './scene.js';
 import { themeFor } from './theme.js';
 
 const args = process.argv.slice(2);
@@ -34,16 +35,13 @@ const CATALOG = [
 ];
 
 // ---- build the retained tree from the real wasm -----------------------------
-const nodes = new Map();
-nodes.set(0, { id: 0, kind: -1, parent: -1, attrs: new Map(), children: [], handlers: new Map() });
+// Same validated Scene applier the WebGPU host uses — one generic op layer, two
+// backends. A reject here means the producer emitted a malformed op.
+const scene = new Scene({ onReject: (m) => process.stderr.write(`softrender drop: ${m}\n`) });
+const nodes = scene.nodes;
 let openDropdownId = null;
 function ops() {
-  return { env: { out: () => {} }, qview: {
-    create: (id, k, p) => { id = Number(id); const n = { id, kind: Number(k), parent: Number(p), attrs: new Map(), children: [], handlers: new Map() }; nodes.set(id, n); (nodes.get(Number(p)) ?? nodes.get(0)).children.push(id); },
-    set_attr: (id, a, v) => nodes.get(Number(id))?.attrs.set(Number(a), v),
-    remove: () => {}, on: (id, e, h) => nodes.get(Number(id))?.handlers.set(Number(e), Number(h)),
-    present: () => {},
-  } };
+  return { env: { out: () => {} }, qview: scene.face(() => {}) };
 }
 
 // ---- SVG emitter ------------------------------------------------------------
