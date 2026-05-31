@@ -29,4 +29,5 @@ register(KIND.checkbox, {
     const w = r.attr(node, ATTR.w, 24), h = r.attr(node, ATTR.h, 24);
     return px >= x && px <= x + w && py >= y && py <= y + h;
   },
+  measure(node, r) { const s = 24; return { w: s, h: s }; },
 });

@@ -31,4 +31,5 @@ register(KIND.button, {
     const w = r.attr(node, ATTR.w, 0), h = r.attr(node, ATTR.h, 0);
     return px >= x && px <= x + w && py >= y && py <= y + h;
   },
+  measure(node, r) { const l = r.textFor(node); const w = l ? l.w + 40 : 120; return { w, h: 48 }; },
 });

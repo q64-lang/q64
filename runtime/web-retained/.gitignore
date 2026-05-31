@@ -4,3 +4,4 @@ version.js
 node_modules/
 *.png
 bun.lock
+*.wasm
