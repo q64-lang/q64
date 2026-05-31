@@ -774,8 +774,15 @@ async function canvasToPng(canvas) {
 async function main() {
   // Stamp the build into the header title span (not the whole header — that holds
   // the Snap button too) so you can confirm you're on the latest deploy.
+  // Lead the title with the short git sha so it stays visible even when the
+  // header ellipsizes on a narrow iPhone (the long full stamp is cut from the
+  // right). e.g. "build 5530203 · QView retained".
   const ttl = document.querySelector('header .ttl');
-  if (ttl) ttl.textContent = `QView · retained · build ${BUILD}`;
+  if (ttl) {
+    const sha = (BUILD.match(/\(([^)]+)\)/) || [, BUILD])[1];
+    ttl.textContent = `build ${sha} · QView retained`;
+    ttl.title = BUILD;   // full stamp on long-press / desktop hover
+  }
   wireSnapButton();
 
   // Fully suppress the browser's default touch/gesture behaviour — the app owns
