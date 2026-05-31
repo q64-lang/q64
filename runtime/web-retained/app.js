@@ -653,6 +653,7 @@ function focusField(node, px, py) {
   }
   focusedId = node.id;
   kbScrolled = false;
+  if (spinRAF) { cancelAnimationFrame(spinRAF); spinRAF = 0; }  // stop animation now (don't wait a frame)
   startBlink();
   // The capture element is pinned top-left (always visible) so iOS never
   // auto-scrolls to it — we lift the drawn field ourselves. Seed its value +
@@ -1151,6 +1152,12 @@ async function main() {
   // yank the position); we just track the size + redraw.
   let lastCW = -1, lastCH = -1;
   const refit = () => {
+    // While a text field is focused, treat the keyboard as a pure overlay: do
+    // NOT resize the canvas. On iPhone the keyboard/toolbar shrinks the layout
+    // viewport, which fires the ResizeObserver during focus; resizing the canvas
+    // backing store mid-keyboard dismisses the keyboard there. We handle keyboard
+    // occlusion via the scroll-lift (kbInset), not a canvas resize.
+    if (focusedId !== null) return;
     const cw = canvas.clientWidth, ch = canvas.clientHeight;
     if (cw === lastCW && ch === lastCH) return;   // no real change — don't loop
     lastCW = cw; lastCH = ch;
