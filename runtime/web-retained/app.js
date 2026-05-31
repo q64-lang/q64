@@ -13,6 +13,7 @@ import { KIND, ATTR, EVENT, EVENT_NAME, SURFACE, unpackColor, PROTOCOL_VERSION }
 let BUILD = 'dev';
 try { ({ BUILD } = await import('./version.js')); } catch {}
 import { initGPU, drawPrim, sdfTexture, beginFrame, endFrame, DPR } from './gpu.js';
+import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
 import { resolvePlatform } from './platform.js';
 import { themeFor } from './theme.js';
@@ -147,8 +148,19 @@ const renderCtx = {
   isOpen: (id) => id === openDropdownId,
 };
 
-// The dropdown currently showing its popup (one at a time), or null.
+// The node currently showing a menu (one open at a time), or null. Any widget
+// exposing menuSpec(node, r) can raise the shared popup; today that's the
+// dropdown, tomorrow a context menu.
 let openDropdownId = null;
+
+// The menu spec for the currently-open node (or null) — built fresh each use so
+// it reflects current selection/geometry.
+function openMenuSpec() {
+  if (openDropdownId === null) return null;
+  const n = nodes.get(openDropdownId);
+  const w = n && widgetFor(n.kind);
+  return (w && w.menuSpec) ? w.menuSpec(n, renderCtx) : null;
+}
 
 // A glyph for a host-catalog id directly (popup option rows), cached.
 const idGlyphCache = new Map();
@@ -163,12 +175,9 @@ function render() {
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
   walk(ROOT);
-  // Overlays last, on top of everything: the open dropdown's popup.
-  if (openDropdownId !== null) {
-    const n = nodes.get(openDropdownId);
-    const w = n && widgetFor(n.kind);
-    if (w && w.drawPopup) w.drawPopup(n, renderCtx);
-  }
+  // Overlays last, on top of everything: the open menu (shared popup primitive).
+  const spec = openMenuSpec();
+  if (spec) drawMenu(spec, renderCtx);
   endFrame(frame);
 }
 function walk(id) {
@@ -254,24 +263,22 @@ async function main() {
   canvas.addEventListener('pointerdown', (ev) => {
     const [px, py] = localXY(ev);
 
-    // If a dropdown is open, its popup captures this tap first: pick an option
-    // (-> selection payload to the wasm) or dismiss on an outside tap.
+    // If a menu is open, it captures this tap first (shared popup primitive):
+    // pick an item (-> selection payload to the wasm) or dismiss on an outside tap.
     if (openDropdownId !== null) {
       const dd = nodes.get(openDropdownId);
-      const dw = dd && widgetFor(dd.kind);
-      const chosen = dw && dw.hitPopup ? dw.hitPopup(dd, px, py, renderCtx) : null;
-      const wasOpen = openDropdownId;
+      const chosen = hitMenu(openMenuSpec(), px, py);
       openDropdownId = null;                    // close either way
       if (chosen !== null && chosen !== undefined) dispatch(dd, EVENT.change, chosen);
       else render();                            // outside tap: just close + redraw
-      if (wasOpen) return;                      // consume this tap
+      return;                                   // consume this tap
     }
 
     const hit = hitTest(px, py);
     if (!hit) return;
     const w = widgetFor(hit.kind);
-    // Dropdown field: toggle its popup open.
-    if (w && w.drawPopup) {
+    // A widget that can raise a menu (dropdown): toggle it open.
+    if (w && w.menuSpec) {
       openDropdownId = hit.id;
       render();
       return;
