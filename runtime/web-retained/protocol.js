@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.4';
+export const PROTOCOL_VERSION = '1.5';
 
 // Node kinds (spec §"Node kinds"). 13 = text_input is RESERVED (deferred).
 export const KIND = {
@@ -13,7 +13,8 @@ export const KIND = {
   divider: 13,   // thin separator line (hairline rule)
   group: 14,     // titled container: a panel + heading that holds sub-widgets
   meter: 15,     // level/VU meter (mono or stereo) — value=level, used for peak meters
-  // text_input: 16,  // reserved — focus/blur/key follow-up
+  knob: 16,      // rotary control (pan, volume) — value on min..max, dragged to rotate
+  // text_input: 17,  // reserved — focus/blur/key follow-up
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 
