@@ -308,6 +308,9 @@ fn main {
   qview.set_attr(244, 2, 28)
   qview.set_attr(244, 3, 28)
   qview.set_attr(244, 26, 7)        // icon = heart
+  qview.create(245, 20, 240)        // animated wait cursor (spinner)
+  qview.set_attr(245, 2, 32)
+  qview.set_attr(245, 3, 32)
 
   qview.present()
 }

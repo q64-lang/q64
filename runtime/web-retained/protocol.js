@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.8';
+export const PROTOCOL_VERSION = '1.9';
 
 // Node kinds (spec §"Node kinds").
 export const KIND = {
@@ -17,6 +17,7 @@ export const KIND = {
   text_input: 17, // single-line text field (host-owned editable value)
   text_area: 18,  // multi-line text field (wraps; Enter inserts a newline)
   icon: 19,       // a vector icon (Lucide) rendered as an SDF, tinted by fg
+  spinner: 20,    // round animated wait cursor (dot-ring; host drives the RAF)
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 

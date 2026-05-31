@@ -162,6 +162,7 @@ function ops() {
     // present() = the tree just changed -> relayout (Phase 1) then render (Phase 2).
     layout();
     render();
+    ensureSpin();                 // a spinner may have just appeared -> start the RAF loop
     const m = scene.drainMuts();
     if (m.length) log('mutate: ' + m.join(', '));
   });
@@ -188,6 +189,26 @@ function ops() {
 const decoder = new TextDecoder();
 function readUtf8(ptr, len) {
   return decoder.decode(new Uint8Array(instance.exports.memory.buffer, Number(ptr), Number(len)));
+}
+
+// ---- animation loop -------------------------------------------------------
+// The retained renderer is event-driven; a spinner needs continuous frames.
+// While any spinner node is in the tree, run a requestAnimationFrame loop that
+// re-renders (render() stamps renderCtx.now). It self-stops when none remain, so
+// the page idles when nothing is animating. ensureSpin() (re)starts it after a
+// present() in case a spinner was just added.
+let spinRAF = 0;
+function hasSpinner() {
+  for (const n of nodes.values()) if (n.kind === KIND.spinner) return true;
+  return false;
+}
+function spinTick() {
+  spinRAF = 0;
+  render();
+  if (hasSpinner()) spinRAF = requestAnimationFrame(spinTick);
+}
+function ensureSpin() {
+  if (!spinRAF && hasSpinner()) spinRAF = requestAnimationFrame(spinTick);
 }
 
 // ATTR.surface role tag -> theme token key (the translucent material fills).
@@ -484,6 +505,7 @@ function layout() {
 // The GPU host and the soft renderer are two such paths over the same layout.
 // ===========================================================================
 function render() {
+  renderCtx.now = performance.now();   // frame timestamp for time-based animation (spinner)
   const cv = document.getElementById('gpu');
   viewportH = cv ? cv.clientHeight : 0;
   const viewportW = cv ? cv.clientWidth : 0;
