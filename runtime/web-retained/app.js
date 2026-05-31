@@ -509,7 +509,10 @@ function layout() {
 // The GPU host and the soft renderer are two such paths over the same layout.
 // ===========================================================================
 function render() {
-  renderCtx.now = performance.now();   // frame timestamp for time-based animation (spinner)
+  // Frame timestamp for time-based animation (spinner). FROZEN while a field is
+  // focused so the spinner holds — the caret-blink/keystroke renders that still
+  // run during text entry won't keep stepping it forward.
+  if (focusedId === null) renderCtx.now = performance.now();
   const cv = document.getElementById('gpu');
   viewportH = cv ? cv.clientHeight : 0;
   const viewportW = cv ? cv.clientWidth : 0;
