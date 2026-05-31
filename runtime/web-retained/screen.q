@@ -181,12 +181,13 @@ fn main {
   qview.set_attr(9, 13, 1020)
   qview.on(9, 1, 9)
 
-  // Fader + meter section (HStack 300): a VERTICAL slider on the LEFT drives a
-  // vertical STEREO PEAK METER on the right. Dragging the fader sets both meter
-  // channels + the peak hold. Each is a labeled VStack column.
+  // Mixer strip (HStack 300): Fader | Meter | (Pan over Volume). One row; each is
+  // a labeled VStack column, top-aligned. The fader drives the meter; pan
+  // balances it; volume scales it.
   qview.create(300, 1, 100)
   qview.set_attr(300, 19, 28)
-  // Left: "Fader" label over the vertical slider (322).
+  qview.set_attr(300, 21, 0)
+  // Col 1: "Fader" label over the vertical slider (322).
   qview.create(320, 2, 300)
   qview.set_attr(320, 19, 10)
   qview.set_attr(320, 21, 1)
@@ -199,7 +200,7 @@ fn main {
   qview.set_attr(322, 16, 100)
   qview.set_attr(322, 17, stackVal)
   qview.on(322, 0, 322)
-  // Right: "Meter" label over the vertical stereo peak meter (332).
+  // Col 2: "Meter" label over the vertical stereo peak meter (332).
   qview.create(330, 2, 300)
   qview.set_attr(330, 19, 10)
   qview.set_attr(330, 21, 1)
@@ -214,14 +215,12 @@ fn main {
   qview.set_attr(332, 23, stackVal)
   qview.set_attr(332, 24, stackVal)
   qview.set_attr(332, 25, stackVal)
-
-  // Knobs row (HStack 400): Pan + Volume. Pan (-100..100, center 0) BALANCES the
-  // meter — left louder when panned left. Volume (0..100) scales both channels.
-  qview.create(400, 1, 100)
-  qview.set_attr(400, 19, 36)
-  qview.set_attr(400, 21, 1)
-  // Pan column: label over knob (410).
-  qview.create(405, 2, 400)
+  // Col 3: pots VStack (340) to the RIGHT of the meter — Pan over Volume.
+  qview.create(340, 2, 300)
+  qview.set_attr(340, 19, 18)
+  qview.set_attr(340, 21, 1)
+  // Pan: label over knob (410).
+  qview.create(405, 2, 340)
   qview.set_attr(405, 19, 8)
   qview.set_attr(405, 21, 1)
   qview.create(406, 4, 405)
@@ -233,8 +232,8 @@ fn main {
   qview.set_attr(410, 16, 200)
   qview.set_attr(410, 17, pan)
   qview.on(410, 0, 410)
-  // Volume column: label over knob (420).
-  qview.create(415, 2, 400)
+  // Volume: label over knob (420).
+  qview.create(415, 2, 340)
   qview.set_attr(415, 19, 8)
   qview.set_attr(415, 21, 1)
   qview.create(416, 4, 415)
