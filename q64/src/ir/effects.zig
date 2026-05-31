@@ -158,6 +158,10 @@ fn collectExpr(
         .concat => |pieces| for (pieces) |p| try collectExpr(a, p, d, e),
         .fmt_int => |inner| try collectExpr(a, inner, d, e),
         .str_len => |s| try collectExpr(a, s, d, e),
+        .str_index => |si| {
+            try collectExpr(a, si.str, d, e);
+            try collectExpr(a, si.idx, d, e);
+        },
         // Leaves: no calls, no faces.
         .str_const, .int_const, .bool_const, .local, .global_get, .str_binding => {},
     }

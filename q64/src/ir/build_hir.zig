@@ -1219,6 +1219,16 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             out.* = .{ .str_len = sval };
         },
+        .index => |ix| {
+            // `s[i]` — the unsigned byte at index i of a str value, as i64.
+            const base = ix.base() orelse return error.Unsupported;
+            const sval = buildStrExpr(b, base, scope, null) catch |e| switch (e) {
+                error.Unsupported => return error.Unsupported, // indexing a non-str
+                else => return e,
+            };
+            const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
+            out.* = .{ .str_index = .{ .str = sval, .idx = idx } };
+        },
         else => return error.Unsupported,
     }
     return out;

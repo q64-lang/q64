@@ -174,6 +174,10 @@ pub const Op = union(enum) {
     /// The byte length of a `str` value as i64 (`s.len`). `value` is a str-typed
     /// inst; the backend reads its len component and zero-extends to i64.
     str_len: *Inst,
+    /// The unsigned byte at `idx` of a str value as i64 (`s[i]`). `str` is a
+    /// str-typed inst (its ptr component is the base); `idx` is an i64 offset.
+    /// Lowers to an `i32.load8_u` at `ptr + idx`, zero-extended to i64.
+    str_index: struct { str: *Inst, idx: *Inst },
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the

@@ -350,6 +350,8 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         // `s.len` — lower the str operand to its (ptr, len) value; the backend
         // reads the len component and zero-extends it to i64.
         .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
+        // `s[i]` — str operand to (ptr, len), idx to i64; backend loads the byte.
+        .str_index => |si| return mk(ctx.a, .i64, .{ .str_index = .{ .str = try lowerStrExpr(ctx, si.str), .idx = try lowerExpr(ctx, si.idx) } }),
         .str_const, .concat, .str_binding, .fmt_int => unreachable, // str values never reach the i64 path
     }
 }
