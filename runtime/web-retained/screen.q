@@ -20,6 +20,7 @@ state choice    = 0
 state sliderVal = 40
 state taps      = 0
 state platform  = 12   // dropdown: catalog id of the selected option (12 = iOS)
+state grouped   = 1    // the checkbox inside the group widget
 
 fn main {
   // Layout grid: a control column at x=24 and a name-label column at x=150,
@@ -173,11 +174,13 @@ fn main {
   qview.set_attr(7, 0, 56)
   qview.set_attr(7, 1, 600)
   qview.set_attr(7, 9, 17)
-  // sub-checkbox (8) inside the group
+  // sub-checkbox (8) inside the group — wired to handler 8 to prove a grouped
+  // child still receives touch.
   qview.create(8, 7, 6)
   qview.set_attr(8, 0, 280)
   qview.set_attr(8, 1, 596)
-  qview.set_attr(8, 12, 1)
+  qview.set_attr(8, 12, grouped)
+  qview.on(8, 0, 8)
 
   // Translucent material top bar (90), created LAST so it overlays nothing but
   // the panel's top edge — showing the platform material. surface=3 materialThin.
@@ -240,5 +243,12 @@ pub fn on_80(node: i64, event: i64, value: i64) {
   platform = value
   qview.set_attr(80, 9, platform)
   qview.set_attr(80, 13, platform - 12)
+  qview.present()
+}
+// Grouped checkbox: toggles like any other — proves a child of a group node
+// still receives touch and mutates surgically.
+pub fn on_8(node: i64, event: i64) {
+  grouped = 1 - grouped
+  qview.set_attr(8, 12, grouped)
   qview.present()
 }
