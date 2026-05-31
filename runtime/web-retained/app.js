@@ -50,6 +50,10 @@ const CATALOG = [
   'Linux',           // 15
   'Grouped',         // 16  group heading
   'In a group',      // 17  group sub-label
+  'Long Click',      // 18  the context-menu touch area title
+  'Cut',             // 19  context-menu items
+  'Copy',            // 20
+  'Paste',           // 21
 ];
 
 // ---- the retained tree -------------------------------------------------------
@@ -154,6 +158,9 @@ const renderCtx = {
 // exposing menuSpec(node, r) can raise the shared popup; today that's the
 // dropdown, tomorrow a context menu.
 let openDropdownId = null;
+// A context menu (long-press / right-click) raised at a point: its popup spec +
+// the node it belongs to. Separate from openDropdownId (anchored differently).
+let contextSpec = null, contextNode = null;
 
 // The menu spec for the currently-open node (or null) — built fresh each use so
 // it reflects current selection/geometry. The host injects the viewport (CSS px)
@@ -163,7 +170,11 @@ function openMenuSpec() {
   const n = nodes.get(openDropdownId);
   const w = n && widgetFor(n.kind);
   if (!w || !w.menuSpec) return null;
-  const spec = w.menuSpec(n, renderCtx);
+  return withViewport(w.menuSpec(n, renderCtx));
+}
+
+// Inject the viewport (CSS px) into a popup spec so it can flip/clamp on-screen.
+function withViewport(spec) {
   if (spec) {
     const cv = document.getElementById('gpu');
     if (cv) spec.viewport = { w: cv.clientWidth, h: cv.clientHeight };
@@ -184,8 +195,9 @@ function render() {
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;
   walk(ROOT);
-  // Overlays last, on top of everything: the open menu (shared popup primitive).
-  const spec = openMenuSpec();
+  // Overlays last, on top of everything: the open menu or context menu (shared
+  // popup primitive). Both get the viewport so they flip/clamp near edges.
+  const spec = contextSpec ? withViewport(contextSpec) : openMenuSpec();
   if (spec) drawMenu(spec, renderCtx);
   endFrame(frame);
 }
@@ -269,23 +281,52 @@ async function main() {
 
   const localXY = (ev) => { const r = canvas.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; };
 
+  // Long-press (touch) / right-click (mouse) -> a context menu anchored at the
+  // point, for any node whose widget exposes contextMenu(node, r). Reuses the
+  // shared popup primitive (so it flips/clamps near edges too).
+  const LONG_PRESS_MS = 500;
+  let longPressTimer = null, longPressFired = false;
+  const cancelLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } };
+
+  // Open a context menu for the node at (px,py), anchored at the point. Returns
+  // true if a menu was raised.
+  function openContextMenu(px, py) {
+    const hit = hitTest(px, py);
+    const w = hit && widgetFor(hit.kind);
+    if (!w || !w.contextMenu) return false;
+    const cm = w.contextMenu(hit, renderCtx);
+    if (!cm || !cm.items || cm.items.length === 0) return false;
+    contextSpec = { anchor: { x: px, y: py, w: 0, h: 0 }, items: cm.items, width: cm.width ?? 200 };
+    contextNode = hit;
+    render();
+    return true;
+  }
+
   canvas.addEventListener('pointerdown', (ev) => {
     const [px, py] = localXY(ev);
 
     // If a menu is open, it captures this tap first (shared popup primitive):
     // pick an item (-> selection payload to the wasm) or dismiss on an outside tap.
-    if (openDropdownId !== null) {
-      const dd = nodes.get(openDropdownId);
-      const chosen = hitMenu(openMenuSpec(), px, py);
-      openDropdownId = null;                    // close either way
-      if (chosen !== null && chosen !== undefined) dispatch(dd, EVENT.change, chosen);
-      else render();                            // outside tap: just close + redraw
-      return;                                   // consume this tap
+    if (openDropdownId !== null || contextSpec) {
+      const spec = contextSpec ? withViewport(contextSpec) : openMenuSpec();
+      const target = contextSpec ? contextNode : nodes.get(openDropdownId);
+      const chosen = hitMenu(spec, px, py);
+      openDropdownId = null; contextSpec = null; contextNode = null;
+      if (chosen !== null && chosen !== undefined && target) dispatch(target, EVENT.change, chosen);
+      else render();
+      return;
     }
 
     const hit = hitTest(px, py);
     if (!hit) return;
     const w = widgetFor(hit.kind);
+
+    // Arm long-press if this node has a context menu (touch raises it after a hold).
+    if (w && w.contextMenu) {
+      longPressFired = false;
+      cancelLongPress();
+      longPressTimer = setTimeout(() => { longPressTimer = null; longPressFired = openContextMenu(px, py); }, LONG_PRESS_MS);
+    }
     // A widget that can raise a menu (dropdown): toggle it open.
     if (w && w.menuSpec) {
       openDropdownId = hit.id;
@@ -302,12 +343,17 @@ async function main() {
       dispatch(hit, EVENT.input, w.value(hit, px, py, renderCtx));
       return;
     }
+    // A context-menu-only node (no press handler) waits for the long-press; don't
+    // flash a press for it.
+    if (w && w.contextMenu && !(hit.handlers && hit.handlers.size)) return;
     pressedId = hit.id; render();                       // immediate pressed-state flash
     dispatch(hit, EVENT.press);                         // wasm mutates + presents
     setTimeout(() => { pressedId = null; render(); }, 120);
   }, { passive: false });
 
   canvas.addEventListener('pointermove', (ev) => {
+    // A finger that moves cancels a pending long-press (it's a drag/scroll, not a hold).
+    if (longPressTimer) cancelLongPress();
     if (!dragNode) return;
     ev.preventDefault();
     // Only the x drives the value; vertical drift (e.g. toward a label) is
@@ -318,12 +364,22 @@ async function main() {
   }, { passive: false });
 
   const endDrag = (ev) => {
+    cancelLongPress();                          // a lift before the hold elapsed = a tap, not long-press
     if (!dragNode) return;
     try { canvas.releasePointerCapture(ev.pointerId); } catch {}
     dragNode = null;
   };
   canvas.addEventListener('pointerup', endDrag);
   canvas.addEventListener('pointercancel', endDrag);
+
+  // Right-click (desktop) -> the same context menu, anchored at the pointer.
+  canvas.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();                        // suppress the browser menu
+    const [px, py] = localXY(ev);
+    // Dismiss any open menu first; then raise the context menu (if any) here.
+    openDropdownId = null; contextSpec = null; contextNode = null;
+    if (!openContextMenu(px, py)) render();
+  });
 
   window.addEventListener('resize', () => { resize(); render(); });
 }
