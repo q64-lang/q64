@@ -156,12 +156,19 @@ const renderCtx = {
 let openDropdownId = null;
 
 // The menu spec for the currently-open node (or null) — built fresh each use so
-// it reflects current selection/geometry.
+// it reflects current selection/geometry. The host injects the viewport (CSS px)
+// so the popup can flip/clamp to stay on-screen.
 function openMenuSpec() {
   if (openDropdownId === null) return null;
   const n = nodes.get(openDropdownId);
   const w = n && widgetFor(n.kind);
-  return (w && w.menuSpec) ? w.menuSpec(n, renderCtx) : null;
+  if (!w || !w.menuSpec) return null;
+  const spec = w.menuSpec(n, renderCtx);
+  if (spec) {
+    const cv = document.getElementById('gpu');
+    if (cv) spec.viewport = { w: cv.clientWidth, h: cv.clientHeight };
+  }
+  return spec;
 }
 
 // A glyph for a host-catalog id directly (popup option rows), cached.
