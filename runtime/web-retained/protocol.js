@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.9';
+export const PROTOCOL_VERSION = '1.10';
 
 // Node kinds (spec §"Node kinds").
 export const KIND = {
@@ -40,6 +40,12 @@ export const ATTR = {
   // icon (26): the host ICONS catalog index of a vector icon to draw — on an
   // `icon` node, or on a `button` (icon-only, or icon + label).
   icon: 26,
+  // max_w (27) / min_w (28): width constraints clamped by the layout engine. On
+  // a `column` child with `align: stretch`, max_w caps the stretched width and
+  // the child is re-centered in the freed space — the responsive "content
+  // container" (fill small screens, cap + center on wide ones). They also clamp
+  // a node's intrinsic/explicit width anywhere. See arrange.js.
+  max_w: 27, min_w: 28,
 };
 export const ATTR_NAME = Object.fromEntries(Object.entries(ATTR).map(([k, v]) => [v, k]));
 
