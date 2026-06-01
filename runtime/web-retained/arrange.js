@@ -26,6 +26,13 @@ const isRow = (kind) => kind === KIND.row;
 const attr = (node, a, d) => { const v = node.attrs.get(a); return v === undefined ? d : Number(v); };
 const has = (node, a) => node.attrs.has(a);
 
+// Clamp a width to a node's min_w/max_w constraints (either may be absent).
+const clampW = (node, w) => {
+  if (has(node, ATTR.max_w)) w = Math.min(w, attr(node, ATTR.max_w, w));
+  if (has(node, ATTR.min_w)) w = Math.max(w, attr(node, ATTR.min_w, w));
+  return w;
+};
+
 // Intrinsic size of a node. r is the render context (for widget.measure, which
 // may need text metrics). Returns {w,h}.
 export function measure(scene, node, r) {
@@ -48,7 +55,7 @@ export function measure(scene, node, r) {
     if (kids.length > 1) main += gap * (kids.length - 1);
     const natW = isRow(node.kind) ? main : cross;
     const natH = isRow(node.kind) ? cross : main;
-    return { w: mw ?? (natW + pad * 2), h: mh ?? (natH + pad * 2) };
+    return { w: clampW(node, mw ?? (natW + pad * 2)), h: mh ?? (natH + pad * 2) };
   }
 
   // A group auto-sizes to wrap its children (heading + content), so the panel
@@ -70,7 +77,7 @@ export function measure(scene, node, r) {
     if (mw === null && nat.w != null) mw = nat.w;
     if (mh === null && nat.h != null) mh = nat.h;
   }
-  return { w: mw ?? 0, h: mh ?? 0 };
+  return { w: clampW(node, mw ?? 0), h: mh ?? 0 };
 }
 
 // Arrange: write resolved rects into `out` (Map id->{x,y,w,h}). For a stack,
@@ -95,7 +102,19 @@ export function arrange(scene, node, self, r, out) {
       let crossLen = isRow(node.kind) ? ks.h : ks.w;
       if (align === ALIGN.center) crossPos = crossStart + (crossSize - kCross) / 2;
       else if (align === ALIGN.end) crossPos = crossStart + (crossSize - kCross);
-      else if (align === ALIGN.stretch) crossLen = crossSize;
+      else if (align === ALIGN.stretch) {
+        crossLen = crossSize;
+        // A column's cross axis is width: cap a stretched child at its max_w
+        // (or floor at min_w) and re-center it in the freed space, so a capped
+        // content container sits centered instead of clinging to the start.
+        if (!isRow(node.kind)) {
+          const capped = clampW(k, crossLen);
+          if (capped !== crossLen) {
+            crossPos = crossStart + (crossSize - capped) / 2;
+            crossLen = capped;
+          }
+        }
+      }
       const kx = isRow(node.kind) ? cursor : crossPos;
       const ky = isRow(node.kind) ? crossPos : cursor;
       const kw = isRow(node.kind) ? ks.w : crossLen;

@@ -136,6 +136,14 @@ encoding** column.
 | `18` | `z` | all | stacking order within parent (default = creation order) |
 | `19` | `gap` | row, column | inter-child spacing px |
 | `20` | `surface` | box, containers | **semantic** fill role resolved against the platform theme (a `SURFACE` enum), taking precedence over a literal `fill`. See [§Per-platform look](#per-platform-look--themes). |
+| `21` | `align` | row, column | cross-axis alignment of a stack's children (an `ALIGN` enum: `start`/`center`/`end`/`stretch`) |
+| `22` | `pad` | row, column, group | inner padding px |
+| `23` | `value2` | meter | second-channel value (stereo right; left is `value`) on the `min`..`max` scale |
+| `24` | `peak` | meter | peak-hold level for the left channel, on `min`..`max` |
+| `25` | `peak2` | meter | peak-hold level for the right channel, on `min`..`max` |
+| `26` | `icon` | icon, button | host `ICONS` catalog index of the vector icon to draw |
+| `27` | `max_w` | all | maximum width px. Clamps intrinsic/explicit width; on a `column` child with `align: stretch` it caps the stretched width and re-centers the child (responsive content container). |
+| `28` | `min_w` | all | minimum width px. Floors the resolved width by the same rules as `max_w`. |
 
 **`SURFACE` roles** (the `surface` attr value) — theme-resolved translucent
 fills, so a producer asks for "a frosted bar" and the host paints the platform's
