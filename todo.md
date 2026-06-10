@@ -116,9 +116,11 @@ and `qube run`):
        `NameNotFound` / `UnsupportedImport`). `q64/src/codegen/emit.zig`
        `Resolver` + `renderStringLit`; `cmdEmit` reports + exits non-zero.
 1. [x] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
-       `json5ToJson` strips `//`+`/* */` comments and trailing commas, then
-       parses with `std.json` into a `Value`). Single-quoted strings /
-       unquoted keys not yet handled (no manifest in the corpus uses them).
+       `json5ToJson` normalizes the full manifest dialect — `//`+`/* */`
+       comments, trailing commas, single-quoted strings, unquoted keys —
+       then parses with `std.json` into a `Value`). Unit tests in
+       `main.zig` (`zig build test`); the qube-test "full JSON5" case is
+       no longer `test.failing`.
 2. [x] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
        repeatable. Reads each module's `src/lib.q` and hands codegen a
        `[]ModuleSource`. Spec: `q64-cli.md:71`.
