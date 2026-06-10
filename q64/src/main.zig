@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     // is observable. Never triggered in normal use.
     if (init.environ_map.get("Q64_FORCE_ICE") != null) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.writeAll(
             \\{"ok":false,"diagnostics":[{"code":"Q9001","severity":"internal","kind":"ice","message":"forced internal error (Q64_FORCE_ICE)","repair":{"id":"report-upstream","safety":"n/a","report_url":"https://docs.q64.dev/diagnostics/Q9001"}}]}
         );
@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "--version")) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stdout().writer(io, &buf);
+        var w = std.Io.File.stdout().writerStreaming(io, &buf);
         try w.interface.writeAll("q64 0.0.1 (pre-alpha)\n");
         try w.interface.flush();
         return;
@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn usage(io: std.Io) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     try w.interface.writeAll(
         \\usage: q64 <command> [args]
         \\
@@ -130,7 +130,7 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: cannot read {s}: {s}\n", .{ path, @errorName(err) });
         try w.interface.flush();
         std.process.exit(2);
@@ -147,7 +147,7 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
     };
 
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
 
     if (json) {
         try diag.emitJson(&w.interface, source, result.diagnostics, gpa);
@@ -217,7 +217,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
                 addr = .wasm64;
             } else {
                 var buf: [4096]u8 = undefined;
-                var w = std.Io.File.stderr().writer(io, &buf);
+                var w = std.Io.File.stderr().writerStreaming(io, &buf);
                 try w.interface.print("q64: --addr expects wasm32 or wasm64, got '{s}'\n", .{v});
                 try w.interface.flush();
                 std.process.exit(2);
@@ -229,7 +229,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             };
             const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
                 var buf: [4096]u8 = undefined;
-                var w = std.Io.File.stderr().writer(io, &buf);
+                var w = std.Io.File.stderr().writerStreaming(io, &buf);
                 try w.interface.print("q64: --module expects name=dir, got '{s}'\n", .{spec});
                 try w.interface.flush();
                 std.process.exit(2);
@@ -260,7 +260,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(16 * 1024 * 1024)) catch |err| {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: cannot read {s}: {s}\n", .{ src, @errorName(err) });
         try w.interface.flush();
         std.process.exit(2);
@@ -276,7 +276,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
 
     const bytes = emit.emitFromSource(gpa, source, src, module_sources.items, addr) catch |err| {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: emit failed: {s}\n", .{@errorName(err)});
         try w.interface.flush();
         std.process.exit(1);
@@ -293,7 +293,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     if (want_component) {
         const artifact = emit.emitComponent(gpa, source, src, module_sources.items, addr) catch |err| {
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
             try w.interface.print("q64: component emit failed: {s}\n", .{@errorName(err)});
             try w.interface.flush();
             std.process.exit(1);
@@ -350,7 +350,7 @@ fn adaptPreview1Component(
     const argv = [_][]const u8{ wasm_tools, "component", "new", tmp_core, "--adapt", adapt_arg, "-o", comp_path };
     const term = spawnInherit(io, &argv) catch |err| {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: could not run wasm-tools ({s}): {s}\n", .{ wasm_tools, @errorName(err) });
         try w.interface.print("q64: set Q64_WASM_TOOLS / Q64_WASI_ADAPTER, or run ./init.sh to vendor the WASI toolchain\n", .{});
         try w.interface.flush();
@@ -358,7 +358,7 @@ fn adaptPreview1Component(
     };
     if (termCode(term) != @as(u8, 0)) {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: wasm-tools component new failed (the WASI adapter could not lift the preview1 core)\n", .{});
         try w.interface.flush();
         std.process.exit(1);
@@ -445,7 +445,7 @@ fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
         .flags = .{ .truncate = true },
     }) catch |err| {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: cannot write {s}: {s}\n", .{ path, @errorName(err) });
         try w.interface.flush();
         std.process.exit(2);
@@ -467,7 +467,7 @@ fn readModuleSources(gpa: std.mem.Allocator, io: std.Io, module_args: []const Mo
         defer gpa.free(lib_path);
         const lib_src = std.Io.Dir.cwd().readFileAlloc(io, lib_path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
             var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writer(io, &buf);
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
             try w.interface.print("q64: cannot read module {s} entry {s}: {s}\n", .{ ma.name, lib_path, @errorName(err) });
             try w.interface.flush();
             std.process.exit(2);
@@ -498,7 +498,7 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
             };
             const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
                 var buf: [4096]u8 = undefined;
-                var w = std.Io.File.stderr().writer(io, &buf);
+                var w = std.Io.File.stderr().writerStreaming(io, &buf);
                 try w.interface.print("q64: --module expects name=dir, got '{s}'\n", .{spec});
                 try w.interface.flush();
                 std.process.exit(2);
@@ -540,7 +540,7 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         .world
     else {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: show: unknown kind '{s}'\n", .{k});
         try w.interface.flush();
         std.process.exit(2);
@@ -560,7 +560,7 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
 
     const source = std.Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(16 * 1024 * 1024)) catch |err| {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: cannot read {s}: {s}\n", .{ src, @errorName(err) });
         try w.interface.flush();
         std.process.exit(2);
@@ -581,7 +581,7 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         .world => emit.showWorld(gpa, source, src, module_sources.items),
     }) catch |err| {
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.stderr().writer(io, &buf);
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: show {s} failed: {s}\n", .{ k, @errorName(err) });
         try w.interface.flush();
         std.process.exit(1);
@@ -589,7 +589,7 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     defer gpa.free(dump);
 
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.writeAll(dump);
     try w.interface.flush();
 }
@@ -625,19 +625,19 @@ fn cmdDoc(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterato
     if (!json) {
         // v0 has only the JSON form; there is no human renderer for `doc` yet.
         var ebuf: [256]u8 = undefined;
-        var ew = std.Io.File.stderr().writer(io, &ebuf);
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
         try ew.interface.writeAll("q64: doc requires --json\n");
         try ew.interface.flush();
         std.process.exit(2);
     }
 
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
 
     if (qube_file) |path| {
         const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
             var ebuf: [4096]u8 = undefined;
-            var ew = std.Io.File.stderr().writer(io, &ebuf);
+            var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
             try ew.interface.print("q64: cannot read {s}: {s}\n", .{ path, @errorName(err) });
             try ew.interface.flush();
             std.process.exit(2);
@@ -677,14 +677,14 @@ fn cmdExplain(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Ite
 
     const info = diag.lookup(c) orelse {
         var ebuf: [256]u8 = undefined;
-        var ew = std.Io.File.stderr().writer(io, &ebuf);
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
         try ew.interface.print("q64: explain: unknown diagnostic code '{s}'\n", .{c});
         try ew.interface.flush();
         std.process.exit(1);
     };
 
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     if (json) {
         try w.interface.writeAll("{\"code\":");
         try diag.writeJsonString(&w.interface, info.code);
