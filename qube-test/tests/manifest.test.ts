@@ -37,12 +37,8 @@ describe.skipIf(!binaryAvailable())("qube.json5 parsing (via qube run)", () => {
     const r = runCli(["run"], { cwd: proj });
     expect(r.exitCode).not.toBe(65);
   });
-});
 
-// Test-first: full JSON5 parsing and manifest validation (PKG diagnostics) are
-// not implemented in v0. `test.failing` until they land.
-describe.skipIf(!binaryAvailable())("qube.json5 validation (spec surface)", () => {
-  test.failing("full JSON5 (unquoted keys, single-quoted strings) parses per spec", () => {
+  test("full JSON5 dialect (unquoted keys, single-quoted strings) parses per spec", () => {
     const proj = makeProject({
       "qube.json5": "{ name: 'dev.q64.j5', version: '0.1.0', license: 'MIT', type: 'application', entry: 'src/main.q' }",
       "src/main.q": "fn main { env.out(\"x\") }\n",
@@ -51,7 +47,11 @@ describe.skipIf(!binaryAvailable())("qube.json5 validation (spec surface)", () =
     expect(r.exitCode).not.toBe(65);
     expect(r.stderr).not.toContain("cannot parse");
   });
+});
 
+// Test-first: manifest validation (PKG diagnostics) is not implemented in v0.
+// `test.failing` until it lands.
+describe.skipIf(!binaryAvailable())("qube.json5 validation (spec surface)", () => {
   test.failing("a single-segment publishable name is a PKG diagnostic", () => {
     const proj = makeProject({
       "qube.json5": '{ "name": "singlename", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q" }',

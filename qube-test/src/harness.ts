@@ -153,9 +153,9 @@ export function makeProject(files: Record<string, string>): string {
 
 /**
  * A minimal valid application manifest. Uses quoted keys + double-quoted
- * strings — the form the v0 reader accepts (it strips // comments and
- * trailing commas but does not yet handle JSON5 unquoted keys / single
- * quotes; see todo.md). Mirrors examples/hello/qube.json5.
+ * strings for readability; the reader accepts the full manifest dialect
+ * (comments, trailing commas, unquoted keys, single-quoted strings) per
+ * spec/qube.json5.md. Mirrors examples/hello/qube.json5.
  */
 export function appManifest(name = "dev.q64.test_app"): string {
   return [

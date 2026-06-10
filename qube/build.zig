@@ -26,6 +26,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run qube with the supplied arguments");
     run_step.dependOn(&run_exe.step);
 
+    const unit_tests = b.addTest(.{ .root_module = exe_mod });
+    const test_step = b.step("test", "Run qube unit tests");
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
     // Black-box CLI suite (Bun). Builds the binary, then runs `bun test`
     // in the sibling ../qube-test against zig-out/bin/qube. Only runs when
     // invoked explicitly; needs `bun` on PATH.
