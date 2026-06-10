@@ -899,8 +899,9 @@ Additional grammar-shaped items inherited from other specs:
   expressible as a sequence of typed `catch` arms; sugar deferred per
   [`errors.md` §"Open items deferred"](./errors.md).
 - **Closure effect annotations** — explicit effect spec on a lambda
-  literal. Closures currently inherit per
-  [`effects.md` §"Open items deferred"](./effects.md).
+  literal. A closure's effects are inferred from its body per
+  [`closures.md` §Effects](./closures.md); the literal-level
+  annotation form is deferred there.
 - **`try?` and `try!` shortcuts** — Swift-style fallible-cast sugar;
   not in v0 per [`errors.md` §"Variants deferred"](./errors.md).
 

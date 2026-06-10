@@ -832,9 +832,10 @@ type for `Frame<Shared>` whose buffer lives in `mem.shared`.
   checker should track residual effects through `dyn` boxing is open
   (cross-references the
   [`errors.md` §Open items](./errors.md) entry on `dyn Error`).
-- **Effect annotations on closures.** Closures inherit the enclosing
-  function's effect set; explicit annotation of a closure literal is
-  deferred until the closure surface itself stabilizes.
+- **Effect annotations on closures.** A closure's effect set is
+  inferred from its own body and checked against the `fn` type's
+  `EffectSpec` per [`closures.md`](./closures.md) §Effects; explicit
+  annotation of a closure literal is deferred.
 - **`@realtime` budget annotations.** Future revisions may attach a
   cycle-budget or latency bound to `@realtime` (`@realtime(< 1.ms)`).
   Out of scope for v0.
