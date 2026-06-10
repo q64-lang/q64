@@ -20,6 +20,7 @@ suite.
 | [`modules.md`](./modules.md)                             | Module organization, imports, visibility, re-exports              |
 | [`faces.md`](./faces.md)                                 | Polymorphism: faces (interfaces) and fits (implementations)       |
 | [`errors.md`](./errors.md)                               | `Result<T, E>`, `try`, `panic` / `trap`, `Option<T>`, `Error` face |
+| [`closures.md`](./closures.md)                           | Lambda literals, alias capture, the v0 no-escape rule, `fn` types, effect rows |
 | [`effects.md`](./effects.md)                             | Effect markers, implication graph, propagation, capability disclosure |
 | [`generics.md`](./generics.md)                           | Type / const / region / effect parameters, bounds, where, defaults, inference |
 | [`types.md`](./types.md)                                 | Numeric tower, bool, arb-width ints, parameter modes, optional narrowing |
