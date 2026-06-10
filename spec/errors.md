@@ -457,24 +457,9 @@ let first_name: str? = match user {
 `?.` is the only `?`-sigil form in user code. `?` does *not* appear on
 `Result` — that uses `try`.
 
-## Destructure form (`example.md` sugar)
+## Result as a JSON envelope
 
-```q64
-let (obj, err) = env.net.get(url).json()
-if let e = err { return e }
-// obj is non-None here by flow typing
-```
-
-Sugar over `Result<T, E>`:
-
-- `let (x, y) = expr` where `expr: Result<T, E>` binds:
-  - `x: Option<T>`
-  - `y: Option<E>`
-  - With the invariant: exactly one is `Some`.
-- After `if let e = err { return ... }`, the flow-typer narrows
-  `obj` from `Option<T>` to `T` on the fall-through path.
-
-This is the same shape as the `{ ok, result, error }` JSON envelopes
+`Result<T, E>` maps onto the `{ ok, value? | error? }` envelope shape
 used by Vercel Zero, the AI SDK, and modern API conventions — a q64
 `Result<T, E>` round-trips cleanly to JSON:
 
@@ -499,7 +484,7 @@ effect-system concerns under `EFF*`.
 | `TYP301` | error conversion not available               | `try` needs `fit TargetError : From<SourceError>`; no such fit is reachable.    |
 | `TYP302` | non-exhaustive match on `Result`             | A `match` over `Result` doesn't handle both `Ok` and `Err`.                     |
 | `TYP303` | `?.` on non-`Option` value                   | `?.` chain operator used on a value whose type is not `Option<T>`.              |
-| `TYP304` | mismatched arms in destructure form          | `let (x, y) = expr` where `expr` is not a `Result<_, _>`.                       |
+| `TYP304` | (retired)                                    | Was: mismatched arms in the `Result` destructure form. The form was removed — its "exactly one of the pair is `Some`" invariant was unenforceable by the type system; `try` and `match` cover both uses. Number reserved; not reused. |
 | `TYP305` | `?` postfix on `Result`                      | Bare `?` used on a `Result` value; use the `try` prefix instead.                |
 | `TYP306` | `panic` payload does not fit `Panic`         | The value passed to `panic` is not a `str` and its type does not fit `Panic`.   |
 | `TYP307` | `catch` type is not `Panic`-fitting          | `catch (e: T)` where `T` is neither `Panic` itself nor a type fitting `Panic`.  |
