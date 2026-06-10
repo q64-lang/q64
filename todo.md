@@ -309,10 +309,19 @@ needs argument passing + a memory/stack convention) and runtime string
 concatenation for interpolation.
 
 ### Deferred package bits (not compiler; pick up anytime)
-- [ ] `qube.lock` — `add` doesn't write one; needed for ladder step 4.
-- [ ] `add` dedup + `--offline` / `--frozen` / `--locked` flags.
+- [x] `qube.lock` — specced (`spec/qube.lock.md`: format v1, deterministic
+      JSON, PKG010–PKG013) and implemented: `qube add` upserts an entry,
+      `qube lock` regenerates from the manifest (reusing satisfying locked
+      versions; resolves caret/exact ranges against registry metadata, no
+      archive download), and `qube run`/`build`/`web` resolve a registry
+      dep **only** via lockfile → sha256 → `~/.qube/cache` → `--module`
+      (never the network). Verified end-to-end: a cached registry dep
+      links and runs; PKG01x paths covered in `add-remove.test.ts`;
+      renderer/semver unit tests in `main.zig`.
+- [ ] `qube install` — fetch locked entries into the cache (PKG012 repair);
+      `--offline` / `--frozen` / `--locked` flags; `add` dedup.
 - [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
-- [ ] `qube remove` / `install` / `outdated` still stubs.
+- [ ] `qube remove` / `outdated` still stubs.
 
 ### Notes for the next agent
 - Build with the **vendored** zig: `vendor/zig/zig build` (homebrew zig at
