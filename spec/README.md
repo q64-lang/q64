@@ -13,6 +13,7 @@ suite.
 | File                                                     | Covers                                                            |
 |----------------------------------------------------------|-------------------------------------------------------------------|
 | [`qube.json5.md`](./qube.json5.md) + `.schema.json`      | Manifest file every qube ships at its root                        |
+| [`qube.lock.md`](./qube.lock.md)                         | Lockfile pinning the resolved dependency graph: format, lifecycle, staleness |
 | [`diagnostics.md`](./diagnostics.md) + `.schema.json`    | JSON envelope every toolchain binary emits on stderr              |
 | [`q64-cli.md`](./q64-cli.md)                             | The `q64` binary's CLI surface and subprocess contract            |
 | [`qube-cli.md`](./qube-cli.md)                           | The `qube` binary's CLI surface and how it invokes `q64`          |
