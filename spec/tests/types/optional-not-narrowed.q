@@ -5,7 +5,9 @@
 struct User { name: str }
 
 fn process(user: User?) -> str {
-    if let None = user { return "anonymous" }
+    // The `if let None` body falls through (no exit), so nothing
+    // narrows on the path after it — `user` is still `User?`.
+    if let None = user { let _ = "missing user" }
     user.name
 }
 
