@@ -738,17 +738,22 @@ subsequent code.
    }
    ```
 
-3. **An early-return `if let` that exits**:
+3. **An `if let None` whose body exits**:
 
    ```q64
    fn process(user: User?) -> str {
        if let None = user { return "anonymous" }
-       user.name            // ❌ TYP047 — user is still User? here
+       user.name            // ✓ user: User (narrowed on the fall-through path)
    }
    ```
 
-   Narrowing does **not** propagate past an `if-let-None` exit in
-   v0. To narrow, use the `if let Some(u) = user` form (above).
+   The narrowing condition is syntactic, the same shape as the
+   `match`-exit rule above: the `if let None` body's tail statement
+   is an exit — `return`, `panic`, `trap()`, or (inside a loop)
+   `break` / `continue` — so the fall-through path can only be
+   reached when the binding is `Some`. If the body does **not**
+   exit, nothing narrows (the fall-through is reachable either
+   way) and a later bare use is `TYP047`.
 
 ### What is **not** narrowed in v0
 
@@ -756,15 +761,18 @@ subsequent code.
   is a regular boolean; the compiler does no smart-cast analysis
   past it. Compiler emits `TYP080` (note, not error) suggesting
   the `if let Some(u) = user` form.
+- An `if let None = user { log("missing") }` whose body falls
+  through. Only an exiting body (rule 3 above) narrows.
 - Narrowing inside a closure or nested function. The narrowed
-  scope ends at the closure's body boundary.
+  scope ends at the closure's body boundary (per
+  [`closures.md`](./closures.md)).
 - Narrowing across `&&` chains. `if user.is_some() && user.age > 18`
   is `TYP047`; rewrite to `if let Some(u) = user { if u.age > 18 }`.
 
-This is the deliberate v0 stance: a single, syntactic rule users
-can recognize without an inference engine. Kotlin-style smart
-casts are deferred; the spec may grow toward them in a later
-revision.
+This is the deliberate v0 stance: syntactic rules users can
+recognize without an inference engine — destructure, match-exit,
+or an exiting `if let None`. Kotlin-style smart casts are
+deferred; the spec may grow toward them in a later revision.
 
 ## SIMD and Tensor as language types
 
@@ -925,7 +933,7 @@ call. The compiler enforces `cache` and `frame` being `var`
 bindings and `frame` being assigned-after-call (it was `uninit`
 beforehand) by consulting the signature.
 
-### Optional narrowing — destructure or match-exit
+### Optional narrowing — destructure or early exit
 
 ```q64
 fn greet(user: User?) {
@@ -941,6 +949,11 @@ fn require_age(user: User?) -> i32 {
         Some(u) -> u.age,
         None    -> return -1,
     }
+}
+
+fn display_name(user: User?) -> str {
+    if let None = user { return "anonymous" }
+    user.name                       // narrowed: the None path exited
 }
 ```
 
