@@ -1113,6 +1113,9 @@ fn first<T>(items: [T]) -> T {
 fn nth_plus<T>(xs: [T], i: i64, fallback: T) -> i64 {
     fallback + xs.len + i
 }
+fn idr<T>(x: T) -> T {
+    x
+}
 fn main {
     show(Color { r: 255, g: 0 })
     let c = Color { r: 1, g: 2 }
@@ -1121,9 +1124,13 @@ fn main {
     env.out(twice(1.5))
     env.out(first([10, 20]))
     env.out(nth_plus([10, 20], 5, 100))
+    let f = first([Color { r: 9, g: 8 }, Color { r: 1, g: 2 }])
+    env.out(f.fmt())
+    let g = idr(f)
+    env.out(g.g)
 }
 Q64
-bgen_expected=$'rgb(255, 0)\nrgb(1, 2)\n42\n3.0\n10\n107'
+bgen_expected=$'rgb(255, 0)\nrgb(1, 2)\n42\n3.0\n10\n107\nrgb(9, 8)\n8'
 "$Q64_BIN" emit "$bgen_app" "$tmp/genbare.wasm"
 bgen_out="$("$HOST_BIN" "$tmp/genbare.wasm")"
 if [[ "$bgen_out" != "$bgen_expected" ]]; then
@@ -1136,6 +1143,6 @@ if [[ "$bgen32_out" != "$bgen_expected" ]]; then
     echo "FAIL: bare-T generic wasm32 output mismatch (got: $bgen32_out)" >&2
     exit 1
 fi
-echo "    ok: show<Color> + twice<i64/f64> + first<i64> + nth_plus -> rgb/42/3.0/10/107 (wasm64 + wasm32)"
+echo "    ok: show<Color> + twice<i64/f64> + first<i64/Color> + idr<Color> -> rgb/42/3.0/10/107/rgb(9, 8)/8 (wasm64 + wasm32)"
 
 echo "PASS: $qube_out"

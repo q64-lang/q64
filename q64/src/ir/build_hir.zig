@@ -369,10 +369,13 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = arr.e } };
                 try out.append(b.a, st);
-            } else if (try recCallStruct(b, init_expr)) |_| {
-                // `let p = make(3, 4)` — a record-returning call: bind the
-                // returned base pointer (the record lives in the scope arena).
-                const rv = (try buildRecExpr(b, init_expr, scope)) orelse return error.Unsupported;
+            } else if (if (init_expr == .call) try buildRecExpr(b, init_expr, scope) else null) |rv| {
+                // `let p = make(3, 4)` / `let c = first([...])` — a
+                // record-returning call (incl. a generic whose `-> T`
+                // inferred to a record): bind the returned base pointer
+                // (the record lives in the scope arena). Gated on `.call`
+                // so a bare `let q = p` stays the documented
+                // whole-record-copy rejection, not a silent alias.
                 try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
             } else {
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
@@ -2133,17 +2136,20 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     const key = try keybuf.toOwnedSlice(b.a);
     if (b.ids.get(key)) |id| return id;
 
+    // `-> T` returns the slot's type — a scalar by value, a record as
+    // its base pointer (`ret_rec` carries which struct, for fn_recs).
+    var ret_rec: ?*const StructInfo = null;
     const ret_ty: hir.Type = if (fd.returnType()) |rt| blk: {
-        // `-> T` returns the slot's type — a scalar for a scalar T;
-        // a record T (`.ptr`) needs the caller-side record plumbing
-        // (fn_recs through the generic path), a later slice.
         if (rt.type_()) |rte| if (sema.fits.typeWhich(rte, sig, b.a)) |which| {
             break :blk switch (slots[which].?.elem) {
                 .scalar => |t| t,
-                .rec => return error.Unsupported,
+                .rec => |si| rblk: {
+                    ret_rec = si;
+                    break :rblk .ptr;
+                },
             };
         };
-        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported; // str, records: later
+        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported; // str, concrete records: later
         break :blk switch (rs) {
             .bool, .i64, .f64, .f32 => rs,
             else => return error.Unsupported,
@@ -2152,6 +2158,8 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
 
     var scope = Scope{ .a = b.a };
     var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    var any_rec = false;
     const ps = fd.params() orelse return error.Unsupported;
     var pit = ps.iter();
     while (pit.next()) |p| {
@@ -2164,6 +2172,7 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
             const cnt_idx = try scope.declare(hidden, false, .i64);
             try params.append(b.a, .{ .name = pn, .ty = .ptr });
             try params.append(b.a, .{ .name = hidden, .ty = .i64 });
+            try rec_params.appendNTimes(b.a, null, 2);
             try scope.arrs.put(b.a, pn, .{
                 .ptr_idx = ptr_idx,
                 .count = .{ .local_idx = cnt_idx },
@@ -2179,10 +2188,13 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
                     _ = try scope.declare(pn, false, .ptr);
                     try scope.recs.put(b.a, pn, si);
                     try params.append(b.a, .{ .name = pn, .ty = .ptr });
+                    try rec_params.append(b.a, si);
+                    any_rec = true;
                 },
                 .scalar => |t| {
                     _ = try scope.declare(pn, false, t);
                     try params.append(b.a, .{ .name = pn, .ty = t });
+                    try rec_params.append(b.a, null);
                 },
             }
         } else {
@@ -2193,6 +2205,7 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
             };
             _ = try scope.declare(pn, false, pty);
             try params.append(b.a, .{ .name = pn, .ty = pty });
+            try rec_params.append(b.a, null);
         }
     }
     scope.n_params = @intCast(params.items.len);
@@ -2203,6 +2216,11 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     const dummy = try b.a.create(hir.Stmt);
     dummy.* = .{ .block = &.{} };
     try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy, .is_screen = true });
+    if (ret_rec != null or any_rec) {
+        try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = ret_rec });
+    } else {
+        rec_params.deinit(b.a);
+    }
 
     // The body builds entry-style (host statements allowed) with its own
     // locals list and rt map; locals index past the params.
@@ -2224,16 +2242,23 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     for (ast_stmts.items, 0..) |stmt, i| {
         if (ret_ty != .void and i == ast_stmts.items.len - 1) {
             // The value tail: a tail expression or an explicit `return`,
-            // typed as the declared return scalar. The lowering reads it
-            // as the value block's tail (lowerIntBlock).
+            // typed as the declared return — a record value for a record
+            // `-> T`, a scalar otherwise. The lowering reads it as the
+            // value block's tail (lowerIntBlock).
             const e: ast.Expr, const is_ret: bool = switch (stmt) {
                 .expr_stmt => |es| .{ es.expression() orelse return error.Unsupported, false },
                 .return_stmt => |rs| .{ rs.value() orelse return error.Unsupported, true },
                 else => return error.Unsupported, // a value `if` tail: later
             };
-            if (scalarBindTy(try exprScalar(b, e, &scope)) != ret_ty) return error.Unsupported;
+            const value: *hir.Expr = if (ret_rec) |want| rblk: {
+                const rv = (try buildRecExpr(b, e, &scope)) orelse return error.Unsupported;
+                if (rv.si != want) return reject(b, .unsupported_call); // a different struct
+                break :rblk rv.e;
+            } else sblk: {
+                if (scalarBindTy(try exprScalar(b, e, &scope)) != ret_ty) return error.Unsupported;
+                break :sblk try buildIntExpr(b, e, &scope);
+            };
             const st = try b.a.create(hir.Stmt);
-            const value = try buildIntExpr(b, e, &scope);
             st.* = if (is_ret) .{ .ret = value } else .{ .expr = value };
             try stmts.append(b.a, st);
         } else {
@@ -2272,7 +2297,9 @@ fn bindMainRecord(b: *Builder, scope: *Scope, name: []const u8, is_var: bool, va
 /// in the scope arena), a bare reference to a materialized record binding /
 /// record param, or a call to a record-returning function. `null` when the
 /// expression isn't record-shaped (the caller picks another path).
-fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct { e: *hir.Expr, si: *const StructInfo } {
+const RecValue = struct { e: *hir.Expr, si: *const StructInfo };
+
+fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue {
     switch (expr) {
         .paren => |p| return buildRecExpr(b, p.inner() orelse return error.Unsupported, scope),
         .record => |re| {
@@ -2341,6 +2368,9 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
             return .{ .e = try elemPtrExpr(b, ai, idx), .si = si };
         },
         .call => |cc| {
+            // A generic callee whose `-> T` resolved to a record: infer,
+            // stamp, and read the instance's record return (fn_recs).
+            if (try genericRecCall(b, cc, scope)) |gv| return gv;
             const si = (try recCallStruct(b, expr)) orelse return null;
             const callee_path = switch (cc.callee() orelse return error.Unsupported) {
                 .path => |p| p,
@@ -2356,6 +2386,31 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
         },
         else => return null,
     }
+}
+
+/// A call to a generic declaration whose `-> T` infers to a *record*:
+/// stamp it and yield the record-valued call. `null` when the callee
+/// isn't a generic with a type-param return, or T inferred to a scalar
+/// (the scalar path builds it — the stamp dedups).
+fn genericRecCall(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecValue {
+    const callee = cc.callee() orelse return null;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return null,
+    };
+    const cname = try cpath.text(b.a);
+    defer b.a.free(cname);
+    if (std.mem.indexOfScalar(u8, cname, '.') != null) return null;
+    const fd = b.resolver.lookup(cname) orelse return null;
+    if (!fd.isGeneric()) return null;
+    // Cheap syntactic pre-check: only a `-> T` return can be a record here.
+    const sig = parseGenericSig(fd.genericParams().?) orelse return null;
+    const rt = fd.returnType() orelse return null;
+    if (sema.fits.typeWhich(rt.type_() orelse return null, sig, b.a) == null) return null;
+    const e = try buildGenericCall(b, cname, fd, cc, scope);
+    const frec = b.fn_recs.get(e.call.func) orelse return null; // scalar T: not a record value
+    const si = frec.ret orelse return null;
+    return .{ .e = e, .si = si };
 }
 
 /// Build + check a call's arguments against the callee's parameter kinds
@@ -4602,7 +4657,40 @@ test "B5: bare `T` params + `-> T` returns (records by ptr, scalars by value)" {
     try testing.expect(std.mem.indexOf(u8, dump, "fn first<i64> -> i64") != null);
 }
 
-test "B5: a record `-> T` return is honestly unsupported (caller record plumbing)" {
+test "B5: record `-> T` returns bind and dispatch (first<Color> -> ptr)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct Color { r: i64 }
+        \\fit Color : D { fn fmt(self) -> str { "c{self.r}" } }
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn idr<T>(x: T) -> T {
+        \\    x
+        \\}
+        \\fn main {
+        \\    let c = first([Color { r: 9 }, Color { r: 1 }])
+        \\    env.out(c.fmt())
+        \\    env.out(c.r)
+        \\    let d = idr(c)
+        \\    env.out(d.r)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The instance returns the record's base pointer; fn_recs carries
+    // which struct, so the binding dispatches and reads fields.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn first<Color> -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn idr<Color> -> ptr") != null);
+}
+
+test "B5: printing a whole record value stays unsupported" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
     const src =

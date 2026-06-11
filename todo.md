@@ -950,9 +950,28 @@ verified, honest diagnostics throughout.
 - [ ] **B5 — generics beyond the first rung.** Monomorphization's v0
       floor landed with B4's close (one `<T: Face>` param, `[T]` slice
       params, record element types, void returns, statement calls).
-      Remaining: record `-> T` returns (caller-side record plumbing —
-      fn_recs through the generic path), const generics; then `dyn`
-      dispatch; enums + `match` lowering (separate ladders).
+      Remaining: const generics; then `dyn` dispatch; enums + `match`
+      lowering (separate ladders).
+      - [x] **Record `-> T` returns.** The `-> T` story closes: a
+            generic whose T infers to a record returns its base pointer
+            (`first<Color> -> ptr`), with the instance registered in
+            `fn_recs` (ret + per-param struct info) so callers know.
+            The pieces: `genericRecCall` intercepts `buildRecExpr`'s
+            call arm (cheap `-> T` pre-check, then infer/stamp and read
+            `fn_recs.ret`); the stamp's value tail builds via
+            `buildRecExpr` when the return is a record (struct-checked);
+            `main`'s let arm gates record-call bindings on a
+            `buildRecExpr` probe for `.call` initializers instead of
+            the name-based `recCallStruct` (a bare `let q = p` stays
+            the documented copy-rejection, not a silent alias). So
+            `let c = first([Color{…}, …]); c.fmt(); let d = idr(c)`
+            binds, dispatches, reads fields, and chains. **Boundary:**
+            method dispatch directly on a generic call expression
+            (`first([…]).fmt()`) wants recvStruct-without-building —
+            later; printing a whole record value stays unsupported.
+            Verified end-to-end wasm64 + wasm32 (roundtrip bare-T
+            section extended: `rgb(9, 8)` / `8`) + 2 unit tests.
+            368 unit / 80 CLI / 21-of-49 / roundtrips green.
       - [x] **Bare `T` params + scalar `-> T` returns.** The feared
             "receiver-by-value story" mostly dissolved: a record T
             already crosses calls as its base pointer (B2b), so
