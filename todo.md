@@ -973,10 +973,26 @@ verified, honest diagnostics throughout.
       → `Option`/`Result` in the prelude + generic enum declarations
       (landed) → enum returns from functions (landed) → `if let`
       narrowing (landed) → `T?` sugar (landed) → `try` (landed) →
-      match in callee bodies + enum params (landed) → next:
-      `while let`, the `From` conversion on `try` (cross-E
-      propagation), match in *record-returning* callee bodies,
-      statement-position callee matches with side-effecting arms.
+      match in callee bodies + enum params (landed) → match in
+      record-returning bodies (landed) → next: `while let`, the
+      `From` conversion on `try` (cross-E propagation),
+      statement-position callee matches with side-effecting arms,
+      `let x = match …` inside callees.
+      - [x] **Match in record-returning bodies.** Transform functions
+            close the loop: `fn flip(o: Option<i64>) -> Option<i64> {
+            match o { Some(v) -> Some(v * 2), None -> Some(0) } }` and
+            Option→Result conversion both work. `buildRecTailStmt`
+            gained a `match` arm (`buildRecMatch`): same value-if-chain
+            shape as `buildIntMatch`, with each arm built as a record
+            value of the declared enum (`recValueStmt` — a
+            wrong-enum arm rejects `unsupported_call`); exhaustive-
+            without-`_` promotes the last arm to the chain's else.
+            No lowering changes — the `.block` tail recursion from the
+            callee-match rung covers it. Verified end-to-end wasm64 +
+            wasm32 (roundtrip record-match section: `42 / flipped none
+            to 0 / err 7`) + 1 unit test (both transforms; wrong-enum
+            arm rejection). 395 unit / 81 CLI / 24-of-51 / roundtrips
+            green.
       - [x] **Match in callee bodies + matchable enum params.**
             `fn area(s: Shape) -> i64 { match s { Empty -> 0, … } }`
             and `fn unwrap_or(o: Option<i64>, d: i64) -> i64` work —

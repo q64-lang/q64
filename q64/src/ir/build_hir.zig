@@ -1488,8 +1488,57 @@ fn buildRecTailStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, want: *const Str
             out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
             return out;
         },
+        .match_stmt => |ms| return buildRecMatch(b, ms, scope, want),
         else => return error.Unsupported,
     }
+}
+
+/// A `match` as a record-returning body's tail: every arm is a `->`
+/// expression yielding the declared record/enum (`fn flip(o:
+/// Option<i64>) -> Option<i64> { match o { Some(v) -> Some(v * 2),
+/// None -> Some(0) } }`). Same shape as `buildIntMatch`, with
+/// record-valued arms; an exhaustive match without `_` promotes its
+/// last arm to the chain's else so every path yields.
+fn buildRecMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, want: *const StructInfo) BuildError!*hir.Stmt {
+    const scrut = ms.scrutinee() orelse return error.Unsupported;
+    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+    const boxed = info.si != null;
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, &stmts);
+
+    var arms: std.ArrayList(LoweredArm) = .empty;
+    defer arms.deinit(b.a);
+    var default: ?*hir.Stmt = null;
+    var seen: u64 = 0;
+    var it = ms.arms();
+    while (it.next()) |arm| {
+        const pat = arm.pattern() orelse return error.Unsupported;
+        // Pattern first: payload bindings must be in scope for the value.
+        const rp = try resolveArmPattern(b, info, pat, scope, s_idx);
+        const e = arm.expression() orelse return error.Unsupported; // value arms only
+        const vstmt = try recValueStmt(b, e, scope, want);
+        const body = try b.a.create(hir.Stmt);
+        body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+        const ap = rp orelse {
+            if (default != null) return error.Unsupported; // two `_` arms
+            default = body;
+            continue;
+        };
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
+        seen |= @as(u64, 1) << @intCast(ap.tag);
+    }
+    if (default == null and @popCount(seen) < info.variants.len) return error.Unsupported;
+    var arm_slice: []const LoweredArm = arms.items;
+    var dflt = default;
+    if (dflt == null) {
+        dflt = arm_slice[arm_slice.len - 1].body;
+        arm_slice = arm_slice[0 .. arm_slice.len - 1];
+    }
+    try foldMatchChain(b, s_idx, boxed, arm_slice, dflt, &stmts);
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try stmts.toOwnedSlice(b.a) };
+    return out;
 }
 
 /// Build `e` as a record value of exactly `want`, as a tail statement.
@@ -6439,4 +6488,54 @@ test "callee-body match: enum params + value if-chain tails" {
         \\}
         \\
     )) == null);
+}
+
+test "record-returning match tails: Option -> Option / Option -> Result" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn flip(o: Option<i64>) -> Option<i64> {
+        \\    match o {
+        \\        Some(v) -> Some(v * 2),
+        \\        None -> Some(0),
+        \\    }
+        \\}
+        \\fn to_result(o: Option<i64>, e: i64) -> Result<i64, i64> {
+        \\    match o {
+        \\        Some(v) -> Ok(v),
+        \\        None -> Err(e),
+        \\    }
+        \\}
+        \\fn main {
+        \\    match flip(Some(21)) {
+        \\        Some(v) -> env.out(v),
+        \\        None -> env.out("none"),
+        \\    }
+        \\    match to_result(None, 7) {
+        \\        Ok(v) -> env.out(v),
+        \\        Err(c) -> env.out(c),
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    // An arm yielding the wrong enum rejects (Result body, Option arm).
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    const src2 =
+        \\fn f(o: Option<i64>) -> Result<i64, i64> {
+        \\    match o {
+        \\        Some(v) -> Ok(v),
+        \\        None -> Some(0),
+        \\    }
+        \\}
+        \\fn main {
+        \\    let r = f(Some(1))
+        \\    env.out(1)
+        \\}
+        \\
+    ;
+    try tr2.addLib(src2);
+    const r = try rejectFromSource(testing.allocator, src2, tr2.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
 }

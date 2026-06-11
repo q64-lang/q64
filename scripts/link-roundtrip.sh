@@ -1551,4 +1551,48 @@ cmatch32_out="$("$HOST_BIN" "$tmp/cmatch32.wasm")"
 [[ "$cmatch32_out" == "$cmatch_expected" ]] || { echo "FAIL: callee-match wasm32 (got: $cmatch32_out)" >&2; exit 1; }
 echo "    ok: callee match -> 48 / 15 / 0 / 7 / 99 (wasm64 + wasm32)"
 
+# match in record-returning bodies: Option -> Option / Option -> Result
+# transform functions.
+echo "==> record match tails: flip / to_result"
+rmatch_app="$tmp/rmatch.q"
+cat > "$rmatch_app" <<'Q64'
+fn flip(o: Option<i64>) -> Option<i64> {
+    match o {
+        Some(v) -> Some(v * 2),
+        None -> Some(0),
+    }
+}
+fn to_result(o: Option<i64>, e: i64) -> Result<i64, i64> {
+    match o {
+        Some(v) -> Ok(v),
+        None -> Err(e),
+    }
+}
+fn find(n: i64) -> i64? {
+    if n > 0 { Some(n) } else { None }
+}
+fn main {
+    match flip(find(21)) {
+        Some(v) -> env.out(v),
+        None -> env.out("none"),
+    }
+    match flip(find(0 - 1)) {
+        Some(v) -> env.out("flipped none to {v}"),
+        None -> env.out("none"),
+    }
+    match to_result(find(0 - 4), 7) {
+        Ok(v) -> env.out(v),
+        Err(c) -> env.out("err {c}"),
+    }
+}
+Q64
+rmatch_expected=$'42\nflipped none to 0\nerr 7'
+"$Q64_BIN" emit "$rmatch_app" "$tmp/rmatch.wasm"
+rmatch_out="$("$HOST_BIN" "$tmp/rmatch.wasm")"
+[[ "$rmatch_out" == "$rmatch_expected" ]] || { echo "FAIL: rec-match (got: $rmatch_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$rmatch_app" "$tmp/rmatch32.wasm" --addr wasm32
+rmatch32_out="$("$HOST_BIN" "$tmp/rmatch32.wasm")"
+[[ "$rmatch32_out" == "$rmatch_expected" ]] || { echo "FAIL: rec-match wasm32 (got: $rmatch32_out)" >&2; exit 1; }
+echo "    ok: record match tails -> 42 / flipped none to 0 / err 7 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
