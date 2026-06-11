@@ -644,7 +644,16 @@ verified, honest diagnostics throughout.
       - [ ] `PAR040` re-land on name kinds (generic-call vs
             chained-comparison — the reverted parser heuristic, see "Other
             open items").
-      - [ ] Fit registry (with B3's structured face/fit method grammar).
+      - [x] Fit registry (`sema/fits.zig`, on B3's structured grammar):
+            classifies faces single- vs multi-param by the mechanical
+            spec/faces.md rule (any `self` method → single; methods but
+            no `self` → multi; prelude faces all single), registers fits
+            keyed (target, face) with a `find()` for B4 dispatch, and
+            emits **TYP201/TYP202** on the wrong written form. Wired
+            into `q64 check` + catalog. Conformance **18 → 20 of 48**
+            (both `faces/wrong-fit-form-*.q` flip); 4 sema unit tests +
+            a check.test.ts envelope case (79 CLI tests). Unknown
+            (cross-module) faces stay silent — the NAM story.
 - [x] **A2 — type representation (core).** `sema/types.zig`: an interned,
       structural `TypeStore` — the builtin tower (i8…i128/u8…u128/f16…f64/
       bool/str/void per `spec/types.md`), named types resolved against the
@@ -849,6 +858,13 @@ verified, honest diagnostics throughout.
       call. No vtables, no monomorphization, no `dyn`. Definition of done: the
       `spec/tests/golden/library-face-fit.q` program compiles and runs;
       `spec/tests/faces/wrong-fit-form-*.q` fixtures pass.
+      - [x] First slice done: the fit registry + TYP201/TYP202 (see the
+            A1 fit-registry item) — the `wrong-fit-form-*.q` half of the
+            definition of done. Remaining: `p.fmt()` static dispatch in
+            the emit path (registry lookup → direct call with `p` as the
+            `self` receiver — B2b's record params are the ABI), then the
+            golden program's other needs (u8 fields, `[T]` arrays +
+            `for`, format specs `{x:02x}`, generic `print_all<T: Face>`).
 - [ ] **B5 — later (separate ladders).** Face-bounded generics +
       monomorphization; `dyn` dispatch; enums + `match` lowering (can start
       after A2 in parallel with B).

@@ -170,6 +170,20 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
                 .offset = cd.offset,
             });
         }
+
+        // The fit registry + fit-form checks (TYP201 / TYP202,
+        // spec/faces.md Â§"Fit declaration").
+        var fitreg = try sema.fits.build(gpa, sf);
+        defer fitreg.deinit();
+        for (fitreg.diags.items) |fd| {
+            try all_diags.append(gpa, .{
+                .code = fd.code,
+                .severity = .err,
+                .message = diag.messageFor(fd.code),
+                .file = path,
+                .offset = fd.offset,
+            });
+        }
     }
 
     var has_error = false;
