@@ -267,6 +267,7 @@ pub const SyntaxKind = enum {
     IF_STMT,
     IF_COND_LET, // `let Pattern = expr` form of an if condition
     MATCH_STMT,
+    MATCH_EXPR, // `match` in expression position (same shape as MATCH_STMT)
     MATCH_ARM,
     FOR_STMT,
     LOOP_STMT,

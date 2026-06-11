@@ -1303,6 +1303,20 @@ pub const MatchStmt = struct {
     }
 };
 
+/// `match` in expression position (`let x = match l { … }`) — the
+/// same scrutinee/arms shape as `MatchStmt`, yielding a value.
+pub const MatchExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn scrutinee(self: MatchExpr) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+
+    pub fn arms(self: MatchExpr) MatchArmIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
 pub const MatchArmIter = struct {
     children: []const cst.Element,
     i: usize = 0,
@@ -1425,11 +1439,13 @@ pub const Expr = union(enum) {
     paren: ParenExpr,
     array: ArrayExpr,
     record: RecordExpr,
+    match: MatchExpr,
 
     pub fn cast(node: *const cst.Node) ?Expr {
         return switch (node.kind) {
             .CALL_EXPR => .{ .call = .{ .cst = node } },
             .RECORD_EXPR => .{ .record = .{ .cst = node } },
+            .MATCH_EXPR => .{ .match = .{ .cst = node } },
             .PATH_EXPR => .{ .path = .{ .cst = node } },
             .STR_LITERAL => .{ .string_lit = .{ .cst = node } },
             .NUM_LITERAL => .{ .num_lit = .{ .cst = node } },

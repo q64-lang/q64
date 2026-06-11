@@ -1192,4 +1192,50 @@ if [[ "$enum32_out" != "$enum_expected" ]]; then
 fi
 echo "    ok: match on Light -> slow / moving+fast / direct red (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# C2 (value match): match as an expression — let initializers and assignment
+# RHS, i64 and f64 yields, desugared to per-arm assignments of the target.
+# ---------------------------------------------------------------------------
+echo "==> C2: value match — let secs = match l { ... }"
+vmatch_app="$tmp/vmatch.q"
+cat > "$vmatch_app" <<'Q64'
+enum Light { Red, Yellow, Green }
+fn main {
+    var l = Light.Yellow
+    let secs = match l {
+        Red -> 30,
+        Yellow -> 5,
+        Green -> 45,
+    }
+    env.out("wait {secs}s")
+    let rate = match l {
+        Red -> 0.0,
+        _ -> 1.5,
+    }
+    env.out(rate)
+    var n = 0
+    l = Light.Green
+    n = match l {
+        Red -> 1,
+        Yellow -> 2,
+        Green -> 3,
+    }
+    env.out(n + 100)
+}
+Q64
+vmatch_expected=$'wait 5s\n1.5\n103'
+"$Q64_BIN" emit "$vmatch_app" "$tmp/vmatch.wasm"
+vmatch_out="$("$HOST_BIN" "$tmp/vmatch.wasm")"
+if [[ "$vmatch_out" != "$vmatch_expected" ]]; then
+    echo "FAIL: value-match output mismatch (got: $vmatch_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$vmatch_app" "$tmp/vmatch-32.wasm" --addr wasm32
+vmatch32_out="$("$HOST_BIN" "$tmp/vmatch-32.wasm")"
+if [[ "$vmatch32_out" != "$vmatch_expected" ]]; then
+    echo "FAIL: value-match wasm32 output mismatch (got: $vmatch32_out)" >&2
+    exit 1
+fi
+echo "    ok: value match -> wait 5s / 1.5 / 103 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

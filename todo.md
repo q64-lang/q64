@@ -967,13 +967,32 @@ verified, honest diagnostics throughout.
 
 - [ ] **C — enums + `match`.** The biggest blocked language surface
       (the conformance corpus and `errors.md` lean on `match`).
-      Rungs: C1 unit variants + statement `match` (landed below) →
-      C2 value `match` (match as an expression: arms yield a scalar)
-      → C3 payload variants (tag + payload layout in the arena;
-      `Some(v)` construction; pattern bindings) → C4 `match` on
-      scalars/strs with literal patterns → exhaustiveness diagnostics
-      in `q64 check` (the TYP3xx band) → `Option`/`Result` in the
-      prelude.
+      Rungs: C1 unit variants + statement `match` (landed) → C2
+      value `match` (landed) → C3 payload variants (tag + payload
+      layout in the arena; `Some(v)` construction; pattern bindings)
+      → C4 `match` on scalars/strs with literal patterns →
+      exhaustiveness diagnostics in `q64 check` (the TYP3xx band) →
+      `Option`/`Result` in the prelude.
+      - [x] **C2 — value `match` (let initializers + assignment RHS,
+            scalar yields).** `match` parses in expression position
+            now (`MATCH_EXPR` primary sharing `parseMatch` with the
+            statement form — grammar.md already said match yields a
+            value; `ast.Expr.match` view). The builder desugars: a
+            `let x = match l { … }` declares a hidden result local,
+            lowers the match with each arm assigning it (the same
+            scrutinee/tag/exhaustiveness machinery as C1, shared via
+            `foldMatchChain`/`LoweredArm`), then binds the name
+            reading the result — so an initializer can't see itself.
+            `x = match …` assigns the target directly (plain `=`
+            only, type-checked). The yield type is the first arm's
+            scalar (`matchValueTy`); every arm checks against it —
+            i64/f64/bool/f32, no mixing; str/record arms and other
+            expression positions (`env.out(match …)`, call args) are
+            later. Verified end-to-end wasm64 + wasm32 (roundtrip C2
+            section: `wait 5s` / `1.5` / `103`) + 2 unit tests
+            (let/assign + f64 yield; mixed-type and non-exhaustive
+            rejections). 374 unit / 80 CLI / 21-of-49 / roundtrips
+            green.
       - [x] **C1 — all-unit enums + statement `match` in `main` (and
             stamped generic bodies — they share the builder).**
             A variant value is its **declaration-order tag** (an i64

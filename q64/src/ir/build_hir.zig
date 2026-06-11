@@ -314,6 +314,26 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     return;
                 }
             }
+            // C2: a value-`match` initializer (`let x = match l { … }`):
+            // desugar into a hidden result local assigned per arm, then
+            // bind the name reading it (the name is NOT in scope inside
+            // the arms — an initializer can't see itself).
+            if (init_expr == .match) {
+                const mty = try matchValueTy(b, init_expr.match, scope);
+                scope.next_idx = @intCast(b.cur_locals.items.len);
+                const res_idx = try scope.declare("#mres", true, mty);
+                try b.cur_locals.append(b.a, mty);
+                try buildMatchInto(b, init_expr.match, scope, rt, out, res_idx, mty);
+                scope.next_idx = @intCast(b.cur_locals.items.len);
+                const bidx = try scope.declare(nm.text, ls.isVar(), mty);
+                try b.cur_locals.append(b.a, mty);
+                const read = try b.a.create(hir.Expr);
+                read.* = .{ .local = .{ .idx = res_idx, .ty = mty } };
+                const bst = try b.a.create(hir.Stmt);
+                bst.* = .{ .let = .{ .idx = bidx, .value = read } };
+                try out.append(b.a, bst);
+                return;
+            }
             // Otherwise a runtime str binding (`let g = shout("hi")`): build
             // the str value and store its (ptr, len) into two new locals.
             if (init_expr == .string_lit or (try isStrCall(b, init_expr, scope))) {
@@ -427,6 +447,16 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             defer b.a.free(tname);
             const op = as.op() orelse return error.Unsupported;
             const rhs_ast = as.value() orelse return error.Unsupported;
+            // C2: `x = match l { … }` — desugar the value match into
+            // per-arm assignments of the target.
+            if (rhs_ast == .match) {
+                const mloc = scope.find(tname) orelse return error.Unsupported;
+                if (!mloc.mutable) return reject(b, .immutable_assign);
+                if (op.kind != .EQ) return error.Unsupported;
+                if ((try matchValueTy(b, rhs_ast.match, scope)) != mloc.ty) return error.Unsupported;
+                try buildMatchInto(b, rhs_ast.match, scope, rt, out, mloc.idx, mloc.ty);
+                return;
+            }
             const st = try b.a.create(hir.Stmt);
             if (scope.find(tname)) |loc| {
                 // Local reassignment (`x = …`, `x += …`). A bool is not an int:
@@ -624,8 +654,7 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
     try out.append(b.a, set);
 
     // Collect the arms: (tag, body) pairs + at most one `_` default.
-    const Arm = struct { tag: i64, body: *hir.Stmt };
-    var arms: std.ArrayList(Arm) = .empty;
+    var arms: std.ArrayList(LoweredArm) = .empty;
     defer arms.deinit(b.a);
     var default: ?*hir.Stmt = null;
     var covered: usize = 0;
@@ -653,14 +682,22 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
     // floor requires it structurally): every variant, or a default.
     if (default == null and covered < info.variants.len) return error.Unsupported;
 
-    // Fold the arms back-to-front into an if/else chain on the tag.
-    // The lowering reads branch payloads as blocks, so a nested `if`
-    // (the rest of the chain) wraps in a one-statement block.
+    try foldMatchChain(b, s_idx, arms.items, default, out);
+}
+
+/// One lowered match arm: the variant's tag + the body block.
+const LoweredArm = struct { tag: i64, body: *hir.Stmt };
+
+/// Fold lowered arms back-to-front into an if/else chain comparing the
+/// scrutinee local against each tag. The lowering reads branch
+/// payloads as blocks, so a nested `if` (the rest of the chain) wraps
+/// in a one-statement block.
+fn foldMatchChain(b: *Builder, s_idx: u32, arms: []const LoweredArm, default: ?*hir.Stmt, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     var chain: ?*hir.Stmt = default;
-    var i = arms.items.len;
+    var i = arms.len;
     while (i > 0) {
         i -= 1;
-        const a = arms.items[i];
+        const a = arms[i];
         const sread = try b.a.create(hir.Expr);
         sread.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
         const tagv = try b.a.create(hir.Expr);
@@ -680,6 +717,71 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
         chain = st;
     }
     if (chain) |c| try out.append(b.a, c);
+}
+
+/// The scalar a value `match` yields: the first arm's expression type
+/// (every arm is checked against it during the build). Scalars only —
+/// str/record arms are later rungs.
+fn matchValueTy(b: *Builder, me: ast.MatchExpr, scope: *const Scope) BuildError!hir.Type {
+    var it = me.arms();
+    const arm = it.next() orelse return error.Unsupported;
+    const e = arm.expression() orelse return error.Unsupported;
+    const sc = try exprScalar(b, e, scope);
+    if (sc == .narrow_int or sc == .str) return error.Unsupported;
+    return scalarBindTy(sc);
+}
+
+/// C2: a value `match` desugared into per-arm assignments of
+/// `target_idx` (type `ty`). The same scrutinee/tag/exhaustiveness
+/// rules as the statement form; arms are `->` value expressions.
+fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt), target_idx: u32, ty: hir.Type) BuildError!void {
+    _ = rt; // arm values are scalar expressions (str arms: later)
+    const scrut = me.scrutinee() orelse return error.Unsupported;
+    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+
+    // Evaluate the scrutinee once.
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const s_idx = try scope.declare("#match", false, .i64);
+    try b.cur_locals.append(b.a, .i64);
+    const sval = try buildIntExpr(b, scrut, scope);
+    const set = try b.a.create(hir.Stmt);
+    set.* = .{ .let = .{ .idx = s_idx, .value = sval } };
+    try out.append(b.a, set);
+
+    var arms: std.ArrayList(LoweredArm) = .empty;
+    defer arms.deinit(b.a);
+    var default: ?*hir.Stmt = null;
+    var covered: usize = 0;
+    var it = me.arms();
+    while (it.next()) |arm| {
+        const pat = arm.pattern() orelse return error.Unsupported;
+        const e = arm.expression() orelse return error.Unsupported; // value arms only
+        if (scalarBindTy(try exprScalar(b, e, scope)) != ty) return error.Unsupported;
+        const value = try buildIntExpr(b, e, scope);
+        const asn = try b.a.create(hir.Stmt);
+        asn.* = .{ .assign = .{ .idx = target_idx, .value = value } };
+        const body = try b.a.create(hir.Stmt);
+        body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{asn}) };
+        switch (pat.kind()) {
+            .WILD_PATTERN => {
+                if (default != null) return error.Unsupported; // two `_` arms
+                default = body;
+            },
+            .IDENT_PATTERN => {
+                const nm = pat.bindingName() orelse return error.Unsupported;
+                const tag = for (info.variants, 0..) |v, i| {
+                    if (std.mem.eql(u8, v, nm.text)) break @as(i64, @intCast(i));
+                } else return reject(b, .name_not_found);
+                try arms.append(b.a, .{ .tag = tag, .body = body });
+                covered += 1;
+            },
+            else => return error.Unsupported, // payload/literal patterns: later
+        }
+    }
+    // Structural exhaustiveness, like the statement form.
+    if (default == null and covered < info.variants.len) return error.Unsupported;
+
+    try foldMatchChain(b, s_idx, arms.items, default, out);
 }
 
 /// A match arm's body as one HIR block: a `{ … }` block of statements,
@@ -5129,4 +5231,73 @@ test "C1: an arm naming a non-variant rejects NameNotFound" {
     try tr.addLib(src);
     const r = try rejectFromSource(testing.allocator, src, tr.resolver());
     try testing.expectEqual(hir.Reject.name_not_found, r.?);
+}
+
+test "C2: value match — let and assign positions, i64 and f64 yields" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum Light { Red, Yellow, Green }
+        \\fn main {
+        \\    var l = Light.Yellow
+        \\    let secs = match l {
+        \\        Red -> 30,
+        \\        Yellow -> 5,
+        \\        Green -> 45,
+        \\    }
+        \\    env.out("wait {secs}s")
+        \\    let rate = match l {
+        \\        Red -> 0.0,
+        \\        _ -> 1.5,
+        \\    }
+        \\    env.out(rate)
+        \\    var n = 0
+        \\    n = match l {
+        \\        Red -> 1,
+        \\        _ -> 2,
+        \\    }
+        \\    env.out(n)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The desugar assigns the result local in every arm and the
+    // binding reads it; the f64 match keeps its float type.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_float") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null);
+}
+
+test "C2: mixed arm types and non-exhaustive value match are unsupported" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // i64 vs f64 arms never mix.
+    try testing.expect((try buildLocal(testing.allocator, &tr,
+        \\enum L { A, B }
+        \\fn main {
+        \\    let x = match L.A {
+        \\        A -> 1,
+        \\        B -> 2.5,
+        \\    }
+        \\    env.out(x)
+        \\}
+        \\
+    )) == null);
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    // A value match must cover every variant or have a `_`.
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\enum L { A, B, C }
+        \\fn main {
+        \\    let x = match L.A {
+        \\        A -> 1,
+        \\        B -> 2,
+        \\    }
+        \\    env.out(x)
+        \\}
+        \\
+    )) == null);
 }

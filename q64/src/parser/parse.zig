@@ -1526,6 +1526,13 @@ const Parser = struct {
 
     /// `MatchStmt := "match" Expr "{" MatchArm ("," MatchArm)* ","? "}"`.
     fn parseMatchStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        return self.parseMatch(.MATCH_STMT);
+    }
+
+    /// One grammar, two positions: a `match` statement or a `match`
+    /// expression (`let x = match l { … }`) — only the node kind
+    /// differs (spec/grammar.md: `match` yields a value).
+    fn parseMatch(self: *Parser, kind: cst.SyntaxKind) std.mem.Allocator.Error!*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // match
         try self.eatTrivia(&children);
@@ -1548,7 +1555,7 @@ const Parser = struct {
                 try children.append(self.arena, .{ .token = self.advance() });
             }
         }
-        return try cst.makeNode(self.arena, .MATCH_STMT, children.items);
+        return try cst.makeNode(self.arena, kind, children.items);
     }
 
     /// `MatchArm := Pattern "->" (Block | Expr)`. Pattern is a raw span.
@@ -1985,6 +1992,7 @@ const Parser = struct {
         }
         if (k == .L_PAREN) return self.parseParenOrTuple();
         if (k == .L_BRACK) return self.parseArrayExpr();
+        if (k == .KW_MATCH) return self.parseMatch(.MATCH_EXPR);
         if (isPathStart(k)) return self.parsePath();
         return self.parseUnknownExpr();
     }
