@@ -53,6 +53,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
+        .host_out_float => |e| {
+            try app(gpa, out, "host_out_float ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
         .host_out_str => |e| {
             try app(gpa, out, "host_out_str ", .{});
             try hirExpr(gpa, out, e);
@@ -137,6 +142,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
     switch (e.*) {
         .str_const => |b| try app(gpa, out, "\"{s}\"", .{b}),
         .int_const => |v| try app(gpa, out, "{d}", .{v}),
+        .float_const => |v| try app(gpa, out, "{d}f", .{v}),
         .bool_const => |v| try app(gpa, out, "{s}", .{if (v) "true" else "false"}),
         .local => |l| try app(gpa, out, "local#{d}", .{l.idx}),
         .global_get => |i| try app(gpa, out, "global#{d}", .{i}),
@@ -178,6 +184,11 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
         .str_binding => |sb| try app(gpa, out, "str_binding[{d},{d}]", .{ sb.ptr_idx, sb.len_idx }),
         .fmt_int => |inner| {
             try app(gpa, out, "fmt_int(", .{});
+            try hirExpr(gpa, out, inner);
+            try app(gpa, out, ")", .{});
+        },
+        .fmt_float => |inner| {
+            try app(gpa, out, "fmt_float(", .{});
             try hirExpr(gpa, out, inner);
             try app(gpa, out, ")", .{});
         },
@@ -287,6 +298,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             for (hc.args) |a| try mirInst(gpa, out, a, depth + 1);
         },
         .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
+        .const_f64 => |v| try app(gpa, out, "const_f64 {d}\n", .{v}),
         .const_i32 => |v| try app(gpa, out, "const_i32 {d}\n", .{v}),
         .local_get => |i| try app(gpa, out, "local_get {d}\n", .{i}),
         .global_get => |i| try app(gpa, out, "global_get {d}\n", .{i}),
@@ -316,6 +328,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "host_out_int nl_off={d}\n", .{hi.nl_off});
             try mirInst(gpa, out, hi.value, depth + 1);
         },
+        .host_out_float => |hf| {
+            try app(gpa, out, "host_out_float nl_off={d}\n", .{hf.nl_off});
+            try mirInst(gpa, out, hf.value, depth + 1);
+        },
         .str_const_val => |sc| try app(gpa, out, "str_const_val off={d} len={d}\n", .{ sc.off, sc.len }),
         .str_param => |idx| try app(gpa, out, "str_param {d}\n", .{idx}),
         .str_concat => |pieces| {
@@ -333,6 +349,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         },
         .fmt_int_to_str => |inner| {
             try app(gpa, out, "fmt_int_to_str\n", .{});
+            try mirInst(gpa, out, inner, depth + 1);
+        },
+        .fmt_float_to_str => |inner| {
+            try app(gpa, out, "fmt_float_to_str\n", .{});
             try mirInst(gpa, out, inner, depth + 1);
         },
         .str_len => |s| {

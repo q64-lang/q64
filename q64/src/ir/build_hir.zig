@@ -267,8 +267,11 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             // An immutable `let` whose initializer const-folds (incl. a
             // const-bodied call, e.g. `let v = version()`) becomes a
             // compile-time binding. A `var` is mutable, so it must stay a real
-            // runtime local even when its initializer is constant.
-            if (!ls.isVar()) {
+            // runtime local even when its initializer is constant. Floats
+            // never const-fold (the evaluator is integer/text-only): an f64
+            // initializer goes straight to a typed runtime local so later
+            // arithmetic sees a real f64 binding.
+            if (!ls.isVar() and (try exprScalar(b, init_expr, scope)) != .f64) {
                 b.eval.fold_calls = true;
                 const folded = try tryConst(b, init_expr);
                 b.eval.fold_calls = false;
@@ -317,7 +320,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     const fname = fi.name() orelse return error.Unsupported;
                     const fval = fi.value() orelse return error.Unsupported; // shorthand: later
                     const full = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ nm.text, fname.text });
-                    const lty: hir.Type = if (try exprIsBool(b, fval, scope)) .bool else .i64;
+                    const lty: hir.Type = scalarBindTy(try exprScalar(b, fval, scope));
                     scope.next_idx = @intCast(b.main_locals.items.len);
                     const value = try buildIntExpr(b, fval, scope);
                     const idx = try scope.declare(full, ls.isVar(), lty);
@@ -336,7 +339,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
                 // bool (`let even = n % 2 == 0`, `var flag = true`). A bool
                 // binding takes one slot too — its value is an i32 0/1.
-                const lty: hir.Type = if (try exprIsBool(b, init_expr, scope)) .bool else .i64;
+                const lty: hir.Type = scalarBindTy(try exprScalar(b, init_expr, scope));
                 // Build the initializer first so it can't see its own name,
                 // then allocate a single local and register in scope so later
                 // expressions can resolve it. The local index is the current
@@ -397,6 +400,9 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
                 // binding, or a `-> bool` call. Printed as "true" / "false".
                 st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
+            } else if ((try exprScalar(b, arg, scope)) == .f64) {
+                // An f64: formatted via __fmt_f64 (decimal, ≤6 frac digits).
+                st.* = .{ .host_out_float = try buildIntExpr(b, arg, scope) };
             } else {
                 // Otherwise an i64 expression (a call to an i64 function).
                 const e = try buildIntExpr(b, arg, scope);
@@ -420,9 +426,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // a plain `=` must match the binding's type; compound ops are
                 // arithmetic (i64 only).
                 if (!loc.mutable) return reject(b, .immutable_assign);
-                const rhs_is_bool = try exprIsBool(b, rhs_ast, scope);
+                const rhs_sc = try exprScalar(b, rhs_ast, scope);
                 if (op.kind == .EQ) {
-                    if ((loc.ty == .bool) != rhs_is_bool) return error.Unsupported;
+                    if (scalarBindTy(rhs_sc) != loc.ty) return error.Unsupported;
+                } else if (loc.ty == .f64) {
+                    // f64 compound assigns: arithmetic only, no `%=`.
+                    if (op.kind == .PERCENT_EQ or rhs_sc != .f64) return error.Unsupported;
                 } else if (loc.ty != .i64) {
                     return error.Unsupported;
                 }
@@ -441,9 +450,11 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // Same typing discipline as a local: plain `=` must match the
                 // field's type; compound ops are i64 arithmetic.
                 if (!rf.mutable) return reject(b, .immutable_assign);
-                const rhs_is_bool = try exprIsBool(b, rhs_ast, scope);
+                const rhs_sc = try exprScalar(b, rhs_ast, scope);
                 if (op.kind == .EQ) {
-                    if ((rf.ty == .bool) != rhs_is_bool) return error.Unsupported;
+                    if (scalarBindTy(rhs_sc) != rf.ty) return error.Unsupported;
+                } else if (rf.ty == .f64) {
+                    if (op.kind == .PERCENT_EQ or rhs_sc != .f64) return error.Unsupported;
                 } else if (rf.ty != .i64) {
                     return error.Unsupported;
                 }
@@ -732,10 +743,10 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     const ret_ty: hir.Type = if (rec_ret != null) .ptr else blk: {
         const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
         if (rs == .str) return registerStrFunc(b, name, fd);
-        // An i64 or a `-> bool` (i32 0/1) value function; both have i64 params
-        // and a value body built by `buildIntBlock`.
+        // An i64, f64, or `-> bool` (i32 0/1) value function; the value
+        // body builds through `buildIntBlock` whatever the scalar.
         break :blk switch (rs) {
-            .bool, .i64 => rs,
+            .bool, .i64, .f64 => rs,
             else => return error.Unsupported,
         };
     };
@@ -754,7 +765,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
             const pn = (p.name() orelse return error.Unsupported).text;
             if (try paramScalar(b, p)) |psc| {
                 const pty: hir.Type = switch (psc) {
-                    .bool, .i64 => psc,
+                    .bool, .i64, .f64 => psc,
                     else => return error.Unsupported,
                 };
                 _ = try scope.declare(pn, false, pty);
@@ -1088,6 +1099,11 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                                             w.* = .{ .fmt_int = call_e };
                                             break :blk2 w;
                                         },
+                                        .f64 => blk3: {
+                                            const w = try b.a.create(hir.Expr);
+                                            w.* = .{ .fmt_float = call_e };
+                                            break :blk3 w;
+                                        },
                                         else => return error.Unsupported, // a bool has no text form here yet
                                     };
                                     try pieces.append(b.a, piece);
@@ -1131,14 +1147,15 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                     if (scope.find(ptext)) |loc| {
                         try flush(b, &lit, &pieces);
                         const piece = try b.a.create(hir.Expr);
-                        // A str local (callee param) passes through as-is; an
-                        // i64 local interpolates as its decimal text.
+                        // A str local (callee param) passes through as-is; a
+                        // numeric local interpolates as its decimal text
+                        // (i64 via __fmt_i64, f64 via __fmt_f64).
                         if (loc.ty == .str) {
                             piece.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
                         } else {
                             const lref = try b.a.create(hir.Expr);
                             lref.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
-                            piece.* = .{ .fmt_int = lref };
+                            piece.* = if (loc.ty == .f64) .{ .fmt_float = lref } else .{ .fmt_int = lref };
                         }
                         try pieces.append(b.a, piece);
                     } else if (rtBinding(rt, ptext)) |bnd| {
@@ -1147,12 +1164,15 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                         e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
                         try pieces.append(b.a, e);
                     } else if (try findRecField(scope, ptext)) |rf| {
-                        // `{p.x}` on a materialized record: format the i64
-                        // field. (A bool field has no text form here yet.)
-                        if (rf.ty != .i64) return error.Unsupported;
+                        // `{p.x}` on a materialized record: format the
+                        // numeric field. (A bool field has no text form yet.)
+                        if (rf.ty != .i64 and rf.ty != .f64) return error.Unsupported;
                         try flush(b, &lit, &pieces);
                         const piece = try b.a.create(hir.Expr);
-                        piece.* = .{ .fmt_int = try recFieldExpr(b, rf) };
+                        piece.* = if (rf.ty == .f64)
+                            .{ .fmt_float = try recFieldExpr(b, rf) }
+                        else
+                            .{ .fmt_int = try recFieldExpr(b, rf) };
                         try pieces.append(b.a, piece);
                     } else {
                         // A const binding folds into the run; otherwise defer.
@@ -1288,7 +1308,7 @@ fn paramScalar(b: *Builder, p: ast.Param) std.mem.Allocator.Error!?hir.Type {
 /// spec/memory.md §"Linear struct layout". `null` = outside the floor.
 fn fieldWidth(ty: hir.Type) ?struct { size: u32, alignment: u32 } {
     return switch (ty) {
-        .i64 => .{ .size = 8, .alignment = 8 },
+        .i64, .f64 => .{ .size = 8, .alignment = 8 },
         .bool => .{ .size = 1, .alignment = 1 },
         else => null,
     };
@@ -1498,7 +1518,7 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     const rt = m.returnType() orelse return error.Unsupported;
     const rs = (try semaScalar(b, rt.type_())) orelse return error.Unsupported;
     const ret_ty: hir.Type = switch (rs) {
-        .bool, .i64, .str => rs,
+        .bool, .i64, .f64, .str => rs,
         else => return error.Unsupported, // record-valued methods: later
     };
 
@@ -1516,7 +1536,7 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     while (pit.next()) |p| {
         const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
         const pty: hir.Type = switch (psc) {
-            .bool, .i64 => psc,
+            .bool, .i64, .f64 => psc,
             else => return error.Unsupported,
         };
         const pn = (p.name() orelse return error.Unsupported).text;
@@ -1607,8 +1627,9 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
                 const fname = fi.name() orelse return error.Unsupported;
                 const fval = fi.value() orelse return error.Unsupported; // shorthand inits: later
                 const f = si.field(fname.text) orelse return error.Unsupported;
-                // A bool is not an int: the value's kind must match the field.
-                if ((f.ty == .bool) != (try exprIsBool(b, fval, scope))) return error.Unsupported;
+                // No implicit conversion: the value's scalar kind must
+                // match the field's declared type.
+                if (scalarBindTy(try exprScalar(b, fval, scope)) != f.ty) return error.Unsupported;
                 try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildIntExpr(b, fval, scope) });
                 seen += 1;
             }
@@ -1665,7 +1686,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
     // Snapshot the parameter kinds before building the args — building an
     // argument may register a new callee and grow `b.funcs`, so we can't
     // hold a slice into it across the loop.
-    const ParamKind = union(enum) { int, bool_, rec: *const StructInfo };
+    const ParamKind = union(enum) { int, float, bool_, rec: *const StructInfo };
     const np = b.funcs.items[id].params.len;
     const kinds = try b.a.alloc(ParamKind, np);
     const frec = b.fn_recs.get(id);
@@ -1673,6 +1694,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
         kinds[k] = switch (p.ty) {
             .bool => .bool_,
             .i64 => .int,
+            .f64 => .float,
             // A `.ptr` param is a record on this path (str callees never get here).
             .ptr => .{ .rec = (frec orelse return error.Unsupported).params[k] orelse return error.Unsupported },
             else => return error.Unsupported,
@@ -1694,9 +1716,15 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
                 if (rv.si != want) return reject(b, .unsupported_call); // a different struct
                 try args.append(b.a, rv.e);
             },
-            // A bool is not an int: each arg's kind must match its parameter.
+            // No implicit conversion: each arg's scalar kind must match
+            // its parameter (bool ≠ int ≠ float).
             .int => {
-                if (try exprIsBool(b, a, scope)) return reject(b, .unsupported_call);
+                const sc = try exprScalar(b, a, scope);
+                if (sc == .bool or sc == .f64) return reject(b, .unsupported_call);
+                try args.append(b.a, try buildIntExpr(b, a, scope));
+            },
+            .float => {
+                if ((try exprScalar(b, a, scope)) != .f64) return reject(b, .unsupported_call);
                 try args.append(b.a, try buildIntExpr(b, a, scope));
             },
             .bool_ => {
@@ -1717,12 +1745,28 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
 /// collapse into sema's own tables when name lookup moves there
 /// (A3 final slice).
 fn exprIsBool(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
+    return (try exprScalar(b, arg, scope)) == .bool;
+}
+
+/// The expression's scalar-floor type under the current scope (sema's
+/// typer through the bridge). Drives binding types, env.out routing,
+/// and the no-implicit-conversion checks.
+fn exprScalar(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!sema.exprtype.ScalarType {
     var bridge = ExprTypeBridge{ .b = b, .scope = scope };
-    return (try sema.exprtype.scalarOf(b.a, arg, .{
+    return sema.exprtype.scalarOf(b.a, arg, .{
         .ctx = @ptrCast(&bridge),
         .localType = ExprTypeBridge.localType,
         .callRet = ExprTypeBridge.callRet,
-    })) == .bool;
+    });
+}
+
+/// Binding type for a value of this scalar (the typed-local floor).
+fn scalarBindTy(sc: sema.exprtype.ScalarType) hir.Type {
+    return switch (sc) {
+        .bool => .bool,
+        .f64 => .f64,
+        else => .i64,
+    };
 }
 
 const ExprTypeBridge = struct {
@@ -1737,12 +1781,14 @@ const ExprTypeBridge = struct {
             return switch (rf.ty) {
                 .bool => .bool,
                 .i64 => .i64,
+                .f64 => .f64,
                 else => .unknown,
             };
         };
         return switch (loc.ty) {
             .bool => .bool,
             .i64 => .i64,
+            .f64 => .f64,
             .str => .str,
             else => .unknown,
         };
@@ -1762,6 +1808,7 @@ const ExprTypeBridge = struct {
             return switch (rs) {
                 .bool => .bool,
                 .i64 => .i64,
+                .f64 => .f64,
                 .str => .str,
                 else => null,
             };
@@ -1771,6 +1818,7 @@ const ExprTypeBridge = struct {
         return switch (rs) {
             .bool => .bool,
             .i64 => .i64,
+            .f64 => .f64,
             .str => .str,
             else => null,
         };
@@ -1836,7 +1884,7 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             // A `bool` binding (`let even = n % 2 == 0`) gets a bool local; any
             // other value expression is i64. (str lets in a value body aren't
             // reached here — those functions take the str path.)
-            const ty: hir.Type = if (try exprIsBool(b, init_expr, scope)) .bool else .i64;
+            const ty: hir.Type = scalarBindTy(try exprScalar(b, init_expr, scope));
             // Build the initializer before declaring, so it can't see itself.
             const value = try buildIntExpr(b, init_expr, scope);
             const idx = try scope.declare(nm.text, ls.isVar(), ty);
@@ -1854,12 +1902,14 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             if (!loc.mutable) return reject(b, .immutable_assign); // a `let` binding or a parameter
             const rhs_ast = as.value() orelse return error.Unsupported;
             const op = as.op() orelse return error.Unsupported;
-            // A bool is not an int: the two don't interconvert. A plain `=` must
-            // assign a value of the binding's type; compound ops (`+=` …) are
-            // arithmetic and only apply to an i64 binding.
-            const rhs_is_bool = try exprIsBool(b, rhs_ast, scope);
+            // No implicit conversion: a plain `=` must assign a value of the
+            // binding's type; compound ops (`+=` …) are arithmetic and apply
+            // to numeric bindings (no `%=` on f64 — wasm has no float rem).
+            const rhs_sc = try exprScalar(b, rhs_ast, scope);
             if (op.kind == .EQ) {
-                if ((loc.ty == .bool) != rhs_is_bool) return error.Unsupported;
+                if (scalarBindTy(rhs_sc) != loc.ty) return error.Unsupported;
+            } else if (loc.ty == .f64) {
+                if (op.kind == .PERCENT_EQ or rhs_sc != .f64) return error.Unsupported;
             } else if (loc.ty != .i64) {
                 return error.Unsupported; // `bool += …` and the like are not arithmetic
             }
@@ -1913,7 +1963,14 @@ fn buildIfStmtNode(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.S
 fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
     const out = try b.a.create(hir.Expr);
     switch (expr) {
-        .num_lit => |n| out.* = .{ .int_const = consteval.parseIntLit(n.rawText() orelse return error.Unsupported) catch return error.Unsupported },
+        .num_lit => |n| {
+            const tok = n.token() orelse return error.Unsupported;
+            if (tok.kind == .FLOAT_LIT) {
+                out.* = .{ .float_const = std.fmt.parseFloat(f64, tok.text) catch return error.Unsupported };
+            } else {
+                out.* = .{ .int_const = consteval.parseIntLit(tok.text) catch return error.Unsupported };
+            }
+        },
         .literal => |lit| {
             // `true` / `false`. `none` (optionals) isn't represented yet.
             const tok = lit.token() orelse return error.Unsupported;
@@ -1943,10 +2000,10 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 }
             }
             if (scope.find(txt)) |loc| {
-                // i64 and bool (i32 0/1) locals are readable here; a `str`
-                // local belongs in the str path — and a bare record binding
-                // (`.ptr`) is a whole-value use, not an i64/bool expression.
-                if (loc.ty != .i64 and loc.ty != .bool) return error.Unsupported;
+                // i64, f64, and bool (i32 0/1) locals are readable here; a
+                // `str` local belongs in the str path — and a bare record
+                // binding (`.ptr`) is a whole-value use, not a scalar.
+                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64) return error.Unsupported;
                 out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (try findRecField(scope, txt)) |rf| {
                 // `p.x` on a materialized record: a load at (base ptr, offset).
@@ -1984,6 +2041,21 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     else => return e,
                 }
             };
+            // No implicit numeric conversion (spec/types.md): an f64 on
+            // either side requires f64 on both, and the float operator set
+            // excludes `%`, bitwise, and shifts (no wasm f64 forms).
+            {
+                const ls = try exprScalar(b, bx.lhs() orelse return error.Unsupported, scope);
+                const rs2 = try exprScalar(b, bx.rhs() orelse return error.Unsupported, scope);
+                if ((ls == .f64) != (rs2 == .f64)) return error.Unsupported;
+                if (ls == .f64) {
+                    const float_ok = switch (op_tok.kind) {
+                        .PLUS, .MINUS, .STAR, .SLASH, .EQ_EQ, .BANG_EQ, .L_ANGLE, .LT_EQ, .R_ANGLE, .GT_EQ => true,
+                        else => false,
+                    };
+                    if (!float_ok) return error.Unsupported;
+                }
+            }
             const lhs = try buildIntExpr(b, bx.lhs() orelse return error.Unsupported, scope);
             const rhs = try buildIntExpr(b, bx.rhs() orelse return error.Unsupported, scope);
             if (logicalKind(op_tok)) |lk| {
@@ -2017,7 +2089,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         const fid = (try registerFitMethod(b, si, mname)) orelse
                             return reject(b, .name_not_found); // no fit declares it
                         switch (b.funcs.items[fid].ret) {
-                            .i64, .bool => {},
+                            .i64, .bool, .f64 => {},
                             else => return reject(b, .unsupported_call),
                         }
                         const recv = try b.a.create(hir.Expr);
@@ -2051,7 +2123,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             // An i64 or bool (i32 0/1) callee produces a value usable here; a
             // str or record callee does not belong in an i64/bool expression.
             switch (b.funcs.items[id].ret) {
-                .i64, .bool => {},
+                .i64, .bool, .f64 => {},
                 else => return reject(b, .unsupported_call),
             }
             out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc.args(), scope, null) } };
@@ -2088,7 +2160,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 const fid = (try registerFitMethod(b, rv.si, mname)) orelse
                     return reject(b, .name_not_found);
                 switch (b.funcs.items[fid].ret) {
-                    .i64, .bool => {},
+                    .i64, .bool, .f64 => {},
                     else => return reject(b, .unsupported_call),
                 }
                 out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, me.args(), scope, rv.e) } };
@@ -3187,4 +3259,64 @@ test "B4: plain field interpolation alone keeps SROA (no materialization)" {
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") == null);
+}
+
+test "f64: typed bindings, arithmetic, fields, fit methods, interpolation" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Vec2 { x: f64, y: f64 }
+        \\face Norm { fn norm2(self) -> f64 }
+        \\fit Vec2 : Norm { fn norm2(self) -> f64 { self.x * self.x + self.y * self.y } }
+        \\
+        \\fn scale(x: f64, k: f64) -> f64 { x * k }
+        \\
+        \\fn main {
+        \\    let a = 1.5
+        \\    var b = a * 2.0
+        \\    b += 0.25
+        \\    env.out(b)
+        \\    env.out(scale(a, 4.0))
+        \\    let v = Vec2 { x: 3.0, y: 4.0 }
+        \\    env.out("norm2 = {v.norm2()}, x = {v.x}, a = {a}")
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_float") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn scale -> f64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Vec2.norm2 -> f64") != null);
+    // f64 pieces format through __fmt_f64, fields load as f64.
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_float(") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get(") != null);
+}
+
+test "f64: no implicit conversion — mixed arithmetic and float `%` are Unsupported" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const mixed =
+        \\fn main {
+        \\    let a = 1.5
+        \\    env.out(a + 1)
+        \\}
+        \\
+    ;
+    try tr.addLib(mixed);
+    try testing.expect((try buildFromSource(testing.allocator, mixed, tr.resolver())) == null);
+
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    const frem =
+        \\fn main {
+        \\    let a = 7.5
+        \\    env.out(a % 2.0)
+        \\}
+        \\
+    ;
+    try tr2.addLib(frem);
+    try testing.expect((try buildFromSource(testing.allocator, frem, tr2.resolver())) == null);
 }

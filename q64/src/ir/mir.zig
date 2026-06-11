@@ -137,6 +137,7 @@ pub const Op = union(enum) {
     block: []const *Inst,
     host_out_const: struct { off: u32, len: u32 },
     const_i64: i64,
+    const_f64: f64,
     /// A boolean (0/1) constant — the branch leaves of a short-circuit
     /// `&&`/`||` `if_`, which yields an i32 to match comparisons and `!`.
     const_i32: i32,
@@ -147,6 +148,8 @@ pub const Op = union(enum) {
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
     host_out_int: struct { value: *Inst, nl_off: u32 },
+    /// `env.out` of an f64: `__fmt_f64` to decimal text, write, newline.
+    host_out_float: struct { value: *Inst, nl_off: u32 },
     /// A constant `str` value: the `(ptr, len)` pointing at `off`/`len` in the
     /// memory image (no trailing newline — it's a value, not a host write).
     str_const_val: struct { off: u32, len: u32 },
@@ -177,6 +180,9 @@ pub const Op = union(enum) {
     /// yields its `(ptr, len)`. Used as a piece inside `str_concat` when an
     /// i64 binding (or any i64 expression) appears in interpolation.
     fmt_int_to_str: *Inst,
+    /// The decimal `str` value of an f64 via `__fmt_f64` (integer part,
+    /// `.`, ≤6 fractional digits, trailing zeros trimmed). A concat piece.
+    fmt_float_to_str: *Inst,
     /// The byte length of a `str` value as i64 (`s.len`). `value` is a str-typed
     /// inst; the backend reads its len component and zero-extends to i64.
     str_len: *Inst,

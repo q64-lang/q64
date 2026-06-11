@@ -107,7 +107,7 @@ fn collectStmt(
     switch (stmt.*) {
         .block => |stmts| for (stmts) |s| try collectStmt(a, s, d, e),
         // Every `env.out` form writes stdout.
-        .host_out, .host_out_int, .host_out_str, .host_out_bool => |expr| {
+        .host_out, .host_out_int, .host_out_float, .host_out_str, .host_out_bool => |expr| {
             d.insert(.stdout);
             try collectExpr(a, expr, d, e);
         },
@@ -160,7 +160,7 @@ fn collectExpr(
             try collectExpr(a, l.rhs, d, e);
         },
         .concat => |pieces| for (pieces) |p| try collectExpr(a, p, d, e),
-        .fmt_int => |inner| try collectExpr(a, inner, d, e),
+        .fmt_int, .fmt_float => |inner| try collectExpr(a, inner, d, e),
         .str_len => |s| try collectExpr(a, s, d, e),
         .str_index => |si| {
             try collectExpr(a, si.str, d, e);
@@ -190,7 +190,7 @@ fn collectExpr(
         .record_alloc => |ra| for (ra.inits) |fi| try collectExpr(a, fi.value, d, e),
         .field_get => |fg| try collectExpr(a, fg.base, d, e),
         // Leaves: no calls, no faces.
-        .str_const, .int_const, .bool_const, .local, .global_get, .str_binding => {},
+        .str_const, .int_const, .float_const, .bool_const, .local, .global_get, .str_binding => {},
     }
 }
 

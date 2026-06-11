@@ -913,6 +913,43 @@ verified, honest diagnostics throughout.
       monomorphization; `dyn` dispatch; enums + `match` lowering (can start
       after A2 in parallel with B).
 
+## Numeric tower — floats (f64 landed; f32 next)
+
+- [x] **The f64 floor, end-to-end.** Floats are first-class scalars now:
+      FLOAT_LIT → `hir.float_const` (floats never const-fold — the
+      evaluator stays integer/text-only; an f64 `let` goes straight to a
+      typed runtime local), typed f64 `let`/`var` + compound assigns
+      (`+= -= *= /=`; no `%=` — wasm has no float rem), arithmetic and
+      comparisons (MIR `bin` picks the instruction family from operand
+      type; `binOpF64` — `%`, bitwise, shifts honestly rejected),
+      **no implicit int↔float conversion anywhere** (bin guard, call
+      args, assigns, record fields — all reject mixing), f64
+      params/returns (plain fns, fit methods), f64 struct fields (8/8
+      layout), and printing/interpolation via a new `__fmt_f64` backend
+      helper (sign, integer part, `.`, ≤6 fractional digits rounded
+      half-up with carry, trailing zeros trimmed — `0.1 + 0.2` prints
+      `0.3`; needs the universal nontrapping-fptoint feature, on in both
+      address spaces). sema's `ScalarType` gained `.f64` with operand-
+      recursive typing for arithmetic. Verified end-to-end wasm64 +
+      wasm32 (link-roundtrip f64 section) + 2 unit tests incl. the
+      rejections. **Boundaries:** NaN prints "0.0", |x| ≥ 2^64
+      saturates (documented in `emitFmtF64`); f64 in `qview` host args
+      and `q64 check`'s TYP042 float awareness untouched.
+- [ ] **f32.** Needs a `mir.ValueType.f32` + width plumbing through
+      locals/params/fields (4/4 layout), `f32.demote/promote` at
+      explicit cast sites (no implicit conversion), and a literal-
+      suffix story (`1.5f32`? annotation-driven?). Spec the cast
+      syntax first (types.md has the tower; the cast form is TBD).
+- [ ] **sin/cos/tan/exp/log → `q64.math` (decision recorded).** Wasm
+      3.0 has no transcendental instructions (only `f64.sqrt`/`abs`/
+      `ceil`/`floor`/`min`/`max`/`copysign` are native). Decision:
+      software implementations in the `q64.math` stdlib qube —
+      deterministic and portable, the libm-port approach — NOT host
+      imports (per-host results would break determinism and force a
+      capability disclosure on `@pure` math). Gated on stdlib qubes
+      being loadable; `sqrt` can land earlier as a builtin since the
+      instruction exists.
+
 ## Wasm 3.0 feature audit — DO BEFORE implementing concurrency
 
 The Memory64 lesson (`/wasm` probe: WebKit has none → dual address space) has

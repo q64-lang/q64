@@ -21,7 +21,7 @@ const cst = parser.cst;
 /// The scalar floor (mirrors what codegen can represent today).
 /// `unknown` is "not provable at this floor" — callers treat it as
 /// not-bool / not-str rather than an error.
-pub const ScalarType = enum { i64, bool, str, unknown };
+pub const ScalarType = enum { i64, f64, bool, str, unknown };
 
 /// Caller-injected lookups. Both return `null` for "not found / not
 /// scalar"; `callRet` may allocate (signature lowering), hence the
@@ -46,21 +46,40 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
                 else => .unknown, // `none` — optionals are beyond the floor
             };
         },
-        .num_lit => return .i64,
+        .num_lit => |n| {
+            // A FLOAT_LIT (`3.14`, `1e9`) is f64 at the floor; ints stay
+            // the flexible i64 they were.
+            const tok = n.token() orelse return .i64;
+            return if (tok.kind == .FLOAT_LIT) .f64 else .i64;
+        },
         .string_lit => return .str,
         .paren => |p| return scalarOf(gpa, p.inner() orelse return .unknown, env),
         .unary => |u| {
             const op = u.op() orelse return .unknown;
             return switch (op.kind) {
                 .BANG => .bool,
-                .MINUS, .TILDE => .i64,
+                // `-x` keeps its operand's numeric type (f64 stays f64).
+                .MINUS => switch (try scalarOf(gpa, u.operand() orelse return .i64, env)) {
+                    .f64 => .f64,
+                    else => .i64,
+                },
+                .TILDE => .i64,
                 else => .unknown,
             };
         },
         .bin => |bx| {
             const op = bx.op() orelse return .unknown;
             if (boolOp(op.kind)) return .bool;
-            if (intOp(op.kind)) return .i64;
+            if (intOp(op.kind)) {
+                // Arithmetic keeps the operands' numeric type: either side
+                // provably f64 makes the result f64 (mixing is rejected at
+                // the emit/check layers, not here — typing stays total).
+                const l = try scalarOf(gpa, bx.lhs() orelse return .i64, env);
+                if (l == .f64) return .f64;
+                const r = try scalarOf(gpa, bx.rhs() orelse return .i64, env);
+                if (r == .f64) return .f64;
+                return .i64;
+            }
             return .unknown;
         },
         .call => |cc| {

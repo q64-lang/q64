@@ -716,4 +716,53 @@ if [[ "$sfit32_out" != "$sfit_expected" ]]; then
 fi
 echo "    ok: Display.fmt -> Rect(6x7) / s = Rect(6x7) / 42 / inline (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# f64 floor: literals, arithmetic (+ - * / and comparisons; % and bitwise
+# honestly rejected), typed let/var + compound assigns, f64 params/returns,
+# f64 struct fields (8/8 layout), f64 fit methods, and __fmt_f64 printing
+# (decimal, <=6 fractional digits, trailing zeros trimmed, round-half-up:
+# 0.1 + 0.2 prints 0.3). No implicit int<->float conversion anywhere.
+echo "==> f64: literals / fns / fields / methods / formatting"
+flt_app="$tmp/flt.q"
+flt_wasm="$tmp/flt.wasm"
+cat > "$flt_app" <<'Q64'
+struct Vec2 { x: f64, y: f64 }
+face Norm { fn norm2(self) -> f64 }
+fit Vec2 : Norm { fn norm2(self) -> f64 { self.x * self.x + self.y * self.y } }
+
+fn scale(x: f64, k: f64) -> f64 { x * k }
+
+fn main {
+    env.out(0.25 + 0.25)
+    env.out(scale(2.5, 4.0))
+    let a = 1.5
+    var b = a * 2.0
+    b += 0.25
+    env.out(b)
+    env.out(-2.75)
+    env.out(a > 1.0)
+    env.out(0.1 + 0.2)
+    env.out("a = {a}, b = {b}")
+    let v = Vec2 { x: 3.0, y: 4.0 }
+    env.out(v.norm2())
+    env.out("norm2 = {v.norm2()}, x = {v.x}")
+}
+Q64
+"$Q64_BIN" emit "$flt_app" "$flt_wasm"
+flt_out="$("$HOST_BIN" "$flt_wasm")"
+flt_expected=$'0.5\n10.0\n3.25\n-2.75\ntrue\n0.3\na = 1.5, b = 3.25\n25.0\nnorm2 = 25.0, x = 3.0'
+if [[ "$flt_out" != "$flt_expected" ]]; then
+    echo "FAIL: f64 output mismatch" >&2
+    printf "  expected: %q\n" "$flt_expected" >&2
+    printf "  actual:   %q\n" "$flt_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$flt_app" "$tmp/flt32.wasm" --addr wasm32
+flt32_out="$("$HOST_BIN" "$tmp/flt32.wasm")"
+if [[ "$flt32_out" != "$flt_expected" ]]; then
+    echo "FAIL: f64 wasm32 output mismatch" >&2
+    exit 1
+fi
+echo "    ok: f64 floor -> 0.5 / 10.0 / 3.25 / -2.75 / true / 0.3 / 25.0 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
