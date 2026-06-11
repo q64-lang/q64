@@ -659,10 +659,22 @@ verified, honest diagnostics throughout.
       structured `fn` types (needed for closure params) + struct field
       shapes (lands with B2). Verified: 287 unit / 77 CLI / 11-of-45
       conformance / link-roundtrip green.
-- [ ] **A3 — migrate the existing corpus.** i64/bool/str programs type-check in
-      sema; `build_hir` reads resolved types instead of inferring
-      (`returnsBool`/`exprIsBool`-style detection retired). Gate: 197+ unit
-      tests, `link-roundtrip.sh`, 81 CLI tests green, diagnostics byte-stable.
+- [ ] **A3 — `build_hir` consumes sema.** In progress:
+      - [x] **Signature lowering goes through sema.** `ir` now imports
+            `sema` (one-directional, per the sema README plan); the
+            `typeNamed` text-matching family (`returnsStr/Bool/I64`,
+            `paramIsStr/Bool/I64`) is deleted, replaced by one
+            `semaScalar` query: annotation → `sema.types.lower`
+            (null table: builtins resolve, named stay unresolved — exactly
+            the scalar floor) → mapped onto `hir.Type`, with everything
+            beyond the floor staying the honest `Unsupported`. Verified
+            byte-stable: 287 unit / 77 CLI / 11-of-45 conformance /
+            link-roundtrip — all identical before and after.
+      - [ ] Expression-level inference (`exprIsBool`, Scope local typing)
+            reads sema instead of re-deriving.
+      - [ ] The codegen `Resolver`'s name lookup is replaced by the sema
+            symbol table (NameNotFound moves to the sema layer; the
+            recorded unresolved-heads become the emitted diagnostic).
 - [ ] **A4 — first real TYP codes.** Arg-count/type mismatches move from
       `UnsupportedCall` to their specced TYP codes; flip the matching
       `spec/tests/` fixtures from expected-future to passing. Conformance

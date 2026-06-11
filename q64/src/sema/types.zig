@@ -219,7 +219,9 @@ fn appendFmt(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fmt: []co
 /// Lower a parsed type expression against the file's symbol table.
 /// `null` (no annotation) lowers to `.unparsed` — the *caller* decides
 /// whether absence means `void` (return position) or inference (binding).
-pub fn lower(store: *TypeStore, table: *const symbols.SymbolTable, te_opt: ?ast.TypeExpr) std.mem.Allocator.Error!TypeId {
+/// A `null` table resolves builtins only (every named type becomes
+/// `.unresolved`) — the shape `build_hir` consumes for scalar signatures.
+pub fn lower(store: *TypeStore, table: ?*const symbols.SymbolTable, te_opt: ?ast.TypeExpr) std.mem.Allocator.Error!TypeId {
     const te = te_opt orelse return store.unparsed_id;
     switch (te) {
         .path => |p| {
@@ -230,7 +232,7 @@ pub fn lower(store: *TypeStore, table: *const symbols.SymbolTable, te_opt: ?ast.
             const args = p.genericArgsText(store.gpa) catch null;
             defer if (args) |a| store.gpa.free(a);
 
-            if (table.lookup(name)) |sym| {
+            if (table) |tbl| if (tbl.lookup(name)) |sym| {
                 const kind: NamedKind = switch (sym.kind) {
                     .struct_ => .struct_,
                     .enum_ => .enum_,
@@ -242,7 +244,7 @@ pub fn lower(store: *TypeStore, table: *const symbols.SymbolTable, te_opt: ?ast.
                     else => return store.intern(.{ .unresolved = name }),
                 };
                 return store.intern(.{ .named = .{ .kind = kind, .name = name, .args = args } });
-            }
+            };
             return store.intern(.{ .unresolved = name });
         },
         .optional => |o| {

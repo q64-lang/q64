@@ -69,7 +69,11 @@ parse (CST/AST)
   B2). The core type store is in (`types.zig`): interned builtin tower,
   named/optional/ref/slice/array/tuple lowering against the symbol
   table, fn-signature collection, unresolved-type recording.
-- **A3** — `build_hir` consumes sema; ad-hoc inference
-  (`returnsBool`-style) deleted; unresolved-head recording becomes the
-  emitted diagnostic; diagnostics byte-stable.
+- **A3 (in progress)** — signature lowering is migrated: `ir/build_hir`
+  imports sema and lowers every param/return annotation through
+  `types.lower` (the `typeNamed` text-matching family is gone).
+  Remaining: expression-level inference (`exprIsBool`, Scope local
+  typing) and replacing the codegen `Resolver`'s name lookup with the
+  sema symbol table, at which point the recorded unresolved heads
+  become the emitted diagnostic.
 - **A4** — first real TYP codes; conformance fixtures flip to passing.
