@@ -337,4 +337,17 @@ pub const Expr = union(enum) {
     /// Read a record field through its base pointer (`p.x` where `p` is a
     /// materialized record value): load the `ty`-typed field at `base + offset`.
     field_get: struct { base: *Expr, offset: u32, ty: Type },
+    /// An array literal materialized in the scope arena: `count` elements
+    /// of `stride` bytes each. A scalar element stores at its width; a
+    /// record element (`copy_bytes` set) is a `.ptr` value whose bytes are
+    /// copied inline into the slot. Yields the base pointer.
+    array_lit: struct { stride: u32, alignment: u32, elem_ty: Type, copy_bytes: ?u32, inits: []const *Expr },
+    /// The address of element `index` (`base + index·stride`) — a `.ptr`.
+    /// An inline record element's value IS this address; a scalar loads
+    /// through `field_get` at offset 0.
+    elem_ptr: struct { base: *Expr, index: *Expr, stride: u32 },
+    /// `index`, passed through — but **traps** if `index >= count` or
+    /// `index < 0` (spec/types.md: bounds violations trap; `a.get(i)` is
+    /// the fallible form, later).
+    bounds_check: struct { index: *Expr, count: *Expr },
 };

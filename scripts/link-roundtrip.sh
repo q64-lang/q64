@@ -855,4 +855,113 @@ if [[ "$nar32_out" != "$nar_expected" ]]; then
 fi
 echo "    ok: narrow ints -> rgb(255, 128, 0) / 255 / 383 / -7,65535,u32max / 2^32 (wasm64 + wasm32)"
 
+# Arrays + for (the golden program's iteration shape): literals of scalars
+# and inline records in the scope arena, `for x in xs` desugared to an
+# index loop, trapping `xs[i]`, compile-time `xs.len`, and dispatch on
+# indexed record elements (colors[1].fmt()).
+echo "==> arrays: literals / for-in / xs[i] / len / record elements"
+arr_app="$tmp/arr.q"
+arr_wasm="$tmp/arr.wasm"
+cat > "$arr_app" <<'Q64'
+struct Color { r: u8, g: u8, b: u8 }
+face Display { fn fmt(self) -> str }
+fit Color : Display {
+    fn fmt(self) -> str { "rgb({self.r}, {self.g}, {self.b})" }
+}
+
+fn main {
+    let xs = [10, 20, 30, 40]
+    env.out(xs.len)
+    env.out(xs[2])
+    var total = 0
+    for x in xs {
+        total = total + x
+    }
+    env.out(total)
+    let colors = [
+        Color { r: 255, g: 0, b: 0 },
+        Color { r: 0, g: 255, b: 0 },
+        Color { r: 0, g: 0, b: 255 },
+    ]
+    for c in colors {
+        env.out(c.fmt())
+    }
+    env.out(colors[1].fmt())
+    env.out(i64(colors[2].b))
+}
+Q64
+"$Q64_BIN" emit "$arr_app" "$arr_wasm"
+arr_out="$("$HOST_BIN" "$arr_wasm")"
+arr_expected=$'4\n30\n100\nrgb(255, 0, 0)\nrgb(0, 255, 0)\nrgb(0, 0, 255)\nrgb(0, 255, 0)\n255'
+if [[ "$arr_out" != "$arr_expected" ]]; then
+    echo "FAIL: array output mismatch" >&2
+    printf "  expected: %q\n" "$arr_expected" >&2
+    printf "  actual:   %q\n" "$arr_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$arr_app" "$tmp/arr32.wasm" --addr wasm32
+arr32_out="$("$HOST_BIN" "$tmp/arr32.wasm")"
+if [[ "$arr32_out" != "$arr_expected" ]]; then
+    echo "FAIL: array wasm32 output mismatch" >&2
+    exit 1
+fi
+# Bounds violations trap (spec/types.md): xs[5] of a 2-element array.
+printf 'fn main {\n    let xs = [10, 20]\n    env.out(xs[5])\n}\n' > "$tmp/oob.q"
+"$Q64_BIN" emit "$tmp/oob.q" "$tmp/oob.wasm"
+if "$HOST_BIN" "$tmp/oob.wasm" >/dev/null 2>&1; then
+    echo "FAIL: out-of-bounds index did not trap" >&2
+    exit 1
+fi
+echo "    ok: arrays -> 4 / 30 / 100 / 3x rgb / indexed fmt / 255; oob traps (wasm64 + wasm32)"
+
+# ---------------------------------------------------------------------------
+# B4 DEFINITION OF DONE: the golden face/fit/generic triangle —
+# spec/tests/golden/library-face-fit.q — compiles AND RUNS.
+# print_all<T: Display>(items: [T]) monomorphizes per element type (a
+# stamped private instance per T; [T] lowers to a (ptr, count) pair;
+# T's methods resolve through the fit registry inside the stamped body).
+echo "==> B4 done: golden library-face-fit.q compiles and runs"
+golden="$REPO_ROOT/spec/tests/golden/library-face-fit.q"
+"$Q64_BIN" emit "$golden" "$tmp/golden.wasm"
+golden_out="$("$HOST_BIN" "$tmp/golden.wasm")"
+golden_expected=$'rgb(255, 0, 0)\nrgb(0, 255, 0)\nrgb(0, 0, 255)'
+if [[ "$golden_out" != "$golden_expected" ]]; then
+    echo "FAIL: golden output mismatch" >&2
+    printf "  expected: %q\n" "$golden_expected" >&2
+    printf "  actual:   %q\n" "$golden_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$golden" "$tmp/golden32.wasm" --addr wasm32
+golden32_out="$("$HOST_BIN" "$tmp/golden32.wasm")"
+if [[ "$golden32_out" != "$golden_expected" ]]; then
+    echo "FAIL: golden wasm32 output mismatch" >&2
+    exit 1
+fi
+# Two instantiations of one generic stamp two instances; a type with no
+# fit for the bound is rejected at the call site.
+gen_app="$tmp/gen2.q"
+cat > "$gen_app" <<'Q64'
+face D { fn fmt(self) -> str }
+struct A { x: i64 }
+struct B { y: i64 }
+fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+fit B : D { fn fmt(self) -> str { "B{self.y}" } }
+fn show_all<T: D>(items: [T]) {
+    for it in items {
+        env.out(it.fmt())
+    }
+}
+fn main {
+    show_all([A { x: 1 }, A { x: 2 }])
+    show_all([B { y: 9 }])
+}
+Q64
+"$Q64_BIN" emit "$gen_app" "$tmp/gen2.wasm"
+gen_out="$("$HOST_BIN" "$tmp/gen2.wasm")"
+if [[ "$gen_out" != $'A1\nA2\nB9' ]]; then
+    echo "FAIL: two-instantiation output mismatch (got: $gen_out)" >&2
+    exit 1
+fi
+echo "    ok: GOLDEN RUNS -> rgb(255,0,0)/rgb(0,255,0)/rgb(0,0,255) (wasm64 + wasm32); A1/A2/B9"
+
 echo "PASS: $qube_out"

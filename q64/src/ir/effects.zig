@@ -190,6 +190,15 @@ fn collectExpr(
         },
         .record_alloc => |ra| for (ra.inits) |fi| try collectExpr(a, fi.value, d, e),
         .field_get => |fg| try collectExpr(a, fg.base, d, e),
+        .array_lit => |al| for (al.inits) |iv| try collectExpr(a, iv, d, e),
+        .elem_ptr => |ep| {
+            try collectExpr(a, ep.base, d, e);
+            try collectExpr(a, ep.index, d, e);
+        },
+        .bounds_check => |bc| {
+            try collectExpr(a, bc.index, d, e);
+            try collectExpr(a, bc.count, d, e);
+        },
         // Leaves: no calls, no faces.
         .str_const, .int_const, .float_const, .bool_const, .local, .global_get, .str_binding => {},
     }

@@ -328,6 +328,17 @@ pub const FnDecl = struct {
         return self.visibility() != null;
     }
 
+    /// The raw `<…>` generic-parameter span (`<T: Display>`), or null
+    /// for a non-generic function. Internals are tokens pending the
+    /// generics grammar; B5 monomorphization reads them directly.
+    pub fn genericParams(self: FnDecl) ?*const cst.Node {
+        return firstChildRawNode(self.cst, .GENERIC_PARAMS);
+    }
+
+    pub fn isGeneric(self: FnDecl) bool {
+        return self.genericParams() != null;
+    }
+
     /// The function's name token. `null` for ill-formed input where
     /// the parser didn't find an `IDENT` after `fn`.
     pub fn name(self: FnDecl) ?cst.Token {
