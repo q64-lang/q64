@@ -258,6 +258,84 @@ preference: a twin (cross-device/user), a `LatestValue` channel
 mirroring the value (cross-thread, discrete), or a
 `SharedSignal<T, R>` (cross-thread, continuous, real-time consumers).
 
+## Example — one program, four surfaces
+
+A chat screen: an LLM token pipeline (dataflow) streams into reactive
+state, the conversation syncs through a twin, and the lifecycle glue is
+a structured scope. Every layer crossing is one of the D4 bridges.
+
+```q64
+// ── Reactive layer: the screen owns state (reactivity.md) ──────────
+screen Chat {
+    state  draft:   str       = ""    // local cell; dynamic deps → State<str> (Stage 3)
+    state  reply:   str       = ""    // the streamed completion accumulates here
+    @state history: [Message] = []    // user twin — an actor, placed remotely (D2)
+
+    draw {
+        column {
+            for m in history { bubble(m) }     // keyed reconciliation
+            text(reply)
+            text_input(bind: draft)
+            button("Send")                     // fires the exported `on send` handler
+        }
+    }
+
+    // Handlers are tasks on the one scheduler (D1): the suspensions
+    // below yield to it — they do not block input dispatch.
+    on send {
+        history.push(Message.user(draft))      // command → twin → diff fan-out
+        let prompt = draft
+        draft = ""
+        reply = ""
+
+        scope {
+            let g = complete.start(prompt)     // graph → task: Handle (bridge 1)
+
+            for_each(g.output) |chunk| {       // sink loop on the cell's owning task:
+                reply += chunk                 // bridge 4 — dataflow → reactive write
+            }
+
+            match g.completion().await() {
+                Ok(())  -> {},
+                Err(e)  -> log.warn("generation failed: {e}"),
+            }
+        } catch (e: Cancelled) {
+            // screen torn down → scope cancelled → graph stopped; no orphans
+        }
+    }
+}
+
+// ── Dataflow layer: the rate-shaped work is a graph (streams.md) ───
+@stage
+fn detokenize(toks: Stream<Token<LlamaVocab>, 20.Hz>) -> Stream<str, 20.Hz> { … }
+
+graph complete(prompt: str) -> Stream<str, 20.Hz> {
+    llama_complete(prompt) |> detokenize       // edge = Backpressure channel (D1)
+}
+
+// Bridge 3 (reactive → dataflow), when a graph wants UI input:
+// let edits: Event<str> = draft.changes()     // one event per committed batch
+```
+
+What the example pins down:
+
+- **D1** — every box is the one scheduler's work: the graph's stages
+  are tasks, `for_each(g.output)` suspends on a `Backpressure`
+  channel, and `reply += chunk` is a memory write + version bump; the
+  bubble list reconciles on the UI task's next batch. No second
+  runtime appears.
+- **D2** — each job sits on its owning surface: the rate-shaped token
+  transform is a `graph`, the cross-device conversation is a twin
+  (writes serialize at its remote actor), the screen is reactive
+  `state`, and the lifecycle glue is a plain `scope`. The UI is *not*
+  a 60 Hz render graph.
+- **D3** — `reply` (a rateless `State<str>` under Stage 3) and
+  `Stream<str, 20.Hz>` coexist with no name confusion.
+- **D4** — the only crossings are the sanctioned bridges: the sink
+  loop writing the cell inbound, `draft.changes()` outbound. Piping
+  `reply |> anything` would be `STR040`; handing `reply` to a
+  cross-thread channel would be `CONC052`.
+
 ## Diagnostics
 
 This chapter introduces **no new diagnostic band**. The codes live with
