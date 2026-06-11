@@ -1,8 +1,17 @@
-# Deployment
+# Deployment — maintainer runbook
 
-How the q64 web properties and the q64 / qube binary releases ship, and what
-each one needs to be **enabled**. Three Cloudflare Workers + one GitHub release,
-plus a sibling concern in the qubepods repo.
+> **Contributors don't deploy.** The q64.dev properties and the binary
+> releases run on project-owned infrastructure, operated by the
+> maintainers. The way to change the site, the docs, the registry, or the
+> compiler is the same: **open a PR.** Once it merges, a maintainer (or
+> the auto-deploy workflow) rolls it out. Nothing in the local
+> build/test loop — `./init.sh`, `zig build`, `bun test` — needs a
+> Cloudflare account, wrangler login, or any of what follows.
+
+This file is the runbook for the people who hold the keys: how each q64
+property ships and what each one needs to be **enabled**. Three
+Cloudflare Workers + one GitHub release, plus a sibling concern in the
+qubepods repo.
 
 | Target | Worker / artifact | Where | How |
 |---|---|---|---|
@@ -12,12 +21,12 @@ plus a sibling concern in the qubepods repo.
 | **macOS binaries** | release assets | `scripts/release-mac.sh` | run on a Mac |
 | **qubepods.com `.well-known`** | `qubepods-web` | *qubepods repo* `apps/web/` | `pnpm -C apps/web deploy` |
 
-## Prerequisites
+## Prerequisites (maintainers)
 
 ### Cloudflare (the three Workers)
 - Account: the Cloudflare account hosting the `q64.dev` zone and all `q64-*`
   Workers. The account id is **deliberately not committed** — look it up with
-  `wrangler whoami` (or the dashboard URL) and keep it in your shell profile
+  `wrangler whoami` (or the dashboard URL) and keep it in a shell profile
   or an untracked `.env`.
 - `wrangler` must be authenticated (`wrangler whoami`). If more than one
   account is visible, **every** deploy must pin the account:
@@ -131,6 +140,9 @@ It builds the host arch (arm64 on Apple Silicon, amd64 on Intel) and
 each Mac arch you want to publish.
 
 #### Gatekeeper
+
+(The one part of this file aimed at **users**, not maintainers — it
+applies to anyone downloading the mac binaries from the release page.)
 
 The mac binaries are **ad-hoc signed, not notarized**. A copy downloaded from
 the release page carries `com.apple.quarantine`, so macOS blocks it with
