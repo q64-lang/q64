@@ -894,11 +894,21 @@ verified, honest diagnostics throughout.
             compiles AND runs): u8 struct fields, `[T]` array literals
             + `for` iteration, format specs (`{self.r:02x}`), and
             generic `print_all<T: Display>` (face-bounded generics —
-            the B5 ladder); plus fit-method calls inside interpolation
-            (`"{r.fmt()}"` — bind first). Dispatch on receiver
-            *expressions* landed (`make(1,2).area()`,
-            `(Rect{…}).area()` — METHOD_EXPR receivers build through
-            buildRecExpr, the resulting `.ptr` is `self` directly).
+            the B5 ladder). Dispatch on receiver *expressions* landed
+            (`make(1,2).area()`, `(Rect{…}).area()`), and fit-method
+            calls inside interpolation landed too: `"{r.fmt()}"` is a
+            str concat piece, `"{r.area()}"` formats decimal, and
+            `{self.area()}` works inside another fit method's body.
+            The escape scan reads string tokens for `{name.method(…)}`
+            (interpolation is invisible to the CST walk), so the
+            receiver materializes; plain `{name.field}` keeps SROA.
+            **Spec reconciliation:** types.md normatively defers format
+            specs (`{value:02x}`) to an open item, but faces.md's
+            canonical example and golden/library-face-fit.q used
+            `{self.r:02x}` — both now render decimal
+            (`rgb({self.r}, …)`) with a pointer at the open item, so
+            the golden target no longer depends on a deferred
+            sublanguage.
 - [ ] **B5 — later (separate ladders).** Face-bounded generics +
       monomorphization; `dyn` dispatch; enums + `match` lowering (can start
       after A2 in parallel with B).

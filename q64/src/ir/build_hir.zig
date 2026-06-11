@@ -709,6 +709,17 @@ fn pathText(b: *Builder, p: ast.PathExpr) BuildError![]const u8 {
     return p.text(b.a);
 }
 
+/// The dotted text of `call`'s path callee (caller frees), or null when
+/// the callee isn't a plain path.
+fn callPathName(b: *Builder, call: ast.CallExpr) ?[]const u8 {
+    const callee = call.callee() orelse return null;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return null,
+    };
+    return cpath.text(b.a) catch null;
+}
+
 /// Resolve `name` to a registered i64 function, building it (and anything it
 /// calls) the first time. Returns its FuncId. The id and the parameter list
 /// are reserved *before* the body is built, so a recursive call inside the
@@ -1050,8 +1061,42 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
             const r = parser.parse.parseExpression(b.a, inner, "<interp>") catch return error.Unsupported;
             const iexpr = ast.Expr.cast(r.root) orelse return error.Unsupported;
             switch (iexpr) {
-                .call => |cc| {
-                    if (in_callee) return error.Unsupported; // callee bodies don't nest calls (v0)
+                .call => |cc| fit: {
+                    // A fit-method call piece: `{r.fmt()}` is a str piece,
+                    // `{r.area()}` formats decimal. Resolves in main and
+                    // inside fit-method bodies alike (`{self.area()}` —
+                    // the receiver is in scope.recs either way).
+                    if (callPathName(b, cc)) |cn| {
+                        defer b.a.free(cn);
+                        if (std.mem.indexOfScalar(u8, cn, '.')) |dotp| {
+                            const head = cn[0..dotp];
+                            const mn = cn[dotp + 1 ..];
+                            if (std.mem.indexOfScalar(u8, mn, '.') == null) {
+                                if (scope.recs.get(head)) |si| {
+                                    const loc = scope.find(head) orelse return error.Unsupported;
+                                    const fid = (try registerFitMethod(b, si, mn)) orelse
+                                        return reject(b, .name_not_found);
+                                    const recv = try b.a.create(hir.Expr);
+                                    recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                                    const call_e = try b.a.create(hir.Expr);
+                                    call_e.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, cc.args(), scope, recv) } };
+                                    try flush(b, &lit, &pieces);
+                                    const piece = switch (b.funcs.items[fid].ret) {
+                                        .str => call_e,
+                                        .i64 => blk2: {
+                                            const w = try b.a.create(hir.Expr);
+                                            w.* = .{ .fmt_int = call_e };
+                                            break :blk2 w;
+                                        },
+                                        else => return error.Unsupported, // a bool has no text form here yet
+                                    };
+                                    try pieces.append(b.a, piece);
+                                    break :fit;
+                                }
+                            }
+                        }
+                    }
+                    if (in_callee) return error.Unsupported; // callee bodies don't nest plain calls (v0)
                     var ca = cc.args();
                     if (ca.next() != null) return error.Unsupported; // nullary only
                     const callee = cc.callee() orelse return error.Unsupported;
@@ -1374,6 +1419,27 @@ fn nodeHasWholePath(b: *Builder, node: *const parser.cst.Node, name: []const u8)
         const txt = try (ast.PathExpr{ .cst = node }).text(b.a);
         defer b.a.free(txt);
         return std.mem.eql(u8, txt, name); // paths don't nest — no recursion
+    }
+    if (node.kind == .STR_LITERAL) {
+        // Interpolation lives inside the string token, invisible to the
+        // node walk: a `{name.method(...)}` piece is a receiver use, so
+        // the record must materialize. A plain `{name.field}` stays
+        // SROA-friendly (no '(' before the closing brace).
+        for (node.children) |ch| switch (ch) {
+            .token => |t| if (t.kind == .STR_PLAIN) {
+                const needle = try std.fmt.allocPrint(b.a, "{{{s}.", .{name});
+                defer b.a.free(needle);
+                var at: usize = 0;
+                while (std.mem.indexOfPos(u8, t.text, at, needle)) |hit| {
+                    const after = hit + needle.len;
+                    const close = std.mem.indexOfScalarPos(u8, t.text, after, '}') orelse break;
+                    if (std.mem.indexOfScalar(u8, t.text[after..close], '(') != null) return true;
+                    at = hit + 1;
+                }
+            },
+            .node => {},
+        };
+        return false;
     }
     if (node.kind == .CALL_EXPR) {
         // A dotted callee whose head is `name` is a method call on the
@@ -3064,4 +3130,61 @@ test "B4: a method on a receiver expression (call result / literal) dispatches" 
     // record_alloc, each a `.ptr` value passed as `self`.
     try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.area -> i64") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+}
+
+test "B4: fit-method calls inside interpolation (str and i64 pieces)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Display { fn fmt(self) -> str }
+        \\face Area { fn area(self) -> i64 }
+        \\face Label { fn label(self) -> str }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Display { fn fmt(self) -> str { "rgb({self.w}, {self.h})" } }
+        \\fit Rect : Area { fn area(self) -> i64 { self.w * self.h } }
+        \\fit Rect : Label { fn label(self) -> str { "{self.w}x{self.h} = {self.area()}" } }
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6, h: 7 }
+        \\    env.out("r is {r.fmt()} with area {r.area()}")
+        \\    env.out("label: {r.label()}")
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The interpolated method call materializes the receiver (escape via
+    // the string-token scan) and shows up as a concat piece: the str
+    // method directly, the i64 method wrapped in fmt_int.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.fmt -> str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.label -> str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_int(call#") != null);
+    // `{self.area()}` inside Label's body: a call piece in a callee concat.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.area -> i64") != null);
+}
+
+test "B4: plain field interpolation alone keeps SROA (no materialization)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Point { x: i64, y: i64 }
+        \\
+        \\fn main {
+        \\    let p = Point { x: 1, y: 2 }
+        \\    env.out("p = ({p.x}, {p.y})")
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") == null);
 }

@@ -696,11 +696,12 @@ fn main {
     let s = r.fmt()
     env.out("s = {s}")
     env.out(describe(r))
+    env.out("inline: {r.fmt()} has {r.area()}")
 }
 Q64
 "$Q64_BIN" emit "$sfit_app" "$sfit_wasm"
 sfit_out="$("$HOST_BIN" "$sfit_wasm")"
-sfit_expected=$'Rect(6x7)\ns = Rect(6x7)\n42'
+sfit_expected=$'Rect(6x7)\ns = Rect(6x7)\n42\ninline: Rect(6x7) has 42'
 if [[ "$sfit_out" != "$sfit_expected" ]]; then
     echo "FAIL: str-fit output mismatch" >&2
     printf "  expected: %q\n" "$sfit_expected" >&2
@@ -713,6 +714,6 @@ if [[ "$sfit32_out" != "$sfit_expected" ]]; then
     echo "FAIL: str-fit wasm32 output mismatch" >&2
     exit 1
 fi
-echo "    ok: Display.fmt -> Rect(6x7) / s = Rect(6x7) / 42 (wasm64 + wasm32)"
+echo "    ok: Display.fmt -> Rect(6x7) / s = Rect(6x7) / 42 / inline (wasm64 + wasm32)"
 
 echo "PASS: $qube_out"

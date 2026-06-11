@@ -11,8 +11,10 @@ pub face Display {
 pub struct Color { r: u8, g: u8, b: u8 }
 
 pub fit Color : Display {
+    // v0 interpolation has no format specs (types.md §"String types" —
+    // {value:02x} is a deferred open item), so Display renders decimal.
     fn fmt(self) -> str {
-        "#{self.r:02x}{self.g:02x}{self.b:02x}"
+        "rgb({self.r}, {self.g}, {self.b})"
     }
 }
 
