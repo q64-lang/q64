@@ -1029,6 +1029,7 @@ fn buildMainBlock(b: *Builder, block: ast.Block, scope: *Scope, rt: *RtMap) Buil
 /// The `main` analogue of `buildIfStmtNode`: an `if`/`else(-if)` whose bodies
 /// can contain host statements. An `else if` nests as a one-statement block.
 fn buildMainIfNode(b: *Builder, is: ast.IfStmt, scope: *Scope, rt: *RtMap) BuildError!*hir.Stmt {
+    if (is.ifLet()) |il| return buildMainIfLet(b, is, il, scope, rt);
     const cond = try buildIntExpr(b, is.condition() orelse return error.Unsupported, scope);
     const then_ = try buildMainBlock(b, is.thenBody() orelse return error.Unsupported, scope, rt);
     const else_: ?*hir.Stmt = if (is.elseIf()) |eif| blk: {
@@ -1042,6 +1043,39 @@ fn buildMainIfNode(b: *Builder, is: ast.IfStmt, scope: *Scope, rt: *RtMap) Build
         null;
     const out = try b.a.create(hir.Stmt);
     out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
+    return out;
+}
+
+/// `if let <pattern> = <scrutinee> { … } else { … }` in `main`: a
+/// one-arm match. The scrutinee (an enum value) evaluates once; the
+/// pattern's variant tag selects the then-block with its payload
+/// bindings in scope; anything else falls to the else branch (a block
+/// or another `if`/`if let`). Wrapped in a block so the hidden
+/// scrutinee local's set rides along.
+fn buildMainIfLet(b: *Builder, is: ast.IfStmt, il: ast.IfCondLet, scope: *Scope, rt: *RtMap) BuildError!*hir.Stmt {
+    const scrut = il.scrutinee() orelse return error.Unsupported;
+    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+    const boxed = info.si != null;
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, &stmts);
+    const pat = il.pattern() orelse return error.Unsupported;
+    // A wildcard head is pointless here (always taken) — Unsupported.
+    const ap = (try resolveArmPattern(b, info, pat, scope, s_idx)) orelse return error.Unsupported;
+    const then_blk = try buildMainBlock(b, is.thenBody() orelse return error.Unsupported, scope, rt);
+    const then_ = try prependPrelude(b, ap.prelude, then_blk);
+    const else_: ?*hir.Stmt = if (is.elseIf()) |eif| blk: {
+        const inner = try buildMainIfNode(b, eif, scope, rt);
+        const wrap = try b.a.create(hir.Stmt);
+        wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+        break :blk wrap;
+    } else if (is.elseBody()) |eb|
+        try buildMainBlock(b, eb, scope, rt)
+    else
+        null;
+    try foldMatchChain(b, s_idx, boxed, &.{.{ .tag = ap.tag, .body = then_ }}, else_, &stmts);
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try stmts.toOwnedSlice(b.a) };
     return out;
 }
 
@@ -6032,4 +6066,51 @@ test "enum returns: honest rejections — missing else, wrong enum" {
     try tr2.addLib(src2);
     const r2 = try rejectFromSource(testing.allocator, src2, tr2.resolver());
     try testing.expectEqual(hir.Reject.unsupported_call, r2.?);
+}
+
+test "if let: one-arm match in main — payload bind, else, else-if-let chain" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn find(n: i64) -> Option<i64> {
+        \\    if n > 0 { Some(n) } else { None }
+        \\}
+        \\fn main {
+        \\    if let Some(v) = find(21) {
+        \\        env.out(v * 2)
+        \\    } else {
+        \\        env.out("nothing")
+        \\    }
+        \\    let r = Err(9)
+        \\    if let Err(c) = r {
+        \\        env.out(c)
+        \\    }
+        \\    if let Some(x) = find(3) {
+        \\        env.out(x)
+        \\    } else if let None = find(4) {
+        \\        env.out(0)
+        \\    }
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The desugar reads the boxed tag and binds the payload slot.
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null);
+
+    // An `if let` on a non-enum scrutinee is honestly unsupported.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    let n = 5
+        \\    if let Some(v) = n {
+        \\        env.out(v)
+        \\    }
+        \\}
+        \\
+    )) == null);
 }

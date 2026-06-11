@@ -148,6 +148,13 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .ret => |e| return mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null }),
         .brk => return mk(ctx.a, .void, .br),
         .cont => return mk(ctx.a, .void, .br_cont),
+        // A statement-position block (an `if let` desugar: the hidden
+        // scrutinee set + the tag test ride together).
+        .block => |items| {
+            const insts = try ctx.a.alloc(*mir.Inst, items.len);
+            for (items, 0..) |st, i| insts[i] = try lowerEntryStmt(ctx, st);
+            return mk(ctx.a, .void, .{ .block = insts });
+        },
         // A statement-position call to a void function (a stamped generic
         // instance, `print_all<Color>(...)`). Value-producing expression
         // statements stay unsupported (nothing may be left on the stack).
@@ -156,7 +163,6 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             if (ctx.funcs[e.call.func].ret != .void) return error.Unsupported;
             return lowerExpr(ctx, e);
         },
-        else => return error.Unsupported, // a value/tail-only statement
     }
 }
 

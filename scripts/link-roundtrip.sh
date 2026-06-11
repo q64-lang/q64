@@ -1407,4 +1407,43 @@ eret32_out="$("$HOST_BIN" "$tmp/enum-ret32.wasm")"
 [[ "$eret32_out" == "$eret_expected" ]] || { echo "FAIL: enum-returns wasm32 (got: $eret32_out)" >&2; exit 1; }
 echo "    ok: enum returns -> found 5 / none for negatives / code = 40 / 14 (wasm64 + wasm32)"
 
+# `if let` narrowing: a one-arm match — payload bind in the then-block,
+# else fallback, and an `else if let` chain.
+echo "==> if let: Some(v) narrowing"
+iflet_app="$tmp/iflet.q"
+cat > "$iflet_app" <<'Q64'
+fn find(n: i64) -> Option<i64> {
+    if n > 0 { Some(n) } else { None }
+}
+fn main {
+    if let Some(v) = find(21) {
+        env.out(v * 2)
+    } else {
+        env.out("nothing")
+    }
+    if let Some(v) = find(0 - 1) {
+        env.out(v)
+    } else {
+        env.out("nothing")
+    }
+    let r = Err(9)
+    if let Err(c) = r {
+        env.out("err {c}")
+    }
+    if let None = find(0 - 2) {
+        env.out("none indeed")
+    } else if let Some(x) = find(8) {
+        env.out(x)
+    }
+}
+Q64
+iflet_expected=$'42\nnothing\nerr 9\nnone indeed'
+"$Q64_BIN" emit "$iflet_app" "$tmp/iflet.wasm"
+iflet_out="$("$HOST_BIN" "$tmp/iflet.wasm")"
+[[ "$iflet_out" == "$iflet_expected" ]] || { echo "FAIL: if-let (got: $iflet_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$iflet_app" "$tmp/iflet32.wasm" --addr wasm32
+iflet32_out="$("$HOST_BIN" "$tmp/iflet32.wasm")"
+[[ "$iflet32_out" == "$iflet_expected" ]] || { echo "FAIL: if-let wasm32 (got: $iflet32_out)" >&2; exit 1; }
+echo "    ok: if let -> 42 / nothing / err 9 / none indeed (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

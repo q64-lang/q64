@@ -1265,6 +1265,27 @@ pub const IfStmt = struct {
     pub fn elseIf(self: IfStmt) ?IfStmt {
         return firstChildNode(self.cst, .IF_STMT, IfStmt);
     }
+    /// The `if let …` binding head, if this is the binding form.
+    pub fn ifLet(self: IfStmt) ?IfCondLet {
+        return firstChildNode(self.cst, .IF_COND_LET, IfCondLet);
+    }
+};
+
+/// `IfCondLet := "let" Pattern "=" Expr` — the `if let` binding head.
+pub const IfCondLet = struct {
+    cst: *const cst.Node,
+
+    pub fn pattern(self: IfCondLet) ?Pattern {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Pattern.cast(n)) |p| return p,
+            .token => {},
+        };
+        return null;
+    }
+    /// The scrutinee expression (after the `=`).
+    pub fn scrutinee(self: IfCondLet) ?Expr {
+        return nthChildExpr(self.cst, 0);
+    }
 };
 
 /// `WhileStmt := "while" Expr Block`.

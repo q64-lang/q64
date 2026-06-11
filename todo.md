@@ -971,9 +971,31 @@ verified, honest diagnostics throughout.
       value `match` (landed) → C3 payload variants (landed) → C4
       literal patterns (landed) → exhaustiveness diagnostic (landed)
       → `Option`/`Result` in the prelude + generic enum declarations
-      (landed) → enum returns from functions (landed) → next: `T?`
-      sugar, `if let Some(x)` narrowing, `try` (the remaining `try`
-      prerequisite — Result-returning fns — is in).
+      (landed) → enum returns from functions (landed) → `if let`
+      narrowing (landed) → next: `T?` sugar, `while let`, `try` (the
+      remaining `try` prerequisite — Result-returning fns — is in).
+      - [x] **`if let Some(v)` narrowing in `main`.** The binding `if`
+            desugars to a one-arm match: the parser already produced
+            `IF_COND_LET` (pattern + scrutinee), now surfaced as
+            `ast.IfStmt.ifLet()` / `ast.IfCondLet`; `buildMainIfLet`
+            evaluates the scrutinee once (`declareMatchScrutinee`),
+            resolves the pattern through `resolveArmPattern` (payload
+            bindings in scope for the then-block via `prependPrelude`),
+            and folds `if tag == want { binds; then } else { else }`
+            (`foldMatchChain`, one arm + the else as default). `else`
+            blocks and `else if (let)` chains compose (the chain just
+            recurses through `buildMainIfNode`). The desugar wraps in a
+            statement-position block (hidden scrutinee set + tag test),
+            which `lowerEntryStmt` now lowers (`.block` arm — the
+            switch became exhaustive, else prong dropped). Verified
+            end-to-end wasm64 + wasm32 (roundtrip if-let section: `42 /
+            nothing / err 9 / none indeed`) + 1 unit test (payload
+            bind, else, else-if-let chain; non-enum scrutinee
+            rejection). 390 unit / 81 CLI / 23-of-51 / roundtrips
+            green. **Boundary:** `main`-only (callee bodies wait on
+            match-in-callees); enum patterns only (no literal/tuple
+            heads); no `while let`; a wildcard head is Unsupported
+            (always-taken `if let _` is pointless).
       - [x] **Enum returns from functions (the cross-fn enum story).**
             `fn find(n: i64) -> Option<i64> { if n > 0 { Some(n) } else
             { None } }` works: `structOfType` resolves a boxed enum
