@@ -2006,7 +2006,11 @@ fn buildArrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!?ArrArg {
 /// Build `f(arg…)` against a generic declaration: infer T from the
 /// first `[T]` argument, fit-check the bound, stamp (or reuse) the
 /// instance, and emit the call statement.
-fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+/// Build `f(arg…)` against a generic declaration: infer T from the
+/// first `[T]` argument, fit-check the bound, stamp (or reuse) the
+/// instance, and yield the call expression (the stamped instance's
+/// return type is on `b.funcs`).
+fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Expr {
     const sig = parseGenericSig(fd.genericParams().?) orelse return error.Unsupported;
     const ps = fd.params() orelse return error.Unsupported;
 
@@ -2062,6 +2066,14 @@ fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: as
     const fid = try stampGeneric(b, gname, fd, sig, elem, t_stride);
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
+    return e;
+}
+
+/// The statement form (`print_all(colors)` as a `main` statement): the
+/// stamped instance must be void — a value left on the stack is
+/// rejected at lowering.
+fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+    const e = try buildGenericCall(b, gname, fd, call, scope);
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .expr = e };
     return st;
@@ -2079,7 +2091,10 @@ fn elemEql(x: ElemKind, y: ElemKind) bool {
 /// struct or a scalar type (`each<i64>`). The body builds with the
 /// entry-style builder (it may env.out), `[T]` params as (ptr, count)
 /// pairs registered in `Scope.arrs` with a *runtime* count, and its
-/// own locals list.
+/// own locals list. A `-> i64`/`bool`/`f64`/`f32` declaration makes a
+/// *value-returning* instance: the body's last statement is its value
+/// tail (a tail expression or `return expr`); `-> T` and str/record
+/// returns are a later slice.
 fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, elem: ElemKind, stride: u32) BuildError!hir.FuncId {
     const tname = switch (elem) {
         .rec => |r| r.name,
@@ -2087,6 +2102,14 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     };
     const key = try std.fmt.allocPrint(b.a, "{s}<{s}>", .{ gname, tname });
     if (b.ids.get(key)) |id| return id;
+
+    const ret_ty: hir.Type = if (fd.returnType() == null) .void else blk: {
+        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported; // `-> T` (needs by-value T), str, records: later
+        break :blk switch (rs) {
+            .bool, .i64, .f64, .f32 => rs,
+            else => return error.Unsupported,
+        };
+    };
 
     var scope = Scope{ .a = b.a };
     var params: std.ArrayList(hir.Param) = .empty;
@@ -2124,7 +2147,7 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     try b.ids.put(b.a, key, id);
     const dummy = try b.a.create(hir.Stmt);
     dummy.* = .{ .block = &.{} };
-    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = .void, .body = dummy, .is_screen = true });
+    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy, .is_screen = true });
 
     // The body builds entry-style (host statements allowed) with its own
     // locals list and rt map; locals index past the params.
@@ -2137,9 +2160,31 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     // params (main has no params; stamped instances do).
     try inst_locals.appendNTimes(b.a, .i64, param_slice.len);
 
-    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    var ast_stmts: std.ArrayList(ast.Stmt) = .empty;
+    defer ast_stmts.deinit(b.a);
     var it = (fd.body() orelse return error.Unsupported).statements();
-    while (it.next()) |stmt| try buildMainStmt(b, stmt, &scope, &inst_rt, &stmts);
+    while (it.next()) |stmt| try ast_stmts.append(b.a, stmt);
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    for (ast_stmts.items, 0..) |stmt, i| {
+        if (ret_ty != .void and i == ast_stmts.items.len - 1) {
+            // The value tail: a tail expression or an explicit `return`,
+            // typed as the declared return scalar. The lowering reads it
+            // as the value block's tail (lowerIntBlock).
+            const e: ast.Expr, const is_ret: bool = switch (stmt) {
+                .expr_stmt => |es| .{ es.expression() orelse return error.Unsupported, false },
+                .return_stmt => |rs| .{ rs.value() orelse return error.Unsupported, true },
+                else => return error.Unsupported, // a value `if` tail: later
+            };
+            if (scalarBindTy(try exprScalar(b, e, &scope)) != ret_ty) return error.Unsupported;
+            const st = try b.a.create(hir.Stmt);
+            const value = try buildIntExpr(b, e, &scope);
+            st.* = if (is_ret) .{ .ret = value } else .{ .expr = value };
+            try stmts.append(b.a, st);
+        } else {
+            try buildMainStmt(b, stmt, &scope, &inst_rt, &stmts);
+        }
+    }
 
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
@@ -2147,7 +2192,7 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     b.funcs.items[id] = .{
         .name = key,
         .params = param_slice,
-        .ret = .void,
+        .ret = ret_ty,
         .locals = all[param_slice.len..], // past the param padding
         .body = block,
         .is_screen = true,
@@ -2764,6 +2809,20 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         }
                         return out;
                     }
+                }
+            }
+            // A generic callee in value position (`let n = count_of(xs)`):
+            // monomorphize per the inferred element type, like the
+            // statement form (B5). The stamped instance must produce a
+            // scalar value here.
+            if (b.resolver.lookup(cname)) |gfd| {
+                if (gfd.isGeneric()) {
+                    const ge = try buildGenericCall(b, cname, gfd, cc, scope);
+                    switch (b.funcs.items[ge.call.func].ret) {
+                        .i64, .bool, .f64, .f32 => {},
+                        else => return reject(b, .unsupported_call),
+                    }
+                    return ge;
                 }
             }
             const id = try registerFunc(b, cname);
@@ -4295,6 +4354,53 @@ test "B5: scalar element types stamp per type (each<i64>, each<f64>)" {
     }
     try testing.expectEqual(@as(usize, 1), count_i64);
     try testing.expect(std.mem.indexOf(u8, dump, "fn each<f64> -> void") != null);
+}
+
+test "B5: value-returning generic calls (tail expr, return, composition)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn count_of<T>(items: [T]) -> i64 {
+        \\    items.len
+        \\}
+        \\fn total<T>(items: [T]) -> i64 {
+        \\    var n = 0
+        \\    for x in items {
+        \\        n = n + x
+        \\    }
+        \\    return n
+        \\}
+        \\fn main {
+        \\    env.out(count_of([1.5, 2.5]))
+        \\    let n = total([10, 20, 30])
+        \\    env.out(n + count_of([7, 8]))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Instances are stamped per element type with the declared value ret.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn count_of<f64> -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn count_of<i64> -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn total<i64> -> i64") != null);
+}
+
+test "B5: a `-> T` generic return is honestly unsupported (needs by-value T)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn main {
+        \\    env.out(first([10, 20]))
+        \\}
+        \\
+    ;
+    try testing.expect((try buildLocal(testing.allocator, &tr, src)) == null);
 }
 
 test "B5: a scalar element type never satisfies a face bound" {

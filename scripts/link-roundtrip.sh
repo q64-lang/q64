@@ -998,4 +998,56 @@ if [[ "$scal32_out" != "$scal_expected" ]]; then
 fi
 echo "    ok: each<i64> + each<f64> -> 10/20/30, 1.5/2.5, 7/8 via binding (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# B5 (value-returning generic calls): a `-> i64` generic stamps a value
+# instance — tail expr (count_of) and for-loop + return (total, and
+# total_area dispatching a fit method on the iterated record) — usable in
+# env.out, let bindings, and arithmetic composition.
+# ---------------------------------------------------------------------------
+echo "==> B5: value-returning generics — count_of / total / total_area"
+vgen_app="$tmp/genval.q"
+cat > "$vgen_app" <<'Q64'
+face HasArea { fn area(self) -> i64 }
+struct Rect { w: i64, h: i64 }
+fit Rect : HasArea { fn area(self) -> i64 { self.w * self.h } }
+fn total_area<T: HasArea>(items: [T]) -> i64 {
+    var n = 0
+    for r in items {
+        n = n + r.area()
+    }
+    n
+}
+fn count_of<T>(items: [T]) -> i64 {
+    items.len
+}
+fn total<T>(items: [T]) -> i64 {
+    var n = 0
+    for x in items {
+        n = n + x
+    }
+    return n
+}
+fn main {
+    env.out(total_area([Rect { w: 2, h: 3 }, Rect { w: 4, h: 5 }]))
+    let xs = [10, 20, 30]
+    let n = total(xs)
+    env.out("total = {n}")
+    env.out(count_of([1.5, 2.5]) + 100)
+}
+Q64
+vgen_expected=$'26\ntotal = 60\n102'
+"$Q64_BIN" emit "$vgen_app" "$tmp/genval.wasm"
+vgen_out="$("$HOST_BIN" "$tmp/genval.wasm")"
+if [[ "$vgen_out" != "$vgen_expected" ]]; then
+    echo "FAIL: value-generic output mismatch (got: $vgen_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$vgen_app" "$tmp/genval32.wasm" --addr wasm32
+vgen32_out="$("$HOST_BIN" "$tmp/genval32.wasm")"
+if [[ "$vgen32_out" != "$vgen_expected" ]]; then
+    echo "FAIL: value-generic wasm32 output mismatch (got: $vgen32_out)" >&2
+    exit 1
+fi
+echo "    ok: total_area/total/count_of -> 26 / total = 60 / 102 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

@@ -950,10 +950,29 @@ verified, honest diagnostics throughout.
 - [ ] **B5 — generics beyond the first rung.** Monomorphization's v0
       floor landed with B4's close (one `<T: Face>` param, `[T]` slice
       params, record element types, void returns, statement calls).
-      Remaining: value-returning generic calls, multiple type params,
-      bare `T` params (needs the receiver-by-value story), const
-      generics; then `dyn` dispatch; enums + `match` lowering
-      (separate ladders).
+      Remaining: multiple type params, bare `T` params + `-> T`
+      returns (need the receiver-by-value story), const generics; then
+      `dyn` dispatch; enums + `match` lowering (separate ladders).
+      - [x] **Value-returning generic calls.** A `-> i64`/`bool`/`f64`/
+            `f32` generic stamps a *value* instance: `count_of(xs)`,
+            `let n = total(xs)`, `count_of(xs) + 100`, and a bounded
+            `total_area<T: HasArea>` summing `r.area()` over the slice
+            all work. The pieces: `buildGenericCallStmt` split into a
+            shared `buildGenericCall` (inference/bound/stamp walk → call
+            expr) + the void statement wrapper; `buildIntExpr`'s call
+            arm intercepts generic callees before `registerFunc`;
+            `stampGeneric` reads the declared return scalar and builds
+            the body's last statement as the value tail (tail expr or
+            `return expr` — entry-style statements before it, so
+            for-loops and `env.out` still work); `lower` gives a
+            value-returning screen func `lowerIntBlock(body, ret)`
+            instead of the void entry lowering (the setup-statement set
+            is shared, so nothing else changed). `-> T` rejects
+            honestly (needs by-value T). Verified end-to-end wasm64 +
+            wasm32 (link-roundtrip value-generics section: 26 /
+            total = 60 / 102) + 2 unit tests (value stamps incl. f64
+            elements; `-> T` rejection). 361 unit / 80 CLI / 21-of-49 /
+            roundtrips green.
       - [x] **Scalar element types.** An *unbounded* generic stamps per
             scalar element type too: `each([10, 20])` → `each<i64>`,
             `each([1.5])` → `each<f64>` (deduped per T like records;
