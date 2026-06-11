@@ -147,7 +147,11 @@ Server validates, in order:
 6. **Capability cross-check.** The manifest's `capabilities` must
    match the capability set derived from the effect index (per
    [`env.md`](./env.md) §"Capability disclosure"). Drift returns
-   `422` with `ENV040`.
+   `422` with `ENV040`. This is a backstop: the `capabilities`
+   field is generated — `qube publish` syncs it from the compiler
+   before upload (per [`qube.json5.md`](./qube.json5.md)
+   §Capabilities) — so drift indicates a stale or non-toolchain
+   client.
 
 On success: `201 Created` with the new version's metadata, including
 the indexed effect set and the computed SHA-256.

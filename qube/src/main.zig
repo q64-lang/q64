@@ -1767,6 +1767,244 @@ const pack_script =
     \\rm -rf "$STAGE"
 ;
 
+// ---------------------------------------------------------------------------
+// Capability sync (spec/qube.json5.md §Capabilities, spec/env.md §disclosure)
+//
+// The manifest's `capabilities` field is generated, not authored: publish
+// derives it from the compiler (`q64 show capabilities`) and rewrites the
+// field in place, so the registry's ENV040/ENV041 backstop never fires for
+// a toolchain publish.
+// ---------------------------------------------------------------------------
+
+/// The 1:1 effect-marker → capability-name table from
+/// spec/qube.json5.md §Capabilities / spec/env.md. Umbrella effects with
+/// no capability of their own (`@io`, `@pure`, …) map to null.
+fn capabilityForEffect(effect: []const u8) ?[]const u8 {
+    const map = [_]struct { effect: []const u8, capability: []const u8 }{
+        .{ .effect = "@network", .capability = "Net" },
+        .{ .effect = "@fs", .capability = "Fs" },
+        .{ .effect = "@kv", .capability = "KeyValue" },
+        .{ .effect = "@audio", .capability = "Audio" },
+        .{ .effect = "@midi", .capability = "Midi" },
+        .{ .effect = "@ui", .capability = "Ui" },
+        .{ .effect = "@inference", .capability = "AiEnv" },
+        .{ .effect = "@time", .capability = "Clock" },
+        .{ .effect = "@random", .capability = "Rng" },
+        .{ .effect = "@stdout", .capability = "Stdout" },
+        .{ .effect = "@stderr", .capability = "Stderr" },
+        .{ .effect = "@exit", .capability = "ExitFn" },
+        .{ .effect = "@envvars", .capability = "EnvVars" },
+    };
+    for (map) |e| {
+        if (std.mem.eql(u8, e.effect, effect)) return e.capability;
+    }
+    return null;
+}
+
+/// Map `q64 show capabilities` output (one effect marker per line) to the
+/// sorted, deduplicated capability list. Allocated in `arena`.
+fn capabilitiesFromEffects(arena: std.mem.Allocator, q64_output: []const u8) ![]const []const u8 {
+    var caps: std.ArrayList([]const u8) = .empty;
+    defer caps.deinit(arena);
+    var it = std.mem.tokenizeAny(u8, q64_output, " \r\n\t");
+    while (it.next()) |tok| {
+        const cap = capabilityForEffect(tok) orelse continue;
+        var dup = false;
+        for (caps.items) |c| {
+            if (std.mem.eql(u8, c, cap)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try caps.append(arena, cap);
+    }
+    const out = try arena.dupe([]const u8, caps.items);
+    std.mem.sort([]const u8, out, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    return out;
+}
+
+/// Render a capability list as the manifest array value: `["Net", "Stdout"]`.
+fn renderCapabilitiesValue(gpa: std.mem.Allocator, caps: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '[');
+    for (caps, 0..) |c, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try out.print(gpa, "\"{s}\"", .{c});
+    }
+    try out.append(gpa, ']');
+    return out.toOwnedSlice(gpa);
+}
+
+/// Return a copy of the JSON5 manifest `raw` with its `capabilities`
+/// field's array replaced by `rendered`, inserting the field before the
+/// final closing brace when absent. Handles quoted and unquoted keys;
+/// preserves the rest of the text byte-for-byte.
+fn replaceCapabilitiesField(gpa: std.mem.Allocator, raw: []const u8, rendered: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    const key_at: ?usize = std.mem.indexOf(u8, raw, "\"capabilities\"") orelse blk: {
+        // Unquoted JSON5 key: a bare identifier in key position.
+        var search: usize = 0;
+        while (std.mem.indexOfPos(u8, raw, search, "capabilities")) |i| {
+            const before_ok = i == 0 or switch (raw[i - 1]) {
+                '{', ',', ' ', '\n', '\t', '\r' => true,
+                else => false,
+            };
+            var j = i + "capabilities".len;
+            while (j < raw.len and (raw[j] == ' ' or raw[j] == '\t')) j += 1;
+            if (before_ok and j < raw.len and raw[j] == ':') break :blk i;
+            search = i + 1;
+        }
+        break :blk null;
+    };
+
+    if (key_at) |k| {
+        const colon = std.mem.indexOfScalarPos(u8, raw, k, ':') orelse return error.MalformedManifest;
+        const open = std.mem.indexOfScalarPos(u8, raw, colon, '[') orelse return error.MalformedManifest;
+        const close = std.mem.indexOfScalarPos(u8, raw, open, ']') orelse return error.MalformedManifest;
+        try out.appendSlice(gpa, raw[0..open]);
+        try out.appendSlice(gpa, rendered);
+        try out.appendSlice(gpa, raw[close + 1 ..]);
+    } else {
+        const brace = std.mem.lastIndexOfScalar(u8, raw, '}') orelse return error.MalformedManifest;
+        // Trim trailing whitespace before the brace; add a comma if the
+        // last property lacks one.
+        var k = brace;
+        while (k > 0 and switch (raw[k - 1]) {
+            ' ', '\n', '\t', '\r' => true,
+            else => false,
+        }) k -= 1;
+        const needs_comma = k > 0 and raw[k - 1] != ',' and raw[k - 1] != '{';
+        try out.appendSlice(gpa, raw[0..k]);
+        if (needs_comma) try out.append(gpa, ',');
+        try out.print(gpa, "\n  \"capabilities\": {s},\n", .{rendered});
+        try out.appendSlice(gpa, raw[brace..]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "capabilitiesFromEffects: maps, dedupes, sorts, ignores umbrellas" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const caps = try capabilitiesFromEffects(arena_state.allocator(), "@stdout\n@io\n@network\n@stdout\n@kv\n");
+    try std.testing.expectEqual(@as(usize, 3), caps.len);
+    try std.testing.expectEqualStrings("KeyValue", caps[0]);
+    try std.testing.expectEqualStrings("Net", caps[1]);
+    try std.testing.expectEqualStrings("Stdout", caps[2]);
+}
+
+test "replaceCapabilitiesField: replaces quoted and unquoted keys, inserts when absent" {
+    const gpa = std.testing.allocator;
+
+    const replaced = try replaceCapabilitiesField(gpa, "{ \"name\": \"x\", \"capabilities\": [\"Net\"], \"type\": \"library\" }", "[\"Stdout\"]");
+    defer gpa.free(replaced);
+    try std.testing.expectEqualStrings("{ \"name\": \"x\", \"capabilities\": [\"Stdout\"], \"type\": \"library\" }", replaced);
+
+    const unquoted = try replaceCapabilitiesField(gpa, "{ name: 'x', capabilities: [], type: 'library' }", "[\"Stdout\"]");
+    defer gpa.free(unquoted);
+    try std.testing.expectEqualStrings("{ name: 'x', capabilities: [\"Stdout\"], type: 'library' }", unquoted);
+
+    const inserted = try replaceCapabilitiesField(gpa, "{\n  \"name\": \"x\"\n}", "[\"Stdout\"]");
+    defer gpa.free(inserted);
+    try std.testing.expectEqualStrings("{\n  \"name\": \"x\",\n  \"capabilities\": [\"Stdout\"],\n}", inserted);
+
+    const inserted_after_comma = try replaceCapabilitiesField(gpa, "{\n  \"name\": \"x\",\n}", "[]");
+    defer gpa.free(inserted_after_comma);
+    try std.testing.expectEqualStrings("{\n  \"name\": \"x\",\n  \"capabilities\": [],\n}", inserted_after_comma);
+}
+
+/// Derive the qube's capability set from the compiler and sync the
+/// manifest's `capabilities` field in place. Soft-skips (with a warning)
+/// when `q64` is not available; any compile failure is fatal — a qube
+/// that does not compile must not publish.
+fn syncManifestCapabilities(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    m: *const LoadedManifest,
+) !void {
+    const project_dir = m.projectDir();
+    const repo_root_opt = findRepoRoot(gpa, io, project_dir) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const q64_bin = try resolveBinary(gpa, io, env, "Q64_BIN", repo_root_opt, "q64/zig-out/bin/q64", "q64");
+    defer gpa.free(q64_bin);
+
+    const type_str = manifestString(m.root, "type") orelse "library";
+    const entry_rel = manifestString(m.root, "entry") orelse
+        (if (std.mem.eql(u8, type_str, "application")) "src/main.q" else "src/lib.q");
+    const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
+    defer gpa.free(entry_path);
+
+    var module_specs = resolveModuleSpecs(gpa, io, env, project_dir, m.root) catch |err| {
+        try printStderr(io, "qube publish: dependency resolution failed: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    };
+    defer {
+        for (module_specs.items) |s| gpa.free(s);
+        module_specs.deinit(gpa);
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ q64_bin, "show", "capabilities", "--qube", entry_path });
+    for (module_specs.items) |spec| {
+        try argv.appendSlice(gpa, &.{ "--module", spec });
+    }
+
+    const cap_out = runCapture(gpa, io, argv.items) catch {
+        try writeStderr(io, "qube publish: q64 not found; skipping capability sync (the registry will cross-check)\n");
+        return;
+    };
+    defer gpa.free(cap_out.stdout);
+    const q64_code = cap_out.code orelse 255;
+    if (q64_code != 0) {
+        try printStderr(io, "qube publish: `q64 show capabilities` failed (exit {d}); cannot derive the capability set\n", .{q64_code});
+        std.process.exit(@intFromEnum(ExitCode.compile));
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const derived = try capabilitiesFromEffects(arena_state.allocator(), cap_out.stdout);
+
+    const current: ?[]const std.json.Value = if (m.root.get("capabilities")) |v| switch (v) {
+        .array => |a| a.items,
+        else => null,
+    } else null;
+
+    const in_sync = blk: {
+        const cur = current orelse break :blk derived.len == 0;
+        if (cur.len != derived.len) break :blk false;
+        for (derived) |d| {
+            var found = false;
+            for (cur) |cv| {
+                if (cv == .string and std.mem.eql(u8, cv.string, d)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break :blk false;
+        }
+        break :blk true;
+    };
+    if (in_sync) return;
+
+    const rendered = try renderCapabilitiesValue(gpa, derived);
+    defer gpa.free(rendered);
+    const updated = replaceCapabilitiesField(gpa, m.src, rendered) catch |err| {
+        try printStderr(io, "qube publish: cannot rewrite the capabilities field: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(updated);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = m.path, .data = updated });
+    try printStdout(io, "qube publish: capabilities synced to {s} (compiler-derived)\n", .{rendered});
+}
+
 fn cmdPublish(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1785,23 +2023,16 @@ fn cmdPublish(
         }
     }
 
-    const cwd_path = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd_path);
-    const manifest_path = try findManifestUpward(gpa, io, cwd_path) orelse {
-        try writeStderr(io, "qube: no qube.json5 found in this directory or any parent\n");
-        std.process.exit(@intFromEnum(ExitCode.input));
-    };
-    defer gpa.free(manifest_path);
-    const project_dir = std.fs.path.dirname(manifest_path) orelse ".";
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    const manifest_path = m.path;
+    const project_dir = m.projectDir();
 
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
-    defer gpa.free(raw);
-
-    const name = extractStringField(raw, "\"name\"") orelse {
+    const name = manifestString(m.root, "name") orelse {
         try writeStderr(io, "qube publish: manifest has no \"name\" field\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
-    const version = extractStringField(raw, "\"version\"") orelse {
+    const version = manifestString(m.root, "version") orelse {
         try writeStderr(io, "qube publish: manifest has no \"version\" field\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
@@ -1814,11 +2045,17 @@ fn cmdPublish(
         try writeStderr(io, "qube publish: the 'q64.*' namespace is reserved for the built-in standard library\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     }
-    if (std.mem.indexOf(u8, raw, "\"publish\"") != null and std.mem.indexOf(u8, raw, "false") != null) {
-        // Coarse v0 guard: a manifest that sets publish:false is opted out.
-        try writeStderr(io, "qube publish: manifest sets publish: false; refusing\n");
-        std.process.exit(@intFromEnum(ExitCode.input));
+    if (m.root.get("publish")) |v| {
+        if (v == .bool and !v.bool) {
+            try writeStderr(io, "qube publish: manifest sets publish: false; refusing\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
     }
+
+    // Sync the generated `capabilities` field from the compiler before
+    // packing, so the uploaded manifest always matches the effect index
+    // (spec/qube.json5.md §Capabilities).
+    try syncManifestCapabilities(gpa, io, env, &m);
 
     // Pack the default file set into target/publish/<name>-<version>.zip.
     const root = try std.fmt.allocPrint(gpa, "{s}-{s}", .{ name, version });
