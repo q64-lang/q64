@@ -519,4 +519,44 @@ if [[ "$w32_out" != "$intfn_expected" ]]; then
 fi
 echo "    ok: wasm32 string ABI -> ... / hi!: a=42, b=50 (matches wasm64)"
 
+# ---------------------------------------------------------------------------
+# B2 (SROA): record-literal bindings in main lower to per-field scalar
+# locals named with the dotted path ("p.x"), so field reads, var field
+# assignment, and {p.x} interpolation all run through the plain local
+# machinery. No aggregate layout exists yet (struct copies/passing are
+# honestly Unsupported); this pins the slice end-to-end on both addrs.
+echo "==> B2: record-literal bindings (SROA) — field reads / assign / interpolation"
+rec_app="$tmp/record.q"
+rec_wasm="$tmp/record.wasm"
+cat > "$rec_app" <<'Q64'
+struct Point { x: i64, y: i64 }
+
+fn dbl(n: i64) -> i64 { n + n }
+
+fn main {
+    let p = Point { x: dbl(21), y: 8 }
+    env.out(p.x)
+    var q = Point { x: 1, y: p.y }
+    q.x = q.x + p.x
+    env.out(q.x)
+    env.out("p = ({p.x}, {p.y}); q.x = {q.x}")
+}
+Q64
+"$Q64_BIN" emit "$rec_app" "$rec_wasm"
+rec_out="$("$HOST_BIN" "$rec_wasm")"
+rec_expected=$'42\n43\np = (42, 8); q.x = 43'
+if [[ "$rec_out" != "$rec_expected" ]]; then
+    echo "FAIL: record-binding output mismatch" >&2
+    printf "  expected: %q\n" "$rec_expected" >&2
+    printf "  actual:   %q\n" "$rec_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$rec_app" "$tmp/record32.wasm" --addr wasm32
+rec32_out="$("$HOST_BIN" "$tmp/record32.wasm")"
+if [[ "$rec32_out" != "$rec_expected" ]]; then
+    echo "FAIL: record-binding wasm32 output mismatch" >&2
+    exit 1
+fi
+echo "    ok: record bindings -> 42 / 43 / p = (42, 8); q.x = 43 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
