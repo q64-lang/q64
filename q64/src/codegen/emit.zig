@@ -27,6 +27,7 @@ const parser = @import("parser");
 const parse = parser.parse;
 const ast = parser.ast;
 const ir = @import("ir");
+const sema = @import("sema");
 const component = @import("component.zig");
 
 const c = @cImport({
@@ -95,10 +96,7 @@ pub const StdoutAbi = enum {
 /// that module's entry file (`src/lib.q`). The compiler resolves
 /// `import <name>.{…}` against this set — it never reads `qube.json5`
 /// or touches the filesystem itself (per spec/q64-cli.md §"--module").
-pub const ModuleSource = struct {
-    name: []const u8,
-    source: []const u8,
-};
+pub const ModuleSource = sema.link.ModuleSource;
 
 /// Build the hello-world wasm module and return its bytes. Caller
 /// owns the returned slice and must free it via `allocator`.
@@ -506,12 +504,12 @@ fn worldName(file: []const u8) []const u8 {
     return if (name.len == 0) "qube" else name;
 }
 
-/// Adapts the codegen `Resolver` to the IR builder's `ModuleResolver` so
+/// Adapts the sema `Linker` to the IR builder's `ModuleResolver` so
 /// `build_hir` can resolve call targets to their AST without `ir/` depending
 /// on `codegen/`.
-fn resolverLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
-    const r: *Resolver = @ptrCast(@alignCast(ctx));
-    return r.lookup(name);
+fn linkerLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
+    const l: *sema.link.Linker = @ptrCast(@alignCast(ctx));
+    return l.lookup(name);
 }
 
 /// Parse `source`, resolve its imports against `modules`, and build the HIR —
@@ -519,8 +517,8 @@ fn resolverLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
 /// arena-owned HIR module (caller `deinit`s). A construct the IR can't yet
 /// represent is an honest `UnsupportedExpression`; a definite semantic error
 /// surfaces as its diagnostic code (`build_hir.Reject` → `mapReject`). The
-/// parse result and resolver are scoped to HIR construction (the HIR retains
-/// no AST or resolver pointers), so both are freed before returning.
+/// parse result and linker are scoped to HIR construction (the HIR retains
+/// no AST or linker pointers), so both are freed before returning.
 fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) !ir.hir.Module {
     const parse_result = try parse.parse(allocator, source, file);
     defer parse_result.deinit(allocator);
@@ -528,13 +526,20 @@ fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, 
 
     // Resolve every import against `modules` and index this file's own
     // functions (so a local `version()` resolves without an import). An
-    // unresolvable import is an honest error here (ladder step 0).
-    var resolver = Resolver.init(allocator, modules);
-    defer resolver.deinit();
-    try resolver.indexLocalFunctions(sf);
-    try resolver.resolveImports(sf);
+    // unresolvable import is an honest error here (A3 final slice: this
+    // lives in sema now — sema/link.zig); map the linker's error trio onto
+    // the stable emit codes.
+    var linker = sema.link.Linker.init(allocator, modules);
+    defer linker.deinit();
+    try linker.indexLocalFunctions(sf);
+    linker.resolveImports(sf) catch |e| return switch (e) {
+        error.UnknownModule => Error.UnknownModule,
+        error.NameNotFound => Error.NameNotFound,
+        error.UnsupportedImport => Error.UnsupportedImport,
+        error.OutOfMemory => error.OutOfMemory,
+    };
 
-    const mres = ir.hir.ModuleResolver{ .ctx = &resolver, .lookupFn = resolverLookupShim };
+    const mres = ir.hir.ModuleResolver{ .ctx = &linker, .lookupFn = linkerLookupShim };
     return switch (try ir.build_hir.tryBuild(allocator, sf, mres)) {
         .unsupported => Error.UnsupportedExpression,
         .rejected => |r| mapReject(r),
@@ -1543,96 +1548,6 @@ fn binOp(kind: ir.ops.BinKind) c.BinaryenOp {
         .gt => c.BinaryenGtSInt64(),
         .ge => c.BinaryenGeSInt64(),
     };
-}
-
-const Resolver = struct {
-    allocator: std.mem.Allocator,
-    modules: []const ModuleSource,
-    /// Parsed dependency modules, kept alive so the `FnDecl` views below
-    /// stay valid for the lifetime of the resolver.
-    parsed: std.ArrayList(parse.Result),
-    /// name → defining function. Keys are slices into a CST that outlives
-    /// the resolver (the caller's parse result or a `parsed` entry).
-    symbols: std.StringHashMapUnmanaged(ast.FnDecl),
-
-    fn init(allocator: std.mem.Allocator, modules: []const ModuleSource) Resolver {
-        return .{
-            .allocator = allocator,
-            .modules = modules,
-            .parsed = .empty,
-            .symbols = .empty,
-        };
-    }
-
-    fn deinit(self: *Resolver) void {
-        for (self.parsed.items) |r| r.deinit(self.allocator);
-        self.parsed.deinit(self.allocator);
-        self.symbols.deinit(self.allocator);
-    }
-
-    /// Index every top-level function in `sf` under its own name, so a
-    /// program that defines and calls a local const function resolves
-    /// without an import.
-    fn indexLocalFunctions(self: *Resolver, sf: ast.SourceFile) !void {
-        var it = sf.items();
-        while (it.next()) |item| switch (item) {
-            .fn_decl => |fd| {
-                const name = fd.name() orelse continue;
-                try self.symbols.put(self.allocator, name.text, fd);
-            },
-            else => {},
-        };
-    }
-
-    /// Resolve each import statement against the `--module` set. Binds
-    /// every selectively-imported name to its defining function. Errors
-    /// on unresolvable imports (unknown module, missing name) and on
-    /// import forms not yet supported (relative paths, stdlib).
-    fn resolveImports(self: *Resolver, sf: ast.SourceFile) !void {
-        var imports = sf.imports();
-        while (imports.next()) |im| {
-            if (im.isRelative()) return Error.UnsupportedImport;
-
-            const module_path = (try im.path(self.allocator)) orelse return Error.UnsupportedImport;
-            defer self.allocator.free(module_path);
-
-            const src = self.moduleSource(module_path) orelse return Error.UnknownModule;
-
-            const r = try parse.parse(self.allocator, src, module_path);
-            try self.parsed.append(self.allocator, r);
-            const dep_sf = ast.SourceFile.cast(r.root) orelse return Error.UnknownModule;
-
-            var names = im.names();
-            while (names.next()) |name_tok| {
-                const fd = findPublicFn(dep_sf, name_tok.text) orelse return Error.NameNotFound;
-                try self.symbols.put(self.allocator, name_tok.text, fd);
-            }
-        }
-    }
-
-    fn moduleSource(self: *Resolver, name: []const u8) ?[]const u8 {
-        for (self.modules) |m| {
-            if (std.mem.eql(u8, m.name, name)) return m.source;
-        }
-        return null;
-    }
-
-    fn lookup(self: *Resolver, name: []const u8) ?ast.FnDecl {
-        return self.symbols.get(name);
-    }
-};
-
-fn findPublicFn(sf: ast.SourceFile, name: []const u8) ?ast.FnDecl {
-    var it = sf.items();
-    while (it.next()) |item| switch (item) {
-        .fn_decl => |fd| {
-            if (!fd.isPublic()) continue;
-            const fn_name = fd.name() orelse continue;
-            if (std.mem.eql(u8, fn_name.text, name)) return fd;
-        },
-        else => {},
-    };
-    return null;
 }
 
 /// The wasm labels for one enclosing loop: `brk` exits it (the outer

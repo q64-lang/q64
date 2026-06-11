@@ -69,13 +69,14 @@ parse (CST/AST)
   B2). The core type store is in (`types.zig`): interned builtin tower,
   named/optional/ref/slice/array/tuple lowering against the symbol
   table, fn-signature collection, unresolved-type recording.
-- **A3 (in progress)** — signature lowering and expression typing are
-  migrated: `ir/build_hir` lowers every param/return annotation through
-  `types.lower` (the `typeNamed` text-matching family is gone) and
-  decides expression types through `exprtype.scalarOf` (the
-  `isBoolOp`/`isBoolCall` rules moved here; build_hir bridges its Scope
-  via the injected `Env`). Remaining: replacing the codegen `Resolver`'s
-  name lookup with the sema symbol table, at which point the Env
-  callbacks collapse into sema's own tables and the recorded unresolved
-  heads become the emitted diagnostic.
+- **A3 (structurally done)** — `ir/build_hir` consumes sema for all
+  three: annotations lower through `types.lower` (the `typeNamed`
+  text-matching family is gone), expression types come from
+  `exprtype.scalarOf` (the `isBoolOp`/`isBoolCall` rules moved here),
+  and name lookup is `link.zig`'s `Linker` (the codegen `Resolver`
+  moved wholesale; emit.zig maps the UnknownModule/NameNotFound/
+  UnsupportedImport trio onto its stable codes at one call site).
+  Still in build_hir: body-scope ownership — the `Env` bridge adapts
+  its wasm-slot `Scope`. That collapses when the A4 check pass brings
+  sema its own body scopes.
 - **A4** — first real TYP codes; conformance fixtures flip to passing.

@@ -123,6 +123,7 @@ pub fn build(b: *std.Build) void {
     });
     codegen_mod.addImport("parser", parser_mod);
     codegen_mod.addImport("ir", ir_mod);
+    codegen_mod.addImport("sema", sema_mod);
     linkBinaryen(codegen_mod, target, binaryen_include, binaryen_lib);
     const codegen_tests = b.addTest(.{ .root_module = codegen_mod });
     test_step.dependOn(&b.addRunArtifact(codegen_tests).step);
