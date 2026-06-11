@@ -44,7 +44,7 @@ pub const ModuleResolver = struct {
 /// `(ptr, len)`. Distinct from `i64` (a genuine integer value) so the backend
 /// realizes pointer locals at the build's address width. `str` itself stays
 /// abstract (the `(ptr, len)` pair is a lowering concern).
-pub const Type = enum { i64, i32, f64, str, bool, ptr, void };
+pub const Type = enum { i64, i32, f32, f64, str, bool, ptr, void };
 
 /// A definite semantic error the AST→HIR builder detected — distinct from
 /// "construct not yet supported" (which signals a fall-back). The codegen
@@ -268,6 +268,10 @@ pub const Expr = union(enum) {
     /// An f64 constant (`3.14`, `1e9`). Floats never const-fold in v0 —
     /// they stay runtime values end to end.
     float_const: f64,
+    /// An explicit numeric cast (`f32(x)`, `f64(x)`, `i64(x)` —
+    /// spec/types.md §Casts; the only conversions, nothing implicit).
+    /// float→int narrowing traps on overflow/NaN per the spec.
+    num_cast: struct { to: Type, value: *Expr },
     /// A `true` / `false` literal. A boolean (i32 0/1), like a comparison or
     /// `!` — usable in conditions and as an operand of `&&`/`||`/`!`.
     bool_const: bool,

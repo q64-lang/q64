@@ -319,6 +319,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .float_const => |v| return mk(ctx.a, .f64, .{ .const_f64 = v }),
+        .num_cast => |nc| return mk(ctx.a, mapType(nc.to), .{ .num_cast = try lowerExpr(ctx, nc.value) }),
         .bool_const => |v| return mk(ctx.a, .i32, .{ .const_i32 = @intFromBool(v) }),
         .local => |l| return mk(ctx.a, mapType(l.ty), .{ .local_get = l.idx }),
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
@@ -386,7 +387,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .str_index_of => |m| return mk(ctx.a, .i64, .{ .str_index_of = .{ .str = try lowerStrExpr(ctx, m.str), .byte = try lowerExpr(ctx, m.byte) } }),
         .str_starts_with => |m| return mk(ctx.a, .i32, .{ .str_starts_with = .{ .str = try lowerStrExpr(ctx, m.str), .prefix = try lowerStrExpr(ctx, m.prefix) } }),
         .str_contains => |m| return mk(ctx.a, .i32, .{ .str_contains = .{ .str = try lowerStrExpr(ctx, m.str), .sub = try lowerStrExpr(ctx, m.sub) } }),
-        .str_const, .concat, .str_binding, .fmt_int, .fmt_float, .str_slice => unreachable, // str values never reach the i64 path
+        .str_const, .concat, .str_binding, .fmt_int, .fmt_float, .str_slice => unreachable, // str values never reach the scalar path
     }
 }
 
@@ -401,6 +402,7 @@ fn mapType(t: hir.Type) mir.ValueType {
     return switch (t) {
         .i64 => .i64,
         .i32 => .i32,
+        .f32 => .f32,
         .f64 => .f64,
         .str => .str,
         .bool => .i32, // a boolean is an i32 0/1 at the executable tier

@@ -21,7 +21,7 @@ const cst = parser.cst;
 /// The scalar floor (mirrors what codegen can represent today).
 /// `unknown` is "not provable at this floor" — callers treat it as
 /// not-bool / not-str rather than an error.
-pub const ScalarType = enum { i64, f64, bool, str, unknown };
+pub const ScalarType = enum { i64, f32, f64, bool, str, unknown };
 
 /// Caller-injected lookups. Both return `null` for "not found / not
 /// scalar"; `callRet` may allocate (signature lowering), hence the
@@ -61,6 +61,7 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
                 // `-x` keeps its operand's numeric type (f64 stays f64).
                 .MINUS => switch (try scalarOf(gpa, u.operand() orelse return .i64, env)) {
                     .f64 => .f64,
+                    .f32 => .f32,
                     else => .i64,
                 },
                 .TILDE => .i64,
@@ -72,12 +73,12 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
             if (boolOp(op.kind)) return .bool;
             if (intOp(op.kind)) {
                 // Arithmetic keeps the operands' numeric type: either side
-                // provably f64 makes the result f64 (mixing is rejected at
-                // the emit/check layers, not here — typing stays total).
+                // provably float makes the result that float (mixing is
+                // rejected at the emit/check layers — typing stays total).
                 const l = try scalarOf(gpa, bx.lhs() orelse return .i64, env);
-                if (l == .f64) return .f64;
+                if (l == .f64 or l == .f32) return l;
                 const r = try scalarOf(gpa, bx.rhs() orelse return .i64, env);
-                if (r == .f64) return .f64;
+                if (r == .f64 or r == .f32) return r;
                 return .i64;
             }
             return .unknown;
