@@ -90,8 +90,9 @@ That is a complete, publishable library qube. The default `entry` is
     deny:     ["@unrestricted_fs"],
   },
 
-  // Capability disclosure (cross-checked at publish; see env.md ENV040)
-  capabilities: ["Net", "Audio", "Stdout"],
+  // Capability disclosure (generated — `qube publish` syncs it from the
+  // compiler; see §Capabilities below)
+  capabilities: ["Audio", "Net", "Stdout"],
 }
 ```
 
@@ -296,17 +297,22 @@ capability disclosure UI.
 capabilities: ["Net", "Fs", "Stdout"]
 ```
 
-The `capabilities` field is the developer-asserted summary of
-which runtime capabilities (per [`env.md`](./env.md)) this qube
-reaches. It is **cross-checked** at `qube publish` against the
-compiler-derived set computed from the effect graph; mismatch is
-`ENV040` and blocks publication.
+The `capabilities` field is **generated, not authored**. It is the
+human-readable summary of which runtime capabilities (per
+[`env.md`](./env.md)) this qube reaches — but its content is owned
+by the compiler, not the developer: `qube publish` derives the set
+(via `q64 show capabilities`, the effect graph's capability
+closure) and **rewrites the field in place** before packing, the
+way `qube add` maintains `dependencies`. A missing field is added;
+a stale hand-edited one is corrected (and the sync is reported);
+an in-sync manifest is untouched. Hand-editing the field is
+therefore harmless but pointless — the next publish restores the
+derived truth.
 
 The two records exist because they serve different audiences:
 
-- The **manifest declaration** is human-readable and visible at
-  the top of the file; reviewers and registry users see it
-  immediately.
+- The **manifest field** is human-readable and visible at the top
+  of the file; reviewers and registry users see it immediately.
 - The **compiler-derived set** is emitted into a Wasm custom
   section (`q64.capabilities`) and is the ground truth used by
   the registry's installation prompt.
@@ -319,6 +325,7 @@ reachable through `Env` is gated by exactly one effect marker:
 |--------------|----------------------|
 | `@network`   | `Net`                |
 | `@fs`        | `Fs`                 |
+| `@kv`        | `KeyValue`           |
 | `@audio`     | `Audio`              |
 | `@midi`      | `Midi`               |
 | `@ui`        | `Ui`                 |
@@ -331,11 +338,15 @@ reachable through `Env` is gated by exactly one effect marker:
 | `@envvars`   | `EnvVars`            |
 
 Capability names are PascalCase (matching the face names in
-`env.md`). Listing a capability not used by the source is
-`ENV041` at publish (warning). Listing a capability the source
-*does* use, and one it *doesn't*, both raise — `ENV040` for the
-missing entry, `ENV041` for the extraneous one — so the developer
-gets one clean fix on each publish attempt.
+`env.md`), sorted, deduplicated.
+
+The registry **cross-checks anyway**: an uploaded manifest whose
+`capabilities` omit a detected capability is `ENV040`, an
+extraneous entry is `ENV041` (per
+[`continuum-api.md`](./continuum-api.md) §"Write — publish").
+Because the toolchain generates the field, these codes act as a
+backstop — they fire only for an upload produced by a stale or
+non-toolchain client, never for an ordinary `qube publish`.
 
 User-defined capabilities (introduced by `fit MyAdapter : Net`
 or by user-defined effect markers) are listed by the
@@ -437,8 +448,9 @@ versions together until 1.0.
 - [`effects.md`](./effects.md) — the formal effect-marker registry;
   `effects.declared` and `effects.deny` semantics; the cross-check that
   produces `EFF130` / `EFF131` at publish.
-- [`env.md`](./env.md) — capability model and the `ENV040` /
-  `ENV041` publish cross-checks for the `capabilities` field.
+- [`env.md`](./env.md) — capability model, the `qube publish` sync
+  for the `capabilities` field, and the `ENV040` / `ENV041`
+  registry backstop.
 - [`concurrency.md`](./concurrency.md) — `@cancel` / `@uncancellable`
   semantics and the M:N task model that `@realtime` pins on.
 - [`continuum-api.md`](./continuum-api.md) — how the registry

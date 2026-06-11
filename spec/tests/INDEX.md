@@ -126,7 +126,7 @@ no test.
 | `TYP301` | errors.md       | error conversion not available                    | —                                                        |
 | `TYP302` | errors.md       | non-exhaustive match on `Result`                  | —                                                        |
 | `TYP303` | errors.md       | `?.` on non-`Option` value                        | —                                                        |
-| `TYP304` | errors.md       | mismatched arms in destructure form               | —                                                        |
+| `TYP304` | errors.md       | (retired — `Result` destructure form removed)     | —                                                        |
 | `TYP305` | errors.md       | `?` postfix on `Result`                           | `errors/question-on-result.q`                            |
 | `TYP306` | errors.md       | `panic` payload does not fit `Panic`              | `errors/panic-payload-not-panic-fitting.q`               |
 | `TYP307` | errors.md       | `catch` type is not `Panic`-fitting               | —                                                        |

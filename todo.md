@@ -116,9 +116,11 @@ and `qube run`):
        `NameNotFound` / `UnsupportedImport`). `q64/src/codegen/emit.zig`
        `Resolver` + `renderStringLit`; `cmdEmit` reports + exits non-zero.
 1. [x] JSON5 manifest parsing in `qube run`/`web` (`qube/src/main.zig`
-       `json5ToJson` strips `//`+`/* */` comments and trailing commas, then
-       parses with `std.json` into a `Value`). Single-quoted strings /
-       unquoted keys not yet handled (no manifest in the corpus uses them).
+       `json5ToJson` normalizes the full manifest dialect — `//`+`/* */`
+       comments, trailing commas, single-quoted strings, unquoted keys —
+       then parses with `std.json` into a `Value`). Unit tests in
+       `main.zig` (`zig build test`); the qube-test "full JSON5" case is
+       no longer `test.failing`.
 2. [x] `--module <name>=<dir>` flag in `q64` (`q64/src/main.zig` `cmdEmit`),
        repeatable. Reads each module's `src/lib.q` and hands codegen a
        `[]ModuleSource`. Spec: `q64-cli.md:71`.
@@ -307,10 +309,29 @@ needs argument passing + a memory/stack convention) and runtime string
 concatenation for interpolation.
 
 ### Deferred package bits (not compiler; pick up anytime)
-- [ ] `qube.lock` — `add` doesn't write one; needed for ladder step 4.
-- [ ] `add` dedup + `--offline` / `--frozen` / `--locked` flags.
+- [x] `qube.lock` — specced (`spec/qube.lock.md`: format v1, deterministic
+      JSON, PKG010–PKG013) and implemented: `qube add` upserts an entry,
+      `qube lock` regenerates from the manifest (reusing satisfying locked
+      versions; resolves caret/exact ranges against registry metadata, no
+      archive download), and `qube run`/`build`/`web` resolve a registry
+      dep **only** via lockfile → sha256 → `~/.qube/cache` → `--module`
+      (never the network). Verified end-to-end: a cached registry dep
+      links and runs; PKG01x paths covered in `add-remove.test.ts`;
+      renderer/semver unit tests in `main.zig`.
+- [x] `qube install` — relocks when qube.lock is missing/stale
+      (`lockSatisfiesManifest`), then fetches every locked registry
+      archive the cache is missing (shared `downloadAndCacheArchive`
+      with `add`). `--offline` turns a needed relock into PKG010 and a
+      cache miss into PKG012. Hermetic CLI tests in `install.test.ts`.
+- [x] `capabilities` is generated, not authored: `qube publish` derives
+      the set from `q64 show capabilities` (effect→capability table in
+      `qube.json5.md`) and rewrites the manifest field in place before
+      packing; a non-compiling qube refuses to publish (exit 64); the
+      registry's ENV040/ENV041 check is reframed as a backstop across
+      `qube.json5.md` / `env.md` / `qube-cli.md` / `continuum-api.md`.
+- [ ] `--frozen` / `--locked` flags; `add` dedup.
 - [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
-- [ ] `qube remove` / `install` / `outdated` still stubs.
+- [ ] `qube remove` / `outdated` still stubs.
 
 ### Notes for the next agent
 - Build with the **vendored** zig: `vendor/zig/zig build` (homebrew zig at

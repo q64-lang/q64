@@ -8,10 +8,11 @@ import { describe, expect, test } from "bun:test";
 import { binaryAvailable, runCli } from "../src/harness";
 
 // Documented subcommands that print "not implemented yet" and exit 2 today.
-// `new`, `init`, `pod`, and `build` are implemented (see new-init.test.ts,
-// pod.test.ts, build.test.ts).
+// `new`, `init`, `pod`, `build`, `lock`, and `install` are implemented (see
+// new-init.test.ts, pod.test.ts, build.test.ts, add-remove.test.ts,
+// install.test.ts).
 const STUB_SUBCOMMANDS = [
-  "remove", "test", "install", "lock",
+  "remove", "test",
   "outdated", "audit", "clean", "explain", "fix", "fmt", "workspace",
 ];
 

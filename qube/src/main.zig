@@ -105,6 +105,22 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "lock")) {
+        cmdLock(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: lock failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "install")) {
+        cmdInstall(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: install failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "publish")) {
         cmdPublish(gpa, io, env, &args_it) catch |err| {
             try printStderr(io, "qube: publish failed: {s}\n", .{@errorName(err)});
@@ -148,10 +164,9 @@ pub fn main(init: std.process.Init) !void {
     // Documented subcommands that are not implemented yet. Listed
     // explicitly so unknown names still hit the usage fallback.
     const stub_subs = [_][]const u8{
-        "remove", "test",     "install",
-        "lock",   "outdated", "audit",
-        "clean",  "explain",  "fix",
-        "fmt",    "workspace",
+        "remove", "test",  "outdated",
+        "audit",  "clean", "explain",
+        "fix",    "fmt",   "workspace",
     };
     for (stub_subs) |s| {
         if (std.mem.eql(u8, sub, s)) {
@@ -182,6 +197,8 @@ fn usage(io: std.Io) !void {
         \\  run                     Build and run the qube in the current directory.
         \\  web                     Build the qube to wasm and serve it in a browser.
         \\  add <name>[@version]    Resolve a dependency from the Continuum and add it.
+        \\  lock                    Resolve manifest dependencies and write qube.lock.
+        \\  install [--offline]     Fetch locked dependencies into the cache (relocks if stale).
         \\  publish                 Pack this qube and publish it to the Continuum.
         \\  login                   Authenticate against the Continuum registry.
         \\  --version, -v           Print the version and exit.
@@ -195,21 +212,21 @@ fn usage(io: std.Io) !void {
 
 fn writeStdout(io: std.Io, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.writeAll(text);
     try w.interface.flush();
 }
 
 fn writeStderr(io: std.Io, text: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     try w.interface.writeAll(text);
     try w.interface.flush();
 }
 
 fn printStderr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
 }
@@ -218,34 +235,53 @@ fn printStderr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 // qube run
 // ---------------------------------------------------------------------------
 
+/// Copy a quoted string literal (including its quotes) from `src[start..]`
+/// into `out`, honoring backslash escapes. `src[start]` must be the opening
+/// quote (`"` or `'`). Returns the index just past the closing quote.
+fn copyStringLiteral(gpa: std.mem.Allocator, out: *std.ArrayList(u8), src: []const u8, start: usize) !usize {
+    const q = src[start];
+    try out.append(gpa, q);
+    var i = start + 1;
+    while (i < src.len) {
+        const d = src[i];
+        try out.append(gpa, d);
+        i += 1;
+        if (d == '\\' and i < src.len) {
+            try out.append(gpa, src[i]);
+            i += 1;
+            continue;
+        }
+        if (d == q) break;
+    }
+    return i;
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+}
+
+fn isIdentChar(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
 /// Convert a JSON5 manifest to strict JSON that `std.json` accepts.
-/// v0 handles the features every real `qube.json5` uses: `//` and
-/// `/* */` comments and trailing commas. Single-quoted strings and
-/// unquoted keys (also valid JSON5) are not yet handled — all manifests
-/// in the corpus quote their keys. String contents are preserved
-/// verbatim so a `//` or `,` inside a value is never touched. Caller
-/// owns the returned buffer.
+/// Handles exactly the dialect `spec/qube.json5.md` commits to: `//` and
+/// `/* */` comments, trailing commas, single-quoted strings, and unquoted
+/// (ASCII-identifier) object keys. String contents are preserved verbatim,
+/// so a `//`, `,`, or quote inside a value is never touched. JSON5
+/// features outside the manifest dialect (hex numbers, `Infinity`, …)
+/// pass through and are rejected by `std.json`. Caller owns the returned
+/// buffer.
 fn json5ToJson(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
-    // Pass 1: drop comments, copying string literals through untouched.
+    // Pass 1: drop comments, copying string literals (either quote kind)
+    // through untouched.
     var nocomments: std.ArrayList(u8) = .empty;
     defer nocomments.deinit(gpa);
     var i: usize = 0;
     while (i < src.len) {
         const c = src[i];
-        if (c == '"') {
-            try nocomments.append(gpa, c);
-            i += 1;
-            while (i < src.len) {
-                const d = src[i];
-                try nocomments.append(gpa, d);
-                i += 1;
-                if (d == '\\' and i < src.len) {
-                    try nocomments.append(gpa, src[i]);
-                    i += 1;
-                    continue;
-                }
-                if (d == '"') break;
-            }
+        if (c == '"' or c == '\'') {
+            i = try copyStringLiteral(gpa, &nocomments, src, i);
             continue;
         }
         if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
@@ -263,27 +299,116 @@ fn json5ToJson(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
         i += 1;
     }
 
-    // Pass 2: drop a comma when the next significant byte is `}` or `]`.
+    // Pass 2: rewrite single-quoted strings as double-quoted — `\'`
+    // unescapes to a bare `'`, an embedded `"` gains a backslash.
+    var dquoted: std.ArrayList(u8) = .empty;
+    defer dquoted.deinit(gpa);
+    {
+        const buf = nocomments.items;
+        var j: usize = 0;
+        while (j < buf.len) {
+            const c = buf[j];
+            if (c == '"') {
+                j = try copyStringLiteral(gpa, &dquoted, buf, j);
+                continue;
+            }
+            if (c == '\'') {
+                try dquoted.append(gpa, '"');
+                j += 1;
+                while (j < buf.len) {
+                    const d = buf[j];
+                    if (d == '\\' and j + 1 < buf.len) {
+                        if (buf[j + 1] == '\'') {
+                            try dquoted.append(gpa, '\'');
+                        } else {
+                            try dquoted.append(gpa, d);
+                            try dquoted.append(gpa, buf[j + 1]);
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    if (d == '\'') {
+                        try dquoted.append(gpa, '"');
+                        j += 1;
+                        break;
+                    }
+                    if (d == '"') {
+                        try dquoted.appendSlice(gpa, "\\\"");
+                        j += 1;
+                        continue;
+                    }
+                    try dquoted.append(gpa, d);
+                    j += 1;
+                }
+                continue;
+            }
+            try dquoted.append(gpa, c);
+            j += 1;
+        }
+    }
+
+    // Pass 3: quote unquoted object keys. A container stack tells object
+    // from array context; in an object, a key is expected after `{` and
+    // after `,`. Value-position identifiers (`true`, `false`, `null`)
+    // are never in key position, so they pass through.
+    var keyed: std.ArrayList(u8) = .empty;
+    defer keyed.deinit(gpa);
+    {
+        var stack: std.ArrayList(u8) = .empty;
+        defer stack.deinit(gpa);
+        var expect_key = false;
+        const buf = dquoted.items;
+        var j: usize = 0;
+        while (j < buf.len) {
+            const c = buf[j];
+            if (c == '"') {
+                j = try copyStringLiteral(gpa, &keyed, buf, j);
+                expect_key = false;
+                continue;
+            }
+            switch (c) {
+                '{' => {
+                    try stack.append(gpa, '{');
+                    expect_key = true;
+                },
+                '[' => {
+                    try stack.append(gpa, '[');
+                    expect_key = false;
+                },
+                '}', ']' => {
+                    _ = stack.pop();
+                    expect_key = false;
+                },
+                ',' => {
+                    expect_key = stack.items.len > 0 and stack.items[stack.items.len - 1] == '{';
+                },
+                else => {
+                    if (expect_key and isIdentStart(c)) {
+                        try keyed.append(gpa, '"');
+                        while (j < buf.len and isIdentChar(buf[j])) {
+                            try keyed.append(gpa, buf[j]);
+                            j += 1;
+                        }
+                        try keyed.append(gpa, '"');
+                        expect_key = false;
+                        continue;
+                    }
+                },
+            }
+            try keyed.append(gpa, c);
+            j += 1;
+        }
+    }
+
+    // Pass 4: drop a comma when the next significant byte is `}` or `]`.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    const buf = nocomments.items;
+    const buf = keyed.items;
     var j: usize = 0;
     while (j < buf.len) {
         const c = buf[j];
         if (c == '"') {
-            try out.append(gpa, c);
-            j += 1;
-            while (j < buf.len) {
-                const d = buf[j];
-                try out.append(gpa, d);
-                j += 1;
-                if (d == '\\' and j < buf.len) {
-                    try out.append(gpa, buf[j]);
-                    j += 1;
-                    continue;
-                }
-                if (d == '"') break;
-            }
+            j = try copyStringLiteral(gpa, &out, buf, j);
             continue;
         }
         if (c == ',') {
@@ -300,6 +425,303 @@ fn json5ToJson(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Test helper: drop whitespace outside string literals, so expectations
+/// don't depend on the exact residue comment-stripping leaves behind.
+fn stripWsOutsideStrings(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '"') {
+            i = try copyStringLiteral(gpa, &out, src, i);
+            continue;
+        }
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') try out.append(gpa, c);
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn expectJson5(expected: []const u8, src: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const got = try json5ToJson(gpa, src);
+    defer gpa.free(got);
+    const got_stripped = try stripWsOutsideStrings(gpa, got);
+    defer gpa.free(got_stripped);
+    const expected_stripped = try stripWsOutsideStrings(gpa, expected);
+    defer gpa.free(expected_stripped);
+    try std.testing.expectEqualStrings(expected_stripped, got_stripped);
+    // Whatever the transform produces must be valid strict JSON.
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, got, .{});
+    defer parsed.deinit();
+}
+
+test "json5ToJson: comments and trailing commas (regression)" {
+    try expectJson5(
+        "{ \"name\": \"x\" }",
+        "{ \"name\": \"x\", // c\n /* block */ }",
+    );
+}
+
+test "json5ToJson: comment markers inside strings are preserved" {
+    try expectJson5(
+        "{ \"url\": \"https://q64.dev\", \"note\": \"a, b /* not a comment */\" }",
+        "{ \"url\": \"https://q64.dev\", \"note\": \"a, b /* not a comment */\" }",
+    );
+}
+
+test "json5ToJson: single-quoted strings convert, escapes rewrite" {
+    try expectJson5(
+        "{ \"a\": \"it's\", \"b\": \"say \\\"hi\\\"\" }",
+        "{ \"a\": 'it\\'s', \"b\": 'say \"hi\"' }",
+    );
+}
+
+test "json5ToJson: unquoted keys are quoted, value identifiers untouched" {
+    try expectJson5(
+        "{ \"$schema\": \"s\", \"name\": \"x\", \"flag\": true, \"deps\": { \"a_1\": null }, \"xs\": [false] }",
+        "{ $schema: \"s\", name: \"x\", flag: true, deps: { a_1: null }, xs: [false] }",
+    );
+}
+
+test "json5ToJson: full manifest dialect end to end" {
+    try expectJson5(
+        "{ \"name\": \"dev.q64.j5\", \"version\": \"0.1.0\", \"license\": \"MIT\", \"type\": \"application\", \"entry\": \"src/main.q\" }",
+        "{ name: 'dev.q64.j5', version: '0.1.0', /* id */ license: 'MIT', type: 'application', entry: 'src/main.q', // tail\n }",
+    );
+}
+
+test "json5ToJson: single-quoted string containing comment and brace bytes" {
+    try expectJson5(
+        "{ \"k\": \"// { , } [\" }",
+        "{ k: '// { , } [' }",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// qube.lock (spec/qube.lock.md)
+// ---------------------------------------------------------------------------
+
+const lock_file_name = "qube.lock";
+
+const LockEntry = struct {
+    name: []const u8,
+    version: []const u8,
+    source: []const u8,
+    sha256: ?[]const u8 = null,
+    effects: []const []const u8 = &.{},
+    dependencies: []const []const u8 = &.{},
+};
+
+const LockFile = struct {
+    version: i64 = 1,
+    qubes: []LockEntry = &.{},
+};
+
+/// Serialize lock entries to the deterministic strict-JSON form the spec
+/// pins: sorted by name, two-space indent, fixed field order, trailing
+/// newline. Field values come from validated names / semvers / URLs /
+/// manifest paths, so no JSON string escaping is applied. Caller owns
+/// the returned buffer.
+fn renderLockFile(gpa: std.mem.Allocator, entries: []const LockEntry) ![]u8 {
+    const sorted = try gpa.dupe(LockEntry, entries);
+    defer gpa.free(sorted);
+    std.mem.sort(LockEntry, sorted, {}, struct {
+        fn lt(_: void, a: LockEntry, b: LockEntry) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lt);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\n  \"version\": 1,\n  \"qubes\": [");
+    for (sorted, 0..) |e, idx| {
+        if (idx > 0) try out.append(gpa, ',');
+        try out.appendSlice(gpa, "\n    {\n");
+        try out.print(gpa, "      \"name\": \"{s}\",\n", .{e.name});
+        try out.print(gpa, "      \"version\": \"{s}\",\n", .{e.version});
+        try out.print(gpa, "      \"source\": \"{s}\"", .{e.source});
+        if (e.sha256) |sha| try out.print(gpa, ",\n      \"sha256\": \"{s}\"", .{sha});
+        if (e.effects.len > 0) {
+            try out.appendSlice(gpa, ",\n      \"effects\": [");
+            for (e.effects, 0..) |eff, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try out.print(gpa, "\"{s}\"", .{eff});
+            }
+            try out.append(gpa, ']');
+        }
+        if (e.dependencies.len > 0) {
+            try out.appendSlice(gpa, ",\n      \"dependencies\": [");
+            for (e.dependencies, 0..) |d, i| {
+                if (i > 0) try out.appendSlice(gpa, ", ");
+                try out.print(gpa, "\"{s}\"", .{d});
+            }
+            try out.append(gpa, ']');
+        }
+        try out.appendSlice(gpa, "\n    }");
+    }
+    if (sorted.len > 0) try out.appendSlice(gpa, "\n  ");
+    try out.appendSlice(gpa, "]\n}\n");
+    return out.toOwnedSlice(gpa);
+}
+
+/// Read and parse `<project_dir>/qube.lock`. Returns null when the file
+/// does not exist; `error.MalformedLockfile` (PKG013) when it is not
+/// valid JSON or its format version is unknown.
+fn readLockFile(gpa: std.mem.Allocator, io: std.Io, project_dir: []const u8) !?std.json.Parsed(LockFile) {
+    const path = try std.fs.path.join(gpa, &.{ project_dir, lock_file_name });
+    defer gpa.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer gpa.free(raw);
+    // `raw` dies with this frame, so the parse must copy every string.
+    const parsed = std.json.parseFromSlice(LockFile, gpa, raw, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.MalformedLockfile;
+    if (parsed.value.version != 1) {
+        parsed.deinit();
+        return error.MalformedLockfile;
+    }
+    return parsed;
+}
+
+fn writeLockFileEntries(gpa: std.mem.Allocator, io: std.Io, project_dir: []const u8, entries: []const LockEntry) !void {
+    const rendered = try renderLockFile(gpa, entries);
+    defer gpa.free(rendered);
+    const path = try std.fs.path.join(gpa, &.{ project_dir, lock_file_name });
+    defer gpa.free(path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = rendered });
+}
+
+/// Replace-or-append one entry in the project's lockfile (creating the
+/// file if absent), preserving every other entry.
+fn upsertLockEntry(gpa: std.mem.Allocator, io: std.Io, project_dir: []const u8, new_entry: LockEntry) !void {
+    const maybe = try readLockFile(gpa, io, project_dir);
+    defer if (maybe) |p| p.deinit();
+
+    var entries: std.ArrayList(LockEntry) = .empty;
+    defer entries.deinit(gpa);
+    if (maybe) |p| {
+        for (p.value.qubes) |e| {
+            if (!std.mem.eql(u8, e.name, new_entry.name)) try entries.append(gpa, e);
+        }
+    }
+    try entries.append(gpa, new_entry);
+    try writeLockFileEntries(gpa, io, project_dir, entries.items);
+}
+
+/// Extracted-archive cache directory for a locked digest:
+/// `<home>/cache/sha256/<ab>/<cd>/<digest>` (spec/qube-cli.md §cache).
+fn cacheDirForSha(gpa: std.mem.Allocator, home: []const u8, sha: []const u8) ![]u8 {
+    if (sha.len < 4) return error.MalformedLockfile;
+    return std.fmt.allocPrint(gpa, "{s}/cache/sha256/{s}/{s}/{s}", .{ home, sha[0..2], sha[2..4], sha });
+}
+
+const Semver = struct { major: u64, minor: u64, patch: u64 };
+
+/// Parse `maj[.min[.pat]]`, ignoring any prerelease / build suffix.
+fn parseSemver(s: []const u8) ?Semver {
+    var core = s;
+    if (std.mem.indexOfAny(u8, s, "-+")) |i| core = s[0..i];
+    var it = std.mem.splitScalar(u8, core, '.');
+    const major = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const minor = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch return null;
+    const patch = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch return null;
+    if (it.next() != null) return null;
+    return .{ .major = major, .minor = minor, .patch = patch };
+}
+
+fn semverGte(a: Semver, b: Semver) bool {
+    if (a.major != b.major) return a.major > b.major;
+    if (a.minor != b.minor) return a.minor > b.minor;
+    return a.patch >= b.patch;
+}
+
+/// The v0 range forms (spec/qube.lock.md §"v0 resolver floor"): caret
+/// (`^0.3`, `^1.2.3` — compatible-and-at-least) and exact (`0.3.2`).
+fn versionSatisfies(spec: []const u8, version: []const u8) bool {
+    const v = parseSemver(version) orelse return false;
+    if (spec.len > 0 and spec[0] == '^') {
+        const base = parseSemver(spec[1..]) orelse return false;
+        if (v.major != base.major) return false;
+        if (base.major == 0 and v.minor != base.minor) return false;
+        return semverGte(v, base);
+    }
+    const base = parseSemver(spec) orelse return false;
+    return v.major == base.major and v.minor == base.minor and v.patch == base.patch;
+}
+
+test "versionSatisfies: caret and exact forms" {
+    try std.testing.expect(versionSatisfies("^0.3", "0.3.0"));
+    try std.testing.expect(versionSatisfies("^0.3", "0.3.7"));
+    try std.testing.expect(!versionSatisfies("^0.3", "0.4.0")); // 0.x: minor is breaking
+    try std.testing.expect(versionSatisfies("^1.2", "1.9.0"));
+    try std.testing.expect(!versionSatisfies("^1.2", "2.0.0"));
+    try std.testing.expect(!versionSatisfies("^1.2", "1.1.9")); // below base
+    try std.testing.expect(versionSatisfies("0.3.2", "0.3.2"));
+    try std.testing.expect(!versionSatisfies("0.3.2", "0.3.3"));
+    try std.testing.expect(versionSatisfies("^1.2.3", "1.2.3-rc.1")); // prerelease ignored
+    try std.testing.expect(!versionSatisfies("^0.3", "junk"));
+}
+
+test "renderLockFile: deterministic, sorted, parseable" {
+    const gpa = std.testing.allocator;
+    const entries = [_]LockEntry{
+        .{ .name = "dev.q64.zeta", .version = "0.1.0", .source = "path+../zeta" },
+        .{
+            .name = "dev.q64.audio",
+            .version = "0.3.2",
+            .source = "registry+https://qubes.q64.dev",
+            .sha256 = "ab12cd34",
+            .effects = &.{ "@audio", "@io" },
+        },
+    };
+    const rendered = try renderLockFile(gpa, &entries);
+    defer gpa.free(rendered);
+
+    const expected =
+        \\{
+        \\  "version": 1,
+        \\  "qubes": [
+        \\    {
+        \\      "name": "dev.q64.audio",
+        \\      "version": "0.3.2",
+        \\      "source": "registry+https://qubes.q64.dev",
+        \\      "sha256": "ab12cd34",
+        \\      "effects": ["@audio", "@io"]
+        \\    },
+        \\    {
+        \\      "name": "dev.q64.zeta",
+        \\      "version": "0.1.0",
+        \\      "source": "path+../zeta"
+        \\    }
+        \\  ]
+        \\}
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, rendered);
+
+    // Round-trip through the reader's parse.
+    const parsed = try std.json.parseFromSlice(LockFile, gpa, rendered, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.qubes.len);
+    try std.testing.expectEqualStrings("dev.q64.audio", parsed.value.qubes[0].name);
+    try std.testing.expectEqualStrings("ab12cd34", parsed.value.qubes[0].sha256.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.qubes[0].effects.len);
+    try std.testing.expect(parsed.value.qubes[1].sha256 == null);
+}
+
+test "renderLockFile: empty graph" {
+    const gpa = std.testing.allocator;
+    const rendered = try renderLockFile(gpa, &.{});
+    defer gpa.free(rendered);
+    try std.testing.expectEqualStrings("{\n  \"version\": 1,\n  \"qubes\": []\n}\n", rendered);
+}
+
 /// Read a top-level string field from a parsed manifest object.
 fn manifestString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
@@ -310,14 +732,16 @@ fn manifestString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 }
 
 /// Resolve the manifest's `dependencies` map into `name=dir` strings for
-/// `q64 emit --module`. v0 resolves local-path dependencies only: the
-/// module's source directory is `<dep-path>/src`, made absolute. A
-/// registry or git dependency (which would need cache/lock resolution)
-/// is reported and rejected rather than silently dropped. Caller owns
-/// each returned string and the list.
+/// `q64 emit --module`. A local-path dependency resolves to
+/// `<dep-path>/src`, made absolute. A registry dependency (a version-range
+/// string) resolves only through `qube.lock` (spec/qube.lock.md): the
+/// locked sha256 names the extracted cache directory — the build path
+/// never touches the network. Caller owns each returned string and the
+/// list.
 fn resolveModuleSpecs(
     gpa: std.mem.Allocator,
     io: std.Io,
+    env: *std.process.Environ.Map,
     project_dir: []const u8,
     root: std.json.ObjectMap,
 ) !std.ArrayList([]u8) {
@@ -333,22 +757,74 @@ fn resolveModuleSpecs(
         else => return specs,
     };
 
+    // The lockfile is read lazily: a path-only project never needs one.
+    var lock: ?std.json.Parsed(LockFile) = null;
+    defer if (lock) |p| p.deinit();
+    var lock_loaded = false;
+
     var it = deps.iterator();
     while (it.next()) |entry| {
         const dep_name = entry.key_ptr.*;
-        const path_val: ?[]const u8 = switch (entry.value_ptr.*) {
-            .object => |o| manifestString(o, "path"),
-            else => null,
-        };
-        const p = path_val orelse {
-            try printStderr(io, "qube: dependency '{s}' is not a local-path dependency; v0 resolves only `path` deps\n", .{dep_name});
-            return error.UnsupportedDependency;
-        };
-        // Module source dir = <dep>/src, absolute and normalized.
-        const dir = try std.fs.path.resolve(gpa, &.{ project_dir, p, "src" });
-        defer gpa.free(dir);
-        const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, dir });
-        try specs.append(gpa, spec);
+        switch (entry.value_ptr.*) {
+            .object => |o| {
+                const p = manifestString(o, "path") orelse {
+                    try printStderr(io, "qube: dependency '{s}' has no `path`; v0 resolves `path` and locked registry deps\n", .{dep_name});
+                    return error.UnsupportedDependency;
+                };
+                // Module source dir = <dep>/src, absolute and normalized.
+                const dir = try std.fs.path.resolve(gpa, &.{ project_dir, p, "src" });
+                defer gpa.free(dir);
+                const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, dir });
+                try specs.append(gpa, spec);
+            },
+            .string => |range| {
+                if (!lock_loaded) {
+                    lock_loaded = true;
+                    lock = readLockFile(gpa, io, project_dir) catch |err| switch (err) {
+                        error.MalformedLockfile => {
+                            try writeStderr(io, "qube: PKG013: qube.lock is malformed or has an unsupported version; run `qube lock`\n");
+                            return error.MalformedLockfile;
+                        },
+                        else => return err,
+                    };
+                }
+                const locked: ?LockEntry = blk: {
+                    const l = lock orelse break :blk null;
+                    for (l.value.qubes) |e| {
+                        if (std.mem.eql(u8, e.name, dep_name)) break :blk e;
+                    }
+                    break :blk null;
+                };
+                const e = locked orelse {
+                    try printStderr(io, "qube: PKG010: dependency '{s}' is not locked; run `qube lock` (or `qube add {s}`)\n", .{ dep_name, dep_name });
+                    return error.DependencyNotLocked;
+                };
+                if (!versionSatisfies(range, e.version)) {
+                    try printStderr(io, "qube: PKG011: locked '{s}@{s}' does not satisfy the manifest range '{s}'; run `qube lock`\n", .{ dep_name, e.version, range });
+                    return error.LockedVersionMismatch;
+                }
+                const sha = e.sha256 orelse {
+                    try printStderr(io, "qube: PKG011: '{s}' is locked from a path source but the manifest declares a registry range; run `qube lock`\n", .{dep_name});
+                    return error.LockedVersionMismatch;
+                };
+                const home = try qubeHome(gpa, env);
+                defer gpa.free(home);
+                const cache_dir = try cacheDirForSha(gpa, home, sha);
+                defer gpa.free(cache_dir);
+                std.Io.Dir.cwd().access(io, cache_dir, .{}) catch {
+                    try printStderr(io, "qube: PKG012: locked archive for '{s}@{s}' is not in the cache ({s}); run `qube add {s}@{s}`\n", .{ dep_name, e.version, cache_dir, dep_name, e.version });
+                    return error.LockedArchiveMissing;
+                };
+                const dir = try std.fs.path.join(gpa, &.{ cache_dir, "src" });
+                defer gpa.free(dir);
+                const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, dir });
+                try specs.append(gpa, spec);
+            },
+            else => {
+                try printStderr(io, "qube: dependency '{s}' has an unsupported value shape\n", .{dep_name});
+                return error.UnsupportedDependency;
+            },
+        }
     }
     return specs;
 }
@@ -419,7 +895,7 @@ fn cmdRun(
     defer gpa.free(entry_path);
 
     // Resolve dependencies → `--module name=dir` specs (ladder step 4).
-    var module_specs = resolveModuleSpecs(gpa, io, project_dir, root) catch |err| {
+    var module_specs = resolveModuleSpecs(gpa, io, env, project_dir, root) catch |err| {
         try printStderr(io, "qube: dependency resolution failed: {s}\n", .{@errorName(err)});
         std.process.exit(@intFromEnum(ExitCode.dependency));
     };
@@ -575,7 +1051,7 @@ fn cmdBuild(
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
 
-    var module_specs = resolveModuleSpecs(gpa, io, project_dir, root) catch |err| {
+    var module_specs = resolveModuleSpecs(gpa, io, env, project_dir, root) catch |err| {
         try printStderr(io, "qube: dependency resolution failed: {s}\n", .{@errorName(err)});
         std.process.exit(@intFromEnum(ExitCode.dependency));
     };
@@ -776,7 +1252,7 @@ fn cmdWeb(
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
 
-    var module_specs = resolveModuleSpecs(gpa, io, project_dir, root) catch |err| {
+    var module_specs = resolveModuleSpecs(gpa, io, env, project_dir, root) catch |err| {
         try printStderr(io, "qube: dependency resolution failed: {s}\n", .{@errorName(err)});
         std.process.exit(@intFromEnum(ExitCode.dependency));
     };
@@ -978,7 +1454,7 @@ fn openBrowser(io: std.Io, url: []const u8) !void {
 
 fn printStdout(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
 }
@@ -1291,6 +1767,244 @@ const pack_script =
     \\rm -rf "$STAGE"
 ;
 
+// ---------------------------------------------------------------------------
+// Capability sync (spec/qube.json5.md §Capabilities, spec/env.md §disclosure)
+//
+// The manifest's `capabilities` field is generated, not authored: publish
+// derives it from the compiler (`q64 show capabilities`) and rewrites the
+// field in place, so the registry's ENV040/ENV041 backstop never fires for
+// a toolchain publish.
+// ---------------------------------------------------------------------------
+
+/// The 1:1 effect-marker → capability-name table from
+/// spec/qube.json5.md §Capabilities / spec/env.md. Umbrella effects with
+/// no capability of their own (`@io`, `@pure`, …) map to null.
+fn capabilityForEffect(effect: []const u8) ?[]const u8 {
+    const map = [_]struct { effect: []const u8, capability: []const u8 }{
+        .{ .effect = "@network", .capability = "Net" },
+        .{ .effect = "@fs", .capability = "Fs" },
+        .{ .effect = "@kv", .capability = "KeyValue" },
+        .{ .effect = "@audio", .capability = "Audio" },
+        .{ .effect = "@midi", .capability = "Midi" },
+        .{ .effect = "@ui", .capability = "Ui" },
+        .{ .effect = "@inference", .capability = "AiEnv" },
+        .{ .effect = "@time", .capability = "Clock" },
+        .{ .effect = "@random", .capability = "Rng" },
+        .{ .effect = "@stdout", .capability = "Stdout" },
+        .{ .effect = "@stderr", .capability = "Stderr" },
+        .{ .effect = "@exit", .capability = "ExitFn" },
+        .{ .effect = "@envvars", .capability = "EnvVars" },
+    };
+    for (map) |e| {
+        if (std.mem.eql(u8, e.effect, effect)) return e.capability;
+    }
+    return null;
+}
+
+/// Map `q64 show capabilities` output (one effect marker per line) to the
+/// sorted, deduplicated capability list. Allocated in `arena`.
+fn capabilitiesFromEffects(arena: std.mem.Allocator, q64_output: []const u8) ![]const []const u8 {
+    var caps: std.ArrayList([]const u8) = .empty;
+    defer caps.deinit(arena);
+    var it = std.mem.tokenizeAny(u8, q64_output, " \r\n\t");
+    while (it.next()) |tok| {
+        const cap = capabilityForEffect(tok) orelse continue;
+        var dup = false;
+        for (caps.items) |c| {
+            if (std.mem.eql(u8, c, cap)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try caps.append(arena, cap);
+    }
+    const out = try arena.dupe([]const u8, caps.items);
+    std.mem.sort([]const u8, out, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    return out;
+}
+
+/// Render a capability list as the manifest array value: `["Net", "Stdout"]`.
+fn renderCapabilitiesValue(gpa: std.mem.Allocator, caps: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '[');
+    for (caps, 0..) |c, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try out.print(gpa, "\"{s}\"", .{c});
+    }
+    try out.append(gpa, ']');
+    return out.toOwnedSlice(gpa);
+}
+
+/// Return a copy of the JSON5 manifest `raw` with its `capabilities`
+/// field's array replaced by `rendered`, inserting the field before the
+/// final closing brace when absent. Handles quoted and unquoted keys;
+/// preserves the rest of the text byte-for-byte.
+fn replaceCapabilitiesField(gpa: std.mem.Allocator, raw: []const u8, rendered: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    const key_at: ?usize = std.mem.indexOf(u8, raw, "\"capabilities\"") orelse blk: {
+        // Unquoted JSON5 key: a bare identifier in key position.
+        var search: usize = 0;
+        while (std.mem.indexOfPos(u8, raw, search, "capabilities")) |i| {
+            const before_ok = i == 0 or switch (raw[i - 1]) {
+                '{', ',', ' ', '\n', '\t', '\r' => true,
+                else => false,
+            };
+            var j = i + "capabilities".len;
+            while (j < raw.len and (raw[j] == ' ' or raw[j] == '\t')) j += 1;
+            if (before_ok and j < raw.len and raw[j] == ':') break :blk i;
+            search = i + 1;
+        }
+        break :blk null;
+    };
+
+    if (key_at) |k| {
+        const colon = std.mem.indexOfScalarPos(u8, raw, k, ':') orelse return error.MalformedManifest;
+        const open = std.mem.indexOfScalarPos(u8, raw, colon, '[') orelse return error.MalformedManifest;
+        const close = std.mem.indexOfScalarPos(u8, raw, open, ']') orelse return error.MalformedManifest;
+        try out.appendSlice(gpa, raw[0..open]);
+        try out.appendSlice(gpa, rendered);
+        try out.appendSlice(gpa, raw[close + 1 ..]);
+    } else {
+        const brace = std.mem.lastIndexOfScalar(u8, raw, '}') orelse return error.MalformedManifest;
+        // Trim trailing whitespace before the brace; add a comma if the
+        // last property lacks one.
+        var k = brace;
+        while (k > 0 and switch (raw[k - 1]) {
+            ' ', '\n', '\t', '\r' => true,
+            else => false,
+        }) k -= 1;
+        const needs_comma = k > 0 and raw[k - 1] != ',' and raw[k - 1] != '{';
+        try out.appendSlice(gpa, raw[0..k]);
+        if (needs_comma) try out.append(gpa, ',');
+        try out.print(gpa, "\n  \"capabilities\": {s},\n", .{rendered});
+        try out.appendSlice(gpa, raw[brace..]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "capabilitiesFromEffects: maps, dedupes, sorts, ignores umbrellas" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const caps = try capabilitiesFromEffects(arena_state.allocator(), "@stdout\n@io\n@network\n@stdout\n@kv\n");
+    try std.testing.expectEqual(@as(usize, 3), caps.len);
+    try std.testing.expectEqualStrings("KeyValue", caps[0]);
+    try std.testing.expectEqualStrings("Net", caps[1]);
+    try std.testing.expectEqualStrings("Stdout", caps[2]);
+}
+
+test "replaceCapabilitiesField: replaces quoted and unquoted keys, inserts when absent" {
+    const gpa = std.testing.allocator;
+
+    const replaced = try replaceCapabilitiesField(gpa, "{ \"name\": \"x\", \"capabilities\": [\"Net\"], \"type\": \"library\" }", "[\"Stdout\"]");
+    defer gpa.free(replaced);
+    try std.testing.expectEqualStrings("{ \"name\": \"x\", \"capabilities\": [\"Stdout\"], \"type\": \"library\" }", replaced);
+
+    const unquoted = try replaceCapabilitiesField(gpa, "{ name: 'x', capabilities: [], type: 'library' }", "[\"Stdout\"]");
+    defer gpa.free(unquoted);
+    try std.testing.expectEqualStrings("{ name: 'x', capabilities: [\"Stdout\"], type: 'library' }", unquoted);
+
+    const inserted = try replaceCapabilitiesField(gpa, "{\n  \"name\": \"x\"\n}", "[\"Stdout\"]");
+    defer gpa.free(inserted);
+    try std.testing.expectEqualStrings("{\n  \"name\": \"x\",\n  \"capabilities\": [\"Stdout\"],\n}", inserted);
+
+    const inserted_after_comma = try replaceCapabilitiesField(gpa, "{\n  \"name\": \"x\",\n}", "[]");
+    defer gpa.free(inserted_after_comma);
+    try std.testing.expectEqualStrings("{\n  \"name\": \"x\",\n  \"capabilities\": [],\n}", inserted_after_comma);
+}
+
+/// Derive the qube's capability set from the compiler and sync the
+/// manifest's `capabilities` field in place. Soft-skips (with a warning)
+/// when `q64` is not available; any compile failure is fatal — a qube
+/// that does not compile must not publish.
+fn syncManifestCapabilities(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    m: *const LoadedManifest,
+) !void {
+    const project_dir = m.projectDir();
+    const repo_root_opt = findRepoRoot(gpa, io, project_dir) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const q64_bin = try resolveBinary(gpa, io, env, "Q64_BIN", repo_root_opt, "q64/zig-out/bin/q64", "q64");
+    defer gpa.free(q64_bin);
+
+    const type_str = manifestString(m.root, "type") orelse "library";
+    const entry_rel = manifestString(m.root, "entry") orelse
+        (if (std.mem.eql(u8, type_str, "application")) "src/main.q" else "src/lib.q");
+    const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
+    defer gpa.free(entry_path);
+
+    var module_specs = resolveModuleSpecs(gpa, io, env, project_dir, m.root) catch |err| {
+        try printStderr(io, "qube publish: dependency resolution failed: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    };
+    defer {
+        for (module_specs.items) |s| gpa.free(s);
+        module_specs.deinit(gpa);
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ q64_bin, "show", "capabilities", "--qube", entry_path });
+    for (module_specs.items) |spec| {
+        try argv.appendSlice(gpa, &.{ "--module", spec });
+    }
+
+    const cap_out = runCapture(gpa, io, argv.items) catch {
+        try writeStderr(io, "qube publish: q64 not found; skipping capability sync (the registry will cross-check)\n");
+        return;
+    };
+    defer gpa.free(cap_out.stdout);
+    const q64_code = cap_out.code orelse 255;
+    if (q64_code != 0) {
+        try printStderr(io, "qube publish: `q64 show capabilities` failed (exit {d}); cannot derive the capability set\n", .{q64_code});
+        std.process.exit(@intFromEnum(ExitCode.compile));
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const derived = try capabilitiesFromEffects(arena_state.allocator(), cap_out.stdout);
+
+    const current: ?[]const std.json.Value = if (m.root.get("capabilities")) |v| switch (v) {
+        .array => |a| a.items,
+        else => null,
+    } else null;
+
+    const in_sync = blk: {
+        const cur = current orelse break :blk derived.len == 0;
+        if (cur.len != derived.len) break :blk false;
+        for (derived) |d| {
+            var found = false;
+            for (cur) |cv| {
+                if (cv == .string and std.mem.eql(u8, cv.string, d)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break :blk false;
+        }
+        break :blk true;
+    };
+    if (in_sync) return;
+
+    const rendered = try renderCapabilitiesValue(gpa, derived);
+    defer gpa.free(rendered);
+    const updated = replaceCapabilitiesField(gpa, m.src, rendered) catch |err| {
+        try printStderr(io, "qube publish: cannot rewrite the capabilities field: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer gpa.free(updated);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = m.path, .data = updated });
+    try printStdout(io, "qube publish: capabilities synced to {s} (compiler-derived)\n", .{rendered});
+}
+
 fn cmdPublish(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1309,23 +2023,16 @@ fn cmdPublish(
         }
     }
 
-    const cwd_path = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd_path);
-    const manifest_path = try findManifestUpward(gpa, io, cwd_path) orelse {
-        try writeStderr(io, "qube: no qube.json5 found in this directory or any parent\n");
-        std.process.exit(@intFromEnum(ExitCode.input));
-    };
-    defer gpa.free(manifest_path);
-    const project_dir = std.fs.path.dirname(manifest_path) orelse ".";
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    const manifest_path = m.path;
+    const project_dir = m.projectDir();
 
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
-    defer gpa.free(raw);
-
-    const name = extractStringField(raw, "\"name\"") orelse {
+    const name = manifestString(m.root, "name") orelse {
         try writeStderr(io, "qube publish: manifest has no \"name\" field\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
-    const version = extractStringField(raw, "\"version\"") orelse {
+    const version = manifestString(m.root, "version") orelse {
         try writeStderr(io, "qube publish: manifest has no \"version\" field\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
@@ -1338,11 +2045,17 @@ fn cmdPublish(
         try writeStderr(io, "qube publish: the 'q64.*' namespace is reserved for the built-in standard library\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     }
-    if (std.mem.indexOf(u8, raw, "\"publish\"") != null and std.mem.indexOf(u8, raw, "false") != null) {
-        // Coarse v0 guard: a manifest that sets publish:false is opted out.
-        try writeStderr(io, "qube publish: manifest sets publish: false; refusing\n");
-        std.process.exit(@intFromEnum(ExitCode.input));
+    if (m.root.get("publish")) |v| {
+        if (v == .bool and !v.bool) {
+            try writeStderr(io, "qube publish: manifest sets publish: false; refusing\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
     }
+
+    // Sync the generated `capabilities` field from the compiler before
+    // packing, so the uploaded manifest always matches the effect index
+    // (spec/qube.json5.md §Capabilities).
+    try syncManifestCapabilities(gpa, io, env, &m);
 
     // Pack the default file set into target/publish/<name>-<version>.zip.
     const root = try std.fmt.allocPrint(gpa, "{s}-{s}", .{ name, version });
@@ -1516,46 +2229,482 @@ fn cmdAdd(
     };
 
     // Download the archive into the cache, verifying the SHA-256.
+    const cache_dir = try downloadAndCacheArchive(gpa, io, env, registry, name, cv.version, cv.archive_sha, "add");
+    defer gpa.free(cache_dir);
+
+    // Insert the dependency into the manifest.
+    try insertDependency(gpa, io, manifest_path, name, cv.version);
+
+    // Pin it in the lockfile (spec/qube.lock.md).
+    const project_dir = std.fs.path.dirname(manifest_path) orelse ".";
+    const lock_source = try std.fmt.allocPrint(gpa, "registry+{s}", .{registry});
+    defer gpa.free(lock_source);
+    try upsertLockEntry(gpa, io, project_dir, .{
+        .name = name,
+        .version = cv.version,
+        .source = lock_source,
+        .sha256 = cv.archive_sha,
+    });
+
+    try printStdout(io, "Added {s}@{s}\n  cached at {s}\n  locked in {s}\n", .{ name, cv.version, cache_dir, lock_file_name });
+}
+
+/// Download `<registry>/v1/qubes/<name>/<version>/archive`, verify the
+/// expected SHA-256, and extract it into the content-addressed cache
+/// (`~/.qube/cache/sha256/<ab>/<cd>/<digest>/`, spec/qube-cli.md).
+/// Returns the extracted directory; caller owns it. `cmd` names the
+/// caller for messages. Exits with registry / dependency codes on
+/// failure, like the rest of the registry client.
+fn downloadAndCacheArchive(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    registry: []const u8,
+    name: []const u8,
+    version: []const u8,
+    expected_sha: []const u8,
+    cmd: []const u8,
+) ![]u8 {
     const home = try qubeHome(gpa, env);
     defer gpa.free(home);
     const cache_root = try std.fs.path.join(gpa, &.{ home, "cache" });
     defer gpa.free(cache_root);
     try std.Io.Dir.cwd().createDirPath(io, cache_root);
-    const tmp_zip = try std.fmt.allocPrint(gpa, "{s}/{s}.part", .{ cache_root, cv.archive_sha });
+    const tmp_zip = try std.fmt.allocPrint(gpa, "{s}/{s}.part", .{ cache_root, expected_sha });
     defer gpa.free(tmp_zip);
 
-    const archive_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}/{s}/archive", .{ registry, name, cv.version });
+    const archive_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}/{s}/archive", .{ registry, name, version });
     defer gpa.free(archive_url);
     const dl_status = try httpGetToFile(gpa, io, archive_url, tmp_zip);
     if (dl_status != 200) {
-        try printStderr(io, "qube add: archive download returned {d}\n", .{dl_status});
+        try printStderr(io, "qube {s}: archive download returned {d}\n", .{ cmd, dl_status });
         std.process.exit(@intFromEnum(ExitCode.registry));
     }
 
     const got_sha = try sha256HexOfFile(gpa, io, tmp_zip);
     defer gpa.free(got_sha);
-    if (!std.mem.eql(u8, got_sha, cv.archive_sha)) {
-        try printStderr(io, "qube add: archive SHA-256 mismatch\n  expected {s}\n  got      {s}\n", .{ cv.archive_sha, got_sha });
+    if (!std.mem.eql(u8, got_sha, expected_sha)) {
+        try printStderr(io, "qube {s}: archive SHA-256 mismatch\n  expected {s}\n  got      {s}\n", .{ cmd, expected_sha, got_sha });
         std.process.exit(@intFromEnum(ExitCode.dependency));
     }
 
-    // Extract to cache/sha256/<ab>/<cd>/<digest>/ (spec/qube-cli.md).
-    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/sha256/{s}/{s}/{s}", .{ cache_root, cv.archive_sha[0..2], cv.archive_sha[2..4], cv.archive_sha });
-    defer gpa.free(cache_dir);
+    const cache_dir = try cacheDirForSha(gpa, home, expected_sha);
+    errdefer gpa.free(cache_dir);
     {
         const argv = [_][]const u8{ "sh", "-c", extract_script, "sh", tmp_zip, cache_dir };
         const term = try spawnInherit(io, &argv);
         if (termCode(term) != 0) {
-            try writeStderr(io, "qube add: extracting the archive failed\n");
+            try printStderr(io, "qube {s}: extracting the archive failed\n", .{cmd});
             std.process.exit(@intFromEnum(ExitCode.internal));
         }
     }
     std.Io.Dir.cwd().deleteFile(io, tmp_zip) catch {};
+    return cache_dir;
+}
 
-    // Insert the dependency into the manifest.
-    try insertDependency(gpa, io, manifest_path, name, cv.version);
+/// The nearest manifest, discovered and parsed. `root` borrows from
+/// `parsed`; `projectDir()` borrows from `path`.
+const LoadedManifest = struct {
+    path: []u8,
+    src: []u8,
+    json: []u8,
+    parsed: std.json.Parsed(std.json.Value),
+    root: std.json.ObjectMap,
 
-    try printStdout(io, "Added {s}@{s}\n  cached at {s}\n", .{ name, cv.version, cache_dir });
+    fn projectDir(self: *const LoadedManifest) []const u8 {
+        return std.fs.path.dirname(self.path) orelse ".";
+    }
+
+    fn deinit(self: *LoadedManifest, gpa: std.mem.Allocator) void {
+        self.parsed.deinit();
+        gpa.free(self.json);
+        gpa.free(self.src);
+        gpa.free(self.path);
+    }
+};
+
+/// Discover the nearest qube.json5 (walking up from cwd) and parse it.
+/// Exits with input-error codes on failure, like the run/build path.
+fn loadManifest(gpa: std.mem.Allocator, io: std.Io) !LoadedManifest {
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const manifest_path = try findManifestUpward(gpa, io, cwd_path) orelse {
+        try writeStderr(io, "qube: no qube.json5 found in this directory or any parent\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    errdefer gpa.free(manifest_path);
+    const manifest_src = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1 * 1024 * 1024)) catch |err| {
+        try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    errdefer gpa.free(manifest_src);
+    const json = json5ToJson(gpa, manifest_src) catch |err| {
+        try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    errdefer gpa.free(json);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |err| {
+        try printStderr(io, "qube: cannot parse {s}: {s}\n", .{ manifest_path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    errdefer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try writeStderr(io, "qube: manifest is not a JSON object\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        },
+    };
+    return .{ .path = manifest_path, .src = manifest_src, .json = json, .parsed = parsed, .root = root };
+}
+
+/// Resolve the manifest's dependencies into lock entries
+/// (spec/qube.lock.md). A path dep is recorded from its own manifest; a
+/// registry range reuses the `old_lock` version when it still
+/// satisfies, and otherwise resolves to the highest non-yanked
+/// satisfying version from the registry's metadata (no archive download
+/// — the sha comes from the index). With `offline`, a range that cannot
+/// be reused is PKG010 instead of a fetch. Strings that outlive their
+/// producers are allocated in `arena`; `cmd` names the caller for
+/// messages.
+fn buildLockEntries(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    project_dir: []const u8,
+    root: std.json.ObjectMap,
+    registry: []const u8,
+    old_lock: ?std.json.Parsed(LockFile),
+    offline: bool,
+    cmd: []const u8,
+    entries: *std.ArrayList(LockEntry),
+) !void {
+    const deps: ?std.json.ObjectMap = if (root.get("dependencies")) |v| switch (v) {
+        .object => |o| o,
+        else => null,
+    } else null;
+
+    if (deps) |d| {
+        var it = d.iterator();
+        while (it.next()) |entry| {
+            const dep_name = entry.key_ptr.*;
+            switch (entry.value_ptr.*) {
+                .object => |o| {
+                    const p = manifestString(o, "path") orelse {
+                        try printStderr(io, "qube {s}: dependency '{s}' has no `path`\n", .{ cmd, dep_name });
+                        std.process.exit(@intFromEnum(ExitCode.dependency));
+                    };
+                    const dep_version = pathDepVersion(gpa, io, arena, project_dir, p) catch "0.0.0";
+                    try entries.append(gpa, .{
+                        .name = dep_name,
+                        .version = dep_version,
+                        .source = try std.fmt.allocPrint(arena, "path+{s}", .{p}),
+                    });
+                },
+                .string => |range| {
+                    // Reuse the locked version while it still satisfies.
+                    const reused: ?LockEntry = blk: {
+                        const l = old_lock orelse break :blk null;
+                        for (l.value.qubes) |e| {
+                            if (std.mem.eql(u8, e.name, dep_name) and
+                                e.sha256 != null and
+                                std.mem.startsWith(u8, e.source, "registry+") and
+                                versionSatisfies(range, e.version)) break :blk e;
+                        }
+                        break :blk null;
+                    };
+                    if (reused) |e| {
+                        try entries.append(gpa, e);
+                        continue;
+                    }
+                    if (offline) {
+                        try printStderr(io, "qube {s}: PKG010: dependency '{s}' is not locked and --offline forbids resolving it\n", .{ cmd, dep_name });
+                        std.process.exit(@intFromEnum(ExitCode.dependency));
+                    }
+
+                    const meta_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}", .{ registry, dep_name });
+                    defer gpa.free(meta_url);
+                    const resp = try httpGet(gpa, io, meta_url);
+                    defer gpa.free(resp.raw);
+                    if (resp.status == 404) {
+                        try printStderr(io, "qube {s}: '{s}' not found on {s}\n", .{ cmd, dep_name, registry });
+                        std.process.exit(@intFromEnum(ExitCode.dependency));
+                    }
+                    if (resp.status != 200) {
+                        try printStderr(io, "qube {s}: registry returned {d}:\n{s}\n", .{ cmd, resp.status, resp.body });
+                        std.process.exit(@intFromEnum(ExitCode.registry));
+                    }
+                    const meta_parsed = std.json.parseFromSlice(QubeMeta, gpa, resp.body, .{ .ignore_unknown_fields = true }) catch {
+                        try printStderr(io, "qube {s}: could not parse registry metadata\n", .{cmd});
+                        std.process.exit(@intFromEnum(ExitCode.registry));
+                    };
+                    defer meta_parsed.deinit();
+
+                    var best: ?VersionMeta = null;
+                    for (meta_parsed.value.versions) |v| {
+                        if (v.yanked) continue;
+                        if (!versionSatisfies(range, v.version)) continue;
+                        if (best) |b| {
+                            const vs = parseSemver(v.version) orelse continue;
+                            const bs = parseSemver(b.version) orelse {
+                                best = v;
+                                continue;
+                            };
+                            if (!semverGte(vs, bs)) continue;
+                        }
+                        best = v;
+                    }
+                    const cv = best orelse {
+                        try printStderr(io, "qube {s}: no version of '{s}' satisfies '{s}'\n", .{ cmd, dep_name, range });
+                        std.process.exit(@intFromEnum(ExitCode.dependency));
+                    };
+                    try entries.append(gpa, .{
+                        .name = dep_name,
+                        .version = try arena.dupe(u8, cv.version),
+                        .source = try std.fmt.allocPrint(arena, "registry+{s}", .{registry}),
+                        .sha256 = try arena.dupe(u8, cv.archive_sha),
+                    });
+                },
+                else => {
+                    try printStderr(io, "qube {s}: dependency '{s}' has an unsupported value shape\n", .{ cmd, dep_name });
+                    std.process.exit(@intFromEnum(ExitCode.dependency));
+                },
+            }
+        }
+    }
+}
+
+/// True when every manifest dependency has a lock entry of the matching
+/// source kind whose version satisfies the declared range
+/// (spec/qube.lock.md §Staleness).
+fn lockSatisfiesManifest(root: std.json.ObjectMap, lock: LockFile) bool {
+    const deps_v = root.get("dependencies") orelse return true;
+    const deps = switch (deps_v) {
+        .object => |o| o,
+        else => return true,
+    };
+    var it = deps.iterator();
+    while (it.next()) |entry| {
+        const dep_name = entry.key_ptr.*;
+        const locked: ?LockEntry = blk: {
+            for (lock.qubes) |e| {
+                if (std.mem.eql(u8, e.name, dep_name)) break :blk e;
+            }
+            break :blk null;
+        };
+        const e = locked orelse return false;
+        switch (entry.value_ptr.*) {
+            .string => |range| {
+                if (e.sha256 == null) return false;
+                if (!std.mem.startsWith(u8, e.source, "registry+")) return false;
+                if (!versionSatisfies(range, e.version)) return false;
+            },
+            .object => |o| {
+                const p = manifestString(o, "path") orelse return false;
+                if (!std.mem.startsWith(u8, e.source, "path+")) return false;
+                if (!std.mem.eql(u8, e.source["path+".len..], p)) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+test "lockSatisfiesManifest: range, source kind, and presence checks" {
+    const gpa = std.testing.allocator;
+    const manifest =
+        \\{ "name": "dev.q64.x", "dependencies": {
+        \\  "dev.q64.reg": "^0.3",
+        \\  "dev.q64.loc": { "path": "../loc" }
+        \\} }
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, manifest, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const good = [_]LockEntry{
+        .{ .name = "dev.q64.reg", .version = "0.3.4", .source = "registry+https://qubes.q64.dev", .sha256 = "ab" },
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../loc" },
+    };
+    try std.testing.expect(lockSatisfiesManifest(root, .{ .qubes = @constCast(&good) }));
+
+    const out_of_range = [_]LockEntry{
+        .{ .name = "dev.q64.reg", .version = "0.4.0", .source = "registry+https://qubes.q64.dev", .sha256 = "ab" },
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../loc" },
+    };
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = @constCast(&out_of_range) }));
+
+    const repointed_path = [_]LockEntry{
+        .{ .name = "dev.q64.reg", .version = "0.3.4", .source = "registry+https://qubes.q64.dev", .sha256 = "ab" },
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../elsewhere" },
+    };
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = @constCast(&repointed_path) }));
+
+    const missing = [_]LockEntry{
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../loc" },
+    };
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = @constCast(&missing) }));
+
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = &.{} }));
+}
+
+/// `qube lock` — regenerate qube.lock from the manifest (spec/qube.lock.md).
+fn cmdLock(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    _ = env;
+    var registry: []const u8 = default_registry;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--registry")) {
+            registry = args_it.next() orelse {
+                try writeStderr(io, "qube lock: --registry needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else {
+            try printStderr(io, "qube lock: unexpected arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    const project_dir = m.projectDir();
+
+    // The previous lockfile, for version reuse. A malformed one is
+    // regenerated rather than fatal — `lock` is the repair command.
+    const old_lock: ?std.json.Parsed(LockFile) = readLockFile(gpa, io, project_dir) catch |err| switch (err) {
+        error.MalformedLockfile => blk: {
+            try writeStderr(io, "qube lock: existing qube.lock is malformed; regenerating\n");
+            break :blk null;
+        },
+        else => return err,
+    };
+    defer if (old_lock) |p| p.deinit();
+
+    // Entry strings whose owners die before the write live in this arena.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var entries: std.ArrayList(LockEntry) = .empty;
+    defer entries.deinit(gpa);
+    try buildLockEntries(gpa, io, arena_state.allocator(), project_dir, m.root, registry, old_lock, false, "lock", &entries);
+
+    try writeLockFileEntries(gpa, io, project_dir, entries.items);
+    try printStdout(io, "Locked {d} dependencies -> {s}\n", .{ entries.items.len, lock_file_name });
+}
+
+/// `qube install` — make the cache satisfy the lockfile
+/// (spec/qube.lock.md §Lifecycle, spec/continuum-api.md §Resolver
+/// protocol). Relocks first when the lockfile is missing or stale, then
+/// fetches every locked registry archive the cache is missing. With
+/// `--offline`, both a needed relock and a cache miss are errors.
+fn cmdInstall(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var registry: []const u8 = default_registry;
+    var offline = false;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--registry")) {
+            registry = args_it.next() orelse {
+                try writeStderr(io, "qube install: --registry needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.eql(u8, a, "--offline")) {
+            offline = true;
+        } else {
+            try printStderr(io, "qube install: unexpected arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    const project_dir = m.projectDir();
+
+    const old_lock: ?std.json.Parsed(LockFile) = readLockFile(gpa, io, project_dir) catch |err| switch (err) {
+        error.MalformedLockfile => blk: {
+            if (offline) {
+                try writeStderr(io, "qube: PKG013: qube.lock is malformed and --offline forbids relocking\n");
+                std.process.exit(@intFromEnum(ExitCode.dependency));
+            }
+            try writeStderr(io, "qube install: existing qube.lock is malformed; regenerating\n");
+            break :blk null;
+        },
+        else => return err,
+    };
+    defer if (old_lock) |p| p.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var entries: std.ArrayList(LockEntry) = .empty;
+    defer entries.deinit(gpa);
+
+    const stale = if (old_lock) |p| !lockSatisfiesManifest(m.root, p.value) else true;
+    if (stale) {
+        try buildLockEntries(gpa, io, arena_state.allocator(), project_dir, m.root, registry, old_lock, offline, "install", &entries);
+        try writeLockFileEntries(gpa, io, project_dir, entries.items);
+    } else {
+        for (old_lock.?.value.qubes) |e| try entries.append(gpa, e);
+    }
+
+    const home = try qubeHome(gpa, env);
+    defer gpa.free(home);
+    var fetched: usize = 0;
+    var present: usize = 0;
+    for (entries.items) |e| {
+        const sha = e.sha256 orelse continue;
+        if (!std.mem.startsWith(u8, e.source, "registry+")) continue;
+        const cache_dir = try cacheDirForSha(gpa, home, sha);
+        defer gpa.free(cache_dir);
+        const cached = blk: {
+            std.Io.Dir.cwd().access(io, cache_dir, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (cached) {
+            present += 1;
+            continue;
+        }
+        if (offline) {
+            try printStderr(io, "qube: PKG012: locked archive for '{s}@{s}' is not in the cache and --offline forbids fetching it\n", .{ e.name, e.version });
+            std.process.exit(@intFromEnum(ExitCode.dependency));
+        }
+        const src_registry = e.source["registry+".len..];
+        const dir = try downloadAndCacheArchive(gpa, io, env, src_registry, e.name, e.version, sha, "install");
+        gpa.free(dir);
+        fetched += 1;
+    }
+    try printStdout(io, "Installed: {d} fetched, {d} already cached ({d} locked)\n", .{ fetched, present, entries.items.len });
+}
+
+/// Version declared by a path dep's own manifest, allocated in `arena`.
+fn pathDepVersion(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    project_dir: []const u8,
+    rel: []const u8,
+) ![]const u8 {
+    const dep_manifest = try std.fs.path.resolve(gpa, &.{ project_dir, rel, "qube.json5" });
+    defer gpa.free(dep_manifest);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, dep_manifest, gpa, .limited(1024 * 1024));
+    defer gpa.free(raw);
+    const json = try json5ToJson(gpa, raw);
+    defer gpa.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.MalformedManifest,
+    };
+    const v = manifestString(obj, "version") orelse return error.MalformedManifest;
+    return arena.dupe(u8, v);
 }
 
 /// Add `"<name>": "^<major>.<minor>"` to the manifest's `dependencies` map,
