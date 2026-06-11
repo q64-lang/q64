@@ -717,11 +717,32 @@ verified, honest diagnostics throughout.
             record-pattern fields, auto-prelude names (`sleep`). Unknown
             heads stay recorded-only until those land + an auto-prelude
             name table exists.
-      - [ ] Arg-count/type mismatch at call sites (TYP06x?) via the
-            signature store; needs the spec code confirmed in types.md.
-      - [ ] Unresolved *type* names (annotations) — needs its TYP code
-            picked from types.md and the same false-positive survey for
-            type positions (generic args ride as text today).
+      - [x] **Four more codes: TYP040 / TYP041 / TYP050 / TYP060.** One
+            shared `checkAgainstExpected(expected, value)` covers both
+            declared-type sites — call arguments (against this file's
+            lowered signatures; unknown callees silent) and annotated
+            `let` initializers: TYP041 (two different known numerics),
+            TYP050 (bool where integer expected), TYP051 (integer where
+            bool expected — literals are definitely integers, so they
+            fire here even though they stay flexible for TYP041/042).
+            TYP040 checks bare/negated literal initializers against the
+            annotated width (dec/hex/oct/bin, `_` separators, saturating
+            u128 parse; i8…u128 bounds incl. `-129`-style negatives).
+            TYP060 fires on a flattened [mode-kw, `:`] token prefix in a
+            call argument — judged on tokens, not node shape, because
+            recovery degrades `ref:` into a unary-expr wrapper.
+            Conformance **13 → 17 of 47** (int-literal-out-of-range +
+            mode-keyword-in-call flip; new `bool-as-int.q` +
+            `call-arg-numeric-mismatch.q` fixtures pass; INDEX rows
+            filled); 300 unit / 78 CLI / roundtrip green.
+      - [ ] **Value-call arity is unspecced** — no TYP code exists for a
+            plain wrong-argument-count call (`TYP100` covers *generic*
+            args only). Needs a types.md row + code before the check can
+            emit; today build_hir still rejects at emit as
+            `UnsupportedCall`.
+      - [ ] Unresolved *type* names (annotations) — blocked on the same
+            auto-prelude table as NAM010 (`Signal`, `Vec`, `Result`, …
+            would all false-fire today).
 
 ### Ladder B — struct values → static fits (after A3)
 

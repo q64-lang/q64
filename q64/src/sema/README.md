@@ -80,9 +80,12 @@ parse (CST/AST)
   its wasm-slot `Scope`. That collapses when the A4 check pass brings
   sema its own body scopes.
 - **A4 (in progress)** — `check.zig` is the first emitting layer:
-  body walks with sema-owned typed scopes; TYP051 (integer condition)
-  and TYP042 (mixed numeric arithmetic) ship in `q64 check`.
-  Conformance 13/45. NAM010 stays recorded-only (corpus survey shows
-  false positives from unparsed forms — lambdas, graph/channel exprs,
-  named args, record-pattern fields, auto-prelude names). Next: call
-  arg-count/type mismatches, unresolved type names.
+  body walks with sema-owned typed scopes. Shipping in `q64 check`:
+  TYP051 (integer condition / integer where bool expected), TYP042
+  (mixed numeric arithmetic), TYP041 (numeric mismatch at a declared
+  type — call args + annotated lets), TYP050 (bool as integer),
+  TYP040 (annotated literal out of range), TYP060 (mode keyword in a
+  call argument). Conformance 17/47. Deferred with reasons recorded in
+  todo.md: NAM010 + unresolved type names (need the auto-prelude
+  table; corpus survey shows false positives), value-call arity (no
+  specced code — spec gap).
