@@ -10,6 +10,7 @@ const parser = @import("parser");
 const parse = parser.parse;
 const diag = parser.diag;
 const emit = @import("codegen/emit.zig");
+const sema = @import("sema");
 const doc = @import("doc.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -95,7 +96,7 @@ fn usage(io: std.Io) !void {
         \\                                     --addr selects the linear-memory address space
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
-        \\  show <hir|mir> <file.q> [--module name=dir ...]
+        \\  show <hir|mir|symbols> <file.q> [--module name=dir ...]
         \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
         \\  show effects <fn> --qube <file.q>  Print a function's inferred capability effect set.
         \\  show capabilities --qube <file.q>  Print the qube's compiler-derived capability set.
@@ -140,8 +141,22 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
     const result = try parse.parse(gpa, source, path);
     defer result.deinit(gpa);
 
+    // Parse diagnostics + the sema file-level pass (today: NAM005 name
+    // collisions in the import scope — spec/modules.md). Sema only runs
+    // when the file parsed into a source-file root.
+    var all_diags: std.ArrayList(diag.Diagnostic) = .empty;
+    defer all_diags.deinit(gpa);
+    try all_diags.appendSlice(gpa, result.diagnostics);
+    if (parser.ast.SourceFile.cast(result.root)) |sf| {
+        var table = try sema.build(gpa, sf);
+        defer table.deinit();
+        const sema_diags = try sema.fileDiagnostics(gpa, &table, path);
+        defer gpa.free(sema_diags);
+        try all_diags.appendSlice(gpa, sema_diags);
+    }
+
     var has_error = false;
-    for (result.diagnostics) |d| if (d.severity == .err) {
+    for (all_diags.items) |d| if (d.severity == .err) {
         has_error = true;
         break;
     };
@@ -150,11 +165,11 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
 
     if (json) {
-        try diag.emitJson(&w.interface, source, result.diagnostics, gpa);
+        try diag.emitJson(&w.interface, source, all_diags.items, gpa);
     } else {
         // Human-readable form. Mirrors the human format described
         // in spec/diagnostics.md §"Rendering".
-        for (result.diagnostics) |d| {
+        for (all_diags.items) |d| {
             const idx = try diag.LineIndex.build(gpa, source);
             defer idx.deinit();
             const loc = idx.locate(d.offset);
@@ -527,11 +542,13 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     };
 
     // Classify the kind and resolve which positional is the source file.
-    const Kind = enum { hir, mir, effects, capabilities, world };
+    const Kind = enum { hir, mir, symbols, effects, capabilities, world };
     const which: Kind = if (std.mem.eql(u8, k, "hir"))
         .hir
     else if (std.mem.eql(u8, k, "mir"))
         .mir
+    else if (std.mem.eql(u8, k, "symbols"))
+        .symbols
     else if (std.mem.eql(u8, k, "effects"))
         .effects
     else if (std.mem.eql(u8, k, "capabilities"))
@@ -546,9 +563,10 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         std.process.exit(2);
     };
 
-    // `hir`/`mir` take the source file as the second positional; the effect /
-    // component kinds take `--qube <file>` (and `effects` a `<fn>` positional).
-    const ir_kind = which == .hir or which == .mir;
+    // `hir`/`mir`/`symbols` take the source file as the second positional; the
+    // effect / component kinds take `--qube <file>` (and `effects` a `<fn>`
+    // positional).
+    const ir_kind = which == .hir or which == .mir or which == .symbols;
     const src = (if (ir_kind) (arg2 orelse qube_file) else qube_file) orelse {
         try usage(io);
         std.process.exit(2);
@@ -576,6 +594,7 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     const dump = (switch (which) {
         .hir => emit.showHir(gpa, source, src, module_sources.items),
         .mir => emit.showMir(gpa, source, src, module_sources.items),
+        .symbols => sema.showSymbols(gpa, source, src),
         .effects => emit.showEffects(gpa, source, src, module_sources.items, arg2.?),
         .capabilities => emit.showCapabilities(gpa, source, src, module_sources.items),
         .world => emit.showWorld(gpa, source, src, module_sources.items),

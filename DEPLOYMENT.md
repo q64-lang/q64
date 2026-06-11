@@ -1,159 +1,129 @@
-# Deployment
+# Deploying a Qube
 
-How the q64 web properties and the q64 / qube binary releases ship, and what
-each one needs to be **enabled**. Three Cloudflare Workers + one GitHub release,
-plus a sibling concern in the qubepods repo.
+How to ship a q64 application. Two verbs, two destinations — don't mix
+them up:
 
-| Target | Worker / artifact | Where | How |
-|---|---|---|---|
-| **q64.dev** | `q64-web` | `web/` | `pnpm run deploy` |
-| **docs.q64.dev** | `q64-docs` | `q64-docs/` | `pnpm run deploy` |
-| **q64 + qube binaries** | GitHub Release `nightly` | `.github/workflows/release.yml` | manual (`workflow_dispatch`) |
-| **macOS binaries** | release assets | `scripts/release-mac.sh` | run on a Mac |
-| **qubepods.com `.well-known`** | `qubepods-web` | *qubepods repo* `apps/web/` | `pnpm -C apps/web deploy` |
+| You have | Verb | Destination |
+|---|---|---|
+| An application (a **Qube** — `type: "application"`, has `main`) | `qube pod deploy` | [qubepods](https://qubepods.com) — the hosting runtime |
+| A library (a **qube** — `type: "library"`, exports a surface) | `qube publish` | the Continuum — browse at [continuum.q64.dev](https://continuum.q64.dev) |
 
-## Prerequisites
+This page covers the first. For publishing libraries, see
+[`spec/qube-cli.md` §"qube publish"](./spec/qube-cli.md).
 
-### Cloudflare (the three Workers)
-- Account: **<account-email>**, id `<account-id>` (hosts the
-  `q64.dev` zone and all `q64-*` Workers).
-- `wrangler` must be authenticated (`wrangler whoami`). Two accounts are visible
-  on this machine, so **every** deploy must pin the account:
+> **qubepods is currently in private preview.** The build/manifest
+> steps below work for everyone; the deploy itself (step 3's
+> console-minted token onward) requires an invited account.
 
-  ```sh
-  export CLOUDFLARE_ACCOUNT_ID=<account-id>
-  ```
-
-  Without it wrangler errors with "More than one account available". Use
-  `pnpm run deploy` (not `pnpm deploy` — that collides with pnpm's own
-  subcommand).
-
-### GitHub (the release)
-- `gh` authenticated for `q64-lang/q64` (used by `scripts/release-mac.sh`).
-- The toolchain vendored locally: `WASMTIME_SHA256=skip ./init.sh`, then
-  `export PATH="$PWD/vendor/zig:$PATH"` (plain `./init.sh` aborts on the
-  unpinned wasmtime sha; `q64`/`qube` only need Zig + Binaryen).
-
-## q64.dev — the landing site (`q64-web`)
+## TL;DR
 
 ```sh
-cd web
-CLOUDFLARE_ACCOUNT_ID=<account-id> pnpm run deploy
+qube build --component --addr wasm32        # 1. build the component
+qube pod init --project my-project \
+  --wasm ./target/<profile>/wasm32/my_app.component.wasm \
+  --wit-package <pkg> --wit-world <world>   # 2. scaffold qubepod.jsonc
+qube pod login                              # 3. paste a token from the qubepods console
+qube pod deploy                             # 4. pack + upload the bundle
 ```
 
-Astro + Starlight static build served by the Worker. The `q64.dev` custom
-domain is already attached (Cloudflare dashboard), so deploys are content-only.
-Search is disabled here (`pagefind: false` in `web/astro.config.mjs`) — there
-is no real content to index; full search lives on docs.q64.dev.
+Each step in detail below. The full flag reference for every command is
+[`spec/qube-cli.md`](./spec/qube-cli.md) §"`qube pod`".
 
-## docs.q64.dev — the language docs (`q64-docs`)
+## 0. Get the toolchain
+
+Either download `q64` + `qube` from the
+[nightly release](https://github.com/q64-lang/q64/releases/tag/nightly)
+(linux-amd64 + macOS), or build from source:
 
 ```sh
-cd q64-docs
-CLOUDFLARE_ACCOUNT_ID=<account-id> pnpm run deploy
+./init.sh                          # vendors zig, Binaryen, wasmtime
+( cd q64 && ../vendor/zig/zig build )
+( cd qube && ../vendor/zig/zig build )
 ```
 
-`pnpm run deploy` runs the `prebuild` generator (`scripts/gen-docs.mjs`) then
-`astro build && wrangler deploy`. The generator renders the **reference** pages
-(keywords, builtin types, diagnostics) from `doc.json`, mirrors `spec/*.md`,
-emits `/llms.txt` + `/llms-full.txt`, and copies the brand/theme from `web/`.
-
-`doc.json` is resolved in order: `$DOC_JSON` → `$Q64_BIN doc --json` →
-`q64/zig-out/bin/q64 doc --json` → the committed `q64-docs/fixtures/doc.json`
-(so it works offline / without a build). To render against the latest compiler:
+**macOS note:** the downloaded mac binaries are ad-hoc signed, not
+notarized, so Gatekeeper blocks them with *"Apple could not verify …"*.
+Clear the quarantine bit per file:
 
 ```sh
-( cd q64 && zig build )   # produces q64/zig-out/bin/q64
-```
-
-The `docs.q64.dev` custom domain is in `q64-docs/wrangler.jsonc` (`routes`), so
-the first `wrangler deploy` provisions it automatically. Generated output
-(`reference/`, `spec/`, `llms*.txt`, copied brand/theme) is gitignored.
-
-### Auto-deploy (optional)
-
-`.github/workflows/docs.yml` deploys docs.q64.dev on push to `main` (paths
-`q64-docs/**`, `spec/**`) **and** when a release publishes a fresh `doc.json` —
-**without** building Zig (it downloads the `doc.json` release asset). To enable
-it, add two **repo secrets**:
-
-- `CLOUDFLARE_API_TOKEN` — a token with Workers Scripts + Workers Routes edit on
-  the etiamo account.
-- `CLOUDFLARE_ACCOUNT_ID` — `<account-id>`.
-
-Until they exist the workflow **skips the deploy and stays green** (it does not
-fail); deploy manually with the command above.
-
-## Binary release — q64 + qube (+ doc.json)
-
-The release is a **manual** action — it does **not** run on routine pushes to
-main (we push far more often than we release). Refresh the rolling `nightly`:
-
-```sh
-gh workflow run release.yml --ref main      # or Actions → release → Run workflow
-```
-
-Push a `vX.Y.Z` tag for an immutable stable release instead. Either way it builds
-**linux-amd64** `q64` + `qube` (ReleaseFast) and updates the `nightly` release:
-
-```
-q64-linux-amd64  qube-linux-amd64  SHA256SUMS  manifest.json  doc.json
-```
-
-`manifest.json` is the contract the **qubepods builder container** reads to
-fetch (and sha-verify) the binaries. The action **updates** `nightly` in place
-(it no longer deletes/recreates it) and only clobbers the files it builds, so
-**out-of-band assets like the macOS binaries survive** across releases.
-
-> After a release that changes the compiler, **rebuild / repin the qubepods
-> builder container** so it picks up the new `q64`/`qube` (e.g. to use
-> `q64 doc` / `q64 explain`).
-
-### macOS binaries
-
-CI has **no hosted macOS or arm runners**, and `q64` links a host-built Binaryen
-static lib (so it can't be cross-compiled from linux). Build them on a Mac and
-attach them to the release:
-
-```sh
-# after the nightly release exists (you've run the release action)
-scripts/release-mac.sh           # TAG defaults to "nightly"
-```
-
-Because the release action updates `nightly` in place (never deletes it), these
-mac binaries persist across subsequent releases — re-run this only when you want
-to refresh them for a new compiler build.
-
-It builds the host arch (arm64 on Apple Silicon, amd64 on Intel) and
-`gh release upload`s `q64-darwin-<arch>` + `qube-darwin-<arch>`. Run it once on
-each Mac arch you want to publish.
-
-#### Gatekeeper
-
-The mac binaries are **ad-hoc signed, not notarized**. A copy downloaded from
-the release page carries `com.apple.quarantine`, so macOS blocks it with
-*"Apple could not verify …"*. Clear it per file:
-
-```sh
-xattr -d com.apple.quarantine ./qube ./q64    # or: xattr -dr … <dir>
+xattr -d com.apple.quarantine ./qube ./q64
 chmod +x ./qube ./q64
 ```
 
-(Locally **built** binaries have no quarantine and run as-is.) To remove the
-warning for everyone, sign with an Apple Developer ID + notarize
-(`codesign --options runtime` → `xcrun notarytool submit --staple`) — needs a
-paid Apple Developer account; not wired up yet.
+(Locally built binaries have no quarantine and run as-is.)
 
-## qubepods.com `.well-known` (sibling repo)
-
-The AI-agent discovery files (`/.well-known/qubepods.json`, `/llms.txt`) live in
-the **qubepods** repo, not here. Deploy from there:
+## 1. Build
 
 ```sh
-cd <qubepods-repo>/apps/web
-pnpm run deploy        # prebuild regenerates the files from scripts/gen-well-known.mjs
+qube build --component --addr wasm32
 ```
 
-It advertises docs.q64.dev, the deploy API, the hosted MCP, and the manifest
-schema. The schema host (`schemas.qubepods.com`) is still pending; the manifest
-flags service status accordingly.
+- `--component` emits the WebAssembly **component**
+  (`<name>.component.wasm`) the QubePod manifest points at.
+- `--addr` picks the address space (per
+  [`spec/memory.md` §"The platform"](./spec/memory.md)): **`wasm32` is
+  the universal baseline** — it is the only one that runs on
+  WebKit/Safari/iPad. `wasm64` adds Memory64 for capable hosts. To ship
+  both, build both and declare them as variants in step 2.
+
+Output lands under `target/<profile>/<addr>/`.
+
+## 2. Scaffold the deploy manifest
+
+```sh
+qube pod init --project <slug> --wasm <path-to-component> \
+  --wit-package <pkg> --wit-world <world>
+```
+
+This writes `qubepod.jsonc` — the QubePod deploy manifest (project slug,
+name, the component + its WIT world, optional `exports.http` routes and
+an `assets` directory). Run it with **no flags** for an interactive
+wizard. Useful extras:
+
+- `--addr wasm32,wasm64` — declare per-address-space variants
+  (`component.variants`), the recommended shape for a Qube that must
+  reach WebKit *and* wants 64-bit elsewhere.
+- `--http-route <r>` — expose an HTTP handler.
+- `--assets <dir>` — ship a static asset tree alongside the wasm.
+
+## 3. Authenticate
+
+Mint a token in the qubepods console (**private preview** — invited
+accounts only for now), then:
+
+```sh
+qube pod login        # reads the token from stdin (or --token <t>)
+```
+
+Tokens are stored in `~/.qube/pods.toml`, separate from your Continuum
+registry credentials (`~/.qube/credentials.toml`) — the two never
+clobber each other. `qube pod deploy` resolves its token in order:
+`--token` → `$QUBEPODS_TOKEN` → the saved login. `qube pod info` shows
+the provider and auth status; `qube pod logout` forgets the token.
+
+## 4. Deploy
+
+```sh
+qube pod deploy
+```
+
+Packs a bundle zip (`target/deploy/<name>.zip`) from the
+`qubepod.jsonc` in the current directory — manifest, every component
+wasm (single or per-variant), and the asset tree — and uploads it.
+The server content-addresses the wasm and assets into your tenant
+store and materializes the deployment.
+
+## Test locally first
+
+You don't need a deploy to iterate:
+
+```sh
+qube run        # build + run under the local wasmtime host
+qube web        # serve the browser build locally
+```
+
+---
+
+*How the q64 project's own web properties (q64.dev, docs.q64.dev) ship
+is a maintainer concern and intentionally not documented here —
+contributors change them by PR, like everything else.*

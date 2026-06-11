@@ -1087,6 +1087,10 @@ clean up bounded resources before exit.
 
 ## Related specs
 
+- [`concurrency-model.md`](./concurrency-model.md) — the consolidated
+  layer map: when to reach for tasks vs actors vs stream graphs vs
+  reactive state; the twin = actor rule; the one-scheduler invariant
+  made global.
 - [`memory.md`](./memory.md) — scope's implicit arena, `@shared`,
   `Atomic<T>`, `Shared<T, P>` policies, `transfer(to: …)`,
   multi-memory layout.

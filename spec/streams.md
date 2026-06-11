@@ -67,6 +67,12 @@ A `Signal<T, R>` always has a `.current() -> T` operation: it has
 a value right now, by construction. Subscribing to a signal mid-
 stream sees the current value immediately, not the next tick's.
 
+The name `Signal` is **reserved** for this rate-typed continuous
+family (`Signal<T, R>` and `SharedSignal<T, R>`). The fine-grained
+reactive cell behind a `state` declaration is `State<T>` — rateless,
+write-driven, and not a dataflow type. The split is normative in
+[`concurrency-model.md` §D3](./concurrency-model.md).
+
 ### `Event<T>` — discrete
 
 Exists at specific moments, not in between. Examples: MIDI
@@ -722,7 +728,15 @@ Every Signal↔Stream↔Event crossing is explicit. Every rate change
 is a named conversion. The compiler verifies the whole graph at
 build time.
 
-### Reactive UI counter
+### Dataflow counter
+
+> This example demonstrates generic Event→Signal composition. It is
+> **not** the QView UI path: a QView UI renders from reactive `state`
+> through the retained mutation protocol, not from a clocked render
+> graph — see [`concurrency-model.md` §D2](./concurrency-model.md)
+> and [`reactivity.md`](./reactivity.md). Reach for this shape when
+> the *consumer* genuinely runs at a rate (an embedded display, a
+> simulation HUD), not for application UIs.
 
 ```q64
 @stage
@@ -867,6 +881,9 @@ All codes use the envelope from [`diagnostics.md`](./diagnostics.md).
 
 ## Related specs
 
+- [`concurrency-model.md`](./concurrency-model.md) — how the dataflow
+  layer relates to tasks, actors, and reactive state; the `Signal`
+  naming rule; the closed bridge set to/from `State<T>`.
 - [`concurrency.md`](./concurrency.md) — the task scheduler that
   runs the graph; the channel mechanism that `|>` desugars to;
   the `scope { … } catch { … }` form for stage panics.

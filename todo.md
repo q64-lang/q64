@@ -600,6 +600,110 @@ spec/q64-cli.md `--component`).
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
 
+## Semantic pass + struct values → static fits — NEXT (the slope-changing ladder)
+
+Context (coverage audit, 2026-06-11): the compiler emits 18 of 212 specced
+diagnostic codes; semantics sit on the `i64/i32/f64/str/bool/ptr/void` floor in
+`hir.zig` with ad-hoc typing inside `build_hir`. The TYP band (70 codes — the
+largest), structs, optionals, `match`, faces/fits, generics, and the deferred
+`PAR040` all queue behind one missing layer: a real semantic pass between AST
+and HIR. Same treatment as the IR ladder: explicit rungs, each end-to-end
+verified, honest diagnostics throughout.
+
+### Ladder A — semantic pass (name resolution + type checking)
+
+- [x] **A0 — placement decision + scaffold.** `q64/src/sema/` landed:
+      README records the pass placement (parse → sema → build_hir; sema
+      imports `parser` only, additive until A3), `symbols.zig` builds the
+      file-level symbol table (items + selective/namespace import bindings,
+      first-binding-wins lookup, collisions recorded for the A1 NAM005
+      wiring; `fit`s listed but deliberately not name bindings — they key on
+      the (type, face) pair), and `q64 show symbols <file.q>` dumps it
+      (specced in q64-cli.md; covered by sema unit tests + a show.test.ts
+      CLI test). Emit path untouched. Verified: 278 unit + 76 CLI tests +
+      link-roundtrip green.
+- [ ] **A1 — symbol table + scopes.** In progress; the core slice landed:
+      - [x] Import bindings complete: selective names, `as` aliases (new
+            `ast.ImportStmt.alias()` accessor), namespace imports binding the
+            last path segment — all with offsets for diagnostics.
+      - [x] **NAM005 emitted** for import-involving collisions, wired into
+            `q64 check` (parse + sema file-level pass). Conformance:
+            `modules/import-collision.q` passes (11/45, from 10/44);
+            check.test.ts covers the envelope. Decl-vs-decl duplicates have
+            no specced code and stay recorded-only.
+      - [x] Body-level resolution (`sema/resolve.zig`): lexical scope stack
+            (params, let/var-after-initializer, block nesting, for/match/
+            if-let pattern bindings via recursive IDENT_PATTERN collection),
+            ambient hosts (`env`/`qview`/`ctx`) recognized, unresolved path
+            heads *recorded* and surfaced by `q64 show symbols` — emission
+            stays with build_hir until A3 (no double-diagnosis).
+            v0 boundaries: interpolation refs (raw string tokens) and
+            `screen` bodies are invisible to the walk.
+      - [ ] Import-target resolution against `--module` sources (NAM001 /
+            NAM006 at the sema layer).
+      - [ ] `PAR040` re-land on name kinds (generic-call vs
+            chained-comparison — the reverted parser heuristic, see "Other
+            open items").
+      - [ ] Fit registry (with B3's structured face/fit method grammar).
+- [ ] **A2 — type representation.** Interned types beyond the scalar floor:
+      named struct/enum types, tuples, optionals, `fn` types
+      (`spec/types.md`). No generics yet.
+- [ ] **A3 — migrate the existing corpus.** i64/bool/str programs type-check in
+      sema; `build_hir` reads resolved types instead of inferring
+      (`returnsBool`/`exprIsBool`-style detection retired). Gate: 197+ unit
+      tests, `link-roundtrip.sh`, 81 CLI tests green, diagnostics byte-stable.
+- [ ] **A4 — first real TYP codes.** Arg-count/type mismatches move from
+      `UnsupportedCall` to their specced TYP codes; flip the matching
+      `spec/tests/` fixtures from expected-future to passing. Conformance
+      count is the metric (today: 10 parser-level codes pass).
+
+### Ladder B — struct values → static fits (after A3)
+
+- [ ] **B1 — record literal expressions.** The deferred parser item: `Point {
+      x: 1 }` in expression position needs the struct-literal-vs-block
+      disambiguation rule (no bare literal in `if`/`while`/`match` scrutinee
+      position — record the rule in `grammar.md`).
+- [ ] **B2 — struct values in HIR/MIR.** By-value locals/params/returns;
+      scope-arena layout; field access lowering. Scalar fields first
+      (`spec/memory.md` layout rules).
+- [ ] **B3 — face/fit method grammar.** Structure the raw-span method
+      signatures in `FACE_BODY`/`FIT_BODY` (parser-only; today
+      `parseFaceOrFit` keeps them as token spans).
+- [ ] **B4 — fit registration + static dispatch.** Sema registers fits;
+      `p.fmt()` on a concrete type with a non-generic fit resolves to a direct
+      call. No vtables, no monomorphization, no `dyn`. Definition of done: the
+      `spec/tests/golden/library-face-fit.q` program compiles and runs;
+      `spec/tests/faces/wrong-fit-form-*.q` fixtures pass.
+- [ ] **B5 — later (separate ladders).** Face-bounded generics +
+      monomorphization; `dyn` dispatch; enums + `match` lowering (can start
+      after A2 in parallel with B).
+
+## Wasm 3.0 feature audit — DO BEFORE implementing concurrency
+
+The Memory64 lesson (`/wasm` probe: WebKit has none → dual address space) has
+not been applied to the rest of the platform bet. Everything in
+`spec/concurrency.md` / `spec/streams.md` — and the one-scheduler invariant in
+`spec/concurrency-model.md` — sits on **stack-switching**, which no production
+engine ships; WebKit (the declared iPad baseline) also lacks threads-adjacent
+pieces. Cheap insurance, do it before any scheduler code:
+
+- [ ] **Probe matrix.** Tiny `.wat` + `WebAssembly.validate` probes (mirroring
+      the Memory64 probe) per feature × host: stack-switching, threads + SAB +
+      atomics (incl. COOP/COEP reality on qubepods), WasmGC, exception
+      handling (the `panic` lowering), tail calls. Hosts: WebKit/iPad Safari,
+      Chrome, Firefox, vendored wasmtime, wasmer. Record engine versions +
+      dates; script it so it can re-run.
+- [ ] **Record the decision in the specs.** Extend `spec/memory.md` §"The
+      platform" with the audited matrix; cross-link from `concurrency.md` and
+      `concurrency-model.md`.
+- [ ] **Pick the v0 concurrency floor for hosts without stack-switching**
+      (WebKit will be one). Options, by cost: (a) "v0 concurrency requires a
+      capable host" — spec the restriction, UI-only qubes unaffected; (b) a
+      single-threaded cooperative scheduler floor (suspension only at host-call
+      boundaries — no mid-function yield); (c) an asyncify-style transform
+      (binaryen has it; code-size + perf tax). Decide, spec it, and gate any
+      `spawn`/`channel` codegen work on the decision.
+
 ## C bindings
 
 Two distinct questions, both currently "planned, not active."
@@ -845,6 +949,16 @@ visible at a glance whether it's been picked up.
       struct-literal-vs-block ambiguity (Rust-style); today they degrade to
       lossless one-token recovery. Needs the disambiguation rule (likely:
       no bare record literal in `if`/`while`/`match` scrutinee position).
+- [x] `spec/concurrency-model.md` — the concurrency/reactivity consolidation
+      chapter (the big remaining feature-review item): the global
+      one-scheduler invariant + lowering table, the tasks vs actors vs
+      graphs vs reactive-state decision table (QView owned by the reactive
+      layer; twin = actor made normative), the `Signal` naming rule —
+      `Signal` reserved for the rate-typed dataflow family, Stage-3 reactive
+      primitives renamed `State<T>`/`Memo<T>`/`Watch`, `EventStream<T>`
+      retired — and the closed bridge set between layers. Cross-edits:
+      `reactivity.md`, `streams.md`, `concurrency.md`, `qview-protocol.md`,
+      `spec/README.md` (+vocabulary), `stdlib/{reactive,event}/README.md`.
 - [x] `spec/annotations.md` — categorize `@`-forms (markers / derive /
       property wrappers). Smallest scope, highest cross-reference value.
 - [x] `spec/units.md` — drain the unit-suffix table out of `types.md`

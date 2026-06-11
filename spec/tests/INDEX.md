@@ -41,7 +41,7 @@ no test.
 | `NAM002` | modules.md      | import path escapes qube                          | `modules/import-path-escapes-qube.q`                     |
 | `NAM003` | modules.md      | wildcard import is forbidden                      | `modules/wildcard-import.q`                              |
 | `NAM004` | modules.md      | selective import combined with alias              | `modules/selective-with-alias.q`                         |
-| `NAM005` | modules.md      | name collision in import scope                    | —                                                        |
+| `NAM005` | modules.md      | name collision in import scope                    | `modules/import-collision.q`                             |
 | `NAM006` | modules.md      | name is private to its qube                       | —                                                        |
 | `NAM007` | modules.md      | sub-module not re-exported                        | —                                                        |
 | `NAM008` | modules.md      | re-export cycle                                   | —                                                        |

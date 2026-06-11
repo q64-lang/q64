@@ -252,6 +252,17 @@ pub const ImportStmt = struct {
             return .{ .children = &.{} };
         return .{ .children = sel.children };
     }
+
+    /// The alias identifier of an `import foo as bar` binding, or `null`
+    /// when the import has no alias clause.
+    pub fn alias(self: ImportStmt) ?cst.Token {
+        const ab = firstChildRawNode(self.cst, .ALIAS_BINDING) orelse return null;
+        for (ab.children) |c| switch (c) {
+            .token => |t| if (t.kind == .IDENT) return t,
+            .node => {},
+        };
+        return null;
+    }
 };
 
 pub const NameIter = struct {

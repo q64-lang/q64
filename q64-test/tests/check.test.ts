@@ -28,9 +28,20 @@ describe.skipIf(!binaryAvailable())("q64 check", () => {
     expect(r.stderr).toContain("\"diagnostics\"");
   });
 
-  // `check` is parser-only in v0; type-checking diagnostics (TYP*) are not
-  // emitted yet, so type-error.q parses clean today. Test-first: red until the
-  // type-checker lands and surfaces TYP042 (spec/types.md §arithmetic).
+  test("sema diagnostic: import-vs-declaration collision is NAM005, non-zero exit", () => {
+    // `check` = parse + the sema file-level pass (q64/src/sema): an import
+    // and a local declaration binding one name is NAM005 (spec/modules.md),
+    // located at the second binding.
+    const r = runCli(["check", fixture("import-collision.q"), "--diagnostics", "json"]);
+    expect(r.envelope?.ok).toBe(false);
+    expect(hasDiagnostic(r.envelope, "NAM005", "error")).toBe(true);
+    expect(r.exitCode).not.toBe(0);
+  });
+
+  // `check` is parse + the sema file-level pass; type-checking diagnostics
+  // (TYP*) are not emitted yet, so type-error.q checks clean today.
+  // Test-first: red until the type-checker (sema rung A4) surfaces TYP042
+  // (spec/types.md §arithmetic).
   test.failing("surfaces a type error (TYP042) for type-error.q once type-checking lands", () => {
     const r = runCli(["check", fixture("type-error.q"), "--diagnostics", "json"]);
     expect(hasDiagnostic(r.envelope, "TYP042", "error")).toBe(true);

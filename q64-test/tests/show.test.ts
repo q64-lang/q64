@@ -23,6 +23,14 @@ describe.skipIf(!binaryAvailable())("q64 show hir|mir", () => {
     expect(r.stdout).toContain("host_out_const");
   });
 
+  test("show symbols dumps the sema file-level table, exit 0, stdout-only", () => {
+    const r = runCli(["show", "symbols", fixture("hello.q")]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("symbols ");
+    expect(r.stdout).toContain("fn main");
+    expect(r.stderr).toBe("");
+  });
+
   test("unknown show kind is a usage error, exit 2", () => {
     const r = runCli(["show", "types", fixture("hello.q")]);
     expect(r.exitCode).toBe(2);

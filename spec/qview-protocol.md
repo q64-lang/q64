@@ -279,7 +279,8 @@ A host applying an op stream — especially an **agent**-produced one — MUST:
 - **Compiler-derived bindings** (which `state` writes touch which node attrs) —
   that's Stage 2 (compiled reactivity). Stage 1's producer re-emits changed nodes
   by hand in handlers; the *host* does the diffing.
-- **Runtime signals** (`Signal`/`Memo`/`Watch`) — Stage 3.
+- **Runtime reactive cells** (`State`/`Memo`/`Watch`, per
+  [`concurrency-model.md` §D3](./concurrency-model.md)) — Stage 3.
 - **Keyed list reconciliation** — Stage 1 ids are lexical; lists come with keys.
 - **Transforms / clip / floating layers**, **MSDF text**, **producer-owned
   strings**, **`text_input`** — all forward-compatible follow-ups.
