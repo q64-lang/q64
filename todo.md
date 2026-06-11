@@ -600,6 +600,86 @@ spec/q64-cli.md `--component`).
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
 
+## Semantic pass + struct values → static fits — NEXT (the slope-changing ladder)
+
+Context (coverage audit, 2026-06-11): the compiler emits 18 of 212 specced
+diagnostic codes; semantics sit on the `i64/i32/f64/str/bool/ptr/void` floor in
+`hir.zig` with ad-hoc typing inside `build_hir`. The TYP band (70 codes — the
+largest), structs, optionals, `match`, faces/fits, generics, and the deferred
+`PAR040` all queue behind one missing layer: a real semantic pass between AST
+and HIR. Same treatment as the IR ladder: explicit rungs, each end-to-end
+verified, honest diagnostics throughout.
+
+### Ladder A — semantic pass (name resolution + type checking)
+
+- [ ] **A0 — placement decision.** A `sema` stage (`q64/src/sema/`) between
+      parse and `build_hir`: produces a symbol table + resolved types that
+      `build_hir` *consumes* (no more ad-hoc inference there). HIR shape
+      unchanged at first; `lower`/backend untouched.
+- [ ] **A1 — symbol table + scopes.** File-level items, params, locals, import
+      bindings. Every path expression resolves to a symbol or emits the honest
+      NAM/NameNotFound diagnostic at the *sema* layer. Unblocks `PAR040`
+      (generic-call vs chained-comparison needs name kinds — the reverted
+      parser heuristic, see "Other open items").
+- [ ] **A2 — type representation.** Interned types beyond the scalar floor:
+      named struct/enum types, tuples, optionals, `fn` types
+      (`spec/types.md`). No generics yet.
+- [ ] **A3 — migrate the existing corpus.** i64/bool/str programs type-check in
+      sema; `build_hir` reads resolved types instead of inferring
+      (`returnsBool`/`exprIsBool`-style detection retired). Gate: 197+ unit
+      tests, `link-roundtrip.sh`, 81 CLI tests green, diagnostics byte-stable.
+- [ ] **A4 — first real TYP codes.** Arg-count/type mismatches move from
+      `UnsupportedCall` to their specced TYP codes; flip the matching
+      `spec/tests/` fixtures from expected-future to passing. Conformance
+      count is the metric (today: 10 parser-level codes pass).
+
+### Ladder B — struct values → static fits (after A3)
+
+- [ ] **B1 — record literal expressions.** The deferred parser item: `Point {
+      x: 1 }` in expression position needs the struct-literal-vs-block
+      disambiguation rule (no bare literal in `if`/`while`/`match` scrutinee
+      position — record the rule in `grammar.md`).
+- [ ] **B2 — struct values in HIR/MIR.** By-value locals/params/returns;
+      scope-arena layout; field access lowering. Scalar fields first
+      (`spec/memory.md` layout rules).
+- [ ] **B3 — face/fit method grammar.** Structure the raw-span method
+      signatures in `FACE_BODY`/`FIT_BODY` (parser-only; today
+      `parseFaceOrFit` keeps them as token spans).
+- [ ] **B4 — fit registration + static dispatch.** Sema registers fits;
+      `p.fmt()` on a concrete type with a non-generic fit resolves to a direct
+      call. No vtables, no monomorphization, no `dyn`. Definition of done: the
+      `spec/tests/golden/library-face-fit.q` program compiles and runs;
+      `spec/tests/faces/wrong-fit-form-*.q` fixtures pass.
+- [ ] **B5 — later (separate ladders).** Face-bounded generics +
+      monomorphization; `dyn` dispatch; enums + `match` lowering (can start
+      after A2 in parallel with B).
+
+## Wasm 3.0 feature audit — DO BEFORE implementing concurrency
+
+The Memory64 lesson (`/wasm` probe: WebKit has none → dual address space) has
+not been applied to the rest of the platform bet. Everything in
+`spec/concurrency.md` / `spec/streams.md` — and the one-scheduler invariant in
+`spec/concurrency-model.md` — sits on **stack-switching**, which no production
+engine ships; WebKit (the declared iPad baseline) also lacks threads-adjacent
+pieces. Cheap insurance, do it before any scheduler code:
+
+- [ ] **Probe matrix.** Tiny `.wat` + `WebAssembly.validate` probes (mirroring
+      the Memory64 probe) per feature × host: stack-switching, threads + SAB +
+      atomics (incl. COOP/COEP reality on qubepods), WasmGC, exception
+      handling (the `panic` lowering), tail calls. Hosts: WebKit/iPad Safari,
+      Chrome, Firefox, vendored wasmtime, wasmer. Record engine versions +
+      dates; script it so it can re-run.
+- [ ] **Record the decision in the specs.** Extend `spec/memory.md` §"The
+      platform" with the audited matrix; cross-link from `concurrency.md` and
+      `concurrency-model.md`.
+- [ ] **Pick the v0 concurrency floor for hosts without stack-switching**
+      (WebKit will be one). Options, by cost: (a) "v0 concurrency requires a
+      capable host" — spec the restriction, UI-only qubes unaffected; (b) a
+      single-threaded cooperative scheduler floor (suspension only at host-call
+      boundaries — no mid-function yield); (c) an asyncify-style transform
+      (binaryen has it; code-size + perf tax). Decide, spec it, and gate any
+      `spawn`/`channel` codegen work on the decision.
+
 ## C bindings
 
 Two distinct questions, both currently "planned, not active."
