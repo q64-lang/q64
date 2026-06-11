@@ -79,4 +79,10 @@ parse (CST/AST)
   Still in build_hir: body-scope ownership — the `Env` bridge adapts
   its wasm-slot `Scope`. That collapses when the A4 check pass brings
   sema its own body scopes.
-- **A4** — first real TYP codes; conformance fixtures flip to passing.
+- **A4 (in progress)** — `check.zig` is the first emitting layer:
+  body walks with sema-owned typed scopes; TYP051 (integer condition)
+  and TYP042 (mixed numeric arithmetic) ship in `q64 check`.
+  Conformance 13/45. NAM010 stays recorded-only (corpus survey shows
+  false positives from unparsed forms — lambdas, graph/channel exprs,
+  named args, record-pattern fields, auto-prelude names). Next: call
+  arg-count/type mismatches, unresolved type names.

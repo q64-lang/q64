@@ -38,13 +38,19 @@ describe.skipIf(!binaryAvailable())("q64 check", () => {
     expect(r.exitCode).not.toBe(0);
   });
 
-  // `check` is parse + the sema file-level pass; type-checking diagnostics
-  // (TYP*) are not emitted yet, so type-error.q checks clean today.
-  // Test-first: red until the type-checker (sema rung A4) surfaces TYP042
-  // (spec/types.md §arithmetic).
-  test.failing("surfaces a type error (TYP042) for type-error.q once type-checking lands", () => {
+  // The A4 sema check pass: mixed numeric arithmetic on annotated
+  // bindings is TYP042 (spec/types.md §arithmetic). Was test.failing
+  // from the day the fixture landed; green since the check pass.
+  test("surfaces a type error (TYP042) for type-error.q", () => {
     const r = runCli(["check", fixture("type-error.q"), "--diagnostics", "json"]);
+    expect(r.envelope?.ok).toBe(false);
     expect(hasDiagnostic(r.envelope, "TYP042", "error")).toBe(true);
+    expect(r.exitCode).not.toBe(0);
+  });
+
+  test("integer condition is TYP051 (spec/types.md §bool)", () => {
+    const r = runCli(["check", fixture("int-condition.q"), "--diagnostics", "json"]);
+    expect(hasDiagnostic(r.envelope, "TYP051", "error")).toBe(true);
   });
 
   test("missing file: input error, exit non-zero", () => {

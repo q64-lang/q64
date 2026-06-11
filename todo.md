@@ -695,13 +695,33 @@ verified, honest diagnostics throughout.
       expression types, and name lookup. What remains is *ownership of
       body scopes* (the Env bridge in build_hir adapts its wasm-slot
       Scope) — that collapses when the sema check pass lands with A4.
-- [ ] **A4 — first real TYP codes + sema-emitted NAM.** Arg-count/type
-      mismatches move from `UnsupportedCall` to their specced TYP codes;
-      the recorded unresolved heads + unresolved type names get their
-      NAM/TYP emission (a sema check pass with its own body scopes,
-      collapsing build_hir's Env bridge); flip the matching
-      `spec/tests/` fixtures from expected-future to passing. Conformance
-      count is the metric (today: 11 codes pass).
+- [ ] **A4 — first real TYP codes + sema-emitted NAM.** In progress:
+      - [x] **The check pass + TYP051/TYP042 emitted.** `sema/check.zig`:
+            the first sema layer that *emits* — walks fn bodies with
+            sema's own typed scopes (params from lowered signatures,
+            `let` bindings from annotations — new `ast.LetStmt.type_()`
+            accessor, the annotation was already parsed structured — or
+            inferred initializers; bare int literals stay *flexible* so
+            `a + 1` never false-fires). Emits **TYP051** (provably-integer
+            `if`/`while` condition) and **TYP042** (arithmetic mixing two
+            different known numeric types), both wired into `q64 check`
+            and the diag catalog. Conformance **11 → 13** of 45
+            (`types/int-as-bool.q`, `types/numeric-mismatch-no-implicit.q`
+            flip; zero golden regressions); q64-test's TYP042
+            `test.failing` flips to passing + a TYP051 case (78 CLI
+            tests); link-roundtrip PASS (emit path untouched).
+      - [ ] **NAM010 deferred — documented.** The corpus survey
+            (`show symbols` over spec/tests + fixtures + examples) shows
+            systematic false positives from not-yet-parsed forms: lambda
+            params, `graph`/`channel` exprs, named args (`capacity: 16`),
+            record-pattern fields, auto-prelude names (`sleep`). Unknown
+            heads stay recorded-only until those land + an auto-prelude
+            name table exists.
+      - [ ] Arg-count/type mismatch at call sites (TYP06x?) via the
+            signature store; needs the spec code confirmed in types.md.
+      - [ ] Unresolved *type* names (annotations) — needs its TYP code
+            picked from types.md and the same false-positive survey for
+            type positions (generic args ride as text today).
 
 ### Ladder B — struct values → static fits (after A3)
 

@@ -152,6 +152,9 @@ pub const codes = [_]CodeInfo{
     .{ .code = "NAM009", .subsystem = "Names", .severity = .err, .message = "block `pub` form is forbidden", .summary = "A `pub { … }` block applying visibility to a group of items is not allowed. Mark each item `pub` individually." },
     .{ .code = "NAM010", .subsystem = "Names", .severity = .err, .message = "unknown name in source module", .summary = "A name referenced here is neither declared in this module nor brought into scope by an `import`. Check for a typo, a missing `import`, or a name that isn't `pub` in its module." },
     .{ .code = "NAM011", .subsystem = "Names", .severity = .err, .message = "dash in bare module path", .summary = "A bare (dotted) module path segment contains `-`, but segments are snake_case identifiers (`[a-z][a-z0-9_]*`). Rename the segment, or use a quoted relative path for a file whose name contains a dash." },
+    // Type checking (emitted by the sema check pass)
+    .{ .code = "TYP042", .subsystem = "Type checking", .severity = .err, .message = "implicit numeric conversion is forbidden", .summary = "An arithmetic site mixes two different numeric types (e.g. `i32 + i64`). q64 never converts implicitly; cast one side explicitly so the widths and signedness are visible. See spec/types.md §arithmetic." },
+    .{ .code = "TYP051", .subsystem = "Type checking", .severity = .err, .message = "integer used as bool", .summary = "An `if`/`while` condition is an integer, but conditions require `bool` (e.g. `if 1 { … }`). Write the comparison out (`if x != 0`). See spec/types.md §bool." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"
