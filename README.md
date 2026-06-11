@@ -143,9 +143,9 @@ The remaining bootstrap pieces (still in progress; folders are scaffolded):
   code disagree, the spec wins.
 - [`CLAUDE.md`](./CLAUDE.md) — repo conventions, chiefly the naming/casing
   rules (`Q64` vs `q64`, `Qube` vs `qube`, the Continuum).
-- [`DEPLOYMENT.md`](./DEPLOYMENT.md) — maintainer runbook: how the web
-  properties (q64.dev, docs.q64.dev) and the q64/qube binary releases ship.
-  Contributors never need it — changes ship by PR.
+- [`DEPLOYMENT.md`](./DEPLOYMENT.md) — deploying a Qube: build the
+  component, scaffold `qubepod.jsonc`, `qube pod login`, `qube pod deploy`.
+  (Publishing a library is `qube publish` → the Continuum.)
 
 ## License
 
