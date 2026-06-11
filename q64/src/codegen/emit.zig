@@ -567,7 +567,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // it so the emitted module is a genuine 32-bit module (the WebKit/iPad
     // baseline). Multivalue + BulkMemory are address-space-independent.
     var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
-        c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals();
+        c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
+        c.BinaryenFeatureNontrappingFPToInt(); // i64.trunc_sat_f64_* (__fmt_f64) — universal, incl. WebKit
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
     c.BinaryenModuleSetFeatures(module, features);
 
@@ -644,6 +645,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // Int formatting needs `__fmt_i64`; either formatting or a concat needs
     // the scope-arena bump global (`sp`).
     var needs_fmt = false;
+    var needs_fmt_f64 = false;
     var needs_arena = false;
     var needs_str_eq = false;
     var needs_index_of = false;
@@ -659,12 +661,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         scanScratch(inst, &sc);
         if (sc.has_concat) needs_arena = true;
         if (sc.rec_depth > 0) needs_arena = true; // records live in the scope arena
+        if (sc.has_float_fmt) needs_fmt_f64 = true;
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
         if (sc.has_contains) needs_contains = true;
     }
     if (needs_fmt) needs_arena = true;
+    if (needs_fmt_f64) needs_arena = true;
     if (needs_arena) {
         // The scope-arena bump pointer starts just past the static data — and,
         // on the preview1 path, past the reserved iovec scratch — at the address
@@ -677,6 +681,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         _ = c.BinaryenAddGlobal(module, "sp", ptr_type, true, sp_init);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
+    if (needs_fmt_f64) try emitFmtF64(module, allocator, i64_type, pair_type, ptr_type, mem64);
     if (needs_str_eq) try emitStrEq(module, allocator, i32_type, ptr_type, mem64);
     if (needs_index_of) try emitStrIndexOf(module, allocator, i64_type, i32_type, ptr_type, mem64);
     // `contains` is implemented on top of `starts_with`, so emit the latter when
@@ -861,6 +866,8 @@ fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenT
 fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
     return switch (inst.op) {
         .host_out_int => |h| want_int or bodyHasOut(h.value, want_int),
+        .host_out_float => |h| bodyHasOut(h.value, want_int), // __fmt_f64 is its own helper
+        .fmt_float_to_str => |inner| bodyHasOut(inner, want_int),
         .host_out_str => |h| !want_int or bodyHasOut(h.value, want_int),
         .block => |items| blk: {
             for (items) |child| if (bodyHasOut(child, want_int)) break :blk true;
@@ -901,7 +908,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .field_get => |fg| bodyHasOut(fg.base, want_int),
         .field_set => |fs| bodyHasOut(fs.base, want_int) or bodyHasOut(fs.value, want_int),
-        .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
+        .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
 
@@ -922,7 +929,7 @@ fn usesEnvOut(m: *const ir.mir.Module) bool {
 
 fn instUsesEnvOut(inst: *const ir.mir.Inst) bool {
     switch (inst.op) {
-        .host_out_const, .host_out_int, .host_out_str => return true,
+        .host_out_const, .host_out_int, .host_out_str, .host_out_float => return true,
         .str_concat => |pieces| for (pieces) |p| {
             if (instUsesEnvOut(p)) return true;
         },
@@ -963,6 +970,9 @@ const Scratch = struct {
     /// field value, via a call argument): each level needs its own base-ptr
     /// scratch local so an inner alloc can't clobber the outer's base.
     rec_depth: u32 = 0,
+    /// Formats an f64 (host_out_float / fmt_float_to_str) → needs the
+    /// `__fmt_f64` helper + the arena.
+    has_float_fmt: bool = false,
 };
 
 fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
@@ -993,16 +1003,25 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         },
         .str_concat => |pieces| {
             s.has_concat = true;
-            // A `call` and an `fmt_int_to_str` piece each return a (ptr, len)
-            // tuple that needs one tuple slot at the concat's call site.
+            // A `call`, `fmt_int_to_str`, or `fmt_float_to_str` piece each
+            // return a (ptr, len) tuple needing one tuple slot at the site.
             var tuples: u32 = 0;
             for (pieces) |p| {
-                if (p.op == .call or p.op == .fmt_int_to_str) tuples += 1;
+                if (p.op == .call or p.op == .fmt_int_to_str or p.op == .fmt_float_to_str) tuples += 1;
                 scanScratch(p, s);
             }
             if (tuples > s.max_tuples) s.max_tuples = tuples;
         },
         .fmt_int_to_str => |inner| scanScratch(inner, s),
+        .fmt_float_to_str => |inner| {
+            s.has_float_fmt = true;
+            scanScratch(inner, s);
+        },
+        .host_out_float => |h| {
+            s.host_out = true; // pair scratch for the (ptr, len) split
+            s.has_float_fmt = true;
+            scanScratch(h.value, s);
+        },
         .host_out_int => |h| {
             s.host_out = true;
             scanScratch(h.value, s);
@@ -1066,7 +1085,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(m.str, s);
             scanScratch(m.sub, s);
         },
-        .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
+        .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
 
@@ -1149,12 +1168,21 @@ const Lowerer = struct {
             },
             .host_out_const => |hc| return self.envOut(@intCast(hc.off), @intCast(hc.len)),
             .const_i64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt64(v)),
+            .const_f64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralFloat64(v)),
             .const_i32 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt32(v)),
             .local_get => |idx| return c.BinaryenLocalGet(module, idx, self.wty(n.ty)),
             .local_set => |ls| return c.BinaryenLocalSet(module, ls.idx, try self.inst(ls.value)),
-            .bin => |b| return c.BinaryenBinary(module, binOp(b.kind), try self.inst(b.lhs), try self.inst(b.rhs)),
+            .bin => |b| {
+                // Operand type picks the instruction family; the builder
+                // guarantees both sides agree (no implicit conversion).
+                const op = if (b.lhs.ty == .f64) binOpF64(b.kind) orelse return Error.UnsupportedCall else binOp(b.kind);
+                return c.BinaryenBinary(module, op, try self.inst(b.lhs), try self.inst(b.rhs));
+            },
             .un => |u| {
                 const x = try self.inst(u.operand);
+                if (u.kind == .neg and u.operand.ty == .f64) {
+                    return c.BinaryenUnary(module, c.BinaryenNegFloat64(), x);
+                }
                 return switch (u.kind) {
                     .neg => c.BinaryenBinary(module, c.BinaryenSubInt64(), c.BinaryenConst(module, c.BinaryenLiteralInt64(0)), x),
                     .bit_not => c.BinaryenBinary(module, c.BinaryenXorInt64(), x, c.BinaryenConst(module, c.BinaryenLiteralInt64(-1))),
@@ -1216,6 +1244,12 @@ const Lowerer = struct {
                 const fmt = c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
                 return self.hostOutPair(fmt, @intCast(hi.nl_off));
             },
+            .host_out_float => |hf| {
+                // __fmt_f64(value) → (ptr, len), then write it + the newline.
+                var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(hf.value)};
+                const fmt = c.BinaryenCall(module, "__fmt_f64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
+                return self.hostOutPair(fmt, @intCast(hf.nl_off));
+            },
             .host_out_str => |hs| return self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)),
             .host_call => |hc| {
                 // A `str` argument expands to two operands (ptr, len), exactly
@@ -1239,6 +1273,10 @@ const Lowerer = struct {
                 // value; the caller consumes it just like any str-typed inst.
                 var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(inner)};
                 return c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
+            },
+            .fmt_float_to_str => |inner| {
+                var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(inner)};
+                return c.BinaryenCall(module, "__fmt_f64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
             },
             .str_len => |s| {
                 // The str value's (ptr, len) pair; take element 1 (len). q64 ints
@@ -1308,6 +1346,7 @@ const Lowerer = struct {
                 const base = try self.inst(fg.base);
                 return switch (n.ty) {
                     .i64 => c.BinaryenLoad(module, 8, true, fg.offset, 0, self.i64_type, base, "0"),
+                    .f64 => c.BinaryenLoad(module, 8, true, fg.offset, 0, c.BinaryenTypeFloat64(), base, "0"),
                     .i32 => c.BinaryenLoad(module, 1, false, fg.offset, 0, self.i32_type, base, "0"),
                     else => Error.UnsupportedCall,
                 };
@@ -1317,6 +1356,7 @@ const Lowerer = struct {
                 const value = try self.inst(fs.value);
                 return switch (fs.value.ty) {
                     .i64 => c.BinaryenStore(module, 8, fs.offset, 0, base, value, self.i64_type, "0"),
+                    .f64 => c.BinaryenStore(module, 8, fs.offset, 0, base, value, c.BinaryenTypeFloat64(), "0"),
                     .i32 => c.BinaryenStore(module, 1, fs.offset, 0, base, value, self.i32_type, "0"),
                     else => Error.UnsupportedCall,
                 };
@@ -1484,7 +1524,7 @@ const Lowerer = struct {
         // slot — they're computed inline below.)
         var j: c.BinaryenIndex = 0;
         for (pieces) |p| switch (p.op) {
-            .call, .fmt_int_to_str => {
+            .call, .fmt_int_to_str, .fmt_float_to_str => {
                 try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx + j, try self.inst(p)));
                 j += 1;
             },
@@ -1500,7 +1540,7 @@ const Lowerer = struct {
         var total = self.ptrConst(@intCast(const_total));
         j = 0;
         for (pieces) |p| switch (p.op) {
-            .call, .fmt_int_to_str => {
+            .call, .fmt_int_to_str, .fmt_float_to_str => {
                 total = self.ptrAdd(total, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1));
                 j += 1;
             },
@@ -1538,7 +1578,7 @@ const Lowerer = struct {
                     ln = self.ptrGet(sb.len_idx);
                     ln2 = self.ptrGet(sb.len_idx);
                 },
-                .call, .fmt_int_to_str => {
+                .call, .fmt_int_to_str, .fmt_float_to_str => {
                     src = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 0);
                     ln = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1);
                     ln2 = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx + j, self.pair_type), 1);
@@ -1589,6 +1629,7 @@ const Lowerer = struct {
             self.rec_level -= 1;
             const store = switch (fi.value.ty) {
                 .i64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, self.i64_type, "0"),
+                .f64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, c.BinaryenTypeFloat64(), "0"),
                 .i32 => c.BinaryenStore(m, 1, fi.offset, 0, self.ptrGet(ridx), value, self.i32_type, "0"),
                 else => return Error.UnsupportedCall,
             };
@@ -1657,6 +1698,25 @@ fn binOp(kind: ir.ops.BinKind) c.BinaryenOp {
         .le => c.BinaryenLeSInt64(),
         .gt => c.BinaryenGtSInt64(),
         .ge => c.BinaryenGeSInt64(),
+    };
+}
+
+/// The f64 instruction for a binary op, or null for ops wasm has no
+/// float form of (`%`, bitwise, shifts) — the builder rejects those
+/// before lowering; this is the backstop.
+fn binOpF64(kind: ir.ops.BinKind) ?c.BinaryenOp {
+    return switch (kind) {
+        .add => c.BinaryenAddFloat64(),
+        .sub => c.BinaryenSubFloat64(),
+        .mul => c.BinaryenMulFloat64(),
+        .div => c.BinaryenDivFloat64(),
+        .eq => c.BinaryenEqFloat64(),
+        .ne => c.BinaryenNeFloat64(),
+        .lt => c.BinaryenLtFloat64(),
+        .le => c.BinaryenLeFloat64(),
+        .gt => c.BinaryenGtFloat64(),
+        .ge => c.BinaryenGeFloat64(),
+        .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => null,
     };
 }
 
@@ -1749,6 +1809,157 @@ fn emitFmtI64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
     const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), pair_type);
     var var_types = [_]c.BinaryenType{ i64_type, ptr_type, ptr_type, i32_type };
     _ = c.BinaryenAddFunction(module, "__fmt_i64", i64_type, pair_type, @ptrCast(&var_types), var_types.len, body);
+}
+
+/// Emit `__fmt_f64(x: f64) -> (ptr, len)`: decimal text in the scope
+/// arena — sign, integer part, `.`, then up to 6 fractional digits with
+/// trailing zeros trimmed (at least one digit: `1.0` prints "1.0",
+/// `0.25` prints "0.25"). The fraction is scaled by 1e6 and rounded
+/// half-up, with a carry into the integer part (0.9999995 → "1.0").
+/// v0 boundaries: NaN prints "0.0"; magnitudes beyond i64 saturate
+/// (the trunc is the saturating form, so nothing traps).
+fn emitFmtF64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_type: c.BinaryenType, pair_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
+    const i32_type = c.BinaryenTypeInt32();
+    const f64_type = c.BinaryenTypeFloat64();
+    const none = c.BinaryenTypeNone();
+    // Locals: 0=x (param f64), 1=a (|x|, f64), 2=ip (i64), 3=fr (i64,
+    // the 1e6-scaled fraction), 4=p, 5=end (ptr cursors), 6=neg (i32),
+    // 7=started (i32, a fractional digit has been written).
+    const X: c.BinaryenIndex = 0;
+    const A: c.BinaryenIndex = 1;
+    const IP: c.BinaryenIndex = 2;
+    const FR: c.BinaryenIndex = 3;
+    const P: c.BinaryenIndex = 4;
+    const END: c.BinaryenIndex = 5;
+    const NEG: c.BinaryenIndex = 6;
+    const STARTED: c.BinaryenIndex = 7;
+    const add_p = if (mem64) c.BinaryenAddInt64() else c.BinaryenAddInt32();
+    const sub_p = if (mem64) c.BinaryenSubInt64() else c.BinaryenSubInt32();
+    const k = struct {
+        fn i64c(m: c.BinaryenModuleRef, v: i64) c.BinaryenExpressionRef {
+            return c.BinaryenConst(m, c.BinaryenLiteralInt64(v));
+        }
+        fn f64c(m: c.BinaryenModuleRef, v: f64) c.BinaryenExpressionRef {
+            return c.BinaryenConst(m, c.BinaryenLiteralFloat64(v));
+        }
+        fn ptrc(m: c.BinaryenModuleRef, m64: bool, v: i64) c.BinaryenExpressionRef {
+            return if (m64) c.BinaryenConst(m, c.BinaryenLiteralInt64(v)) else c.BinaryenConst(m, c.BinaryenLiteralInt32(@intCast(v)));
+        }
+        fn get(m: c.BinaryenModuleRef, idx: c.BinaryenIndex, t: c.BinaryenType) c.BinaryenExpressionRef {
+            return c.BinaryenLocalGet(m, idx, t);
+        }
+        // p--; mem[p] = byte (an i64 i64.store8)
+        fn putc(m: c.BinaryenModuleRef, m64: bool, byte: c.BinaryenExpressionRef, pt: c.BinaryenType) [2]c.BinaryenExpressionRef {
+            const subp = if (m64) c.BinaryenSubInt64() else c.BinaryenSubInt32();
+            return .{
+                c.BinaryenLocalSet(m, P, c.BinaryenBinary(m, subp, c.BinaryenLocalGet(m, P, pt), ptrc(m, m64, 1))),
+                c.BinaryenStore(m, 1, 0, 0, c.BinaryenLocalGet(m, P, pt), byte, c.BinaryenTypeInt64(), "0"),
+            };
+        }
+    };
+
+    var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer stmts.deinit(allocator);
+
+    // neg = x < 0.0; a = |x|
+    try stmts.append(allocator, c.BinaryenLocalSet(module, NEG, c.BinaryenBinary(module, c.BinaryenLtFloat64(), k.get(module, X, f64_type), k.f64c(module, 0.0))));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, A, c.BinaryenUnary(module, c.BinaryenAbsFloat64(), k.get(module, X, f64_type))));
+    // ip = trunc_sat_u(a); fr = trunc_sat_u((a - convert(ip)) * 1e6 + 0.5)
+    try stmts.append(allocator, c.BinaryenLocalSet(module, IP, c.BinaryenUnary(module, c.BinaryenTruncSatUFloat64ToInt64(), k.get(module, A, f64_type))));
+    const frac = c.BinaryenBinary(module, c.BinaryenSubFloat64(), k.get(module, A, f64_type), c.BinaryenUnary(module, c.BinaryenConvertUInt64ToFloat64(), k.get(module, IP, i64_type)));
+    const scaled = c.BinaryenBinary(module, c.BinaryenAddFloat64(), c.BinaryenBinary(module, c.BinaryenMulFloat64(), frac, k.f64c(module, 1_000_000.0)), k.f64c(module, 0.5));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, FR, c.BinaryenUnary(module, c.BinaryenTruncSatUFloat64ToInt64(), scaled)));
+    // rounding carry: fr == 1_000_000 → ip += 1, fr = 0
+    var carry_body = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(module, IP, c.BinaryenBinary(module, c.BinaryenAddInt64(), k.get(module, IP, i64_type), k.i64c(module, 1))),
+        c.BinaryenLocalSet(module, FR, k.i64c(module, 0)),
+    };
+    const carry_block = c.BinaryenBlock(module, null, @ptrCast(&carry_body), carry_body.len, none);
+    try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, c.BinaryenGeUInt64(), k.get(module, FR, i64_type), k.i64c(module, 1_000_000)), carry_block, null));
+
+    // end = sp + 40; sp = end; p = end (backward writer, like __fmt_i64)
+    try stmts.append(allocator, c.BinaryenLocalSet(module, END, c.BinaryenBinary(module, add_p, c.BinaryenGlobalGet(module, "sp", ptr_type), k.ptrc(module, mem64, 40))));
+    try stmts.append(allocator, c.BinaryenGlobalSet(module, "sp", k.get(module, END, ptr_type)));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, P, k.get(module, END, ptr_type)));
+    try stmts.append(allocator, c.BinaryenLocalSet(module, STARTED, c.BinaryenConst(module, c.BinaryenLiteralInt32(0))));
+
+    // 6 fractional digits, written backward, trailing zeros skipped until
+    // the first nonzero: for i in 0..6 { d = fr%10; fr/=10; if (d!=0 or
+    // started) { putc('0'+d); started=1 } }
+    {
+        var loop_body: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer loop_body.deinit(allocator);
+        const digit = c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, FR, i64_type), k.i64c(module, 10));
+        const cond = c.BinaryenBinary(module, c.BinaryenOrInt32(),
+            c.BinaryenUnary(module, c.BinaryenWrapInt64(), c.BinaryenBinary(module, c.BinaryenNeInt64(), digit, k.i64c(module, 0)), ),
+            k.get(module, STARTED, i32_type));
+        _ = cond;
+        // (cond rebuilt inline below — Binaryen refs aren't shareable.)
+        const digit2 = c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, FR, i64_type), k.i64c(module, 10));
+        const ne0 = c.BinaryenBinary(module, c.BinaryenNeInt64(), digit2, k.i64c(module, 0)); // already i32
+        const cond2 = c.BinaryenBinary(module, c.BinaryenOrInt32(), ne0, k.get(module, STARTED, i32_type));
+        const putd = k.putc(module, mem64, c.BinaryenBinary(module, c.BinaryenAddInt64(), k.i64c(module, '0'), c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, FR, i64_type), k.i64c(module, 10))), ptr_type);
+        var then_body = [_]c.BinaryenExpressionRef{
+            putd[0],
+            putd[1],
+            c.BinaryenLocalSet(module, STARTED, c.BinaryenConst(module, c.BinaryenLiteralInt32(1))),
+        };
+        const then_block = c.BinaryenBlock(module, null, @ptrCast(&then_body), then_body.len, none);
+        try loop_body.append(allocator, c.BinaryenIf(module, cond2, then_block, null));
+        try loop_body.append(allocator, c.BinaryenLocalSet(module, FR, c.BinaryenBinary(module, c.BinaryenDivUInt64(), k.get(module, FR, i64_type), k.i64c(module, 10))));
+        // Reuse FR's exhaustion as the loop bound: exactly 6 iterations via
+        // a counter in IP's spare bits would need another local — instead
+        // loop while the digit budget remains, tracked in local A reused as
+        // an i64 counter? A is f64. Add a dedicated counter local: index 8.
+        const I: c.BinaryenIndex = 8;
+        try loop_body.append(allocator, c.BinaryenLocalSet(module, I, c.BinaryenBinary(module, c.BinaryenAddInt64(), c.BinaryenLocalGet(module, I, i64_type), k.i64c(module, 1))));
+        try loop_body.append(allocator, c.BinaryenBreak(module, "ffrac", c.BinaryenBinary(module, c.BinaryenLtUInt64(), c.BinaryenLocalGet(module, I, i64_type), k.i64c(module, 6)), null));
+        const loop_block = c.BinaryenBlock(module, null, @ptrCast(loop_body.items.ptr), @intCast(loop_body.items.len), none);
+        try stmts.append(allocator, c.BinaryenLoop(module, "ffrac", loop_block));
+    }
+    // no fractional digit written → a single '0'
+    {
+        const putz = k.putc(module, mem64, k.i64c(module, '0'), ptr_type);
+        var z_body = [_]c.BinaryenExpressionRef{ putz[0], putz[1] };
+        const z_block = c.BinaryenBlock(module, null, @ptrCast(&z_body), z_body.len, none);
+        try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenUnary(module, c.BinaryenEqZInt32(), c.BinaryenLocalGet(module, STARTED, i32_type)), z_block, null));
+    }
+    // '.'
+    {
+        const putdot = k.putc(module, mem64, k.i64c(module, '.'), ptr_type);
+        try stmts.append(allocator, putdot[0]);
+        try stmts.append(allocator, putdot[1]);
+    }
+    // integer digits: do { putc('0' + ip%10); ip /= 10 } while (ip != 0)
+    {
+        var loop_body: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer loop_body.deinit(allocator);
+        const putd = k.putc(module, mem64, c.BinaryenBinary(module, c.BinaryenAddInt64(), k.i64c(module, '0'), c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, IP, i64_type), k.i64c(module, 10))), ptr_type);
+        try loop_body.append(allocator, putd[0]);
+        try loop_body.append(allocator, putd[1]);
+        try loop_body.append(allocator, c.BinaryenLocalSet(module, IP, c.BinaryenBinary(module, c.BinaryenDivUInt64(), k.get(module, IP, i64_type), k.i64c(module, 10))));
+        try loop_body.append(allocator, c.BinaryenBreak(module, "fint", c.BinaryenBinary(module, c.BinaryenNeInt64(), k.get(module, IP, i64_type), k.i64c(module, 0)), null));
+        const loop_block = c.BinaryenBlock(module, null, @ptrCast(loop_body.items.ptr), @intCast(loop_body.items.len), none);
+        try stmts.append(allocator, c.BinaryenLoop(module, "fint", loop_block));
+    }
+    // sign
+    {
+        const putm = k.putc(module, mem64, k.i64c(module, '-'), ptr_type);
+        var sign_body = [_]c.BinaryenExpressionRef{ putm[0], putm[1] };
+        const sign_block = c.BinaryenBlock(module, null, @ptrCast(&sign_body), sign_body.len, none);
+        try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenLocalGet(module, NEG, i32_type), sign_block, null));
+    }
+    // (p, end - p)
+    var ret = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalGet(module, P, ptr_type),
+        c.BinaryenBinary(module, sub_p, c.BinaryenLocalGet(module, END, ptr_type), c.BinaryenLocalGet(module, P, ptr_type)),
+    };
+    try stmts.append(allocator, c.BinaryenTupleMake(module, @ptrCast(&ret), ret.len));
+
+    const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), pair_type);
+    // locals beyond the param: a(f64) ip fr (i64) p end (ptr) neg started (i32) i(i64)
+    var var_types = [_]c.BinaryenType{ f64_type, i64_type, i64_type, ptr_type, ptr_type, i32_type, i32_type, i64_type };
+    _ = c.BinaryenAddFunction(module, "__fmt_f64", f64_type, pair_type, @ptrCast(&var_types), var_types.len, body);
 }
 
 /// Emit `__str_eq(pa, la, pb, lb) -> i32`: byte-wise equality of two strings.

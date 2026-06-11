@@ -226,6 +226,8 @@ pub const Stmt = union(enum) {
     host_out: *Expr,
     /// `env.out(expr)` where `expr` is `i64` — formatted to decimal on lowering.
     host_out_int: *Expr,
+    /// `env.out(expr)` where `expr` is `f64` — formatted via `__fmt_f64`.
+    host_out_float: *Expr,
     /// `env.out(expr)` where `expr` is a runtime `str` value (e.g. a call to a
     /// str-returning function) — its `(ptr, len)` is written, then a newline.
     host_out_str: *Expr,
@@ -263,6 +265,9 @@ pub const Expr = union(enum) {
     /// A fully-resolved constant string value (escapes decoded, no newline).
     str_const: []const u8,
     int_const: i64,
+    /// An f64 constant (`3.14`, `1e9`). Floats never const-fold in v0 —
+    /// they stay runtime values end to end.
+    float_const: f64,
     /// A `true` / `false` literal. A boolean (i32 0/1), like a comparison or
     /// `!` — usable in conditions and as an operand of `&&`/`||`/`!`.
     bool_const: bool,
@@ -291,6 +296,10 @@ pub const Expr = union(enum) {
     /// as the value of an `env.out(<i64>)` would be — but `host_out_int` is the
     /// shorter path for the latter, so `fmt_int` only appears inside `concat`.
     fmt_int: *Expr,
+    /// The decimal `str` of an f64 value (`__fmt_f64`: integer part, `.`,
+    /// up to 6 fractional digits, trailing zeros trimmed). A concat piece,
+    /// like `fmt_int`.
+    fmt_float: *Expr,
     /// The byte length of a `str` value as an i64 (`s.len`). The operand is a
     /// str-valued expression; lowering reads its `(ptr, len)` len component and
     /// zero-extends it to i64.

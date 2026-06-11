@@ -33,8 +33,10 @@ pub struct Color { r: u8, g: u8, b: u8 }
 
 // 2. fit — bind a type to the face.
 pub fit Color : Display {
+    // v0 interpolation has no format specs ({value:02x} is a deferred
+    // open item — types.md §"String types"); Display renders decimal.
     fn fmt(self) -> str {
-        "#{self.r:02x}{self.g:02x}{self.b:02x}"
+        "rgb({self.r}, {self.g}, {self.b})"
     }
 }
 

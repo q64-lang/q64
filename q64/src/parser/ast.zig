@@ -1582,8 +1582,14 @@ pub const NumLit = struct {
 
     /// The numeric token's raw text (e.g. `"42"`, `"3.14"`, `"0xFF"`).
     pub fn rawText(self: NumLit) ?[]const u8 {
+        const t = self.token() orelse return null;
+        return t.text;
+    }
+
+    /// The numeric token itself (its kind tells INT_LIT from FLOAT_LIT).
+    pub fn token(self: NumLit) ?cst.Token {
         for (self.cst.children) |c| switch (c) {
-            .token => |t| if (t.kind == .INT_LIT or t.kind == .FLOAT_LIT) return t.text,
+            .token => |t| if (t.kind == .INT_LIT or t.kind == .FLOAT_LIT) return t,
             .node => {},
         };
         return null;
