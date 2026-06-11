@@ -963,11 +963,49 @@ verified, honest diagnostics throughout.
       need sema-typed field exprs; narrow-field arithmetic through
       `cs[0].r + 1` widens silently (same gap) — closes when field
       exprs are sema-typed.
+### Ladder C — enums + `match` lowering
+
+- [ ] **C — enums + `match`.** The biggest blocked language surface
+      (the conformance corpus and `errors.md` lean on `match`).
+      Rungs: C1 unit variants + statement `match` (landed below) →
+      C2 value `match` (match as an expression: arms yield a scalar)
+      → C3 payload variants (tag + payload layout in the arena;
+      `Some(v)` construction; pattern bindings) → C4 `match` on
+      scalars/strs with literal patterns → exhaustiveness diagnostics
+      in `q64 check` (the TYP3xx band) → `Option`/`Result` in the
+      prelude.
+      - [x] **C1 — all-unit enums + statement `match` in `main` (and
+            stamped generic bodies — they share the builder).**
+            A variant value is its **declaration-order tag** (an i64
+            at the compute floor; storage width + payload layout are
+            later rungs' spec work). `registerEnums` registers
+            all-unit enums (payload variants skip the enum — a use is
+            honestly Unsupported); `Enum.Variant` resolves in the
+            path arm to its tag const; an enum-valued `let`/`var`
+            registers in `Scope.enum_binds` so `match` knows the
+            scrutinee's enum. `buildMainMatch` evaluates the
+            scrutinee once into a hidden local and folds arms
+            back-to-front into an if/else chain on tag equality —
+            bare variant names resolve against the scrutinee's enum
+            (unknown name → NameNotFound), `_` is the default, and
+            the v0 floor requires structural exhaustiveness (every
+            variant or a `_`; else Unsupported — the diagnostic wire
+            is the `q64 check` rung). Arm bodies are blocks or `->`
+            expression statements (the expr-statement builder was
+            factored into `buildMainExprStmt`, shared). Verified
+            end-to-end wasm64 + wasm32 (roundtrip C1 section: slow /
+            moving+fast / direct red) + 3 unit tests (tags + chain;
+            non-exhaustive rejection; non-variant arm name). 372
+            unit / 80 CLI / 21-of-49 / roundtrips green.
+            **Boundary:** `match` as a value expression, payload
+            variants, literal patterns, enum printing (`env.out`
+            of an enum prints its tag today — the variant-name
+            formatter is a later nicety), and cross-module enums.
+
 - [ ] **B5 — generics beyond the first rung.** Monomorphization's v0
       floor landed with B4's close (one `<T: Face>` param, `[T]` slice
       params, record element types, void returns, statement calls).
-      Remaining: const generics; then `dyn` dispatch; enums + `match`
-      lowering (separate ladders).
+      Remaining: const generics; then `dyn` dispatch (separate ladder).
       - [x] **Record `-> T` returns.** The `-> T` story closes: a
             generic whose T infers to a record returns its base pointer
             (`first<Color> -> ptr`), with the instance registered in

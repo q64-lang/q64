@@ -1147,4 +1147,49 @@ if [[ "$bgen32_out" != "$bgen_expected" ]]; then
 fi
 echo "    ok: show<Color> + twice<i64/f64> + first<i64/Color> + idr<Color> + dispatch-on-call-expr -> rgb/42/3.0/10/107/rgb(9, 8)/8/rgb(4, 5)/6 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# C1 (enums + match, first rung): all-unit enums — a variant value is its
+# declaration-order tag; statement `match` lowers to an if/else chain with
+# bare-variant-name arms, a `_` default, and structural exhaustiveness.
+# ---------------------------------------------------------------------------
+echo "==> C1: enums + match — unit variants, tags, wildcard"
+enum_app="$tmp/enum1.q"
+cat > "$enum_app" <<'Q64'
+enum Light { Red, Yellow, Green }
+fn main {
+    var l = Light.Yellow
+    match l {
+        Red -> env.out("stop"),
+        Yellow -> env.out("slow"),
+        Green -> env.out("go"),
+    }
+    l = Light.Green
+    match l {
+        Red -> env.out("stop"),
+        _ -> {
+            env.out("moving")
+            env.out("fast")
+        },
+    }
+    match Light.Red {
+        Red -> env.out("direct red"),
+        _ -> env.out("other"),
+    }
+}
+Q64
+enum_expected=$'slow\nmoving\nfast\ndirect red'
+"$Q64_BIN" emit "$enum_app" "$tmp/enum1.wasm"
+enum_out="$("$HOST_BIN" "$tmp/enum1.wasm")"
+if [[ "$enum_out" != "$enum_expected" ]]; then
+    echo "FAIL: enum/match output mismatch (got: $enum_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$enum_app" "$tmp/enum1-32.wasm" --addr wasm32
+enum32_out="$("$HOST_BIN" "$tmp/enum1-32.wasm")"
+if [[ "$enum32_out" != "$enum_expected" ]]; then
+    echo "FAIL: enum/match wasm32 output mismatch (got: $enum32_out)" >&2
+    exit 1
+fi
+echo "    ok: match on Light -> slow / moving+fast / direct red (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

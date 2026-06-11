@@ -119,6 +119,9 @@ const Builder = struct {
     /// spec/memory.md §"Linear struct layout". Struct-typed signatures resolve
     /// against this table (v0: the compiling file's structs only).
     structs: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
+    /// This file's all-unit enum declarations (C1): a variant value is
+    /// its declaration-order tag (an i64 at the compute floor).
+    enums: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
     /// The fit registry (sema/fits.zig) over this file — B4 static
     /// dispatch resolves `p.area()` through it. Arena-backed (never
     /// deinit'd separately).
@@ -234,6 +237,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // fields outside the v0 floor (i64 / bool) are skipped, not rejected —
     // a *use* of one surfaces the honest Unsupported.
     try registerStructs(b, sf);
+    // Pass 0.55: register this file's all-unit enum declarations (C1) —
+    // a variant value is its declaration-order tag. Enums with payload
+    // variants are skipped (a *use* surfaces the honest Unsupported).
+    try registerEnums(b, sf);
     // Pass 0.6: the fit registry (B4) — `p.area()` dispatches through it.
     // Its form diagnostics (TYP201/202) belong to `q64 check`, not emit.
     b.fitreg = try sema.fits.build(b.a, sf);
@@ -397,85 +404,19 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = value } };
                 try out.append(b.a, st);
+                // An enum-valued initializer (`var c = Color.Red`, or a
+                // copy of another enum binding): remember the enum so
+                // `match` resolves bare variant names against it.
+                if (try enumOfExpr(b, scope, init_expr)) |info| {
+                    try scope.enum_binds.put(b.a, nm.text, info);
+                }
             }
         },
         .expr_stmt => |es| {
             const expr = es.expression() orelse return error.Unsupported;
-            const call = switch (expr) {
-                .call => |cc| cc,
-                else => return error.Unsupported,
-            };
-            // A statement-position call to a face-bounded generic function
-            // (`print_all(colors)` / `print_all([...])`): monomorphize per
-            // the inferred element type and call the stamped instance (B5).
-            if (callPathName(b, call)) |gn| {
-                defer b.a.free(gn);
-                if (std.mem.indexOfScalar(u8, gn, '.') == null) {
-                    if (b.resolver.lookup(gn)) |fd| {
-                        if (fd.isGeneric()) {
-                            try out.append(b.a, try buildGenericCallStmt(b, gn, fd, call, scope));
-                            return;
-                        }
-                    }
-                }
-            }
-            // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`
-            // or `qview.set_text(80, 9, "…")`): str args flow as (ptr, len), the
-            // rest as i64; no return. The backend declares the matching import.
-            if (try hostFaceName(b, call)) |fname| {
-                var args: std.ArrayList(*hir.Expr) = .empty;
-                var ait = call.args();
-                while (ait.next()) |a| try args.append(b.a, try buildHostArg(b, a, scope, rt));
-                const st = try b.a.create(hir.Stmt);
-                st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
-                try out.append(b.a, st);
-                return;
-            }
-            if (!isEnvOut(b.a, call)) return reject(b, .unsupported_call);
-            const arg = firstArg(call) orelse return error.Unsupported;
-
-            const st = try b.a.create(hir.Stmt);
-            if (try tryConst(b, arg)) |bytes| {
-                // A constant string/number/interpolation → fold into the data.
-                const e = try b.a.create(hir.Expr);
-                e.* = .{ .str_const = bytes };
-                st.* = .{ .host_out = e };
-            } else if (arg == .path and rt.get(try pathText(b, arg.path)) != null) {
-                // env.out(g) where g is a runtime str binding.
-                const bnd = rt.get(try pathText(b, arg.path)).?;
-                const e = try b.a.create(hir.Expr);
-                e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
-                st.* = .{ .host_out_str = e };
-            } else if (arg == .string_lit) {
-                // A string literal with interpolation. If it folds entirely to
-                // a constant (e.g. only untyped fold-only helpers), emit a
-                // folded `host_out`; otherwise a runtime concat.
-                const v = try buildConcat(b, arg.string_lit, scope, false, rt);
-                st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
-            } else if (try isStrCall(b, arg, scope)) {
-                // A real call to a str-returning function.
-                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
-            } else if (try exprIsBool(b, arg, scope)) {
-                // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
-                // binding, or a `-> bool` call. Printed as "true" / "false".
-                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
-            } else if (isFloatSc(try exprScalar(b, arg, scope))) {
-                // A float: formatted via __fmt_f64 (decimal, ≤6 frac
-                // digits); an f32 promotes to f64 first — one formatter.
-                var fv = try buildIntExpr(b, arg, scope);
-                if ((try exprScalar(b, arg, scope)) == .f32) {
-                    const w = try b.a.create(hir.Expr);
-                    w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
-                    fv = w;
-                }
-                st.* = .{ .host_out_float = fv };
-            } else {
-                // Otherwise an i64 expression (a call to an i64 function).
-                const e = try buildIntExpr(b, arg, scope);
-                st.* = .{ .host_out_int = e };
-            }
-            try out.append(b.a, st);
+            try buildMainExprStmt(b, expr, scope, rt, out);
         },
+        .match_stmt => |ms| try buildMainMatch(b, ms, scope, rt, out),
         .assign_stmt => |as| {
             const tgt = as.target() orelse return error.Unsupported;
             const tpath = switch (tgt) {
@@ -662,6 +603,175 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
         },
         else => return error.Unsupported,
     }
+}
+
+/// C1: a statement-position `match` on an all-unit enum value. The
+/// scrutinee evaluates once into a hidden i64 local; arms lower to an
+/// if/else chain on tag equality. v0 floor: arm patterns are bare
+/// variant names (resolved against the scrutinee's enum) or `_`; the
+/// match must be exhaustive (every variant covered, or a `_` arm).
+fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const scrut = ms.scrutinee() orelse return error.Unsupported;
+    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+
+    // Evaluate the scrutinee once.
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const s_idx = try scope.declare("#match", false, .i64);
+    try b.cur_locals.append(b.a, .i64);
+    const sval = try buildIntExpr(b, scrut, scope);
+    const set = try b.a.create(hir.Stmt);
+    set.* = .{ .let = .{ .idx = s_idx, .value = sval } };
+    try out.append(b.a, set);
+
+    // Collect the arms: (tag, body) pairs + at most one `_` default.
+    const Arm = struct { tag: i64, body: *hir.Stmt };
+    var arms: std.ArrayList(Arm) = .empty;
+    defer arms.deinit(b.a);
+    var default: ?*hir.Stmt = null;
+    var covered: usize = 0;
+    var it = ms.arms();
+    while (it.next()) |arm| {
+        const pat = arm.pattern() orelse return error.Unsupported;
+        const body = try buildMatchArmBody(b, arm, scope, rt);
+        switch (pat.kind()) {
+            .WILD_PATTERN => {
+                if (default != null) return error.Unsupported; // two `_` arms
+                default = body;
+            },
+            .IDENT_PATTERN => {
+                const nm = pat.bindingName() orelse return error.Unsupported;
+                const tag = for (info.variants, 0..) |v, i| {
+                    if (std.mem.eql(u8, v, nm.text)) break @as(i64, @intCast(i));
+                } else return reject(b, .name_not_found); // not a variant of this enum
+                try arms.append(b.a, .{ .tag = tag, .body = body });
+                covered += 1;
+            },
+            else => return error.Unsupported, // payload/literal patterns: later rungs
+        }
+    }
+    // Exhaustiveness (spec/grammar.md leaves the rules open; the v0
+    // floor requires it structurally): every variant, or a default.
+    if (default == null and covered < info.variants.len) return error.Unsupported;
+
+    // Fold the arms back-to-front into an if/else chain on the tag.
+    // The lowering reads branch payloads as blocks, so a nested `if`
+    // (the rest of the chain) wraps in a one-statement block.
+    var chain: ?*hir.Stmt = default;
+    var i = arms.items.len;
+    while (i > 0) {
+        i -= 1;
+        const a = arms.items[i];
+        const sread = try b.a.create(hir.Expr);
+        sread.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
+        const tagv = try b.a.create(hir.Expr);
+        tagv.* = .{ .int_const = a.tag };
+        const cond = try b.a.create(hir.Expr);
+        cond.* = .{ .bin = .{ .kind = .eq, .lhs = sread, .rhs = tagv } };
+        var else_part = chain;
+        if (else_part) |ep| {
+            if (ep.* == .if_) {
+                const wrap = try b.a.create(hir.Stmt);
+                wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{ep}) };
+                else_part = wrap;
+            }
+        }
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .if_ = .{ .cond = cond, .then_ = a.body, .else_ = else_part } };
+        chain = st;
+    }
+    if (chain) |c| try out.append(b.a, c);
+}
+
+/// A match arm's body as one HIR block: a `{ … }` block of statements,
+/// or a single `->` expression statement.
+fn buildMatchArmBody(b: *Builder, arm: ast.MatchArm, scope: *Scope, rt: *RtMap) BuildError!*hir.Stmt {
+    if (arm.block()) |blk| return buildMainBlock(b, blk, scope, rt);
+    const e = arm.expression() orelse return error.Unsupported;
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    try buildMainExprStmt(b, e, scope, rt, &items);
+    const blkst = try b.a.create(hir.Stmt);
+    blkst.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return blkst;
+}
+
+/// Build one of `main`'s expression statements — a statement-position
+/// generic call, a host-face call, or `env.out(…)`. Shared by the
+/// expr-statement arm and `match` arm bodies.
+fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const call = switch (expr) {
+        .call => |cc| cc,
+        else => return error.Unsupported,
+    };
+            // A statement-position call to a face-bounded generic function
+            // (`print_all(colors)` / `print_all([...])`): monomorphize per
+            // the inferred element type and call the stamped instance (B5).
+            if (callPathName(b, call)) |gn| {
+                defer b.a.free(gn);
+                if (std.mem.indexOfScalar(u8, gn, '.') == null) {
+                    if (b.resolver.lookup(gn)) |fd| {
+                        if (fd.isGeneric()) {
+                            try out.append(b.a, try buildGenericCallStmt(b, gn, fd, call, scope));
+                            return;
+                        }
+                    }
+                }
+            }
+            // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`
+            // or `qview.set_text(80, 9, "…")`): str args flow as (ptr, len), the
+            // rest as i64; no return. The backend declares the matching import.
+            if (try hostFaceName(b, call)) |fname| {
+                var args: std.ArrayList(*hir.Expr) = .empty;
+                var ait = call.args();
+                while (ait.next()) |a| try args.append(b.a, try buildHostArg(b, a, scope, rt));
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
+                try out.append(b.a, st);
+                return;
+            }
+            if (!isEnvOut(b.a, call)) return reject(b, .unsupported_call);
+            const arg = firstArg(call) orelse return error.Unsupported;
+
+            const st = try b.a.create(hir.Stmt);
+            if (try tryConst(b, arg)) |bytes| {
+                // A constant string/number/interpolation → fold into the data.
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .str_const = bytes };
+                st.* = .{ .host_out = e };
+            } else if (arg == .path and rt.get(try pathText(b, arg.path)) != null) {
+                // env.out(g) where g is a runtime str binding.
+                const bnd = rt.get(try pathText(b, arg.path)).?;
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+                st.* = .{ .host_out_str = e };
+            } else if (arg == .string_lit) {
+                // A string literal with interpolation. If it folds entirely to
+                // a constant (e.g. only untyped fold-only helpers), emit a
+                // folded `host_out`; otherwise a runtime concat.
+                const v = try buildConcat(b, arg.string_lit, scope, false, rt);
+                st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
+            } else if (try isStrCall(b, arg, scope)) {
+                // A real call to a str-returning function.
+                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
+            } else if (try exprIsBool(b, arg, scope)) {
+                // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
+                // binding, or a `-> bool` call. Printed as "true" / "false".
+                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
+            } else if (isFloatSc(try exprScalar(b, arg, scope))) {
+                // A float: formatted via __fmt_f64 (decimal, ≤6 frac
+                // digits); an f32 promotes to f64 first — one formatter.
+                var fv = try buildIntExpr(b, arg, scope);
+                if ((try exprScalar(b, arg, scope)) == .f32) {
+                    const w = try b.a.create(hir.Expr);
+                    w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
+                    fv = w;
+                }
+                st.* = .{ .host_out_float = fv };
+            } else {
+                // Otherwise an i64 expression (a call to an i64 function).
+                const e = try buildIntExpr(b, arg, scope);
+                st.* = .{ .host_out_int = e };
+            }
+            try out.append(b.a, st);
 }
 
 /// Build a `{ … }` block of `main` statements into one HIR block.
@@ -1580,6 +1690,82 @@ fn buildNarrowValue(b: *Builder, ty: hir.Type, fval: ast.Expr) BuildError!*hir.E
 /// alignment, size rounded up to the struct alignment). A struct with a
 /// field outside the v0 floor — or with no record fields at all — is not
 /// registered; a use of it stays the honest `Unsupported`.
+/// An all-unit enum: its name and variant names in declaration order
+/// (a variant's tag is its index).
+const EnumInfo = struct { name: []const u8, variants: []const []const u8 };
+
+/// Register this file's all-unit enums (C1). An enum with any payload
+/// variant is skipped — using it surfaces the honest Unsupported.
+fn registerEnums(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .enum_decl => |ed| {
+            const nm = ed.name() orelse continue;
+            var names: std.ArrayList([]const u8) = .empty;
+            var ok = true;
+            var vit = ed.variants();
+            while (vit.next()) |v| {
+                const vname = v.name() orelse {
+                    ok = false;
+                    break;
+                };
+                if (variantHasPayload(v)) {
+                    ok = false; // payload variants: a later rung
+                    break;
+                }
+                try names.append(b.a, vname.text);
+            }
+            if (!ok or names.items.len == 0) {
+                names.deinit(b.a);
+                continue;
+            }
+            const info = try b.a.create(EnumInfo);
+            info.* = .{ .name = nm.text, .variants = try names.toOwnedSlice(b.a) };
+            try b.enums.put(b.a, nm.text, info);
+        },
+        else => {},
+    };
+}
+
+/// Does this variant carry a payload (`Some(T)` / `Point { x: … }`)?
+fn variantHasPayload(v: ast.Variant) bool {
+    for (v.cst.children) |c| switch (c) {
+        .token => |t| switch (t.kind) {
+            .L_PAREN, .L_BRACE => return true,
+            else => {},
+        },
+        .node => return true, // any structured payload child
+    };
+    return false;
+}
+
+/// `Color.Red` → the enum + the variant's declaration-order tag.
+fn enumVariantTag(b: *Builder, txt: []const u8) ?struct { info: *const EnumInfo, tag: i64 } {
+    const dot = std.mem.indexOfScalar(u8, txt, '.') orelse return null;
+    const vname = txt[dot + 1 ..];
+    if (std.mem.indexOfScalar(u8, vname, '.') != null) return null;
+    const info = b.enums.get(txt[0..dot]) orelse return null;
+    for (info.variants, 0..) |v, i| {
+        if (std.mem.eql(u8, v, vname)) return .{ .info = info, .tag = @intCast(i) };
+    }
+    return null;
+}
+
+/// The enum a scrutinee expression carries: a `Enum.Variant` value or
+/// a binding registered in `Scope.enum_binds`.
+fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const EnumInfo {
+    switch (e) {
+        .paren => |p| return enumOfExpr(b, scope, p.inner() orelse return null),
+        .path => |p| {
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            if (enumVariantTag(b, txt)) |ev| return ev.info;
+            return scope.enum_binds.get(txt);
+        },
+        else => return null,
+    }
+}
+
 fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2753,6 +2939,10 @@ const Scope = struct {
     /// is compile-time (array literals have fixed length; growth is Vec's
     /// job, later).
     arrs: std.StringHashMapUnmanaged(ArrInfo) = .empty,
+    /// Enum-typed bindings (C1): name → the enum; the tag lives in an
+    /// i64 local under the same name. `match` reads this to resolve
+    /// bare variant names in arm patterns.
+    enum_binds: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
 
     fn find(self: *const Scope, name: []const u8) ?Local {
         var i = self.locals.items.len;
@@ -2932,6 +3122,8 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 return recFieldExpr(b, rf);
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
+            } else if (enumVariantTag(b, txt)) |ev| {
+                out.* = .{ .int_const = ev.tag };    // `Color.Red` → its tag
             } else if (b.eval.evalInt(expr)) |v| {
                 // A compile-time `let` binding (`let n = 7`) used in a runtime
                 // expression (e.g. an `if`/`while` condition) materializes as
@@ -4869,4 +5061,72 @@ test "B5: an element type with no fit for the bound is UnsupportedCall" {
     try tr.addLib(src);
     const r = try rejectFromSource(testing.allocator, src, tr.resolver());
     try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
+test "C1: match on an all-unit enum — tags, wildcard, exhaustive chain" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum Light { Red, Yellow, Green }
+        \\fn main {
+        \\    var l = Light.Yellow
+        \\    match l {
+        \\        Red -> env.out("stop"),
+        \\        Yellow -> env.out("slow"),
+        \\        Green -> env.out("go"),
+        \\    }
+        \\    l = Light.Green
+        \\    match l {
+        \\        Red -> env.out("stop"),
+        \\        _ -> {
+        \\            env.out("moving")
+        \\        },
+        \\    }
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `Light.Yellow` is its declaration-order tag; arms compare the
+    // hidden scrutinee local against each tag.
+    try testing.expect(std.mem.indexOf(u8, dump, "let local#0 = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "eq 0)") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "eq 2)") != null);
+}
+
+test "C1: a non-exhaustive match (no wildcard) is honestly unsupported" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum L { A, B, C }
+        \\fn main {
+        \\    match L.A {
+        \\        A -> env.out("a"),
+        \\        B -> env.out("b"),
+        \\    }
+        \\}
+        \\
+    ;
+    try testing.expect((try buildLocal(testing.allocator, &tr, src)) == null);
+}
+
+test "C1: an arm naming a non-variant rejects NameNotFound" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum L { A, B }
+        \\fn main {
+        \\    match L.A {
+        \\        Nope -> env.out("x"),
+        \\        _ -> env.out("y"),
+        \\    }
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.name_not_found, r.?);
 }
