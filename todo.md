@@ -969,9 +969,22 @@ verified, honest diagnostics throughout.
       (the conformance corpus and `errors.md` lean on `match`).
       Rungs: C1 unit variants + statement `match` (landed) → C2
       value `match` (landed) → C3 payload variants (landed) → C4
-      literal patterns (landed) → exhaustiveness diagnostics in
-      `q64 check` (the TYP3xx band) → `Option`/`Result` in the
-      prelude.
+      literal patterns (landed) → exhaustiveness diagnostic (landed)
+      → `Option`/`Result` in the prelude (next: generic enums — C3's
+      boxed representation meets B5's monomorphization).
+      - [x] **TYP062 emitted in `q64 check` — non-exhaustive match.**
+            Specced first (types.md gains the row; `Result`-specific
+            guidance stays TYP302). The check pass collects this
+            file's enums (name → variants), types enum values
+            (`Light.Yellow`, constructions, bindings —
+            `Info.enum_value`), and judges both match forms (the
+            statement walk + a `.match` expr arm): covered-variant
+            bitmask, `_` short-circuits, unjudgeable shapes (unknown
+            scrutinee, non-variant heads, literal patterns) stay
+            silent. New fixture `types/non-exhaustive-match.q` flips
+            conformance **22/50**; 379 unit (2 new) / 80 CLI /
+            roundtrips green. (The emit path's structural rejection
+            stays — the diagnostic is the friendly wire.)
       - [x] **C4 — integer literal patterns.** A non-enum scrutinee
             that is provably an i64 matches integer-literal arms
             (`match n { 0 -> .., 1 -> .., _ -> .. }`), statement and

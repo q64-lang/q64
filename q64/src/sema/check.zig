@@ -49,6 +49,9 @@ const Info = union(enum) {
     /// An array whose elements are all records of one local struct
     /// (`[Color { … }, …]`) — what a `[T]` argument infers T from.
     rec_array: []const u8,
+    /// A value of a locally-declared enum (`Light.Yellow`,
+    /// `Shape.Circle(7)`, or a binding holding one) — the enum's name.
+    enum_value: []const u8,
     unknown,
 };
 
@@ -93,6 +96,43 @@ const Scope = struct {
 const GenericDecl = struct { sig: fits.GenericSig, fd: ast.FnDecl };
 const Generics = std.StringHashMapUnmanaged(GenericDecl);
 
+/// This file's enums: name → variant names (declaration order), for
+/// the TYP062 exhaustiveness check.
+const Enums = std.StringHashMapUnmanaged([]const []const u8);
+
+fn collectEnums(gpa: std.mem.Allocator, sf: ast.SourceFile) !Enums {
+    var out: Enums = .empty;
+    errdefer deinitEnums(gpa, &out);
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .enum_decl => |ed| {
+            const name = ed.name() orelse continue;
+            var names: std.ArrayList([]const u8) = .empty;
+            var vit = ed.variants();
+            while (vit.next()) |v| {
+                const vn = v.name() orelse {
+                    names.deinit(gpa);
+                    continue;
+                };
+                try names.append(gpa, vn.text);
+            }
+            if (names.items.len == 0) {
+                names.deinit(gpa);
+                continue;
+            }
+            try out.put(gpa, name.text, try names.toOwnedSlice(gpa));
+        },
+        else => {},
+    };
+    return out;
+}
+
+fn deinitEnums(gpa: std.mem.Allocator, e: *Enums) void {
+    var it = e.valueIterator();
+    while (it.next()) |v| gpa.free(v.*);
+    e.deinit(gpa);
+}
+
 fn collectGenerics(gpa: std.mem.Allocator, sf: ast.SourceFile) !Generics {
     var out: Generics = .empty;
     errdefer out.deinit(gpa);
@@ -116,6 +156,7 @@ const Checker = struct {
     table: *const symbols.SymbolTable,
     fitreg: ?*const fits.Registry,
     generics: *const Generics,
+    enums: *const Enums,
     scope: Scope,
     diags: *std.ArrayList(Diag),
 
@@ -193,6 +234,19 @@ const Checker = struct {
                 return .unknown;
             },
             .call => |cc| {
+                // `Shape.Circle(7)` — a payload-variant construction.
+                if (cc.callee()) |callee| {
+                    if (callee == .path) {
+                        if (callee.path.text(c.gpa)) |cn| {
+                            defer c.gpa.free(cn);
+                            if (c.enumOfDotted(cn)) |ename| {
+                                var args = cc.args();
+                                while (args.next()) |a| _ = try c.typeOf(a);
+                                return .{ .enum_value = ename };
+                            }
+                        } else |_| {}
+                    }
+                }
                 // TYP060: a parameter-mode keyword used argument-style
                 // (`process(ref: s)`). Syntactic; checked on every call.
                 try c.checkCallArgModes(cc);
@@ -249,7 +303,14 @@ const Checker = struct {
             .path => |p| {
                 const name = p.text(c.gpa) catch return .unknown;
                 defer c.gpa.free(name);
+                if (c.enumOfDotted(name)) |ename| return .{ .enum_value = ename };
                 return c.scope.find(name) orelse .unknown;
+            },
+            .match => |me| {
+                // A value match: judge exhaustiveness like the
+                // statement form; its own type stays unknown here.
+                try c.checkMatch(me.scrutinee(), me.arms(), firstTokenOffset(me.cst));
+                return .unknown;
             },
             .record => |re| {
                 // A record literal of a locally-declared struct. Field
@@ -313,7 +374,7 @@ const Checker = struct {
         const is_int_value = switch (info) {
             .int_literal => true,
             .id => if (c.builtinOf(info)) |b| isInteger(b) else false,
-            .record, .rec_array, .unknown => false,
+            .record, .rec_array, .enum_value, .unknown => false,
         };
         if (eb == .bool) {
             if (is_int_value) try c.diags.append(c.gpa, .{ .code = "TYP051", .offset = offset });
@@ -425,13 +486,67 @@ const Checker = struct {
         const is_int = switch (info) {
             .int_literal => true,
             .id => if (c.builtinOf(info)) |b| isInteger(b) else false,
-            .record, .rec_array, .unknown => false,
+            .record, .rec_array, .enum_value, .unknown => false,
         };
         if (is_int) {
             try c.diags.append(c.gpa, .{
                 .code = "TYP051",
                 .offset = firstTokenOffset(exprNode(cond)),
             });
+        }
+    }
+
+    /// The enum a dotted `Enum.Variant` path names, if both halves
+    /// resolve against this file's enums.
+    fn enumOfDotted(c: *Checker, name: []const u8) ?[]const u8 {
+        const dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+        const vname = name[dot + 1 ..];
+        if (std.mem.indexOfScalar(u8, vname, '.') != null) return null;
+        const variants = c.enums.get(name[0..dot]) orelse return null;
+        for (variants) |v| {
+            if (std.mem.eql(u8, v, vname)) {
+                // Borrow the enum's key text via the variants slice owner:
+                // look the key up again for a stable slice.
+                return c.enums.getKey(name[0..dot]);
+            }
+        }
+        return null;
+    }
+
+    /// TYP062: a `match` over a known enum value covers neither every
+    /// variant nor a `_` arm (spec/types.md). Judged only when the
+    /// scrutinee provably carries a local enum and every arm pattern
+    /// is a judgeable shape; anything else stays silent.
+    fn checkMatch(c: *Checker, scrut_opt: ?ast.Expr, arms_in: ast.MatchArmIter, offset: u32) std.mem.Allocator.Error!void {
+        const scrut = scrut_opt orelse return;
+        const info = try c.typeOf(scrut);
+        const ename = switch (info) {
+            .enum_value => |n| n,
+            else => return,
+        };
+        const variants = c.enums.get(ename) orelse return;
+        var covered: usize = 0;
+        var seen: u64 = 0;
+        var arms = arms_in;
+        while (arms.next()) |arm| {
+            const pat = arm.pattern() orelse return; // unjudgeable: silent
+            switch (pat.kind()) {
+                .WILD_PATTERN => return, // a default arm: exhaustive
+                .IDENT_PATTERN, .TUPLE_STRUCT_PATTERN, .ENUM_VARIANT_PATTERN => {
+                    const head = patternHead(pat.cst) orelse return;
+                    const idx = for (variants, 0..) |v, i| {
+                        if (std.mem.eql(u8, v, head)) break i;
+                    } else return; // not a variant: another check's story
+                    if (idx < 64 and (seen & (@as(u64, 1) << @intCast(idx))) == 0) {
+                        seen |= @as(u64, 1) << @intCast(idx);
+                        covered += 1;
+                    }
+                },
+                else => return, // literal/nested patterns: silent
+            }
+        }
+        if (covered < variants.len) {
+            try c.diags.append(c.gpa, .{ .code = "TYP062", .offset = offset });
         }
     }
 
@@ -491,7 +606,7 @@ const Checker = struct {
                 if (fs.body()) |b| try c.walkBlock(b);
             },
             .match_stmt => |ms| {
-                _ = try c.typeOfOpt(ms.scrutinee());
+                try c.checkMatch(ms.scrutinee(), ms.arms(), firstTokenOffset(ms.cst));
                 var arms = ms.arms();
                 while (arms.next()) |arm| {
                     try c.scope.push();
@@ -702,6 +817,22 @@ fn firstTwoTokens(node: *const cst.Node, first: *?cst.Token, second: *?cst.Token
     }
 }
 
+/// The variant name an arm pattern opens with: a bare ident, or the
+/// last IDENT before a payload `(`.
+fn patternHead(node: *const cst.Node) ?[]const u8 {
+    var head: ?[]const u8 = null;
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind == .L_PAREN) return head;
+            if (t.kind == .IDENT) head = t.text;
+        },
+        .node => |n| if (patternHead(n)) |h| {
+            head = h;
+        },
+    };
+    return head;
+}
+
 fn firstTokenOffset(node: *const cst.Node) u32 {
     for (node.children) |c| switch (c) {
         .token => |t| if (!t.kind.isTrivia()) return t.offset,
@@ -728,6 +859,8 @@ pub fn checkFile(
 
     var generics = try collectGenerics(gpa, sf);
     defer generics.deinit(gpa);
+    var enums = try collectEnums(gpa, sf);
+    defer deinitEnums(gpa, &enums);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -742,6 +875,7 @@ pub fn checkFile(
                 .table = table,
                 .fitreg = fitreg,
                 .generics = &generics,
+                .enums = &enums,
                 .scope = .{ .gpa = gpa },
                 .diags = &diags,
             };
@@ -1041,6 +1175,54 @@ test "check: TYP200 stays silent on fitting / unprovable shapes" {
         \\struct B { v: i64 }
         \\fn print_all<T: Display>(items: [T]) { }
         \\fn main { print_all([A { v: 1 }, B { v: 2 }]) }
+        \\
+    , &.{});
+}
+
+test "check: TYP062 — non-exhaustive match on a local enum" {
+    try expectCodes(
+        \\enum Light { Red, Yellow, Green }
+        \\fn main {
+        \\    var l = Light.Yellow
+        \\    match l {
+        \\        Red -> env.out("stop"),
+        \\        Yellow -> env.out("slow"),
+        \\    }
+        \\}
+        \\
+    , &.{"TYP062"});
+    // A value match misses a payload variant.
+    try expectCodes(
+        \\enum Shape { Empty, Circle(i64) }
+        \\fn main {
+        \\    let s = Shape.Circle(7)
+        \\    let x = match s {
+        \\        Circle(r) -> r,
+        \\    }
+        \\    env.out(x)
+        \\}
+        \\
+    , &.{"TYP062"});
+}
+
+test "check: TYP062 stays silent on exhaustive / unjudgeable matches" {
+    // Full coverage; a `_` arm; an unknown scrutinee.
+    try expectCodes(
+        \\enum L { A, B }
+        \\fn main {
+        \\    var l = L.A
+        \\    match l {
+        \\        A -> env.out("a"),
+        \\        B -> env.out("b"),
+        \\    }
+        \\    match l {
+        \\        A -> env.out("a"),
+        \\        _ -> env.out("rest"),
+        \\    }
+        \\    match mystery() {
+        \\        A -> env.out("a"),
+        \\    }
+        \\}
         \\
     , &.{});
 }
