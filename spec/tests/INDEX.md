@@ -5,7 +5,7 @@ when tests are added or a code's owning spec moves. The table is the
 audit surface — `grep ' — $' INDEX.md` lists every code that still has
 no test.
 
-> **Coverage today: 39 / ~155 named codes (≈25%) + 5 golden positives.**
+> **Coverage today: 40 / ~156 named codes (≈26%) + 5 golden positives.**
 > Coverage will grow as the implementation surfaces corner cases; new
 > tests are appended to their subdirectory and the matching row updated
 > here.
@@ -69,6 +69,7 @@ no test.
 | `TYP053` | types.md        | use of uninitialized binding                      | —                                                        |
 | `TYP054` | types.md        | slice borrows outlive their bytes                 | —                                                        |
 | `TYP060` | types.md        | parameter mode keyword in call argument           | `types/mode-keyword-in-call.q`                           |
+| `TYP061` | types.md        | wrong number of call arguments                    | `types/wrong-arg-count.q`                                |
 | `TYP070` | types.md        | shape mismatch in tensor op                       | —                                                        |
 | `TYP071` | types.md        | SIMD lane width mismatch                          | —                                                        |
 | `TYP080` | types.md        | (note) prefer `if let Some(u)` form               | —                                                        |

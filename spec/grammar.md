@@ -689,9 +689,18 @@ TupleExpr     := "(" Expr ("," Expr)+ ","? ")"
               | "(" ")"
 ArrayExpr     := "[" Expr ("," Expr)* ","? "]"          (* [T; N] literal; N inferred *)
               | "[" Expr ";" Expr "]"                   (* repeated init: [x; N] *)
-RecordExpr    := PathType "{" RecordInit ("," RecordInit)* ","? "}"
+RecordExpr    := PathType "{" (RecordInit ("," RecordInit)* ","?)? "}"
 RecordInit    := IDENT ":" Expr
               | IDENT                                   (* shorthand: { x, y } *)
+
+(* Record-literal restriction: in the bare condition / scrutinee /
+   iterable head of `if` / `while` / `for` / `match` (and the RHS of an
+   `if let`), `Path {` parses as the head expression followed by the
+   statement's block — never as a record literal. Wrap in parentheses
+   to force the literal: `if (Point { x: 1 }).ok { … }`. Inside
+   parens, brackets, and argument lists the brace is unambiguous and
+   the restriction lifts. Same rule as Rust's struct-literal
+   restriction; it keeps `if x { … }` unambiguous without lookahead. *)
 RangeExpr     := Expr ".." Expr
               | Expr "..=" Expr
 

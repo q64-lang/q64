@@ -17,6 +17,7 @@ const std = @import("std");
 const parser = @import("parser");
 const ast = parser.ast;
 const symbols = @import("symbols.zig");
+const prelude = @import("prelude.zig");
 
 pub const TypeId = u32;
 
@@ -57,6 +58,9 @@ pub const NamedKind = enum {
     /// Bound by an import; its declaring module isn't loaded in this
     /// pass, so the shape is unknown until cross-module resolution (A3).
     imported,
+    /// An auto-prelude type or face (spec/modules.md §"The auto-prelude",
+    /// mirrored in prelude.zig).
+    prelude,
 };
 
 pub const Type = union(enum) {
@@ -245,6 +249,9 @@ pub fn lower(store: *TypeStore, table: ?*const symbols.SymbolTable, te_opt: ?ast
                 };
                 return store.intern(.{ .named = .{ .kind = kind, .name = name, .args = args } });
             };
+            if (prelude.isType(name)) {
+                return store.intern(.{ .named = .{ .kind = .prelude, .name = name, .args = args } });
+            }
             return store.intern(.{ .unresolved = name });
         },
         .optional => |o| {
@@ -274,6 +281,16 @@ pub fn lower(store: *TypeStore, table: ?*const symbols.SymbolTable, te_opt: ?ast
         },
         .raw => return store.unparsed_id,
     }
+}
+
+
+/// True when `node` has `kind` among its direct token children.
+fn hasDirectToken(node: *const parser.cst.Node, kind: parser.cst.SyntaxKind) bool {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (t.kind == kind) return true,
+        .node => {},
+    };
+    return false;
 }
 
 // =====================================================================
@@ -318,6 +335,12 @@ pub fn collectSignatures(
     while (it.next()) |item| switch (item) {
         .fn_decl => |fd| {
             const name_tok = fd.name() orelse continue;
+
+            // A degraded header — parens present in the raw tokens but
+            // no structured PARAMS node — means the parameter list is
+            // unknown. Record no signature at all: a wrong zero-arity
+            // one would false-fire every sig-based check (TYP061 …).
+            if (fd.params() == null and hasDirectToken(fd.cst, .L_PAREN)) continue;
 
             var params: std.ArrayList(TypeId) = .empty;
             defer params.deinit(store.gpa);

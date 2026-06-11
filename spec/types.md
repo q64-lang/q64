@@ -880,6 +880,7 @@ own `TYP100–TYP149`, faces own `TYP200–TYP249`, errors own
 | `TYP053` | use of uninitialized binding               | A `let`/`var` declared without an initializer is read on a path that hasn't assigned it. |
 | `TYP054` | slice borrows outlive their bytes          | A `[T]` or `ref T` escapes the region whose bytes it points at.                    |
 | `TYP060` | parameter mode keyword in call argument    | `process(in: x)`-style call; v0 uses bare arguments.                              |
+| `TYP061` | wrong number of call arguments             | A call supplies more or fewer arguments than the function declares. (Generic-argument count is `TYP100`, [`generics.md`](./generics.md).) |
 | `TYP070` | shape mismatch in tensor op                | Shape arithmetic fails the broadcast/concat compatibility predicate.              |
 | `TYP071` | SIMD lane width mismatch                   | `Simd<f32, 4> + Simd<f32, 8>` or similar.                                          |
 | `TYP080` | suggestion: prefer `if let Some(u)` form   | (Note severity.) `if user.is_some()` followed by `user.method()` without narrowing.|

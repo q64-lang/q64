@@ -8,6 +8,7 @@ pub const types = @import("types.zig");
 pub const exprtype = @import("exprtype.zig");
 pub const link = @import("link.zig");
 pub const check = @import("check.zig");
+pub const prelude = @import("prelude.zig");
 
 pub const SymbolTable = symbols.SymbolTable;
 pub const Symbol = symbols.Symbol;

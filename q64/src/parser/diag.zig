@@ -155,6 +155,7 @@ pub const codes = [_]CodeInfo{
     // Type checking (emitted by the sema check pass)
     .{ .code = "TYP042", .subsystem = "Type checking", .severity = .err, .message = "implicit numeric conversion is forbidden", .summary = "An arithmetic site mixes two different numeric types (e.g. `i32 + i64`). q64 never converts implicitly; cast one side explicitly so the widths and signedness are visible. See spec/types.md §arithmetic." },
     .{ .code = "TYP051", .subsystem = "Type checking", .severity = .err, .message = "integer used as bool", .summary = "An `if`/`while` condition is an integer, but conditions require `bool` (e.g. `if 1 { … }`). Write the comparison out (`if x != 0`). See spec/types.md §bool." },
+    .{ .code = "TYP061", .subsystem = "Type checking", .severity = .err, .message = "wrong number of call arguments", .summary = "A call supplies more or fewer arguments than the function declares. Match the declaration's parameter list (generic-argument count is TYP100). See spec/types.md." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"

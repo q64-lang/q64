@@ -146,6 +146,13 @@ const Parser = struct {
     gpa: Allocator,
     file: []const u8,
     diags: *std.ArrayList(diag.Diagnostic),
+    /// Record-literal restriction depth (spec/grammar.md §"Record
+    /// literals"). While > 0 — inside the bare condition/scrutinee/
+    /// iterable of `if`/`while`/`for`/`match` — `Path {` parses as an
+    /// expression followed by the statement's block, not as a record
+    /// literal. Parenthesized/bracketed/argument positions reset it to
+    /// 0 (the brace is unambiguous again inside delimiters).
+    no_record_depth: u32 = 0,
 
     fn peek(self: *const Parser) cst.SyntaxKind {
         if (self.pos >= self.tokens.len) return .EOF;
@@ -178,6 +185,31 @@ const Parser = struct {
             .file = self.file,
             .offset = offset,
         });
+    }
+
+    /// Kind of the next non-trivia token at or after the cursor.
+    fn nextNonTrivia(self: *const Parser) cst.SyntaxKind {
+        var i = self.pos;
+        while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+        if (i >= self.tokens.len) return .EOF;
+        return self.tokens[i].kind;
+    }
+
+    /// Kind of the next non-trivia token *after* the current one.
+    fn peekSecond(self: *const Parser) cst.SyntaxKind {
+        var i = self.pos + 1;
+        while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+        if (i >= self.tokens.len) return .EOF;
+        return self.tokens[i].kind;
+    }
+
+    /// Parse an expression with the record-literal restriction lifted —
+    /// inside parens/brackets/argument lists the `{` is unambiguous.
+    fn parseExprUnrestricted(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        const saved = self.no_record_depth;
+        self.no_record_depth = 0;
+        defer self.no_record_depth = saved;
+        return self.parseExpr();
     }
 
     /// Kind of the first non-trivia token after the upcoming `.`, or
@@ -385,6 +417,14 @@ const Parser = struct {
             try children.append(self.arena, .{ .token = self.advance() });
         }
         try self.eatTrivia(&children);
+
+        // Generic params (`<T: Display>`) are captured as a raw-span
+        // GENERIC_PARAMS node (internals pending the generics grammar),
+        // so the parameter list after them still parses structured.
+        if (self.peek() == .L_ANGLE) {
+            try children.append(self.arena, .{ .node = try self.parseGenericParams() });
+            try self.eatTrivia(&children);
+        }
 
         if (self.peek() == .L_PAREN) {
             const params_node = try self.parseParams();
@@ -1248,11 +1288,15 @@ const Parser = struct {
             if (self.peek() == .EQ) {
                 try cl.append(self.arena, .{ .token = self.advance() });
                 try self.eatTrivia(&cl);
+                self.no_record_depth += 1;
                 try cl.append(self.arena, .{ .node = try self.parseExpr() });
+                self.no_record_depth -= 1;
             }
             try children.append(self.arena, .{ .node = try cst.makeNode(self.arena, .IF_COND_LET, cl.items) });
         } else {
+            self.no_record_depth += 1;
             try children.append(self.arena, .{ .node = try self.parseExpr() });
+            self.no_record_depth -= 1;
         }
 
         try self.eatTrivia(&children);
@@ -1284,7 +1328,9 @@ const Parser = struct {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // while
         try self.eatTrivia(&children);
+        self.no_record_depth += 1;
         try children.append(self.arena, .{ .node = try self.parseExpr() });
+        self.no_record_depth -= 1;
         try self.eatTrivia(&children);
         if (self.peek() == .L_BRACE) {
             try children.append(self.arena, .{ .node = try self.parseBlock() });
@@ -1312,7 +1358,9 @@ const Parser = struct {
         if (self.peek() == .KW_IN) {
             try children.append(self.arena, .{ .token = self.advance() });
             try self.eatTrivia(&children);
+            self.no_record_depth += 1;
             try children.append(self.arena, .{ .node = try self.parseExpr() });
+            self.no_record_depth -= 1;
             try self.eatTrivia(&children);
             if (self.peek() == .L_BRACE) {
                 try children.append(self.arena, .{ .node = try self.parseBlock() });
@@ -1326,7 +1374,9 @@ const Parser = struct {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // match
         try self.eatTrivia(&children);
+        self.no_record_depth += 1;
         try children.append(self.arena, .{ .node = try self.parseExpr() });
+        self.no_record_depth -= 1;
         try self.eatTrivia(&children);
         if (self.peek() == .L_BRACE) {
             try children.append(self.arena, .{ .token = self.advance() }); // {
@@ -1630,6 +1680,18 @@ const Parser = struct {
     fn parsePostfix(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
         var base = try self.parsePrimary();
         while (true) {
+            // A record literal usually has space before its `{`
+            // (`Point { x: 1 }`); look past trivia for that one case —
+            // the trivia is captured inside the RECORD_EXPR node.
+            if (self.peek().isTrivia()) {
+                if (base.kind == .PATH_EXPR and self.no_record_depth == 0 and
+                    self.nextNonTrivia() == .L_BRACE)
+                {
+                    base = try self.parseRecordExpr(base);
+                    continue;
+                }
+                break;
+            }
             switch (self.peek()) {
                 .L_PAREN => {
                     var children: std.ArrayList(cst.Element) = .empty;
@@ -1643,13 +1705,22 @@ const Parser = struct {
                     try children.append(self.arena, .{ .node = base });
                     try children.append(self.arena, .{ .token = self.advance() }); // [
                     try self.eatTrivia(&children);
-                    const idx = try self.parseExpr();
+                    const idx = try self.parseExprUnrestricted();
                     try children.append(self.arena, .{ .node = idx });
                     try self.eatTrivia(&children);
                     if (self.peek() == .R_BRACK) {
                         try children.append(self.arena, .{ .token = self.advance() });
                     }
                     base = try cst.makeNode(self.arena, .INDEX_EXPR, children.items);
+                },
+                .L_BRACE => {
+                    // `Path { field: expr, … }` — a record literal
+                    // (spec/grammar.md §"Record literals"). Only on a
+                    // plain path base, and not in a restricted position
+                    // (the bare head of an `if`/`while`/`for`/`match`,
+                    // where `{` opens the statement's block).
+                    if (base.kind != .PATH_EXPR or self.no_record_depth > 0) break;
+                    base = try self.parseRecordExpr(base);
                 },
                 .DOT => {
                     const after = self.kindAfterDot();
@@ -1691,6 +1762,60 @@ const Parser = struct {
         return base;
     }
 
+    /// `RecordExpr := PathExpr "{" (RecordInit ("," RecordInit)* ","?)? "}"`
+    /// with `RecordInit := IDENT (":" Expr)?` (shorthand binds the field
+    /// from a same-named binding). `base` is the already-parsed path.
+    /// An unrecognized shape inside the braces degrades losslessly: the
+    /// remaining tokens are captured raw (brace-balanced) inside the
+    /// RECORD_EXPR node.
+    fn parseRecordExpr(self: *Parser, base: *const cst.Node) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .node = base });
+        try self.eatTrivia(&children); // space before the brace
+        std.debug.assert(self.peek() == .L_BRACE);
+        try children.append(self.arena, .{ .token = self.advance() }); // {
+        try self.eatTrivia(&children);
+
+        while (!self.isEof() and self.peek() != .R_BRACE) {
+            if (self.peek() == .IDENT and (self.peekSecond() == .COLON or
+                self.peekSecond() == .COMMA or self.peekSecond() == .R_BRACE))
+            {
+                var init_children: std.ArrayList(cst.Element) = .empty;
+                try init_children.append(self.arena, .{ .token = self.advance() }); // field name
+                try self.eatTrivia(&init_children);
+                if (self.peek() == .COLON) {
+                    try init_children.append(self.arena, .{ .token = self.advance() });
+                    try self.eatTrivia(&init_children);
+                    try init_children.append(self.arena, .{ .node = try self.parseExprUnrestricted() });
+                }
+                try children.append(self.arena, .{ .node = try cst.makeNode(self.arena, .RECORD_INIT, init_children.items) });
+                try self.eatTrivia(&children);
+                if (self.peek() == .COMMA) {
+                    try children.append(self.arena, .{ .token = self.advance() });
+                    try self.eatTrivia(&children);
+                }
+            } else {
+                // Not a field-init shape: capture the rest raw,
+                // brace-balanced, so the node stays lossless.
+                var depth: usize = 0;
+                while (!self.isEof()) {
+                    const k = self.peek();
+                    if (k == .L_BRACE) depth += 1;
+                    if (k == .R_BRACE) {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    }
+                    try children.append(self.arena, .{ .token = self.advance() });
+                }
+                break;
+            }
+        }
+        if (self.peek() == .R_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .RECORD_EXPR, children.items);
+    }
+
     /// `Primary` — the leaf forms. Statement-keyword primaries (match /
     /// if / block / scope / spawn / …) are not yet parsed and fall to
     /// `parseUnknownExpr` recovery.
@@ -1719,7 +1844,7 @@ const Parser = struct {
             try children.append(self.arena, .{ .token = self.advance() });
             return try cst.makeNode(self.arena, .TUPLE_EXPR, children.items);
         }
-        try children.append(self.arena, .{ .node = try self.parseExpr() });
+        try children.append(self.arena, .{ .node = try self.parseExprUnrestricted() });
         try self.eatTrivia(&children);
         var is_tuple = false;
         while (self.peek() == .COMMA) {
@@ -1727,7 +1852,7 @@ const Parser = struct {
             try children.append(self.arena, .{ .token = self.advance() });
             try self.eatTrivia(&children);
             if (self.peek() == .R_PAREN) break; // trailing comma
-            try children.append(self.arena, .{ .node = try self.parseExpr() });
+            try children.append(self.arena, .{ .node = try self.parseExprUnrestricted() });
             try self.eatTrivia(&children);
         }
         if (self.peek() == .R_PAREN) {
@@ -1737,6 +1862,8 @@ const Parser = struct {
     }
 
     /// `[` Expr (`,` Expr)* `]` (list) or `[` Expr `;` Expr `]` (repeat).
+    /// Elements parse unrestricted (record literals are unambiguous
+    /// inside brackets).
     fn parseArrayExpr(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // [
@@ -1745,19 +1872,19 @@ const Parser = struct {
             try children.append(self.arena, .{ .token = self.advance() });
             return try cst.makeNode(self.arena, .ARRAY_EXPR, children.items);
         }
-        try children.append(self.arena, .{ .node = try self.parseExpr() });
+        try children.append(self.arena, .{ .node = try self.parseExprUnrestricted() });
         try self.eatTrivia(&children);
         if (self.peek() == .SEMICOLON) {
             try children.append(self.arena, .{ .token = self.advance() });
             try self.eatTrivia(&children);
-            try children.append(self.arena, .{ .node = try self.parseExpr() });
+            try children.append(self.arena, .{ .node = try self.parseExprUnrestricted() });
             try self.eatTrivia(&children);
         } else {
             while (self.peek() == .COMMA) {
                 try children.append(self.arena, .{ .token = self.advance() });
                 try self.eatTrivia(&children);
                 if (self.peek() == .R_BRACK) break;
-                try children.append(self.arena, .{ .node = try self.parseExpr() });
+                try children.append(self.arena, .{ .node = try self.parseExprUnrestricted() });
                 try self.eatTrivia(&children);
             }
         }
@@ -1850,7 +1977,7 @@ const Parser = struct {
 
     fn parseCallArg(self: *Parser) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
-        const expr = try self.parseExpr();
+        const expr = try self.parseExprUnrestricted();
         try children.append(self.arena, .{ .node = expr });
         return try cst.makeNode(self.arena, .CALL_ARG, children.items);
     }
@@ -2258,6 +2385,73 @@ test "postfix: method call on a call result is METHOD_EXPR" {
     const r = try parseExpression(testing.allocator, "f().g()", "e.q");
     defer r.deinit(testing.allocator);
     try testing.expectEqual(cst.SyntaxKind.METHOD_EXPR, r.root.kind);
+}
+
+test "record literal: `Point { x: 1, y: 2 }` is RECORD_EXPR with two inits" {
+    const r = try parseExpression(testing.allocator, "Point { x: 1, y: 2 }", "e.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(cst.SyntaxKind.RECORD_EXPR, r.root.kind);
+    var inits: usize = 0;
+    for (r.root.children) |c| switch (c) {
+        .node => |n| if (n.kind == .RECORD_INIT) {
+            inits += 1;
+        },
+        .token => {},
+    };
+    try testing.expectEqual(@as(usize, 2), inits);
+}
+
+test "record literal: shorthand, empty, nested-in-array all parse losslessly" {
+    const cases = [_]struct { src: []const u8, kind: cst.SyntaxKind }{
+        .{ .src = "Color { r }", .kind = .RECORD_EXPR },
+        .{ .src = "DemoTools {}", .kind = .RECORD_EXPR },
+        .{ .src = "[Color { r: 1 }, Color { r: 2 }]", .kind = .ARRAY_EXPR },
+        .{ .src = "f(Point { x: 1 })", .kind = .CALL_EXPR },
+    };
+    for (cases) |cse| {
+        const r = try parseExpression(testing.allocator, cse.src, "e.q");
+        defer r.deinit(testing.allocator);
+        try testing.expectEqual(cse.kind, r.root.kind);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try cst.serialize(r.root, testing.allocator, &out);
+        try testing.expectEqualStrings(cse.src, out.items);
+    }
+}
+
+test "record literal: restricted in if/while/match heads - brace opens the block" {
+    const src =
+        "fn f(x: bool) {\n" ++
+        "    if x { env.out(\"y\") }\n" ++
+        "    while x { env.out(\"w\") }\n" ++
+        "    match x { _ -> env.out(\"m\"), }\n" ++
+        "}\n";
+    const r = try parse(testing.allocator, src, "t.q");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!nodeContainsKind(r.root, .RECORD_EXPR));
+    try testing.expect(nodeContainsKind(r.root, .IF_STMT));
+    try testing.expect(nodeContainsKind(r.root, .WHILE_STMT));
+    try testing.expect(nodeContainsKind(r.root, .MATCH_STMT));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+}
+
+test "record literal: parenthesized form lifts the restriction" {
+    const src = "fn f { if (Point { x: 1 }).ok { env.out(\"y\") } }\n";
+    const r = try parse(testing.allocator, src, "t.q");
+    defer r.deinit(testing.allocator);
+    try testing.expect(nodeContainsKind(r.root, .RECORD_EXPR));
+}
+
+fn nodeContainsKind(node: *const cst.Node, kind: cst.SyntaxKind) bool {
+    if (node.kind == kind) return true;
+    for (node.children) |c| switch (c) {
+        .node => |n| if (nodeContainsKind(n, kind)) return true,
+        .token => {},
+    };
+    return false;
 }
 
 test "expression views: bin / unary / try / index / field / method / tuple-field / paren / tuple / array" {

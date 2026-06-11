@@ -23,10 +23,12 @@ const parser = @import("parser");
 const ast = parser.ast;
 const cst = parser.cst;
 const symbols = @import("symbols.zig");
+const prelude = @import("prelude.zig");
 
 /// Ambient host-face names usable without declaration (spec/env.md's
 /// `env`, the QView host face, and the implicit `ctx: Cancel` that
-/// `main`/`spawn`/`scope` introduce per spec/concurrency.md).
+/// `main`/`spawn`/`scope` introduce per spec/concurrency.md). The
+/// auto-prelude proper lives in prelude.zig.
 const ambient = [_][]const u8{ "env", "qview", "ctx" };
 
 pub const Ref = struct {
@@ -93,6 +95,7 @@ const Walker = struct {
 
     fn resolveHead(w: *Walker, tok: cst.Token) !void {
         for (ambient) |a| if (std.mem.eql(u8, tok.text, a)) return;
+        if (prelude.contains(tok.text)) return;
         if (w.scopes.contains(tok.text)) return;
         if (w.table.lookup(tok.text) != null) return;
         try w.res.unresolved.append(w.res.gpa, .{

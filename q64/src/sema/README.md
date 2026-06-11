@@ -85,7 +85,11 @@ parse (CST/AST)
   (mixed numeric arithmetic), TYP041 (numeric mismatch at a declared
   type — call args + annotated lets), TYP050 (bool as integer),
   TYP040 (annotated literal out of range), TYP060 (mode keyword in a
-  call argument). Conformance 17/47. Deferred with reasons recorded in
-  todo.md: NAM010 + unresolved type names (need the auto-prelude
-  table; corpus survey shows false positives), value-call arity (no
-  specced code — spec gap).
+  call argument), TYP061 (wrong argument count — specced this rung;
+  positional claims are gated on an argument-list well-formedness
+  check, because parse recovery degrades unsupported forms into extra
+  CALL_ARGs). `prelude.zig` mirrors modules.md §"The auto-prelude"
+  for resolve + type lowering. Conformance 18/48. Still deferred with
+  reasons in todo.md: NAM010 + unresolved type names (parser gaps:
+  lambdas, graph/channel exprs, named args, record patterns,
+  generic-param scoping).
