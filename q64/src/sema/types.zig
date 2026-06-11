@@ -283,6 +283,16 @@ pub fn lower(store: *TypeStore, table: ?*const symbols.SymbolTable, te_opt: ?ast
     }
 }
 
+
+/// True when `node` has `kind` among its direct token children.
+fn hasDirectToken(node: *const parser.cst.Node, kind: parser.cst.SyntaxKind) bool {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (t.kind == kind) return true,
+        .node => {},
+    };
+    return false;
+}
+
 // =====================================================================
 // Signatures
 // =====================================================================
@@ -325,6 +335,12 @@ pub fn collectSignatures(
     while (it.next()) |item| switch (item) {
         .fn_decl => |fd| {
             const name_tok = fd.name() orelse continue;
+
+            // A degraded header — parens present in the raw tokens but
+            // no structured PARAMS node — means the parameter list is
+            // unknown. Record no signature at all: a wrong zero-arity
+            // one would false-fire every sig-based check (TYP061 …).
+            if (fd.params() == null and hasDirectToken(fd.cst, .L_PAREN)) continue;
 
             var params: std.ArrayList(TypeId) = .empty;
             defer params.deinit(store.gpa);

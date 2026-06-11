@@ -1294,10 +1294,12 @@ pub const Expr = union(enum) {
     tuple: TupleExpr,
     paren: ParenExpr,
     array: ArrayExpr,
+    record: RecordExpr,
 
     pub fn cast(node: *const cst.Node) ?Expr {
         return switch (node.kind) {
             .CALL_EXPR => .{ .call = .{ .cst = node } },
+            .RECORD_EXPR => .{ .record = .{ .cst = node } },
             .PATH_EXPR => .{ .path = .{ .cst = node } },
             .STR_LITERAL => .{ .string_lit = .{ .cst = node } },
             .NUM_LITERAL => .{ .num_lit = .{ .cst = node } },
@@ -1626,6 +1628,61 @@ pub const ArrayExpr = struct {
 
     pub fn elements(self: ArrayExpr) ExprIter {
         return .{ .children = self.cst.children };
+    }
+};
+
+/// `RecordExpr := PathExpr "{" (RecordInit ("," RecordInit)* ","?)? "}"`
+/// (spec/grammar.md §"Record literals") — `Point { x: 1, y: 2 }`.
+pub const RecordExpr = struct {
+    cst: *const cst.Node,
+
+    /// The type path before the brace (`Point`, `q64.math.Vec3`).
+    pub fn path(self: RecordExpr) ?PathExpr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (n.kind == .PATH_EXPR) return .{ .cst = n },
+            .token => {},
+        };
+        return null;
+    }
+
+    pub fn inits(self: RecordExpr) RecordInitIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+pub const RecordInitIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *RecordInitIter) ?RecordInit {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .RECORD_INIT) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// One `field: value` (or shorthand `field`) initializer.
+pub const RecordInit = struct {
+    cst: *const cst.Node,
+
+    pub fn name(self: RecordInit) ?cst.Token {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .IDENT) return t,
+            .node => {},
+        };
+        return null;
+    }
+
+    /// The initializer value; `null` for the shorthand form.
+    pub fn value(self: RecordInit) ?Expr {
+        return firstChildExpr(self.cst);
     }
 };
 
