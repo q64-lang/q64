@@ -681,13 +681,27 @@ verified, honest diagnostics throughout.
             `isBoolCall` deleted; all seven call sites untouched.
             Byte-stable: 289 unit / 77 CLI / 11-of-45 / roundtrip — all
             identical.
-      - [ ] The codegen `Resolver`'s name lookup is replaced by the sema
-            symbol table (NameNotFound moves to the sema layer; the
-            recorded unresolved-heads become the emitted diagnostic).
-- [ ] **A4 — first real TYP codes.** Arg-count/type mismatches move from
-      `UnsupportedCall` to their specced TYP codes; flip the matching
+      - [x] **Name lookup lives in sema.** `sema/link.zig`: the codegen
+            `Resolver` moved wholesale as `Linker` (root-fn indexing,
+            `--module` import resolution, `findPublicFn`, the honest
+            UnknownModule/NameNotFound/UnsupportedImport trio — mapped
+            back onto the stable emit codes at the one call site).
+            emit.zig's Resolver + findPublicFn deleted; `ModuleSource` is
+            now an alias of `sema.link.ModuleSource`; the
+            `hir.ModuleResolver` injection stays (ir never imports
+            codegen). Byte-stable: 291 unit / 77 CLI / 11-of-45 /
+            roundtrip identical.
+      **A3 is structurally done**: build_hir consumes sema for signatures,
+      expression types, and name lookup. What remains is *ownership of
+      body scopes* (the Env bridge in build_hir adapts its wasm-slot
+      Scope) — that collapses when the sema check pass lands with A4.
+- [ ] **A4 — first real TYP codes + sema-emitted NAM.** Arg-count/type
+      mismatches move from `UnsupportedCall` to their specced TYP codes;
+      the recorded unresolved heads + unresolved type names get their
+      NAM/TYP emission (a sema check pass with its own body scopes,
+      collapsing build_hir's Env bridge); flip the matching
       `spec/tests/` fixtures from expected-future to passing. Conformance
-      count is the metric (today: 10 parser-level codes pass).
+      count is the metric (today: 11 codes pass).
 
 ### Ladder B — struct values → static fits (after A3)
 
