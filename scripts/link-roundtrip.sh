@@ -1595,4 +1595,36 @@ rmatch32_out="$("$HOST_BIN" "$tmp/rmatch32.wasm")"
 [[ "$rmatch32_out" == "$rmatch_expected" ]] || { echo "FAIL: rec-match wasm32 (got: $rmatch32_out)" >&2; exit 1; }
 echo "    ok: record match tails -> 42 / flipped none to 0 / err 7 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# Frame reclamation (spec/memory.md §"Frame reclamation"): a formatted-print
+# loop runs in constant memory. 9000 iterations × two host writes would
+# exhaust the 1-page arena many times over without the watermark/slide
+# convention — this program trapped out-of-bounds before it landed.
+# ---------------------------------------------------------------------------
+echo "==> frame reclamation: constant-memory print loop"
+rec_app="$tmp/reclaim.q"
+cat > "$rec_app" <<'Q64'
+fn shout(s: str) -> str {
+    "{s}!"
+}
+fn main {
+    var i = 0
+    while i < 9000 {
+        env.out("count {i} now")
+        env.out(shout("hey"))
+        i = i + 1
+    }
+    env.out("done")
+}
+Q64
+"$Q64_BIN" emit "$rec_app" "$tmp/reclaim.wasm"
+rec_lines="$("$HOST_BIN" "$tmp/reclaim.wasm" | wc -l | tr -d ' ')"
+rec_last="$("$HOST_BIN" "$tmp/reclaim.wasm" | tail -1)"
+[[ "$rec_lines" == "18001" && "$rec_last" == "done" ]] || { echo "FAIL: reclamation (lines=$rec_lines last=$rec_last)" >&2; exit 1; }
+"$Q64_BIN" emit "$rec_app" "$tmp/reclaim32.wasm" --addr wasm32
+rec32_lines="$("$HOST_BIN" "$tmp/reclaim32.wasm" | wc -l | tr -d ' ')"
+rec32_last="$("$HOST_BIN" "$tmp/reclaim32.wasm" | tail -1)"
+[[ "$rec32_lines" == "18001" && "$rec32_last" == "done" ]] || { echo "FAIL: reclamation wasm32 (lines=$rec32_lines last=$rec32_last)" >&2; exit 1; }
+echo "    ok: frame reclamation -> 18001 lines, constant memory (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

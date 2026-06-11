@@ -668,6 +668,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (sc.has_concat) needs_arena = true;
         if (sc.rec_depth > 0) needs_arena = true; // records live in the scope arena
         if (sc.has_float_fmt) needs_fmt_f64 = true;
+        // Any frame-reclamation region (a call / host statement wrap)
+        // reads + writes `sp`, so the arena global must exist.
+        if (sc.region_depth > 0) needs_arena = true;
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -790,6 +793,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .len_idx = base + n_tuples + 2,
             .rec_base = base + n_tuples + n_concat,
             .bounds_idx = base + n_tuples + n_concat + sc.rec_depth,
+            .region_base = base + n_tuples + n_concat + sc.rec_depth + n_bounds,
             .host_imports = &host_imports,
             .global_names = global_names,
             .stdout_abi = stdout_abi,
@@ -800,7 +804,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         // varTypes (locals beyond params): declared locals, then tuple slots,
         // then the concat scratch (buf/off/len) when concatenating, then one
         // base-ptr scratch per record_make nesting level.
-        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds;
+        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
         for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type, ptr_type);
@@ -813,6 +817,18 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         }
         for (0..sc.rec_depth) |j| vts[f.locals.len + n_tuples + n_concat + j] = ptr_type;
         if (sc.has_bounds) vts[f.locals.len + n_tuples + n_concat + sc.rec_depth] = i64_type;
+        // Frame-reclamation scratch: per region level, [wm ptr, i64, i32,
+        // f64, f32, pair, ptr] (the watermark + one stash per value type).
+        for (0..sc.region_depth) |j| {
+            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + j * 7;
+            vts[g] = ptr_type;
+            vts[g + 1] = i64_type;
+            vts[g + 2] = i32_type;
+            vts[g + 3] = c.BinaryenTypeFloat64();
+            vts[g + 4] = c.BinaryenTypeFloat32();
+            vts[g + 5] = pair_type;
+            vts[g + 6] = ptr_type;
+        }
 
         // Parameter wasm types (a `str` param → two address-width ptr/len).
         var ptype = none_type;
@@ -992,6 +1008,11 @@ const Scratch = struct {
     has_float_fmt: bool = false,
     /// Contains a bounds_check → needs the i64 index scratch local.
     has_bounds: bool = false,
+    /// Max nesting depth of frame-reclamation regions (a `.call` or a host
+    /// statement — spec/memory.md §"Frame reclamation"): each level needs
+    /// its own watermark + result-stash scratch group, since a nested call
+    /// in an argument saves its watermark while the outer's is live.
+    region_depth: u32 = 0,
 };
 
 fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
@@ -1004,6 +1025,18 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_contains = s.has_contains or sub.has_contains;
     s.has_float_fmt = s.has_float_fmt or sub.has_float_fmt;
     s.has_bounds = s.has_bounds or sub.has_bounds;
+    if (sub.rec_depth > s.rec_depth) s.rec_depth = sub.rec_depth;
+    if (sub.region_depth > s.region_depth) s.region_depth = sub.region_depth;
+}
+
+/// Fold one reclamation-wrapped child (a call's argument, a host
+/// statement's value): the wrap occupies one region level around
+/// whatever the child needs.
+fn scanRegionChild(s: *Scratch, child: *const ir.mir.Inst) void {
+    var sub = Scratch{};
+    scanScratch(child, &sub);
+    mergeScratch(s, &sub);
+    if (1 + sub.region_depth > s.region_depth) s.region_depth = 1 + sub.region_depth;
 }
 
 fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
@@ -1066,15 +1099,15 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         .host_out_float => |h| {
             s.host_out = true; // pair scratch for the (ptr, len) split
             s.has_float_fmt = true;
-            scanScratch(h.value, s);
+            scanRegionChild(s, h.value);
         },
         .host_out_int => |h| {
             s.host_out = true;
-            scanScratch(h.value, s);
+            scanRegionChild(s, h.value);
         },
         .host_out_str => |h| {
             s.host_out = true;
-            scanScratch(h.value, s);
+            scanRegionChild(s, h.value);
         },
         .str_bind => |sb| {
             s.host_out = true; // uses the pair scratch to split (ptr, len)
@@ -1087,7 +1120,13 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(b.rhs, s);
         },
         .un => |u| scanScratch(u.operand, s),
-        .call => |cl| for (cl.args) |a| scanScratch(a, s),
+        .call => |cl| {
+            // The call wraps in a reclamation region around its args.
+            var sub = Scratch{};
+            for (cl.args) |a| scanScratch(a, &sub);
+            mergeScratch(s, &sub);
+            if (1 + sub.region_depth > s.region_depth) s.region_depth = 1 + sub.region_depth;
+        },
         .ret => |v| if (v) |val| scanScratch(val, s),
         .if_ => |iff| {
             scanScratch(iff.cond, s);
@@ -1099,7 +1138,12 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(w.body, s);
         },
         .loop => |body| scanScratch(body, s),
-        .host_call => |hc| for (hc.args) |a| scanScratch(a, s),
+        .host_call => |hc| {
+            var sub = Scratch{};
+            for (hc.args) |a| scanScratch(a, &sub);
+            mergeScratch(s, &sub);
+            if (1 + sub.region_depth > s.region_depth) s.region_depth = 1 + sub.region_depth;
+        },
         .global_set => |gs| scanScratch(gs.value, s),
         .str_len => |inner| scanScratch(inner, s),
         .str_index => |si| {
@@ -1183,6 +1227,14 @@ const Lowerer = struct {
     /// The i64 scratch holding a bounds-checked index (the index expr is
     /// evaluated once, tested, then yielded).
     bounds_idx: c.BinaryenIndex = 0,
+    /// Frame-reclamation scratch (spec/memory.md §"Frame reclamation"):
+    /// per region-nesting level, a 7-local group
+    /// [wm ptr, i64, i32, f64, f32, pair, ptr] — the watermark plus a
+    /// result stash of each value type. `region_lvl` tracks the current
+    /// nesting depth while lowering (a nested call in an argument wraps
+    /// one level deeper than its caller's wrap).
+    region_base: c.BinaryenIndex = 0,
+    region_lvl: u32 = 0,
     label_ctr: u32 = 0,
     loops: std.ArrayList(LoopLabels) = .empty,
     /// Dotted host-face name (`qview.text`) → the declared wasm import's internal
@@ -1276,6 +1328,13 @@ const Lowerer = struct {
                 };
             },
             .call => |cl| {
+                // Frame reclamation (spec/memory.md §"Frame reclamation"):
+                // the call wraps in a region — watermark saved before the
+                // arguments evaluate, the result slid down onto it after.
+                // Nested calls in the arguments wrap one level deeper.
+                const d = self.region_lvl;
+                self.region_lvl += 1;
+                defer self.region_lvl -= 1;
                 // A `str` argument expands to two i64 operands (ptr, len).
                 var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
                 defer operands.deinit(self.allocator);
@@ -1286,7 +1345,9 @@ const Lowerer = struct {
                         try operands.append(self.allocator, try self.inst(a));
                     }
                 }
-                return c.BinaryenCall(module, self.funcs[cl.func].name.ptr, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.wty(n.ty));
+                const callee = self.funcs[cl.func];
+                const callex = c.BinaryenCall(module, callee.name.ptr, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.wty(n.ty));
+                return self.slideCall(d, n.ty, callee.ret_size, callex);
             },
             .str_param => |idx| {
                 var elems = [_]c.BinaryenExpressionRef{
@@ -1323,20 +1384,37 @@ const Lowerer = struct {
             },
             .host_out_int => |hi| {
                 // __fmt_i64(value) → (ptr, len), then write it + the newline.
+                // The statement's bytes are consumed by the host before it
+                // completes, so the wrap resets `sp` afterwards.
+                const d = self.region_lvl;
+                self.region_lvl += 1;
+                defer self.region_lvl -= 1;
                 var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(hi.value)};
                 const fmt = c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
-                return self.hostOutPair(fmt, @intCast(hi.nl_off));
+                return self.resetAfter(d, self.hostOutPair(fmt, @intCast(hi.nl_off)));
             },
             .host_out_float => |hf| {
                 // __fmt_f64(value) → (ptr, len), then write it + the newline.
+                const d = self.region_lvl;
+                self.region_lvl += 1;
+                defer self.region_lvl -= 1;
                 var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(hf.value)};
                 const fmt = c.BinaryenCall(module, "__fmt_f64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
-                return self.hostOutPair(fmt, @intCast(hf.nl_off));
+                return self.resetAfter(d, self.hostOutPair(fmt, @intCast(hf.nl_off)));
             },
-            .host_out_str => |hs| return self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)),
+            .host_out_str => |hs| {
+                const d = self.region_lvl;
+                self.region_lvl += 1;
+                defer self.region_lvl -= 1;
+                return self.resetAfter(d, self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)));
+            },
             .host_call => |hc| {
                 // A `str` argument expands to two operands (ptr, len), exactly
-                // like a regular `.call`; any other arg is one i64 value.
+                // like a regular `.call`; any other arg is one i64 value. The
+                // host consumes the bytes within the statement → reset after.
+                const d = self.region_lvl;
+                self.region_lvl += 1;
+                defer self.region_lvl -= 1;
                 var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
                 defer operands.deinit(self.allocator);
                 for (hc.args) |a| {
@@ -1347,7 +1425,7 @@ const Lowerer = struct {
                     }
                 }
                 const name = self.host_imports.get(hc.name) orelse return Error.UnsupportedCall;
-                return c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type);
+                return self.resetAfter(d, c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type));
             },
             .global_get => |idx| return c.BinaryenGlobalGet(module, self.global_names[idx], self.i64_type),
             .global_set => |gs| return c.BinaryenGlobalSet(module, self.global_names[gs.idx], try self.inst(gs.value)),
@@ -1607,6 +1685,109 @@ const Lowerer = struct {
     // wasm32) — for using an i64 index/bound in pointer arithmetic.
     fn toPtr(self: *Lowerer, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
         return if (self.ptr_type == self.i64_type) v else c.BinaryenUnary(self.module, c.BinaryenWrapInt64(), v);
+    }
+
+    // ---- Frame reclamation (spec/memory.md §"Frame reclamation") ----
+
+    /// The watermark local for region-nesting level `d`.
+    fn wmIdx(self: *const Lowerer, d: u32) c.BinaryenIndex {
+        return self.region_base + d * 7;
+    }
+    /// The result-stash local of value type `t` at level `d`.
+    fn stashIdx(self: *const Lowerer, d: u32, t: ir.mir.ValueType) c.BinaryenIndex {
+        const off: c.BinaryenIndex = switch (t) {
+            .i64 => 1,
+            .i32 => 2,
+            .f64 => 3,
+            .f32 => 4,
+            .str => 5,
+            .ptr => 6,
+            .void => unreachable,
+        };
+        return self.region_base + d * 7 + off;
+    }
+
+    /// Wrap a host statement: save the watermark, run it, restore `sp` —
+    /// the host consumed the bytes within the statement.
+    fn resetAfter(self: *Lowerer, d: u32, inner: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        const m = self.module;
+        var seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenLocalSet(m, self.wmIdx(d), c.BinaryenGlobalGet(m, "sp", self.ptr_type)),
+            inner,
+            c.BinaryenGlobalSet(m, "sp", self.ptrGet(self.wmIdx(d))),
+        };
+        return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.none_type);
+    }
+
+    /// Wrap a call: watermark before the arguments evaluate (the save is
+    /// the block's first child; the operands evaluate inside `callex`),
+    /// then slide the result down onto it. A scalar result lives in a
+    /// wasm local, so the frame just restores; an aggregate's bytes are
+    /// copied down (memory.copy is memmove — the overlapping downward
+    /// slide is safe) and `sp` advances past exactly the result.
+    fn slideCall(self: *Lowerer, d: u32, ty: ir.mir.ValueType, ret_size: u32, callex: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        const m = self.module;
+        const wm = self.wmIdx(d);
+        const sp_now = c.BinaryenGlobalGet(m, "sp", self.ptr_type);
+        switch (ty) {
+            .void => {
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(m, wm, sp_now),
+                    callex,
+                    c.BinaryenGlobalSet(m, "sp", self.ptrGet(wm)),
+                };
+                return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.none_type);
+            },
+            .str => {
+                // (ptr, len) → copy len bytes to the watermark, rebase.
+                const stash = self.stashIdx(d, .str);
+                const pget = c.BinaryenLocalGet(m, stash, self.pair_type);
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(m, wm, sp_now),
+                    c.BinaryenLocalSet(m, stash, callex),
+                    c.BinaryenMemoryCopy(m, self.ptrGet(wm), c.BinaryenTupleExtract(m, pget, 0), c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, stash, self.pair_type), 1), "0", "0"),
+                    c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(wm), c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, stash, self.pair_type), 1))),
+                    blk: {
+                        var elems = [_]c.BinaryenExpressionRef{
+                            self.ptrGet(wm),
+                            c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, stash, self.pair_type), 1),
+                        };
+                        break :blk c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len);
+                    },
+                };
+                return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.pair_type);
+            },
+            .ptr => {
+                // A record/boxed-enum base pointer: copy `ret_size` bytes to
+                // the 8-aligned watermark (≥ any v0 struct alignment).
+                if (ret_size == 0) {
+                    // No size known (shouldn't happen for a ptr return):
+                    // restore only, keeping the result above sp is unsound —
+                    // so don't reclaim at all.
+                    return callex;
+                }
+                const stash = self.stashIdx(d, .ptr);
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(m, wm, self.ptrAnd(self.ptrAdd(sp_now, self.ptrConst(7)), self.ptrConst(-8))),
+                    c.BinaryenLocalSet(m, stash, callex),
+                    c.BinaryenMemoryCopy(m, self.ptrGet(wm), self.ptrGet(stash), self.ptrConst(ret_size), "0", "0"),
+                    c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(wm), self.ptrConst(ret_size))),
+                    self.ptrGet(wm),
+                };
+                return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.ptr_type);
+            },
+            else => {
+                // A scalar result: stash it, restore, yield.
+                const stash = self.stashIdx(d, ty);
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(m, wm, sp_now),
+                    c.BinaryenLocalSet(m, stash, callex),
+                    c.BinaryenGlobalSet(m, "sp", self.ptrGet(wm)),
+                    c.BinaryenLocalGet(m, stash, self.wty(ty)),
+                };
+                return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.wty(ty));
+            },
+        }
     }
 
     /// Write a `(ptr, len)` pair value to env.out, then the newline byte:

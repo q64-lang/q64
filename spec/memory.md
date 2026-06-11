@@ -145,6 +145,57 @@ The rest of this spec uses "the `Region` face," "a region kind,"
 or "a region binding" — never bare "region" — when the
 distinction matters.
 
+## Frame reclamation (v0): Stack discipline on the implicit arena
+
+The v0 compiler allocates from one implicit **scope arena** — a bump
+pointer (`sp`) in linear memory, starting past the static data. Named
+region bindings are future surface; until they land, reclamation comes
+from giving call frames the **`Stack` kind's semantics** (LIFO,
+implicit free on return) layered on that arena, as a **caller-side
+calling convention**:
+
+1. **Watermark.** Every call site saves `sp` into a local before
+   evaluating the call's arguments. Everything allocated from that
+   point — argument temporaries, the callee's entire frame, the frames
+   of everything *it* calls — sits above the watermark.
+2. **The result slides down.** After the call returns: a scalar result
+   needs no memory, so `sp` is simply restored to the watermark. An
+   aggregate result (a `str`'s bytes, a record, a boxed enum) is
+   copied down to the watermark (`memory.copy` — memmove semantics, so
+   the overlapping downward slide is safe; record results align the
+   watermark up to the value's alignment first), the result pointer is
+   rebased onto it, and `sp` becomes `watermark + size`. The frame
+   dies; exactly its result survives, now inside the caller's live
+   region.
+3. **Host statements reset.** A host-call statement (`env.out(…)`,
+   `qview.*`) consumes its bytes before it completes, so the entry's
+   statement wrapper restores `sp` to its own watermark afterwards —
+   a formatted-print loop runs in constant memory.
+
+The convention is correct without escape analysis: results are slid
+unconditionally (re-copying a constant or a passthrough parameter is
+wasteful, never wrong — `str` and record results are immutable values
+at the seam). Compiler analyses may *skip* provably-redundant slides;
+they can never be required for correctness.
+
+**Pinned boundary — interior pointers.** The flat slide is a complete
+deep copy only while aggregates contain no pointers, which is true of
+the v0 floor (scalar fields; enum payload slots are scalars; `str`
+values are `(ptr, len)` pairs held in locals, never stored inside
+aggregates). The day a pointer-bearing field lands (a `str` struct
+field, a nested-struct reference), its type's returns must either
+slide recursively (the compiler knows the layout) or allocate into the
+caller's frame from the start. That decision rides with the feature
+that introduces such a field; until then a pointer-bearing aggregate
+return is a compile error, not a silent shallow copy.
+
+**Known leaks at this floor** (reclaimed only by an enclosing frame's
+exit, or never in `main`): a binding re-assigned each loop iteration
+abandons its previous bytes; concat temporaries feeding a `let` (not a
+host statement) in `main`. Per-iteration resets via the existing
+escape scan, and explicit `scope { }` resets, are the recorded next
+rungs.
+
 ## Region literal syntax
 
 A `region` declaration introduces a named region whose lifetime is

@@ -1353,7 +1353,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         const rec_extra = scope.extra();
         const rec_locals = try b.a.alloc(hir.Type, rec_extra);
         for (rec_locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
-        b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .locals = rec_locals, .body = block };
+        b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .locals = rec_locals, .body = block, .ret_size = want.size };
         return id;
     }
 
@@ -2742,7 +2742,7 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
         else => return error.Unsupported, // record-valued methods: later
     };
 
-    var scope = Scope{ .a = b.a };
+    var scope = Scope{ .a = b.a, .callee = true };
     var params: std.ArrayList(hir.Param) = .empty;
     var rec_params: std.ArrayList(?*const StructInfo) = .empty;
     const ps = m.params() orelse return error.Unsupported;
@@ -3195,6 +3195,7 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
         .locals = all[param_slice.len..], // past the param padding
         .body = block,
         .is_screen = true,
+        .ret_size = if (ret_rec) |w| w.size else 0,
     };
     return id;
 }

@@ -76,6 +76,11 @@ pub const Func = struct {
     /// Export this function by `name` (in addition to the entry's `_start`).
     /// Set for public screen handlers (e.g. `on_press`) the host invokes.
     exported: bool = false,
+    /// For a `.ptr`-returning function: the returned record/boxed-enum
+    /// value's byte size — the backend's frame-reclamation slide copies
+    /// this many bytes down to the call-site watermark
+    /// (spec/memory.md §"Frame reclamation"). 0 otherwise.
+    ret_size: u32 = 0,
 };
 
 /// A function body in one of two interchangeable forms. **Structured is the

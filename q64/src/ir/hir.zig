@@ -217,6 +217,10 @@ pub const Func = struct {
     /// runs and for a function that reaches no capability. The component/WIT +
     /// QubePod stages read this as the import side of the world.
     effects: []const Effect = &.{},
+    /// For a record/boxed-enum-returning function (`ret == .ptr`): the
+    /// returned value's byte size, read by the backend's frame-reclamation
+    /// slide (spec/memory.md §"Frame reclamation"). 0 otherwise.
+    ret_size: u32 = 0,
 };
 
 /// High-level statements. `block` is shared; the `host_out*` forms appear in

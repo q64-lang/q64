@@ -72,6 +72,7 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
                 .body = .{ .structured = if (vty) |t| try lowerIntBlock(ctx, hf.body, t) else try lowerEntry(ctx, hf.body) },
                 .linkage = if (is_entry) .entry else .local,
                 .exported = (!is_entry and hf.visibility == .public),
+                .ret_size = hf.ret_size,
             };
         } else {
             funcs[i] = try lowerCallee(ctx, hf);
@@ -196,6 +197,7 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
         // A public value-returning function (a library export) is exported by
         // name so a host — or the component lift — can reach it.
         .exported = (hf.visibility == .public),
+        .ret_size = hf.ret_size,
     };
 }
 

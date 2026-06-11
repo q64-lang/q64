@@ -1379,6 +1379,46 @@ verified, honest diagnostics throughout.
             (**21/49**, zero regressions); 357 unit (2 new) / 80 CLI
             (1 new TYP200 envelope case) / link-roundtrip green.
 
+## Memory reclamation — Stack discipline on the implicit arena
+
+The arena-never-frees era is over. Specced first
+(`spec/memory.md` §"Frame reclamation (v0)"), then landed as a
+**caller-side calling convention** — correctness never depends on an
+analysis.
+
+- [x] **Watermark + slide + host-statement reset.** Every call site
+      saves `sp` before its arguments evaluate and reclaims after: a
+      scalar result restores `sp` outright; an aggregate result (str
+      bytes, record, boxed enum) is **slid down** onto the watermark
+      (`memory.copy` is memmove — the overlapping downward copy is
+      safe; record slides 8-align the watermark; the size rides
+      `hir.Func.ret_size` → `mir.Func.ret_size`, set from `fn_recs`)
+      and `sp` advances past exactly the result. Host statements
+      (`env.out`, `qview.*`) reset to their own watermark — the host
+      consumed the bytes. Backend: a per-region-nesting-level scratch
+      group [wm + one stash per value type] (`Scratch.region_depth`,
+      `Lowerer.region_base/region_lvl`, `slideCall`/`resetAfter`);
+      nested calls in arguments wrap one level deeper, host wraps and
+      call wraps share the level counter so saves can't clobber.
+      `mergeScratch` now also folds `rec_depth` (a pre-existing
+      drop for records nested in scanned subtrees). Verified: the
+      roundtrip reclamation section — a 9000-iteration formatted-print
+      loop (18001 lines) that **trapped out-of-bounds before** now
+      runs in constant memory, wasm64 + wasm32 — plus the entire
+      existing corpus (unit / roundtrip / conformance / CLI /
+      component-roundtrip) byte-identical green.
+      **Pinned boundary (specced):** the flat slide is a deep copy
+      only while aggregates are pointer-free (true at this floor);
+      a pointer-bearing field's return must slide recursively or
+      caller-allocate — decided with the feature that introduces it.
+- [ ] **Known leaks (recorded in the spec):** a loop-iteration
+      rebinding abandons its prior bytes; concat temporaries feeding a
+      `let` (not a host statement) in `main`. Next rungs:
+      per-iteration reset via the existing escape scan; explicit
+      `scope { }` reset (parser: scope blocks are still unstructured).
+- [ ] **Growth for collections** (`Vec` copy-on-grow inside the owning
+      region) — the gate for the collections ladder.
+
 ## Numeric tower — floats (f64 landed; f32 next)
 
 - [x] **The f64 floor, end-to-end.** Floats are first-class scalars now:
