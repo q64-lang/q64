@@ -29,6 +29,7 @@ const cst = parser.cst;
 const symbols = @import("symbols.zig");
 const types = @import("types.zig");
 const exprtype = @import("exprtype.zig");
+const fits = @import("fits.zig");
 
 pub const Diag = struct {
     code: []const u8,
@@ -42,6 +43,12 @@ const Info = union(enum) {
     /// A bare integer literal — flexible, adapts to context: counts as
     /// an integer for TYP051, never mismatches for TYP042.
     int_literal,
+    /// A record value of a locally-declared struct (`Color { … }`);
+    /// the name borrows the symbol table's token text.
+    record: []const u8,
+    /// An array whose elements are all records of one local struct
+    /// (`[Color { … }, …]`) — what a `[T]` argument infers T from.
+    rec_array: []const u8,
     unknown,
 };
 
@@ -81,10 +88,34 @@ const Scope = struct {
     }
 };
 
+/// A face-bounded generic declaration in this file (the B5 v0 floor:
+/// one `<T>` / `<T: Face>` parameter), for the TYP200 bound check.
+const GenericDecl = struct { sig: fits.GenericSig, fd: ast.FnDecl };
+const Generics = std.StringHashMapUnmanaged(GenericDecl);
+
+fn collectGenerics(gpa: std.mem.Allocator, sf: ast.SourceFile) !Generics {
+    var out: Generics = .empty;
+    errdefer out.deinit(gpa);
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .fn_decl => |fd| {
+            const gp = fd.genericParams() orelse continue;
+            const sig = fits.parseGenericSig(gp) orelse continue;
+            const name = fd.name() orelse continue;
+            try out.put(gpa, name.text, .{ .sig = sig, .fd = fd });
+        },
+        else => {},
+    };
+    return out;
+}
+
 const Checker = struct {
     gpa: std.mem.Allocator,
     store: *types.TypeStore,
     sigs: *const types.Signatures,
+    table: *const symbols.SymbolTable,
+    fitreg: ?*const fits.Registry,
+    generics: *const Generics,
     scope: Scope,
     diags: *std.ArrayList(Diag),
 
@@ -166,16 +197,18 @@ const Checker = struct {
                 // (`process(ref: s)`). Syntactic; checked on every call.
                 try c.checkCallArgModes(cc);
 
-                const sig: ?types.FnSig = blk: {
-                    const callee = cc.callee() orelse break :blk null;
+                const Callee = struct { sig: ?types.FnSig, gen: ?GenericDecl };
+                const target: Callee = blk: {
+                    const callee = cc.callee() orelse break :blk .{ .sig = null, .gen = null };
                     const cpath = switch (callee) {
                         .path => |p| p,
-                        else => break :blk null,
+                        else => break :blk .{ .sig = null, .gen = null },
                     };
-                    const name = cpath.text(c.gpa) catch break :blk null;
+                    const name = cpath.text(c.gpa) catch break :blk .{ .sig = null, .gen = null };
                     defer c.gpa.free(name);
-                    break :blk c.sigs.find(name);
+                    break :blk .{ .sig = c.sigs.find(name), .gen = c.generics.get(name) };
                 };
+                const sig = target.sig;
 
                 // Positional claims (per-arg type checks, the TYP061
                 // count) are only honest on a *well-formed* argument
@@ -192,6 +225,7 @@ const Checker = struct {
                 while (args.next()) |a| : (i += 1) {
                     const info = try c.typeOf(a);
                     if (!wf) continue;
+                    try c.checkGenericBound(target.gen, i, a, info);
                     const s = sig orelse continue;
                     if (i >= s.params.len) continue; // counted below (TYP061)
                     try c.checkAgainstExpected(s.params[i], info, firstTokenOffset(exprNode(a)));
@@ -217,6 +251,47 @@ const Checker = struct {
                 defer c.gpa.free(name);
                 return c.scope.find(name) orelse .unknown;
             },
+            .record => |re| {
+                // A record literal of a locally-declared struct. Field
+                // values are typed too (a mismatch can hide inside);
+                // field-shape checks join when struct shapes land.
+                var iit = re.inits();
+                while (iit.next()) |fi| {
+                    if (fi.value()) |v| _ = try c.typeOf(v);
+                }
+                const p = re.path() orelse return .unknown;
+                const name = p.text(c.gpa) catch return .unknown;
+                defer c.gpa.free(name);
+                const sym = c.table.lookup(name) orelse return .unknown;
+                if (sym.kind != .struct_) return .unknown;
+                return .{ .record = sym.name };
+            },
+            .array => |ae| {
+                // An array of record literals of one struct is what a
+                // generic's `[T]` argument infers T from
+                // (`print_all([Color { … }])`); anything mixed or
+                // non-record stays unknown.
+                var it = ae.elements();
+                var elem: ?[]const u8 = null;
+                var any = false;
+                var all_match = true;
+                while (it.next()) |e| {
+                    const ei = try c.typeOf(e);
+                    const nm: ?[]const u8 = switch (ei) {
+                        .record => |r| r,
+                        else => null,
+                    };
+                    if (!any) {
+                        elem = nm;
+                        any = true;
+                    } else if (elem == null or nm == null or !std.mem.eql(u8, elem.?, nm.?)) {
+                        all_match = false;
+                    }
+                }
+                const n = elem orelse return .unknown;
+                if (!all_match) return .unknown;
+                return .{ .rec_array = n };
+            },
             else => return .unknown,
         }
     }
@@ -238,7 +313,7 @@ const Checker = struct {
         const is_int_value = switch (info) {
             .int_literal => true,
             .id => if (c.builtinOf(info)) |b| isInteger(b) else false,
-            .unknown => false,
+            .record, .rec_array, .unknown => false,
         };
         if (eb == .bool) {
             if (is_int_value) try c.diags.append(c.gpa, .{ .code = "TYP051", .offset = offset });
@@ -251,6 +326,36 @@ const Checker = struct {
         }
         if (isNumeric(eb) and isNumeric(vb) and eb != vb) {
             try c.diags.append(c.gpa, .{ .code = "TYP041", .offset = offset });
+        }
+    }
+
+    /// TYP200: a call argument bound to a generic's `[T]` parameter
+    /// whose inferred element type has no fit for the face bound
+    /// (spec/faces.md §"Diagnostic codes"). Fires only on provable
+    /// shapes — the face judgeable in this file (declared locally or in
+    /// the auto-prelude), the element type a local struct's record
+    /// array. Everything else stays silent; the emit path still rejects
+    /// honestly.
+    fn checkGenericBound(c: *Checker, gen_opt: ?GenericDecl, i: usize, arg: ast.Expr, info: Info) !void {
+        const gen = gen_opt orelse return;
+        const reg = c.fitreg orelse return;
+        const p = paramAt(gen.fd, i) orelse return;
+        // The param decides the judgeable shape: `[T]` takes a record
+        // array, a bare `T` takes a record value.
+        const elem: []const u8, const which: usize = if (fits.sliceOfWhich(p, gen.sig, c.gpa)) |w| switch (info) {
+            .rec_array => |n| .{ n, w },
+            else => return,
+        } else if (fits.bareWhich(p, gen.sig, c.gpa)) |w| switch (info) {
+            .record => |n| .{ n, w },
+            else => return,
+        } else return;
+        const face = gen.sig.params[which].bound orelse return;
+        if (!reg.knowsFace(face)) return;
+        if (reg.find(elem, face) == null) {
+            try c.diags.append(c.gpa, .{
+                .code = "TYP200",
+                .offset = firstTokenOffset(exprNode(arg)),
+            });
         }
     }
 
@@ -293,8 +398,8 @@ const Checker = struct {
     /// annotated standard-width integer type. `neg` marks a `-literal`.
     fn checkLiteralRange(c: *Checker, b: types.Builtin, text: []const u8, neg: bool, offset: u32) !void {
         const mag = parseIntMagnitude(c.gpa, text) orelse return; // suffixed/float/odd: skip
-        const fits = literalFits(b, mag, neg);
-        if (!fits) try c.diags.append(c.gpa, .{ .code = "TYP040", .offset = offset });
+        const in_range = literalFits(b, mag, neg);
+        if (!in_range) try c.diags.append(c.gpa, .{ .code = "TYP040", .offset = offset });
     }
 
     /// An annotated `let`'s initializer against its annotation: the
@@ -320,7 +425,7 @@ const Checker = struct {
         const is_int = switch (info) {
             .int_literal => true,
             .id => if (c.builtinOf(info)) |b| isInteger(b) else false,
-            .unknown => false,
+            .record, .rec_array, .unknown => false,
         };
         if (is_int) {
             try c.diags.append(c.gpa, .{
@@ -430,6 +535,17 @@ fn exprNode(e: ast.Expr) *const cst.Node {
     return switch (e) {
         inline else => |v| v.cst,
     };
+}
+
+/// The declaration's i-th parameter, if it has one.
+fn paramAt(fd: ast.FnDecl, i: usize) ?ast.Param {
+    const ps = fd.params() orelse return null;
+    var it = ps.iter();
+    var k: usize = 0;
+    while (it.next()) |p| : (k += 1) {
+        if (k == i) return p;
+    }
+    return null;
 }
 
 /// A bare integer literal initializer — `42` or `-42` (one negation,
@@ -597,17 +713,21 @@ fn firstTokenOffset(node: *const cst.Node) u32 {
     return 0;
 }
 
-/// Check every function body in `sf`. Caller frees the returned slice.
+/// Check every function body in `sf`. `fitreg` (when supplied) powers
+/// the TYP200 generic-bound check. Caller frees the returned slice.
 pub fn checkFile(
     gpa: std.mem.Allocator,
     sf: ast.SourceFile,
     table: *const symbols.SymbolTable,
     store: *types.TypeStore,
     sigs: *const types.Signatures,
+    fitreg: ?*const fits.Registry,
 ) ![]Diag {
-    _ = table; // named-type checks join when struct shapes land (B2)
     var diags: std.ArrayList(Diag) = .empty;
     errdefer diags.deinit(gpa);
+
+    var generics = try collectGenerics(gpa, sf);
+    defer generics.deinit(gpa);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -619,6 +739,9 @@ pub fn checkFile(
                 .gpa = gpa,
                 .store = store,
                 .sigs = sigs,
+                .table = table,
+                .fitreg = fitreg,
+                .generics = &generics,
                 .scope = .{ .gpa = gpa },
                 .diags = &diags,
             };
@@ -668,7 +791,9 @@ fn checkSource(src: []const u8) ![]Diag {
     defer store.deinit();
     var sigs = try types.collectSignatures(&store, &table, sf);
     defer sigs.deinit();
-    return checkFile(t_alloc, sf, &table, &store, &sigs);
+    var fitreg = try fits.build(t_alloc, sf);
+    defer fitreg.deinit();
+    return checkFile(t_alloc, sf, &table, &store, &sigs, &fitreg);
 }
 
 fn expectCodes(src: []const u8, expected: []const []const u8) !void {
@@ -802,4 +927,120 @@ test "check: TYP060 — mode keyword in call argument" {
         \\}
         \\
     , &.{"TYP060"});
+}
+
+test "check: TYP200 — bounded generic call, element type has no fit" {
+    // `Plain` has no `fit Plain : Display`; the bound fails. Both the
+    // literal-argument and via-binding forms fire.
+    try expectCodes(
+        \\face Display { fn fmt(self) -> str }
+        \\struct Plain { v: i64 }
+        \\fn print_all<T: Display>(items: [T]) { }
+        \\fn main { print_all([Plain { v: 1 }, Plain { v: 2 }]) }
+        \\
+    , &.{"TYP200"});
+    try expectCodes(
+        \\face Display { fn fmt(self) -> str }
+        \\struct Plain { v: i64 }
+        \\fn print_all<T: Display>(items: [T]) { }
+        \\fn main {
+        \\    let ps = [Plain { v: 1 }]
+        \\    print_all(ps)
+        \\}
+        \\
+    , &.{"TYP200"});
+    // A prelude face (no local declaration) is judgeable too.
+    try expectCodes(
+        \\struct Plain { v: i64 }
+        \\fn show_all<T: Display>(items: [T]) { }
+        \\fn main { show_all([Plain { v: 1 }]) }
+        \\
+    , &.{"TYP200"});
+}
+
+test "check: TYP200 — a bare `T` argument is judged like a `[T]` one" {
+    // A record value to a bounded bare `T` with no fit fires; a record
+    // array to the same param shape does not match (and vice versa).
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct Plain { v: i64 }
+        \\fn show<T: D>(x: T) { }
+        \\fn main { show(Plain { v: 1 }) }
+        \\
+    , &.{"TYP200"});
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct Color { r: i64 }
+        \\fit Color : D { fn fmt(self) -> str { "c" } }
+        \\fn show<T: D>(x: T) { }
+        \\fn main { show(Color { r: 1 }) }
+        \\
+    , &.{});
+}
+
+test "check: TYP200 — multi-param bounds judge each slot independently" {
+    // Only the second slot's element type lacks a fit: one TYP200.
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct NoFit { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "a" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) { }
+        \\fn main { both([A { x: 1 }], [NoFit { y: 2 }]) }
+        \\
+    , &.{"TYP200"});
+    // Both slots fit: clean.
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct B { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "a" } }
+        \\fit B : D { fn fmt(self) -> str { "b" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) { }
+        \\fn main { both([B { y: 2 }], [A { x: 1 }]) }
+        \\
+    , &.{});
+}
+
+test "check: TYP200 stays silent on fitting / unprovable shapes" {
+    // The fit exists: clean (the golden triangle's shape).
+    try expectCodes(
+        \\face Display { fn fmt(self) -> str }
+        \\struct Color { r: i64 }
+        \\fit Color : Display { fn fmt(self) -> str { "c" } }
+        \\fn print_all<T: Display>(items: [T]) { }
+        \\fn main { print_all([Color { r: 1 }]) }
+        \\
+    , &.{});
+    // Unbounded generic: nothing to check.
+    try expectCodes(
+        \\struct Plain { v: i64 }
+        \\fn each<T>(items: [T]) { }
+        \\fn main { each([Plain { v: 1 }]) }
+        \\
+    , &.{});
+    // A cross-module face is not judgeable here: silent.
+    try expectCodes(
+        \\struct Plain { v: i64 }
+        \\fn render<T: SomeoneElsesFace>(items: [T]) { }
+        \\fn main { render([Plain { v: 1 }]) }
+        \\
+    , &.{});
+    // Unknown element type (a binding the typer can't see through):
+    // silent.
+    try expectCodes(
+        \\face Display { fn fmt(self) -> str }
+        \\fn print_all<T: Display>(items: [T]) { }
+        \\fn main { print_all(mystery()) }
+        \\
+    , &.{});
+    // A mixed-element array doesn't infer one T: silent.
+    try expectCodes(
+        \\face Display { fn fmt(self) -> str }
+        \\struct A { v: i64 }
+        \\struct B { v: i64 }
+        \\fn print_all<T: Display>(items: [T]) { }
+        \\fn main { print_all([A { v: 1 }, B { v: 2 }]) }
+        \\
+    , &.{});
 }

@@ -599,6 +599,22 @@ spec/q64-cli.md `--component`).
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
+      **Decision recorded (2026-06): direct `MIR → LLVM IR`, no MLIR layer.**
+      HIR→MIR already is the multi-level lowering MLIR would provide; the
+      last hop is the *easy* direction (structured MIR → basic blocks is the
+      same label-stack walk the Binaryen `Lowerer` does — no relooper; the
+      `mir.Body.cfg` escape hatch isn't even needed for it), and MLIR's cost
+      (a huge C++ dep on a pure-Zig compiler, C API hostile from Zig, a third
+      IR) buys nothing at one CPU target. First rung when this activates:
+      emit **textual `.ll`** (zero link deps — data image as a global byte
+      array, `sp` global, structured-walk block emission, faces as `declare`d
+      externals; system `clang`/`llc` consume it), upgrade to the LLVM C API
+      later if warranted. The genuinely hard part is the native `env.*` host
+      ABI shim, not the lowering. Pin down the value-add vs `wasmtime
+      compile` (Cranelift AOT already runs the components natively) before
+      building. Revisit MLIR only if Q64 grows multi-target (GPU) or its own
+      mid-level optimization passes — and then as HIR/MIR *as dialects*, not
+      a layer on top.
 
 ## Semantic pass + struct values → static fits — NEXT (the slope-changing ladder)
 
@@ -947,13 +963,175 @@ verified, honest diagnostics throughout.
       need sema-typed field exprs; narrow-field arithmetic through
       `cs[0].r + 1` widens silently (same gap) — closes when field
       exprs are sema-typed.
+### Ladder C — enums + `match` lowering
+
+- [ ] **C — enums + `match`.** The biggest blocked language surface
+      (the conformance corpus and `errors.md` lean on `match`).
+      Rungs: C1 unit variants + statement `match` (landed below) →
+      C2 value `match` (match as an expression: arms yield a scalar)
+      → C3 payload variants (tag + payload layout in the arena;
+      `Some(v)` construction; pattern bindings) → C4 `match` on
+      scalars/strs with literal patterns → exhaustiveness diagnostics
+      in `q64 check` (the TYP3xx band) → `Option`/`Result` in the
+      prelude.
+      - [x] **C1 — all-unit enums + statement `match` in `main` (and
+            stamped generic bodies — they share the builder).**
+            A variant value is its **declaration-order tag** (an i64
+            at the compute floor; storage width + payload layout are
+            later rungs' spec work). `registerEnums` registers
+            all-unit enums (payload variants skip the enum — a use is
+            honestly Unsupported); `Enum.Variant` resolves in the
+            path arm to its tag const; an enum-valued `let`/`var`
+            registers in `Scope.enum_binds` so `match` knows the
+            scrutinee's enum. `buildMainMatch` evaluates the
+            scrutinee once into a hidden local and folds arms
+            back-to-front into an if/else chain on tag equality —
+            bare variant names resolve against the scrutinee's enum
+            (unknown name → NameNotFound), `_` is the default, and
+            the v0 floor requires structural exhaustiveness (every
+            variant or a `_`; else Unsupported — the diagnostic wire
+            is the `q64 check` rung). Arm bodies are blocks or `->`
+            expression statements (the expr-statement builder was
+            factored into `buildMainExprStmt`, shared). Verified
+            end-to-end wasm64 + wasm32 (roundtrip C1 section: slow /
+            moving+fast / direct red) + 3 unit tests (tags + chain;
+            non-exhaustive rejection; non-variant arm name). 372
+            unit / 80 CLI / 21-of-49 / roundtrips green.
+            **Boundary:** `match` as a value expression, payload
+            variants, literal patterns, enum printing (`env.out`
+            of an enum prints its tag today — the variant-name
+            formatter is a later nicety), and cross-module enums.
+
 - [ ] **B5 — generics beyond the first rung.** Monomorphization's v0
       floor landed with B4's close (one `<T: Face>` param, `[T]` slice
       params, record element types, void returns, statement calls).
-      Remaining: value-returning generic calls, multiple type params,
-      bare `T` params (needs the receiver-by-value story), scalar
-      element types, TYP200 emission in `q64 check`, const generics;
-      then `dyn` dispatch; enums + `match` lowering (separate ladders).
+      Remaining: const generics; then `dyn` dispatch (separate ladder).
+      - [x] **Record `-> T` returns.** The `-> T` story closes: a
+            generic whose T infers to a record returns its base pointer
+            (`first<Color> -> ptr`), with the instance registered in
+            `fn_recs` (ret + per-param struct info) so callers know.
+            The pieces: `genericRecCall` intercepts `buildRecExpr`'s
+            call arm (cheap `-> T` pre-check, then infer/stamp and read
+            `fn_recs.ret`); the stamp's value tail builds via
+            `buildRecExpr` when the return is a record (struct-checked);
+            `main`'s let arm gates record-call bindings on a
+            `buildRecExpr` probe for `.call` initializers instead of
+            the name-based `recCallStruct` (a bare `let q = p` stays
+            the documented copy-rejection, not a silent alias). So
+            `let c = first([Color{…}, …]); c.fmt(); let d = idr(c)`
+            binds, dispatches, reads fields, and chains. Printing a
+            whole record value stays unsupported. Verified end-to-end
+            wasm64 + wasm32 (roundtrip bare-T section extended:
+            `rgb(9, 8)` / `8`) + 2 unit tests. 368 unit / 80 CLI /
+            21-of-49 / roundtrips green.
+      - [x] **Method dispatch on generic call expressions.**
+            `first([Color{…}]).fmt()` / `.area()` and
+            `idr(Color{…}).r` work without binding first:
+            `genericRetStruct` is the non-building twin of
+            `genericRecCall` — `recvStruct`'s call arm peeks a generic
+            callee's `-> T` slot from the deciding argument (record
+            literal → `b.structs`; bindings/index/calls recurse through
+            `recvStruct`; slice args read `Scope.arrs` or the literal's
+            first element) so the str/int routing predicates
+            (`isStrCall` → fit-method return type) classify correctly;
+            the *building* method arms already went through the
+            generic-aware `buildRecExpr`. **Boundary (pre-existing, not
+            generic-specific):** a call-receiver method inside
+            interpolation (`"{first(cs).fmt()}"` — and equally
+            `"{make(1,2).fmt()}"`) isn't a recognized interpolation
+            piece shape; bind first. Verified end-to-end wasm64 +
+            wasm32 (roundtrip: `rgb(4, 5)` / `6`) + 1 unit test.
+            369 unit / 80 CLI / 21-of-49 / roundtrips green.
+      - [x] **Bare `T` params + scalar `-> T` returns.** The feared
+            "receiver-by-value story" mostly dissolved: a record T
+            already crosses calls as its base pointer (B2b), so
+            `fn show<T: Display>(x: T)` takes a record literal or
+            binding (`x.fmt()` dispatches — the param registers in
+            `recs`), and a scalar T is a plain scalar param. `-> T`
+            returns the slot's scalar — `twice(21)` is i64,
+            `twice(1.5)` is f64, `first([10, 20])` reads `[T]` element
+            type — typed correctly at the *caller* too: `Env.callRet`
+            now carries the CallExpr, so the build_hir bridge infers a
+            generic `-> T` call's scalar from the deciding argument
+            (`genericRet`; bare arg's type or slice arg's element).
+            `fits.bareWhich`/`typeWhich` join `sliceOfWhich`; slice/
+            bare/concrete params mix on one slot (`nth_plus`). TYP200
+            judges bare record args like record arrays. Honest
+            boundaries: record `-> T` rejects (needs caller fn_recs
+            plumbing), scalar-to-bounded-bare rejects (no scalar
+            fits). Verified end-to-end wasm64 + wasm32 (link-roundtrip
+            bare-T section) + 4 unit tests. 367 unit / 80 CLI /
+            21-of-49 / roundtrips green.
+      - [x] **Multiple type params.** `fn both<T: D, U: D>(xs: [T],
+            ys: [U])` works: `sema.fits.GenericSig` is a bounded list
+            (`max_generic_params` = 4; `parseGenericSig` scans
+            `< T (: F)? (, …)* >`), `sliceOfWhich` maps a fn param to
+            its slot, inference fills one `TSlot` (ElemKind + stride)
+            per slot independently (every slot needs a `[T]` inference
+            source), bounds check per slot, and the stamp key joins all
+            slot names — so `both<A, B>` and `both<B, A>` are distinct
+            instances and `zipped_count<i64, f64>` mixes scalar slots
+            in a value-returning generic. sema's TYP200 resolves the
+            bound per slice param too (the multi-param fixture shape
+            judges each slot). Verified end-to-end wasm64 + wasm32
+            (link-roundtrip multi-param section) + 3 unit tests (both
+            orders + mixed-scalar value; non-fitting second slot;
+            TYP200 per-slot). 364 unit / 80 CLI / 21-of-49 /
+            roundtrips green.
+      - [x] **Value-returning generic calls.** A `-> i64`/`bool`/`f64`/
+            `f32` generic stamps a *value* instance: `count_of(xs)`,
+            `let n = total(xs)`, `count_of(xs) + 100`, and a bounded
+            `total_area<T: HasArea>` summing `r.area()` over the slice
+            all work. The pieces: `buildGenericCallStmt` split into a
+            shared `buildGenericCall` (inference/bound/stamp walk → call
+            expr) + the void statement wrapper; `buildIntExpr`'s call
+            arm intercepts generic callees before `registerFunc`;
+            `stampGeneric` reads the declared return scalar and builds
+            the body's last statement as the value tail (tail expr or
+            `return expr` — entry-style statements before it, so
+            for-loops and `env.out` still work); `lower` gives a
+            value-returning screen func `lowerIntBlock(body, ret)`
+            instead of the void entry lowering (the setup-statement set
+            is shared, so nothing else changed). `-> T` rejects
+            honestly (needs by-value T). Verified end-to-end wasm64 +
+            wasm32 (link-roundtrip value-generics section: 26 /
+            total = 60 / 102) + 2 unit tests (value stamps incl. f64
+            elements; `-> T` rejection). 361 unit / 80 CLI / 21-of-49 /
+            roundtrips green.
+      - [x] **Scalar element types.** An *unbounded* generic stamps per
+            scalar element type too: `each([10, 20])` → `each<i64>`,
+            `each([1.5])` → `each<f64>` (deduped per T like records;
+            literal and binding arguments). The gate was one rejection:
+            inference now carries `ElemKind` (record or scalar) instead
+            of a StructInfo, `stampGeneric` takes elem+stride and keys
+            the instance by `@tagName` for scalars, and the stamped
+            body reuses the existing scalar-array machinery (`for`
+            loads at width, `{x}` formats by local type). A *bounded*
+            generic still takes record elements only — scalars have no
+            fits yet, so `show_all<T: D>([1, 2])` rejects honestly.
+            Verified end-to-end wasm64 + wasm32 (link-roundtrip B5
+            section) + 2 unit tests (per-type stamp + dedup; the
+            scalar-vs-bound rejection). 359 unit / 80 CLI / 21-of-49 /
+            roundtrips green.
+      - [x] **TYP200 emitted in `q64 check`** (B4's diagnostic
+            follow-up). The check pass owns the generic bound check:
+            `GenericSig` parsing + `[T]`-param detection moved to
+            `sema/fits.zig` (shared with the emit path's
+            monomorphization — ir already imports sema), the checker
+            types record literals (`Info.record`, via the symbol table
+            that checkFile already received) and arrays-of-records
+            (`Info.rec_array`, all elements one local struct), and a
+            call argument bound to a face-bounded generic's `[T]`
+            param with no (target, face) fit in the registry emits
+            **TYP200** at the argument. Honesty rules: fires only when
+            the face is judgeable locally (declared or auto-prelude)
+            and the element type is a provable local-struct record
+            array; unbounded generics, unknown faces, unknown/mixed
+            elements stay silent. The fit registry now feeds `checkFile`
+            (built once in `cmdCheck`, also kept for TYP201/202). New
+            conformance fixture `faces/no-fit-for-bound.q` flips
+            (**21/49**, zero regressions); 357 unit (2 new) / 80 CLI
+            (1 new TYP200 envelope case) / link-roundtrip green.
 
 ## Numeric tower — floats (f64 landed; f32 next)
 

@@ -59,12 +59,17 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
             for (hf.params, 0..) |p, j| params[j] = mapType(p.ty);
             const locals = try a.alloc(mir.ValueType, hf.locals.len);
             for (hf.locals, 0..) |t, j| locals[j] = mapType(t);
+            // A *value-returning* screen func (a stamped generic with
+            // `-> i64` etc.) lowers its body as a value block: the same
+            // entry statement set, with the last statement as the value
+            // tail. The entry and void handlers stay the void lowering.
+            const vty: ?mir.ValueType = if (!is_entry and hf.ret != .void) mapType(hf.ret) else null;
             funcs[i] = .{
                 .name = if (is_entry) "start" else try a.dupeZ(u8, hf.name),
                 .params = params,
-                .ret = .void,
+                .ret = vty orelse .void,
                 .locals = locals,
-                .body = .{ .structured = try lowerEntry(ctx, hf.body) },
+                .body = .{ .structured = if (vty) |t| try lowerIntBlock(ctx, hf.body, t) else try lowerEntry(ctx, hf.body) },
                 .linkage = if (is_entry) .entry else .local,
                 .exported = (!is_entry and hf.visibility == .public),
             };

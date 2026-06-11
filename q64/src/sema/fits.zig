@@ -73,7 +73,106 @@ pub const Registry = struct {
         }
         return null;
     }
+
+    /// Is `name` a face this file can judge — declared (and classified)
+    /// locally, or an auto-prelude face? Anything else is the NAM story
+    /// (cross-module faces), and bound checks stay silent on it.
+    pub fn knowsFace(self: *const Registry, name: []const u8) bool {
+        if (self.faces.contains(name)) return true;
+        const pk = prelude.kindOf(name) orelse return false;
+        return pk == .face;
+    }
 };
+
+// ---------------------------------------------------------------------
+// Generic signatures (the B5 v0 floor) — shared between the TYP200
+// bound check (sema/check.zig) and the emit path's monomorphization
+// (ir/build_hir.zig).
+// ---------------------------------------------------------------------
+
+pub const max_generic_params = 4;
+
+/// One type parameter: `T` / `T: Face`.
+pub const GenericParam = struct { tname: []const u8, bound: ?[]const u8 };
+
+/// The parsed `<T: Display, U>` span (the B5 floor: plain type params
+/// with optional single-face bounds; effect params, defaults, and
+/// `where` clauses are later slices).
+pub const GenericSig = struct {
+    params: [max_generic_params]GenericParam,
+    n: usize,
+};
+
+/// Parse the raw `<T: Display, U>` span. `null` for anything beyond
+/// the floor (so the caller stays honest about it).
+pub fn parseGenericSig(gp: *const cst.Node) ?GenericSig {
+    var toks: [2 + 4 * max_generic_params]cst.Token = undefined;
+    var n: usize = 0;
+    for (gp.children) |ch| switch (ch) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            if (n == toks.len) return null;
+            toks[n] = t;
+            n += 1;
+        },
+        .node => return null,
+    };
+    if (n < 3 or toks[0].kind != .L_ANGLE or toks[n - 1].kind != .R_ANGLE) return null;
+
+    var out = GenericSig{ .params = undefined, .n = 0 };
+    var i: usize = 1;
+    while (i < n - 1) {
+        if (toks[i].kind != .IDENT or out.n == max_generic_params) return null;
+        var p = GenericParam{ .tname = toks[i].text, .bound = null };
+        i += 1;
+        if (i < n - 1 and toks[i].kind == .COLON) {
+            if (i + 1 >= n - 1 or toks[i + 1].kind != .IDENT) return null;
+            p.bound = toks[i + 1].text;
+            i += 2;
+        }
+        out.params[out.n] = p;
+        out.n += 1;
+        if (i < n - 1) {
+            if (toks[i].kind != .COMMA) return null;
+            i += 1; // a trailing comma before `>` is fine
+        }
+    }
+    if (out.n == 0) return null;
+    return out;
+}
+
+/// Which of the signature's type params this fn param is a `[T]`
+/// slice of, if any (the index into `sig.params`).
+pub fn sliceOfWhich(p: ast.Param, sig: GenericSig, a: std.mem.Allocator) ?usize {
+    const te = p.type_() orelse return null;
+    const sl = switch (te) {
+        .slice => |x| x,
+        else => return null,
+    };
+    return typeWhich(sl.element() orelse return null, sig, a);
+}
+
+/// Which of the signature's type params this fn param is a *bare* `T`
+/// of, if any.
+pub fn bareWhich(p: ast.Param, sig: GenericSig, a: std.mem.Allocator) ?usize {
+    return typeWhich(p.type_() orelse return null, sig, a);
+}
+
+/// Which of the signature's type params a type expression names bare
+/// (`T`, no generic args), if any.
+pub fn typeWhich(te: ast.TypeExpr, sig: GenericSig, a: std.mem.Allocator) ?usize {
+    const pt = switch (te) {
+        .path => |x| x,
+        else => return null,
+    };
+    if (pt.hasGenericArgs()) return null;
+    const nm = pt.name(a) catch return null;
+    defer a.free(nm);
+    for (sig.params[0..sig.n], 0..) |gp, i| {
+        if (std.mem.eql(u8, nm, gp.tname)) return i;
+    }
+    return null;
+}
 
 /// Build the registry for `sf` and run the fit-form checks. The caller
 /// owns the result (`deinit`).

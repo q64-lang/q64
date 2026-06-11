@@ -964,4 +964,232 @@ if [[ "$gen_out" != $'A1\nA2\nB9' ]]; then
 fi
 echo "    ok: GOLDEN RUNS -> rgb(255,0,0)/rgb(0,255,0)/rgb(0,0,255) (wasm64 + wasm32); A1/A2/B9"
 
+# ---------------------------------------------------------------------------
+# B5 (scalar element types): an unbounded generic stamps per scalar type —
+# each<i64> / each<f64> — over literals and bindings, on both address spaces.
+# ---------------------------------------------------------------------------
+echo "==> B5: scalar-element generics — each<i64> / each<f64>"
+scal_app="$tmp/genscal.q"
+cat > "$scal_app" <<'Q64'
+fn each<T>(items: [T]) {
+    for x in items {
+        env.out("- {x}")
+    }
+}
+fn main {
+    each([10, 20, 30])
+    each([1.5, 2.5])
+    let xs = [7, 8]
+    each(xs)
+}
+Q64
+scal_expected=$'- 10\n- 20\n- 30\n- 1.5\n- 2.5\n- 7\n- 8'
+"$Q64_BIN" emit "$scal_app" "$tmp/genscal.wasm"
+scal_out="$("$HOST_BIN" "$tmp/genscal.wasm")"
+if [[ "$scal_out" != "$scal_expected" ]]; then
+    echo "FAIL: scalar-generic output mismatch (got: $scal_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$scal_app" "$tmp/genscal32.wasm" --addr wasm32
+scal32_out="$("$HOST_BIN" "$tmp/genscal32.wasm")"
+if [[ "$scal32_out" != "$scal_expected" ]]; then
+    echo "FAIL: scalar-generic wasm32 output mismatch (got: $scal32_out)" >&2
+    exit 1
+fi
+echo "    ok: each<i64> + each<f64> -> 10/20/30, 1.5/2.5, 7/8 via binding (wasm64 + wasm32)"
+
+# ---------------------------------------------------------------------------
+# B5 (value-returning generic calls): a `-> i64` generic stamps a value
+# instance — tail expr (count_of) and for-loop + return (total, and
+# total_area dispatching a fit method on the iterated record) — usable in
+# env.out, let bindings, and arithmetic composition.
+# ---------------------------------------------------------------------------
+echo "==> B5: value-returning generics — count_of / total / total_area"
+vgen_app="$tmp/genval.q"
+cat > "$vgen_app" <<'Q64'
+face HasArea { fn area(self) -> i64 }
+struct Rect { w: i64, h: i64 }
+fit Rect : HasArea { fn area(self) -> i64 { self.w * self.h } }
+fn total_area<T: HasArea>(items: [T]) -> i64 {
+    var n = 0
+    for r in items {
+        n = n + r.area()
+    }
+    n
+}
+fn count_of<T>(items: [T]) -> i64 {
+    items.len
+}
+fn total<T>(items: [T]) -> i64 {
+    var n = 0
+    for x in items {
+        n = n + x
+    }
+    return n
+}
+fn main {
+    env.out(total_area([Rect { w: 2, h: 3 }, Rect { w: 4, h: 5 }]))
+    let xs = [10, 20, 30]
+    let n = total(xs)
+    env.out("total = {n}")
+    env.out(count_of([1.5, 2.5]) + 100)
+}
+Q64
+vgen_expected=$'26\ntotal = 60\n102'
+"$Q64_BIN" emit "$vgen_app" "$tmp/genval.wasm"
+vgen_out="$("$HOST_BIN" "$tmp/genval.wasm")"
+if [[ "$vgen_out" != "$vgen_expected" ]]; then
+    echo "FAIL: value-generic output mismatch (got: $vgen_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$vgen_app" "$tmp/genval32.wasm" --addr wasm32
+vgen32_out="$("$HOST_BIN" "$tmp/genval32.wasm")"
+if [[ "$vgen32_out" != "$vgen_expected" ]]; then
+    echo "FAIL: value-generic wasm32 output mismatch (got: $vgen32_out)" >&2
+    exit 1
+fi
+echo "    ok: total_area/total/count_of -> 26 / total = 60 / 102 (wasm64 + wasm32)"
+
+# ---------------------------------------------------------------------------
+# B5 (multiple type params): each slot infers independently — both<A, B> and
+# both<B, A> are distinct instances; a value-returning <T, U> mixes scalars.
+# ---------------------------------------------------------------------------
+echo "==> B5: multi-param generics — both<T: D, U: D> / zipped_count<T, U>"
+mgen_app="$tmp/genmulti.q"
+cat > "$mgen_app" <<'Q64'
+face D { fn fmt(self) -> str }
+struct A { x: i64 }
+struct B { y: i64 }
+fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+fit B : D { fn fmt(self) -> str { "B{self.y}" } }
+fn both<T: D, U: D>(xs: [T], ys: [U]) {
+    for x in xs { env.out(x.fmt()) }
+    for y in ys { env.out(y.fmt()) }
+}
+fn zipped_count<T, U>(xs: [T], ys: [U]) -> i64 {
+    xs.len + ys.len
+}
+fn main {
+    both([A { x: 1 }], [B { y: 2 }, B { y: 3 }])
+    both([B { y: 7 }], [A { x: 8 }])
+    env.out(zipped_count([1, 2, 3], [1.5]))
+}
+Q64
+mgen_expected=$'A1\nB2\nB3\nB7\nA8\n4'
+"$Q64_BIN" emit "$mgen_app" "$tmp/genmulti.wasm"
+mgen_out="$("$HOST_BIN" "$tmp/genmulti.wasm")"
+if [[ "$mgen_out" != "$mgen_expected" ]]; then
+    echo "FAIL: multi-param generic output mismatch (got: $mgen_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$mgen_app" "$tmp/genmulti32.wasm" --addr wasm32
+mgen32_out="$("$HOST_BIN" "$tmp/genmulti32.wasm")"
+if [[ "$mgen32_out" != "$mgen_expected" ]]; then
+    echo "FAIL: multi-param generic wasm32 output mismatch (got: $mgen32_out)" >&2
+    exit 1
+fi
+echo "    ok: both<A, B> + both<B, A> + zipped_count<i64, f64> -> A1/B2/B3/B7/A8/4 (wasm64 + wasm32)"
+
+# ---------------------------------------------------------------------------
+# B5 (bare T params + -> T returns): a record T passes as its base pointer
+# (fit dispatch works on it), a scalar T by value; `-> T` follows the slot
+# (twice<i64> -> i64, twice<f64> -> f64); slice/bare/concrete params mix.
+# ---------------------------------------------------------------------------
+echo "==> B5: bare-T generics — show<T: D>(x: T) / twice<T>(x: T) -> T"
+bgen_app="$tmp/genbare.q"
+cat > "$bgen_app" <<'Q64'
+face Display { fn fmt(self) -> str }
+struct Color { r: i64, g: i64 }
+fit Color : Display { fn fmt(self) -> str { "rgb({self.r}, {self.g})" } }
+fn show<T: Display>(x: T) {
+    env.out(x.fmt())
+}
+fn twice<T>(x: T) -> T {
+    x + x
+}
+fn first<T>(items: [T]) -> T {
+    items[0]
+}
+fn nth_plus<T>(xs: [T], i: i64, fallback: T) -> i64 {
+    fallback + xs.len + i
+}
+fn idr<T>(x: T) -> T {
+    x
+}
+fn main {
+    show(Color { r: 255, g: 0 })
+    let c = Color { r: 1, g: 2 }
+    show(c)
+    env.out(twice(21))
+    env.out(twice(1.5))
+    env.out(first([10, 20]))
+    env.out(nth_plus([10, 20], 5, 100))
+    let f = first([Color { r: 9, g: 8 }, Color { r: 1, g: 2 }])
+    env.out(f.fmt())
+    let g = idr(f)
+    env.out(g.g)
+    env.out(first([Color { r: 4, g: 5 }]).fmt())
+    env.out(idr(Color { r: 6, g: 7 }).r)
+}
+Q64
+bgen_expected=$'rgb(255, 0)\nrgb(1, 2)\n42\n3.0\n10\n107\nrgb(9, 8)\n8\nrgb(4, 5)\n6'
+"$Q64_BIN" emit "$bgen_app" "$tmp/genbare.wasm"
+bgen_out="$("$HOST_BIN" "$tmp/genbare.wasm")"
+if [[ "$bgen_out" != "$bgen_expected" ]]; then
+    echo "FAIL: bare-T generic output mismatch (got: $bgen_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$bgen_app" "$tmp/genbare32.wasm" --addr wasm32
+bgen32_out="$("$HOST_BIN" "$tmp/genbare32.wasm")"
+if [[ "$bgen32_out" != "$bgen_expected" ]]; then
+    echo "FAIL: bare-T generic wasm32 output mismatch (got: $bgen32_out)" >&2
+    exit 1
+fi
+echo "    ok: show<Color> + twice<i64/f64> + first<i64/Color> + idr<Color> + dispatch-on-call-expr -> rgb/42/3.0/10/107/rgb(9, 8)/8/rgb(4, 5)/6 (wasm64 + wasm32)"
+
+# ---------------------------------------------------------------------------
+# C1 (enums + match, first rung): all-unit enums — a variant value is its
+# declaration-order tag; statement `match` lowers to an if/else chain with
+# bare-variant-name arms, a `_` default, and structural exhaustiveness.
+# ---------------------------------------------------------------------------
+echo "==> C1: enums + match — unit variants, tags, wildcard"
+enum_app="$tmp/enum1.q"
+cat > "$enum_app" <<'Q64'
+enum Light { Red, Yellow, Green }
+fn main {
+    var l = Light.Yellow
+    match l {
+        Red -> env.out("stop"),
+        Yellow -> env.out("slow"),
+        Green -> env.out("go"),
+    }
+    l = Light.Green
+    match l {
+        Red -> env.out("stop"),
+        _ -> {
+            env.out("moving")
+            env.out("fast")
+        },
+    }
+    match Light.Red {
+        Red -> env.out("direct red"),
+        _ -> env.out("other"),
+    }
+}
+Q64
+enum_expected=$'slow\nmoving\nfast\ndirect red'
+"$Q64_BIN" emit "$enum_app" "$tmp/enum1.wasm"
+enum_out="$("$HOST_BIN" "$tmp/enum1.wasm")"
+if [[ "$enum_out" != "$enum_expected" ]]; then
+    echo "FAIL: enum/match output mismatch (got: $enum_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$enum_app" "$tmp/enum1-32.wasm" --addr wasm32
+enum32_out="$("$HOST_BIN" "$tmp/enum1-32.wasm")"
+if [[ "$enum32_out" != "$enum_expected" ]]; then
+    echo "FAIL: enum/match wasm32 output mismatch (got: $enum32_out)" >&2
+    exit 1
+fi
+echo "    ok: match on Light -> slow / moving+fast / direct red (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

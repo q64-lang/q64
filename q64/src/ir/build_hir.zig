@@ -119,6 +119,9 @@ const Builder = struct {
     /// spec/memory.md §"Linear struct layout". Struct-typed signatures resolve
     /// against this table (v0: the compiling file's structs only).
     structs: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
+    /// This file's all-unit enum declarations (C1): a variant value is
+    /// its declaration-order tag (an i64 at the compute floor).
+    enums: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
     /// The fit registry (sema/fits.zig) over this file — B4 static
     /// dispatch resolves `p.area()` through it. Arena-backed (never
     /// deinit'd separately).
@@ -234,6 +237,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // fields outside the v0 floor (i64 / bool) are skipped, not rejected —
     // a *use* of one surfaces the honest Unsupported.
     try registerStructs(b, sf);
+    // Pass 0.55: register this file's all-unit enum declarations (C1) —
+    // a variant value is its declaration-order tag. Enums with payload
+    // variants are skipped (a *use* surfaces the honest Unsupported).
+    try registerEnums(b, sf);
     // Pass 0.6: the fit registry (B4) — `p.area()` dispatches through it.
     // Its form diagnostics (TYP201/202) belong to `q64 check`, not emit.
     b.fitreg = try sema.fits.build(b.a, sf);
@@ -369,10 +376,13 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = arr.e } };
                 try out.append(b.a, st);
-            } else if (try recCallStruct(b, init_expr)) |_| {
-                // `let p = make(3, 4)` — a record-returning call: bind the
-                // returned base pointer (the record lives in the scope arena).
-                const rv = (try buildRecExpr(b, init_expr, scope)) orelse return error.Unsupported;
+            } else if (if (init_expr == .call) try buildRecExpr(b, init_expr, scope) else null) |rv| {
+                // `let p = make(3, 4)` / `let c = first([...])` — a
+                // record-returning call (incl. a generic whose `-> T`
+                // inferred to a record): bind the returned base pointer
+                // (the record lives in the scope arena). Gated on `.call`
+                // so a bare `let q = p` stays the documented
+                // whole-record-copy rejection, not a silent alias.
                 try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
             } else {
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
@@ -394,85 +404,19 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = value } };
                 try out.append(b.a, st);
+                // An enum-valued initializer (`var c = Color.Red`, or a
+                // copy of another enum binding): remember the enum so
+                // `match` resolves bare variant names against it.
+                if (try enumOfExpr(b, scope, init_expr)) |info| {
+                    try scope.enum_binds.put(b.a, nm.text, info);
+                }
             }
         },
         .expr_stmt => |es| {
             const expr = es.expression() orelse return error.Unsupported;
-            const call = switch (expr) {
-                .call => |cc| cc,
-                else => return error.Unsupported,
-            };
-            // A statement-position call to a face-bounded generic function
-            // (`print_all(colors)` / `print_all([...])`): monomorphize per
-            // the inferred element type and call the stamped instance (B5).
-            if (callPathName(b, call)) |gn| {
-                defer b.a.free(gn);
-                if (std.mem.indexOfScalar(u8, gn, '.') == null) {
-                    if (b.resolver.lookup(gn)) |fd| {
-                        if (fd.isGeneric()) {
-                            try out.append(b.a, try buildGenericCallStmt(b, gn, fd, call, scope));
-                            return;
-                        }
-                    }
-                }
-            }
-            // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`
-            // or `qview.set_text(80, 9, "…")`): str args flow as (ptr, len), the
-            // rest as i64; no return. The backend declares the matching import.
-            if (try hostFaceName(b, call)) |fname| {
-                var args: std.ArrayList(*hir.Expr) = .empty;
-                var ait = call.args();
-                while (ait.next()) |a| try args.append(b.a, try buildHostArg(b, a, scope, rt));
-                const st = try b.a.create(hir.Stmt);
-                st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
-                try out.append(b.a, st);
-                return;
-            }
-            if (!isEnvOut(b.a, call)) return reject(b, .unsupported_call);
-            const arg = firstArg(call) orelse return error.Unsupported;
-
-            const st = try b.a.create(hir.Stmt);
-            if (try tryConst(b, arg)) |bytes| {
-                // A constant string/number/interpolation → fold into the data.
-                const e = try b.a.create(hir.Expr);
-                e.* = .{ .str_const = bytes };
-                st.* = .{ .host_out = e };
-            } else if (arg == .path and rt.get(try pathText(b, arg.path)) != null) {
-                // env.out(g) where g is a runtime str binding.
-                const bnd = rt.get(try pathText(b, arg.path)).?;
-                const e = try b.a.create(hir.Expr);
-                e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
-                st.* = .{ .host_out_str = e };
-            } else if (arg == .string_lit) {
-                // A string literal with interpolation. If it folds entirely to
-                // a constant (e.g. only untyped fold-only helpers), emit a
-                // folded `host_out`; otherwise a runtime concat.
-                const v = try buildConcat(b, arg.string_lit, scope, false, rt);
-                st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
-            } else if (try isStrCall(b, arg, scope)) {
-                // A real call to a str-returning function.
-                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
-            } else if (try exprIsBool(b, arg, scope)) {
-                // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
-                // binding, or a `-> bool` call. Printed as "true" / "false".
-                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
-            } else if (isFloatSc(try exprScalar(b, arg, scope))) {
-                // A float: formatted via __fmt_f64 (decimal, ≤6 frac
-                // digits); an f32 promotes to f64 first — one formatter.
-                var fv = try buildIntExpr(b, arg, scope);
-                if ((try exprScalar(b, arg, scope)) == .f32) {
-                    const w = try b.a.create(hir.Expr);
-                    w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
-                    fv = w;
-                }
-                st.* = .{ .host_out_float = fv };
-            } else {
-                // Otherwise an i64 expression (a call to an i64 function).
-                const e = try buildIntExpr(b, arg, scope);
-                st.* = .{ .host_out_int = e };
-            }
-            try out.append(b.a, st);
+            try buildMainExprStmt(b, expr, scope, rt, out);
         },
+        .match_stmt => |ms| try buildMainMatch(b, ms, scope, rt, out),
         .assign_stmt => |as| {
             const tgt = as.target() orelse return error.Unsupported;
             const tpath = switch (tgt) {
@@ -659,6 +603,175 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
         },
         else => return error.Unsupported,
     }
+}
+
+/// C1: a statement-position `match` on an all-unit enum value. The
+/// scrutinee evaluates once into a hidden i64 local; arms lower to an
+/// if/else chain on tag equality. v0 floor: arm patterns are bare
+/// variant names (resolved against the scrutinee's enum) or `_`; the
+/// match must be exhaustive (every variant covered, or a `_` arm).
+fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const scrut = ms.scrutinee() orelse return error.Unsupported;
+    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+
+    // Evaluate the scrutinee once.
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const s_idx = try scope.declare("#match", false, .i64);
+    try b.cur_locals.append(b.a, .i64);
+    const sval = try buildIntExpr(b, scrut, scope);
+    const set = try b.a.create(hir.Stmt);
+    set.* = .{ .let = .{ .idx = s_idx, .value = sval } };
+    try out.append(b.a, set);
+
+    // Collect the arms: (tag, body) pairs + at most one `_` default.
+    const Arm = struct { tag: i64, body: *hir.Stmt };
+    var arms: std.ArrayList(Arm) = .empty;
+    defer arms.deinit(b.a);
+    var default: ?*hir.Stmt = null;
+    var covered: usize = 0;
+    var it = ms.arms();
+    while (it.next()) |arm| {
+        const pat = arm.pattern() orelse return error.Unsupported;
+        const body = try buildMatchArmBody(b, arm, scope, rt);
+        switch (pat.kind()) {
+            .WILD_PATTERN => {
+                if (default != null) return error.Unsupported; // two `_` arms
+                default = body;
+            },
+            .IDENT_PATTERN => {
+                const nm = pat.bindingName() orelse return error.Unsupported;
+                const tag = for (info.variants, 0..) |v, i| {
+                    if (std.mem.eql(u8, v, nm.text)) break @as(i64, @intCast(i));
+                } else return reject(b, .name_not_found); // not a variant of this enum
+                try arms.append(b.a, .{ .tag = tag, .body = body });
+                covered += 1;
+            },
+            else => return error.Unsupported, // payload/literal patterns: later rungs
+        }
+    }
+    // Exhaustiveness (spec/grammar.md leaves the rules open; the v0
+    // floor requires it structurally): every variant, or a default.
+    if (default == null and covered < info.variants.len) return error.Unsupported;
+
+    // Fold the arms back-to-front into an if/else chain on the tag.
+    // The lowering reads branch payloads as blocks, so a nested `if`
+    // (the rest of the chain) wraps in a one-statement block.
+    var chain: ?*hir.Stmt = default;
+    var i = arms.items.len;
+    while (i > 0) {
+        i -= 1;
+        const a = arms.items[i];
+        const sread = try b.a.create(hir.Expr);
+        sread.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
+        const tagv = try b.a.create(hir.Expr);
+        tagv.* = .{ .int_const = a.tag };
+        const cond = try b.a.create(hir.Expr);
+        cond.* = .{ .bin = .{ .kind = .eq, .lhs = sread, .rhs = tagv } };
+        var else_part = chain;
+        if (else_part) |ep| {
+            if (ep.* == .if_) {
+                const wrap = try b.a.create(hir.Stmt);
+                wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{ep}) };
+                else_part = wrap;
+            }
+        }
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .if_ = .{ .cond = cond, .then_ = a.body, .else_ = else_part } };
+        chain = st;
+    }
+    if (chain) |c| try out.append(b.a, c);
+}
+
+/// A match arm's body as one HIR block: a `{ … }` block of statements,
+/// or a single `->` expression statement.
+fn buildMatchArmBody(b: *Builder, arm: ast.MatchArm, scope: *Scope, rt: *RtMap) BuildError!*hir.Stmt {
+    if (arm.block()) |blk| return buildMainBlock(b, blk, scope, rt);
+    const e = arm.expression() orelse return error.Unsupported;
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    try buildMainExprStmt(b, e, scope, rt, &items);
+    const blkst = try b.a.create(hir.Stmt);
+    blkst.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return blkst;
+}
+
+/// Build one of `main`'s expression statements — a statement-position
+/// generic call, a host-face call, or `env.out(…)`. Shared by the
+/// expr-statement arm and `match` arm bodies.
+fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const call = switch (expr) {
+        .call => |cc| cc,
+        else => return error.Unsupported,
+    };
+            // A statement-position call to a face-bounded generic function
+            // (`print_all(colors)` / `print_all([...])`): monomorphize per
+            // the inferred element type and call the stamped instance (B5).
+            if (callPathName(b, call)) |gn| {
+                defer b.a.free(gn);
+                if (std.mem.indexOfScalar(u8, gn, '.') == null) {
+                    if (b.resolver.lookup(gn)) |fd| {
+                        if (fd.isGeneric()) {
+                            try out.append(b.a, try buildGenericCallStmt(b, gn, fd, call, scope));
+                            return;
+                        }
+                    }
+                }
+            }
+            // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`
+            // or `qview.set_text(80, 9, "…")`): str args flow as (ptr, len), the
+            // rest as i64; no return. The backend declares the matching import.
+            if (try hostFaceName(b, call)) |fname| {
+                var args: std.ArrayList(*hir.Expr) = .empty;
+                var ait = call.args();
+                while (ait.next()) |a| try args.append(b.a, try buildHostArg(b, a, scope, rt));
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
+                try out.append(b.a, st);
+                return;
+            }
+            if (!isEnvOut(b.a, call)) return reject(b, .unsupported_call);
+            const arg = firstArg(call) orelse return error.Unsupported;
+
+            const st = try b.a.create(hir.Stmt);
+            if (try tryConst(b, arg)) |bytes| {
+                // A constant string/number/interpolation → fold into the data.
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .str_const = bytes };
+                st.* = .{ .host_out = e };
+            } else if (arg == .path and rt.get(try pathText(b, arg.path)) != null) {
+                // env.out(g) where g is a runtime str binding.
+                const bnd = rt.get(try pathText(b, arg.path)).?;
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+                st.* = .{ .host_out_str = e };
+            } else if (arg == .string_lit) {
+                // A string literal with interpolation. If it folds entirely to
+                // a constant (e.g. only untyped fold-only helpers), emit a
+                // folded `host_out`; otherwise a runtime concat.
+                const v = try buildConcat(b, arg.string_lit, scope, false, rt);
+                st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
+            } else if (try isStrCall(b, arg, scope)) {
+                // A real call to a str-returning function.
+                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
+            } else if (try exprIsBool(b, arg, scope)) {
+                // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
+                // binding, or a `-> bool` call. Printed as "true" / "false".
+                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
+            } else if (isFloatSc(try exprScalar(b, arg, scope))) {
+                // A float: formatted via __fmt_f64 (decimal, ≤6 frac
+                // digits); an f32 promotes to f64 first — one formatter.
+                var fv = try buildIntExpr(b, arg, scope);
+                if ((try exprScalar(b, arg, scope)) == .f32) {
+                    const w = try b.a.create(hir.Expr);
+                    w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
+                    fv = w;
+                }
+                st.* = .{ .host_out_float = fv };
+            } else {
+                // Otherwise an i64 expression (a call to an i64 function).
+                const e = try buildIntExpr(b, arg, scope);
+                st.* = .{ .host_out_int = e };
+            }
+            try out.append(b.a, st);
 }
 
 /// Build a `{ … }` block of `main` statements into one HIR block.
@@ -1577,6 +1690,82 @@ fn buildNarrowValue(b: *Builder, ty: hir.Type, fval: ast.Expr) BuildError!*hir.E
 /// alignment, size rounded up to the struct alignment). A struct with a
 /// field outside the v0 floor — or with no record fields at all — is not
 /// registered; a use of it stays the honest `Unsupported`.
+/// An all-unit enum: its name and variant names in declaration order
+/// (a variant's tag is its index).
+const EnumInfo = struct { name: []const u8, variants: []const []const u8 };
+
+/// Register this file's all-unit enums (C1). An enum with any payload
+/// variant is skipped — using it surfaces the honest Unsupported.
+fn registerEnums(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .enum_decl => |ed| {
+            const nm = ed.name() orelse continue;
+            var names: std.ArrayList([]const u8) = .empty;
+            var ok = true;
+            var vit = ed.variants();
+            while (vit.next()) |v| {
+                const vname = v.name() orelse {
+                    ok = false;
+                    break;
+                };
+                if (variantHasPayload(v)) {
+                    ok = false; // payload variants: a later rung
+                    break;
+                }
+                try names.append(b.a, vname.text);
+            }
+            if (!ok or names.items.len == 0) {
+                names.deinit(b.a);
+                continue;
+            }
+            const info = try b.a.create(EnumInfo);
+            info.* = .{ .name = nm.text, .variants = try names.toOwnedSlice(b.a) };
+            try b.enums.put(b.a, nm.text, info);
+        },
+        else => {},
+    };
+}
+
+/// Does this variant carry a payload (`Some(T)` / `Point { x: … }`)?
+fn variantHasPayload(v: ast.Variant) bool {
+    for (v.cst.children) |c| switch (c) {
+        .token => |t| switch (t.kind) {
+            .L_PAREN, .L_BRACE => return true,
+            else => {},
+        },
+        .node => return true, // any structured payload child
+    };
+    return false;
+}
+
+/// `Color.Red` → the enum + the variant's declaration-order tag.
+fn enumVariantTag(b: *Builder, txt: []const u8) ?struct { info: *const EnumInfo, tag: i64 } {
+    const dot = std.mem.indexOfScalar(u8, txt, '.') orelse return null;
+    const vname = txt[dot + 1 ..];
+    if (std.mem.indexOfScalar(u8, vname, '.') != null) return null;
+    const info = b.enums.get(txt[0..dot]) orelse return null;
+    for (info.variants, 0..) |v, i| {
+        if (std.mem.eql(u8, v, vname)) return .{ .info = info, .tag = @intCast(i) };
+    }
+    return null;
+}
+
+/// The enum a scrutinee expression carries: a `Enum.Variant` value or
+/// a binding registered in `Scope.enum_binds`.
+fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const EnumInfo {
+    switch (e) {
+        .paren => |p| return enumOfExpr(b, scope, p.inner() orelse return null),
+        .path => |p| {
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            if (enumVariantTag(b, txt)) |ev| return ev.info;
+            return scope.enum_binds.get(txt);
+        },
+        else => return null,
+    }
+}
+
 fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -1778,9 +1967,77 @@ fn recvStruct(b: *Builder, scope: *const Scope, expr: ast.Expr) BuildError!?*con
                 .scalar => null,
             };
         },
-        .call => return recCallStruct(b, expr),
+        .call => |cc| {
+            if (try genericRetStruct(b, scope, cc)) |si| return si;
+            return recCallStruct(b, expr);
+        },
         else => return null,
     }
+}
+
+/// The struct a *generic* call returns, inferred WITHOUT building (the
+/// routing twin of `genericRecCall`): the callee is a generic decl with
+/// a `-> T` return, and T's slot peeks from the deciding argument — a
+/// record literal names its struct, other shapes resolve through
+/// `recvStruct` / the scope's array bindings.
+fn genericRetStruct(b: *Builder, scope: *const Scope, cc: ast.CallExpr) BuildError!?*const StructInfo {
+    const callee = cc.callee() orelse return null;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return null,
+    };
+    const cname = try cpath.text(b.a);
+    defer b.a.free(cname);
+    if (std.mem.indexOfScalar(u8, cname, '.') != null) return null;
+    const fd = b.resolver.lookup(cname) orelse return null;
+    if (!fd.isGeneric()) return null;
+    const sig = parseGenericSig(fd.genericParams().?) orelse return null;
+    const rt = fd.returnType() orelse return null;
+    const which = sema.fits.typeWhich(rt.type_() orelse return null, sig, b.a) orelse return null;
+    const ps = fd.params() orelse return null;
+    var pit = ps.iter();
+    var ait = cc.args();
+    while (pit.next()) |p| {
+        const a0 = ait.next() orelse return null;
+        if (bareWhich(p, sig, b.a)) |w| {
+            if (w != which) continue;
+            if (try recordLitStruct(b, a0)) |si| return si;
+            return recvStruct(b, scope, a0);
+        }
+        if (sliceOfWhich(p, sig, b.a)) |w| {
+            if (w != which) continue;
+            switch (a0) {
+                .path => |pp| {
+                    const txt = try pp.text(b.a);
+                    defer b.a.free(txt);
+                    const ai = scope.arrs.get(txt) orelse return null;
+                    return switch (ai.elem) {
+                        .rec => |r| r,
+                        .scalar => null,
+                    };
+                },
+                .array => |ae| {
+                    var eit = ae.elements();
+                    const e0 = eit.next() orelse return null;
+                    if (try recordLitStruct(b, e0)) |si| return si;
+                    return recvStruct(b, scope, e0);
+                },
+                else => return null,
+            }
+        }
+    }
+    return null;
+}
+
+/// The registered struct a record literal names, if the expression is one.
+fn recordLitStruct(b: *Builder, e: ast.Expr) BuildError!?*const StructInfo {
+    const re = switch (e) {
+        .record => |x| x,
+        else => return null,
+    };
+    const pname = try (re.path() orelse return null).text(b.a);
+    defer b.a.free(pname);
+    return b.structs.get(pname);
 }
 
 /// The fit method `<struct>.<name>` from the registry: every fit whose
@@ -1975,46 +2232,13 @@ fn elemPtrExpr(b: *Builder, ai: ArrInfo, index: *hir.Expr) BuildError!*hir.Expr 
 /// are `[T]` slices or non-generic scalars, the argument is an array
 /// binding or literal of records. No vtables; each instance is a plain
 /// function.
-const GenericSig = struct { tname: []const u8, bound: ?[]const u8 };
+const GenericSig = sema.fits.GenericSig;
+const parseGenericSig = sema.fits.parseGenericSig;
+const sliceOfWhich = sema.fits.sliceOfWhich;
+const bareWhich = sema.fits.bareWhich;
 
-/// Parse the raw `<T: Display>` span: one type parameter with an
-/// optional face bound. More parameters are a later slice.
-fn parseGenericSig(gp: *const parser.cst.Node) ?GenericSig {
-    var toks: [8]parser.cst.Token = undefined;
-    var n: usize = 0;
-    for (gp.children) |ch| switch (ch) {
-        .token => |t| {
-            if (t.kind.isTrivia()) continue;
-            if (n == toks.len) return null;
-            toks[n] = t;
-            n += 1;
-        },
-        .node => return null,
-    };
-    // < IDENT >  |  < IDENT : IDENT >
-    if (n == 3 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .R_ANGLE)
-        return .{ .tname = toks[1].text, .bound = null };
-    if (n == 5 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .COLON and toks[3].kind == .IDENT and toks[4].kind == .R_ANGLE)
-        return .{ .tname = toks[1].text, .bound = toks[3].text };
-    return null;
-}
-
-/// Is this param type `[T]` for the generic's T?
-fn isSliceOfT(p: ast.Param, tname: []const u8, a: std.mem.Allocator) bool {
-    const te = p.type_() orelse return false;
-    const sl = switch (te) {
-        .slice => |x| x,
-        else => return false,
-    };
-    const inner = sl.element() orelse return false;
-    const pt = switch (inner) {
-        .path => |x| x,
-        else => return false,
-    };
-    const nm = pt.name(a) catch return false;
-    defer a.free(nm);
-    return std.mem.eql(u8, nm, tname);
-}
+/// One inferred type-parameter slot: what T turned out to be.
+const TSlot = struct { elem: ElemKind, stride: u32 };
 
 /// The array info an argument denotes: a binding name or an array
 /// literal (which is built — its value expr rides along).
@@ -2043,31 +2267,51 @@ fn buildArrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!?ArrArg {
 /// Build `f(arg…)` against a generic declaration: infer T from the
 /// first `[T]` argument, fit-check the bound, stamp (or reuse) the
 /// instance, and emit the call statement.
-fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+/// Build `f(arg…)` against a generic declaration: infer each type
+/// param from its first `[T]` argument, fit-check the bounds, stamp
+/// (or reuse) the instance, and yield the call expression (the stamped
+/// instance's return type is on `b.funcs`).
+fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Expr {
     const sig = parseGenericSig(fd.genericParams().?) orelse return error.Unsupported;
     const ps = fd.params() orelse return error.Unsupported;
 
-    // Walk params and args together: infer T at the first `[T]` arg.
-    var t_si: ?*const StructInfo = null;
+    // Walk params and args together: each type param infers at its
+    // first `[T]` / bare `T` arg (and must stay consistent at later ones).
+    var slots: [sema.fits.max_generic_params]?TSlot = @splat(null);
     var args: std.ArrayList(*hir.Expr) = .empty;
-    var arr_args: std.ArrayList(ArrArg) = .empty;
-    defer arr_args.deinit(b.a);
     var pit = ps.iter();
     var ait = call.args();
     while (pit.next()) |p| {
         const a0 = ait.next() orelse return reject(b, .unsupported_call);
-        if (isSliceOfT(p, sig.tname, b.a)) {
+        if (sliceOfWhich(p, sig, b.a)) |which| {
             const aa = (try buildArrArg(b, a0, scope)) orelse return reject(b, .unsupported_call);
-            const si = switch (aa.elem) {
-                .rec => |r| r,
-                .scalar => return error.Unsupported, // scalar-element generics: later
-            };
-            if (t_si) |prev| {
-                if (prev != si) return reject(b, .unsupported_call); // T must infer consistently
-            } else t_si = si;
+            if (slots[which]) |prev| {
+                if (!elemEql(prev.elem, aa.elem)) return reject(b, .unsupported_call); // T must infer consistently
+            } else {
+                slots[which] = .{ .elem = aa.elem, .stride = aa.stride };
+            }
             try args.append(b.a, aa.ptr);
             try args.append(b.a, aa.count);
-            try arr_args.append(b.a, aa);
+        } else if (bareWhich(p, sig, b.a)) |which| {
+            // A bare `T` argument: a record value (passed as its base
+            // pointer — the B2b ABI, so "by value" costs nothing new)
+            // or a scalar.
+            const aslot: TSlot, const value: *hir.Expr = if (try buildRecExpr(b, a0, scope)) |rv|
+                .{ .{ .elem = .{ .rec = rv.si }, .stride = rv.si.size }, rv.e }
+            else blk: {
+                const sc = scalarBindTy(try exprScalar(b, a0, scope));
+                switch (sc) {
+                    .bool, .i64, .f64, .f32 => {},
+                    else => return error.Unsupported,
+                }
+                break :blk .{ .{ .elem = .{ .scalar = sc }, .stride = fieldWidth(sc).?.size }, try buildIntExpr(b, a0, scope) };
+            };
+            if (slots[which]) |prev| {
+                if (!elemEql(prev.elem, aslot.elem)) return reject(b, .unsupported_call); // T must infer consistently
+            } else {
+                slots[which] = aslot;
+            }
+            try args.append(b.a, value);
         } else {
             // A non-generic scalar parameter.
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
@@ -2081,50 +2325,132 @@ fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: as
         }
     }
     if (ait.next() != null) return reject(b, .unsupported_call);
-    const si = t_si orelse return error.Unsupported; // no `[T]` arg to infer from
+    // Every type param must have an inference source (a `[T]` or bare
+    // `T` param).
+    for (slots[0..sig.n]) |s| if (s == null) return error.Unsupported;
 
-    // The bound: T must fit the face (TYP200's check; the emit path
-    // rejects honestly — the diagnostic wiring is `q64 check`'s side).
-    if (sig.bound) |face| {
+    // The bounds: each T must fit its face (TYP200 — `q64 check` emits
+    // it; the emit path rejects honestly). Scalars have no fits yet, so
+    // a *bounded* param takes record elements only; an unbounded one
+    // stamps per scalar type as well.
+    for (sig.params[0..sig.n], 0..) |gp, i| {
+        const face = gp.bound orelse continue;
+        const si = switch (slots[i].?.elem) {
+            .rec => |r| r,
+            .scalar => return reject(b, .unsupported_call),
+        };
         if (b.fitreg == null or b.fitreg.?.find(si.name, face) == null)
             return reject(b, .unsupported_call);
     }
 
-    const fid = try stampGeneric(b, gname, fd, sig, si);
+    const fid = try stampGeneric(b, gname, fd, sig, slots[0..sig.n]);
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
+    return e;
+}
+
+/// The statement form (`print_all(colors)` as a `main` statement): the
+/// stamped instance must be void — a value left on the stack is
+/// rejected at lowering.
+fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+    const e = try buildGenericCall(b, gname, fd, call, scope);
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .expr = e };
     return st;
 }
 
-/// Stamp (or fetch) the concrete instance `gname<T>`. The body builds
-/// with the entry-style builder (it may env.out), `[T]` params as
+/// Do two element kinds name the same T?
+fn elemEql(x: ElemKind, y: ElemKind) bool {
+    return switch (x) {
+        .rec => |r| y == .rec and y.rec == r,
+        .scalar => |t| y == .scalar and y.scalar == t,
+    };
+}
+
+/// Stamp (or fetch) the concrete instance `gname<T1, T2…>` — each T a
+/// record struct or a scalar type (`each<i64>`). The body builds with
+/// the entry-style builder (it may env.out), `[T]` params as
 /// (ptr, count) pairs registered in `Scope.arrs` with a *runtime*
-/// count, and its own locals list.
-fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, si: *const StructInfo) BuildError!hir.FuncId {
-    const key = try std.fmt.allocPrint(b.a, "{s}<{s}>", .{ gname, si.name });
+/// count, and its own locals list. A `-> i64`/`bool`/`f64`/`f32`
+/// declaration makes a *value-returning* instance: the body's last
+/// statement is its value tail (a tail expression or `return expr`);
+/// `-> T` and str/record returns are a later slice.
+fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, slots: []const ?TSlot) BuildError!hir.FuncId {
+    var keybuf: std.ArrayList(u8) = .empty;
+    try keybuf.appendSlice(b.a, gname);
+    try keybuf.append(b.a, '<');
+    for (slots, 0..) |s, i| {
+        if (i > 0) try keybuf.appendSlice(b.a, ", ");
+        try keybuf.appendSlice(b.a, switch (s.?.elem) {
+            .rec => |r| r.name,
+            .scalar => |t| @tagName(t),
+        });
+    }
+    try keybuf.append(b.a, '>');
+    const key = try keybuf.toOwnedSlice(b.a);
     if (b.ids.get(key)) |id| return id;
+
+    // `-> T` returns the slot's type — a scalar by value, a record as
+    // its base pointer (`ret_rec` carries which struct, for fn_recs).
+    var ret_rec: ?*const StructInfo = null;
+    const ret_ty: hir.Type = if (fd.returnType()) |rt| blk: {
+        if (rt.type_()) |rte| if (sema.fits.typeWhich(rte, sig, b.a)) |which| {
+            break :blk switch (slots[which].?.elem) {
+                .scalar => |t| t,
+                .rec => |si| rblk: {
+                    ret_rec = si;
+                    break :rblk .ptr;
+                },
+            };
+        };
+        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported; // str, concrete records: later
+        break :blk switch (rs) {
+            .bool, .i64, .f64, .f32 => rs,
+            else => return error.Unsupported,
+        };
+    } else .void;
 
     var scope = Scope{ .a = b.a };
     var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    var any_rec = false;
     const ps = fd.params() orelse return error.Unsupported;
     var pit = ps.iter();
     while (pit.next()) |p| {
         const pn = (p.name() orelse return error.Unsupported).text;
-        if (isSliceOfT(p, sig.tname, b.a)) {
+        if (sliceOfWhich(p, sig, b.a)) |which| {
+            const slot = slots[which].?;
             // (ptr, count): two wasm params, the arr registered on the name.
             const ptr_idx = try scope.declare(pn, false, .ptr);
             const hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{pn});
             const cnt_idx = try scope.declare(hidden, false, .i64);
             try params.append(b.a, .{ .name = pn, .ty = .ptr });
             try params.append(b.a, .{ .name = hidden, .ty = .i64 });
+            try rec_params.appendNTimes(b.a, null, 2);
             try scope.arrs.put(b.a, pn, .{
                 .ptr_idx = ptr_idx,
                 .count = .{ .local_idx = cnt_idx },
-                .stride = si.size,
-                .elem = .{ .rec = si },
+                .stride = slot.stride,
+                .elem = slot.elem,
             });
+        } else if (sema.fits.bareWhich(p, sig, b.a)) |which| {
+            // A bare `T` param: a record T is a `.ptr` registered in
+            // `recs` (field access + fit dispatch resolve); a scalar T
+            // is a plain scalar local.
+            switch (slots[which].?.elem) {
+                .rec => |si| {
+                    _ = try scope.declare(pn, false, .ptr);
+                    try scope.recs.put(b.a, pn, si);
+                    try params.append(b.a, .{ .name = pn, .ty = .ptr });
+                    try rec_params.append(b.a, si);
+                    any_rec = true;
+                },
+                .scalar => |t| {
+                    _ = try scope.declare(pn, false, t);
+                    try params.append(b.a, .{ .name = pn, .ty = t });
+                    try rec_params.append(b.a, null);
+                },
+            }
         } else {
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
             const pty: hir.Type = switch (psc) {
@@ -2133,6 +2459,7 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
             };
             _ = try scope.declare(pn, false, pty);
             try params.append(b.a, .{ .name = pn, .ty = pty });
+            try rec_params.append(b.a, null);
         }
     }
     scope.n_params = @intCast(params.items.len);
@@ -2142,7 +2469,12 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     try b.ids.put(b.a, key, id);
     const dummy = try b.a.create(hir.Stmt);
     dummy.* = .{ .block = &.{} };
-    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = .void, .body = dummy, .is_screen = true });
+    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy, .is_screen = true });
+    if (ret_rec != null or any_rec) {
+        try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = ret_rec });
+    } else {
+        rec_params.deinit(b.a);
+    }
 
     // The body builds entry-style (host statements allowed) with its own
     // locals list and rt map; locals index past the params.
@@ -2155,9 +2487,38 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     // params (main has no params; stamped instances do).
     try inst_locals.appendNTimes(b.a, .i64, param_slice.len);
 
-    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    var ast_stmts: std.ArrayList(ast.Stmt) = .empty;
+    defer ast_stmts.deinit(b.a);
     var it = (fd.body() orelse return error.Unsupported).statements();
-    while (it.next()) |stmt| try buildMainStmt(b, stmt, &scope, &inst_rt, &stmts);
+    while (it.next()) |stmt| try ast_stmts.append(b.a, stmt);
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    for (ast_stmts.items, 0..) |stmt, i| {
+        if (ret_ty != .void and i == ast_stmts.items.len - 1) {
+            // The value tail: a tail expression or an explicit `return`,
+            // typed as the declared return — a record value for a record
+            // `-> T`, a scalar otherwise. The lowering reads it as the
+            // value block's tail (lowerIntBlock).
+            const e: ast.Expr, const is_ret: bool = switch (stmt) {
+                .expr_stmt => |es| .{ es.expression() orelse return error.Unsupported, false },
+                .return_stmt => |rs| .{ rs.value() orelse return error.Unsupported, true },
+                else => return error.Unsupported, // a value `if` tail: later
+            };
+            const value: *hir.Expr = if (ret_rec) |want| rblk: {
+                const rv = (try buildRecExpr(b, e, &scope)) orelse return error.Unsupported;
+                if (rv.si != want) return reject(b, .unsupported_call); // a different struct
+                break :rblk rv.e;
+            } else sblk: {
+                if (scalarBindTy(try exprScalar(b, e, &scope)) != ret_ty) return error.Unsupported;
+                break :sblk try buildIntExpr(b, e, &scope);
+            };
+            const st = try b.a.create(hir.Stmt);
+            st.* = if (is_ret) .{ .ret = value } else .{ .expr = value };
+            try stmts.append(b.a, st);
+        } else {
+            try buildMainStmt(b, stmt, &scope, &inst_rt, &stmts);
+        }
+    }
 
     const block = try b.a.create(hir.Stmt);
     block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
@@ -2165,7 +2526,7 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     b.funcs.items[id] = .{
         .name = key,
         .params = param_slice,
-        .ret = .void,
+        .ret = ret_ty,
         .locals = all[param_slice.len..], // past the param padding
         .body = block,
         .is_screen = true,
@@ -2190,7 +2551,9 @@ fn bindMainRecord(b: *Builder, scope: *Scope, name: []const u8, is_var: bool, va
 /// in the scope arena), a bare reference to a materialized record binding /
 /// record param, or a call to a record-returning function. `null` when the
 /// expression isn't record-shaped (the caller picks another path).
-fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct { e: *hir.Expr, si: *const StructInfo } {
+const RecValue = struct { e: *hir.Expr, si: *const StructInfo };
+
+fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue {
     switch (expr) {
         .paren => |p| return buildRecExpr(b, p.inner() orelse return error.Unsupported, scope),
         .record => |re| {
@@ -2259,6 +2622,9 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
             return .{ .e = try elemPtrExpr(b, ai, idx), .si = si };
         },
         .call => |cc| {
+            // A generic callee whose `-> T` resolved to a record: infer,
+            // stamp, and read the instance's record return (fn_recs).
+            if (try genericRecCall(b, cc, scope)) |gv| return gv;
             const si = (try recCallStruct(b, expr)) orelse return null;
             const callee_path = switch (cc.callee() orelse return error.Unsupported) {
                 .path => |p| p,
@@ -2274,6 +2640,31 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
         },
         else => return null,
     }
+}
+
+/// A call to a generic declaration whose `-> T` infers to a *record*:
+/// stamp it and yield the record-valued call. `null` when the callee
+/// isn't a generic with a type-param return, or T inferred to a scalar
+/// (the scalar path builds it — the stamp dedups).
+fn genericRecCall(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecValue {
+    const callee = cc.callee() orelse return null;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return null,
+    };
+    const cname = try cpath.text(b.a);
+    defer b.a.free(cname);
+    if (std.mem.indexOfScalar(u8, cname, '.') != null) return null;
+    const fd = b.resolver.lookup(cname) orelse return null;
+    if (!fd.isGeneric()) return null;
+    // Cheap syntactic pre-check: only a `-> T` return can be a record here.
+    const sig = parseGenericSig(fd.genericParams().?) orelse return null;
+    const rt = fd.returnType() orelse return null;
+    if (sema.fits.typeWhich(rt.type_() orelse return null, sig, b.a) == null) return null;
+    const e = try buildGenericCall(b, cname, fd, cc, scope);
+    const frec = b.fn_recs.get(e.call.func) orelse return null; // scalar T: not a record value
+    const si = frec.ret orelse return null;
+    return .{ .e = e, .si = si };
 }
 
 /// Build + check a call's arguments against the callee's parameter kinds
@@ -2418,7 +2809,7 @@ const ExprTypeBridge = struct {
         };
     }
 
-    fn callRet(ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+    fn callRet(ctx: *anyopaque, name: []const u8, call: ast.CallExpr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
         const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
         // A builtin numeric cast types as its target (`f32(x)` is f32).
         if (castTarget(name)) |ct| {
@@ -2447,6 +2838,10 @@ const ExprTypeBridge = struct {
             };
         }
         const fd = self.b.resolver.lookup(name) orelse return null;
+        if (fd.isGeneric()) {
+            if (try self.genericRet(fd, call)) |t| return t;
+            // A concrete return on a generic still types below.
+        }
         const rs = (try fnRetScalar(self.b, fd)) orelse return null;
         return switch (rs) {
             .bool => .bool,
@@ -2454,6 +2849,70 @@ const ExprTypeBridge = struct {
             .f64 => .f64,
             .f32 => .f32,
             .str => .str,
+            else => null,
+        };
+    }
+
+    /// The scalar a generic `-> T` call returns, inferred from the
+    /// deciding argument (a bare `T` arg's scalar type, or a `[T]`
+    /// arg's element type). Null when T isn't decidable here (record
+    /// Ts, unprovable shapes — the builder rejects those honestly).
+    fn genericRet(self: *ExprTypeBridge, fd: ast.FnDecl, call: ast.CallExpr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        const sig = parseGenericSig(fd.genericParams().?) orelse return null;
+        const rt = fd.returnType() orelse return null;
+        const which = sema.fits.typeWhich(rt.type_() orelse return null, sig, self.b.a) orelse return null;
+        const ps = fd.params() orelse return null;
+        var pit = ps.iter();
+        var ait = call.args();
+        while (pit.next()) |p| {
+            const a0 = ait.next() orelse return null;
+            if (bareWhich(p, sig, self.b.a)) |w| {
+                if (w != which) continue;
+                return switch ((try scalarOrNull(self, a0)) orelse return null) {
+                    .bool, .i64, .f64, .f32 => |sc| sc,
+                    else => null,
+                };
+            }
+            if (sliceOfWhich(p, sig, self.b.a)) |w| {
+                if (w != which) continue;
+                switch (a0) {
+                    .path => |pp| {
+                        // An array binding: its element type.
+                        const txt = try pp.text(self.b.a);
+                        defer self.b.a.free(txt);
+                        const ai = self.scope.arrs.get(txt) orelse return null;
+                        return switch (ai.elem) {
+                            .scalar => |t| switch (t) {
+                                .bool => .bool,
+                                .i64 => .i64,
+                                .f64 => .f64,
+                                .f32 => .f32,
+                                else => null,
+                            },
+                            .rec => null,
+                        };
+                    },
+                    .array => |ae| {
+                        // An array literal: its first element's type.
+                        var eit = ae.elements();
+                        const e0 = eit.next() orelse return null;
+                        return switch ((try scalarOrNull(self, e0)) orelse return null) {
+                            .bool, .i64, .f64, .f32 => |sc| sc,
+                            else => null,
+                        };
+                    },
+                    else => return null,
+                }
+            }
+        }
+        return null;
+    }
+
+    /// `exprScalar` mapped onto the total typing contract: a rejected/
+    /// unsupported shape types as "don't know", never an error.
+    fn scalarOrNull(self: *ExprTypeBridge, e: ast.Expr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        return exprScalar(self.b, e, self.scope) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
             else => null,
         };
     }
@@ -2480,6 +2939,10 @@ const Scope = struct {
     /// is compile-time (array literals have fixed length; growth is Vec's
     /// job, later).
     arrs: std.StringHashMapUnmanaged(ArrInfo) = .empty,
+    /// Enum-typed bindings (C1): name → the enum; the tag lives in an
+    /// i64 local under the same name. `match` reads this to resolve
+    /// bare variant names in arm patterns.
+    enum_binds: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
 
     fn find(self: *const Scope, name: []const u8) ?Local {
         var i = self.locals.items.len;
@@ -2659,6 +3122,8 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 return recFieldExpr(b, rf);
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
+            } else if (enumVariantTag(b, txt)) |ev| {
+                out.* = .{ .int_const = ev.tag };    // `Color.Red` → its tag
             } else if (b.eval.evalInt(expr)) |v| {
                 // A compile-time `let` binding (`let n = 7`) used in a runtime
                 // expression (e.g. an `if`/`while` condition) materializes as
@@ -2782,6 +3247,20 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         }
                         return out;
                     }
+                }
+            }
+            // A generic callee in value position (`let n = count_of(xs)`):
+            // monomorphize per the inferred element type, like the
+            // statement form (B5). The stamped instance must produce a
+            // scalar value here.
+            if (b.resolver.lookup(cname)) |gfd| {
+                if (gfd.isGeneric()) {
+                    const ge = try buildGenericCall(b, cname, gfd, cc, scope);
+                    switch (b.funcs.items[ge.call.func].ret) {
+                        .i64, .bool, .f64, .f32 => {},
+                        else => return reject(b, .unsupported_call),
+                    }
+                    return ge;
                 }
             }
             const id = try registerFunc(b, cname);
@@ -4283,6 +4762,286 @@ test "B5: two call sites with different T stamp two instances (dedup per T)" {
     try testing.expect(std.mem.indexOf(u8, dump, "fn show_all<B> -> void") != null);
 }
 
+test "B5: scalar element types stamp per type (each<i64>, each<f64>)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn each<T>(items: [T]) {
+        \\    for x in items {
+        \\        env.out("{x}")
+        \\    }
+        \\}
+        \\fn main {
+        \\    each([10, 20, 30])
+        \\    each([1.5, 2.5])
+        \\    each([40, 50])
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // One instance per scalar element type, deduped.
+    var count_i64: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, dump, at, "fn each<i64> -> void")) |hit| {
+        count_i64 += 1;
+        at = hit + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count_i64);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn each<f64> -> void") != null);
+}
+
+test "B5: value-returning generic calls (tail expr, return, composition)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn count_of<T>(items: [T]) -> i64 {
+        \\    items.len
+        \\}
+        \\fn total<T>(items: [T]) -> i64 {
+        \\    var n = 0
+        \\    for x in items {
+        \\        n = n + x
+        \\    }
+        \\    return n
+        \\}
+        \\fn main {
+        \\    env.out(count_of([1.5, 2.5]))
+        \\    let n = total([10, 20, 30])
+        \\    env.out(n + count_of([7, 8]))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Instances are stamped per element type with the declared value ret.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn count_of<f64> -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn count_of<i64> -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn total<i64> -> i64") != null);
+}
+
+test "B5: multiple type params stamp per (T, U) combination" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct B { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+        \\fit B : D { fn fmt(self) -> str { "B{self.y}" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) {
+        \\    for x in xs { env.out(x.fmt()) }
+        \\    for y in ys { env.out(y.fmt()) }
+        \\}
+        \\fn zipped_count<T, U>(xs: [T], ys: [U]) -> i64 {
+        \\    xs.len + ys.len
+        \\}
+        \\fn main {
+        \\    both([A { x: 1 }], [B { y: 2 }])
+        \\    both([B { y: 7 }], [A { x: 8 }])
+        \\    env.out(zipped_count([1, 2], [1.5]))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Slot order is part of the instance identity.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn both<A, B> -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn both<B, A> -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn zipped_count<i64, f64> -> i64") != null);
+}
+
+test "B5: a multi-param bound rejects the non-fitting slot" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct NoFit { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) {
+        \\    for x in xs { env.out(x.fmt()) }
+        \\}
+        \\fn main {
+        \\    both([A { x: 1 }], [NoFit { y: 2 }])
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
+test "B5: bare `T` params + `-> T` returns (records by ptr, scalars by value)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct Color { r: i64 }
+        \\fit Color : D { fn fmt(self) -> str { "c{self.r}" } }
+        \\fn show<T: D>(x: T) {
+        \\    env.out(x.fmt())
+        \\}
+        \\fn twice<T>(x: T) -> T {
+        \\    x + x
+        \\}
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn main {
+        \\    show(Color { r: 7 })
+        \\    env.out(twice(21))
+        \\    env.out(twice(1.5))
+        \\    env.out(first([10, 20]))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // A bare record T is a `.ptr` param; `-> T` follows the slot's scalar.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn show<Color> -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn twice<i64> -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn twice<f64> -> f64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn first<i64> -> i64") != null);
+}
+
+test "B5: method dispatch directly on a generic call expression" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Display { fn fmt(self) -> str }
+        \\face Sized { fn area(self) -> i64 }
+        \\struct Color { r: i64, g: i64 }
+        \\fit Color : Display { fn fmt(self) -> str { "rgb({self.r}, {self.g})" } }
+        \\fit Color : Sized { fn area(self) -> i64 { self.r * self.g } }
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn idr<T>(x: T) -> T {
+        \\    x
+        \\}
+        \\fn main {
+        \\    env.out(first([Color { r: 9, g: 8 }]).fmt())
+        \\    env.out(first([Color { r: 9, g: 8 }]).area())
+        \\    env.out(idr(Color { r: 2, g: 3 }).fmt())
+        \\    let cs = [Color { r: 4, g: 5 }]
+        \\    env.out(first(cs).area())
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The routing predicate (recvStruct → genericRetStruct) sees the
+    // struct WITHOUT building, so both the str (host_out_str) and i64
+    // (host_out_int) method paths dispatch on the call expression.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn first<Color> -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn idr<Color> -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Color.fmt -> str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Color.area -> i64") != null);
+}
+
+test "B5: record `-> T` returns bind and dispatch (first<Color> -> ptr)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct Color { r: i64 }
+        \\fit Color : D { fn fmt(self) -> str { "c{self.r}" } }
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn idr<T>(x: T) -> T {
+        \\    x
+        \\}
+        \\fn main {
+        \\    let c = first([Color { r: 9 }, Color { r: 1 }])
+        \\    env.out(c.fmt())
+        \\    env.out(c.r)
+        \\    let d = idr(c)
+        \\    env.out(d.r)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The instance returns the record's base pointer; fn_recs carries
+    // which struct, so the binding dispatches and reads fields.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn first<Color> -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn idr<Color> -> ptr") != null);
+}
+
+test "B5: printing a whole record value stays unsupported" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct P { v: i64 }
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn main {
+        \\    env.out(first([P { v: 1 }]))
+        \\}
+        \\
+    ;
+    try testing.expect((try buildLocal(testing.allocator, &tr, src)) == null);
+}
+
+test "B5: a scalar to a bounded bare `T` is rejected (no scalar fits)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\fn show<T: D>(x: T) {
+        \\    env.out(x.fmt())
+        \\}
+        \\fn main {
+        \\    show(42)
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
+test "B5: a scalar element type never satisfies a face bound" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\fn show_all<T: D>(items: [T]) {
+        \\    for it in items {
+        \\        env.out(it.fmt())
+        \\    }
+        \\}
+        \\fn main {
+        \\    show_all([1, 2])
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
 test "B5: an element type with no fit for the bound is UnsupportedCall" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
@@ -4302,4 +5061,72 @@ test "B5: an element type with no fit for the bound is UnsupportedCall" {
     try tr.addLib(src);
     const r = try rejectFromSource(testing.allocator, src, tr.resolver());
     try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
+test "C1: match on an all-unit enum — tags, wildcard, exhaustive chain" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum Light { Red, Yellow, Green }
+        \\fn main {
+        \\    var l = Light.Yellow
+        \\    match l {
+        \\        Red -> env.out("stop"),
+        \\        Yellow -> env.out("slow"),
+        \\        Green -> env.out("go"),
+        \\    }
+        \\    l = Light.Green
+        \\    match l {
+        \\        Red -> env.out("stop"),
+        \\        _ -> {
+        \\            env.out("moving")
+        \\        },
+        \\    }
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `Light.Yellow` is its declaration-order tag; arms compare the
+    // hidden scrutinee local against each tag.
+    try testing.expect(std.mem.indexOf(u8, dump, "let local#0 = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "eq 0)") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "eq 2)") != null);
+}
+
+test "C1: a non-exhaustive match (no wildcard) is honestly unsupported" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum L { A, B, C }
+        \\fn main {
+        \\    match L.A {
+        \\        A -> env.out("a"),
+        \\        B -> env.out("b"),
+        \\    }
+        \\}
+        \\
+    ;
+    try testing.expect((try buildLocal(testing.allocator, &tr, src)) == null);
+}
+
+test "C1: an arm naming a non-variant rejects NameNotFound" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum L { A, B }
+        \\fn main {
+        \\    match L.A {
+        \\        Nope -> env.out("x"),
+        \\        _ -> env.out("y"),
+        \\    }
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.name_not_found, r.?);
 }
