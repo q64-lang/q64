@@ -973,8 +973,38 @@ verified, honest diagnostics throughout.
       → `Option`/`Result` in the prelude + generic enum declarations
       (landed) → enum returns from functions (landed) → `if let`
       narrowing (landed) → `T?` sugar (landed) → `try` (landed) →
-      next: `while let`, match/if-let in callee bodies, the `From`
-      conversion on `try` (cross-E propagation).
+      match in callee bodies + enum params (landed) → next:
+      `while let`, the `From` conversion on `try` (cross-E
+      propagation), match in *record-returning* callee bodies,
+      statement-position callee matches with side-effecting arms.
+      - [x] **Match in callee bodies + matchable enum params.**
+            `fn area(s: Shape) -> i64 { match s { Empty -> 0, … } }`
+            and `fn unwrap_or(o: Option<i64>, d: i64) -> i64` work —
+            the value-match form in plain callees: `buildIntMatch`
+            lowers a callee `match` to a value `if` chain (hidden
+            scrutinee set + chain in one block; the lowering reads a
+            `.block` tail as a nested value block — new tail arm in
+            `lowerIntBlock`). An *exhaustive* match without `_` makes
+            the last arm's test redundant — it becomes the chain's
+            else, so every path yields. The bookkeeping split that
+            made match main-only is resolved by `declareBodyLocal`
+            (entry-style bodies mirror locals into `b.cur_locals`,
+            callee scopes — new `Scope.callee` flag — track via
+            `declare` alone); `declareMatchScrutinee` and the payload
+            binds in `resolveArmPattern` go through it. `enumOfExpr`
+            resolves an enum-typed param/record binding via
+            `scope.recs` (si.name → registry, identity-checked).
+            Verified end-to-end wasm64 + wasm32 (roundtrip
+            callee-match section: `48 / 15 / 0 / 7 / 99`) + 1 unit
+            test (Shape/Option params; non-exhaustive and
+            mixed-arm-type rejections). 394 unit / 81 CLI / 24-of-51 /
+            roundtrips green. **Boundary:** value arms only (`->`
+            expression of one scalar family; block arms and
+            side-effecting statement-position matches in callees are
+            later); no match in *record-returning* callee bodies yet
+            (the tail there is expr/if only); `let x = match …` inside
+            a callee (bind-the-match form) still unsupported — write
+            it as the tail or restructure.
       - [x] **`try` propagation + TYP300 (v0 floor).** `let x = try
             half(n)` inside a Result-returning fn desugars to: bind
             the operand's boxed value once, `if tag == Err { return

@@ -293,6 +293,9 @@ fn lowerIntBlock(ctx: Ctx, blk: *const hir.Stmt, value_ty: ?mir.ValueType) Error
         .expr => |e| try lowerExpr(ctx, e),
         .ret => |e| try lowerExpr(ctx, e orelse return error.Unsupported),
         .if_ => |iff| try lowerValueIf(ctx, iff, vty),
+        // A nested value block (a callee-tail `match` desugar: the
+        // hidden scrutinee set + the value if-chain).
+        .block => try lowerIntBlock(ctx, tail, vty),
         else => return error.Unsupported,
     };
 

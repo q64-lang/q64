@@ -1511,4 +1511,44 @@ try32_out="$("$HOST_BIN" "$tmp/try32.wasm")"
 [[ "$try32_out" == "$try_expected" ]] || { echo "FAIL: try wasm32 (got: $try32_out)" >&2; exit 1; }
 echo "    ok: try -> ok 3 / err 3 / err 7 (wasm64 + wasm32)"
 
+# match in callee bodies + enum params: `fn area(s: Shape)` matches its
+# parameter; `unwrap_or(o: Option<i64>, d)` is expressible in the language.
+echo "==> callee match: area(s: Shape) / unwrap_or(o: Option<i64>, d)"
+cmatch_app="$tmp/cmatch.q"
+cat > "$cmatch_app" <<'Q64'
+enum Shape { Empty, Circle(i64), Rect(i64, i64) }
+fn area(s: Shape) -> i64 {
+    match s {
+        Empty -> 0,
+        Circle(r) -> r * r * 3,
+        Rect(w, h) -> w * h,
+    }
+}
+fn unwrap_or(o: Option<i64>, d: i64) -> i64 {
+    match o {
+        Some(v) -> v,
+        None -> d,
+    }
+}
+fn find(n: i64) -> i64? {
+    if n > 0 { Some(n) } else { None }
+}
+fn main {
+    env.out(area(Shape.Circle(4)))
+    env.out(area(Shape.Rect(3, 5)))
+    let e = Shape.Empty
+    env.out(area(e))
+    env.out(unwrap_or(find(7), 0 - 1))
+    env.out(unwrap_or(find(0 - 2), 99))
+}
+Q64
+cmatch_expected=$'48\n15\n0\n7\n99'
+"$Q64_BIN" emit "$cmatch_app" "$tmp/cmatch.wasm"
+cmatch_out="$("$HOST_BIN" "$tmp/cmatch.wasm")"
+[[ "$cmatch_out" == "$cmatch_expected" ]] || { echo "FAIL: callee-match (got: $cmatch_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$cmatch_app" "$tmp/cmatch32.wasm" --addr wasm32
+cmatch32_out="$("$HOST_BIN" "$tmp/cmatch32.wasm")"
+[[ "$cmatch32_out" == "$cmatch_expected" ]] || { echo "FAIL: callee-match wasm32 (got: $cmatch32_out)" >&2; exit 1; }
+echo "    ok: callee match -> 48 / 15 / 0 / 7 / 99 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

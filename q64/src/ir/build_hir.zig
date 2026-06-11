@@ -719,9 +719,7 @@ fn firstNonTriviaToken(node: *const parser.cst.Node) ?parser.cst.Token {
 /// for an immediate enum, the value's base pointer for a boxed one.
 fn declareMatchScrutinee(b: *Builder, scope: *Scope, scrut: ast.Expr, boxed: bool, out: *std.ArrayList(*hir.Stmt)) BuildError!u32 {
     const sty: hir.Type = if (boxed) .ptr else .i64;
-    scope.next_idx = @intCast(b.cur_locals.items.len);
-    const s_idx = try scope.declare("#match", false, sty);
-    try b.cur_locals.append(b.a, sty);
+    const s_idx = try declareBodyLocal(b, scope, "#match", false, sty);
     const sval = if (boxed) blk: {
         const rv = (try buildRecExpr(b, scrut, scope)) orelse return error.Unsupported;
         break :blk rv.e;
@@ -763,9 +761,7 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
                         .WILD_PATTERN => {},
                         .IDENT_PATTERN => {
                             const snm = sp.bindingName() orelse return error.Unsupported;
-                            scope.next_idx = @intCast(b.cur_locals.items.len);
-                            const idx = try scope.declare(snm.text, false, .i64);
-                            try b.cur_locals.append(b.a, .i64);
+                            const idx = try declareBodyLocal(b, scope, snm.text, false, .i64);
                             const base = try b.a.create(hir.Expr);
                             base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
                             const ld = try b.a.create(hir.Expr);
@@ -1301,8 +1297,9 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     const owned = try b.a.dupe(u8, name);
 
     // Parameters (i64, bool, or a record — one `.ptr` slot) occupy local
-    // indices 0..n; seed the body scope.
-    var scope = Scope{ .a = b.a };
+    // indices 0..n; seed the body scope. Callee bookkeeping: locals are
+    // tracked by `scope.declare` alone (no cur_locals mirror).
+    var scope = Scope{ .a = b.a, .callee = true };
     var params: std.ArrayList(hir.Param) = .empty;
     var rec_params: std.ArrayList(?*const StructInfo) = .empty;
     var any_rec = (rec_ret != null);
@@ -2314,7 +2311,15 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             const txt = try p.text(b.a);
             defer b.a.free(txt);
             if (enumVariantTag(b, txt)) |ev| return ev.info;
-            return scope.enum_binds.get(txt);
+            if (scope.enum_binds.get(txt)) |info| return info;
+            // An enum-typed *param* or record binding (`s: Shape`) —
+            // registered in `recs` with the enum's boxed shape.
+            if (scope.recs.get(txt)) |si| {
+                if (b.enums.get(si.name)) |info| {
+                    if (info.si == si) return info;
+                }
+            }
+            return null;
         },
         .literal => |le| {
             // The prelude `None` literal.
@@ -3613,6 +3618,11 @@ const Scope = struct {
     /// i64 local under the same name. `match` reads this to resolve
     /// bare variant names in arm patterns.
     enum_binds: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
+    /// True for a plain callee body (registerFunc), whose locals are
+    /// tracked by `declare` alone — entry-style bodies (`main`,
+    /// stamped generics) mirror every local into `b.cur_locals` too.
+    /// `declareBodyLocal` picks the right bookkeeping.
+    callee: bool = false,
 
     fn find(self: *const Scope, name: []const u8) ?Local {
         var i = self.locals.items.len;
@@ -3632,6 +3642,17 @@ const Scope = struct {
         return self.next_idx - self.n_params;
     }
 };
+
+/// Declare a body local with the right bookkeeping for the context:
+/// entry-style bodies (`main`, stamped generics) mirror each local into
+/// `b.cur_locals`; a plain callee body tracks them in the scope alone.
+fn declareBodyLocal(b: *Builder, scope: *Scope, name: []const u8, mutable: bool, ty: hir.Type) BuildError!u32 {
+    if (scope.callee) return scope.declare(name, mutable, ty);
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const idx = try scope.declare(name, mutable, ty);
+    try b.cur_locals.append(b.a, ty);
+    return idx;
+}
 
 fn buildIntBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.Stmt {
     var items: std.ArrayList(*hir.Stmt) = .empty;
@@ -3699,6 +3720,7 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             out.* = .{ .assign = .{ .idx = loc.idx, .value = value } };
         },
         .if_stmt => |is| return buildIfStmtNode(b, is, scope),
+        .match_stmt => |ms| return buildIntMatch(b, ms, scope),
         .while_stmt => |ws| {
             const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, scope);
             const body = try buildIntBlock(b, ws.body() orelse return error.Unsupported, scope);
@@ -3712,6 +3734,72 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         .continue_stmt => out.* = .cont,
         else => return error.Unsupported,
     }
+    return out;
+}
+
+/// A `match` in a callee body — the value form: every arm is a `->`
+/// expression of one scalar type, lowered to a value `if` chain. The
+/// hidden scrutinee set + the chain ride in one block; as the body's
+/// tail the lowering reads it as a nested value block. The scrutinee
+/// may be an enum value (incl. an enum-typed *param*) or a provable
+/// i64 (literal arms). Statement-position matches with side-effecting
+/// arm bodies are a later rung.
+fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.Stmt {
+    const scrut = ms.scrutinee() orelse return error.Unsupported;
+    const info_opt = try enumOfExpr(b, scope, scrut);
+    if (info_opt == null and (try exprScalar(b, scrut, scope)) != .i64) return error.Unsupported;
+    const boxed = if (info_opt) |info| info.si != null else false;
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, &stmts);
+
+    var arms: std.ArrayList(LoweredArm) = .empty;
+    defer arms.deinit(b.a);
+    var default: ?*hir.Stmt = null;
+    var seen: u64 = 0;
+    var vty: ?hir.Type = null;
+    var it = ms.arms();
+    while (it.next()) |arm| {
+        const pat = arm.pattern() orelse return error.Unsupported;
+        // Pattern first: payload bindings must be in scope for the value.
+        const rp = if (info_opt) |info|
+            try resolveArmPattern(b, info, pat, scope, s_idx)
+        else
+            try resolveLiteralPattern(b, pat);
+        const e = arm.expression() orelse return error.Unsupported; // value arms only
+        const sc = scalarBindTy(try exprScalar(b, e, scope));
+        if (vty) |t| {
+            if (sc != t) return error.Unsupported; // arms must agree on one type
+        } else vty = sc;
+        const value = try buildIntExpr(b, e, scope);
+        const vstmt = try b.a.create(hir.Stmt);
+        vstmt.* = .{ .expr = value };
+        const body = try b.a.create(hir.Stmt);
+        body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+        const ap = rp orelse {
+            if (default != null) return error.Unsupported; // two `_` arms
+            default = body;
+            continue;
+        };
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
+        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
+    }
+    if (default == null) {
+        const info = info_opt orelse return error.Unsupported;
+        if (@popCount(seen) < info.variants.len) return error.Unsupported;
+    }
+    // A *value* chain must yield on every path. An exhaustive match
+    // without `_` makes the last arm's test redundant — it becomes the
+    // chain's else.
+    var arm_slice: []const LoweredArm = arms.items;
+    var dflt = default;
+    if (dflt == null) {
+        dflt = arm_slice[arm_slice.len - 1].body;
+        arm_slice = arm_slice[0 .. arm_slice.len - 1];
+    }
+    try foldMatchChain(b, s_idx, boxed, arm_slice, dflt, &stmts);
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try stmts.toOwnedSlice(b.a) };
     return out;
 }
 
@@ -6292,6 +6380,62 @@ test "try: Err propagates, Ok binds the payload (errors.md v0 floor)" {
         \\fn main {
         \\    let r = f(4)
         \\    env.out(1)
+        \\}
+        \\
+    )) == null);
+}
+
+test "callee-body match: enum params + value if-chain tails" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\enum Shape { Empty, Circle(i64), Rect(i64, i64) }
+        \\fn area(s: Shape) -> i64 {
+        \\    match s {
+        \\        Empty -> 0,
+        \\        Circle(r) -> r * r * 3,
+        \\        Rect(w, h) -> w * h,
+        \\    }
+        \\}
+        \\fn unwrap_or(o: Option<i64>, d: i64) -> i64 {
+        \\    match o {
+        \\        Some(v) -> v,
+        \\        None -> d,
+        \\    }
+        \\}
+        \\fn main {
+        \\    env.out(area(Shape.Circle(4)))
+        \\    env.out(unwrap_or(Some(7), 0 - 1))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    // Honest rejections: a non-exhaustive callee match, and arms that
+    // disagree on the yielded type.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn unwrap(o: Option<i64>) -> i64 {
+        \\    match o {
+        \\        Some(v) -> v,
+        \\    }
+        \\}
+        \\fn main {
+        \\    env.out(unwrap(Some(7)))
+        \\}
+        \\
+    )) == null);
+    var tr3 = TestResolver{ .a = testing.allocator };
+    defer tr3.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr3,
+        \\fn f(o: Option<i64>) -> i64 {
+        \\    match o {
+        \\        Some(v) -> v,
+        \\        None -> 1.5,
+        \\    }
+        \\}
+        \\fn main {
+        \\    env.out(f(Some(7)))
         \\}
         \\
     )) == null);
