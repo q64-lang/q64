@@ -53,6 +53,15 @@ describe.skipIf(!binaryAvailable())("q64 check", () => {
     expect(hasDiagnostic(r.envelope, "TYP051", "error")).toBe(true);
   });
 
+  test("non-exhaustive match on prelude Option is TYP062 (spec/errors.md)", () => {
+    // Option/Result live in the auto-prelude: bare `Some(5)` types as
+    // an Option value, and a match missing `None` is non-exhaustive.
+    const r = runCli(["check", fixture("option-missing-none.q"), "--diagnostics", "json"]);
+    expect(r.envelope?.ok).toBe(false);
+    expect(hasDiagnostic(r.envelope, "TYP062", "error")).toBe(true);
+    expect(r.exitCode).not.toBe(0);
+  });
+
   test("wrong fit form for a single-param face is TYP201 (spec/faces.md)", () => {
     // The fit registry (q64/src/sema/fits.zig): `Eq` is a prelude
     // single-param face, so the bare `fit Eq<Point>` form is rejected.

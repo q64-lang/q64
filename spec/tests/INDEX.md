@@ -70,7 +70,7 @@ no test.
 | `TYP054` | types.md        | slice borrows outlive their bytes                 | —                                                        |
 | `TYP060` | types.md        | parameter mode keyword in call argument           | `types/mode-keyword-in-call.q`                           |
 | `TYP061` | types.md        | wrong number of call arguments                    | `types/wrong-arg-count.q`                                |
-| `TYP062` | types.md        | non-exhaustive `match`                            | `types/non-exhaustive-match.q`                           |
+| `TYP062` | types.md        | non-exhaustive `match`                            | `types/non-exhaustive-match.q`, `types/non-exhaustive-option-match.q` |
 | `TYP070` | types.md        | shape mismatch in tensor op                       | —                                                        |
 | `TYP071` | types.md        | SIMD lane width mismatch                          | —                                                        |
 | `TYP080` | types.md        | (note) prefer `if let Some(u)` form               | —                                                        |

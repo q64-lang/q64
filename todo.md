@@ -970,8 +970,51 @@ verified, honest diagnostics throughout.
       Rungs: C1 unit variants + statement `match` (landed) → C2
       value `match` (landed) → C3 payload variants (landed) → C4
       literal patterns (landed) → exhaustiveness diagnostic (landed)
-      → `Option`/`Result` in the prelude (next: generic enums — C3's
-      boxed representation meets B5's monomorphization).
+      → `Option`/`Result` in the prelude + generic enum declarations
+      (landed) → next: `T?` sugar, `if let Some(x)` narrowing, `try`
+      (needs Result-returning functions — the cross-fn enum story).
+      - [x] **`Option`/`Result` in the prelude + generic enums (v0
+            floor).** Generic enum *declarations* register now — no
+            monomorphization needed at this floor: every payload slot
+            is uniformly 8 bytes (C3's boxed shape), so `enum BoxE<T>
+            { Full(T), Empty }` lays out identically for any scalar T
+            (a `T` slot rides the i64 compute floor; `registerEnums`
+            reads the `<…>` header via `parseGenericSig`, new
+            `ast.EnumDecl.genericParams()`). On top of that,
+            `Option<T>`/`Result<T, E>` register as auto-prelude enums
+            (spec/errors.md §"Result and Option") with **bare
+            constructors**: `Some(40)`, `None`, `Ok(7)`, `Err(3)`
+            construct without qualification (`enumVariantTag` resolves
+            a dotless name through `sema.prelude.ctorEnum` → the
+            registry, so a file `enum Option` **shadows** the prelude
+            — and drops the bare form for variants it lacks, honestly
+            NameNotFound). `None` was the landmine: it lexes as
+            `KW_NONE`, which (a) hung the parser forever on any enum
+            declaring a `None` variant — `parseVariant` only took
+            IDENT and the variant loop had no progress guard (the same
+            bug class as B2b's `on:` field fix; guard + KW_NONE-as-name
+            landed, pre-existing bug) — and (b) parses as a *literal*
+            expression, not a path, so `let e = None`, match scrutinees,
+            and `enumOfExpr` gained literal arms routing KW_NONE to the
+            (possibly shadowed) Option unit alloc; match arms already
+            parsed `None` as ENUM_VARIANT_PATTERN and `patternHeadName`
+            learned the KW_NONE head. `q64 check` follows: TYP062 knows
+            the prelude pair (`collectEnums` adds them shadow-aware),
+            bare ctor calls/paths and the `None` literal type as enum
+            values. specs: modules.md prelude row lists the ctors.
+            Verified end-to-end wasm64 + wasm32 (roundtrip prelude-enum
+            section: `42 / none / ok 7 / code = 300 / 27`) + 6 unit
+            tests (constructors/match/None-literal, generic enum,
+            non-exhaustive rejection, shadowing, parser hang
+            regression, check TYP062 incl. shadow-silence). New
+            conformance fixture `types/non-exhaustive-option-match.q`
+            flips **23/51**; 386 unit / 81 CLI / roundtrips green.
+            **Boundary:** payload slots stay the i64 floor (str/record
+            payloads later); `T?` sugar, `?.` chaining, `try`, and
+            Option/Result *returns* from functions (cross-fn enum
+            signatures) are later rungs; `env.out(o)` of an enum value
+            still prints nothing useful (variant-name formatter is a
+            nicety rung).
       - [x] **TYP062 emitted in `q64 check` — non-exhaustive match.**
             Specced first (types.md gains the row; `Result`-specific
             guidance stays TYP302). The check pass collects this

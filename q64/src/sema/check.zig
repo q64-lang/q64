@@ -30,6 +30,7 @@ const symbols = @import("symbols.zig");
 const types = @import("types.zig");
 const exprtype = @import("exprtype.zig");
 const fits = @import("fits.zig");
+const prelude = @import("prelude.zig");
 
 pub const Diag = struct {
     code: []const u8,
@@ -124,6 +125,16 @@ fn collectEnums(gpa: std.mem.Allocator, sf: ast.SourceFile) !Enums {
         },
         else => {},
     };
+    // The auto-prelude pair (spec/errors.md §"Result and Option") — a
+    // file declaration of the same name shadows it.
+    const prelude_enums = [_]struct { name: []const u8, variants: []const []const u8 }{
+        .{ .name = "Option", .variants = &.{ "Some", "None" } },
+        .{ .name = "Result", .variants = &.{ "Ok", "Err" } },
+    };
+    for (prelude_enums) |pe| {
+        if (out.contains(pe.name)) continue;
+        try out.put(gpa, pe.name, try gpa.dupe([]const u8, pe.variants));
+    }
     return out;
 }
 
@@ -198,10 +209,16 @@ const Checker = struct {
             .string_lit => return .{ .id = try c.store.intern(.{ .builtin = .str }) },
             .literal => |lit| {
                 const t = lit.token() orelse return .unknown;
-                return switch (t.kind) {
-                    .KW_TRUE, .KW_FALSE => try c.boolInfo(),
-                    else => .unknown,
-                };
+                switch (t.kind) {
+                    .KW_TRUE, .KW_FALSE => return try c.boolInfo(),
+                    .KW_NONE => {
+                        // The prelude `None` — an Option value (unless a
+                        // file declaration shadows Option without it).
+                        if (c.enumOfCtor("None")) |ename| return .{ .enum_value = ename };
+                        return .unknown;
+                    },
+                    else => return .unknown,
+                }
             },
             .paren => |p| return c.typeOf(p.inner() orelse return .unknown),
             .unary => |u| {
@@ -234,12 +251,13 @@ const Checker = struct {
                 return .unknown;
             },
             .call => |cc| {
-                // `Shape.Circle(7)` — a payload-variant construction.
+                // `Shape.Circle(7)` — a payload-variant construction —
+                // or a bare auto-prelude constructor (`Some(5)`).
                 if (cc.callee()) |callee| {
                     if (callee == .path) {
                         if (callee.path.text(c.gpa)) |cn| {
                             defer c.gpa.free(cn);
-                            if (c.enumOfDotted(cn)) |ename| {
+                            if (c.enumOfDotted(cn) orelse c.enumOfCtor(cn)) |ename| {
                                 var args = cc.args();
                                 while (args.next()) |a| _ = try c.typeOf(a);
                                 return .{ .enum_value = ename };
@@ -304,7 +322,11 @@ const Checker = struct {
                 const name = p.text(c.gpa) catch return .unknown;
                 defer c.gpa.free(name);
                 if (c.enumOfDotted(name)) |ename| return .{ .enum_value = ename };
-                return c.scope.find(name) orelse .unknown;
+                if (c.scope.find(name)) |info| return info;
+                // A bare auto-prelude constructor (`None`) — after the
+                // scope so a local binding of the name wins.
+                if (c.enumOfCtor(name)) |ename| return .{ .enum_value = ename };
+                return .unknown;
             },
             .match => |me| {
                 // A value match: judge exhaustiveness like the
@@ -509,6 +531,19 @@ const Checker = struct {
                 // look the key up again for a stable slice.
                 return c.enums.getKey(name[0..dot]);
             }
+        }
+        return null;
+    }
+
+    /// The enum a bare auto-prelude constructor names (`Some`/`None` →
+    /// `Option`, `Ok`/`Err` → `Result`). Resolved through the enums
+    /// table, so a file declaration shadowing the enum wins — and
+    /// drops the bare form when it lacks the variant.
+    fn enumOfCtor(c: *Checker, name: []const u8) ?[]const u8 {
+        const ename = prelude.ctorEnum(name) orelse return null;
+        const variants = c.enums.get(ename) orelse return null;
+        for (variants) |v| {
+            if (std.mem.eql(u8, v, name)) return c.enums.getKey(ename);
         }
         return null;
     }
@@ -824,7 +859,7 @@ fn patternHead(node: *const cst.Node) ?[]const u8 {
     for (node.children) |c| switch (c) {
         .token => |t| {
             if (t.kind == .L_PAREN) return head;
-            if (t.kind == .IDENT) head = t.text;
+            if (t.kind == .IDENT or t.kind == .KW_NONE) head = t.text;
         },
         .node => |n| if (patternHead(n)) |h| {
             head = h;
@@ -1203,6 +1238,46 @@ test "check: TYP062 — non-exhaustive match on a local enum" {
         \\}
         \\
     , &.{"TYP062"});
+}
+
+test "check: TYP062 — non-exhaustive match on prelude Option/Result" {
+    // Bare constructors type as enum values; a missing `None` fires.
+    try expectCodes(
+        \\fn main {
+        \\    let o = Some(5)
+        \\    match o {
+        \\        Some(v) -> env.out(v),
+        \\    }
+        \\}
+        \\
+    , &.{"TYP062"});
+    // The `None` literal types as Option; a missing `Some` fires.
+    try expectCodes(
+        \\fn main {
+        \\    let e = None
+        \\    match e {
+        \\        None -> env.out("none"),
+        \\    }
+        \\}
+        \\
+    , &.{"TYP062"});
+    // Exhaustive Option / Result matches stay silent; a file enum
+    // shadowing Option drops the prelude variants.
+    try expectCodes(
+        \\enum Option { Just(i64) }
+        \\fn main {
+        \\    let o = Err(3)
+        \\    match o {
+        \\        Ok(v) -> env.out(v),
+        \\        Err(c) -> env.out(c),
+        \\    }
+        \\    let e = None
+        \\    match e {
+        \\        None -> env.out("none"),
+        \\    }
+        \\}
+        \\
+    , &.{});
 }
 
 test "check: TYP062 stays silent on exhaustive / unjudgeable matches" {

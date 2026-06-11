@@ -469,6 +469,13 @@ pub const EnumDecl = struct {
         return itemName(self.cst);
     }
 
+    /// The raw `<…>` generic-parameter span (`<T>`), or null for a
+    /// non-generic enum. Internals are tokens pending the generics
+    /// grammar, like `FnDecl.genericParams`.
+    pub fn genericParams(self: EnumDecl) ?*const cst.Node {
+        return firstChildRawNode(self.cst, .GENERIC_PARAMS);
+    }
+
     pub fn variants(self: EnumDecl) VariantIter {
         return .{ .children = self.cst.children };
     }
@@ -493,11 +500,16 @@ pub const VariantIter = struct {
 };
 
 /// `Variant := IDENT VariantPayload?` (payload is a raw span in v0).
+/// `None` lexes as `KW_NONE` but names a variant (the prelude `Option`).
 pub const Variant = struct {
     cst: *const cst.Node,
 
     pub fn name(self: Variant) ?cst.Token {
-        return itemName(self.cst);
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .IDENT or t.kind == .KW_NONE) return t,
+            .node => {},
+        };
+        return null;
     }
 };
 

@@ -788,13 +788,14 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
 }
 
 /// The variant name a payload pattern opens with: the last IDENT
-/// before its `(`.
+/// before its `(`. A bare `None` arm parses as an ENUM_VARIANT_PATTERN
+/// holding just the `KW_NONE` token, so it names a head too.
 fn patternHeadName(node: *const parser.cst.Node) ?[]const u8 {
     var head: ?[]const u8 = null;
     for (node.children) |c| switch (c) {
         .token => |t| {
             if (t.kind == .L_PAREN) return head;
-            if (t.kind == .IDENT) head = t.text;
+            if (t.kind == .IDENT or t.kind == .KW_NONE) head = t.text;
         },
         .node => |n| {
             // A structured path head: its last IDENT.
@@ -1954,76 +1955,108 @@ const EnumInfo = struct {
 
 const max_enum_payload = 4;
 
-/// Register this file's enums (C1/C3). The v0 floor: unit variants
-/// and tuple payloads of up to four `i64` fields; anything else skips
-/// the enum — using it surfaces the honest Unsupported.
+/// Register this file's enums (C1/C3) plus the auto-prelude pair. The
+/// v0 floor: unit variants and tuple payloads of up to four fields,
+/// each `i64` or one of the enum's type params (a `T` slot is an
+/// 8-byte slot at the i64 compute floor); anything else skips the
+/// enum — using it surfaces the honest Unsupported.
 fn registerEnums(b: *Builder, sf: ast.SourceFile) BuildError!void {
     var it = sf.items();
     while (it.next()) |item| switch (item) {
         .enum_decl => |ed| {
             const nm = ed.name() orelse continue;
+            // A generic enum's `<T, …>` header; payload slots may name
+            // its params. Beyond-the-floor headers skip the enum.
+            const sig: ?sema.fits.GenericSig = if (ed.genericParams()) |gp|
+                sema.fits.parseGenericSig(gp) orelse continue
+            else
+                null;
             var vars: std.ArrayList(EnumVariant) = .empty;
             var ok = true;
-            var max_arity: u32 = 0;
             var vit = ed.variants();
             while (vit.next()) |v| {
                 const vname = v.name() orelse {
                     ok = false;
                     break;
                 };
-                const arity = variantArity(v) orelse {
+                const arity = variantArity(v, sig) orelse {
                     ok = false; // record payloads / non-i64 fields: later
                     break;
                 };
-                if (arity > max_arity) max_arity = arity;
                 try vars.append(b.a, .{ .name = vname.text, .arity = arity });
             }
             if (!ok or vars.items.len == 0) {
                 vars.deinit(b.a);
                 continue;
             }
-            // A boxed enum's arena shape: tag at 0, payload slots after.
-            var si: ?*const StructInfo = null;
-            if (max_arity > 0) {
-                var fields: std.ArrayList(StructField) = .empty;
-                try fields.append(b.a, .{ .name = "#tag", .ty = .i64, .offset = 0 });
-                var j: u32 = 0;
-                while (j < max_arity) : (j += 1) {
-                    const fname = try std.fmt.allocPrint(b.a, "#p{d}", .{j});
-                    try fields.append(b.a, .{ .name = fname, .ty = .i64, .offset = 8 * (j + 1) });
-                }
-                const s = try b.a.create(StructInfo);
-                s.* = .{
-                    .name = nm.text,
-                    .fields = try fields.toOwnedSlice(b.a),
-                    .size = 8 * (max_arity + 1),
-                    .alignment = 8,
-                };
-                si = s;
-            }
-            const info = try b.a.create(EnumInfo);
-            info.* = .{ .name = nm.text, .variants = try vars.toOwnedSlice(b.a), .si = si };
-            try b.enums.put(b.a, nm.text, info);
+            try registerEnum(b, nm.text, try vars.toOwnedSlice(b.a));
         },
         else => {},
     };
+    // The auto-prelude pair (spec/errors.md §"Result and Option"). A
+    // file declaration of the same name shadows it (registered above,
+    // so the prelude entry is skipped).
+    if (!b.enums.contains("Option")) {
+        try registerEnum(b, "Option", try b.a.dupe(EnumVariant, &.{
+            .{ .name = "Some", .arity = 1 },
+            .{ .name = "None", .arity = 0 },
+        }));
+    }
+    if (!b.enums.contains("Result")) {
+        try registerEnum(b, "Result", try b.a.dupe(EnumVariant, &.{
+            .{ .name = "Ok", .arity = 1 },
+            .{ .name = "Err", .arity = 1 },
+        }));
+    }
+}
+
+/// Register one enum, computing the boxed arena shape — tag at 0,
+/// payload slots after (spec/memory.md §"Enum representation (v0)") —
+/// when any variant carries a payload.
+fn registerEnum(b: *Builder, name: []const u8, vars: []const EnumVariant) BuildError!void {
+    var max_arity: u32 = 0;
+    for (vars) |v| {
+        if (v.arity > max_arity) max_arity = v.arity;
+    }
+    var si: ?*const StructInfo = null;
+    if (max_arity > 0) {
+        var fields: std.ArrayList(StructField) = .empty;
+        try fields.append(b.a, .{ .name = "#tag", .ty = .i64, .offset = 0 });
+        var j: u32 = 0;
+        while (j < max_arity) : (j += 1) {
+            const fname = try std.fmt.allocPrint(b.a, "#p{d}", .{j});
+            try fields.append(b.a, .{ .name = fname, .ty = .i64, .offset = 8 * (j + 1) });
+        }
+        const s = try b.a.create(StructInfo);
+        s.* = .{
+            .name = name,
+            .fields = try fields.toOwnedSlice(b.a),
+            .size = 8 * (max_arity + 1),
+            .alignment = 8,
+        };
+        si = s;
+    }
+    const info = try b.a.create(EnumInfo);
+    info.* = .{ .name = name, .variants = vars, .si = si };
+    try b.enums.put(b.a, name, info);
 }
 
 /// The tuple-payload arity of a variant at the v0 floor: 0 for a unit
-/// variant, N for `(i64, … i64)` (each slot exactly `i64`, N ≤ 4).
-/// `null` for record payloads or anything else.
-fn variantArity(v: ast.Variant) ?u32 {
+/// variant, N for `(slot, … slot)` where each slot is exactly `i64`
+/// or one of the enum's type params (N ≤ 4). `null` for record
+/// payloads or anything else.
+fn variantArity(v: ast.Variant, sig: ?sema.fits.GenericSig) ?u32 {
     var buf: [4 * max_enum_payload]parser.cst.Token = undefined;
     var n: usize = 0;
     if (!flattenVariantTokens(v.cst, &buf, &n, true)) return null;
     if (n == 0) return 0; // unit
-    // Expect exactly: ( i64 (, i64)* ,? )
+    // Expect exactly: ( slot (, slot)* ,? )
     if (buf[0].kind != .L_PAREN or buf[n - 1].kind != .R_PAREN) return null;
     var arity: u32 = 0;
     var i: usize = 1;
     while (i < n - 1) {
         const t = buf[i];
-        if (t.kind == .IDENT and std.mem.eql(u8, t.text, "i64")) {
+        if (t.kind == .IDENT and payloadSlotOk(t.text, sig)) {
             arity += 1;
             i += 1;
             if (i < n - 1) {
@@ -2036,15 +2069,27 @@ fn variantArity(v: ast.Variant) ?u32 {
     return arity;
 }
 
+/// A payload slot type at the v0 floor: `i64`, or a type param of the
+/// declaring enum (stored as an 8-byte slot, the i64 compute floor).
+fn payloadSlotOk(text: []const u8, sig: ?sema.fits.GenericSig) bool {
+    if (std.mem.eql(u8, text, "i64")) return true;
+    const s = sig orelse return false;
+    for (s.params[0..s.n]) |p| {
+        if (std.mem.eql(u8, text, p.tname)) return true;
+    }
+    return false;
+}
+
 /// Flatten a variant's non-trivia tokens (past the name) into `buf`.
-/// `top` skips the leading variant-name IDENT; a `{` (record payload)
-/// or overflow returns false.
+/// `top` skips the leading variant-name token (an IDENT, or `KW_NONE`
+/// — the prelude `Option.None`); a `{` (record payload) or overflow
+/// returns false.
 fn flattenVariantTokens(node: *const parser.cst.Node, buf: []parser.cst.Token, n: *usize, top: bool) bool {
     for (node.children) |c| switch (c) {
         .token => |t| {
             if (t.kind.isTrivia()) continue;
             if (t.kind == .L_BRACE) return false; // record payload: later
-            if (top and t.kind == .IDENT and n.* == 0) continue; // the variant name
+            if (top and (t.kind == .IDENT or t.kind == .KW_NONE) and n.* == 0) continue; // the variant name
             if (n.* == buf.len) return false;
             buf[n.*] = t;
             n.* += 1;
@@ -2054,9 +2099,19 @@ fn flattenVariantTokens(node: *const parser.cst.Node, buf: []parser.cst.Token, n
     return true;
 }
 
-/// `Color.Red` → the enum + the variant's declaration-order tag.
+/// `Color.Red` → the enum + the variant's declaration-order tag. A
+/// bare (dotless) name resolves only against the auto-prelude
+/// constructors (`Some`/`None`/`Ok`/`Err`, spec/errors.md §"Result
+/// and Option") — via the registry, so a file declaration shadowing
+/// `Option`/`Result` wins (and drops the bare form if it lacks the
+/// variant).
 fn enumVariantTag(b: *Builder, txt: []const u8) ?struct { info: *const EnumInfo, tag: i64 } {
-    const dot = std.mem.indexOfScalar(u8, txt, '.') orelse return null;
+    const dot = std.mem.indexOfScalar(u8, txt, '.') orelse {
+        const ename = sema.prelude.ctorEnum(txt) orelse return null;
+        const info = b.enums.get(ename) orelse return null;
+        const tag = info.variantTag(txt) orelse return null;
+        return .{ .info = info, .tag = @intCast(tag) };
+    };
     const vname = txt[dot + 1 ..];
     if (std.mem.indexOfScalar(u8, vname, '.') != null) return null;
     const info = b.enums.get(txt[0..dot]) orelse return null;
@@ -2068,14 +2123,23 @@ fn enumVariantTag(b: *Builder, txt: []const u8) ?struct { info: *const EnumInfo,
 /// where Shape has payload variants)? Such a value is a record, so the
 /// let arm routes it through the record path.
 fn isBoxedVariantPath(b: *Builder, e: ast.Expr) bool {
-    const p = switch (e) {
-        .path => |x| x,
+    switch (e) {
+        .path => |p| {
+            const txt = p.text(b.a) catch return false;
+            defer b.a.free(txt);
+            const ev = enumVariantTag(b, txt) orelse return false;
+            return ev.info.si != null;
+        },
+        .literal => |le| {
+            // The prelude `None` literal (KW_NONE) is Option's unit
+            // variant — boxed, since Some carries a payload.
+            const t = le.token() orelse return false;
+            if (t.kind != .KW_NONE) return false;
+            const ev = enumVariantTag(b, "None") orelse return false;
+            return ev.info.si != null;
+        },
         else => return false,
-    };
-    const txt = p.text(b.a) catch return false;
-    defer b.a.free(txt);
-    const ev = enumVariantTag(b, txt) orelse return false;
-    return ev.info.si != null;
+    }
 }
 
 /// The enum a scrutinee expression carries: a `Enum.Variant` value or
@@ -2088,6 +2152,13 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             defer b.a.free(txt);
             if (enumVariantTag(b, txt)) |ev| return ev.info;
             return scope.enum_binds.get(txt);
+        },
+        .literal => |le| {
+            // The prelude `None` literal.
+            const t = le.token() orelse return null;
+            if (t.kind != .KW_NONE) return null;
+            const ev = enumVariantTag(b, "None") orelse return null;
+            return ev.info;
         },
         .call => |cc| {
             // A payload construction (`Shape.Circle(7)`).
@@ -2950,6 +3021,15 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
             const out = try b.a.create(hir.Expr);
             out.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
             return .{ .e = out, .si = si };
+        },
+        .literal => |le| {
+            // The prelude `None` (lexed KW_NONE, so a literal — not a
+            // path): a unit variant of the possibly-shadowed Option.
+            const t = le.token() orelse return null;
+            if (t.kind != .KW_NONE) return null;
+            const ev = enumVariantTag(b, "None") orelse return null;
+            const esi = ev.info.si orelse return null;
+            return .{ .e = try enumAlloc(b, esi, ev.tag, &.{}), .si = esi };
         },
         .index => |ix| {
             // `xs[i]` where xs holds inline records: the element address
@@ -5690,4 +5770,114 @@ test "C4: literal patterns on an integer scrutinee (statement + value)" {
         \\}
         \\
     )) == null);
+}
+
+test "prelude Option/Result: bare + qualified constructors, match, None literal" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn main {
+        \\    let o = Some(40)
+        \\    let n = match o {
+        \\        Some(v) -> v + 2,
+        \\        None -> 0,
+        \\    }
+        \\    env.out(n)
+        \\    let e = None
+        \\    match e {
+        \\        Some(v) -> env.out(v),
+        \\        None -> env.out("none"),
+        \\    }
+        \\    match Result.Ok(7) {
+        \\        Ok(v) -> env.out(v),
+        \\        Err(c) -> env.out(c),
+        \\    }
+        \\    let r = Err(3)
+        \\    let code = match r {
+        \\        Ok(_) -> 0,
+        \\        Err(c) -> c * 100,
+        \\    }
+        \\    env.out(code)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Option/Result box to {tag, p0}: size 16, align 8.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+}
+
+test "prelude Option: non-exhaustive match is honestly unsupported" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    let o = Some(5)
+        \\    match o {
+        \\        Some(v) -> env.out(v),
+        \\    }
+        \\}
+        \\
+    )) == null);
+}
+
+test "generic enum: a type-param payload slot registers at the i64 floor" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum BoxE<T> { Full(T, T), Empty }
+        \\fn main {
+        \\    let bx = BoxE.Full(4, 5)
+        \\    match bx {
+        \\        Full(x, y) -> env.out(x + y),
+        \\        Empty -> env.out(0),
+        \\    }
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Two T slots box to {tag, p0, p1}: size 24.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=24 align=8") != null);
+}
+
+test "prelude shadowing: a file `enum Option` wins; missing variants drop the bare form" {
+    // The file's Option declares Some/None and works through the same
+    // machinery (the pre-existing parser hang on a `None` variant is
+    // the regression here).
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\enum Option { Some(i64), None }
+        \\fn main {
+        \\    let o = Option.Some(40)
+        \\    match o {
+        \\        Some(v) -> env.out(v + 2),
+        \\        None -> env.out(0),
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    // A shadowing Option *without* a Some variant drops bare `Some` —
+    // the call resolves as an unknown function (NameNotFound).
+    const src2 =
+        \\enum Option { Just(i64), None }
+        \\fn main {
+        \\    let o = Some(5)
+        \\    env.out(1)
+        \\}
+        \\
+    ;
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try tr2.addLib(src2);
+    const r = try rejectFromSource(testing.allocator, src2, tr2.resolver());
+    try testing.expectEqual(hir.Reject.name_not_found, r.?);
 }

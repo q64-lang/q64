@@ -621,9 +621,14 @@ const Parser = struct {
             while (!self.isEof()) {
                 try self.eatTrivia(&children);
                 if (self.peek() == .R_BRACE) break;
+                const before = self.pos;
                 try children.append(self.arena, .{ .node = try self.parseVariant() });
                 try self.eatTrivia(&children);
                 if (self.peek() == .COMMA) {
+                    try children.append(self.arena, .{ .token = self.advance() });
+                } else if (self.pos == before) {
+                    // parseVariant consumed nothing (a keyword-shaped
+                    // name): eat one token so the loop must progress.
                     try children.append(self.arena, .{ .token = self.advance() });
                 }
             }
@@ -637,10 +642,12 @@ const Parser = struct {
     /// `Variant := IDENT VariantPayload?` — payload is a raw balanced
     /// `(…)` (tuple-like) or `{…}` (record-like). A payload may sit after
     /// inline whitespace (`C { … }`); a newline ends the variant, so the
-    /// lookahead won't grab the next variant's tokens.
+    /// lookahead won't grab the next variant's tokens. `None` lexes as
+    /// `KW_NONE` but is a valid variant name (the prelude `Option`
+    /// declares it).
     fn parseVariant(self: *Parser) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
-        if (self.peek() == .IDENT) {
+        if (self.peek() == .IDENT or self.peek() == .KW_NONE) {
             try children.append(self.arena, .{ .token = self.advance() });
         }
         const save = self.pos;
@@ -2787,6 +2794,30 @@ test "enum variants are structured" {
         .token => {},
     };
     try testing.expectEqual(@as(usize, 3), variants);
+}
+
+test "enum: a `None` variant parses (KW_NONE name; the loop must progress)" {
+    // `None` lexes as KW_NONE; parseVariant accepts it as a name. The
+    // regression: the variant loop hung forever on any keyword-shaped
+    // name (no progress guard).
+    const src = "enum Opt { Some(i64), None }\n";
+    const r = try parse(testing.allocator, src, "opt.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    const decl = childKindNode(sf.cst, .ENUM_DECL) orelse return error.TestExpectedEnum;
+    var names: [2][]const u8 = undefined;
+    var n: usize = 0;
+    for (decl.children) |c| switch (c) {
+        .node => |node| if (node.kind == .VARIANT) {
+            const v = ast.Variant{ .cst = node };
+            names[n] = (v.name() orelse return error.TestExpectedName).text;
+            n += 1;
+        },
+        .token => {},
+    };
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("Some", names[0]);
+    try testing.expectEqualStrings("None", names[1]);
 }
 
 test "ItemIter surfaces struct / enum / fn declarations in order" {

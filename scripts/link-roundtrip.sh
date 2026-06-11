@@ -1313,4 +1313,51 @@ lit32_out="$("$HOST_BIN" "$tmp/lit32.wasm")"
 [[ "$lit32_out" == "$lit_expected" ]] || { echo "FAIL: literal-match wasm32 (got: $lit32_out)" >&2; exit 1; }
 echo "    ok: literal match -> one / 200 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# Prelude Option/Result + generic enums: bare constructors (`Some(40)`,
+# `None`, `Err(3)`), qualified construction, payload bindings in statement
+# and value matches, and a user generic enum at the i64 floor.
+# ---------------------------------------------------------------------------
+echo "==> prelude enums: Option / Result + generic enum <T>"
+opt_app="$tmp/option.q"
+cat > "$opt_app" <<'Q64'
+enum BoxE<T> { Full(T), Empty }
+fn main {
+    let o = Some(40)
+    let n = match o {
+        Some(v) -> v + 2,
+        None -> 0,
+    }
+    env.out(n)
+    let e = None
+    match e {
+        Some(v) -> env.out(v),
+        None -> env.out("none"),
+    }
+    match Result.Ok(7) {
+        Ok(v) -> env.out("ok {v}"),
+        Err(c) -> env.out("err {c}"),
+    }
+    let r = Err(3)
+    let code = match r {
+        Ok(_) -> 0,
+        Err(c) -> c * 100,
+    }
+    env.out("code = {code}")
+    let bx = BoxE.Full(9)
+    match bx {
+        Full(x) -> env.out(x * 3),
+        Empty -> env.out("empty"),
+    }
+}
+Q64
+opt_expected=$'42\nnone\nok 7\ncode = 300\n27'
+"$Q64_BIN" emit "$opt_app" "$tmp/option.wasm"
+opt_out="$("$HOST_BIN" "$tmp/option.wasm")"
+[[ "$opt_out" == "$opt_expected" ]] || { echo "FAIL: prelude-enum (got: $opt_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$opt_app" "$tmp/option32.wasm" --addr wasm32
+opt32_out="$("$HOST_BIN" "$tmp/option32.wasm")"
+[[ "$opt32_out" == "$opt_expected" ]] || { echo "FAIL: prelude-enum wasm32 (got: $opt32_out)" >&2; exit 1; }
+echo "    ok: prelude enums -> 42 / none / ok 7 / code = 300 / 27 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

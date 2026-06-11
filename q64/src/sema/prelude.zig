@@ -38,9 +38,15 @@ const entries = [_]Entry{
     .{ .name = "Simd", .kind = .type_ },
     .{ .name = "Tensor", .kind = .type_ },
     .{ .name = "DynTensor", .kind = .type_ },
-    // Optionality / errors.
+    // Optionality / errors. The constructors ride along with their
+    // enums (errors.md §"Result and Option": both live in the
+    // auto-prelude, variants usable bare).
     .{ .name = "Option", .kind = .type_ },
     .{ .name = "Result", .kind = .type_ },
+    .{ .name = "Some", .kind = .value },
+    .{ .name = "None", .kind = .value },
+    .{ .name = "Ok", .kind = .value },
+    .{ .name = "Err", .kind = .value },
     .{ .name = "PanicMessage", .kind = .type_ },
     .{ .name = "Cancelled", .kind = .type_ },
     .{ .name = "Closed", .kind = .type_ },
@@ -133,6 +139,16 @@ const entries = [_]Entry{
     .{ .name = "sample", .kind = .value },
 };
 
+/// The auto-prelude enum a bare constructor name belongs to
+/// (errors.md §"Result and Option"), or null. Callers resolve the
+/// enum by name afterwards, so a file declaration shadowing `Option`
+/// or `Result` wins naturally.
+pub fn ctorEnum(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "Some") or std.mem.eql(u8, name, "None")) return "Option";
+    if (std.mem.eql(u8, name, "Ok") or std.mem.eql(u8, name, "Err")) return "Result";
+    return null;
+}
+
 /// The prelude kind of `name`, or null when it isn't auto-prelude.
 pub fn kindOf(name: []const u8) ?Kind {
     inline for (entries) |e| {
@@ -166,4 +182,9 @@ test "prelude: kinds and membership" {
     try std.testing.expect(isType("Result"));
     try std.testing.expect(!isType("sleep"));
     try std.testing.expect(contains("Backpressure"));
+    try std.testing.expectEqual(Kind.value, kindOf("Some").?);
+    try std.testing.expectEqual(Kind.value, kindOf("Err").?);
+    try std.testing.expectEqualStrings("Option", ctorEnum("None").?);
+    try std.testing.expectEqualStrings("Result", ctorEnum("Ok").?);
+    try std.testing.expect(ctorEnum("Red") == null);
 }
