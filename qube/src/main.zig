@@ -113,6 +113,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "install")) {
+        cmdInstall(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: install failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "publish")) {
         cmdPublish(gpa, io, env, &args_it) catch |err| {
             try printStderr(io, "qube: publish failed: {s}\n", .{@errorName(err)});
@@ -156,10 +164,9 @@ pub fn main(init: std.process.Init) !void {
     // Documented subcommands that are not implemented yet. Listed
     // explicitly so unknown names still hit the usage fallback.
     const stub_subs = [_][]const u8{
-        "remove", "test",    "install",
-        "outdated", "audit", "clean",
-        "explain", "fix",    "fmt",
-        "workspace",
+        "remove", "test",  "outdated",
+        "audit",  "clean", "explain",
+        "fix",    "fmt",   "workspace",
     };
     for (stub_subs) |s| {
         if (std.mem.eql(u8, sub, s)) {
@@ -191,6 +198,7 @@ fn usage(io: std.Io) !void {
         \\  web                     Build the qube to wasm and serve it in a browser.
         \\  add <name>[@version]    Resolve a dependency from the Continuum and add it.
         \\  lock                    Resolve manifest dependencies and write qube.lock.
+        \\  install [--offline]     Fetch locked dependencies into the cache (relocks if stale).
         \\  publish                 Pack this qube and publish it to the Continuum.
         \\  login                   Authenticate against the Continuum registry.
         \\  --version, -v           Print the version and exit.
@@ -1984,41 +1992,8 @@ fn cmdAdd(
     };
 
     // Download the archive into the cache, verifying the SHA-256.
-    const home = try qubeHome(gpa, env);
-    defer gpa.free(home);
-    const cache_root = try std.fs.path.join(gpa, &.{ home, "cache" });
-    defer gpa.free(cache_root);
-    try std.Io.Dir.cwd().createDirPath(io, cache_root);
-    const tmp_zip = try std.fmt.allocPrint(gpa, "{s}/{s}.part", .{ cache_root, cv.archive_sha });
-    defer gpa.free(tmp_zip);
-
-    const archive_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}/{s}/archive", .{ registry, name, cv.version });
-    defer gpa.free(archive_url);
-    const dl_status = try httpGetToFile(gpa, io, archive_url, tmp_zip);
-    if (dl_status != 200) {
-        try printStderr(io, "qube add: archive download returned {d}\n", .{dl_status});
-        std.process.exit(@intFromEnum(ExitCode.registry));
-    }
-
-    const got_sha = try sha256HexOfFile(gpa, io, tmp_zip);
-    defer gpa.free(got_sha);
-    if (!std.mem.eql(u8, got_sha, cv.archive_sha)) {
-        try printStderr(io, "qube add: archive SHA-256 mismatch\n  expected {s}\n  got      {s}\n", .{ cv.archive_sha, got_sha });
-        std.process.exit(@intFromEnum(ExitCode.dependency));
-    }
-
-    // Extract to cache/sha256/<ab>/<cd>/<digest>/ (spec/qube-cli.md).
-    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/sha256/{s}/{s}/{s}", .{ cache_root, cv.archive_sha[0..2], cv.archive_sha[2..4], cv.archive_sha });
+    const cache_dir = try downloadAndCacheArchive(gpa, io, env, registry, name, cv.version, cv.archive_sha, "add");
     defer gpa.free(cache_dir);
-    {
-        const argv = [_][]const u8{ "sh", "-c", extract_script, "sh", tmp_zip, cache_dir };
-        const term = try spawnInherit(io, &argv);
-        if (termCode(term) != 0) {
-            try writeStderr(io, "qube add: extracting the archive failed\n");
-            std.process.exit(@intFromEnum(ExitCode.internal));
-        }
-    }
-    std.Io.Dir.cwd().deleteFile(io, tmp_zip) catch {};
 
     // Insert the dependency into the manifest.
     try insertDependency(gpa, io, manifest_path, name, cv.version);
@@ -2037,56 +2012,105 @@ fn cmdAdd(
     try printStdout(io, "Added {s}@{s}\n  cached at {s}\n  locked in {s}\n", .{ name, cv.version, cache_dir, lock_file_name });
 }
 
-/// `qube lock` — regenerate qube.lock from the manifest (spec/qube.lock.md).
-/// A path dep is recorded from its own manifest; a registry range reuses
-/// the already-locked version when it still satisfies, and otherwise
-/// resolves to the highest non-yanked satisfying version from the
-/// registry's metadata (no archive download — the sha comes from the
-/// index; `qube add` / `qube install` populate the cache).
-fn cmdLock(
+/// Download `<registry>/v1/qubes/<name>/<version>/archive`, verify the
+/// expected SHA-256, and extract it into the content-addressed cache
+/// (`~/.qube/cache/sha256/<ab>/<cd>/<digest>/`, spec/qube-cli.md).
+/// Returns the extracted directory; caller owns it. `cmd` names the
+/// caller for messages. Exits with registry / dependency codes on
+/// failure, like the rest of the registry client.
+fn downloadAndCacheArchive(
     gpa: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
-    args_it: *std.process.Args.Iterator,
-) !void {
-    _ = env;
-    var registry: []const u8 = default_registry;
-    while (args_it.next()) |a| {
-        if (std.mem.eql(u8, a, "--registry")) {
-            registry = args_it.next() orelse {
-                try writeStderr(io, "qube lock: --registry needs a value\n");
-                std.process.exit(@intFromEnum(ExitCode.usage));
-            };
-        } else {
-            try printStderr(io, "qube lock: unexpected arg: {s}\n", .{a});
-            std.process.exit(@intFromEnum(ExitCode.usage));
-        }
+    registry: []const u8,
+    name: []const u8,
+    version: []const u8,
+    expected_sha: []const u8,
+    cmd: []const u8,
+) ![]u8 {
+    const home = try qubeHome(gpa, env);
+    defer gpa.free(home);
+    const cache_root = try std.fs.path.join(gpa, &.{ home, "cache" });
+    defer gpa.free(cache_root);
+    try std.Io.Dir.cwd().createDirPath(io, cache_root);
+    const tmp_zip = try std.fmt.allocPrint(gpa, "{s}/{s}.part", .{ cache_root, expected_sha });
+    defer gpa.free(tmp_zip);
+
+    const archive_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}/{s}/archive", .{ registry, name, version });
+    defer gpa.free(archive_url);
+    const dl_status = try httpGetToFile(gpa, io, archive_url, tmp_zip);
+    if (dl_status != 200) {
+        try printStderr(io, "qube {s}: archive download returned {d}\n", .{ cmd, dl_status });
+        std.process.exit(@intFromEnum(ExitCode.registry));
     }
 
+    const got_sha = try sha256HexOfFile(gpa, io, tmp_zip);
+    defer gpa.free(got_sha);
+    if (!std.mem.eql(u8, got_sha, expected_sha)) {
+        try printStderr(io, "qube {s}: archive SHA-256 mismatch\n  expected {s}\n  got      {s}\n", .{ cmd, expected_sha, got_sha });
+        std.process.exit(@intFromEnum(ExitCode.dependency));
+    }
+
+    const cache_dir = try cacheDirForSha(gpa, home, expected_sha);
+    errdefer gpa.free(cache_dir);
+    {
+        const argv = [_][]const u8{ "sh", "-c", extract_script, "sh", tmp_zip, cache_dir };
+        const term = try spawnInherit(io, &argv);
+        if (termCode(term) != 0) {
+            try printStderr(io, "qube {s}: extracting the archive failed\n", .{cmd});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        }
+    }
+    std.Io.Dir.cwd().deleteFile(io, tmp_zip) catch {};
+    return cache_dir;
+}
+
+/// The nearest manifest, discovered and parsed. `root` borrows from
+/// `parsed`; `projectDir()` borrows from `path`.
+const LoadedManifest = struct {
+    path: []u8,
+    src: []u8,
+    json: []u8,
+    parsed: std.json.Parsed(std.json.Value),
+    root: std.json.ObjectMap,
+
+    fn projectDir(self: *const LoadedManifest) []const u8 {
+        return std.fs.path.dirname(self.path) orelse ".";
+    }
+
+    fn deinit(self: *LoadedManifest, gpa: std.mem.Allocator) void {
+        self.parsed.deinit();
+        gpa.free(self.json);
+        gpa.free(self.src);
+        gpa.free(self.path);
+    }
+};
+
+/// Discover the nearest qube.json5 (walking up from cwd) and parse it.
+/// Exits with input-error codes on failure, like the run/build path.
+fn loadManifest(gpa: std.mem.Allocator, io: std.Io) !LoadedManifest {
     const cwd_path = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd_path);
     const manifest_path = try findManifestUpward(gpa, io, cwd_path) orelse {
         try writeStderr(io, "qube: no qube.json5 found in this directory or any parent\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     };
-    defer gpa.free(manifest_path);
-    const project_dir = std.fs.path.dirname(manifest_path) orelse ".";
-
+    errdefer gpa.free(manifest_path);
     const manifest_src = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1 * 1024 * 1024)) catch |err| {
         try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
         std.process.exit(@intFromEnum(ExitCode.input));
     };
-    defer gpa.free(manifest_src);
+    errdefer gpa.free(manifest_src);
     const json = json5ToJson(gpa, manifest_src) catch |err| {
         try printStderr(io, "qube: cannot read {s}: {s}\n", .{ manifest_path, @errorName(err) });
         std.process.exit(@intFromEnum(ExitCode.input));
     };
-    defer gpa.free(json);
+    errdefer gpa.free(json);
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch |err| {
         try printStderr(io, "qube: cannot parse {s}: {s}\n", .{ manifest_path, @errorName(err) });
         std.process.exit(@intFromEnum(ExitCode.input));
     };
-    defer parsed.deinit();
+    errdefer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |o| o,
         else => {
@@ -2094,26 +2118,30 @@ fn cmdLock(
             std.process.exit(@intFromEnum(ExitCode.input));
         },
     };
+    return .{ .path = manifest_path, .src = manifest_src, .json = json, .parsed = parsed, .root = root };
+}
 
-    // The previous lockfile, for version reuse. A malformed one is
-    // regenerated rather than fatal — `lock` is the repair command.
-    const old_lock: ?std.json.Parsed(LockFile) = readLockFile(gpa, io, project_dir) catch |err| switch (err) {
-        error.MalformedLockfile => blk: {
-            try writeStderr(io, "qube lock: existing qube.lock is malformed; regenerating\n");
-            break :blk null;
-        },
-        else => return err,
-    };
-    defer if (old_lock) |p| p.deinit();
-
-    // Entry strings whose owners die before the write live in this arena.
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var entries: std.ArrayList(LockEntry) = .empty;
-    defer entries.deinit(gpa);
-
+/// Resolve the manifest's dependencies into lock entries
+/// (spec/qube.lock.md). A path dep is recorded from its own manifest; a
+/// registry range reuses the `old_lock` version when it still
+/// satisfies, and otherwise resolves to the highest non-yanked
+/// satisfying version from the registry's metadata (no archive download
+/// — the sha comes from the index). With `offline`, a range that cannot
+/// be reused is PKG010 instead of a fetch. Strings that outlive their
+/// producers are allocated in `arena`; `cmd` names the caller for
+/// messages.
+fn buildLockEntries(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    project_dir: []const u8,
+    root: std.json.ObjectMap,
+    registry: []const u8,
+    old_lock: ?std.json.Parsed(LockFile),
+    offline: bool,
+    cmd: []const u8,
+    entries: *std.ArrayList(LockEntry),
+) !void {
     const deps: ?std.json.ObjectMap = if (root.get("dependencies")) |v| switch (v) {
         .object => |o| o,
         else => null,
@@ -2126,7 +2154,7 @@ fn cmdLock(
             switch (entry.value_ptr.*) {
                 .object => |o| {
                     const p = manifestString(o, "path") orelse {
-                        try printStderr(io, "qube lock: dependency '{s}' has no `path`\n", .{dep_name});
+                        try printStderr(io, "qube {s}: dependency '{s}' has no `path`\n", .{ cmd, dep_name });
                         std.process.exit(@intFromEnum(ExitCode.dependency));
                     };
                     const dep_version = pathDepVersion(gpa, io, arena, project_dir, p) catch "0.0.0";
@@ -2152,21 +2180,25 @@ fn cmdLock(
                         try entries.append(gpa, e);
                         continue;
                     }
+                    if (offline) {
+                        try printStderr(io, "qube {s}: PKG010: dependency '{s}' is not locked and --offline forbids resolving it\n", .{ cmd, dep_name });
+                        std.process.exit(@intFromEnum(ExitCode.dependency));
+                    }
 
                     const meta_url = try std.fmt.allocPrint(gpa, "{s}/v1/qubes/{s}", .{ registry, dep_name });
                     defer gpa.free(meta_url);
                     const resp = try httpGet(gpa, io, meta_url);
                     defer gpa.free(resp.raw);
                     if (resp.status == 404) {
-                        try printStderr(io, "qube lock: '{s}' not found on {s}\n", .{ dep_name, registry });
+                        try printStderr(io, "qube {s}: '{s}' not found on {s}\n", .{ cmd, dep_name, registry });
                         std.process.exit(@intFromEnum(ExitCode.dependency));
                     }
                     if (resp.status != 200) {
-                        try printStderr(io, "qube lock: registry returned {d}:\n{s}\n", .{ resp.status, resp.body });
+                        try printStderr(io, "qube {s}: registry returned {d}:\n{s}\n", .{ cmd, resp.status, resp.body });
                         std.process.exit(@intFromEnum(ExitCode.registry));
                     }
                     const meta_parsed = std.json.parseFromSlice(QubeMeta, gpa, resp.body, .{ .ignore_unknown_fields = true }) catch {
-                        try writeStderr(io, "qube lock: could not parse registry metadata\n");
+                        try printStderr(io, "qube {s}: could not parse registry metadata\n", .{cmd});
                         std.process.exit(@intFromEnum(ExitCode.registry));
                     };
                     defer meta_parsed.deinit();
@@ -2186,7 +2218,7 @@ fn cmdLock(
                         best = v;
                     }
                     const cv = best orelse {
-                        try printStderr(io, "qube lock: no version of '{s}' satisfies '{s}'\n", .{ dep_name, range });
+                        try printStderr(io, "qube {s}: no version of '{s}' satisfies '{s}'\n", .{ cmd, dep_name, range });
                         std.process.exit(@intFromEnum(ExitCode.dependency));
                     };
                     try entries.append(gpa, .{
@@ -2197,15 +2229,221 @@ fn cmdLock(
                     });
                 },
                 else => {
-                    try printStderr(io, "qube lock: dependency '{s}' has an unsupported value shape\n", .{dep_name});
+                    try printStderr(io, "qube {s}: dependency '{s}' has an unsupported value shape\n", .{ cmd, dep_name });
                     std.process.exit(@intFromEnum(ExitCode.dependency));
                 },
             }
         }
     }
+}
+
+/// True when every manifest dependency has a lock entry of the matching
+/// source kind whose version satisfies the declared range
+/// (spec/qube.lock.md §Staleness).
+fn lockSatisfiesManifest(root: std.json.ObjectMap, lock: LockFile) bool {
+    const deps_v = root.get("dependencies") orelse return true;
+    const deps = switch (deps_v) {
+        .object => |o| o,
+        else => return true,
+    };
+    var it = deps.iterator();
+    while (it.next()) |entry| {
+        const dep_name = entry.key_ptr.*;
+        const locked: ?LockEntry = blk: {
+            for (lock.qubes) |e| {
+                if (std.mem.eql(u8, e.name, dep_name)) break :blk e;
+            }
+            break :blk null;
+        };
+        const e = locked orelse return false;
+        switch (entry.value_ptr.*) {
+            .string => |range| {
+                if (e.sha256 == null) return false;
+                if (!std.mem.startsWith(u8, e.source, "registry+")) return false;
+                if (!versionSatisfies(range, e.version)) return false;
+            },
+            .object => |o| {
+                const p = manifestString(o, "path") orelse return false;
+                if (!std.mem.startsWith(u8, e.source, "path+")) return false;
+                if (!std.mem.eql(u8, e.source["path+".len..], p)) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+test "lockSatisfiesManifest: range, source kind, and presence checks" {
+    const gpa = std.testing.allocator;
+    const manifest =
+        \\{ "name": "dev.q64.x", "dependencies": {
+        \\  "dev.q64.reg": "^0.3",
+        \\  "dev.q64.loc": { "path": "../loc" }
+        \\} }
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, manifest, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const good = [_]LockEntry{
+        .{ .name = "dev.q64.reg", .version = "0.3.4", .source = "registry+https://qubes.q64.dev", .sha256 = "ab" },
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../loc" },
+    };
+    try std.testing.expect(lockSatisfiesManifest(root, .{ .qubes = @constCast(&good) }));
+
+    const out_of_range = [_]LockEntry{
+        .{ .name = "dev.q64.reg", .version = "0.4.0", .source = "registry+https://qubes.q64.dev", .sha256 = "ab" },
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../loc" },
+    };
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = @constCast(&out_of_range) }));
+
+    const repointed_path = [_]LockEntry{
+        .{ .name = "dev.q64.reg", .version = "0.3.4", .source = "registry+https://qubes.q64.dev", .sha256 = "ab" },
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../elsewhere" },
+    };
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = @constCast(&repointed_path) }));
+
+    const missing = [_]LockEntry{
+        .{ .name = "dev.q64.loc", .version = "0.1.0", .source = "path+../loc" },
+    };
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = @constCast(&missing) }));
+
+    try std.testing.expect(!lockSatisfiesManifest(root, .{ .qubes = &.{} }));
+}
+
+/// `qube lock` — regenerate qube.lock from the manifest (spec/qube.lock.md).
+fn cmdLock(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    _ = env;
+    var registry: []const u8 = default_registry;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--registry")) {
+            registry = args_it.next() orelse {
+                try writeStderr(io, "qube lock: --registry needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else {
+            try printStderr(io, "qube lock: unexpected arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    const project_dir = m.projectDir();
+
+    // The previous lockfile, for version reuse. A malformed one is
+    // regenerated rather than fatal — `lock` is the repair command.
+    const old_lock: ?std.json.Parsed(LockFile) = readLockFile(gpa, io, project_dir) catch |err| switch (err) {
+        error.MalformedLockfile => blk: {
+            try writeStderr(io, "qube lock: existing qube.lock is malformed; regenerating\n");
+            break :blk null;
+        },
+        else => return err,
+    };
+    defer if (old_lock) |p| p.deinit();
+
+    // Entry strings whose owners die before the write live in this arena.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var entries: std.ArrayList(LockEntry) = .empty;
+    defer entries.deinit(gpa);
+    try buildLockEntries(gpa, io, arena_state.allocator(), project_dir, m.root, registry, old_lock, false, "lock", &entries);
 
     try writeLockFileEntries(gpa, io, project_dir, entries.items);
     try printStdout(io, "Locked {d} dependencies -> {s}\n", .{ entries.items.len, lock_file_name });
+}
+
+/// `qube install` — make the cache satisfy the lockfile
+/// (spec/qube.lock.md §Lifecycle, spec/continuum-api.md §Resolver
+/// protocol). Relocks first when the lockfile is missing or stale, then
+/// fetches every locked registry archive the cache is missing. With
+/// `--offline`, both a needed relock and a cache miss are errors.
+fn cmdInstall(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var registry: []const u8 = default_registry;
+    var offline = false;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--registry")) {
+            registry = args_it.next() orelse {
+                try writeStderr(io, "qube install: --registry needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.eql(u8, a, "--offline")) {
+            offline = true;
+        } else {
+            try printStderr(io, "qube install: unexpected arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    const project_dir = m.projectDir();
+
+    const old_lock: ?std.json.Parsed(LockFile) = readLockFile(gpa, io, project_dir) catch |err| switch (err) {
+        error.MalformedLockfile => blk: {
+            if (offline) {
+                try writeStderr(io, "qube: PKG013: qube.lock is malformed and --offline forbids relocking\n");
+                std.process.exit(@intFromEnum(ExitCode.dependency));
+            }
+            try writeStderr(io, "qube install: existing qube.lock is malformed; regenerating\n");
+            break :blk null;
+        },
+        else => return err,
+    };
+    defer if (old_lock) |p| p.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var entries: std.ArrayList(LockEntry) = .empty;
+    defer entries.deinit(gpa);
+
+    const stale = if (old_lock) |p| !lockSatisfiesManifest(m.root, p.value) else true;
+    if (stale) {
+        try buildLockEntries(gpa, io, arena_state.allocator(), project_dir, m.root, registry, old_lock, offline, "install", &entries);
+        try writeLockFileEntries(gpa, io, project_dir, entries.items);
+    } else {
+        for (old_lock.?.value.qubes) |e| try entries.append(gpa, e);
+    }
+
+    const home = try qubeHome(gpa, env);
+    defer gpa.free(home);
+    var fetched: usize = 0;
+    var present: usize = 0;
+    for (entries.items) |e| {
+        const sha = e.sha256 orelse continue;
+        if (!std.mem.startsWith(u8, e.source, "registry+")) continue;
+        const cache_dir = try cacheDirForSha(gpa, home, sha);
+        defer gpa.free(cache_dir);
+        const cached = blk: {
+            std.Io.Dir.cwd().access(io, cache_dir, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (cached) {
+            present += 1;
+            continue;
+        }
+        if (offline) {
+            try printStderr(io, "qube: PKG012: locked archive for '{s}@{s}' is not in the cache and --offline forbids fetching it\n", .{ e.name, e.version });
+            std.process.exit(@intFromEnum(ExitCode.dependency));
+        }
+        const src_registry = e.source["registry+".len..];
+        const dir = try downloadAndCacheArchive(gpa, io, env, src_registry, e.name, e.version, sha, "install");
+        gpa.free(dir);
+        fetched += 1;
+    }
+    try printStdout(io, "Installed: {d} fetched, {d} already cached ({d} locked)\n", .{ fetched, present, entries.items.len });
 }
 
 /// Version declared by a path dep's own manifest, allocated in `arena`.

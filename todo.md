@@ -318,8 +318,12 @@ concatenation for interpolation.
       (never the network). Verified end-to-end: a cached registry dep
       links and runs; PKG01x paths covered in `add-remove.test.ts`;
       renderer/semver unit tests in `main.zig`.
-- [ ] `qube install` — fetch locked entries into the cache (PKG012 repair);
-      `--offline` / `--frozen` / `--locked` flags; `add` dedup.
+- [x] `qube install` — relocks when qube.lock is missing/stale
+      (`lockSatisfiesManifest`), then fetches every locked registry
+      archive the cache is missing (shared `downloadAndCacheArchive`
+      with `add`). `--offline` turns a needed relock into PKG010 and a
+      cache miss into PKG012. Hermetic CLI tests in `install.test.ts`.
+- [ ] `--frozen` / `--locked` flags; `add` dedup.
 - [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
 - [ ] `qube remove` / `outdated` still stubs.
 
