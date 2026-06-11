@@ -968,11 +968,34 @@ verified, honest diagnostics throughout.
 - [ ] **C — enums + `match`.** The biggest blocked language surface
       (the conformance corpus and `errors.md` lean on `match`).
       Rungs: C1 unit variants + statement `match` (landed) → C2
-      value `match` (landed) → C3 payload variants (tag + payload
-      layout in the arena; `Some(v)` construction; pattern bindings)
-      → C4 `match` on scalars/strs with literal patterns →
-      exhaustiveness diagnostics in `q64 check` (the TYP3xx band) →
-      `Option`/`Result` in the prelude.
+      value `match` (landed) → C3 payload variants (landed) → C4
+      `match` on scalars/strs with literal patterns → exhaustiveness
+      diagnostics in `q64 check` (the TYP3xx band) → `Option`/
+      `Result` in the prelude.
+      - [x] **C3 — payload variants.** Boxed enums land, specced
+            first (`spec/memory.md` §"Enum representation (v0)"): an
+            enum with any tuple payload is an arena record
+            `{tag at 0, p_i at 8·(i+1)}`, size 8·(1+max arity), align
+            8 — every value incl. unit variants shares the shape, so
+            the whole record machinery is reused (a synthetic
+            `StructInfo` per boxed enum; `record_alloc` builds the
+            value). `Shape.Circle(7)` constructs (arity-checked,
+            `buildRecExpr`-interception like generic record calls);
+            `Shape.Empty` of a boxed enum allocates `{tag}` (and is
+            gated OUT of the immediate-tag path); `match` reads the
+            tag from slot 0 (`foldMatchChain` boxed flag) and payload
+            patterns `Circle(r)` / `Rect(w, _)` bind fresh i64 locals
+            loaded from the slots — pattern resolved before the arm
+            body so bindings are in scope, in statement AND value
+            matches. Exhaustiveness tightened to a per-variant seen
+            bitmask (duplicate arms no longer fake coverage — a C1
+            hole). Floor: tuple payloads of ≤4 `i64` slots; record
+            payloads, other field types, nested patterns, literal
+            patterns are later. Verified end-to-end wasm64 + wasm32
+            (roundtrip C3 section: 14 / area = 12 / empty / 9) + 2
+            unit tests (construction/bindings/value-match/boxed-unit;
+            arity + bare-payload-pattern rejections). 376 unit / 80
+            CLI / 21-of-49 / roundtrips green.
       - [x] **C2 — value `match` (let initializers + assignment RHS,
             scalar yields).** `match` parses in expression position
             now (`MATCH_EXPR` primary sharing `parseMatch` with the

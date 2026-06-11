@@ -268,6 +268,31 @@ returned whole, stored in another struct, or referenced via `ref`.
 > nested structs, `str`/`ref` fields, and `q64 show layout` are the
 > next slices.
 
+### Enum representation (v0)
+
+An **all-unit enum** (every variant payload-free) is *immediate*: a
+value is its variant's declaration-order **tag**, an integer at the
+compute floor (i64). No memory is touched.
+
+An enum with any tuple-payload variant is *boxed*: a value is a linear
+record in the active region (the scope arena in v0) laid out as
+
+```
+offset 0:            tag   (i64 — the variant's declaration-order index)
+offset 8·(i+1):      p_i   (the i-th payload slot)
+size  = 8 · (1 + max payload arity over all variants)
+align = 8
+```
+
+Every value of the enum — including its unit variants — shares this
+one shape, so `match` always reads the tag at offset 0 and a variant's
+payload slots are at fixed offsets. Slots beyond a variant's arity are
+unwritten (never read: pattern arity is checked against the variant).
+
+> **Status (impl):** v0 boxes payload enums with up to four `i64`
+> payload slots (tuple form); record-form payloads, non-i64 payload
+> types, and a niche/packed representation are later slices.
+
 ## Marking a struct managed
 
 A `@managed` annotation marks a struct as living in WasmGC memory:

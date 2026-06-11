@@ -396,7 +396,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = arr.e } };
                 try out.append(b.a, st);
-            } else if (if (init_expr == .call) try buildRecExpr(b, init_expr, scope) else null) |rv| {
+            } else if (if (init_expr == .call or isBoxedVariantPath(b, init_expr)) try buildRecExpr(b, init_expr, scope) else null) |rv| {
                 // `let p = make(3, 4)` / `let c = first([...])` — a
                 // record-returning call (incl. a generic whose `-> T`
                 // inferred to a record): bind the returned base pointer
@@ -404,6 +404,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // so a bare `let q = p` stays the documented
                 // whole-record-copy rejection, not a silent alias.
                 try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
+                // A boxed-enum value: remember the enum for `match`.
+                if (try enumOfExpr(b, scope, init_expr)) |info| {
+                    try scope.enum_binds.put(b.a, nm.text, info);
+                }
             } else {
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
                 // (a narrow field read must widen explicitly: i64(c.r))
@@ -635,54 +639,145 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
     }
 }
 
-/// C1: a statement-position `match` on an all-unit enum value. The
-/// scrutinee evaluates once into a hidden i64 local; arms lower to an
-/// if/else chain on tag equality. v0 floor: arm patterns are bare
-/// variant names (resolved against the scrutinee's enum) or `_`; the
-/// match must be exhaustive (every variant covered, or a `_` arm).
+/// C1/C3: a statement-position `match` on an enum value. The
+/// scrutinee evaluates once into a hidden local (an i64 tag for an
+/// immediate enum, the value's base pointer for a boxed one); arms
+/// lower to an if/else chain on tag equality. Patterns: bare unit
+/// variant names, payload forms binding fresh locals (`Circle(r)`),
+/// and `_`; the match must be exhaustive (every variant covered, or
+/// a `_` arm).
 fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     const scrut = ms.scrutinee() orelse return error.Unsupported;
     const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+    const boxed = info.si != null;
 
-    // Evaluate the scrutinee once.
-    scope.next_idx = @intCast(b.cur_locals.items.len);
-    const s_idx = try scope.declare("#match", false, .i64);
-    try b.cur_locals.append(b.a, .i64);
-    const sval = try buildIntExpr(b, scrut, scope);
-    const set = try b.a.create(hir.Stmt);
-    set.* = .{ .let = .{ .idx = s_idx, .value = sval } };
-    try out.append(b.a, set);
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, out);
 
     // Collect the arms: (tag, body) pairs + at most one `_` default.
     var arms: std.ArrayList(LoweredArm) = .empty;
     defer arms.deinit(b.a);
     var default: ?*hir.Stmt = null;
-    var covered: usize = 0;
+    var seen: u64 = 0;
     var it = ms.arms();
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
+        // Pattern first: payload bindings must be in scope for the body.
+        const rp = try resolveArmPattern(b, info, pat, scope, s_idx);
         const body = try buildMatchArmBody(b, arm, scope, rt);
-        switch (pat.kind()) {
-            .WILD_PATTERN => {
-                if (default != null) return error.Unsupported; // two `_` arms
-                default = body;
-            },
-            .IDENT_PATTERN => {
-                const nm = pat.bindingName() orelse return error.Unsupported;
-                const tag = for (info.variants, 0..) |v, i| {
-                    if (std.mem.eql(u8, v, nm.text)) break @as(i64, @intCast(i));
-                } else return reject(b, .name_not_found); // not a variant of this enum
-                try arms.append(b.a, .{ .tag = tag, .body = body });
-                covered += 1;
-            },
-            else => return error.Unsupported, // payload/literal patterns: later rungs
-        }
+        const ap = rp orelse {
+            if (default != null) return error.Unsupported; // two `_` arms
+            default = body;
+            continue;
+        };
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
+        seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Exhaustiveness (spec/grammar.md leaves the rules open; the v0
     // floor requires it structurally): every variant, or a default.
-    if (default == null and covered < info.variants.len) return error.Unsupported;
+    if (default == null and @popCount(seen) < info.variants.len) return error.Unsupported;
 
-    try foldMatchChain(b, s_idx, arms.items, default, out);
+    try foldMatchChain(b, s_idx, boxed, arms.items, default, out);
+}
+
+/// Evaluate a match scrutinee once into a hidden local: the tag (i64)
+/// for an immediate enum, the value's base pointer for a boxed one.
+fn declareMatchScrutinee(b: *Builder, scope: *Scope, scrut: ast.Expr, boxed: bool, out: *std.ArrayList(*hir.Stmt)) BuildError!u32 {
+    const sty: hir.Type = if (boxed) .ptr else .i64;
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const s_idx = try scope.declare("#match", false, sty);
+    try b.cur_locals.append(b.a, sty);
+    const sval = if (boxed) blk: {
+        const rv = (try buildRecExpr(b, scrut, scope)) orelse return error.Unsupported;
+        break :blk rv.e;
+    } else try buildIntExpr(b, scrut, scope);
+    const set = try b.a.create(hir.Stmt);
+    set.* = .{ .let = .{ .idx = s_idx, .value = sval } };
+    try out.append(b.a, set);
+    return s_idx;
+}
+
+/// A resolved (non-wildcard) arm pattern: the variant's tag plus the
+/// statements that bind its payload slots into fresh locals.
+const ArmPattern = struct { tag: i64, prelude: []const *hir.Stmt };
+
+/// Resolve a match-arm pattern against the enum. `null` = wildcard.
+fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope: *Scope, s_idx: u32) BuildError!?ArmPattern {
+    switch (pat.kind()) {
+        .WILD_PATTERN => return null,
+        .IDENT_PATTERN => {
+            const nm = pat.bindingName() orelse return error.Unsupported;
+            const tag = info.variantTag(nm.text) orelse return reject(b, .name_not_found);
+            if (info.variants[tag].arity != 0) return error.Unsupported; // bind the payload: `V(x, ..)`
+            return .{ .tag = @intCast(tag), .prelude = &.{} };
+        },
+        .TUPLE_STRUCT_PATTERN, .ENUM_VARIANT_PATTERN => {
+            // `Circle(r)` / `Rect(w, _)`: head variant + sub-patterns,
+            // one per payload slot. Each ident binds a fresh i64 local
+            // loaded from the boxed value.
+            const head = patternHeadName(pat.cst) orelse return error.Unsupported;
+            const tag = info.variantTag(head) orelse return reject(b, .name_not_found);
+            const arity = info.variants[tag].arity;
+            var prelude: std.ArrayList(*hir.Stmt) = .empty;
+            var n: u32 = 0;
+            for (pat.cst.children) |c| switch (c) {
+                .node => |sub| {
+                    const sp = ast.Pattern.cast(sub) orelse continue;
+                    if (n == arity) return error.Unsupported; // too many sub-patterns
+                    switch (sp.kind()) {
+                        .WILD_PATTERN => {},
+                        .IDENT_PATTERN => {
+                            const snm = sp.bindingName() orelse return error.Unsupported;
+                            scope.next_idx = @intCast(b.cur_locals.items.len);
+                            const idx = try scope.declare(snm.text, false, .i64);
+                            try b.cur_locals.append(b.a, .i64);
+                            const base = try b.a.create(hir.Expr);
+                            base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+                            const ld = try b.a.create(hir.Expr);
+                            ld.* = .{ .field_get = .{ .base = base, .offset = 8 * (n + 1), .ty = .i64 } };
+                            const st = try b.a.create(hir.Stmt);
+                            st.* = .{ .let = .{ .idx = idx, .value = ld } };
+                            try prelude.append(b.a, st);
+                        },
+                        else => return error.Unsupported, // nested patterns: later
+                    }
+                    n += 1;
+                },
+                .token => {},
+            };
+            if (n != arity) return error.Unsupported; // too few sub-patterns
+            return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a) };
+        },
+        else => return error.Unsupported, // literal patterns: later
+    }
+}
+
+/// The variant name a payload pattern opens with: the last IDENT
+/// before its `(`.
+fn patternHeadName(node: *const parser.cst.Node) ?[]const u8 {
+    var head: ?[]const u8 = null;
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind == .L_PAREN) return head;
+            if (t.kind == .IDENT) head = t.text;
+        },
+        .node => |n| {
+            // A structured path head: its last IDENT.
+            if (patternHeadName(n)) |h| head = h;
+        },
+    };
+    return head;
+}
+
+/// Payload bindings load before the arm's own statements: merge the
+/// prelude into the body block.
+fn prependPrelude(b: *Builder, prelude: []const *hir.Stmt, body: *hir.Stmt) BuildError!*hir.Stmt {
+    if (prelude.len == 0) return body;
+    var all: std.ArrayList(*hir.Stmt) = .empty;
+    try all.appendSlice(b.a, prelude);
+    try all.appendSlice(b.a, body.block); // arm bodies are blocks by construction
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try all.toOwnedSlice(b.a) };
+    return out;
 }
 
 /// One lowered match arm: the variant's tag + the body block.
@@ -692,14 +787,25 @@ const LoweredArm = struct { tag: i64, body: *hir.Stmt };
 /// scrutinee local against each tag. The lowering reads branch
 /// payloads as blocks, so a nested `if` (the rest of the chain) wraps
 /// in a one-statement block.
-fn foldMatchChain(b: *Builder, s_idx: u32, arms: []const LoweredArm, default: ?*hir.Stmt, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+fn foldMatchChain(b: *Builder, s_idx: u32, boxed: bool, arms: []const LoweredArm, default: ?*hir.Stmt, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     var chain: ?*hir.Stmt = default;
     var i = arms.len;
     while (i > 0) {
         i -= 1;
         const a = arms[i];
-        const sread = try b.a.create(hir.Expr);
-        sread.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
+        // The tag: the scrutinee local itself (immediate), or a load
+        // from the boxed value's slot 0.
+        const sread = if (boxed) blk: {
+            const base = try b.a.create(hir.Expr);
+            base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+            const ld = try b.a.create(hir.Expr);
+            ld.* = .{ .field_get = .{ .base = base, .offset = 0, .ty = .i64 } };
+            break :blk ld;
+        } else blk: {
+            const r = try b.a.create(hir.Expr);
+            r.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
+            break :blk r;
+        };
         const tagv = try b.a.create(hir.Expr);
         tagv.* = .{ .int_const = a.tag };
         const cond = try b.a.create(hir.Expr);
@@ -731,30 +837,27 @@ fn matchValueTy(b: *Builder, me: ast.MatchExpr, scope: *const Scope) BuildError!
     return scalarBindTy(sc);
 }
 
-/// C2: a value `match` desugared into per-arm assignments of
+/// C2/C3: a value `match` desugared into per-arm assignments of
 /// `target_idx` (type `ty`). The same scrutinee/tag/exhaustiveness
-/// rules as the statement form; arms are `->` value expressions.
+/// rules as the statement form; arms are `->` value expressions (a
+/// payload pattern's bindings are in scope for its arm's value).
 fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt), target_idx: u32, ty: hir.Type) BuildError!void {
     _ = rt; // arm values are scalar expressions (str arms: later)
     const scrut = me.scrutinee() orelse return error.Unsupported;
     const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+    const boxed = info.si != null;
 
-    // Evaluate the scrutinee once.
-    scope.next_idx = @intCast(b.cur_locals.items.len);
-    const s_idx = try scope.declare("#match", false, .i64);
-    try b.cur_locals.append(b.a, .i64);
-    const sval = try buildIntExpr(b, scrut, scope);
-    const set = try b.a.create(hir.Stmt);
-    set.* = .{ .let = .{ .idx = s_idx, .value = sval } };
-    try out.append(b.a, set);
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, out);
 
     var arms: std.ArrayList(LoweredArm) = .empty;
     defer arms.deinit(b.a);
     var default: ?*hir.Stmt = null;
-    var covered: usize = 0;
+    var seen: u64 = 0;
     var it = me.arms();
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
+        // Pattern first: payload bindings must be in scope for the value.
+        const rp = try resolveArmPattern(b, info, pat, scope, s_idx);
         const e = arm.expression() orelse return error.Unsupported; // value arms only
         if (scalarBindTy(try exprScalar(b, e, scope)) != ty) return error.Unsupported;
         const value = try buildIntExpr(b, e, scope);
@@ -762,26 +865,18 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, rt: *RtMap, out
         asn.* = .{ .assign = .{ .idx = target_idx, .value = value } };
         const body = try b.a.create(hir.Stmt);
         body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{asn}) };
-        switch (pat.kind()) {
-            .WILD_PATTERN => {
-                if (default != null) return error.Unsupported; // two `_` arms
-                default = body;
-            },
-            .IDENT_PATTERN => {
-                const nm = pat.bindingName() orelse return error.Unsupported;
-                const tag = for (info.variants, 0..) |v, i| {
-                    if (std.mem.eql(u8, v, nm.text)) break @as(i64, @intCast(i));
-                } else return reject(b, .name_not_found);
-                try arms.append(b.a, .{ .tag = tag, .body = body });
-                covered += 1;
-            },
-            else => return error.Unsupported, // payload/literal patterns: later
-        }
+        const ap = rp orelse {
+            if (default != null) return error.Unsupported; // two `_` arms
+            default = body;
+            continue;
+        };
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
+        seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Structural exhaustiveness, like the statement form.
-    if (default == null and covered < info.variants.len) return error.Unsupported;
+    if (default == null and @popCount(seen) < info.variants.len) return error.Unsupported;
 
-    try foldMatchChain(b, s_idx, arms.items, default, out);
+    try foldMatchChain(b, s_idx, boxed, arms.items, default, out);
 }
 
 /// A match arm's body as one HIR block: a `{ … }` block of statements,
@@ -1792,53 +1887,127 @@ fn buildNarrowValue(b: *Builder, ty: hir.Type, fval: ast.Expr) BuildError!*hir.E
 /// alignment, size rounded up to the struct alignment). A struct with a
 /// field outside the v0 floor — or with no record fields at all — is not
 /// registered; a use of it stays the honest `Unsupported`.
-/// An all-unit enum: its name and variant names in declaration order
-/// (a variant's tag is its index).
-const EnumInfo = struct { name: []const u8, variants: []const []const u8 };
+/// One enum variant: its name and tuple-payload arity (0 = unit).
+const EnumVariant = struct { name: []const u8, arity: u32 };
 
-/// Register this file's all-unit enums (C1). An enum with any payload
-/// variant is skipped — using it surfaces the honest Unsupported.
+/// A registered enum: variant names in declaration order (a variant's
+/// tag is its index). All-unit enums are *immediate* — a value is its
+/// tag, an i64. An enum with tuple payloads is *boxed* — `si` carries
+/// the arena representation `{ #tag, #p0 .. }` (spec/memory.md §"Enum
+/// representation"), and values ride the record machinery.
+const EnumInfo = struct {
+    name: []const u8,
+    variants: []const EnumVariant,
+    si: ?*const StructInfo,
+
+    fn variantTag(self: *const EnumInfo, name: []const u8) ?u32 {
+        for (self.variants, 0..) |v, i| {
+            if (std.mem.eql(u8, v.name, name)) return @intCast(i);
+        }
+        return null;
+    }
+};
+
+const max_enum_payload = 4;
+
+/// Register this file's enums (C1/C3). The v0 floor: unit variants
+/// and tuple payloads of up to four `i64` fields; anything else skips
+/// the enum — using it surfaces the honest Unsupported.
 fn registerEnums(b: *Builder, sf: ast.SourceFile) BuildError!void {
     var it = sf.items();
     while (it.next()) |item| switch (item) {
         .enum_decl => |ed| {
             const nm = ed.name() orelse continue;
-            var names: std.ArrayList([]const u8) = .empty;
+            var vars: std.ArrayList(EnumVariant) = .empty;
             var ok = true;
+            var max_arity: u32 = 0;
             var vit = ed.variants();
             while (vit.next()) |v| {
                 const vname = v.name() orelse {
                     ok = false;
                     break;
                 };
-                if (variantHasPayload(v)) {
-                    ok = false; // payload variants: a later rung
+                const arity = variantArity(v) orelse {
+                    ok = false; // record payloads / non-i64 fields: later
                     break;
-                }
-                try names.append(b.a, vname.text);
+                };
+                if (arity > max_arity) max_arity = arity;
+                try vars.append(b.a, .{ .name = vname.text, .arity = arity });
             }
-            if (!ok or names.items.len == 0) {
-                names.deinit(b.a);
+            if (!ok or vars.items.len == 0) {
+                vars.deinit(b.a);
                 continue;
             }
+            // A boxed enum's arena shape: tag at 0, payload slots after.
+            var si: ?*const StructInfo = null;
+            if (max_arity > 0) {
+                var fields: std.ArrayList(StructField) = .empty;
+                try fields.append(b.a, .{ .name = "#tag", .ty = .i64, .offset = 0 });
+                var j: u32 = 0;
+                while (j < max_arity) : (j += 1) {
+                    const fname = try std.fmt.allocPrint(b.a, "#p{d}", .{j});
+                    try fields.append(b.a, .{ .name = fname, .ty = .i64, .offset = 8 * (j + 1) });
+                }
+                const s = try b.a.create(StructInfo);
+                s.* = .{
+                    .name = nm.text,
+                    .fields = try fields.toOwnedSlice(b.a),
+                    .size = 8 * (max_arity + 1),
+                    .alignment = 8,
+                };
+                si = s;
+            }
             const info = try b.a.create(EnumInfo);
-            info.* = .{ .name = nm.text, .variants = try names.toOwnedSlice(b.a) };
+            info.* = .{ .name = nm.text, .variants = try vars.toOwnedSlice(b.a), .si = si };
             try b.enums.put(b.a, nm.text, info);
         },
         else => {},
     };
 }
 
-/// Does this variant carry a payload (`Some(T)` / `Point { x: … }`)?
-fn variantHasPayload(v: ast.Variant) bool {
-    for (v.cst.children) |c| switch (c) {
-        .token => |t| switch (t.kind) {
-            .L_PAREN, .L_BRACE => return true,
-            else => {},
+/// The tuple-payload arity of a variant at the v0 floor: 0 for a unit
+/// variant, N for `(i64, … i64)` (each slot exactly `i64`, N ≤ 4).
+/// `null` for record payloads or anything else.
+fn variantArity(v: ast.Variant) ?u32 {
+    var buf: [4 * max_enum_payload]parser.cst.Token = undefined;
+    var n: usize = 0;
+    if (!flattenVariantTokens(v.cst, &buf, &n, true)) return null;
+    if (n == 0) return 0; // unit
+    // Expect exactly: ( i64 (, i64)* ,? )
+    if (buf[0].kind != .L_PAREN or buf[n - 1].kind != .R_PAREN) return null;
+    var arity: u32 = 0;
+    var i: usize = 1;
+    while (i < n - 1) {
+        const t = buf[i];
+        if (t.kind == .IDENT and std.mem.eql(u8, t.text, "i64")) {
+            arity += 1;
+            i += 1;
+            if (i < n - 1) {
+                if (buf[i].kind != .COMMA) return null;
+                i += 1;
+            }
+        } else return null;
+    }
+    if (arity == 0 or arity > max_enum_payload) return null;
+    return arity;
+}
+
+/// Flatten a variant's non-trivia tokens (past the name) into `buf`.
+/// `top` skips the leading variant-name IDENT; a `{` (record payload)
+/// or overflow returns false.
+fn flattenVariantTokens(node: *const parser.cst.Node, buf: []parser.cst.Token, n: *usize, top: bool) bool {
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            if (t.kind == .L_BRACE) return false; // record payload: later
+            if (top and t.kind == .IDENT and n.* == 0) continue; // the variant name
+            if (n.* == buf.len) return false;
+            buf[n.*] = t;
+            n.* += 1;
         },
-        .node => return true, // any structured payload child
+        .node => |ch| if (!flattenVariantTokens(ch, buf, n, false)) return false,
     };
-    return false;
+    return true;
 }
 
 /// `Color.Red` → the enum + the variant's declaration-order tag.
@@ -1847,10 +2016,22 @@ fn enumVariantTag(b: *Builder, txt: []const u8) ?struct { info: *const EnumInfo,
     const vname = txt[dot + 1 ..];
     if (std.mem.indexOfScalar(u8, vname, '.') != null) return null;
     const info = b.enums.get(txt[0..dot]) orelse return null;
-    for (info.variants, 0..) |v, i| {
-        if (std.mem.eql(u8, v, vname)) return .{ .info = info, .tag = @intCast(i) };
-    }
-    return null;
+    const tag = info.variantTag(vname) orelse return null;
+    return .{ .info = info, .tag = @intCast(tag) };
+}
+
+/// Is this a bare path naming a *boxed* enum's variant (`Shape.Empty`
+/// where Shape has payload variants)? Such a value is a record, so the
+/// let arm routes it through the record path.
+fn isBoxedVariantPath(b: *Builder, e: ast.Expr) bool {
+    const p = switch (e) {
+        .path => |x| x,
+        else => return false,
+    };
+    const txt = p.text(b.a) catch return false;
+    defer b.a.free(txt);
+    const ev = enumVariantTag(b, txt) orelse return false;
+    return ev.info.si != null;
 }
 
 /// The enum a scrutinee expression carries: a `Enum.Variant` value or
@@ -1863,6 +2044,18 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             defer b.a.free(txt);
             if (enumVariantTag(b, txt)) |ev| return ev.info;
             return scope.enum_binds.get(txt);
+        },
+        .call => |cc| {
+            // A payload construction (`Shape.Circle(7)`).
+            const callee = cc.callee() orelse return null;
+            const cp = switch (callee) {
+                .path => |x| x,
+                else => return null,
+            };
+            const txt = try cp.text(b.a);
+            defer b.a.free(txt);
+            if (enumVariantTag(b, txt)) |ev| return ev.info;
+            return null;
         },
         else => return null,
     }
@@ -2702,6 +2895,12 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
         .path => |p| {
             const txt = try p.text(b.a);
             defer b.a.free(txt);
+            // C3: a *unit* variant of a boxed enum is still an arena
+            // value ({tag} only), so all of the enum's values share one
+            // representation.
+            if (enumVariantTag(b, txt)) |ev| {
+                if (ev.info.si) |esi| return .{ .e = try enumAlloc(b, esi, ev.tag, &.{}), .si = esi };
+            }
             const si = scope.recs.get(txt) orelse return null;
             const loc = scope.find(txt) orelse return null;
             const out = try b.a.create(hir.Expr);
@@ -2724,6 +2923,9 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
             return .{ .e = try elemPtrExpr(b, ai, idx), .si = si };
         },
         .call => |cc| {
+            // C3: a payload-variant construction (`Shape.Circle(7)`):
+            // allocate the boxed value {tag, p0 ..} in the scope arena.
+            if (try enumCtorValue(b, cc, scope)) |ev| return ev;
             // A generic callee whose `-> T` resolved to a record: infer,
             // stamp, and read the instance's record return (fn_recs).
             if (try genericRecCall(b, cc, scope)) |gv| return gv;
@@ -2742,6 +2944,47 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
         },
         else => return null,
     }
+}
+
+/// C3: a payload-variant construction call (`Shape.Circle(7)`): the
+/// callee names a boxed enum's variant; arity-checked i64 arguments
+/// fill the payload slots. Yields the arena value.
+fn enumCtorValue(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecValue {
+    const callee = cc.callee() orelse return null;
+    const cp = switch (callee) {
+        .path => |x| x,
+        else => return null,
+    };
+    const txt = try cp.text(b.a);
+    defer b.a.free(txt);
+    const ev = enumVariantTag(b, txt) orelse return null;
+    const esi = ev.info.si orelse return null; // an immediate enum has no ctor calls
+    const arity = ev.info.variants[@intCast(ev.tag)].arity;
+    var vals: std.ArrayList(*hir.Expr) = .empty;
+    defer vals.deinit(b.a);
+    var ait = cc.args();
+    while (ait.next()) |a| {
+        if (vals.items.len == arity) return reject(b, .unsupported_call); // too many
+        const sc = try exprScalar(b, a, scope);
+        if (scalarBindTy(sc) != .i64) return error.Unsupported; // i64 payloads only (v0)
+        try vals.append(b.a, try buildIntExpr(b, a, scope));
+    }
+    if (vals.items.len != arity) return reject(b, .unsupported_call);
+    return .{ .e = try enumAlloc(b, esi, ev.tag, vals.items), .si = esi };
+}
+
+/// Allocate a boxed enum value: {tag, payloadâ¦} in the scope arena.
+fn enumAlloc(b: *Builder, esi: *const StructInfo, tag: i64, payload: []const *hir.Expr) BuildError!*hir.Expr {
+    var inits: std.ArrayList(hir.FieldInit) = .empty;
+    const tagv = try b.a.create(hir.Expr);
+    tagv.* = .{ .int_const = tag };
+    try inits.append(b.a, .{ .offset = 0, .ty = .i64, .value = tagv });
+    for (payload, 0..) |v, j| {
+        try inits.append(b.a, .{ .offset = @intCast(8 * (j + 1)), .ty = .i64, .value = v });
+    }
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .record_alloc = .{ .size = esi.size, .alignment = esi.alignment, .inits = try inits.toOwnedSlice(b.a) } };
+    return out;
 }
 
 /// A call to a generic declaration whose `-> T` infers to a *record*:
@@ -3225,6 +3468,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
             } else if (enumVariantTag(b, txt)) |ev| {
+                if (ev.info.si != null) return error.Unsupported; // boxed: a record value, not an int
                 out.* = .{ .int_const = ev.tag };    // `Color.Red` → its tag
             } else if (b.eval.evalInt(expr)) |v| {
                 // A compile-time `let` binding (`let n = 7`) used in a runtime
@@ -5297,6 +5541,73 @@ test "C2: mixed arm types and non-exhaustive value match are unsupported" {
         \\        B -> 2,
         \\    }
         \\    env.out(x)
+        \\}
+        \\
+    )) == null);
+}
+
+test "C3: payload variants — construction, bindings, value match, boxed unit" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum Shape { Empty, Circle(i64), Rect(i64, i64) }
+        \\fn main {
+        \\    let s = Shape.Circle(7)
+        \\    match s {
+        \\        Empty -> env.out("none"),
+        \\        Circle(r) -> env.out(r * 2),
+        \\        Rect(w, h) -> env.out(w + h),
+        \\    }
+        \\    let area = match Shape.Rect(3, 4) {
+        \\        Empty -> 0,
+        \\        Circle(r) -> r * r,
+        \\        Rect(w, _) -> w * 10,
+        \\    }
+        \\    env.out(area)
+        \\    let e = Shape.Empty
+        \\    match e {
+        \\        Empty -> env.out("empty"),
+        \\        _ -> env.out("not"),
+        \\    }
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The boxed value is an arena record {tag, p0, p1}: size 24 for
+    // Shape (max arity 2); payload bindings load slots 8/16.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=24 align=8") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null);
+}
+
+test "C3: payload arity and sub-pattern mismatches reject honestly" {
+    // Too few construction args.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src1 =
+        \\enum S { A(i64, i64) }
+        \\fn main {
+        \\    let s = S.A(1)
+        \\    match s { A(x, y) -> env.out(x + y) }
+        \\}
+        \\
+    ;
+    try tr.addLib(src1);
+    const r = try rejectFromSource(testing.allocator, src1, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+    // A payload variant matched bare (no sub-patterns) is unsupported.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\enum S { A(i64), B }
+        \\fn main {
+        \\    match S.A(1) {
+        \\        A -> env.out("a"),
+        \\        B -> env.out("b"),
+        \\    }
         \\}
         \\
     )) == null);
