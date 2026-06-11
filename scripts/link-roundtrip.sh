@@ -1238,4 +1238,52 @@ if [[ "$vmatch32_out" != "$vmatch_expected" ]]; then
 fi
 echo "    ok: value match -> wait 5s / 1.5 / 103 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# C3 (payload variants): boxed enums — {tag, p0, p1} in the scope arena;
+# Shape.Circle(7) constructs, Circle(r) / Rect(w, _) bind payload slots in
+# statement and value matches; boxed unit variants share the representation.
+# ---------------------------------------------------------------------------
+echo "==> C3: payload variants — Shape.Circle(7) / Rect(w, h) bindings"
+pay_app="$tmp/payload.q"
+cat > "$pay_app" <<'Q64'
+enum Shape { Empty, Circle(i64), Rect(i64, i64) }
+fn main {
+    let s = Shape.Circle(7)
+    match s {
+        Empty -> env.out("none"),
+        Circle(r) -> env.out(r * 2),
+        Rect(w, h) -> env.out(w + h),
+    }
+    let area = match Shape.Rect(3, 4) {
+        Empty -> 0,
+        Circle(r) -> r * r,
+        Rect(w, h) -> w * h,
+    }
+    env.out("area = {area}")
+    let e = Shape.Empty
+    match e {
+        Empty -> env.out("empty"),
+        _ -> env.out("not"),
+    }
+    match Shape.Rect(2, 9) {
+        Rect(_, h) -> env.out(h),
+        _ -> env.out(0),
+    }
+}
+Q64
+pay_expected=$'14\narea = 12\nempty\n9'
+"$Q64_BIN" emit "$pay_app" "$tmp/payload.wasm"
+pay_out="$("$HOST_BIN" "$tmp/payload.wasm")"
+if [[ "$pay_out" != "$pay_expected" ]]; then
+    echo "FAIL: payload-enum output mismatch (got: $pay_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$pay_app" "$tmp/payload-32.wasm" --addr wasm32
+pay32_out="$("$HOST_BIN" "$tmp/payload-32.wasm")"
+if [[ "$pay32_out" != "$pay_expected" ]]; then
+    echo "FAIL: payload-enum wasm32 output mismatch (got: $pay32_out)" >&2
+    exit 1
+fi
+echo "    ok: payload enums -> 14 / area = 12 / empty / 9 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
