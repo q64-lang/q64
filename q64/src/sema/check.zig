@@ -313,6 +313,9 @@ const Checker = struct {
                 };
 
                 const s = sig orelse return .unknown;
+                // An enum-returning call (`-> Option<i64>` / `-> Shape`)
+                // is an enum value for the match checks.
+                if (c.enumOfNamed(s.ret)) |ename| return .{ .enum_value = ename };
                 return switch (c.store.get(s.ret)) {
                     .unparsed, .unresolved => .unknown,
                     else => .{ .id = s.ret },
@@ -535,6 +538,29 @@ const Checker = struct {
         return null;
     }
 
+    /// The known enum a `let` annotation's path type names, if any.
+    fn enumAnnotation(c: *Checker, te: ast.TypeExpr) ?[]const u8 {
+        const pt = switch (te) {
+            .path => |x| x,
+            else => return null,
+        };
+        const name = pt.name(c.gpa) catch return null;
+        defer c.gpa.free(name);
+        if (!c.enums.contains(name)) return null;
+        return c.enums.getKey(name);
+    }
+
+    /// The known enum a named type (a signature return, an annotation)
+    /// points at, if any.
+    fn enumOfNamed(c: *Checker, id: types.TypeId) ?[]const u8 {
+        const n = switch (c.store.get(id)) {
+            .named => |nm| nm,
+            else => return null,
+        };
+        if (!c.enums.contains(n.name)) return null;
+        return c.enums.getKey(n.name);
+    }
+
     /// The enum a bare auto-prelude constructor names (`Some`/`None` →
     /// `Option`, `Ok`/`Err` → `Result`). Resolved through the enums
     /// table, so a file declaration shadowing the enum wins — and
@@ -602,15 +628,24 @@ const Checker = struct {
                 // Annotation wins; a missing/unlowerable one infers.
                 var info = init_info;
                 if (ls.type_()) |te| {
-                    const id = try types.lower(c.store, null, te);
-                    switch (c.store.get(id)) {
-                        .unparsed, .unresolved => {},
-                        else => {
-                            info = .{ .id = id };
-                            if (ls.initializer()) |init_expr| {
-                                try c.checkAnnotatedInit(id, init_expr, init_info);
-                            }
-                        },
+                    // An enum annotation (`let o: Option<i64>`, `let s:
+                    // Shape`) binds an enum value for the match checks.
+                    // Judged against the enums table directly — the
+                    // null-table lowering below leaves local names
+                    // unresolved.
+                    if (c.enumAnnotation(te)) |ename| {
+                        info = .{ .enum_value = ename };
+                    } else {
+                        const id = try types.lower(c.store, null, te);
+                        switch (c.store.get(id)) {
+                            .unparsed, .unresolved => {},
+                            else => {
+                                info = .{ .id = id };
+                                if (ls.initializer()) |init_expr| {
+                                    try c.checkAnnotatedInit(id, init_expr, init_info);
+                                }
+                            },
+                        }
                     }
                 }
                 if (ls.pattern()) |p| {
@@ -1278,6 +1313,33 @@ test "check: TYP062 — non-exhaustive match on prelude Option/Result" {
         \\}
         \\
     , &.{});
+}
+
+test "check: TYP062 across calls and annotations — enum-typed returns/lets" {
+    // A `-> Option<i64>` call types as an Option value: matching the
+    // call directly and matching a binding of it are both judgeable.
+    try expectCodes(
+        \\fn find(n: i64) -> Option<i64> {
+        \\    if n > 0 { Some(n) } else { None }
+        \\}
+        \\fn main {
+        \\    match find(5) {
+        \\        Some(v) -> env.out(v),
+        \\    }
+        \\}
+        \\
+    , &.{"TYP062"});
+    // An enum-annotated let binds an enum value.
+    try expectCodes(
+        \\enum Shape { Empty, Circle(i64) }
+        \\fn main {
+        \\    let s: Shape = mystery()
+        \\    match s {
+        \\        Circle(r) -> env.out(r),
+        \\    }
+        \\}
+        \\
+    , &.{"TYP062"});
 }
 
 test "check: TYP062 stays silent on exhaustive / unjudgeable matches" {

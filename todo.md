@@ -971,8 +971,42 @@ verified, honest diagnostics throughout.
       value `match` (landed) → C3 payload variants (landed) → C4
       literal patterns (landed) → exhaustiveness diagnostic (landed)
       → `Option`/`Result` in the prelude + generic enum declarations
-      (landed) → next: `T?` sugar, `if let Some(x)` narrowing, `try`
-      (needs Result-returning functions — the cross-fn enum story).
+      (landed) → enum returns from functions (landed) → next: `T?`
+      sugar, `if let Some(x)` narrowing, `try` (the remaining `try`
+      prerequisite — Result-returning fns — is in).
+      - [x] **Enum returns from functions (the cross-fn enum story).**
+            `fn find(n: i64) -> Option<i64> { if n > 0 { Some(n) } else
+            { None } }` works: `structOfType` resolves a boxed enum
+            name to its arena shape (generic args allowed — they only
+            parameterize the uniformly-8-byte payload slots), so enum
+            returns ride the B2b record machinery (`.ptr` base
+            pointer); record/enum-returning bodies grew their first
+            control flow — the tail may now be an `if`/`else-if`/`else`
+            *value chain* (`buildRecBody`/`buildRecTailStmt`; every
+            path must yield the declared enum, missing `else` and
+            wrong-enum tails reject `unsupported_call`; the existing
+            `lowerValueIf` lowers it, type-threaded as `.ptr`). Callers
+            bind and match: `enumOfExpr`'s call arm reads the callee's
+            return type (`enumOfRet`), so `let o = find(5); match o`
+            and `match find(-3)` both resolve arms. `q64 check`
+            follows across the seam: an enum-returning call types as
+            an enum value (`enumOfNamed` on the signature's lowered
+            return), and an enum-*annotated* `let` (`let s: Shape =
+            mystery()`) binds judgeably (`enumAnnotation`, judged
+            against the enums table since the null-table lowering
+            leaves local names unresolved) — TYP062 now fires across
+            calls and annotations. Verified end-to-end wasm64 + wasm32
+            (roundtrip enum-returns section: `found 5 / none for
+            negatives / code = 40 / 14`) + 3 unit tests (Option/
+            Result/local-enum returns incl. else-if chains; missing-
+            else and wrong-enum rejections; check TYP062 across call +
+            annotation). 389 unit / 81 CLI / 23-of-51 / roundtrips
+            green. **Boundary:** leading statements in enum/record
+            bodies (only the tail statement today); enum *params* pass
+            struct-checked but can't be `match`ed inside a plain
+            callee (match in callee bodies is its own rung); immediate
+            (all-unit) enum returns (an i64 tag, not a record);
+            `env.out` of an enum value.
       - [x] **`Option`/`Result` in the prelude + generic enums (v0
             floor).** Generic enum *declarations* register now — no
             monomorphization needed at this floor: every payload slot

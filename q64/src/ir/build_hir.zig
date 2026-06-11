@@ -1311,17 +1311,13 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         rec_params.deinit(b.a);
     }
 
-    // A record-returning function: v0 bodies are a single tail expression (a
-    // record literal, a passthrough param, or a record-returning call) —
-    // control flow in record bodies lands with a later slice.
+    // A record-returning function: v0 bodies are one tail statement — a
+    // record expression (a literal, a passthrough param, an enum
+    // constructor, a record-returning call) or an `if`/`else` chain
+    // whose every branch yields the record (`if n > 0 { Some(n) } else
+    // { None }`). Leading statements land with a later slice.
     if (rec_ret) |want| {
-        const tail = try singleTailExpr(fd) orelse return error.Unsupported;
-        const rv = (try buildRecExpr(b, tail, &scope)) orelse return error.Unsupported;
-        if (rv.si != want) return reject(b, .unsupported_call); // body builds a different struct
-        const vstmt = try b.a.create(hir.Stmt);
-        vstmt.* = .{ .expr = rv.e };
-        const block = try b.a.create(hir.Stmt);
-        block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+        const block = try buildRecBody(b, fd.body() orelse return error.Unsupported, &scope, want);
         b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .body = block };
         return id;
     }
@@ -1339,6 +1335,55 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
 
     b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
+}
+
+/// A record-returning body at the v0 floor: a single tail statement,
+/// wrapped as the function's value block.
+fn buildRecBody(b: *Builder, blk: ast.Block, scope: *Scope, want: *const StructInfo) BuildError!*hir.Stmt {
+    var it = blk.statements();
+    const first = it.next() orelse return error.Unsupported;
+    if (it.next() != null) return error.Unsupported; // leading statements: later
+    const tail = try buildRecTailStmt(b, first, scope, want);
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{tail}) };
+    return block;
+}
+
+/// One record-yielding tail statement: a record expression, `return
+/// <record>`, or a value `if`/`else` chain (every path must yield the
+/// record, so the chain needs a final `else`). The lowering reads the
+/// `if_` through `lowerValueIf` with the function's `.ptr` type.
+fn buildRecTailStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, want: *const StructInfo) BuildError!*hir.Stmt {
+    switch (stmt) {
+        .expr_stmt => |es| return recValueStmt(b, es.expression() orelse return error.Unsupported, scope, want),
+        .return_stmt => |rs| return recValueStmt(b, rs.value() orelse return error.Unsupported, scope, want),
+        .if_stmt => |is| {
+            const cond = try buildIntExpr(b, is.condition() orelse return error.Unsupported, scope);
+            const then_ = try buildRecBody(b, is.thenBody() orelse return error.Unsupported, scope, want);
+            const else_: *hir.Stmt = if (is.elseIf()) |eif| blk: {
+                const inner = try buildRecTailStmt(b, .{ .if_stmt = eif }, scope, want);
+                const wrap = try b.a.create(hir.Stmt);
+                wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+                break :blk wrap;
+            } else if (is.elseBody()) |eb|
+                try buildRecBody(b, eb, scope, want)
+            else
+                return reject(b, .unsupported_call); // a value `if` needs an else
+            const out = try b.a.create(hir.Stmt);
+            out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
+            return out;
+        },
+        else => return error.Unsupported,
+    }
+}
+
+/// Build `e` as a record value of exactly `want`, as a tail statement.
+fn recValueStmt(b: *Builder, e: ast.Expr, scope: *Scope, want: *const StructInfo) BuildError!*hir.Stmt {
+    const rv = (try buildRecExpr(b, e, scope)) orelse return error.Unsupported;
+    if (rv.si != want) return reject(b, .unsupported_call); // a different struct/enum
+    const vstmt = try b.a.create(hir.Stmt);
+    vstmt.* = .{ .expr = rv.e };
+    return vstmt;
 }
 
 /// True if `body` (an i64 function block) ends in an `if` with no `else` — a
@@ -2161,7 +2206,8 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             return ev.info;
         },
         .call => |cc| {
-            // A payload construction (`Shape.Circle(7)`).
+            // A payload construction (`Shape.Circle(7)`) or a call to
+            // an enum-returning function (`find(5)`).
             const callee = cc.callee() orelse return null;
             const cp = switch (callee) {
                 .path => |x| x,
@@ -2170,10 +2216,28 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             const txt = try cp.text(b.a);
             defer b.a.free(txt);
             if (enumVariantTag(b, txt)) |ev| return ev.info;
+            if (std.mem.indexOfScalar(u8, txt, '.') == null) {
+                if (b.resolver.lookup(txt)) |fd| return enumOfRet(b, fd);
+            }
             return null;
         },
         else => return null,
     }
+}
+
+/// The boxed enum a function's return type names (`-> Option<i64>`,
+/// `-> Shape`), so callers can `match` on the call's value.
+fn enumOfRet(b: *Builder, fd: ast.FnDecl) BuildError!?*const EnumInfo {
+    const rt = fd.returnType() orelse return null;
+    const pt = switch (rt.type_() orelse return null) {
+        .path => |x| x,
+        else => return null,
+    };
+    const nm = try pt.name(b.a);
+    defer b.a.free(nm);
+    const info = b.enums.get(nm) orelse return null;
+    if (info.si == null) return null; // immediate enums return as i64: later
+    return info;
 }
 
 fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
@@ -2224,9 +2288,16 @@ fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInf
     const te = te_opt orelse return null;
     switch (te) {
         .path => |pt| {
-            if (pt.hasGenericArgs()) return null;
             const nm = try pt.name(b.a);
             defer b.a.free(nm);
+            // A boxed enum value is a record (`-> Option<i64>`,
+            // `o: Shape`). Generic args only parameterize the payload
+            // slots, which are uniformly 8 bytes at this floor, so
+            // `Option<i64>` and `Option<bool>` share the shape. An
+            // *immediate* (all-unit) enum is an i64 value, not a
+            // record — null here, and the scalar path stays honest.
+            if (b.enums.get(nm)) |info| return info.si;
+            if (pt.hasGenericArgs()) return null;
             return b.structs.get(nm);
         },
         else => return null,
@@ -5880,4 +5951,85 @@ test "prelude shadowing: a file `enum Option` wins; missing variants drop the ba
     try tr2.addLib(src2);
     const r = try rejectFromSource(testing.allocator, src2, tr2.resolver());
     try testing.expectEqual(hir.Reject.name_not_found, r.?);
+}
+
+test "enum returns: -> Option / -> Result / -> Shape with value-if bodies" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\enum Shape { Empty, Circle(i64) }
+        \\fn find(n: i64) -> Option<i64> {
+        \\    if n > 0 { Some(n) } else { None }
+        \\}
+        \\fn classify(n: i64) -> Result<i64, i64> {
+        \\    if n >= 10 { Ok(n) } else if n >= 0 { Ok(n * 10) } else { Err(1) }
+        \\}
+        \\fn pick(n: i64) -> Shape {
+        \\    Shape.Circle(n)
+        \\}
+        \\fn main {
+        \\    let o = find(5)
+        \\    match o {
+        \\        Some(v) -> env.out(v),
+        \\        None -> env.out("none"),
+        \\    }
+        \\    match find(0 - 3) {
+        \\        Some(v) -> env.out(v),
+        \\        None -> env.out("none"),
+        \\    }
+        \\    let code = match classify(4) {
+        \\        Ok(v) -> v,
+        \\        Err(c) -> 0 - c,
+        \\    }
+        \\    env.out(code)
+        \\    match pick(7) {
+        \\        Circle(d) -> env.out(d),
+        \\        Empty -> env.out("empty"),
+        \\    }
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The callee returns the boxed value's base pointer.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn find") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "-> ptr") != null);
+}
+
+test "enum returns: honest rejections — missing else, wrong enum" {
+    // A value `if` without an `else` has a path yielding no value.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src1 =
+        \\fn find(n: i64) -> Option<i64> {
+        \\    if n > 0 { Some(n) }
+        \\}
+        \\fn main {
+        \\    let o = find(5)
+        \\    env.out(1)
+        \\}
+        \\
+    ;
+    try tr.addLib(src1);
+    const r1 = try rejectFromSource(testing.allocator, src1, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r1.?);
+    // A body yielding a different enum than declared.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    const src2 =
+        \\fn find(n: i64) -> Option<i64> {
+        \\    Ok(n)
+        \\}
+        \\fn main {
+        \\    let o = find(5)
+        \\    env.out(1)
+        \\}
+        \\
+    ;
+    try tr2.addLib(src2);
+    const r2 = try rejectFromSource(testing.allocator, src2, tr2.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r2.?);
 }

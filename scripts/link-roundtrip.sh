@@ -1360,4 +1360,51 @@ opt32_out="$("$HOST_BIN" "$tmp/option32.wasm")"
 [[ "$opt32_out" == "$opt_expected" ]] || { echo "FAIL: prelude-enum wasm32 (got: $opt32_out)" >&2; exit 1; }
 echo "    ok: prelude enums -> 42 / none / ok 7 / code = 300 / 27 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# Enum returns (the cross-fn enum story): `-> Option<i64>` / `-> Result` /
+# `-> Shape` callee bodies with value-`if` chains; callers bind and match.
+# ---------------------------------------------------------------------------
+echo "==> enum returns: -> Option / -> Result / -> Shape"
+eret_app="$tmp/enum-ret.q"
+cat > "$eret_app" <<'Q64'
+enum Shape { Empty, Circle(i64) }
+fn find(n: i64) -> Option<i64> {
+    if n > 0 { Some(n) } else { None }
+}
+fn classify(n: i64) -> Result<i64, i64> {
+    if n >= 10 { Ok(n) } else if n >= 0 { Ok(n * 10) } else { Err(1) }
+}
+fn pick(n: i64) -> Shape {
+    if n > 0 { Shape.Circle(n) } else { Shape.Empty }
+}
+fn main {
+    let o = find(5)
+    match o {
+        Some(v) -> env.out("found {v}"),
+        None -> env.out("nothing"),
+    }
+    match find(0 - 3) {
+        Some(v) -> env.out(v),
+        None -> env.out("none for negatives"),
+    }
+    let code = match classify(4) {
+        Ok(v) -> v,
+        Err(c) -> 0 - c,
+    }
+    env.out("code = {code}")
+    match pick(7) {
+        Circle(d) -> env.out(d * 2),
+        Empty -> env.out("empty"),
+    }
+}
+Q64
+eret_expected=$'found 5\nnone for negatives\ncode = 40\n14'
+"$Q64_BIN" emit "$eret_app" "$tmp/enum-ret.wasm"
+eret_out="$("$HOST_BIN" "$tmp/enum-ret.wasm")"
+[[ "$eret_out" == "$eret_expected" ]] || { echo "FAIL: enum-returns (got: $eret_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$eret_app" "$tmp/enum-ret32.wasm" --addr wasm32
+eret32_out="$("$HOST_BIN" "$tmp/enum-ret32.wasm")"
+[[ "$eret32_out" == "$eret_expected" ]] || { echo "FAIL: enum-returns wasm32 (got: $eret32_out)" >&2; exit 1; }
+echo "    ok: enum returns -> found 5 / none for negatives / code = 40 / 14 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
