@@ -670,8 +670,17 @@ verified, honest diagnostics throughout.
             beyond the floor staying the honest `Unsupported`. Verified
             byte-stable: 287 unit / 77 CLI / 11-of-45 conformance /
             link-roundtrip — all identical before and after.
-      - [ ] Expression-level inference (`exprIsBool`, Scope local typing)
-            reads sema instead of re-deriving.
+      - [x] **Expression typing owned by sema.** `sema/exprtype.zig`:
+            `scalarOf` types expressions at the scalar floor (literals,
+            the boolean/arithmetic operator tables — moved verbatim from
+            `isBoolOp` — paren/unary recursion, call returns, locals)
+            behind an injected `Env` (localType/callRet callbacks, same
+            pattern as `hir.ModuleResolver`, since the local scope still
+            lives in build_hir's wasm-slot bookkeeping). build_hir's
+            `exprIsBool` is now a thin `== .bool` bridge; `isBoolOp` and
+            `isBoolCall` deleted; all seven call sites untouched.
+            Byte-stable: 289 unit / 77 CLI / 11-of-45 / roundtrip — all
+            identical.
       - [ ] The codegen `Resolver`'s name lookup is replaced by the sema
             symbol table (NameNotFound moves to the sema layer; the
             recorded unresolved-heads become the emitted diagnostic).

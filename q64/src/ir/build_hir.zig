@@ -1023,7 +1023,7 @@ fn isStrCall(b: *Builder, arg: ast.Expr) BuildError!bool {
 /// onto the codegen scalar floor. Anything beyond it — named types,
 /// compounds, the wider numeric tower (i8…u128/f16/f32) — is `null`,
 /// which callers turn into the honest `Unsupported`.
-fn semaScalar(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?hir.Type {
+fn semaScalar(b: *Builder, te_opt: ?ast.TypeExpr) std.mem.Allocator.Error!?hir.Type {
     const id = try sema.types.lower(&b.tstore, null, te_opt);
     return switch (b.tstore.get(id)) {
         .builtin => |bi| switch (bi) {
@@ -1042,62 +1042,58 @@ fn semaScalar(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?hir.Type {
 /// Scalar return type of `fd`'s annotation; `null` when absent or
 /// outside the floor. (Absent ≠ void here: the void-returning handler
 /// path is chosen by the caller before consulting this.)
-fn fnRetScalar(b: *Builder, fd: ast.FnDecl) BuildError!?hir.Type {
+fn fnRetScalar(b: *Builder, fd: ast.FnDecl) std.mem.Allocator.Error!?hir.Type {
     const rt = fd.returnType() orelse return null;
     return semaScalar(b, rt.type_());
 }
 
-fn paramScalar(b: *Builder, p: ast.Param) BuildError!?hir.Type {
+fn paramScalar(b: *Builder, p: ast.Param) std.mem.Allocator.Error!?hir.Type {
     return semaScalar(b, p.type_());
 }
 
-/// Syntactic check: does `arg` denote a boolean value? Covers the boolean
-/// expression grammar (comparison / `&&` / `||` / `!` / `true` / `false`) and
-/// a call to a `-> bool` function. Used to route `env.out` to the bool path.
+/// Does `arg` denote a boolean value? Used to route `env.out` to the bool
+/// path, type `let` bindings, and check call-argument kinds. A3 slice 2:
+/// the decision delegates to sema's expression typer
+/// (`sema.exprtype.scalarOf`); this bridge adapts the builder's `Scope`
+/// and module resolver into sema's `Env` callbacks. The callbacks
+/// collapse into sema's own tables when name lookup moves there
+/// (A3 final slice).
 fn exprIsBool(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
-    switch (arg) {
-        .literal => |lit| {
-            const t = lit.token() orelse return false;
-            return t.kind == .KW_TRUE or t.kind == .KW_FALSE;
-        },
-        .paren => |p| return exprIsBool(b, p.inner() orelse return false, scope),
-        .unary => |u| return (u.op() orelse return false).kind == .BANG,
-        .bin => |bx| return isBoolOp((bx.op() orelse return false).kind),
-        .call => return isBoolCall(b, arg),
-        .path => |p| {
-            // A bare name that resolves to a `bool` binding/parameter.
-            const txt = try p.text(b.a);
-            defer b.a.free(txt);
-            if (scope.find(txt)) |loc| return loc.ty == .bool;
-            return false;
-        },
-        else => return false,
+    var bridge = ExprTypeBridge{ .b = b, .scope = scope };
+    return (try sema.exprtype.scalarOf(b.a, arg, .{
+        .ctx = @ptrCast(&bridge),
+        .localType = ExprTypeBridge.localType,
+        .callRet = ExprTypeBridge.callRet,
+    })) == .bool;
+}
+
+const ExprTypeBridge = struct {
+    b: *Builder,
+    scope: *const Scope,
+
+    fn localType(ctx: *anyopaque, name: []const u8) ?sema.exprtype.ScalarType {
+        const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
+        const loc = self.scope.find(name) orelse return null;
+        return switch (loc.ty) {
+            .bool => .bool,
+            .i64 => .i64,
+            .str => .str,
+            else => .unknown,
+        };
     }
-}
 
-fn isBoolOp(k: parser.cst.SyntaxKind) bool {
-    return switch (k) {
-        .EQ_EQ, .BANG_EQ, .L_ANGLE, .R_ANGLE, .LT_EQ, .GT_EQ, .AMP_AMP, .PIPE_PIPE => true,
-        else => false,
-    };
-}
-
-fn isBoolCall(b: *Builder, arg: ast.Expr) BuildError!bool {
-    const call = switch (arg) {
-        .call => |cc| cc,
-        else => return false,
-    };
-    const callee = call.callee() orelse return false;
-    const cpath = switch (callee) {
-        .path => |p| p,
-        else => return false,
-    };
-    const cname = try cpath.text(b.a);
-    defer b.a.free(cname);
-    const fd = b.resolver.lookup(cname) orelse return false;
-    const rs = try fnRetScalar(b, fd);
-    return rs != null and rs.? == .bool;
-}
+    fn callRet(ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
+        const fd = self.b.resolver.lookup(name) orelse return null;
+        const rs = (try fnRetScalar(self.b, fd)) orelse return null;
+        return switch (rs) {
+            .bool => .bool,
+            .i64 => .i64,
+            .str => .str,
+            else => null,
+        };
+    }
+};
 
 /// Name → local-index resolution for a function body. Append-only with a
 /// backward scan (latest declaration wins), mirroring the legacy IntScope:
