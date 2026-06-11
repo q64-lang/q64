@@ -1627,4 +1627,49 @@ rec32_last="$("$HOST_BIN" "$tmp/reclaim32.wasm" | tail -1)"
 [[ "$rec32_lines" == "18001" && "$rec32_last" == "done" ]] || { echo "FAIL: reclamation wasm32 (lines=$rec32_lines last=$rec32_last)" >&2; exit 1; }
 echo "    ok: frame reclamation -> 18001 lines, constant memory (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# The str method floor: len / [i] / slice / contains / starts_with /
+# index_of on runtime str values, mixed str+scalar signatures, str args.
+# ---------------------------------------------------------------------------
+echo "==> str methods: len / index / slice / contains / mixed signatures"
+strm_app="$tmp/strm.q"
+cat > "$strm_app" <<'Q64'
+fn length_of(s: str) -> i64 {
+    s.len
+}
+fn has(s: str, sub: str) -> bool {
+    s.contains(sub)
+}
+fn id(x: str) -> str {
+    x
+}
+fn main {
+    let s = id("hello world")
+    env.out(s.len)
+    env.out(s[0])
+    env.out(s.slice(0, 5))
+    env.out(s.contains("world"))
+    env.out(s.starts_with("hell"))
+    env.out(s.index_of(32))
+    env.out(length_of(s))
+    env.out(has(s, "wor"))
+    let t = s.slice(6, 11)
+    env.out(t)
+    env.out(t.len)
+    if s.contains("world") {
+        env.out("yes")
+    }
+    let n = s.len
+    env.out(n * 2)
+}
+Q64
+strm_expected=$'11\n104\nhello\ntrue\ntrue\n5\n11\ntrue\nworld\n5\nyes\n22'
+"$Q64_BIN" emit "$strm_app" "$tmp/strm.wasm"
+strm_out="$("$HOST_BIN" "$tmp/strm.wasm")"
+[[ "$strm_out" == "$strm_expected" ]] || { echo "FAIL: str-methods (got: $strm_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$strm_app" "$tmp/strm32.wasm" --addr wasm32
+strm32_out="$("$HOST_BIN" "$tmp/strm32.wasm")"
+[[ "$strm32_out" == "$strm_expected" ]] || { echo "FAIL: str-methods wasm32 (got: $strm32_out)" >&2; exit 1; }
+echo "    ok: str methods -> len/index/slice/contains + mixed signatures (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

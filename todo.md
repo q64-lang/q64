@@ -1419,6 +1419,42 @@ analysis.
 - [ ] **Growth for collections** (`Vec` copy-on-grow inside the owning
       region) — the gate for the collections ladder.
 
+## Strings beyond the floor — methods landed
+
+- [x] **The str method floor, wired end-to-end.** `s.len`, `s[i]`
+      (unsigned byte), `s.slice(a, b)`, `s.contains(x)`,
+      `s.starts_with(x)`, `s.index_of(byte)` work on runtime str
+      values in `main` and in callees — plus **mixed signatures**
+      (`fn has(s: str, sub: str) -> bool`, str + scalar params in
+      value functions) and str arguments at call sites. The MIR ops +
+      builder arms existed (dead code — unreachable for lack of
+      typing/routing/signatures); this rung wired them: sema
+      `scalarOf` gained `.index`/`.method` arms + a `strMethodType`
+      table; the build_hir bridge types the dotted forms (`s.len`,
+      `s.contains` as a dotted callee); main's `env.out` and `let`
+      route `.str`-typed expressions through `buildStrExpr`; main's
+      runtime str bindings register in the scope (two slots, ptr at
+      idx / len at idx+1) so the method arms resolve them; and
+      `registerFunc` accepts str params (one hir param, two scope
+      slots, `buildCallArgs` gained the `.str_` kind). **Convention
+      unification:** `registerStrFunc` now also declares two slots
+      per param and `buildConcat`'s param piece builds a raw
+      `str_binding` — retiring the one-slot/`str_param idx*2` dual
+      convention, which **fixes a latent bug** (a passthrough of the
+      *second* str param read wasm slots 1,2 instead of 2,3 —
+      regression-locked). Verified end-to-end wasm64 + wasm32
+      (roundtrip str-methods section: `11 / 104 / hello / true / true
+      / 5 / 11 / true / world / 5 / yes / 22`) + 2 unit tests.
+      397 unit / 81 CLI / 24-of-51 / roundtrips + component green.
+      **Boundary:** `-> str` fns still take all-str params
+      (`registerStrFunc`; a mixed `-> str` signature is the next
+      slice); `s[a..b]` range sugar waits on range parsing; `+`
+      concat of str values unwired (interpolation covers it); str
+      methods on *literals* fold-or-reject via the const path;
+      `String<R>` and the methods needing allocation-into-region
+      (split, replace, …) wait on the collections story.
+
+
 ## Numeric tower — floats (f64 landed; f32 next)
 
 - [x] **The f64 floor, end-to-end.** Floats are first-class scalars now:

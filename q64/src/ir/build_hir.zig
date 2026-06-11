@@ -336,7 +336,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             }
             // Otherwise a runtime str binding (`let g = shout("hi")`): build
             // the str value and store its (ptr, len) into two new locals.
-            if (init_expr == .string_lit or (try isStrCall(b, init_expr, scope))) {
+            if (init_expr == .string_lit or (try isStrCall(b, init_expr, scope)) or (try exprScalar(b, init_expr, scope)) == .str) {
                 const value = if (init_expr == .string_lit)
                     try buildConcat(b, init_expr.string_lit, scope, false, rt)
                 else
@@ -347,6 +347,13 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 try b.cur_locals.append(b.a, .ptr);
                 try b.cur_locals.append(b.a, .ptr);
                 try b.main_rt.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
+                // Also visible in the scope (ptr at idx, len at idx+1 — the
+                // str-binding convention) so the str-method forms (`s.len`,
+                // `s[i]`, `s.contains(…)`) resolve through `strReceiver`.
+                scope.next_idx = ptr_idx;
+                _ = try scope.declare(nm.text, ls.isVar(), .str);
+                const len_hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{nm.text});
+                _ = try scope.declare(len_hidden, false, .ptr);
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
                 try out.append(b.a, st);
@@ -990,6 +997,9 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
             } else if (try isStrCall(b, arg, scope)) {
                 // A real call to a str-returning function.
                 st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
+            } else if ((try exprScalar(b, arg, scope)) == .str) {
+                // A str-valued expression (`s.slice(0, 5)`, a binding copy).
+                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
             } else if (try exprIsBool(b, arg, scope)) {
                 // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
                 // binding, or a `-> bool` call. Printed as "true" / "false".
@@ -1308,6 +1318,17 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         while (pit.next()) |p| {
             const pn = (p.name() orelse return error.Unsupported).text;
             if (try paramScalar(b, p)) |psc| {
+                if (psc == .str) {
+                    // A `str` param in a value function: one hir param
+                    // (two wasm locals — ptr at idx, len at idx+1, the
+                    // str-binding convention `strReceiver` resolves).
+                    _ = try scope.declare(pn, false, .str);
+                    const len_hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{pn});
+                    _ = try scope.declare(len_hidden, false, .ptr);
+                    try params.append(b.a, .{ .name = pn, .ty = .str });
+                    try rec_params.append(b.a, null);
+                    continue;
+                }
                 const pty: hir.Type = switch (psc) {
                     .bool, .i64, .f64, .f32 => psc,
                     else => return error.Unsupported,
@@ -1326,7 +1347,8 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
             } else return error.Unsupported;
         }
     }
-    scope.n_params = @intCast(params.items.len);
+    // Param-occupied scope slots (a str param takes two: ptr + len).
+    scope.n_params = scope.next_idx;
     const param_slice = try params.toOwnedSlice(b.a);
 
     const id: hir.FuncId = @intCast(b.funcs.items.len);
@@ -1569,7 +1591,7 @@ fn tailIsValueIfNoElse(body: *const hir.Stmt) bool {
 /// passthrough parameter ref, or a call to another str function). Concat
 /// bodies and runtime bindings land in a later slice.
 fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
-    var scope = Scope{ .a = b.a };
+    var scope = Scope{ .a = b.a, .callee = true };
     var params: std.ArrayList(hir.Param) = .empty;
     if (fd.params()) |ps| {
         var pit = ps.iter();
@@ -1577,11 +1599,16 @@ fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
             if (psc != .str) return error.Unsupported; // all-str params for now
             const pn = (p.name() orelse return error.Unsupported).text;
+            // Two scope slots per str param (ptr at idx, len at idx+1) —
+            // the raw str-binding convention, shared with mixed
+            // signatures and main's bindings.
             _ = try scope.declare(pn, false, .str);
+            const len_hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{pn});
+            _ = try scope.declare(len_hidden, false, .ptr);
             try params.append(b.a, .{ .name = pn, .ty = .str });
         }
     }
-    scope.n_params = @intCast(params.items.len);
+    scope.n_params = scope.next_idx;
     const param_slice = try params.toOwnedSlice(b.a);
 
     const owned = try b.a.dupe(u8, name);
@@ -1886,11 +1913,12 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                     if (scope.find(ptext)) |loc| {
                         try flush(b, &lit, &pieces);
                         const piece = try b.a.create(hir.Expr);
-                        // A str local (callee param) passes through as-is; a
-                        // numeric local interpolates as its decimal text
+                        // A str local (a param or a binding — ptr at idx,
+                        // len at idx+1) passes through as-is; a numeric
+                        // local interpolates as its decimal text
                         // (i64 via __fmt_i64, f64 via __fmt_f64).
                         if (loc.ty == .str) {
-                            piece.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                            piece.* = .{ .str_binding = .{ .ptr_idx = loc.idx, .len_idx = loc.idx + 1 } };
                         } else {
                             const lref = try b.a.create(hir.Expr);
                             lref.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
@@ -3402,7 +3430,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
     // Snapshot the parameter kinds before building the args — building an
     // argument may register a new callee and grow `b.funcs`, so we can't
     // hold a slice into it across the loop.
-    const ParamKind = union(enum) { int, float: hir.Type, bool_, rec: *const StructInfo };
+    const ParamKind = union(enum) { int, float: hir.Type, bool_, str_, rec: *const StructInfo };
     const np = b.funcs.items[id].params.len;
     const kinds = try b.a.alloc(ParamKind, np);
     const frec = b.fn_recs.get(id);
@@ -3412,6 +3440,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
             .i64 => .int,
             .f64 => .{ .float = .f64 },
             .f32 => .{ .float = .f32 },
+            .str => .str_,
             // A `.ptr` param is a record on this path (str callees never get here).
             .ptr => .{ .rec = (frec orelse return error.Unsupported).params[k] orelse return error.Unsupported },
             else => return error.Unsupported,
@@ -3451,6 +3480,11 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
             .bool_ => {
                 if (!(try exprIsBool(b, a, scope))) return reject(b, .unsupported_call);
                 try args.append(b.a, try buildIntExpr(b, a, scope));
+            },
+            .str_ => {
+                // A constant folds, a binding/param passes by reference
+                // (main's str bindings are scope-visible).
+                try args.append(b.a, try buildStrArg(b, a, scope, null));
             },
         }
     }
@@ -3513,6 +3547,15 @@ const ExprTypeBridge = struct {
     fn localType(ctx: *anyopaque, name: []const u8) ?sema.exprtype.ScalarType {
         const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
         const loc = self.scope.find(name) orelse {
+            // `s.len` parses as one dotted path: the i64 byte length of a
+            // str local (spec/types.md §Strings).
+            if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+                if (std.mem.eql(u8, name[dot + 1 ..], "len")) {
+                    if (self.scope.find(name[0..dot])) |head| {
+                        if (head.ty == .str) return .i64;
+                    }
+                }
+            }
             // `p.x` on a materialized record: the field's declared type.
             const rf = (findRecField(self.scope, name) catch return null) orelse return null;
             return switch (rf.ty) {
@@ -3545,10 +3588,14 @@ const ExprTypeBridge = struct {
             };
         }
         // A dotted call on a record binding (`r.wide()`): the fit
-        // method's declared return type.
+        // method's declared return type — or a str method on a str
+        // local (`s.contains(…)` parses as one dotted callee path).
         if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
             const mname = name[dot + 1 ..];
             if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
+            if (self.scope.find(name[0..dot])) |head| {
+                if (head.ty == .str) return sema.exprtype.strMethodType(mname);
+            }
             const si = self.scope.recs.get(name[0..dot]) orelse return null;
             const m = findFitMethod(self.b, si.name, mname) orelse return null;
             const rt = m.returnType() orelse return null;
@@ -4476,9 +4523,11 @@ test "tryBuild: a concat-bodied str function (interpolated param) builds" {
     defer mod.deinit();
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
-    // shout's body is a concat of its parameter and the literal "!".
+    // shout's body is a concat of its parameter and the literal "!" —
+    // the param piece is a str_binding at its two wasm slots (ptr=0,
+    // len=1), the uniform str-value form.
     try testing.expect(std.mem.indexOf(u8, dump, "fn shout -> str") != null);
-    try testing.expect(std.mem.indexOf(u8, dump, "concat[local#0") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "concat[str_binding[0,1]") != null);
 }
 
 test "tryBuild: a runtime str binding + use in interpolation + arg" {
@@ -6539,4 +6588,57 @@ test "record-returning match tails: Option -> Option / Option -> Result" {
     try tr2.addLib(src2);
     const r = try rejectFromSource(testing.allocator, src2, tr2.resolver());
     try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
+test "str methods: len/index/slice/contains/starts_with/index_of + mixed signatures" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn length_of(s: str) -> i64 {
+        \\    s.len
+        \\}
+        \\fn has(s: str, sub: str) -> bool {
+        \\    s.contains(sub)
+        \\}
+        \\fn id(x: str) -> str {
+        \\    x
+        \\}
+        \\fn main {
+        \\    let s = id("hello world")
+        \\    env.out(s.len)
+        \\    env.out(s[0])
+        \\    env.out(s.slice(0, 5))
+        \\    env.out(s.contains("world"))
+        \\    env.out(s.starts_with("hell"))
+        \\    env.out(s.index_of(32))
+        \\    env.out(length_of(s))
+        \\    env.out(has(s, "wor"))
+        \\    let t = s.slice(6, 11)
+        \\    env.out(t.len)
+        \\    if s.contains("world") {
+        \\        env.out("yes")
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "slice") != null);
+}
+
+test "str params: a second str param reads its own wasm slots (2, 3)" {
+    // The latent bug the two-slot unification fixed: under the one-slot
+    // convention, a passthrough of the SECOND str param read slots
+    // (1, 2) instead of (2, 3).
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn second(a: str, b: str) -> str { b }\n");
+    var mod = (try buildFromSource(testing.allocator, "fn main {\n env.out(second(\"x\", \"y\"))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_binding[2,3]") != null);
 }

@@ -385,8 +385,11 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             return mk(ctx.a, .i32, .{ .if_ = .{ .cond = lhs, .then_ = branches[0], .else_ = branches[1] } });
         },
         .call => |cl| {
+            // A `str` argument lowers on the str path (a (ptr, len) pair
+            // inst the backend expands to two operands) — mixed-signature
+            // callees (`fn length_of(s: str) -> i64`) take both kinds.
             const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
-            for (cl.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
+            for (cl.args, 0..) |arg, i| args[i] = if (isStrExpr(arg)) try lowerStrExpr(ctx, arg) else try lowerExpr(ctx, arg);
             // The call's value type follows the callee's return type (i64, or
             // i32 for a `-> bool`), so it validates against the callee sig.
             return mk(ctx.a, mapType(ctx.funcs[cl.func].ret), .{ .call = .{ .func = cl.func, .args = args } });

@@ -111,8 +111,32 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
             defer gpa.free(name);
             return env.localType(env.ctx, name) orelse .unknown;
         },
+        .index => |ix| {
+            // `s[i]` — the unsigned byte of a str, an i64. Array element
+            // typing lives with the caller's slot scope (its bridge).
+            const base = ix.base() orelse return .unknown;
+            if ((try scalarOf(gpa, base, env)) == .str) return .i64;
+            return .unknown;
+        },
+        .method => |me| {
+            // The str method floor (spec/types.md §Strings): contains /
+            // starts_with → bool, index_of → i64, slice → str. Non-str
+            // receivers (fit methods) are typed by the caller's bridge.
+            const recv = me.receiver() orelse return .unknown;
+            if ((try scalarOf(gpa, recv, env)) != .str) return .unknown;
+            const mname = (me.method() orelse return .unknown).text;
+            return strMethodType(mname) orelse .unknown;
+        },
         else => return .unknown,
     }
+}
+
+/// The result type of a str method by name, or null for an unknown one.
+pub fn strMethodType(name: []const u8) ?ScalarType {
+    if (std.mem.eql(u8, name, "contains") or std.mem.eql(u8, name, "starts_with")) return .bool;
+    if (std.mem.eql(u8, name, "index_of")) return .i64;
+    if (std.mem.eql(u8, name, "slice")) return .str;
+    return null;
 }
 
 /// Operators that produce a `bool` (comparisons + short-circuit logic),
