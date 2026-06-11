@@ -15,13 +15,15 @@ plus a sibling concern in the qubepods repo.
 ## Prerequisites
 
 ### Cloudflare (the three Workers)
-- Account: **<account-email>**, id `<account-id>` (hosts the
-  `q64.dev` zone and all `q64-*` Workers).
-- `wrangler` must be authenticated (`wrangler whoami`). Two accounts are visible
-  on this machine, so **every** deploy must pin the account:
+- Account: the Cloudflare account hosting the `q64.dev` zone and all `q64-*`
+  Workers. The account id is **deliberately not committed** — look it up with
+  `wrangler whoami` (or the dashboard URL) and keep it in your shell profile
+  or an untracked `.env`.
+- `wrangler` must be authenticated (`wrangler whoami`). If more than one
+  account is visible, **every** deploy must pin the account:
 
   ```sh
-  export CLOUDFLARE_ACCOUNT_ID=<account-id>
+  export CLOUDFLARE_ACCOUNT_ID=<account-id>   # from `wrangler whoami`
   ```
 
   Without it wrangler errors with "More than one account available". Use
@@ -78,8 +80,8 @@ the first `wrangler deploy` provisions it automatically. Generated output
 it, add two **repo secrets**:
 
 - `CLOUDFLARE_API_TOKEN` — a token with Workers Scripts + Workers Routes edit on
-  the etiamo account.
-- `CLOUDFLARE_ACCOUNT_ID` — `<account-id>`.
+  the account hosting the `q64.dev` zone.
+- `CLOUDFLARE_ACCOUNT_ID` — the account id (from `wrangler whoami`).
 
 Until they exist the workflow **skips the deploy and stays green** (it does not
 fail); deploy manually with the command above.
