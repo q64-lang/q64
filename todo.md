@@ -789,10 +789,43 @@ verified, honest diagnostics throughout.
             Honestly Unsupported (documented): shorthand inits,
             whole-struct copies/passing/returns, nesting, callee-body
             records, str fields.
-      - [ ] **B2b — the layout story.** Scope-arena layout + (ptr, offset)
-            field access for structs that escape SROA: passed/returned/
-            nested/ref'd values (`spec/memory.md` layout rules). This is
-            the prerequisite for B4's `self` receiver.
+      - [x] **B2b slice 1 — the layout story (escaping records).** Records
+            that escape SROA are real memory now. Specced first:
+            `spec/memory.md` §"Linear struct layout" (declaration order,
+            natural alignment — bool 1/1, i64 8/8 — struct align = max
+            field align, size rounded up, aligned allocation). Then the
+            ladder: HIR `record_alloc`/`field_get`/`field_set`, MIR
+            `record_make` (align `sp` → bump → store fields → yield base)
+            + typed `field_get`/`field_set` loads/stores, backend emission
+            with per-nesting-level base-ptr scratch locals (an inner
+            record literal in a call argument can't clobber the outer's
+            base). The builder lays out this file's structs
+            (`registerStructs`), decides SROA-vs-materialize per `main`
+            binding by a whole-value-use scan (`recordEscapes` — SROA
+            stays for non-escaping literals), binds record-returning
+            calls (`let p = make(3, 4)`), and registers record
+            params/returns as one address-width `.ptr` (`fn_recs` tracks
+            which struct; args are checked struct-for-struct —
+            UnsupportedCall on mismatch). Field reads/assigns/`{p.x}`
+            interpolation resolve via `findRecField` in `main` and in
+            callee bodies. Verified end-to-end on wasm64 + wasm32
+            (`link-roundtrip.sh` B2b: passed/returned/nested-call args,
+            `var` field assign through the pointer, bool field layout →
+            `3/25/5/31/c = (5, 4)/true/7`) + 8 unit tests incl. the
+            honest rejections (wrong struct, missing/unknown field,
+            field-assign on `let`, bool into i64 field).
+            **Bonus fix:** `parseRecordBody` looped forever on a
+            keyword-shaped field name (`on: bool` — `on` lexes KW_ON and
+            `parseField` consumed nothing); a progress guard eats one
+            token so the parse degrades instead of hanging (+ regression
+            test).
+            **Boundary (next slices):** nested structs (struct-typed
+            fields), `str`/`ref` fields, record `let`s *inside* callee
+            bodies, control flow in record-returning bodies (v0 = single
+            tail expr), whole-record interpolation/printing, struct
+            signatures across module boundaries (the table is per-file),
+            `q64 show layout <type>`, and reclamation (the scope arena
+            never frees). B4's `self` receiver can now build on this.
 - [ ] **B3 — face/fit method grammar.** Structure the raw-span method
       signatures in `FACE_BODY`/`FIT_BODY` (parser-only; today
       `parseFaceOrFit` keeps them as token spans).

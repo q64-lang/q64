@@ -217,6 +217,54 @@ The heaps are **disjoint at the platform level**. Wasm 3.0 provides
 separate instructions and separate memory areas. q64 surfaces the
 boundary; there is no implicit pointer-to-reference conversion.
 
+## Linear struct layout
+
+How a `struct` value is laid out when it lives in linear memory (any
+non-`Managed` region). Managed structs lower to WasmGC `struct.new`
+and have no byte layout. The rules are deliberately C-like and
+**stable**: layout is part of the platform contract (`q64 show layout
+<type>` prints it), never a surprise.
+
+1. **Declaration order is layout order.** Fields are placed in source
+   order; the compiler never reorders. (Predictability over packing —
+   a developer who wants a tighter struct reorders the declaration.)
+2. **Natural size and alignment** per field type:
+
+   | Field type                  | Size (bytes)        | Alignment        |
+   |-----------------------------|---------------------|------------------|
+   | `bool`, `i8`, `u8`          | 1                   | 1                |
+   | `i16`, `u16`, `f16`         | 2                   | 2                |
+   | `i32`, `u32`, `f32`         | 4                   | 4                |
+   | `i64`, `u64`, `f64`         | 8                   | 8                |
+   | `ref T`, pointer components | address-space width (4 on `wasm32`, 8 on `wasm64`) | same as size |
+   | nested `struct`             | its own size        | its own alignment |
+
+3. **Each field starts at the next multiple of its alignment** after
+   the previous field's end (padding bytes are unspecified, not
+   zeroed). A nested struct field embeds its bytes **inline**.
+4. **Struct alignment = max field alignment**; **struct size is
+   rounded up** to a multiple of the struct alignment. An empty
+   struct has size 0, alignment 1.
+5. **Allocation is aligned.** A region allocates a struct at an
+   address that is a multiple of its alignment (the arena bump
+   pointer rounds up before allocating).
+
+Field access compiles to a load/store at `base + constant offset`.
+Only pointer-bearing fields make a layout address-space-dependent;
+a struct of scalars has identical layout on `wasm32` and `wasm64`.
+
+**Values vs. addresses.** A record binding whose value never escapes
+(no whole-value use: not passed, returned, nested, or referenced) may
+be scalarized by the compiler (SROA) and never materialize in memory.
+The layout above governs every value that does materialize: passed or
+returned whole, stored in another struct, or referenced via `ref`.
+
+> **Status (impl):** v0 lowers escaping record values into the scope
+> arena (no reclamation yet), passes and returns them as a single
+> pointer at the build's address width, and supports `i64` and `bool`
+> fields; nested structs, `str`/`ref` fields, and `q64 show layout`
+> are the next slices.
+
 ## Marking a struct managed
 
 A `@managed` annotation marks a struct as living in WasmGC memory:

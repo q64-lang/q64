@@ -39,6 +39,35 @@ const BuildError = error{ Unsupported, Rejected } || std.mem.Allocator.Error;
 const StrBinding = struct { ptr_idx: u32, len_idx: u32 };
 const RtMap = std.StringHashMapUnmanaged(StrBinding);
 
+/// One field of a laid-out struct: its declared type and byte offset, per
+/// spec/memory.md §"Linear struct layout" (declaration order, natural
+/// alignment, no reordering).
+const StructField = struct { name: []const u8, ty: hir.Type, offset: u32 };
+
+/// A struct declaration on the v0 layout floor (i64 / bool fields only).
+/// Structs with fields outside the floor aren't registered, so uses stay the
+/// honest `Unsupported`. Size is rounded up to the struct alignment.
+const StructInfo = struct {
+    name: []const u8,
+    fields: []const StructField,
+    size: u32,
+    alignment: u32,
+
+    fn field(self: *const StructInfo, name: []const u8) ?StructField {
+        for (self.fields) |f| if (std.mem.eql(u8, f.name, name)) return f;
+        return null;
+    }
+};
+
+/// Which of a function's params/return are record values (`.ptr` at the ABI).
+/// Present in `Builder.fn_recs` only for functions with any record surface.
+const FnRec = struct { params: []const ?*const StructInfo, ret: ?*const StructInfo };
+
+/// A resolved `<binding>.<field>` access on a materialized record binding:
+/// the binding's ptr local, the field's layout offset/type, and whether the
+/// binding is assignable (`var`).
+const RecField = struct { base_idx: u32, offset: u32, ty: hir.Type, mutable: bool };
+
 const Builder = struct {
     a: std.mem.Allocator,
     resolver: ModuleResolver,
@@ -60,6 +89,15 @@ const Builder = struct {
     globals: std.StringHashMapUnmanaged(u32) = .empty,
     global_inits: std.ArrayList(i64) = .empty,
     global_names: std.ArrayList([]const u8) = .empty,
+    /// This file's struct declarations on the layout floor, laid out per
+    /// spec/memory.md §"Linear struct layout". Struct-typed signatures resolve
+    /// against this table (v0: the compiling file's structs only).
+    structs: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
+    /// FuncId → its record params/return, for functions with a record surface.
+    fn_recs: std.AutoHashMapUnmanaged(hir.FuncId, FnRec) = .empty,
+    /// `main`'s body block, for the record-binding escape scan (does a bare
+    /// `name` appear as a whole value anywhere in `main`?).
+    main_body: ?ast.Block = null,
     /// Entry FuncId (main → 0) when the module has a `fn main`; null for a
     /// main-less module (e.g. a backend twin: only `state` + exported commands).
     entry: ?hir.FuncId = null,
@@ -162,6 +200,11 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
         };
     }
 
+    // Pass 0.5: lay out this file's struct declarations (B2b). Structs with
+    // fields outside the v0 floor (i64 / bool) are skipped, not rejected —
+    // a *use* of one surfaces the honest Unsupported.
+    try registerStructs(b, sf);
+
     // A module may have no `fn main` (a backend twin: just `state` + exported
     // commands). Then there's no entry — build only the screen functions.
     const main_fn = findMain(sf) orelse {
@@ -180,6 +223,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
         return;
     };
     const body = main_fn.body() orelse return error.Unsupported;
+    b.main_body = body;
 
     // Reserve FuncId 0 for the entry so callees discovered while building
     // main's body get ids 1.. .
@@ -242,17 +286,22 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
                 try out.append(b.a, st);
+            } else if (init_expr == .record and try recordEscapes(b, nm.text)) {
+                // B2b: the binding is used as a whole value somewhere in
+                // `main` (passed to a call, …) — materialize it in the scope
+                // arena and bind the base pointer. Field access becomes
+                // (ptr, offset) loads/stores through `findRecField`.
+                const rv = (try buildRecExpr(b, init_expr, scope)) orelse return error.Unsupported;
+                try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
             } else if (init_expr == .record) {
-                // B2 (SROA): a record-literal binding lowers to one scalar
-                // local per field, *named with the dotted access path*
-                // ("p.x"). `p.x` parses as a single greedy PATH_EXPR, so
-                // the existing path machinery — reads, `var` assignment,
-                // `{p.x}` interpolation — resolves field access with no
-                // aggregate representation at all. The struct never
+                // B2 (SROA): a *non-escaping* record-literal binding lowers
+                // to one scalar local per field, *named with the dotted
+                // access path* ("p.x"). `p.x` parses as a single greedy
+                // PATH_EXPR, so the existing path machinery — reads, `var`
+                // assignment, `{p.x}` interpolation — resolves field access
+                // with no aggregate representation at all. The struct never
                 // exists in memory. v0 scope (documented in todo.md):
-                // main-only, i64/bool field values, no shorthand inits,
-                // no whole-struct copies/passing/nesting — those need
-                // the layout story (B2 full).
+                // main-only, i64/bool field values, no shorthand inits.
                 const rec = init_expr.record;
                 var inits = rec.inits();
                 var any = false;
@@ -271,6 +320,11 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     try out.append(b.a, st);
                 }
                 if (!any) return error.Unsupported; // empty literal binds nothing
+            } else if (try recCallStruct(b, init_expr)) |_| {
+                // `let p = make(3, 4)` — a record-returning call: bind the
+                // returned base pointer (the record lives in the scope arena).
+                const rv = (try buildRecExpr(b, init_expr, scope)) orelse return error.Unsupported;
+                try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
             } else {
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
                 // bool (`let even = n % 2 == 0`, `var flag = true`). A bool
@@ -375,6 +429,27 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     break :blk bx;
                 };
                 st.* = .{ .assign = .{ .idx = loc.idx, .value = value } };
+            } else if (try findRecField(scope, tname)) |rf| {
+                // `p.x = …` on a materialized record: a store at (ptr, offset).
+                // Same typing discipline as a local: plain `=` must match the
+                // field's type; compound ops are i64 arithmetic.
+                if (!rf.mutable) return reject(b, .immutable_assign);
+                const rhs_is_bool = try exprIsBool(b, rhs_ast, scope);
+                if (op.kind == .EQ) {
+                    if ((rf.ty == .bool) != rhs_is_bool) return error.Unsupported;
+                } else if (rf.ty != .i64) {
+                    return error.Unsupported;
+                }
+                const rhs = try buildIntExpr(b, rhs_ast, scope);
+                const value = if (op.kind == .EQ) rhs else blk: {
+                    const k = compoundOp(op) orelse return error.Unsupported;
+                    const bx = try b.a.create(hir.Expr);
+                    bx.* = .{ .bin = .{ .kind = k, .lhs = try recFieldExpr(b, rf), .rhs = rhs } };
+                    break :blk bx;
+                };
+                const base = try b.a.create(hir.Expr);
+                base.* = .{ .local = .{ .idx = rf.base_idx, .ty = .ptr } };
+                st.* = .{ .field_set = .{ .base = base, .offset = rf.offset, .ty = rf.ty, .value = value } };
             } else if (b.globals.get(tname)) |gi| {
                 // A module-level `state` global (`count = count + 1`).
                 if (op.kind != .EQ) return error.Unsupported;
@@ -635,31 +710,47 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (b.ids.get(name)) |id| return id;
 
     const fd = b.resolver.lookup(name) orelse return reject(b, .name_not_found);
-    const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
-    if (rs == .str) return registerStrFunc(b, name, fd);
-    // An i64 or a `-> bool` (i32 0/1) value function; both have i64 params and
-    // a value body built by `buildIntBlock`.
-    const ret_ty: hir.Type = switch (rs) {
-        .bool, .i64 => rs,
-        else => return error.Unsupported,
+    const rec_ret = try structOfRet(b, fd);
+    const ret_ty: hir.Type = if (rec_ret != null) .ptr else blk: {
+        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
+        if (rs == .str) return registerStrFunc(b, name, fd);
+        // An i64 or a `-> bool` (i32 0/1) value function; both have i64 params
+        // and a value body built by `buildIntBlock`.
+        break :blk switch (rs) {
+            .bool, .i64 => rs,
+            else => return error.Unsupported,
+        };
     };
 
     const owned = try b.a.dupe(u8, name);
 
-    // Parameters (i64 or bool) occupy local indices 0..n; seed the body scope.
+    // Parameters (i64, bool, or a record — one `.ptr` slot) occupy local
+    // indices 0..n; seed the body scope.
     var scope = Scope{ .a = b.a };
     var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    var any_rec = (rec_ret != null);
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
-            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
-            const pty: hir.Type = switch (psc) {
-                .bool, .i64 => psc,
-                else => return error.Unsupported,
-            };
             const pn = (p.name() orelse return error.Unsupported).text;
-            _ = try scope.declare(pn, false, pty);
-            try params.append(b.a, .{ .name = pn, .ty = pty });
+            if (try paramScalar(b, p)) |psc| {
+                const pty: hir.Type = switch (psc) {
+                    .bool, .i64 => psc,
+                    else => return error.Unsupported,
+                };
+                _ = try scope.declare(pn, false, pty);
+                try params.append(b.a, .{ .name = pn, .ty = pty });
+                try rec_params.append(b.a, null);
+            } else if (try structOfType(b, p.type_())) |si| {
+                // A record param: one address-width pointer into the caller's
+                // scope arena. Field access in the body loads through it.
+                _ = try scope.declare(pn, false, .ptr);
+                try scope.recs.put(b.a, pn, si);
+                try params.append(b.a, .{ .name = pn, .ty = .ptr });
+                try rec_params.append(b.a, si);
+                any_rec = true;
+            } else return error.Unsupported;
         }
     }
     scope.n_params = @intCast(params.items.len);
@@ -672,6 +763,26 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     dummy.* = .{ .block = &.{} };
     // Reserve with the real params so recursive arg-count checks are correct.
     try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = ret_ty, .body = dummy });
+    if (any_rec) {
+        try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = rec_ret });
+    } else {
+        rec_params.deinit(b.a);
+    }
+
+    // A record-returning function: v0 bodies are a single tail expression (a
+    // record literal, a passthrough param, or a record-returning call) —
+    // control flow in record bodies lands with a later slice.
+    if (rec_ret) |want| {
+        const tail = try singleTailExpr(fd) orelse return error.Unsupported;
+        const rv = (try buildRecExpr(b, tail, &scope)) orelse return error.Unsupported;
+        if (rv.si != want) return reject(b, .unsupported_call); // body builds a different struct
+        const vstmt = try b.a.create(hir.Stmt);
+        vstmt.* = .{ .expr = rv.e };
+        const block = try b.a.create(hir.Stmt);
+        block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+        b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .body = block };
+        return id;
+    }
 
     const body = try buildIntBlock(b, fd.body() orelse return error.Unsupported, &scope);
     // A value-producing i64 function whose tail is an `if` with no `else` has a
@@ -965,6 +1076,14 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                         const e = try b.a.create(hir.Expr);
                         e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
                         try pieces.append(b.a, e);
+                    } else if (try findRecField(scope, ptext)) |rf| {
+                        // `{p.x}` on a materialized record: format the i64
+                        // field. (A bool field has no text form here yet.)
+                        if (rf.ty != .i64) return error.Unsupported;
+                        try flush(b, &lit, &pieces);
+                        const piece = try b.a.create(hir.Expr);
+                        piece.* = .{ .fmt_int = try recFieldExpr(b, rf) };
+                        try pieces.append(b.a, piece);
                     } else {
                         // A const binding folds into the run; otherwise defer.
                         const v = (try tryConst(b, iexpr)) orelse return error.Unsupported;
@@ -1080,6 +1199,277 @@ fn paramScalar(b: *Builder, p: ast.Param) std.mem.Allocator.Error!?hir.Type {
     return semaScalar(b, p.type_());
 }
 
+// ---------------------------------------------------------------------
+// Record layout + materialized record values (B2b — the layout story).
+// ---------------------------------------------------------------------
+
+/// The size/alignment of a field type on the v0 layout floor, per
+/// spec/memory.md §"Linear struct layout". `null` = outside the floor.
+fn fieldWidth(ty: hir.Type) ?struct { size: u32, alignment: u32 } {
+    return switch (ty) {
+        .i64 => .{ .size = 8, .alignment = 8 },
+        .bool => .{ .size = 1, .alignment = 1 },
+        else => null,
+    };
+}
+
+/// Lay out every struct declaration in `sf` (declaration order, natural
+/// alignment, size rounded up to the struct alignment). A struct with a
+/// field outside the v0 floor — or with no record fields at all — is not
+/// registered; a use of it stays the honest `Unsupported`.
+fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .struct_decl => |sd| {
+            const nm = sd.name() orelse continue;
+            var fields: std.ArrayList(StructField) = .empty;
+            var off: u32 = 0;
+            var max_align: u32 = 1;
+            var ok = true;
+            var fit = sd.fields();
+            while (fit.next()) |f| {
+                const fname = f.name() orelse {
+                    ok = false;
+                    break;
+                };
+                const fty = (try semaScalar(b, f.type_())) orelse {
+                    ok = false;
+                    break;
+                };
+                const w = fieldWidth(fty) orelse {
+                    ok = false;
+                    break;
+                };
+                off = std.mem.alignForward(u32, off, w.alignment);
+                try fields.append(b.a, .{ .name = fname.text, .ty = fty, .offset = off });
+                off += w.size;
+                if (w.alignment > max_align) max_align = w.alignment;
+            }
+            if (!ok or fields.items.len == 0) continue;
+            const si = try b.a.create(StructInfo);
+            si.* = .{
+                .name = nm.text,
+                .fields = try fields.toOwnedSlice(b.a),
+                .size = std.mem.alignForward(u32, off, max_align),
+                .alignment = max_align,
+            };
+            try b.structs.put(b.a, nm.text, si);
+        },
+        else => {},
+    };
+}
+
+/// The registered struct a type annotation names, if any. Generic paths and
+/// non-path types are not records on the v0 floor.
+fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInfo {
+    const te = te_opt orelse return null;
+    switch (te) {
+        .path => |pt| {
+            if (pt.hasGenericArgs()) return null;
+            const nm = try pt.name(b.a);
+            defer b.a.free(nm);
+            return b.structs.get(nm);
+        },
+        else => return null,
+    }
+}
+
+fn structOfRet(b: *Builder, fd: ast.FnDecl) BuildError!?*const StructInfo {
+    const rt = fd.returnType() orelse return null;
+    return structOfType(b, rt.type_());
+}
+
+/// If `expr` is a call to a record-returning function (resolvable, bare
+/// name), the struct it returns. Used to detect `let p = make(3, 4)`.
+fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
+    const call = switch (expr) {
+        .call => |cc| cc,
+        else => return null,
+    };
+    const callee = call.callee() orelse return null;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return null,
+    };
+    const cname = try cpath.text(b.a);
+    defer b.a.free(cname);
+    if (std.mem.indexOfScalar(u8, cname, '.') != null) return null; // host/method calls aren't record-valued
+    const fd = b.resolver.lookup(cname) orelse return null;
+    return structOfRet(b, fd);
+}
+
+/// Resolve `<binding>.<field>` against the scope's materialized record
+/// bindings (`Scope.recs`). `null` when the head isn't one; an unknown field
+/// on a known record — or nested access — is `Unsupported` (nesting needs
+/// struct-typed fields, a later slice).
+fn findRecField(scope: *const Scope, txt: []const u8) BuildError!?RecField {
+    const dot = std.mem.indexOfScalar(u8, txt, '.') orelse return null;
+    const si = scope.recs.get(txt[0..dot]) orelse return null;
+    const loc = scope.find(txt[0..dot]) orelse return null;
+    const rest = txt[dot + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, '.') != null) return error.Unsupported;
+    const f = si.field(rest) orelse return error.Unsupported;
+    return .{ .base_idx = loc.idx, .offset = f.offset, .ty = f.ty, .mutable = loc.mutable };
+}
+
+/// A `field_get` expression for a resolved record field.
+fn recFieldExpr(b: *Builder, rf: RecField) BuildError!*hir.Expr {
+    const base = try b.a.create(hir.Expr);
+    base.* = .{ .local = .{ .idx = rf.base_idx, .ty = .ptr } };
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .field_get = .{ .base = base, .offset = rf.offset, .ty = rf.ty } };
+    return out;
+}
+
+/// Does the bare name appear as a *whole-value* use anywhere in `main`'s
+/// body — a PATH_EXPR that is exactly `name` (a call argument, `env.out(p)`,
+/// …)? Field access (`p.x`) parses as one greedy dotted PATH_EXPR, so it
+/// never matches. Conservative: a match anywhere (even before the binding)
+/// materializes the record; SROA is the optimization, not the semantics.
+fn recordEscapes(b: *Builder, name: []const u8) BuildError!bool {
+    const body = b.main_body orelse return false;
+    return nodeHasWholePath(b, body.cst, name);
+}
+
+fn nodeHasWholePath(b: *Builder, node: *const parser.cst.Node, name: []const u8) BuildError!bool {
+    if (node.kind == .PATH_EXPR) {
+        const txt = try (ast.PathExpr{ .cst = node }).text(b.a);
+        defer b.a.free(txt);
+        return std.mem.eql(u8, txt, name); // paths don't nest — no recursion
+    }
+    for (node.children) |ch| switch (ch) {
+        .node => |nn| if (try nodeHasWholePath(b, nn, name)) return true,
+        .token => {},
+    };
+    return false;
+}
+
+/// Bind a record value in `main`: one `.ptr` local (shared index space with
+/// the other main bindings) + a `Scope.recs` entry so field access and
+/// whole-value uses resolve.
+fn bindMainRecord(b: *Builder, scope: *Scope, name: []const u8, is_var: bool, value: *hir.Expr, si: *const StructInfo, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    scope.next_idx = @intCast(b.main_locals.items.len);
+    const idx = try scope.declare(name, is_var, .ptr);
+    try b.main_locals.append(b.a, .ptr);
+    try scope.recs.put(b.a, name, si);
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .let = .{ .idx = idx, .value = value } };
+    try out.append(b.a, st);
+}
+
+/// Build a record-valued expression (a `.ptr`): a record literal (allocated
+/// in the scope arena), a bare reference to a materialized record binding /
+/// record param, or a call to a record-returning function. `null` when the
+/// expression isn't record-shaped (the caller picks another path).
+fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct { e: *hir.Expr, si: *const StructInfo } {
+    switch (expr) {
+        .paren => |p| return buildRecExpr(b, p.inner() orelse return error.Unsupported, scope),
+        .record => |re| {
+            const pname = try (re.path() orelse return error.Unsupported).text(b.a);
+            defer b.a.free(pname);
+            const si = b.structs.get(pname) orelse return error.Unsupported; // a literal of an unregistered struct
+            var inits: std.ArrayList(hir.FieldInit) = .empty;
+            var seen: usize = 0;
+            var iit = re.inits();
+            while (iit.next()) |fi| {
+                const fname = fi.name() orelse return error.Unsupported;
+                const fval = fi.value() orelse return error.Unsupported; // shorthand inits: later
+                const f = si.field(fname.text) orelse return error.Unsupported;
+                // A bool is not an int: the value's kind must match the field.
+                if ((f.ty == .bool) != (try exprIsBool(b, fval, scope))) return error.Unsupported;
+                try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildIntExpr(b, fval, scope) });
+                seen += 1;
+            }
+            // Every field must be initialized, each exactly once (the layout
+            // has no default values). seen == fields.len with per-name lookup
+            // admits a duplicate+omission pair only if a name repeats — which
+            // the duplicate-name check below rejects.
+            if (seen != si.fields.len) return error.Unsupported;
+            var i: usize = 0;
+            while (i < inits.items.len) : (i += 1) {
+                var j = i + 1;
+                while (j < inits.items.len) : (j += 1) {
+                    if (inits.items[i].offset == inits.items[j].offset) return error.Unsupported;
+                }
+            }
+            const out = try b.a.create(hir.Expr);
+            out.* = .{ .record_alloc = .{ .size = si.size, .alignment = si.alignment, .inits = try inits.toOwnedSlice(b.a) } };
+            return .{ .e = out, .si = si };
+        },
+        .path => |p| {
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            const si = scope.recs.get(txt) orelse return null;
+            const loc = scope.find(txt) orelse return null;
+            const out = try b.a.create(hir.Expr);
+            out.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+            return .{ .e = out, .si = si };
+        },
+        .call => |cc| {
+            const si = (try recCallStruct(b, expr)) orelse return null;
+            const callee_path = switch (cc.callee() orelse return error.Unsupported) {
+                .path => |p| p,
+                else => return error.Unsupported,
+            };
+            const cname = try callee_path.text(b.a);
+            defer b.a.free(cname);
+            const id = try registerFunc(b, cname);
+            const args = try buildCallArgs(b, id, cc, scope);
+            const out = try b.a.create(hir.Expr);
+            out.* = .{ .call = .{ .func = id, .args = args } };
+            return .{ .e = out, .si = si };
+        },
+        else => return null,
+    }
+}
+
+/// Build + check a call's arguments against the callee's parameter kinds
+/// (int / bool / record). Shared by the i64 path and the record path. A
+/// record argument must be a record value of the parameter's exact struct.
+fn buildCallArgs(b: *Builder, id: hir.FuncId, cc: ast.CallExpr, scope: *Scope) BuildError![]const *hir.Expr {
+    // Snapshot the parameter kinds before building the args — building an
+    // argument may register a new callee and grow `b.funcs`, so we can't
+    // hold a slice into it across the loop.
+    const ParamKind = union(enum) { int, bool_, rec: *const StructInfo };
+    const np = b.funcs.items[id].params.len;
+    const kinds = try b.a.alloc(ParamKind, np);
+    const frec = b.fn_recs.get(id);
+    for (b.funcs.items[id].params, 0..) |p, k| {
+        kinds[k] = switch (p.ty) {
+            .bool => .bool_,
+            .i64 => .int,
+            // A `.ptr` param is a record on this path (str callees never get here).
+            .ptr => .{ .rec = (frec orelse return error.Unsupported).params[k] orelse return error.Unsupported },
+            else => return error.Unsupported,
+        };
+    }
+
+    var args: std.ArrayList(*hir.Expr) = .empty;
+    var ait = cc.args();
+    var ai: usize = 0;
+    while (ait.next()) |a| : (ai += 1) {
+        if (ai >= np) return reject(b, .unsupported_call);
+        switch (kinds[ai]) {
+            .rec => |want| {
+                const rv = (try buildRecExpr(b, a, scope)) orelse return reject(b, .unsupported_call);
+                if (rv.si != want) return reject(b, .unsupported_call); // a different struct
+                try args.append(b.a, rv.e);
+            },
+            // A bool is not an int: each arg's kind must match its parameter.
+            .int => {
+                if (try exprIsBool(b, a, scope)) return reject(b, .unsupported_call);
+                try args.append(b.a, try buildIntExpr(b, a, scope));
+            },
+            .bool_ => {
+                if (!(try exprIsBool(b, a, scope))) return reject(b, .unsupported_call);
+                try args.append(b.a, try buildIntExpr(b, a, scope));
+            },
+        }
+    }
+    if (ai != np) return reject(b, .unsupported_call);
+    return args.toOwnedSlice(b.a);
+}
+
 /// Does `arg` denote a boolean value? Used to route `env.out` to the bool
 /// path, type `let` bindings, and check call-argument kinds. A3 slice 2:
 /// the decision delegates to sema's expression typer
@@ -1102,7 +1492,15 @@ const ExprTypeBridge = struct {
 
     fn localType(ctx: *anyopaque, name: []const u8) ?sema.exprtype.ScalarType {
         const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
-        const loc = self.scope.find(name) orelse return null;
+        const loc = self.scope.find(name) orelse {
+            // `p.x` on a materialized record: the field's declared type.
+            const rf = (findRecField(self.scope, name) catch return null) orelse return null;
+            return switch (rf.ty) {
+                .bool => .bool,
+                .i64 => .i64,
+                else => .unknown,
+            };
+        };
         return switch (loc.ty) {
             .bool => .bool,
             .i64 => .i64,
@@ -1135,6 +1533,11 @@ const Scope = struct {
     locals: std.ArrayList(Local) = .empty,
     next_idx: u32 = 0,
     n_params: u32 = 0,
+    /// Materialized record bindings/params: name → the struct it holds. The
+    /// binding's `.ptr` local lives in `locals` under the same name; field
+    /// access resolves through `findRecField`. (SROA'd record bindings are
+    /// NOT here — their fields are plain dotted-name locals.)
+    recs: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
 
     fn find(self: *const Scope, name: []const u8) ?Local {
         var i = self.locals.items.len;
@@ -1286,9 +1689,13 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             }
             if (scope.find(txt)) |loc| {
                 // i64 and bool (i32 0/1) locals are readable here; a `str`
-                // local belongs in the str path, not an i64/bool expression.
+                // local belongs in the str path — and a bare record binding
+                // (`.ptr`) is a whole-value use, not an i64/bool expression.
                 if (loc.ty != .i64 and loc.ty != .bool) return error.Unsupported;
                 out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+            } else if (try findRecField(scope, txt)) |rf| {
+                // `p.x` on a materialized record: a load at (base ptr, offset).
+                return recFieldExpr(b, rf);
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
             } else if (b.eval.evalInt(expr)) |v| {
@@ -1363,28 +1770,12 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             }
             const id = try registerFunc(b, cname);
             // An i64 or bool (i32 0/1) callee produces a value usable here; a
-            // str callee does not belong in an i64/bool expression.
+            // str or record callee does not belong in an i64/bool expression.
             switch (b.funcs.items[id].ret) {
                 .i64, .bool => {},
                 else => return reject(b, .unsupported_call),
             }
-            // Snapshot which parameters are bool before building the args — a
-            // bool is not an int, so each arg's kind must match its parameter.
-            // (Building an arg may register a new callee and grow `b.funcs`,
-            // so we can't hold a slice into it across the loop.)
-            const np = b.funcs.items[id].params.len;
-            const param_is_bool = try b.a.alloc(bool, np);
-            for (b.funcs.items[id].params, 0..) |p, k| param_is_bool[k] = (p.ty == .bool);
-
-            var args: std.ArrayList(*hir.Expr) = .empty;
-            var ait = cc.args();
-            var ai: usize = 0;
-            while (ait.next()) |a| : (ai += 1) {
-                if (ai < np and param_is_bool[ai] != (try exprIsBool(b, a, scope))) return reject(b, .unsupported_call);
-                try args.append(b.a, try buildIntExpr(b, a, scope));
-            }
-            if (args.items.len != np) return reject(b, .unsupported_call);
-            out.* = .{ .call = .{ .func = id, .args = try args.toOwnedSlice(b.a) } };
+            out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc, scope) } };
         },
         .field => |fe| {
             // `s.len` — the byte length of a str value, as i64. (The only field
@@ -2075,4 +2466,164 @@ test "surface: a main-less library of pub fns builds (not NoMainFunction)" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "pub fn version -> str") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "pub fn add -> i64") != null);
+}
+
+test "B2b: an escaping record binding materializes (record_alloc + field_get)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Point { x: i64, y: i64 }
+        \\
+        \\fn dot(a: Point, b: Point) -> i64 { a.x * b.x + a.y * b.y }
+        \\
+        \\fn main {
+        \\    let p = Point { x: 3, y: 4 }
+        \\    env.out(dot(p, p))
+        \\    env.out(p.x)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Two 8-byte fields → 16 bytes at align 8 (spec/memory.md layout rules);
+    // the binding holds the base pointer, reads go through field_get.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get(") != null);
+    // The callee body reads its record params through field_get too.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn dot -> i64") != null);
+}
+
+test "B2b: a non-escaping record binding still SROAs (no record_alloc)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Point { x: i64, y: i64 }
+        \\
+        \\fn main {
+        \\    let p = Point { x: 40 + 2, y: 8 }
+        \\    env.out(p.x)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") == null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null);
+}
+
+test "B2b: a record-returning call binds the base pointer (`fn make -> ptr`)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Point { x: i64, y: i64 }
+        \\
+        \\fn make(x: i64, y: i64) -> Point { Point { x: x, y: y } }
+        \\
+        \\fn main {
+        \\    let p = make(3, 4)
+        \\    env.out(p.x)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn make -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get(") != null);
+}
+
+test "B2b: field assignment through the base pointer is a field_set" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Point { x: i64, y: i64 }
+        \\
+        \\fn dot(a: Point, b: Point) -> i64 { a.x * b.x + a.y * b.y }
+        \\
+        \\fn main {
+        \\    var c = Point { x: 2, y: 4 }
+        \\    c.x = c.x + 1
+        \\    env.out(dot(c, c))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_set") != null);
+}
+
+test "B2b: bool fields pack at 1 byte; the next i64 pads to offset 8" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Flag { hot: bool, n: i64 }
+        \\
+        \\fn pick(f: Flag) -> i64 { if f.hot { f.n } else { 0 - f.n } }
+        \\
+        \\fn main {
+        \\    let f = Flag { hot: true, n: 7 }
+        \\    env.out(pick(f))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // bool at +0 (1 byte), i64 aligned up to +8, size rounded to 16.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "+8:") != null);
+}
+
+test "B2b: passing a different struct where Point is expected is UnsupportedCall" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct P { x: i64 }
+        \\struct Q { x: i64 }
+        \\
+        \\fn f(p: P) -> i64 { p.x }
+        \\
+        \\fn main {
+        \\    let q = Q { x: 1 }
+        \\    env.out(f(q))
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
+test "B2b: assigning a field of a `let` record is ImmutableAssign" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct P { x: i64 }
+        \\
+        \\fn f(p: P) -> i64 { p.x }
+        \\
+        \\fn main {
+        \\    let p = P { x: 1 }
+        \\    p.x = 2
+        \\    env.out(f(p))
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.immutable_assign, r.?);
 }

@@ -562,9 +562,14 @@ const Parser = struct {
         while (!self.isEof()) {
             try self.eatTrivia(&children);
             if (self.peek() == .R_BRACE) break;
+            const before = self.pos;
             try children.append(self.arena, .{ .node = try self.parseField() });
             try self.eatTrivia(&children);
             if (self.peek() == .COMMA) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            } else if (self.pos == before) {
+                // parseField consumed nothing (e.g. a keyword-shaped field
+                // name like `on`): eat one token so the loop must progress.
                 try children.append(self.arena, .{ .token = self.advance() });
             }
         }
@@ -2922,4 +2927,12 @@ test "mixed items round-trip losslessly and all surface" {
     try testing.expectEqualStrings("Point", s.struct_decl.name().?.text);
     const fd = (iter.next() orelse return error.TestExpectedItem).fn_decl;
     try testing.expectEqualStrings("main", fd.name().?.text);
+}
+
+test "record body: a keyword-shaped field name cannot hang the parser" {
+    // `on` lexes as KW_ON, so parseField consumes nothing — the body loop
+    // must still make progress (the field degrades, the parse terminates).
+    const r = try parse(std.testing.allocator, "struct Flag { on: bool, n: i64 }\n", "<t>");
+    defer r.deinit(std.testing.allocator);
+    try std.testing.expect(ast.SourceFile.cast(r.root) != null);
 }

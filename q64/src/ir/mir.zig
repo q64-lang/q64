@@ -24,6 +24,12 @@ pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
 
+/// One field initializer of a `record_make`: store `value` at `base + offset`.
+/// The store width follows the value's type: an `.i64` field is an 8-byte
+/// store, an `.i32` (bool) field a 1-byte store (spec/memory.md §"Linear
+/// struct layout").
+pub const FieldInit = struct { offset: u32, value: *Inst };
+
 /// Wasm-level value types. A `str` is the `(ptr, len)` pair — the backend
 /// realizes it as a two-i64 multivalue (tuple); a str function returns it and
 /// a str parameter is two i64 wasm params.
@@ -190,6 +196,16 @@ pub const Op = union(enum) {
     str_starts_with: struct { str: *Inst, prefix: *Inst },
     /// `s.contains(sub)` -> i32. Both str-typed. __str_contains.
     str_contains: struct { str: *Inst, sub: *Inst },
+    /// Materialize a record in the scope arena: align the bump pointer up to
+    /// `alignment`, allocate `size` bytes, store each field at its offset
+    /// (width per the value's type — 8 bytes for `.i64`, 1 byte for `.i32`
+    /// bools), and yield the base pointer (a `.ptr`).
+    record_make: struct { size: u32, alignment: u32, inits: []const FieldInit },
+    /// Load a record field at `base + offset`. The result type is `inst.ty`:
+    /// `.i64` → an 8-byte load, `.i32` (bool) → a 1-byte zero-extending load.
+    field_get: struct { base: *Inst, offset: u32 },
+    /// Store a record field at `base + offset` (width per the value's type). Void.
+    field_set: struct { base: *Inst, offset: u32, value: *Inst },
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the
