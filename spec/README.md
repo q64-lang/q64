@@ -31,6 +31,7 @@ suite.
 | [`memory.md`](./memory.md)                               | Regions, dual heap, transfers, multi-memory layout, shared / managed annotations |
 | [`concurrency.md`](./concurrency.md)                     | Scopes, tasks, channels, select, actors, cancellation, panics, host translation |
 | [`streams.md`](./streams.md)                             | Signal / Event / Stream, @stage, graph, |>, pre(), fusion, SharedSignal          |
+| [`concurrency-model.md`](./concurrency-model.md)         | The consolidated concurrency/reactivity model: layer map, one-scheduler invariant, tasks-vs-actors-vs-graphs-vs-reactive decision table, the `Signal`/`State` naming rule, layer bridges |
 | [`env.md`](./env.md)                                     | Capability model, Env structure, main signature, with_capabilities, disclosure   |
 | [`grammar.md`](./grammar.md)                             | Lexical structure and the consolidated syntactic grammar                          |
 | [`rpc.md`](./rpc.md)                                     | Qube-to-qube RPC over the synthesized WIT world: wRPC + component-value wire, the `@wire` effect, transports, addressing |
@@ -117,6 +118,9 @@ covering both.
 | **scope arena** | The implicit `Arena`-kind region bound to a `scope { … }` block, named `scope`. Where panic payloads and defaultable allocations land. See [`memory.md` §"Scope's implicit arena"](./memory.md). |
 | **effect**    | A compile-time marker on a function (or stage, or face method) declaring what it touches or refuses. See [`effects.md`](./effects.md). |
 | **stage**     | An `@stage`-annotated function — a node in a stream graph. See [`streams.md`](./streams.md).      |
+| **twin**      | An actor whose task runs remotely (Durable-Object-backed), addressed by a `@state` scope. The distributed form of `actor` — same shape, different placement. See [`concurrency-model.md`](./concurrency-model.md) and [`reactivity.md`](./reactivity.md). |
+| **`Signal<T, R>`** | The rate-typed *continuous dataflow* type from [`streams.md`](./streams.md). The name `Signal` is reserved for this family (incl. `SharedSignal<T, R>`). Never the reactive UI cell — that is `State<T>`. See [`concurrency-model.md` §D3](./concurrency-model.md). |
+| **`State<T>`** | The fine-grained *reactive cell* backing dynamic `state` declarations (`q64.reactive`, Stage 3). Rateless, write-driven; not a dataflow type and never called a signal. See [`concurrency-model.md` §D3](./concurrency-model.md). |
 | **diagnostic** | Any structured tool output — error, warning, note. The envelope is defined in [`diagnostics.md`](./diagnostics.md). |
 | **trap**      | The bare Wasm "this module is no longer runnable" instruction. Distinct from `panic`. Used consistently across `errors.md`, `effects.md`, and `concurrency.md` — the word "halt" does not name a distinct concept in q64. |
 | **module**    | A q64 **source** namespace — the unit of `import` / visibility / re-export inside a qube. See [`modules.md`](./modules.md). Never the Wasm artifact; that is a **core module**. |

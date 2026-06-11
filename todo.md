@@ -845,6 +845,16 @@ visible at a glance whether it's been picked up.
       struct-literal-vs-block ambiguity (Rust-style); today they degrade to
       lossless one-token recovery. Needs the disambiguation rule (likely:
       no bare record literal in `if`/`while`/`match` scrutinee position).
+- [x] `spec/concurrency-model.md` — the concurrency/reactivity consolidation
+      chapter (the big remaining feature-review item): the global
+      one-scheduler invariant + lowering table, the tasks vs actors vs
+      graphs vs reactive-state decision table (QView owned by the reactive
+      layer; twin = actor made normative), the `Signal` naming rule —
+      `Signal` reserved for the rate-typed dataflow family, Stage-3 reactive
+      primitives renamed `State<T>`/`Memo<T>`/`Watch`, `EventStream<T>`
+      retired — and the closed bridge set between layers. Cross-edits:
+      `reactivity.md`, `streams.md`, `concurrency.md`, `qview-protocol.md`,
+      `spec/README.md` (+vocabulary), `stdlib/{reactive,event}/README.md`.
 - [x] `spec/annotations.md` — categorize `@`-forms (markers / derive /
       property wrappers). Smallest scope, highest cross-reference value.
 - [x] `spec/units.md` — drain the unit-suffix table out of `types.md`

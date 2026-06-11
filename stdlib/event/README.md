@@ -7,11 +7,16 @@ lifted into typed q64 streams; usable by any consumer, not just UIs.
 
 ## Surface (planned)
 
-- **Event types** — `Tap`, `Press`, `Drag`, `Pan`, `Pinch`, `KeyPress`,
-  `TextChange`, `Scroll`, `FocusChange`, `Lifecycle`.
-- **`EventStream<T>`** — a typed stream of events; composes with the
-  existing stream operators (`map`, `filter`, `merge`, `throttle`, …).
-- **`Gesture<T>`** — a state machine over an `EventStream` that emits a
+- **Event payload types** — `Tap`, `Press`, `Drag`, `Pan`, `Pinch`,
+  `KeyPress`, `TextChange`, `Scroll`, `FocusChange`, `Lifecycle` — carried
+  by the language's `Event<T>` dataflow type
+  ([`spec/streams.md`](../../spec/streams.md)). There is no separate
+  `EventStream<T>` wrapper: `Event<Tap>` *is* the stream, and composes
+  with the `q64.streams` operators (`map`, `filter`, `merge`, `throttle`,
+  …). (Retired per
+  [`spec/concurrency-model.md` §D3](../../spec/concurrency-model.md) —
+  no stdlib type may shadow the dataflow types under a new name.)
+- **`Gesture<T>`** — a state machine `Event<In> → Event<Out>` that emits a
   higher-level event (`Drag` → `Swipe`, `Press` + movement → `LongPress`,
   pairs of `Press` → `DoubleTap`).
 - **Hit-testing protocol** — how a renderer reports which view received an

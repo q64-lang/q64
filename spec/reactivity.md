@@ -5,7 +5,10 @@
 > [`stdlib/reactive`](../stdlib/reactive), [`stdlib/view`](../stdlib/view)
 > (`Renderer` face), [`env.md`](./env.md) (`@ui`/`@kv` effects), and the
 > `state` / `@state` distinction. Not yet normative; the recommendation + staged
-> path at the end is what we intend to build.
+> path at the end is what we intend to build. How this layer relates to tasks,
+> actors, and stream graphs — and the naming rule that renamed the Stage-3
+> primitives to `State` / `Memo` / `Watch` — is normative in
+> [`concurrency-model.md`](./concurrency-model.md).
 
 ## The question
 
@@ -91,10 +94,10 @@ emitting to wasm — exactly the Svelte/Solid-compiler sweet spot. It can do at
 
 **Decided — the surface distinction is the `@` effect sigil:**
 
-- **`state x: T = v`** → **local**: an in-memory reactive signal, lives in the instance
+- **`state x: T = v`** → **local**: an in-memory reactive cell, lives in the instance
   (wasm), **pure** (no effect). Lost on reload. Lowers to a wasm global/cell + a
-  `q64.reactive` signal.
-- **`@state x: T = v`** → **remote/persisted**: the *same* reactive signal, but its
+  `q64.reactive` `State<T>` when its dependencies are dynamic (Stage 3 below).
+- **`@state x: T = v`** → **remote/persisted**: the *same* reactive cell, but its
   read/write go through an `env` capability, so they carry an **effect** (`@kv`/`@db`).
   The `@` is q64's existing effect marker — `@state` is self-documenting ("this state
   crosses a boundary"). It **desugars** to `state x = env.kv("x", v)`, so the `@kv`
@@ -241,8 +244,11 @@ generating the bindings** where it can. Get there in stages, each shippable:
   derives `state → binding` dependencies from `draw` and emits a mutation per state
   field, dropping the re-run-`draw` step for static bindings. Needs: the dependency
   analysis pass + a stable node-id model in codegen + the retained `Renderer` face.
-- **Stage 3 — fine-grained signals (Solid-style; later).** Runtime `Signal/Memo/Watch`
-  (`stdlib/reactive`) for dynamic dependencies. Gated on the bigger language lift:
+- **Stage 3 — fine-grained reactivity (Solid-style; later).** Runtime `State/Memo/Watch`
+  (`stdlib/reactive`; the writable cell was renamed from `Signal<T>` to `State<T>` —
+  `Signal` is reserved for the rate-typed dataflow type, per
+  [`concurrency-model.md` §D3](./concurrency-model.md)) for dynamic dependencies.
+  Gated on the bigger language lift:
   **closures/effects + heap aggregates (records/arrays/ADTs) + an allocator** exposed to
   user code, plus a scheduler.
 

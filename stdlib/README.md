@@ -20,8 +20,8 @@ The q64 standard library. A qube workspace; one qube per top-level namespace.
 | [`fs/`](./fs)             → `q64.fs`              | Filesystem access via the `env.fs` capability                                      |
 | [`layout/`](./layout)     → `q64.layout`          | `Rect`, `Constraint`, `IntrinsicSize`, `LayoutTree<N>`, `Solver`, `Diagnostics`    |
 | [`view/`](./view)         → `q64.view`            | `View`, `Container`, `Text`, `Image`, `Stack`, `Grid`, `Input`, `Button`, `Style`, `Renderer` |
-| [`event/`](./event)       → `q64.event`           | `Tap`, `Drag`, `Pinch`, `KeyPress`, `EventStream<T>`, `Gesture<T>`                 |
-| [`reactive/`](./reactive) → `q64.reactive`        | `Signal<T>`, `Memo<T>`, `Watch`                                                    |
+| [`event/`](./event)       → `q64.event`           | `Tap`, `Drag`, `Pinch`, `KeyPress`, `Event<T>` payloads, `Gesture<T>`              |
+| [`reactive/`](./reactive) → `q64.reactive`        | `State<T>`, `Memo<T>`, `Watch`                                                    |
 
 ## Language
 
