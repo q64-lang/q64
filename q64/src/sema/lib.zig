@@ -3,12 +3,16 @@
 //! re-exports the A0 scaffold (the file-level symbol table).
 
 pub const symbols = @import("symbols.zig");
+pub const resolve = @import("resolve.zig");
 
 pub const SymbolTable = symbols.SymbolTable;
 pub const Symbol = symbols.Symbol;
 pub const SymbolKind = symbols.SymbolKind;
 pub const build = symbols.build;
 pub const showSymbols = symbols.showSymbols;
+pub const fileDiagnostics = symbols.fileDiagnostics;
+pub const resolveBodies = resolve.resolveBodies;
+pub const Resolution = resolve.Resolution;
 
 test {
     @import("std").testing.refAllDecls(@This());

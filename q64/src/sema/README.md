@@ -30,27 +30,43 @@ parse (CST/AST)
   retained (the A1 resolver will re-walk with the parse result alive,
   the way `Resolver.lookup` does today).
 
-## What exists now (A0 scaffold)
+## What exists now (A0 scaffold + the A1 slice)
 
 - `symbols.zig` — the file-level `SymbolTable`: one symbol per top-level
-  item + per selective-import binding, first-binding-wins `lookup`,
-  collisions recorded (not yet emitted — NAM005 wiring is A1).
+  item + per import binding (selective names, `as` aliases, namespace
+  imports binding the last path segment), first-binding-wins `lookup`,
+  collisions recorded with offsets.
   `fit` declarations are listed but **not** name bindings: a `fit` is
   registered per *(type, face)* pair, so binding its leading type name
   would false-collide with the type's own declaration. The A1 fit
   registry replaces the placeholder entries.
-- `q64 show symbols <file.q>` — dumps the table
-  (spec/q64-cli.md §"`q64 show` kinds"). Compiler-introspection;
-  unstable format, like `show hir`.
+- `fileDiagnostics` — **NAM005** for a collision involving at least one
+  import binding (spec/modules.md), located at the second binding.
+  Wired into `q64 check` (parse + this pass); covered by the
+  `modules/import-collision.q` conformance fixture.
+  Declaration-vs-declaration duplicates have no specced code yet and
+  stay recorded-only.
+- `resolve.zig` — body-level resolution: a lexical scope stack (params,
+  `let`/`var` after their initializers, block nesting, `for`/`match`/
+  `if let` pattern bindings) classifying every path-expression head.
+  Unresolved heads are **recorded, not emitted** — `build_hir` still
+  owns rejection (`NameNotFound`) until A3 makes sema the single source
+  of truth; emitting NAM010 here would double-diagnose.
+  v0 boundaries: interpolation references (`"{name}"`) live in raw
+  string tokens (invisible until interpolation is parsed); `screen`
+  bodies skipped until the screen lowering lands.
+- `q64 show symbols <file.q>` — dumps the table, collisions, and
+  unresolved heads (spec/q64-cli.md §"`q64 show` kinds").
+  Compiler-introspection; unstable format, like `show hir`.
 
 ## Not here yet (by rung)
 
-- **A1** — scopes below file level (params, locals), resolution of
-  import bindings against `--module` sources, alias-import bindings
-  (needs the `as` accessor on `ast.ImportStmt`), NAM005 emission,
-  `PAR040` re-land on name kinds, the fit registry.
+- **A1 (remaining)** — resolution of import bindings against `--module`
+  sources (NAM001/NAM006 at the sema layer), `PAR040` re-land on name
+  kinds, the fit registry.
 - **A2** — interned types beyond the scalar floor (named struct/enum
   types, tuples, optionals, `fn` types).
 - **A3** — `build_hir` consumes sema; ad-hoc inference
-  (`returnsBool`-style) deleted; diagnostics byte-stable.
+  (`returnsBool`-style) deleted; unresolved-head recording becomes the
+  emitted diagnostic; diagnostics byte-stable.
 - **A4** — first real TYP codes; conformance fixtures flip to passing.

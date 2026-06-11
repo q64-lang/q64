@@ -141,8 +141,22 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
     const result = try parse.parse(gpa, source, path);
     defer result.deinit(gpa);
 
+    // Parse diagnostics + the sema file-level pass (today: NAM005 name
+    // collisions in the import scope — spec/modules.md). Sema only runs
+    // when the file parsed into a source-file root.
+    var all_diags: std.ArrayList(diag.Diagnostic) = .empty;
+    defer all_diags.deinit(gpa);
+    try all_diags.appendSlice(gpa, result.diagnostics);
+    if (parser.ast.SourceFile.cast(result.root)) |sf| {
+        var table = try sema.build(gpa, sf);
+        defer table.deinit();
+        const sema_diags = try sema.fileDiagnostics(gpa, &table, path);
+        defer gpa.free(sema_diags);
+        try all_diags.appendSlice(gpa, sema_diags);
+    }
+
     var has_error = false;
-    for (result.diagnostics) |d| if (d.severity == .err) {
+    for (all_diags.items) |d| if (d.severity == .err) {
         has_error = true;
         break;
     };
@@ -151,11 +165,11 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
     var w = std.Io.File.stderr().writerStreaming(io, &buf);
 
     if (json) {
-        try diag.emitJson(&w.interface, source, result.diagnostics, gpa);
+        try diag.emitJson(&w.interface, source, all_diags.items, gpa);
     } else {
         // Human-readable form. Mirrors the human format described
         // in spec/diagnostics.md §"Rendering".
-        for (result.diagnostics) |d| {
+        for (all_diags.items) |d| {
             const idx = try diag.LineIndex.build(gpa, source);
             defer idx.deinit();
             const loc = idx.locate(d.offset);

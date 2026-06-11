@@ -44,6 +44,8 @@ pub const Symbol = struct {
     name: []const u8,
     kind: SymbolKind,
     public: bool,
+    /// Byte offset of the binding's name token (diagnostic location).
+    offset: u32 = 0,
     /// For an `import_binding`: the module path it came from (owned).
     origin: ?[]const u8 = null,
 };
@@ -120,18 +122,28 @@ pub fn build(gpa: std.mem.Allocator, sf: ast.SourceFile) !SymbolTable {
                 .name = try gpa.dupe(u8, tok.text),
                 .kind = .import_binding,
                 .public = false,
+                .offset = tok.offset,
                 .origin = if (mod_path) |p| try gpa.dupe(u8, p) else null,
             });
         }
-        // Namespace import: binds the last path segment. (Alias imports
-        // need the `as` accessor on ast.ImportStmt — rung A1.)
         if (!selective) {
-            if (mod_path) |p| {
+            if (im.alias()) |tok| {
+                // Alias import: binds exactly the alias name.
+                try t.bind(.{
+                    .name = try gpa.dupe(u8, tok.text),
+                    .kind = .import_binding,
+                    .public = false,
+                    .offset = tok.offset,
+                    .origin = if (mod_path) |p| try gpa.dupe(u8, p) else null,
+                });
+            } else if (mod_path) |p| {
+                // Namespace import: binds the last path segment.
                 const last = if (std.mem.lastIndexOfScalar(u8, p, '.')) |i| p[i + 1 ..] else p;
                 if (last.len > 0) try t.bind(.{
                     .name = try gpa.dupe(u8, last),
                     .kind = .import_binding,
                     .public = false,
+                    .offset = firstTokenOffset(im.cst),
                     .origin = try gpa.dupe(u8, p),
                 });
             }
@@ -164,11 +176,54 @@ pub fn build(gpa: std.mem.Allocator, sf: ast.SourceFile) !SymbolTable {
 
 fn bindNamed(t: *SymbolTable, tok: ?@import("parser").cst.Token, kind: SymbolKind, public: bool) !void {
     const tk = tok orelse return; // nameless item: a parse error already diagnosed it
-    try t.bind(.{ .name = try t.gpa.dupe(u8, tk.text), .kind = kind, .public = public });
+    try t.bind(.{
+        .name = try t.gpa.dupe(u8, tk.text),
+        .kind = kind,
+        .public = public,
+        .offset = tk.offset,
+    });
 }
 
-/// `q64 show symbols` — parse `source` and render the table. Unstable
-/// human/test-facing format, like `show hir`. Caller owns the slice.
+/// Offset of the first token under `node` — the fallback diagnostic
+/// location for bindings without a dedicated name token (namespace imports).
+fn firstTokenOffset(node: *const parser.cst.Node) u32 {
+    for (node.children) |c| switch (c) {
+        .token => |t| return t.offset,
+        .node => |n| return firstTokenOffset(n),
+    };
+    return 0;
+}
+
+/// File-level sema diagnostics — today exactly the NAM005 cases: a name
+/// bound twice where at least one binding is an import (spec/modules.md;
+/// declaration-vs-declaration duplicates have no specced code yet and stay
+/// recorded-only). The diagnostic sits at the SECOND binding. Caller frees
+/// the returned slice; messages are static (diag catalog).
+pub fn fileDiagnostics(
+    gpa: std.mem.Allocator,
+    t: *const SymbolTable,
+    file: []const u8,
+) ![]parser.diag.Diagnostic {
+    var out: std.ArrayList(parser.diag.Diagnostic) = .empty;
+    errdefer out.deinit(gpa);
+    for (t.collisions.items) |c| {
+        const a = t.syms.items[c.first];
+        const b = t.syms.items[c.second];
+        if (a.kind != .import_binding and b.kind != .import_binding) continue;
+        try out.append(gpa, .{
+            .code = "NAM005",
+            .severity = .err,
+            .message = parser.diag.messageFor("NAM005"),
+            .file = file,
+            .offset = b.offset,
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// `q64 show symbols` — parse `source` and render the table plus the
+/// body-resolution result (unresolved heads). Unstable human/test-facing
+/// format, like `show hir`. Caller owns the slice.
 pub fn showSymbols(gpa: std.mem.Allocator, source: []const u8, file: []const u8) ![]u8 {
     const pr = try parse.parse(gpa, source, file);
     defer pr.deinit(gpa);
@@ -176,10 +231,19 @@ pub fn showSymbols(gpa: std.mem.Allocator, source: []const u8, file: []const u8)
 
     var t = try build(gpa, sf);
     defer t.deinit();
-    return render(gpa, &t, file);
+
+    var res = try @import("resolve.zig").resolveBodies(gpa, sf, &t);
+    defer res.deinit();
+
+    return render(gpa, &t, &res, file);
 }
 
-fn render(gpa: std.mem.Allocator, t: *const SymbolTable, file: []const u8) ![]u8 {
+fn render(
+    gpa: std.mem.Allocator,
+    t: *const SymbolTable,
+    res: *const @import("resolve.zig").Resolution,
+    file: []const u8,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
@@ -200,6 +264,12 @@ fn render(gpa: std.mem.Allocator, t: *const SymbolTable, file: []const u8) ![]u8
             const a = t.syms.items[c.first];
             const b = t.syms.items[c.second];
             try app(gpa, &out, "  {s}: {s} then {s}\n", .{ c.name, a.kind.label(), b.kind.label() });
+        }
+    }
+    if (res.unresolved.items.len > 0) {
+        try out.appendSlice(gpa, "unresolved\n");
+        for (res.unresolved.items) |r| {
+            try app(gpa, &out, "  {s} in fn {s}\n", .{ r.name, r.in_fn });
         }
     }
     return out.toOwnedSlice(gpa);

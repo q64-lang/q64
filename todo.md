@@ -622,11 +622,29 @@ verified, honest diagnostics throughout.
       (specced in q64-cli.md; covered by sema unit tests + a show.test.ts
       CLI test). Emit path untouched. Verified: 278 unit + 76 CLI tests +
       link-roundtrip green.
-- [ ] **A1 — symbol table + scopes.** File-level items, params, locals, import
-      bindings. Every path expression resolves to a symbol or emits the honest
-      NAM/NameNotFound diagnostic at the *sema* layer. Unblocks `PAR040`
-      (generic-call vs chained-comparison needs name kinds — the reverted
-      parser heuristic, see "Other open items").
+- [ ] **A1 — symbol table + scopes.** In progress; the core slice landed:
+      - [x] Import bindings complete: selective names, `as` aliases (new
+            `ast.ImportStmt.alias()` accessor), namespace imports binding the
+            last path segment — all with offsets for diagnostics.
+      - [x] **NAM005 emitted** for import-involving collisions, wired into
+            `q64 check` (parse + sema file-level pass). Conformance:
+            `modules/import-collision.q` passes (11/45, from 10/44);
+            check.test.ts covers the envelope. Decl-vs-decl duplicates have
+            no specced code and stay recorded-only.
+      - [x] Body-level resolution (`sema/resolve.zig`): lexical scope stack
+            (params, let/var-after-initializer, block nesting, for/match/
+            if-let pattern bindings via recursive IDENT_PATTERN collection),
+            ambient hosts (`env`/`qview`/`ctx`) recognized, unresolved path
+            heads *recorded* and surfaced by `q64 show symbols` — emission
+            stays with build_hir until A3 (no double-diagnosis).
+            v0 boundaries: interpolation refs (raw string tokens) and
+            `screen` bodies are invisible to the walk.
+      - [ ] Import-target resolution against `--module` sources (NAM001 /
+            NAM006 at the sema layer).
+      - [ ] `PAR040` re-land on name kinds (generic-call vs
+            chained-comparison — the reverted parser heuristic, see "Other
+            open items").
+      - [ ] Fit registry (with B3's structured face/fit method grammar).
 - [ ] **A2 — type representation.** Interned types beyond the scalar floor:
       named struct/enum types, tuples, optionals, `fn` types
       (`spec/types.md`). No generics yet.
