@@ -242,6 +242,35 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
                 try out.append(b.a, st);
+            } else if (init_expr == .record) {
+                // B2 (SROA): a record-literal binding lowers to one scalar
+                // local per field, *named with the dotted access path*
+                // ("p.x"). `p.x` parses as a single greedy PATH_EXPR, so
+                // the existing path machinery — reads, `var` assignment,
+                // `{p.x}` interpolation — resolves field access with no
+                // aggregate representation at all. The struct never
+                // exists in memory. v0 scope (documented in todo.md):
+                // main-only, i64/bool field values, no shorthand inits,
+                // no whole-struct copies/passing/nesting — those need
+                // the layout story (B2 full).
+                const rec = init_expr.record;
+                var inits = rec.inits();
+                var any = false;
+                while (inits.next()) |fi| {
+                    any = true;
+                    const fname = fi.name() orelse return error.Unsupported;
+                    const fval = fi.value() orelse return error.Unsupported; // shorthand: later
+                    const full = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ nm.text, fname.text });
+                    const lty: hir.Type = if (try exprIsBool(b, fval, scope)) .bool else .i64;
+                    scope.next_idx = @intCast(b.main_locals.items.len);
+                    const value = try buildIntExpr(b, fval, scope);
+                    const idx = try scope.declare(full, ls.isVar(), lty);
+                    try b.main_locals.append(b.a, lty);
+                    const st = try b.a.create(hir.Stmt);
+                    st.* = .{ .let = .{ .idx = idx, .value = value } };
+                    try out.append(b.a, st);
+                }
+                if (!any) return error.Unsupported; // empty literal binds nothing
             } else {
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
                 // bool (`let even = n % 2 == 0`, `var flag = true`). A bool
@@ -1977,6 +2006,31 @@ test "effects: a pure i64 helper carries no capability" {
 fn buildLocal(gpa: std.mem.Allocator, tr: *TestResolver, source: []const u8) !?hir.Module {
     try tr.addLib(source);
     return buildFromSource(gpa, source, tr.resolver());
+}
+
+test "B2: record-literal binding lowers to per-field scalar locals (SROA)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Point { x: i64, y: i64 }
+        \\
+        \\fn main {
+        \\    let p = Point { x: 40 + 2, y: 8 }
+        \\    var q = Point { x: 1, y: p.y }
+        \\    q.x = q.x + p.x
+        \\    env.out(q.x)
+        \\    env.out("p = ({p.x}, {p.y})")
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Four field locals + the q.x reassign; reads resolve as plain locals.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null);
 }
 
 test "surface: an unreached pub fn is built and exported (public)" {

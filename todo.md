@@ -777,9 +777,22 @@ verified, honest diagnostics throughout.
       collectSignatures guard: parens-but-no-PARAMS records *no*
       signature, never a wrong zero-arity one). Corpus unresolved heads
       40 → 25; golden library-face-fit checks fully.
-- [ ] **B2 — struct values in HIR/MIR.** By-value locals/params/returns;
-      scope-arena layout; field access lowering. Scalar fields first
-      (`spec/memory.md` layout rules).
+- [ ] **B2 — struct values in HIR/MIR.** In progress:
+      - [x] **B2a — SROA record bindings in `main`.** A record-literal
+            `let`/`var` lowers to one scalar local per field *named with
+            the dotted path* (`"p.x"`): since `p.x` parses as a single
+            greedy PATH_EXPR, field reads, `var` field assignment
+            (`q.x = q.x + p.x`), and `{p.x}` interpolation all resolve
+            through the existing local machinery — no aggregate exists.
+            i64/bool field values (consts, calls, other fields).
+            Verified end-to-end in link-roundtrip.sh on wasm64 + wasm32.
+            Honestly Unsupported (documented): shorthand inits,
+            whole-struct copies/passing/returns, nesting, callee-body
+            records, str fields.
+      - [ ] **B2b — the layout story.** Scope-arena layout + (ptr, offset)
+            field access for structs that escape SROA: passed/returned/
+            nested/ref'd values (`spec/memory.md` layout rules). This is
+            the prerequisite for B4's `self` receiver.
 - [ ] **B3 — face/fit method grammar.** Structure the raw-span method
       signatures in `FACE_BODY`/`FIT_BODY` (parser-only; today
       `parseFaceOrFit` keeps them as token spans).
