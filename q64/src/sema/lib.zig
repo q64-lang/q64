@@ -4,6 +4,7 @@
 
 pub const symbols = @import("symbols.zig");
 pub const resolve = @import("resolve.zig");
+pub const types = @import("types.zig");
 
 pub const SymbolTable = symbols.SymbolTable;
 pub const Symbol = symbols.Symbol;
@@ -13,6 +14,8 @@ pub const showSymbols = symbols.showSymbols;
 pub const fileDiagnostics = symbols.fileDiagnostics;
 pub const resolveBodies = resolve.resolveBodies;
 pub const Resolution = resolve.Resolution;
+pub const TypeStore = types.TypeStore;
+pub const TypeId = types.TypeId;
 
 test {
     @import("std").testing.refAllDecls(@This());

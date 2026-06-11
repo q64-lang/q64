@@ -221,9 +221,10 @@ pub fn fileDiagnostics(
     return out.toOwnedSlice(gpa);
 }
 
-/// `q64 show symbols` — parse `source` and render the table plus the
-/// body-resolution result (unresolved heads). Unstable human/test-facing
-/// format, like `show hir`. Caller owns the slice.
+/// `q64 show symbols` — parse `source` and render the table, function
+/// signatures (A2 type lowering), and the body-resolution result
+/// (unresolved heads). Unstable human/test-facing format, like
+/// `show hir`. Caller owns the slice.
 pub fn showSymbols(gpa: std.mem.Allocator, source: []const u8, file: []const u8) ![]u8 {
     const pr = try parse.parse(gpa, source, file);
     defer pr.deinit(gpa);
@@ -235,13 +236,21 @@ pub fn showSymbols(gpa: std.mem.Allocator, source: []const u8, file: []const u8)
     var res = try @import("resolve.zig").resolveBodies(gpa, sf, &t);
     defer res.deinit();
 
-    return render(gpa, &t, &res, file);
+    const types_mod = @import("types.zig");
+    var store = try types_mod.TypeStore.init(gpa);
+    defer store.deinit();
+    var sigs = try types_mod.collectSignatures(&store, &t, sf);
+    defer sigs.deinit();
+
+    return render(gpa, &t, &res, &store, &sigs, file);
 }
 
 fn render(
     gpa: std.mem.Allocator,
     t: *const SymbolTable,
     res: *const @import("resolve.zig").Resolution,
+    store: *const @import("types.zig").TypeStore,
+    sigs: *const @import("types.zig").Signatures,
     file: []const u8,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -254,6 +263,17 @@ fn render(
             s.kind.label(),
             s.name,
         });
+        if (s.kind == .function) {
+            if (sigs.find(s.name)) |sig| {
+                try out.appendSlice(gpa, " (");
+                for (sig.params, 0..) |p, i| {
+                    if (i > 0) try out.appendSlice(gpa, ", ");
+                    try store.render(gpa, &out, p);
+                }
+                try out.appendSlice(gpa, ") -> ");
+                try store.render(gpa, &out, sig.ret);
+            }
+        }
         if (s.origin) |o| try app(gpa, &out, " <- {s}", .{o});
         if (s.kind == .fit) try out.appendSlice(gpa, " (impl entry; not a name binding)");
         try out.appendSlice(gpa, "\n");
