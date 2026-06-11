@@ -218,6 +218,15 @@ pub const Op = union(enum) {
     /// Store a record field at `base + offset`, truncating the value to
     /// `width` bytes. Void.
     field_set: struct { base: *Inst, offset: u32, width: u8, value: *Inst },
+    /// Materialize an array in the scope arena: bump `alignment`-aligned,
+    /// `inits.len · stride` bytes; each scalar init stores at its slot
+    /// (`elem_width` bytes), a record init (`copy_bytes` set) memory.copys
+    /// its bytes inline. Yields the base pointer.
+    array_make: struct { stride: u32, alignment: u32, elem_width: u8, copy_bytes: ?u32, inits: []const *Inst },
+    /// `base + index·stride` (`base` is a `.ptr`, `index` an i64). A `.ptr`.
+    elem_ptr: struct { base: *Inst, index: *Inst, stride: u32 },
+    /// Pass `index` through; trap (`unreachable`) unless 0 ≤ index < count.
+    bounds_check: struct { index: *Inst, count: *Inst },
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the

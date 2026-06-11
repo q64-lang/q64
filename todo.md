@@ -909,9 +909,36 @@ verified, honest diagnostics throughout.
             (`rgb({self.r}, …)`) with a pointer at the open item, so
             the golden target no longer depends on a deferred
             sublanguage.
-- [ ] **B5 — later (separate ladders).** Face-bounded generics +
-      monomorphization; `dyn` dispatch; enums + `match` lowering (can start
-      after A2 in parallel with B).
+- [x] **Arrays + `for` (the golden iteration shape).** Array literals
+      materialize in the scope arena (`array_lit`/`array_make`: align,
+      bump count·stride, fill slots — scalar elements store at width,
+      record elements memory.copy inline so the element address IS the
+      record value); a binding holds one `.ptr` local with a
+      compile-time count (`Scope.arrs`). `for x in xs` desugars in the
+      builder to an index loop (hidden `i`, per-iteration element
+      assign — a record element binds `x` as a rec ptr so `x.fmt()`
+      dispatches in the body); `xs[i]` is **bounds-checked and traps**
+      per spec/types.md (one `bounds_check` op: evaluate-once index
+      scratch, unsigned compare catches negatives, `unreachable`);
+      `xs.len` folds to the count. Field/method access on *receiver
+      expressions* landed alongside (`cs[0].r`, `colors[1].fmt()` —
+      incl. str-returning methods via `recvStruct` routing). Verified
+      end-to-end wasm64 + wasm32 (roundtrip arrays section incl. the
+      oob-trap assertion) + 2 unit tests. **Boundary:** main-only
+      (like all aggregate bindings); fixed-count literals (growth is
+      Vec's job); `[T]` slice *params* land with B5 monomorphization
+      (print_all); float/bool fields on receiver-expression access
+      need sema-typed field exprs; narrow-field arithmetic through
+      `cs[0].r + 1` widens silently (same gap) — closes when field
+      exprs are sema-typed.
+- [ ] **B5 — face-bounded generics + monomorphization — THE LAST GATE
+      to the golden program.** `print_all<T: Display>(items: [T])`:
+      monomorphize per concrete T at the call site (stamp
+      `print_all_Color` with `[Color]` slice params — (ptr, count)
+      pairs, the str-param ABI shape), `T.method()` resolving through
+      the fit registry inside the stamped body, and TYP200 ("type does
+      not fit face") when the argument's struct has no fit. Then `dyn`
+      dispatch; enums + `match` lowering (separate ladders).
 
 ## Numeric tower — floats (f64 landed; f32 next)
 

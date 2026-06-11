@@ -255,6 +255,28 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, fg.base);
             try app(gpa, out, "+{d} : {s})", .{ fg.offset, @tagName(fg.ty) });
         },
+        .array_lit => |al| {
+            try app(gpa, out, "array_lit stride={d} align={d} n={d}[", .{ al.stride, al.alignment, al.inits.len });
+            for (al.inits, 0..) |iv, i| {
+                if (i != 0) try app(gpa, out, ", ", .{});
+                try hirExpr(gpa, out, iv);
+            }
+            try app(gpa, out, "]", .{});
+        },
+        .elem_ptr => |ep| {
+            try app(gpa, out, "elem_ptr(", .{});
+            try hirExpr(gpa, out, ep.base);
+            try app(gpa, out, "[", .{});
+            try hirExpr(gpa, out, ep.index);
+            try app(gpa, out, "]*{d})", .{ep.stride});
+        },
+        .bounds_check => |bc| {
+            try app(gpa, out, "bounds(", .{});
+            try hirExpr(gpa, out, bc.index);
+            try app(gpa, out, " < ", .{});
+            try hirExpr(gpa, out, bc.count);
+            try app(gpa, out, ")", .{});
+        },
     }
 }
 
@@ -415,6 +437,20 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "field_set +{d}\n", .{fs.offset});
             try mirInst(gpa, out, fs.base, depth + 1);
             try mirInst(gpa, out, fs.value, depth + 1);
+        },
+        .array_make => |am| {
+            try app(gpa, out, "array_make stride={d} n={d}\n", .{ am.stride, am.inits.len });
+            for (am.inits) |iv| try mirInst(gpa, out, iv, depth + 1);
+        },
+        .elem_ptr => |ep| {
+            try app(gpa, out, "elem_ptr *{d}\n", .{ep.stride});
+            try mirInst(gpa, out, ep.base, depth + 1);
+            try mirInst(gpa, out, ep.index, depth + 1);
+        },
+        .bounds_check => |bc| {
+            try app(gpa, out, "bounds_check\n", .{});
+            try mirInst(gpa, out, bc.index, depth + 1);
+            try mirInst(gpa, out, bc.count, depth + 1);
         },
         .if_ => |iff| {
             try app(gpa, out, "if : {s}\n", .{@tagName(inst.ty)});

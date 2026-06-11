@@ -374,6 +374,19 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             for (ra.inits, 0..) |fi, i| inits[i] = .{ .offset = fi.offset, .width = storageOf(fi.ty).width, .value = try lowerExpr(ctx, fi.value) };
             return mk(ctx.a, .ptr, .{ .record_make = .{ .size = ra.size, .alignment = ra.alignment, .inits = inits } });
         },
+        .array_lit => |al| {
+            const inits = try ctx.a.alloc(*mir.Inst, al.inits.len);
+            for (al.inits, 0..) |e2, i| inits[i] = try lowerExpr(ctx, e2);
+            return mk(ctx.a, .ptr, .{ .array_make = .{
+                .stride = al.stride,
+                .alignment = al.alignment,
+                .elem_width = storageOf(al.elem_ty).width,
+                .copy_bytes = al.copy_bytes,
+                .inits = inits,
+            } });
+        },
+        .elem_ptr => |ep| return mk(ctx.a, .ptr, .{ .elem_ptr = .{ .base = try lowerExpr(ctx, ep.base), .index = try lowerExpr(ctx, ep.index), .stride = ep.stride } }),
+        .bounds_check => |bc| return mk(ctx.a, .i64, .{ .bounds_check = .{ .index = try lowerExpr(ctx, bc.index), .count = try lowerExpr(ctx, bc.count) } }),
         // A field read through the base pointer: the storage width and
         // signedness come from the declared field type; a narrow integer
         // widens (sign-/zero-extended) into the i64 compute floor.

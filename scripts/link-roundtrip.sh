@@ -855,4 +855,63 @@ if [[ "$nar32_out" != "$nar_expected" ]]; then
 fi
 echo "    ok: narrow ints -> rgb(255, 128, 0) / 255 / 383 / -7,65535,u32max / 2^32 (wasm64 + wasm32)"
 
+# Arrays + for (the golden program's iteration shape): literals of scalars
+# and inline records in the scope arena, `for x in xs` desugared to an
+# index loop, trapping `xs[i]`, compile-time `xs.len`, and dispatch on
+# indexed record elements (colors[1].fmt()).
+echo "==> arrays: literals / for-in / xs[i] / len / record elements"
+arr_app="$tmp/arr.q"
+arr_wasm="$tmp/arr.wasm"
+cat > "$arr_app" <<'Q64'
+struct Color { r: u8, g: u8, b: u8 }
+face Display { fn fmt(self) -> str }
+fit Color : Display {
+    fn fmt(self) -> str { "rgb({self.r}, {self.g}, {self.b})" }
+}
+
+fn main {
+    let xs = [10, 20, 30, 40]
+    env.out(xs.len)
+    env.out(xs[2])
+    var total = 0
+    for x in xs {
+        total = total + x
+    }
+    env.out(total)
+    let colors = [
+        Color { r: 255, g: 0, b: 0 },
+        Color { r: 0, g: 255, b: 0 },
+        Color { r: 0, g: 0, b: 255 },
+    ]
+    for c in colors {
+        env.out(c.fmt())
+    }
+    env.out(colors[1].fmt())
+    env.out(i64(colors[2].b))
+}
+Q64
+"$Q64_BIN" emit "$arr_app" "$arr_wasm"
+arr_out="$("$HOST_BIN" "$arr_wasm")"
+arr_expected=$'4\n30\n100\nrgb(255, 0, 0)\nrgb(0, 255, 0)\nrgb(0, 0, 255)\nrgb(0, 255, 0)\n255'
+if [[ "$arr_out" != "$arr_expected" ]]; then
+    echo "FAIL: array output mismatch" >&2
+    printf "  expected: %q\n" "$arr_expected" >&2
+    printf "  actual:   %q\n" "$arr_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$arr_app" "$tmp/arr32.wasm" --addr wasm32
+arr32_out="$("$HOST_BIN" "$tmp/arr32.wasm")"
+if [[ "$arr32_out" != "$arr_expected" ]]; then
+    echo "FAIL: array wasm32 output mismatch" >&2
+    exit 1
+fi
+# Bounds violations trap (spec/types.md): xs[5] of a 2-element array.
+printf 'fn main {\n    let xs = [10, 20]\n    env.out(xs[5])\n}\n' > "$tmp/oob.q"
+"$Q64_BIN" emit "$tmp/oob.q" "$tmp/oob.wasm"
+if "$HOST_BIN" "$tmp/oob.wasm" >/dev/null 2>&1; then
+    echo "FAIL: out-of-bounds index did not trap" >&2
+    exit 1
+fi
+echo "    ok: arrays -> 4 / 30 / 100 / 3x rgb / indexed fmt / 255; oob traps (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
