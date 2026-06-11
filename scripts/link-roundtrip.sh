@@ -765,4 +765,48 @@ if [[ "$flt32_out" != "$flt_expected" ]]; then
 fi
 echo "    ok: f64 floor -> 0.5 / 10.0 / 3.25 / -2.75 / true / 0.3 / 25.0 (wasm64 + wasm32)"
 
+# f32 + the cast operators (spec/types.md Â§Casts: f32(x)/f64(x)/i64(x),
+# function-call form; float->int is the trapping trunc). f32 fields pack
+# 4/4; printing/interpolation promotes f32 -> f64 into the one __fmt_f64;
+# f32/f64/int never mix implicitly.
+echo "==> f32: casts / arithmetic / 4-byte fields / methods"
+f32_app="$tmp/f32.q"
+f32_wasm="$tmp/f32.wasm"
+cat > "$f32_app" <<'Q64'
+struct Sample { v: f32, gain: f32 }
+face Amp { fn amped(self) -> f32 }
+fit Sample : Amp { fn amped(self) -> f32 { self.v * self.gain } }
+
+fn mix(a: f32, b: f32) -> f32 { (a + b) / f32(2.0) }
+
+fn main {
+    let a = f32(1.5)
+    let b = f32(0.25)
+    env.out(a + b)
+    env.out(mix(a, b))
+    env.out(f64(a) * 2.0)
+    env.out(i64(2.75))
+    let s = Sample { v: f32(0.5), gain: f32(3.0) }
+    env.out(s.amped())
+    env.out("v = {s.v}, amped = {s.amped()}, a = {a}")
+    env.out(a > b)
+}
+Q64
+"$Q64_BIN" emit "$f32_app" "$f32_wasm"
+f32_out="$("$HOST_BIN" "$f32_wasm")"
+f32_expected=$'1.75\n0.875\n3.0\n2\n1.5\nv = 0.5, amped = 1.5, a = 1.5\ntrue'
+if [[ "$f32_out" != "$f32_expected" ]]; then
+    echo "FAIL: f32 output mismatch" >&2
+    printf "  expected: %q\n" "$f32_expected" >&2
+    printf "  actual:   %q\n" "$f32_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$f32_app" "$tmp/f32w.wasm" --addr wasm32
+f32w_out="$("$HOST_BIN" "$tmp/f32w.wasm")"
+if [[ "$f32w_out" != "$f32_expected" ]]; then
+    echo "FAIL: f32 wasm32 output mismatch" >&2
+    exit 1
+fi
+echo "    ok: f32 -> 1.75 / 0.875 / 3.0 / 2 / 1.5 / true (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

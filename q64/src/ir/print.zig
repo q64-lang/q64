@@ -143,6 +143,11 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
         .str_const => |b| try app(gpa, out, "\"{s}\"", .{b}),
         .int_const => |v| try app(gpa, out, "{d}", .{v}),
         .float_const => |v| try app(gpa, out, "{d}f", .{v}),
+        .num_cast => |nc| {
+            try app(gpa, out, "{s}(", .{@tagName(nc.to)});
+            try hirExpr(gpa, out, nc.value);
+            try app(gpa, out, ")", .{});
+        },
         .bool_const => |v| try app(gpa, out, "{s}", .{if (v) "true" else "false"}),
         .local => |l| try app(gpa, out, "local#{d}", .{l.idx}),
         .global_get => |i| try app(gpa, out, "global#{d}", .{i}),
@@ -299,6 +304,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         },
         .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
         .const_f64 => |v| try app(gpa, out, "const_f64 {d}\n", .{v}),
+        .num_cast => |src| {
+            try app(gpa, out, "num_cast -> {s}\n", .{@tagName(inst.ty)});
+            try mirInst(gpa, out, src, depth + 1);
+        },
         .const_i32 => |v| try app(gpa, out, "const_i32 {d}\n", .{v}),
         .local_get => |i| try app(gpa, out, "local_get {d}\n", .{i}),
         .global_get => |i| try app(gpa, out, "global_get {d}\n", .{i}),

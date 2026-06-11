@@ -935,11 +935,24 @@ verified, honest diagnostics throughout.
       rejections. **Boundaries:** NaN prints "0.0", |x| ≥ 2^64
       saturates (documented in `emitFmtF64`); f64 in `qview` host args
       and `q64 check`'s TYP042 float awareness untouched.
-- [ ] **f32.** Needs a `mir.ValueType.f32` + width plumbing through
-      locals/params/fields (4/4 layout), `f32.demote/promote` at
-      explicit cast sites (no implicit conversion), and a literal-
-      suffix story (`1.5f32`? annotation-driven?). Spec the cast
-      syntax first (types.md has the tower; the cast form is TBD).
+- [x] **f32 + the cast operators.** The cast form was already specced
+      (types.md §Casts: function-call style, `f32(x)`/`f64(x)`/
+      `i64(x)`; float→int narrowing **traps** — wasm's non-saturating
+      trunc gives that for free), so no literal-suffix story was
+      needed: a bare float literal is f64 (the spec default) and f32
+      values come from casts and f32-typed params/returns/fields.
+      Landed: `hir.num_cast` / `mir.num_cast` (target = inst type;
+      backend picks promote/demote/convert/trunc by the (from, to)
+      pair), `ScalarType.f32` with same-float-only mixing (f32+f64 is
+      as rejected as float+int), `binOpF32` family, f32 params/
+      returns on fns and fit methods, f32 struct fields at **4/4
+      layout** (two f32s pack to size 8 align 4), and printing/
+      interpolation promoting f32→f64 into the single `__fmt_f64`.
+      Verified end-to-end wasm64 + wasm32 (link-roundtrip f32
+      section) + 3 unit tests incl. the never-mix rejections.
+      **Boundary:** `i64(x)` of an in-range float works; the full
+      int tower (`i32(x)`, `u8(x)`, …) waits on those types existing;
+      `try_into` waits on Result.
 - [ ] **sin/cos/tan/exp/log → `q64.math` (decision recorded).** Wasm
       3.0 has no transcendental instructions (only `f64.sqrt`/`abs`/
       `ceil`/`floor`/`min`/`max`/`copysign` are native). Decision:

@@ -36,7 +36,7 @@ pub const FieldInit = struct { offset: u32, value: *Inst };
 /// `ptr` is an address-space-width pointer/length (i32 on wasm32, i64 on
 /// wasm64), used for the locals backing a `str` binding's `(ptr, len)`. The
 /// backend realizes it as `i32`/`i64`; integer *values* use `i64` regardless.
-pub const ValueType = enum { i64, i32, f64, str, ptr, void };
+pub const ValueType = enum { i64, i32, f32, f64, str, ptr, void };
 
 pub const Linkage = enum { entry, local, imported_resolved };
 
@@ -138,6 +138,10 @@ pub const Op = union(enum) {
     host_out_const: struct { off: u32, len: u32 },
     const_i64: i64,
     const_f64: f64,
+    /// An explicit numeric conversion; the target type is `inst.ty`, the
+    /// source the operand's type. float→int uses the *trapping* trunc
+    /// (spec/types.md §Casts: narrowing traps on overflow/NaN).
+    num_cast: *Inst,
     /// A boolean (0/1) constant — the branch leaves of a short-circuit
     /// `&&`/`||` `if_`, which yields an i32 to match comparisons and `!`.
     const_i32: i32,

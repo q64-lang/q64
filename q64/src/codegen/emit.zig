@@ -485,6 +485,7 @@ fn witType(t: ir.hir.Type) []const u8 {
     return switch (t) {
         .i64 => "s64",
         .i32 => "s32",
+        .f32 => "f32",
         .f64 => "f64",
         .bool => "bool",
         .str => "string",
@@ -854,6 +855,7 @@ fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenT
     return switch (t) {
         .i64 => i64_type,
         .i32 => i32_type,
+        .f32 => c.BinaryenTypeFloat32(),
         .f64 => c.BinaryenTypeFloat64(),
         .str => pair_type, // a (ptr, len) multivalue
         .ptr => ptr_type, // an address-width pointer/length local
@@ -868,6 +870,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .host_out_int => |h| want_int or bodyHasOut(h.value, want_int),
         .host_out_float => |h| bodyHasOut(h.value, want_int), // __fmt_f64 is its own helper
         .fmt_float_to_str => |inner| bodyHasOut(inner, want_int),
+        .num_cast => |src| bodyHasOut(src, want_int),
         .host_out_str => |h| !want_int or bodyHasOut(h.value, want_int),
         .block => |items| blk: {
             for (items) |child| if (bodyHasOut(child, want_int)) break :blk true;
@@ -1017,6 +1020,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_float_fmt = true;
             scanScratch(inner, s);
         },
+        .num_cast => |src| scanScratch(src, s),
         .host_out_float => |h| {
             s.host_out = true; // pair scratch for the (ptr, len) split
             s.has_float_fmt = true;
@@ -1169,19 +1173,53 @@ const Lowerer = struct {
             .host_out_const => |hc| return self.envOut(@intCast(hc.off), @intCast(hc.len)),
             .const_i64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt64(v)),
             .const_f64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralFloat64(v)),
+            .num_cast => |src| {
+                // (source type, target type) → the wasm conversion. float→int
+                // is the TRAPPING trunc per spec/types.md §Casts.
+                const x = try self.inst(src);
+                const from = src.ty;
+                const to = n.ty;
+                if (from == to) return x;
+                const op: c.BinaryenOp = switch (to) {
+                    .f64 => switch (from) {
+                        .f32 => c.BinaryenPromoteFloat32(),
+                        .i64 => c.BinaryenConvertSInt64ToFloat64(),
+                        else => return Error.UnsupportedCall,
+                    },
+                    .f32 => switch (from) {
+                        .f64 => c.BinaryenDemoteFloat64(),
+                        .i64 => c.BinaryenConvertSInt64ToFloat32(),
+                        else => return Error.UnsupportedCall,
+                    },
+                    .i64 => switch (from) {
+                        .f64 => c.BinaryenTruncSFloat64ToInt64(),
+                        .f32 => c.BinaryenTruncSFloat32ToInt64(),
+                        else => return Error.UnsupportedCall,
+                    },
+                    else => return Error.UnsupportedCall,
+                };
+                return c.BinaryenUnary(module, op, x);
+            },
             .const_i32 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt32(v)),
             .local_get => |idx| return c.BinaryenLocalGet(module, idx, self.wty(n.ty)),
             .local_set => |ls| return c.BinaryenLocalSet(module, ls.idx, try self.inst(ls.value)),
             .bin => |b| {
                 // Operand type picks the instruction family; the builder
                 // guarantees both sides agree (no implicit conversion).
-                const op = if (b.lhs.ty == .f64) binOpF64(b.kind) orelse return Error.UnsupportedCall else binOp(b.kind);
+                const op = switch (b.lhs.ty) {
+                    .f64 => binOpF64(b.kind) orelse return Error.UnsupportedCall,
+                    .f32 => binOpF32(b.kind) orelse return Error.UnsupportedCall,
+                    else => binOp(b.kind),
+                };
                 return c.BinaryenBinary(module, op, try self.inst(b.lhs), try self.inst(b.rhs));
             },
             .un => |u| {
                 const x = try self.inst(u.operand);
                 if (u.kind == .neg and u.operand.ty == .f64) {
                     return c.BinaryenUnary(module, c.BinaryenNegFloat64(), x);
+                }
+                if (u.kind == .neg and u.operand.ty == .f32) {
+                    return c.BinaryenUnary(module, c.BinaryenNegFloat32(), x);
                 }
                 return switch (u.kind) {
                     .neg => c.BinaryenBinary(module, c.BinaryenSubInt64(), c.BinaryenConst(module, c.BinaryenLiteralInt64(0)), x),
@@ -1347,6 +1385,7 @@ const Lowerer = struct {
                 return switch (n.ty) {
                     .i64 => c.BinaryenLoad(module, 8, true, fg.offset, 0, self.i64_type, base, "0"),
                     .f64 => c.BinaryenLoad(module, 8, true, fg.offset, 0, c.BinaryenTypeFloat64(), base, "0"),
+                    .f32 => c.BinaryenLoad(module, 4, true, fg.offset, 0, c.BinaryenTypeFloat32(), base, "0"),
                     .i32 => c.BinaryenLoad(module, 1, false, fg.offset, 0, self.i32_type, base, "0"),
                     else => Error.UnsupportedCall,
                 };
@@ -1357,6 +1396,7 @@ const Lowerer = struct {
                 return switch (fs.value.ty) {
                     .i64 => c.BinaryenStore(module, 8, fs.offset, 0, base, value, self.i64_type, "0"),
                     .f64 => c.BinaryenStore(module, 8, fs.offset, 0, base, value, c.BinaryenTypeFloat64(), "0"),
+                    .f32 => c.BinaryenStore(module, 4, fs.offset, 0, base, value, c.BinaryenTypeFloat32(), "0"),
                     .i32 => c.BinaryenStore(module, 1, fs.offset, 0, base, value, self.i32_type, "0"),
                     else => Error.UnsupportedCall,
                 };
@@ -1630,6 +1670,7 @@ const Lowerer = struct {
             const store = switch (fi.value.ty) {
                 .i64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, self.i64_type, "0"),
                 .f64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, c.BinaryenTypeFloat64(), "0"),
+                .f32 => c.BinaryenStore(m, 4, fi.offset, 0, self.ptrGet(ridx), value, c.BinaryenTypeFloat32(), "0"),
                 .i32 => c.BinaryenStore(m, 1, fi.offset, 0, self.ptrGet(ridx), value, self.i32_type, "0"),
                 else => return Error.UnsupportedCall,
             };
@@ -1716,6 +1757,23 @@ fn binOpF64(kind: ir.ops.BinKind) ?c.BinaryenOp {
         .le => c.BinaryenLeFloat64(),
         .gt => c.BinaryenGtFloat64(),
         .ge => c.BinaryenGeFloat64(),
+        .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => null,
+    };
+}
+
+/// The f32 instruction family (mirrors `binOpF64`).
+fn binOpF32(kind: ir.ops.BinKind) ?c.BinaryenOp {
+    return switch (kind) {
+        .add => c.BinaryenAddFloat32(),
+        .sub => c.BinaryenSubFloat32(),
+        .mul => c.BinaryenMulFloat32(),
+        .div => c.BinaryenDivFloat32(),
+        .eq => c.BinaryenEqFloat32(),
+        .ne => c.BinaryenNeFloat32(),
+        .lt => c.BinaryenLtFloat32(),
+        .le => c.BinaryenLeFloat32(),
+        .gt => c.BinaryenGtFloat32(),
+        .ge => c.BinaryenGeFloat32(),
         .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => null,
     };
 }
