@@ -763,10 +763,20 @@ verified, honest diagnostics throughout.
 
 ### Ladder B — struct values → static fits (after A3)
 
-- [ ] **B1 — record literal expressions.** The deferred parser item: `Point {
-      x: 1 }` in expression position needs the struct-literal-vs-block
-      disambiguation rule (no bare literal in `if`/`while`/`match` scrutinee
-      position — record the rule in `grammar.md`).
+- [x] **B1 — record literal expressions.** `Point { x: 1, y: 2 }`,
+      shorthand `Color { r }`, empty `DemoTools {}` all parse
+      (RECORD_EXPR/RECORD_INIT + ast views; `Expr.record`). The
+      disambiguation rule is implemented and recorded in `grammar.md`
+      §Expressions: in the bare head of `if`/`while`/`for`/`match` (and
+      an if-let RHS), `Path {` opens the statement's block —
+      parenthesize to force the literal; parens/brackets/args lift the
+      restriction. Bonus fix surfaced by the golden gate: **generic fn
+      headers** (`fn f<T: Display>(items: [T])`) previously degraded the
+      whole header to raw tokens — now the `<…>` span becomes a raw
+      GENERIC_PARAMS node and the param list parses structured (plus a
+      collectSignatures guard: parens-but-no-PARAMS records *no*
+      signature, never a wrong zero-arity one). Corpus unresolved heads
+      40 → 25; golden library-face-fit checks fully.
 - [ ] **B2 — struct values in HIR/MIR.** By-value locals/params/returns;
       scope-arena layout; field access lowering. Scalar fields first
       (`spec/memory.md` layout rules).
@@ -1048,11 +1058,9 @@ visible at a glance whether it's been picked up.
       `dev.q64.webmcp_client` example app (match on strings + variants,
       `for`, raw strings, interpolation) now parses with no diagnostics.
 - [x] Parser: lexer raw strings `r"…"` / `r#"…"#` (STR_RAW).
-- [ ] Parser: record/struct **expression** literals (`Point { x: 1 }`,
-      `DemoTools {}`) in expression position. Deferred for the
-      struct-literal-vs-block ambiguity (Rust-style); today they degrade to
-      lossless one-token recovery. Needs the disambiguation rule (likely:
-      no bare record literal in `if`/`while`/`match` scrutinee position).
+- [x] Parser: record/struct **expression** literals — done with ladder
+      B1 (see the sema/struct ladder section): RECORD_EXPR + the
+      Rust-style restriction, recorded in `grammar.md`.
 - [x] `spec/concurrency-model.md` — the concurrency/reactivity consolidation
       chapter (the big remaining feature-review item): the global
       one-scheduler invariant + lowering table, the tasks vs actors vs
