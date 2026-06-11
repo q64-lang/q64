@@ -2260,11 +2260,17 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
 }
 
 /// The boxed enum a function's return type names (`-> Option<i64>`,
-/// `-> Shape`), so callers can `match` on the call's value.
+/// `-> i64?`, `-> Shape`), so callers can `match` on the call's value.
 fn enumOfRet(b: *Builder, fd: ast.FnDecl) BuildError!?*const EnumInfo {
     const rt = fd.returnType() orelse return null;
     const pt = switch (rt.type_() orelse return null) {
         .path => |x| x,
+        .optional => {
+            // `T?` ≡ `Option<T>`.
+            const info = b.enums.get("Option") orelse return null;
+            if (info.si == null) return null;
+            return info;
+        },
         else => return null,
     };
     const nm = try pt.name(b.a);
@@ -2333,6 +2339,12 @@ fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInf
             if (b.enums.get(nm)) |info| return info.si;
             if (pt.hasGenericArgs()) return null;
             return b.structs.get(nm);
+        },
+        .optional => {
+            // `T?` ≡ `Option<T>` (errors.md §"Result and Option") — the
+            // same uniform boxed shape regardless of T at this floor.
+            const info = b.enums.get("Option") orelse return null;
+            return info.si;
         },
         else => return null,
     }
@@ -6113,4 +6125,27 @@ test "if let: one-arm match in main — payload bind, else, else-if-let chain" {
         \\}
         \\
     )) == null);
+}
+
+test "T? sugar: `-> i64?` is `-> Option<i64>` (errors.md)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn find(n: i64) -> i64? {
+        \\    if n > 0 { Some(n) } else { None }
+        \\}
+        \\fn main {
+        \\    if let Some(v) = find(21) {
+        \\        env.out(v * 2)
+        \\    } else {
+        \\        env.out("nothing")
+        \\    }
+        \\    match find(0 - 1) {
+        \\        Some(v) -> env.out(v),
+        \\        None -> env.out("none"),
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
 }

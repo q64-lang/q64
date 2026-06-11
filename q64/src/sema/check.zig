@@ -538,10 +538,12 @@ const Checker = struct {
         return null;
     }
 
-    /// The known enum a `let` annotation's path type names, if any.
+    /// The known enum a `let` annotation's type names, if any —
+    /// a path type (`Shape`, `Option<i64>`) or the `T?` sugar.
     fn enumAnnotation(c: *Checker, te: ast.TypeExpr) ?[]const u8 {
         const pt = switch (te) {
             .path => |x| x,
+            .optional => return c.enums.getKey("Option"), // `T?` ≡ `Option<T>`
             else => return null,
         };
         const name = pt.name(c.gpa) catch return null;
@@ -550,11 +552,12 @@ const Checker = struct {
         return c.enums.getKey(name);
     }
 
-    /// The known enum a named type (a signature return, an annotation)
-    /// points at, if any.
+    /// The known enum a lowered type (a signature return) points at,
+    /// if any — a named type or the `T?` optional sugar.
     fn enumOfNamed(c: *Checker, id: types.TypeId) ?[]const u8 {
         const n = switch (c.store.get(id)) {
             .named => |nm| nm,
+            .optional => return c.enums.getKey("Option"), // `T?` ≡ `Option<T>`
             else => return null,
         };
         if (!c.enums.contains(n.name)) return null;
@@ -1340,6 +1343,22 @@ test "check: TYP062 across calls and annotations — enum-typed returns/lets" {
         \\}
         \\
     , &.{"TYP062"});
+    // The `T?` sugar: `-> i64?` and `let o: i64?` are Option values.
+    try expectCodes(
+        \\fn find(n: i64) -> i64? {
+        \\    if n > 0 { Some(n) } else { None }
+        \\}
+        \\fn main {
+        \\    match find(5) {
+        \\        Some(v) -> env.out(v),
+        \\    }
+        \\    let o: i64? = mystery()
+        \\    match o {
+        \\        None -> env.out("none"),
+        \\    }
+        \\}
+        \\
+    , &.{ "TYP062", "TYP062" });
 }
 
 test "check: TYP062 stays silent on exhaustive / unjudgeable matches" {

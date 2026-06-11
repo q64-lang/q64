@@ -1446,4 +1446,32 @@ iflet32_out="$("$HOST_BIN" "$tmp/iflet32.wasm")"
 [[ "$iflet32_out" == "$iflet_expected" ]] || { echo "FAIL: if-let wasm32 (got: $iflet32_out)" >&2; exit 1; }
 echo "    ok: if let -> 42 / nothing / err 9 / none indeed (wasm64 + wasm32)"
 
+# `T?` sugar: `-> i64?` is `-> Option<i64>` (errors.md).
+echo "==> T? sugar: -> i64?"
+sugar_app="$tmp/sugar.q"
+cat > "$sugar_app" <<'Q64'
+fn find(n: i64) -> i64? {
+    if n > 0 { Some(n) } else { None }
+}
+fn main {
+    if let Some(v) = find(21) {
+        env.out(v * 2)
+    } else {
+        env.out("nothing")
+    }
+    match find(0 - 1) {
+        Some(v) -> env.out(v),
+        None -> env.out("none"),
+    }
+}
+Q64
+sugar_expected=$'42\nnone'
+"$Q64_BIN" emit "$sugar_app" "$tmp/sugar.wasm"
+sugar_out="$("$HOST_BIN" "$tmp/sugar.wasm")"
+[[ "$sugar_out" == "$sugar_expected" ]] || { echo "FAIL: T-sugar (got: $sugar_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$sugar_app" "$tmp/sugar32.wasm" --addr wasm32
+sugar32_out="$("$HOST_BIN" "$tmp/sugar32.wasm")"
+[[ "$sugar32_out" == "$sugar_expected" ]] || { echo "FAIL: T-sugar wasm32 (got: $sugar32_out)" >&2; exit 1; }
+echo "    ok: T? sugar -> 42 / none (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

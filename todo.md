@@ -972,8 +972,19 @@ verified, honest diagnostics throughout.
       literal patterns (landed) → exhaustiveness diagnostic (landed)
       → `Option`/`Result` in the prelude + generic enum declarations
       (landed) → enum returns from functions (landed) → `if let`
-      narrowing (landed) → next: `T?` sugar, `while let`, `try` (the
-      remaining `try` prerequisite — Result-returning fns — is in).
+      narrowing (landed) → `T?` sugar (landed) → next: `while let`,
+      `try` (its prerequisite — Result-returning fns — is in),
+      match/if-let in callee bodies.
+      - [x] **`T?` sugar.** `-> i64?` ≡ `-> Option<i64>` (errors.md):
+            the optional TypeExpr (already parsed structured) maps to
+            Option's boxed shape in `structOfType`/`enumOfRet` (emit)
+            and `enumAnnotation`/`enumOfNamed` (check — annotations and
+            signature returns, so TYP062 judges `T?` seams too).
+            Verified end-to-end wasm64 + wasm32 (roundtrip T?-sugar
+            section: `42 / none`) + 1 unit test + check cases. 391
+            unit / 81 CLI / 23-of-51 / roundtrips green. **Boundary:**
+            `T?` params (like enum params generally) and `?.` chaining
+            are later.
       - [x] **`if let Some(v)` narrowing in `main`.** The binding `if`
             desugars to a one-arm match: the parser already produced
             `IF_COND_LET` (pattern + scrutinee), now surfaced as
