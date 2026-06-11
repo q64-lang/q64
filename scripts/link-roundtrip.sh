@@ -1090,4 +1090,52 @@ if [[ "$mgen32_out" != "$mgen_expected" ]]; then
 fi
 echo "    ok: both<A, B> + both<B, A> + zipped_count<i64, f64> -> A1/B2/B3/B7/A8/4 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# B5 (bare T params + -> T returns): a record T passes as its base pointer
+# (fit dispatch works on it), a scalar T by value; `-> T` follows the slot
+# (twice<i64> -> i64, twice<f64> -> f64); slice/bare/concrete params mix.
+# ---------------------------------------------------------------------------
+echo "==> B5: bare-T generics — show<T: D>(x: T) / twice<T>(x: T) -> T"
+bgen_app="$tmp/genbare.q"
+cat > "$bgen_app" <<'Q64'
+face Display { fn fmt(self) -> str }
+struct Color { r: i64, g: i64 }
+fit Color : Display { fn fmt(self) -> str { "rgb({self.r}, {self.g})" } }
+fn show<T: Display>(x: T) {
+    env.out(x.fmt())
+}
+fn twice<T>(x: T) -> T {
+    x + x
+}
+fn first<T>(items: [T]) -> T {
+    items[0]
+}
+fn nth_plus<T>(xs: [T], i: i64, fallback: T) -> i64 {
+    fallback + xs.len + i
+}
+fn main {
+    show(Color { r: 255, g: 0 })
+    let c = Color { r: 1, g: 2 }
+    show(c)
+    env.out(twice(21))
+    env.out(twice(1.5))
+    env.out(first([10, 20]))
+    env.out(nth_plus([10, 20], 5, 100))
+}
+Q64
+bgen_expected=$'rgb(255, 0)\nrgb(1, 2)\n42\n3.0\n10\n107'
+"$Q64_BIN" emit "$bgen_app" "$tmp/genbare.wasm"
+bgen_out="$("$HOST_BIN" "$tmp/genbare.wasm")"
+if [[ "$bgen_out" != "$bgen_expected" ]]; then
+    echo "FAIL: bare-T generic output mismatch (got: $bgen_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$bgen_app" "$tmp/genbare32.wasm" --addr wasm32
+bgen32_out="$("$HOST_BIN" "$tmp/genbare32.wasm")"
+if [[ "$bgen32_out" != "$bgen_expected" ]]; then
+    echo "FAIL: bare-T generic wasm32 output mismatch (got: $bgen32_out)" >&2
+    exit 1
+fi
+echo "    ok: show<Color> + twice<i64/f64> + first<i64> + nth_plus -> rgb/42/3.0/10/107 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

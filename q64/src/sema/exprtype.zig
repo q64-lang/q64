@@ -42,8 +42,10 @@ pub const Env = struct {
     /// Type of a bare name (local binding or parameter) in the current
     /// body scope.
     localType: *const fn (ctx: *anyopaque, name: []const u8) ?ScalarType,
-    /// Scalar return type of a named callee.
-    callRet: *const fn (ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?ScalarType,
+    /// Scalar return type of a named callee. The call expression rides
+    /// along so a generic callee (`fn twice<T>(x: T) -> T`) can type
+    /// its return from the deciding argument.
+    callRet: *const fn (ctx: *anyopaque, name: []const u8, call: ast.CallExpr) std.mem.Allocator.Error!?ScalarType,
 };
 
 /// Scalar type of `expr` under `env`. Total: anything outside the floor
@@ -102,7 +104,7 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
             };
             const name = cpath.text(gpa) catch return .unknown;
             defer gpa.free(name);
-            return (try env.callRet(env.ctx, name)) orelse .unknown;
+            return (try env.callRet(env.ctx, name, cc)) orelse .unknown;
         },
         .path => |p| {
             const name = p.text(gpa) catch return .unknown;
@@ -146,7 +148,7 @@ const TestEnv = struct {
         if (std.mem.eql(u8, name, "s")) return .str;
         return null;
     }
-    fn callRet(_: *anyopaque, name: []const u8) std.mem.Allocator.Error!?ScalarType {
+    fn callRet(_: *anyopaque, name: []const u8, _: ast.CallExpr) std.mem.Allocator.Error!?ScalarType {
         if (std.mem.eql(u8, name, "pred")) return .bool;
         if (std.mem.eql(u8, name, "count")) return .i64;
         if (std.mem.eql(u8, name, "greet")) return .str;

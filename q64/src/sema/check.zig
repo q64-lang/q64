@@ -339,12 +339,16 @@ const Checker = struct {
     fn checkGenericBound(c: *Checker, gen_opt: ?GenericDecl, i: usize, arg: ast.Expr, info: Info) !void {
         const gen = gen_opt orelse return;
         const reg = c.fitreg orelse return;
-        const elem = switch (info) {
-            .rec_array => |n| n,
-            else => return,
-        };
         const p = paramAt(gen.fd, i) orelse return;
-        const which = fits.sliceOfWhich(p, gen.sig, c.gpa) orelse return;
+        // The param decides the judgeable shape: `[T]` takes a record
+        // array, a bare `T` takes a record value.
+        const elem: []const u8, const which: usize = if (fits.sliceOfWhich(p, gen.sig, c.gpa)) |w| switch (info) {
+            .rec_array => |n| .{ n, w },
+            else => return,
+        } else if (fits.bareWhich(p, gen.sig, c.gpa)) |w| switch (info) {
+            .record => |n| .{ n, w },
+            else => return,
+        } else return;
         const face = gen.sig.params[which].bound orelse return;
         if (!reg.knowsFace(face)) return;
         if (reg.find(elem, face) == null) {
@@ -952,6 +956,26 @@ test "check: TYP200 — bounded generic call, element type has no fit" {
         \\fn main { show_all([Plain { v: 1 }]) }
         \\
     , &.{"TYP200"});
+}
+
+test "check: TYP200 — a bare `T` argument is judged like a `[T]` one" {
+    // A record value to a bounded bare `T` with no fit fires; a record
+    // array to the same param shape does not match (and vice versa).
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct Plain { v: i64 }
+        \\fn show<T: D>(x: T) { }
+        \\fn main { show(Plain { v: 1 }) }
+        \\
+    , &.{"TYP200"});
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct Color { r: i64 }
+        \\fit Color : D { fn fmt(self) -> str { "c" } }
+        \\fn show<T: D>(x: T) { }
+        \\fn main { show(Color { r: 1 }) }
+        \\
+    , &.{});
 }
 
 test "check: TYP200 — multi-param bounds judge each slot independently" {

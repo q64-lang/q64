@@ -149,11 +149,23 @@ pub fn sliceOfWhich(p: ast.Param, sig: GenericSig, a: std.mem.Allocator) ?usize 
         .slice => |x| x,
         else => return null,
     };
-    const inner = sl.element() orelse return null;
-    const pt = switch (inner) {
+    return typeWhich(sl.element() orelse return null, sig, a);
+}
+
+/// Which of the signature's type params this fn param is a *bare* `T`
+/// of, if any.
+pub fn bareWhich(p: ast.Param, sig: GenericSig, a: std.mem.Allocator) ?usize {
+    return typeWhich(p.type_() orelse return null, sig, a);
+}
+
+/// Which of the signature's type params a type expression names bare
+/// (`T`, no generic args), if any.
+pub fn typeWhich(te: ast.TypeExpr, sig: GenericSig, a: std.mem.Allocator) ?usize {
+    const pt = switch (te) {
         .path => |x| x,
         else => return null,
     };
+    if (pt.hasGenericArgs()) return null;
     const nm = pt.name(a) catch return null;
     defer a.free(nm);
     for (sig.params[0..sig.n], 0..) |gp, i| {

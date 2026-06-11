@@ -950,9 +950,29 @@ verified, honest diagnostics throughout.
 - [ ] **B5 — generics beyond the first rung.** Monomorphization's v0
       floor landed with B4's close (one `<T: Face>` param, `[T]` slice
       params, record element types, void returns, statement calls).
-      Remaining: bare `T` params + `-> T` returns (need the
-      receiver-by-value story), const generics; then `dyn` dispatch;
-      enums + `match` lowering (separate ladders).
+      Remaining: record `-> T` returns (caller-side record plumbing —
+      fn_recs through the generic path), const generics; then `dyn`
+      dispatch; enums + `match` lowering (separate ladders).
+      - [x] **Bare `T` params + scalar `-> T` returns.** The feared
+            "receiver-by-value story" mostly dissolved: a record T
+            already crosses calls as its base pointer (B2b), so
+            `fn show<T: Display>(x: T)` takes a record literal or
+            binding (`x.fmt()` dispatches — the param registers in
+            `recs`), and a scalar T is a plain scalar param. `-> T`
+            returns the slot's scalar — `twice(21)` is i64,
+            `twice(1.5)` is f64, `first([10, 20])` reads `[T]` element
+            type — typed correctly at the *caller* too: `Env.callRet`
+            now carries the CallExpr, so the build_hir bridge infers a
+            generic `-> T` call's scalar from the deciding argument
+            (`genericRet`; bare arg's type or slice arg's element).
+            `fits.bareWhich`/`typeWhich` join `sliceOfWhich`; slice/
+            bare/concrete params mix on one slot (`nth_plus`). TYP200
+            judges bare record args like record arrays. Honest
+            boundaries: record `-> T` rejects (needs caller fn_recs
+            plumbing), scalar-to-bounded-bare rejects (no scalar
+            fits). Verified end-to-end wasm64 + wasm32 (link-roundtrip
+            bare-T section) + 4 unit tests. 367 unit / 80 CLI /
+            21-of-49 / roundtrips green.
       - [x] **Multiple type params.** `fn both<T: D, U: D>(xs: [T],
             ys: [U])` works: `sema.fits.GenericSig` is a bounded list
             (`max_generic_params` = 4; `parseGenericSig` scans

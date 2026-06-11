@@ -1978,6 +1978,7 @@ fn elemPtrExpr(b: *Builder, ai: ArrInfo, index: *hir.Expr) BuildError!*hir.Expr 
 const GenericSig = sema.fits.GenericSig;
 const parseGenericSig = sema.fits.parseGenericSig;
 const sliceOfWhich = sema.fits.sliceOfWhich;
+const bareWhich = sema.fits.bareWhich;
 
 /// One inferred type-parameter slot: what T turned out to be.
 const TSlot = struct { elem: ElemKind, stride: u32 };
@@ -2018,7 +2019,7 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
     const ps = fd.params() orelse return error.Unsupported;
 
     // Walk params and args together: each type param infers at its
-    // first `[T]` arg (and must stay consistent at later ones).
+    // first `[T]` / bare `T` arg (and must stay consistent at later ones).
     var slots: [sema.fits.max_generic_params]?TSlot = @splat(null);
     var args: std.ArrayList(*hir.Expr) = .empty;
     var pit = ps.iter();
@@ -2034,6 +2035,26 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
             }
             try args.append(b.a, aa.ptr);
             try args.append(b.a, aa.count);
+        } else if (bareWhich(p, sig, b.a)) |which| {
+            // A bare `T` argument: a record value (passed as its base
+            // pointer — the B2b ABI, so "by value" costs nothing new)
+            // or a scalar.
+            const aslot: TSlot, const value: *hir.Expr = if (try buildRecExpr(b, a0, scope)) |rv|
+                .{ .{ .elem = .{ .rec = rv.si }, .stride = rv.si.size }, rv.e }
+            else blk: {
+                const sc = scalarBindTy(try exprScalar(b, a0, scope));
+                switch (sc) {
+                    .bool, .i64, .f64, .f32 => {},
+                    else => return error.Unsupported,
+                }
+                break :blk .{ .{ .elem = .{ .scalar = sc }, .stride = fieldWidth(sc).?.size }, try buildIntExpr(b, a0, scope) };
+            };
+            if (slots[which]) |prev| {
+                if (!elemEql(prev.elem, aslot.elem)) return reject(b, .unsupported_call); // T must infer consistently
+            } else {
+                slots[which] = aslot;
+            }
+            try args.append(b.a, value);
         } else {
             // A non-generic scalar parameter.
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
@@ -2047,7 +2068,8 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
         }
     }
     if (ait.next() != null) return reject(b, .unsupported_call);
-    // Every type param must have an inference source (a `[T]` param).
+    // Every type param must have an inference source (a `[T]` or bare
+    // `T` param).
     for (slots[0..sig.n]) |s| if (s == null) return error.Unsupported;
 
     // The bounds: each T must fit its face (TYP200 — `q64 check` emits
@@ -2111,13 +2133,22 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     const key = try keybuf.toOwnedSlice(b.a);
     if (b.ids.get(key)) |id| return id;
 
-    const ret_ty: hir.Type = if (fd.returnType() == null) .void else blk: {
-        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported; // `-> T` (needs by-value T), str, records: later
+    const ret_ty: hir.Type = if (fd.returnType()) |rt| blk: {
+        // `-> T` returns the slot's type — a scalar for a scalar T;
+        // a record T (`.ptr`) needs the caller-side record plumbing
+        // (fn_recs through the generic path), a later slice.
+        if (rt.type_()) |rte| if (sema.fits.typeWhich(rte, sig, b.a)) |which| {
+            break :blk switch (slots[which].?.elem) {
+                .scalar => |t| t,
+                .rec => return error.Unsupported,
+            };
+        };
+        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported; // str, records: later
         break :blk switch (rs) {
             .bool, .i64, .f64, .f32 => rs,
             else => return error.Unsupported,
         };
-    };
+    } else .void;
 
     var scope = Scope{ .a = b.a };
     var params: std.ArrayList(hir.Param) = .empty;
@@ -2139,6 +2170,21 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
                 .stride = slot.stride,
                 .elem = slot.elem,
             });
+        } else if (sema.fits.bareWhich(p, sig, b.a)) |which| {
+            // A bare `T` param: a record T is a `.ptr` registered in
+            // `recs` (field access + fit dispatch resolve); a scalar T
+            // is a plain scalar local.
+            switch (slots[which].?.elem) {
+                .rec => |si| {
+                    _ = try scope.declare(pn, false, .ptr);
+                    try scope.recs.put(b.a, pn, si);
+                    try params.append(b.a, .{ .name = pn, .ty = .ptr });
+                },
+                .scalar => |t| {
+                    _ = try scope.declare(pn, false, t);
+                    try params.append(b.a, .{ .name = pn, .ty = t });
+                },
+            }
         } else {
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
             const pty: hir.Type = switch (psc) {
@@ -2454,7 +2500,7 @@ const ExprTypeBridge = struct {
         };
     }
 
-    fn callRet(ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+    fn callRet(ctx: *anyopaque, name: []const u8, call: ast.CallExpr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
         const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
         // A builtin numeric cast types as its target (`f32(x)` is f32).
         if (castTarget(name)) |ct| {
@@ -2483,6 +2529,10 @@ const ExprTypeBridge = struct {
             };
         }
         const fd = self.b.resolver.lookup(name) orelse return null;
+        if (fd.isGeneric()) {
+            if (try self.genericRet(fd, call)) |t| return t;
+            // A concrete return on a generic still types below.
+        }
         const rs = (try fnRetScalar(self.b, fd)) orelse return null;
         return switch (rs) {
             .bool => .bool,
@@ -2490,6 +2540,70 @@ const ExprTypeBridge = struct {
             .f64 => .f64,
             .f32 => .f32,
             .str => .str,
+            else => null,
+        };
+    }
+
+    /// The scalar a generic `-> T` call returns, inferred from the
+    /// deciding argument (a bare `T` arg's scalar type, or a `[T]`
+    /// arg's element type). Null when T isn't decidable here (record
+    /// Ts, unprovable shapes — the builder rejects those honestly).
+    fn genericRet(self: *ExprTypeBridge, fd: ast.FnDecl, call: ast.CallExpr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        const sig = parseGenericSig(fd.genericParams().?) orelse return null;
+        const rt = fd.returnType() orelse return null;
+        const which = sema.fits.typeWhich(rt.type_() orelse return null, sig, self.b.a) orelse return null;
+        const ps = fd.params() orelse return null;
+        var pit = ps.iter();
+        var ait = call.args();
+        while (pit.next()) |p| {
+            const a0 = ait.next() orelse return null;
+            if (bareWhich(p, sig, self.b.a)) |w| {
+                if (w != which) continue;
+                return switch ((try scalarOrNull(self, a0)) orelse return null) {
+                    .bool, .i64, .f64, .f32 => |sc| sc,
+                    else => null,
+                };
+            }
+            if (sliceOfWhich(p, sig, self.b.a)) |w| {
+                if (w != which) continue;
+                switch (a0) {
+                    .path => |pp| {
+                        // An array binding: its element type.
+                        const txt = try pp.text(self.b.a);
+                        defer self.b.a.free(txt);
+                        const ai = self.scope.arrs.get(txt) orelse return null;
+                        return switch (ai.elem) {
+                            .scalar => |t| switch (t) {
+                                .bool => .bool,
+                                .i64 => .i64,
+                                .f64 => .f64,
+                                .f32 => .f32,
+                                else => null,
+                            },
+                            .rec => null,
+                        };
+                    },
+                    .array => |ae| {
+                        // An array literal: its first element's type.
+                        var eit = ae.elements();
+                        const e0 = eit.next() orelse return null;
+                        return switch ((try scalarOrNull(self, e0)) orelse return null) {
+                            .bool, .i64, .f64, .f32 => |sc| sc,
+                            else => null,
+                        };
+                    },
+                    else => return null,
+                }
+            }
+        }
+        return null;
+    }
+
+    /// `exprScalar` mapped onto the total typing contract: a rejected/
+    /// unsupported shape types as "don't know", never an error.
+    fn scalarOrNull(self: *ExprTypeBridge, e: ast.Expr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        return exprScalar(self.b, e, self.scope) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
             else => null,
         };
     }
@@ -4452,19 +4566,74 @@ test "B5: a multi-param bound rejects the non-fitting slot" {
     try testing.expectEqual(hir.Reject.unsupported_call, r.?);
 }
 
-test "B5: a `-> T` generic return is honestly unsupported (needs by-value T)" {
+test "B5: bare `T` params + `-> T` returns (records by ptr, scalars by value)" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
     const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct Color { r: i64 }
+        \\fit Color : D { fn fmt(self) -> str { "c{self.r}" } }
+        \\fn show<T: D>(x: T) {
+        \\    env.out(x.fmt())
+        \\}
+        \\fn twice<T>(x: T) -> T {
+        \\    x + x
+        \\}
         \\fn first<T>(items: [T]) -> T {
         \\    items[0]
         \\}
         \\fn main {
+        \\    show(Color { r: 7 })
+        \\    env.out(twice(21))
+        \\    env.out(twice(1.5))
         \\    env.out(first([10, 20]))
         \\}
         \\
     ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // A bare record T is a `.ptr` param; `-> T` follows the slot's scalar.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn show<Color> -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn twice<i64> -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn twice<f64> -> f64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn first<i64> -> i64") != null);
+}
+
+test "B5: a record `-> T` return is honestly unsupported (caller record plumbing)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct P { v: i64 }
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn main {
+        \\    env.out(first([P { v: 1 }]))
+        \\}
+        \\
+    ;
     try testing.expect((try buildLocal(testing.allocator, &tr, src)) == null);
+}
+
+test "B5: a scalar to a bounded bare `T` is rejected (no scalar fits)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\fn show<T: D>(x: T) {
+        \\    env.out(x.fmt())
+        \\}
+        \\fn main {
+        \\    show(42)
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
 }
 
 test "B5: a scalar element type never satisfies a face bound" {
