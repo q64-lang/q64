@@ -141,9 +141,10 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
     const result = try parse.parse(gpa, source, path);
     defer result.deinit(gpa);
 
-    // Parse diagnostics + the sema file-level pass (today: NAM005 name
-    // collisions in the import scope — spec/modules.md). Sema only runs
-    // when the file parsed into a source-file root.
+    // Parse diagnostics + the sema passes: NAM005 import-scope collisions
+    // (spec/modules.md) and the A4 check pass (TYP042 / TYP051,
+    // spec/types.md). Sema only runs when the file parsed into a
+    // source-file root.
     var all_diags: std.ArrayList(diag.Diagnostic) = .empty;
     defer all_diags.deinit(gpa);
     try all_diags.appendSlice(gpa, result.diagnostics);
@@ -153,6 +154,22 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
         const sema_diags = try sema.fileDiagnostics(gpa, &table, path);
         defer gpa.free(sema_diags);
         try all_diags.appendSlice(gpa, sema_diags);
+
+        var store = try sema.types.TypeStore.init(gpa);
+        defer store.deinit();
+        var sigs = try sema.types.collectSignatures(&store, &table, sf);
+        defer sigs.deinit();
+        const check_diags = try sema.check.checkFile(gpa, sf, &table, &store, &sigs);
+        defer gpa.free(check_diags);
+        for (check_diags) |cd| {
+            try all_diags.append(gpa, .{
+                .code = cd.code,
+                .severity = .err,
+                .message = diag.messageFor(cd.code),
+                .file = path,
+                .offset = cd.offset,
+            });
+        }
     }
 
     var has_error = false;

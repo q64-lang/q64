@@ -1041,14 +1041,21 @@ pub const LetStmt = struct {
     }
 
     /// The initializer expression after `=`, if the binding has one.
-    /// The type annotation between the pattern and `=` is a raw token
-    /// span (no node), so the first `Expr`-shaped child is the value.
+    /// The `: TypeExpr` annotation between the pattern and `=` is a
+    /// type node (never `Expr`-shaped), so the first `Expr` child is
+    /// the value.
     pub fn initializer(self: LetStmt) ?Expr {
         for (self.cst.children) |c| switch (c) {
             .node => |n| if (Expr.cast(n)) |e| return e,
             .token => {},
         };
         return null;
+    }
+
+    /// The structured `: TypeExpr` annotation, or `null` when the binding
+    /// is unannotated.
+    pub fn type_(self: LetStmt) ?TypeExpr {
+        return firstChildType(self.cst);
     }
 };
 

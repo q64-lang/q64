@@ -695,13 +695,54 @@ verified, honest diagnostics throughout.
       expression types, and name lookup. What remains is *ownership of
       body scopes* (the Env bridge in build_hir adapts its wasm-slot
       Scope) — that collapses when the sema check pass lands with A4.
-- [ ] **A4 — first real TYP codes + sema-emitted NAM.** Arg-count/type
-      mismatches move from `UnsupportedCall` to their specced TYP codes;
-      the recorded unresolved heads + unresolved type names get their
-      NAM/TYP emission (a sema check pass with its own body scopes,
-      collapsing build_hir's Env bridge); flip the matching
-      `spec/tests/` fixtures from expected-future to passing. Conformance
-      count is the metric (today: 11 codes pass).
+- [ ] **A4 — first real TYP codes + sema-emitted NAM.** In progress:
+      - [x] **The check pass + TYP051/TYP042 emitted.** `sema/check.zig`:
+            the first sema layer that *emits* — walks fn bodies with
+            sema's own typed scopes (params from lowered signatures,
+            `let` bindings from annotations — new `ast.LetStmt.type_()`
+            accessor, the annotation was already parsed structured — or
+            inferred initializers; bare int literals stay *flexible* so
+            `a + 1` never false-fires). Emits **TYP051** (provably-integer
+            `if`/`while` condition) and **TYP042** (arithmetic mixing two
+            different known numeric types), both wired into `q64 check`
+            and the diag catalog. Conformance **11 → 13** of 45
+            (`types/int-as-bool.q`, `types/numeric-mismatch-no-implicit.q`
+            flip; zero golden regressions); q64-test's TYP042
+            `test.failing` flips to passing + a TYP051 case (78 CLI
+            tests); link-roundtrip PASS (emit path untouched).
+      - [ ] **NAM010 deferred — documented.** The corpus survey
+            (`show symbols` over spec/tests + fixtures + examples) shows
+            systematic false positives from not-yet-parsed forms: lambda
+            params, `graph`/`channel` exprs, named args (`capacity: 16`),
+            record-pattern fields, auto-prelude names (`sleep`). Unknown
+            heads stay recorded-only until those land + an auto-prelude
+            name table exists.
+      - [x] **Four more codes: TYP040 / TYP041 / TYP050 / TYP060.** One
+            shared `checkAgainstExpected(expected, value)` covers both
+            declared-type sites — call arguments (against this file's
+            lowered signatures; unknown callees silent) and annotated
+            `let` initializers: TYP041 (two different known numerics),
+            TYP050 (bool where integer expected), TYP051 (integer where
+            bool expected — literals are definitely integers, so they
+            fire here even though they stay flexible for TYP041/042).
+            TYP040 checks bare/negated literal initializers against the
+            annotated width (dec/hex/oct/bin, `_` separators, saturating
+            u128 parse; i8…u128 bounds incl. `-129`-style negatives).
+            TYP060 fires on a flattened [mode-kw, `:`] token prefix in a
+            call argument — judged on tokens, not node shape, because
+            recovery degrades `ref:` into a unary-expr wrapper.
+            Conformance **13 → 17 of 47** (int-literal-out-of-range +
+            mode-keyword-in-call flip; new `bool-as-int.q` +
+            `call-arg-numeric-mismatch.q` fixtures pass; INDEX rows
+            filled); 300 unit / 78 CLI / roundtrip green.
+      - [ ] **Value-call arity is unspecced** — no TYP code exists for a
+            plain wrong-argument-count call (`TYP100` covers *generic*
+            args only). Needs a types.md row + code before the check can
+            emit; today build_hir still rejects at emit as
+            `UnsupportedCall`.
+      - [ ] Unresolved *type* names (annotations) — blocked on the same
+            auto-prelude table as NAM010 (`Signal`, `Vec`, `Result`, …
+            would all false-fire today).
 
 ### Ladder B — struct values → static fits (after A3)
 

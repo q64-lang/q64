@@ -54,7 +54,7 @@ no test.
 | Code     | Owner           | Short message                                     | Test                                                     |
 |----------|-----------------|---------------------------------------------------|----------------------------------------------------------|
 | `TYP040` | types.md        | integer literal out of range                      | `types/int-literal-out-of-range.q`                       |
-| `TYP041` | types.md        | numeric type mismatch                             | —                                                        |
+| `TYP041` | types.md        | numeric type mismatch                             | `types/call-arg-numeric-mismatch.q`                      |
 | `TYP042` | types.md        | implicit numeric conversion is forbidden          | `types/numeric-mismatch-no-implicit.q`                   |
 | `TYP043` | types.md        | narrowing cast may overflow                       | —                                                        |
 | `TYP044` | types.md        | wrong mode for argument                           | —                                                        |
@@ -63,7 +63,7 @@ no test.
 | `TYP047` | types.md        | optional type not narrowed                        | `types/optional-not-narrowed.q`                          |
 | `TYP048` | types.md        | arb-width literal exceeds declared width          | —                                                        |
 | `TYP049` | types.md        | arb-width narrow can fail                         | —                                                        |
-| `TYP050` | types.md        | `bool` used as integer                            | —                                                        |
+| `TYP050` | types.md        | `bool` used as integer                            | `types/bool-as-int.q`                                    |
 | `TYP051` | types.md        | integer used as `bool`                            | `types/int-as-bool.q`                                    |
 | `TYP052` | types.md        | assignment to `let` binding                       | —                                                        |
 | `TYP053` | types.md        | use of uninitialized binding                      | —                                                        |
