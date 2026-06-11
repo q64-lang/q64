@@ -338,15 +338,15 @@ const Checker = struct {
     /// honestly.
     fn checkGenericBound(c: *Checker, gen_opt: ?GenericDecl, i: usize, arg: ast.Expr, info: Info) !void {
         const gen = gen_opt orelse return;
-        const face = gen.sig.bound orelse return;
         const reg = c.fitreg orelse return;
-        if (!reg.knowsFace(face)) return;
         const elem = switch (info) {
             .rec_array => |n| n,
             else => return,
         };
         const p = paramAt(gen.fd, i) orelse return;
-        if (!fits.isSliceOfT(p, gen.sig.tname, c.gpa)) return;
+        const which = fits.sliceOfWhich(p, gen.sig, c.gpa) orelse return;
+        const face = gen.sig.params[which].bound orelse return;
+        if (!reg.knowsFace(face)) return;
         if (reg.find(elem, face) == null) {
             try c.diags.append(c.gpa, .{
                 .code = "TYP200",
@@ -952,6 +952,30 @@ test "check: TYP200 — bounded generic call, element type has no fit" {
         \\fn main { show_all([Plain { v: 1 }]) }
         \\
     , &.{"TYP200"});
+}
+
+test "check: TYP200 — multi-param bounds judge each slot independently" {
+    // Only the second slot's element type lacks a fit: one TYP200.
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct NoFit { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "a" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) { }
+        \\fn main { both([A { x: 1 }], [NoFit { y: 2 }]) }
+        \\
+    , &.{"TYP200"});
+    // Both slots fit: clean.
+    try expectCodes(
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct B { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "a" } }
+        \\fit B : D { fn fmt(self) -> str { "b" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) { }
+        \\fn main { both([B { y: 2 }], [A { x: 1 }]) }
+        \\
+    , &.{});
 }
 
 test "check: TYP200 stays silent on fitting / unprovable shapes" {

@@ -1977,7 +1977,10 @@ fn elemPtrExpr(b: *Builder, ai: ArrInfo, index: *hir.Expr) BuildError!*hir.Expr 
 /// function.
 const GenericSig = sema.fits.GenericSig;
 const parseGenericSig = sema.fits.parseGenericSig;
-const isSliceOfT = sema.fits.isSliceOfT;
+const sliceOfWhich = sema.fits.sliceOfWhich;
+
+/// One inferred type-parameter slot: what T turned out to be.
+const TSlot = struct { elem: ElemKind, stride: u32 };
 
 /// The array info an argument denotes: a binding name or an array
 /// literal (which is built — its value expr rides along).
@@ -2006,35 +2009,31 @@ fn buildArrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!?ArrArg {
 /// Build `f(arg…)` against a generic declaration: infer T from the
 /// first `[T]` argument, fit-check the bound, stamp (or reuse) the
 /// instance, and emit the call statement.
-/// Build `f(arg…)` against a generic declaration: infer T from the
-/// first `[T]` argument, fit-check the bound, stamp (or reuse) the
-/// instance, and yield the call expression (the stamped instance's
-/// return type is on `b.funcs`).
+/// Build `f(arg…)` against a generic declaration: infer each type
+/// param from its first `[T]` argument, fit-check the bounds, stamp
+/// (or reuse) the instance, and yield the call expression (the stamped
+/// instance's return type is on `b.funcs`).
 fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Expr {
     const sig = parseGenericSig(fd.genericParams().?) orelse return error.Unsupported;
     const ps = fd.params() orelse return error.Unsupported;
 
-    // Walk params and args together: infer T at the first `[T]` arg.
-    var t_elem: ?ElemKind = null;
-    var t_stride: u32 = 0;
+    // Walk params and args together: each type param infers at its
+    // first `[T]` arg (and must stay consistent at later ones).
+    var slots: [sema.fits.max_generic_params]?TSlot = @splat(null);
     var args: std.ArrayList(*hir.Expr) = .empty;
-    var arr_args: std.ArrayList(ArrArg) = .empty;
-    defer arr_args.deinit(b.a);
     var pit = ps.iter();
     var ait = call.args();
     while (pit.next()) |p| {
         const a0 = ait.next() orelse return reject(b, .unsupported_call);
-        if (isSliceOfT(p, sig.tname, b.a)) {
+        if (sliceOfWhich(p, sig, b.a)) |which| {
             const aa = (try buildArrArg(b, a0, scope)) orelse return reject(b, .unsupported_call);
-            if (t_elem) |prev| {
-                if (!elemEql(prev, aa.elem)) return reject(b, .unsupported_call); // T must infer consistently
+            if (slots[which]) |prev| {
+                if (!elemEql(prev.elem, aa.elem)) return reject(b, .unsupported_call); // T must infer consistently
             } else {
-                t_elem = aa.elem;
-                t_stride = aa.stride;
+                slots[which] = .{ .elem = aa.elem, .stride = aa.stride };
             }
             try args.append(b.a, aa.ptr);
             try args.append(b.a, aa.count);
-            try arr_args.append(b.a, aa);
         } else {
             // A non-generic scalar parameter.
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
@@ -2048,14 +2047,16 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
         }
     }
     if (ait.next() != null) return reject(b, .unsupported_call);
-    const elem = t_elem orelse return error.Unsupported; // no `[T]` arg to infer from
+    // Every type param must have an inference source (a `[T]` param).
+    for (slots[0..sig.n]) |s| if (s == null) return error.Unsupported;
 
-    // The bound: T must fit the face (TYP200 — `q64 check` emits it;
-    // the emit path rejects honestly). Scalars have no fits yet, so a
-    // *bounded* generic takes record elements only; an unbounded one
+    // The bounds: each T must fit its face (TYP200 — `q64 check` emits
+    // it; the emit path rejects honestly). Scalars have no fits yet, so
+    // a *bounded* param takes record elements only; an unbounded one
     // stamps per scalar type as well.
-    if (sig.bound) |face| {
-        const si = switch (elem) {
+    for (sig.params[0..sig.n], 0..) |gp, i| {
+        const face = gp.bound orelse continue;
+        const si = switch (slots[i].?.elem) {
             .rec => |r| r,
             .scalar => return reject(b, .unsupported_call),
         };
@@ -2063,7 +2064,7 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
             return reject(b, .unsupported_call);
     }
 
-    const fid = try stampGeneric(b, gname, fd, sig, elem, t_stride);
+    const fid = try stampGeneric(b, gname, fd, sig, slots[0..sig.n]);
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
     return e;
@@ -2087,20 +2088,27 @@ fn elemEql(x: ElemKind, y: ElemKind) bool {
     };
 }
 
-/// Stamp (or fetch) the concrete instance `gname<T>` — T a record
-/// struct or a scalar type (`each<i64>`). The body builds with the
-/// entry-style builder (it may env.out), `[T]` params as (ptr, count)
-/// pairs registered in `Scope.arrs` with a *runtime* count, and its
-/// own locals list. A `-> i64`/`bool`/`f64`/`f32` declaration makes a
-/// *value-returning* instance: the body's last statement is its value
-/// tail (a tail expression or `return expr`); `-> T` and str/record
-/// returns are a later slice.
-fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, elem: ElemKind, stride: u32) BuildError!hir.FuncId {
-    const tname = switch (elem) {
-        .rec => |r| r.name,
-        .scalar => |t| @tagName(t),
-    };
-    const key = try std.fmt.allocPrint(b.a, "{s}<{s}>", .{ gname, tname });
+/// Stamp (or fetch) the concrete instance `gname<T1, T2…>` — each T a
+/// record struct or a scalar type (`each<i64>`). The body builds with
+/// the entry-style builder (it may env.out), `[T]` params as
+/// (ptr, count) pairs registered in `Scope.arrs` with a *runtime*
+/// count, and its own locals list. A `-> i64`/`bool`/`f64`/`f32`
+/// declaration makes a *value-returning* instance: the body's last
+/// statement is its value tail (a tail expression or `return expr`);
+/// `-> T` and str/record returns are a later slice.
+fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, slots: []const ?TSlot) BuildError!hir.FuncId {
+    var keybuf: std.ArrayList(u8) = .empty;
+    try keybuf.appendSlice(b.a, gname);
+    try keybuf.append(b.a, '<');
+    for (slots, 0..) |s, i| {
+        if (i > 0) try keybuf.appendSlice(b.a, ", ");
+        try keybuf.appendSlice(b.a, switch (s.?.elem) {
+            .rec => |r| r.name,
+            .scalar => |t| @tagName(t),
+        });
+    }
+    try keybuf.append(b.a, '>');
+    const key = try keybuf.toOwnedSlice(b.a);
     if (b.ids.get(key)) |id| return id;
 
     const ret_ty: hir.Type = if (fd.returnType() == null) .void else blk: {
@@ -2117,7 +2125,8 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     var pit = ps.iter();
     while (pit.next()) |p| {
         const pn = (p.name() orelse return error.Unsupported).text;
-        if (isSliceOfT(p, sig.tname, b.a)) {
+        if (sliceOfWhich(p, sig, b.a)) |which| {
+            const slot = slots[which].?;
             // (ptr, count): two wasm params, the arr registered on the name.
             const ptr_idx = try scope.declare(pn, false, .ptr);
             const hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{pn});
@@ -2127,8 +2136,8 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
             try scope.arrs.put(b.a, pn, .{
                 .ptr_idx = ptr_idx,
                 .count = .{ .local_idx = cnt_idx },
-                .stride = stride,
-                .elem = elem,
+                .stride = slot.stride,
+                .elem = slot.elem,
             });
         } else {
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
@@ -4386,6 +4395,61 @@ test "B5: value-returning generic calls (tail expr, return, composition)" {
     try testing.expect(std.mem.indexOf(u8, dump, "fn count_of<f64> -> i64") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn count_of<i64> -> i64") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn total<i64> -> i64") != null);
+}
+
+test "B5: multiple type params stamp per (T, U) combination" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct B { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+        \\fit B : D { fn fmt(self) -> str { "B{self.y}" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) {
+        \\    for x in xs { env.out(x.fmt()) }
+        \\    for y in ys { env.out(y.fmt()) }
+        \\}
+        \\fn zipped_count<T, U>(xs: [T], ys: [U]) -> i64 {
+        \\    xs.len + ys.len
+        \\}
+        \\fn main {
+        \\    both([A { x: 1 }], [B { y: 2 }])
+        \\    both([B { y: 7 }], [A { x: 8 }])
+        \\    env.out(zipped_count([1, 2], [1.5]))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Slot order is part of the instance identity.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn both<A, B> -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn both<B, A> -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn zipped_count<i64, f64> -> i64") != null);
+}
+
+test "B5: a multi-param bound rejects the non-fitting slot" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct NoFit { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+        \\fn both<T: D, U: D>(xs: [T], ys: [U]) {
+        \\    for x in xs { env.out(x.fmt()) }
+        \\}
+        \\fn main {
+        \\    both([A { x: 1 }], [NoFit { y: 2 }])
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
 }
 
 test "B5: a `-> T` generic return is honestly unsupported (needs by-value T)" {

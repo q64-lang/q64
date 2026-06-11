@@ -1050,4 +1050,44 @@ if [[ "$vgen32_out" != "$vgen_expected" ]]; then
 fi
 echo "    ok: total_area/total/count_of -> 26 / total = 60 / 102 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# B5 (multiple type params): each slot infers independently — both<A, B> and
+# both<B, A> are distinct instances; a value-returning <T, U> mixes scalars.
+# ---------------------------------------------------------------------------
+echo "==> B5: multi-param generics — both<T: D, U: D> / zipped_count<T, U>"
+mgen_app="$tmp/genmulti.q"
+cat > "$mgen_app" <<'Q64'
+face D { fn fmt(self) -> str }
+struct A { x: i64 }
+struct B { y: i64 }
+fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+fit B : D { fn fmt(self) -> str { "B{self.y}" } }
+fn both<T: D, U: D>(xs: [T], ys: [U]) {
+    for x in xs { env.out(x.fmt()) }
+    for y in ys { env.out(y.fmt()) }
+}
+fn zipped_count<T, U>(xs: [T], ys: [U]) -> i64 {
+    xs.len + ys.len
+}
+fn main {
+    both([A { x: 1 }], [B { y: 2 }, B { y: 3 }])
+    both([B { y: 7 }], [A { x: 8 }])
+    env.out(zipped_count([1, 2, 3], [1.5]))
+}
+Q64
+mgen_expected=$'A1\nB2\nB3\nB7\nA8\n4'
+"$Q64_BIN" emit "$mgen_app" "$tmp/genmulti.wasm"
+mgen_out="$("$HOST_BIN" "$tmp/genmulti.wasm")"
+if [[ "$mgen_out" != "$mgen_expected" ]]; then
+    echo "FAIL: multi-param generic output mismatch (got: $mgen_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$mgen_app" "$tmp/genmulti32.wasm" --addr wasm32
+mgen32_out="$("$HOST_BIN" "$tmp/genmulti32.wasm")"
+if [[ "$mgen32_out" != "$mgen_expected" ]]; then
+    echo "FAIL: multi-param generic wasm32 output mismatch (got: $mgen32_out)" >&2
+    exit 1
+fi
+echo "    ok: both<A, B> + both<B, A> + zipped_count<i64, f64> -> A1/B2/B3/B7/A8/4 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

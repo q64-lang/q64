@@ -950,9 +950,25 @@ verified, honest diagnostics throughout.
 - [ ] **B5 — generics beyond the first rung.** Monomorphization's v0
       floor landed with B4's close (one `<T: Face>` param, `[T]` slice
       params, record element types, void returns, statement calls).
-      Remaining: multiple type params, bare `T` params + `-> T`
-      returns (need the receiver-by-value story), const generics; then
-      `dyn` dispatch; enums + `match` lowering (separate ladders).
+      Remaining: bare `T` params + `-> T` returns (need the
+      receiver-by-value story), const generics; then `dyn` dispatch;
+      enums + `match` lowering (separate ladders).
+      - [x] **Multiple type params.** `fn both<T: D, U: D>(xs: [T],
+            ys: [U])` works: `sema.fits.GenericSig` is a bounded list
+            (`max_generic_params` = 4; `parseGenericSig` scans
+            `< T (: F)? (, …)* >`), `sliceOfWhich` maps a fn param to
+            its slot, inference fills one `TSlot` (ElemKind + stride)
+            per slot independently (every slot needs a `[T]` inference
+            source), bounds check per slot, and the stamp key joins all
+            slot names — so `both<A, B>` and `both<B, A>` are distinct
+            instances and `zipped_count<i64, f64>` mixes scalar slots
+            in a value-returning generic. sema's TYP200 resolves the
+            bound per slice param too (the multi-param fixture shape
+            judges each slot). Verified end-to-end wasm64 + wasm32
+            (link-roundtrip multi-param section) + 3 unit tests (both
+            orders + mixed-scalar value; non-fitting second slot;
+            TYP200 per-slot). 364 unit / 80 CLI / 21-of-49 /
+            roundtrips green.
       - [x] **Value-returning generic calls.** A `-> i64`/`bool`/`f64`/
             `f32` generic stamps a *value* instance: `count_of(xs)`,
             `let n = total(xs)`, `count_of(xs) + 100`, and a bounded

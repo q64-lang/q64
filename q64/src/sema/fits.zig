@@ -90,12 +90,23 @@ pub const Registry = struct {
 // (ir/build_hir.zig).
 // ---------------------------------------------------------------------
 
-pub const GenericSig = struct { tname: []const u8, bound: ?[]const u8 };
+pub const max_generic_params = 4;
 
-/// Parse the raw `<T: Display>` span: one type parameter with an
-/// optional face bound. More parameters are a later slice.
+/// One type parameter: `T` / `T: Face`.
+pub const GenericParam = struct { tname: []const u8, bound: ?[]const u8 };
+
+/// The parsed `<T: Display, U>` span (the B5 floor: plain type params
+/// with optional single-face bounds; effect params, defaults, and
+/// `where` clauses are later slices).
+pub const GenericSig = struct {
+    params: [max_generic_params]GenericParam,
+    n: usize,
+};
+
+/// Parse the raw `<T: Display, U>` span. `null` for anything beyond
+/// the floor (so the caller stays honest about it).
 pub fn parseGenericSig(gp: *const cst.Node) ?GenericSig {
-    var toks: [8]cst.Token = undefined;
+    var toks: [2 + 4 * max_generic_params]cst.Token = undefined;
     var n: usize = 0;
     for (gp.children) |ch| switch (ch) {
         .token => |t| {
@@ -106,29 +117,49 @@ pub fn parseGenericSig(gp: *const cst.Node) ?GenericSig {
         },
         .node => return null,
     };
-    // < IDENT >  |  < IDENT : IDENT >
-    if (n == 3 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .R_ANGLE)
-        return .{ .tname = toks[1].text, .bound = null };
-    if (n == 5 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .COLON and toks[3].kind == .IDENT and toks[4].kind == .R_ANGLE)
-        return .{ .tname = toks[1].text, .bound = toks[3].text };
-    return null;
+    if (n < 3 or toks[0].kind != .L_ANGLE or toks[n - 1].kind != .R_ANGLE) return null;
+
+    var out = GenericSig{ .params = undefined, .n = 0 };
+    var i: usize = 1;
+    while (i < n - 1) {
+        if (toks[i].kind != .IDENT or out.n == max_generic_params) return null;
+        var p = GenericParam{ .tname = toks[i].text, .bound = null };
+        i += 1;
+        if (i < n - 1 and toks[i].kind == .COLON) {
+            if (i + 1 >= n - 1 or toks[i + 1].kind != .IDENT) return null;
+            p.bound = toks[i + 1].text;
+            i += 2;
+        }
+        out.params[out.n] = p;
+        out.n += 1;
+        if (i < n - 1) {
+            if (toks[i].kind != .COMMA) return null;
+            i += 1; // a trailing comma before `>` is fine
+        }
+    }
+    if (out.n == 0) return null;
+    return out;
 }
 
-/// Is this param type `[T]` for the generic's T?
-pub fn isSliceOfT(p: ast.Param, tname: []const u8, a: std.mem.Allocator) bool {
-    const te = p.type_() orelse return false;
+/// Which of the signature's type params this fn param is a `[T]`
+/// slice of, if any (the index into `sig.params`).
+pub fn sliceOfWhich(p: ast.Param, sig: GenericSig, a: std.mem.Allocator) ?usize {
+    const te = p.type_() orelse return null;
     const sl = switch (te) {
         .slice => |x| x,
-        else => return false,
+        else => return null,
     };
-    const inner = sl.element() orelse return false;
+    const inner = sl.element() orelse return null;
     const pt = switch (inner) {
         .path => |x| x,
-        else => return false,
+        else => return null,
     };
-    const nm = pt.name(a) catch return false;
+    const nm = pt.name(a) catch return null;
     defer a.free(nm);
-    return std.mem.eql(u8, nm, tname);
+    for (sig.params[0..sig.n], 0..) |gp, i| {
+        if (std.mem.eql(u8, nm, gp.tname)) return i;
+    }
+    return null;
 }
 
 /// Build the registry for `sf` and run the fit-form checks. The caller
