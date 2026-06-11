@@ -17,6 +17,7 @@ const std = @import("std");
 const parser = @import("parser");
 const ast = parser.ast;
 const symbols = @import("symbols.zig");
+const prelude = @import("prelude.zig");
 
 pub const TypeId = u32;
 
@@ -57,6 +58,9 @@ pub const NamedKind = enum {
     /// Bound by an import; its declaring module isn't loaded in this
     /// pass, so the shape is unknown until cross-module resolution (A3).
     imported,
+    /// An auto-prelude type or face (spec/modules.md §"The auto-prelude",
+    /// mirrored in prelude.zig).
+    prelude,
 };
 
 pub const Type = union(enum) {
@@ -245,6 +249,9 @@ pub fn lower(store: *TypeStore, table: ?*const symbols.SymbolTable, te_opt: ?ast
                 };
                 return store.intern(.{ .named = .{ .kind = kind, .name = name, .args = args } });
             };
+            if (prelude.isType(name)) {
+                return store.intern(.{ .named = .{ .kind = .prelude, .name = name, .args = args } });
+            }
             return store.intern(.{ .unresolved = name });
         },
         .optional => |o| {

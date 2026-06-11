@@ -735,14 +735,31 @@ verified, honest diagnostics throughout.
             mode-keyword-in-call flip; new `bool-as-int.q` +
             `call-arg-numeric-mismatch.q` fixtures pass; INDEX rows
             filled); 300 unit / 78 CLI / roundtrip green.
-      - [ ] **Value-call arity is unspecced** — no TYP code exists for a
-            plain wrong-argument-count call (`TYP100` covers *generic*
-            args only). Needs a types.md row + code before the check can
-            emit; today build_hir still rejects at emit as
-            `UnsupportedCall`.
-      - [ ] Unresolved *type* names (annotations) — blocked on the same
-            auto-prelude table as NAM010 (`Signal`, `Vec`, `Result`, …
-            would all false-fire today).
+      - [x] **TYP061 specced + emitted (arity).** types.md gains the row
+            ("wrong number of call arguments"; generic-arg count stays
+            TYP100); catalog entry; check emission against this file's
+            signatures. Guarded by an argument-list **well-formedness
+            check** (`( ARG (, ARG)* ,? )` exactly): parse recovery
+            degrades unsupported forms — record literals, `ref:` — into
+            back-to-back CALL_ARGs, which would misalign per-arg checks
+            and inflate the count (caught as a golden regression on
+            library-face-fit.q before the guard; per-arg TYP041/050/051
+            now also gated on it). Conformance 17 → 18 of 48.
+      - [x] **Auto-prelude name table** (`sema/prelude.zig`): the
+            identifier-shaped rows of modules.md §"The auto-prelude",
+            kind-classified (type/face/value). Wired into resolve.zig
+            (prelude heads no longer record as unknown — `sleep`,
+            `channel`, policy names) and types.zig lowering
+            (`Vec<f32>`/`Signal<…>` → `.named{.prelude}` instead of
+            `.unresolved`). The *transitive* prelude (capability-face
+            signature types: `Url`, `Response`, …) is computed-not-
+            curated and waits for loadable stdlib faces.
+      - [ ] NAM010 / unresolved-type emission — still blocked on parser
+            gaps (lambdas, graph/channel exprs, named args, record
+            patterns, generic-param scoping), per the survey; the
+            prelude table removed its share of false positives
+            (corpus unresolved heads down, all remaining are parser-gap
+            forms).
 
 ### Ladder B — struct values → static fits (after A3)
 

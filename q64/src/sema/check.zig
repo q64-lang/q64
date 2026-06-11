@@ -177,6 +177,13 @@ const Checker = struct {
                     break :blk c.sigs.find(name);
                 };
 
+                // Positional claims (per-arg type checks, the TYP061
+                // count) are only honest on a *well-formed* argument
+                // list. Parse recovery degrades unsupported forms —
+                // record literals, `ref:` — into extra CALL_ARGs, which
+                // would misalign indices and inflate the count.
+                const wf = argsWellFormed(cc);
+
                 // Type the arguments (a mismatch can hide inside) and,
                 // when this file's signature is known, check each one
                 // against its parameter.
@@ -184,10 +191,20 @@ const Checker = struct {
                 var i: usize = 0;
                 while (args.next()) |a| : (i += 1) {
                     const info = try c.typeOf(a);
+                    if (!wf) continue;
                     const s = sig orelse continue;
-                    if (i >= s.params.len) continue; // arity is unspecced today
+                    if (i >= s.params.len) continue; // counted below (TYP061)
                     try c.checkAgainstExpected(s.params[i], info, firstTokenOffset(exprNode(a)));
                 }
+                // TYP061: argument count vs the declaration.
+                if (wf) if (sig) |s| {
+                    if (i != s.params.len) {
+                        try c.diags.append(c.gpa, .{
+                            .code = "TYP061",
+                            .offset = firstTokenOffset(cc.cst),
+                        });
+                    }
+                };
 
                 const s = sig orelse return .unknown;
                 return switch (c.store.get(s.ret)) {
@@ -516,6 +533,41 @@ fn firstChildPattern(node: *const cst.Node) ?ast.Pattern {
     return null;
 }
 
+/// Did this call's argument list parse cleanly? Well-formed means the
+/// CALL_ARGS children read `( ARG (, ARG)* ,? )` with nothing stray.
+/// Recovery from unsupported forms (record literals, `ref:`) leaves
+/// back-to-back CALL_ARGs or loose tokens, which this rejects.
+fn argsWellFormed(cc: ast.CallExpr) bool {
+    for (cc.cst.children) |ch| switch (ch) {
+        .node => |n| if (n.kind == .CALL_ARGS) {
+            var expect_arg = true; // after `(` or `,`
+            var closed = false;
+            for (n.children) |e| switch (e) {
+                .token => |t| {
+                    if (t.kind.isTrivia()) continue;
+                    switch (t.kind) {
+                        .L_PAREN => {},
+                        .COMMA => {
+                            if (expect_arg) return false; // `(,` / `,,`
+                            expect_arg = true;
+                        },
+                        .R_PAREN => closed = true,
+                        else => return false, // stray token
+                    }
+                },
+                .node => |a| {
+                    if (a.kind != .CALL_ARG) return false;
+                    if (!expect_arg) return false; // two args, no comma
+                    expect_arg = false;
+                },
+            };
+            return closed;
+        },
+        .token => {},
+    };
+    return false; // no argument list at all
+}
+
 /// The first two non-trivia tokens under `node`, in source order.
 fn firstTwoTokens(node: *const cst.Node, first: *?cst.Token, second: *?cst.Token) void {
     for (node.children) |c| {
@@ -719,6 +771,26 @@ test "check: call arguments check against this file's signatures" {
     , &.{});
     // Unknown callee: silent.
     try expectCodes("fn main { ghost(true) }\n", &.{});
+}
+
+test "check: TYP061 — wrong number of call arguments" {
+    try expectCodes(
+        \\fn add(a: i64, b: i64) -> i64 { a + b }
+        \\fn main { env.out(add(1)) }
+        \\
+    , &.{"TYP061"});
+    try expectCodes(
+        \\fn add(a: i64, b: i64) -> i64 { a + b }
+        \\fn main { env.out(add(1, 2, 3)) }
+        \\
+    , &.{"TYP061"});
+    try expectCodes(
+        \\fn add(a: i64, b: i64) -> i64 { a + b }
+        \\fn main { env.out(add(1, 2)) }
+        \\
+    , &.{});
+    // Unknown callee: no signature, no arity claim.
+    try expectCodes("fn main { ghost(1, 2, 3) }\n", &.{});
 }
 
 test "check: TYP060 — mode keyword in call argument" {
