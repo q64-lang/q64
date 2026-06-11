@@ -296,7 +296,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
                 try out.append(b.a, st);
-            } else if (init_expr == .record and try recordEscapes(b, nm.text)) {
+            } else if (init_expr == .record and (try recordEscapes(b, nm.text) or try recordHasNarrow(b, init_expr.record))) {
                 // B2b: the binding is used as a whole value somewhere in
                 // `main` (passed to a call, …) — materialize it in the scope
                 // arena and bind the base pointer. Field access becomes
@@ -304,7 +304,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const rv = (try buildRecExpr(b, init_expr, scope)) orelse return error.Unsupported;
                 try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
             } else if (init_expr == .record) {
-                // B2 (SROA): a *non-escaping* record-literal binding lowers
+                // B2 (SROA): a *non-escaping*, all-wide record-literal binding lowers
                 // to one scalar local per field, *named with the dotted
                 // access path* ("p.x"). `p.x` parses as a single greedy
                 // PATH_EXPR, so the existing path machinery — reads, `var`
@@ -337,9 +337,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
             } else {
                 // A runtime value binding: an i64 (`let a = double(21)`) or a
+                // (a narrow field read must widen explicitly: i64(c.r))
                 // bool (`let even = n % 2 == 0`, `var flag = true`). A bool
                 // binding takes one slot too — its value is an i32 0/1.
-                const lty: hir.Type = scalarBindTy(try exprScalar(b, init_expr, scope));
+                const init_sc = try exprScalar(b, init_expr, scope);
+                if (init_sc == .narrow_int) return error.Unsupported;
+                const lty: hir.Type = scalarBindTy(init_sc);
                 // Build the initializer first so it can't see its own name,
                 // then allocate a single local and register in scope so later
                 // expressions can resolve it. The local index is the current
@@ -457,6 +460,16 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // Same typing discipline as a local: plain `=` must match the
                 // field's type; compound ops are i64 arithmetic.
                 if (!rf.mutable) return reject(b, .immutable_assign);
+                if (narrowRange(rf.ty) != null) {
+                    // A narrow field: plain `=` of an in-range literal only
+                    // (compound ops are arithmetic — unsupported on narrows).
+                    if (op.kind != .EQ) return error.Unsupported;
+                    const base0 = try b.a.create(hir.Expr);
+                    base0.* = .{ .local = .{ .idx = rf.base_idx, .ty = .ptr } };
+                    st.* = .{ .field_set = .{ .base = base0, .offset = rf.offset, .ty = rf.ty, .value = try buildNarrowValue(b, rf.ty, rhs_ast) } };
+                    try out.append(b.a, st);
+                    return;
+                }
                 const rhs_sc = try exprScalar(b, rhs_ast, scope);
                 if (op.kind == .EQ) {
                     if (scalarBindTy(rhs_sc) != rf.ty) return error.Unsupported;
@@ -1188,7 +1201,11 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                     } else if (try findRecField(scope, ptext)) |rf| {
                         // `{p.x}` on a materialized record: format the
                         // numeric field. (A bool field has no text form yet.)
-                        if (rf.ty != .i64 and rf.ty != .f64 and rf.ty != .f32) return error.Unsupported;
+                        const interp_ok = switch (rf.ty) {
+                            .i64, .f64, .f32, .u8, .i8, .u16, .i16, .u32, .i32 => true,
+                            else => false,
+                        };
+                        if (!interp_ok) return error.Unsupported;
                         try flush(b, &lit, &pieces);
                         const piece = try b.a.create(hir.Expr);
                         piece.* = switch (rf.ty) {
@@ -1305,6 +1322,11 @@ fn semaScalar(b: *Builder, te_opt: ?ast.TypeExpr) std.mem.Allocator.Error!?hir.T
         .builtin => |bi| switch (bi) {
             .i64 => .i64,
             .i32 => .i32,
+            .u32 => .u32,
+            .i16 => .i16,
+            .u16 => .u16,
+            .i8 => .i8,
+            .u8 => .u8,
             .f32 => .f32,
             .f64 => .f64,
             .bool => .bool,
@@ -1337,10 +1359,60 @@ fn paramScalar(b: *Builder, p: ast.Param) std.mem.Allocator.Error!?hir.Type {
 fn fieldWidth(ty: hir.Type) ?struct { size: u32, alignment: u32 } {
     return switch (ty) {
         .i64, .f64 => .{ .size = 8, .alignment = 8 },
-        .f32 => .{ .size = 4, .alignment = 4 },
+        .u32, .i32, .f32 => .{ .size = 4, .alignment = 4 },
+        .u16, .i16 => .{ .size = 2, .alignment = 2 },
+        .u8, .i8 => .{ .size = 1, .alignment = 1 },
         .bool => .{ .size = 1, .alignment = 1 },
         else => null,
     };
+}
+
+/// The value range of a narrow integer storage type, or null for
+/// non-narrow types. Field initializers/assignments must be literals
+/// inside this range (the build-time mirror of TYP040).
+fn narrowRange(ty: hir.Type) ?struct { min: i64, max: i64 } {
+    return switch (ty) {
+        .u8 => .{ .min = 0, .max = 255 },
+        .i8 => .{ .min = -128, .max = 127 },
+        .u16 => .{ .min = 0, .max = 65535 },
+        .i16 => .{ .min = -32768, .max = 32767 },
+        .u32 => .{ .min = 0, .max = 4294967295 },
+        .i32 => .{ .min = -2147483648, .max = 2147483647 },
+        else => null,
+    };
+}
+
+/// Build a narrow-field initializer/assignment value: a bare (or
+/// negated) integer literal inside the field's range. Anything else —
+/// an i64 expression, another field — needs an explicit narrowing cast,
+/// which waits on the trapping-cast slice; honestly Unsupported.
+fn buildNarrowValue(b: *Builder, ty: hir.Type, fval: ast.Expr) BuildError!*hir.Expr {
+    const r = narrowRange(ty).?;
+    const v: i64 = switch (fval) {
+        .num_lit => |n| blk: {
+            const tok = n.token() orelse return error.Unsupported;
+            if (tok.kind != .INT_LIT) return error.Unsupported;
+            break :blk consteval.parseIntLit(tok.text) catch return error.Unsupported;
+        },
+        .unary => |u| blk: {
+            const op = u.op() orelse return error.Unsupported;
+            if (op.kind != .MINUS) return error.Unsupported;
+            const inner = u.operand() orelse return error.Unsupported;
+            const n = switch (inner) {
+                .num_lit => |nl| nl,
+                else => return error.Unsupported,
+            };
+            const tok = n.token() orelse return error.Unsupported;
+            if (tok.kind != .INT_LIT) return error.Unsupported;
+            const mag = consteval.parseIntLit(tok.text) catch return error.Unsupported;
+            break :blk -mag;
+        },
+        else => return error.Unsupported,
+    };
+    if (v < r.min or v > r.max) return reject(b, .not_const); // out of range for the width
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .int_const = v };
+    return out;
 }
 
 /// Lay out every struct declaration in `sf` (declaration order, natural
@@ -1458,6 +1530,18 @@ fn recFieldExpr(b: *Builder, rf: RecField) BuildError!*hir.Expr {
 /// (`p.x`) parses as one greedy dotted PATH_EXPR and never matches.
 /// Conservative: a match anywhere (even before the binding) materializes
 /// the record; SROA is the optimization, not the semantics.
+/// Does the record literal's struct declare any narrow integer field?
+/// Narrow fields are *storage* — their range checks and width truncation
+/// only exist in memory, so such records always materialize (SROA has no
+/// storage and would silently widen them).
+fn recordHasNarrow(b: *Builder, re: ast.RecordExpr) BuildError!bool {
+    const pname = try (re.path() orelse return false).text(b.a);
+    defer b.a.free(pname);
+    const si = b.structs.get(pname) orelse return false;
+    for (si.fields) |f| if (narrowRange(f.ty) != null) return true;
+    return false;
+}
+
 fn recordEscapes(b: *Builder, name: []const u8) BuildError!bool {
     const body = b.main_body orelse return false;
     return nodeHasWholePath(b, body.cst, name);
@@ -1656,6 +1740,14 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
                 const fname = fi.name() orelse return error.Unsupported;
                 const fval = fi.value() orelse return error.Unsupported; // shorthand inits: later
                 const f = si.field(fname.text) orelse return error.Unsupported;
+                if (narrowRange(f.ty) != null) {
+                    // A narrow integer field: an in-range literal (the
+                    // build-time mirror of TYP040); wider values need the
+                    // trapping narrowing cast, a later slice.
+                    try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildNarrowValue(b, f.ty, fval) });
+                    seen += 1;
+                    continue;
+                }
                 // No implicit conversion: the value's scalar kind must
                 // match the field's declared type.
                 if (scalarBindTy(try exprScalar(b, fval, scope)) != f.ty) return error.Unsupported;
@@ -1749,8 +1841,10 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
             // No implicit conversion: each arg's scalar kind must match
             // its parameter (bool ≠ int ≠ float).
             .int => {
-                const sc = try exprScalar(b, a, scope);
-                if (sc == .bool or sc == .f64) return reject(b, .unsupported_call);
+                switch (try exprScalar(b, a, scope)) {
+                    .i64, .unknown => {},
+                    else => return reject(b, .unsupported_call), // bool/float/narrow need a cast
+                }
                 try args.append(b.a, try buildIntExpr(b, a, scope));
             },
             .float => |want| {
@@ -1831,6 +1925,7 @@ const ExprTypeBridge = struct {
                 .i64 => .i64,
                 .f64 => .f64,
                 .f32 => .f32,
+                .u8, .i8, .u16, .i16, .u32, .i32 => .narrow_int,
                 else => .unknown,
             };
         };
@@ -1944,7 +2039,9 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             // A `bool` binding (`let even = n % 2 == 0`) gets a bool local; any
             // other value expression is i64. (str lets in a value body aren't
             // reached here — those functions take the str path.)
-            const ty: hir.Type = scalarBindTy(try exprScalar(b, init_expr, scope));
+            const init_sc = try exprScalar(b, init_expr, scope);
+            if (init_sc == .narrow_int) return error.Unsupported; // widen explicitly: i64(c.r)
+            const ty: hir.Type = scalarBindTy(init_sc);
             // Build the initializer before declaring, so it can't see itself.
             const value = try buildIntExpr(b, init_expr, scope);
             const idx = try scope.declare(nm.text, ls.isVar(), ty);
@@ -2108,6 +2205,9 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             {
                 const ls = try exprScalar(b, bx.lhs() orelse return error.Unsupported, scope);
                 const rs2 = try exprScalar(b, bx.rhs() orelse return error.Unsupported, scope);
+                // Narrow-int arithmetic waits on the spec pinning overflow
+                // semantics (wrap vs trap); widen explicitly: i64(c.r) + 1.
+                if (ls == .narrow_int or rs2 == .narrow_int) return error.Unsupported;
                 if (isFloatSc(ls) or isFloatSc(rs2)) {
                     if (ls != rs2) return error.Unsupported;
                     const float_ok = switch (op_tok.kind) {
@@ -3456,6 +3556,66 @@ test "f32: floats never mix — f32+f64, f32+int, and bool casts are Unsupported
         "fn main {\n    env.out(f32(true))\n}\n",
     };
     for (cases) |src| {
+        var tr = TestResolver{ .a = testing.allocator };
+        defer tr.deinit();
+        try tr.addLib(src);
+        try testing.expect((try buildFromSource(testing.allocator, src, tr.resolver())) == null);
+    }
+}
+
+test "narrow ints: u8 fields store/load width-true; explicit widening composes" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Color { r: u8, g: u8, b: u8 }
+        \\struct Mix { tag: i8, count: u16, id: u32 }
+        \\
+        \\fn sum_rg(c: Color) -> i64 { i64(c.r) + i64(c.g) }
+        \\
+        \\fn main {
+        \\    let c = Color { r: 255, g: 128, b: 0 }
+        \\    env.out(sum_rg(c))
+        \\    var m = Mix { tag: -5, count: 65535, id: 4294967295 }
+        \\    m.tag = -7
+        \\    env.out("tag = {m.tag}, id = {m.id}")
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Three u8s pack to 3 bytes at align 1; Mix is i8@0, u16@2, u32@4 → 8/4.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=3 align=1") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=8 align=4") != null);
+    // Narrow reads format through fmt_int (the widened load).
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_int(field_get(") != null);
+}
+
+test "narrow ints: range checks and the no-implicit-widening rule" {
+    // Out of range for the width → the honest NotConstExpr.
+    {
+        var tr = TestResolver{ .a = testing.allocator };
+        defer tr.deinit();
+        const src =
+            \\struct C { r: u8 }
+            \\fn main {
+            \\    let c = C { r: 256 }
+            \\    env.out(c.r)
+            \\}
+            \\
+        ;
+        try tr.addLib(src);
+        const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+        try testing.expectEqual(hir.Reject.not_const, r.?);
+    }
+    // Narrow arithmetic and narrow bindings need an explicit i64(...) cast.
+    const unsupported = [_][]const u8{
+        "struct C { r: u8 }\nfn main {\n    let c = C { r: 9 }\n    env.out(c.r + 1)\n}\n",
+        "struct C { r: u8 }\nfn main {\n    let c = C { r: 9 }\n    let x = c.r\n    env.out(x)\n}\n",
+    };
+    for (unsupported) |src| {
         var tr = TestResolver{ .a = testing.allocator };
         defer tr.deinit();
         try tr.addLib(src);

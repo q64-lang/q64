@@ -261,9 +261,12 @@ returned whole, stored in another struct, or referenced via `ref`.
 
 > **Status (impl):** v0 lowers escaping record values into the scope
 > arena (no reclamation yet), passes and returns them as a single
-> pointer at the build's address width, and supports `i64` and `bool`
-> fields; nested structs, `str`/`ref` fields, and `q64 show layout`
-> are the next slices.
+> pointer at the build's address width, and supports `i64`, `f64`,
+> `f32`, the narrow integer widths (`u8`/`i8`/`u16`/`i16`/`u32`/`i32`
+> — storage-only: width-true loads/stores, in-range literal inits,
+> arithmetic via explicit `i64(x)` widening), and `bool` fields;
+> nested structs, `str`/`ref` fields, and `q64 show layout` are the
+> next slices.
 
 ## Marking a struct managed
 

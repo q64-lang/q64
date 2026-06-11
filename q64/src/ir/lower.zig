@@ -132,7 +132,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         },
         .global_set => |gs| return mk(ctx.a, .void, .{ .global_set = .{ .idx = gs.idx, .value = try lowerExpr(ctx, gs.value) } }),
         .str_let => |sl| return mk(ctx.a, .void, .{ .str_bind = .{ .ptr_idx = sl.ptr_idx, .len_idx = sl.len_idx, .value = try lowerStrExpr(ctx, sl.value) } }),
-        .field_set => |fs| return mk(ctx.a, .void, .{ .field_set = .{ .base = try lowerExpr(ctx, fs.base), .offset = fs.offset, .value = try lowerExpr(ctx, fs.value) } }),
+        .field_set => |fs| return mk(ctx.a, .void, .{ .field_set = .{ .base = try lowerExpr(ctx, fs.base), .offset = fs.offset, .width = storageOf(fs.ty).width, .value = try lowerExpr(ctx, fs.value) } }),
         .let => |l| return mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } }),
         // Void control flow — shared by `main` and function-body setup
         // statements (a non-tail `if`/`while`/`loop`/assign/break/continue).
@@ -371,11 +371,16 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         // yield the base pointer. The store width rides on each value's type.
         .record_alloc => |ra| {
             const inits = try ctx.a.alloc(mir.FieldInit, ra.inits.len);
-            for (ra.inits, 0..) |fi, i| inits[i] = .{ .offset = fi.offset, .value = try lowerExpr(ctx, fi.value) };
+            for (ra.inits, 0..) |fi, i| inits[i] = .{ .offset = fi.offset, .width = storageOf(fi.ty).width, .value = try lowerExpr(ctx, fi.value) };
             return mk(ctx.a, .ptr, .{ .record_make = .{ .size = ra.size, .alignment = ra.alignment, .inits = inits } });
         },
-        // A field read through the base pointer; the loaded type rides on `ty`.
-        .field_get => |fg| return mk(ctx.a, mapType(fg.ty), .{ .field_get = .{ .base = try lowerExpr(ctx, fg.base), .offset = fg.offset } }),
+        // A field read through the base pointer: the storage width and
+        // signedness come from the declared field type; a narrow integer
+        // widens (sign-/zero-extended) into the i64 compute floor.
+        .field_get => |fg| {
+            const st = storageOf(fg.ty);
+            return mk(ctx.a, mapType(fg.ty), .{ .field_get = .{ .base = try lowerExpr(ctx, fg.base), .offset = fg.offset, .width = st.width, .signed = st.signed } });
+        },
         // `s.len` — lower the str operand to its (ptr, len) value; the backend
         // reads the len component and zero-extends it to i64.
         .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
@@ -401,13 +406,31 @@ fn isCmp(k: hir.ops.BinKind) bool {
 fn mapType(t: hir.Type) mir.ValueType {
     return switch (t) {
         .i64 => .i64,
-        .i32 => .i32,
+        .i32, .u32, .i16, .u16, .i8, .u8 => .i64, // narrow ints compute as i64 (storage width is a field concern)
         .f32 => .f32,
         .f64 => .f64,
         .str => .str,
         .bool => .i32, // a boolean is an i32 0/1 at the executable tier
         .ptr => .ptr,
         .void => .void,
+    };
+}
+
+/// The storage width (bytes) and load signedness of a field type, per
+/// spec/memory.md §"Linear struct layout".
+fn storageOf(t: hir.Type) struct { width: u8, signed: bool } {
+    return switch (t) {
+        .i64 => .{ .width = 8, .signed = true },
+        .f64 => .{ .width = 8, .signed = true },
+        .f32 => .{ .width = 4, .signed = true },
+        .i32 => .{ .width = 4, .signed = true },
+        .u32 => .{ .width = 4, .signed = false },
+        .i16 => .{ .width = 2, .signed = true },
+        .u16 => .{ .width = 2, .signed = false },
+        .i8 => .{ .width = 1, .signed = true },
+        .u8 => .{ .width = 1, .signed = false },
+        .bool => .{ .width = 1, .signed = false },
+        .str, .ptr, .void => .{ .width = 8, .signed = true }, // not field types; unreachable in practice
     };
 }
 

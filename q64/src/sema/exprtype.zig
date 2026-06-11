@@ -21,7 +21,18 @@ const cst = parser.cst;
 /// The scalar floor (mirrors what codegen can represent today).
 /// `unknown` is "not provable at this floor" — callers treat it as
 /// not-bool / not-str rather than an error.
-pub const ScalarType = enum { i64, f32, f64, bool, str, unknown };
+pub const ScalarType = enum {
+    i64,
+    f32,
+    f64,
+    bool,
+    str,
+    /// A provably sub-i64 integer (a `u8`…`i32` field read): storage-only
+    /// in v0 — formattable and castable, but arithmetic on it is rejected
+    /// until the spec pins narrow-overflow semantics.
+    narrow_int,
+    unknown,
+};
 
 /// Caller-injected lookups. Both return `null` for "not found / not
 /// scalar"; `callRet` may allocate (signature lowering), hence the
