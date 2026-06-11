@@ -605,8 +605,9 @@ For a `pub` function, the inferred set is part of the qube's
 public surface. The compiler emits the set into the function's
 effect signature and (per `effects.md`) verifies it matches any
 explicit effect annotation. The qube manifest's `capabilities`
-field is cross-checked against the union of all `pub` items' sets
-at `qube publish` time (`ENV040`).
+field is generated from the union of all `pub` items' sets at
+`qube publish` time (synced in place — see §"`qube publish` sync";
+`ENV040` is the registry-side backstop).
 
 The inferred set is computed **after** `with_capabilities`
 resolution: a function whose body wraps every call in
@@ -707,28 +708,30 @@ qube's* function. It still discloses like the others — it appears in the
 derived set, in `qube audit`, and in the component's import list — but its
 "capability" is an imported remote `world`, not an `Env` field.
 
-### `qube publish` cross-check
+### `qube publish` sync
 
-The two must match. `qube publish` runs the cross-check; mismatch
-is `ENV040`:
+The manifest's `capabilities` field is **generated** (per
+[`qube.json5.md`](./qube.json5.md) §Capabilities): `qube publish`
+derives the set from the compiler and rewrites the field in place
+before packing, reporting the change:
 
 ```
 $ qube publish
-ERR ENV040: capability mismatch — manifest claims [Net, Fs]
-            but compiler derived [Net, Fs, Audio]
-
-  Audio appears via:
-    src/notify.q:42  → env.audio.beep()
-    src/notify.q:53  → env.audio.beep()
-
-  Fix:
-    qube.json5:  capabilities: ["Net", "Fs", "Audio"]
-    or remove the audio call sites and rebuild.
+qube publish: capabilities synced to ["Audio", "Fs", "Net"] (compiler-derived)
 ```
 
-The error block names the call sites that introduced each
-unmanifested capability, so the developer can decide whether to
-declare it or remove the dependency.
+There is nothing for the developer to fix by hand — the field
+follows the code. The decision a publisher actually makes is
+whether the *derived* set is the one they intend to ship;
+`q64 show capabilities` names the call sites that introduce each
+capability, so an unexpected entry (say, `Audio` pulled in by a
+new dependency) can be traced and removed at the source.
+
+`ENV040` (missing capability) and `ENV041` (extraneous capability)
+remain the **registry-side backstop**: the server re-derives the
+set from the uploaded archive and rejects a manifest that
+disagrees. Because the toolchain syncs before upload, these fire
+only for stale or non-toolchain clients.
 
 ### Registry surfacing
 
@@ -793,8 +796,8 @@ for expansion.
 | `ENV011` | (retired)                                      | Companion to ENV010. Number reserved; not reused.                                 |
 | `ENV020` | `.mock()` outside `@test` context              | A capability fit's mock constructor was called from non-test code.                |
 | `ENV030` | capability denied (runtime)                    | A capability call entered a `with_capabilities(deny: …)` block's denial set.       |
-| `ENV040` | manifest / derived capability mismatch         | `qube publish` cross-check failed; manifest and compiler-derived sets differ.     |
-| `ENV041` | manifest declares unused capability            | `qube publish` warning; manifest lists a capability the code doesn't reach.       |
+| `ENV040` | manifest / derived capability mismatch         | Registry backstop at publish: the uploaded manifest omits a capability the server's effect index detects. A toolchain `qube publish` syncs first, so this indicates a stale or non-toolchain client. |
+| `ENV041` | manifest declares unused capability            | Registry backstop at publish (warning): the uploaded manifest lists a capability the code doesn't reach. |
 | `ENV050` | `main` Form 2 ends without return              | `fn main -> Result<…>` (or `fn main(env: Env) -> Result<…>`) body falls off without an explicit `return` / tail expression. |
 | `ENV051` | `main` not declared                            | A qube of kind `app` has no `main` function.                                       |
 | `ENV052` | `main` signature mismatch                      | `main` exists but doesn't match any of the four permitted shapes.                 |
@@ -1024,7 +1027,7 @@ OK fetcher@0.1.0 — capabilities verified [Net, Fs, Stdout]
   (`@send` by default); pass through scopes normally. The ambient
   binding lives in the enclosing function's scope arena.
 - [`qube.json5.md`](./qube.json5.md) — the `capabilities` field
-  in the manifest; the `qube publish` cross-check.
+  in the manifest; the `qube publish` sync.
 - [`continuum-api.md`](./continuum-api.md) — registry surfacing
   of capabilities at install time.
 - [`q64-cli.md`](./q64-cli.md) — `q64 show env <fn>` (new) prints

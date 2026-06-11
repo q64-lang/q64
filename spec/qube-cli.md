@@ -365,13 +365,18 @@ Inside `stdlib/` (workspace root with `members: ["math", "anim", ...]`):
 1. Validate `qube.json5` against the schema.
 2. Refuse if `publish: false`, or if version already exists on the
    registry.
-3. Build the include/exclude file list; pack to a `.zip` archive.
-4. Run a clean build against the **release** profile to confirm it
+3. **Sync the generated `capabilities` field**: derive the set from
+   the compiler (`q64 show capabilities`) and rewrite the manifest
+   field in place when it drifts (per
+   [`qube.json5.md`](./qube.json5.md) §Capabilities). A qube whose
+   entry does not compile aborts here (exit `64`).
+4. Build the include/exclude file list; pack to a `.zip` archive.
+5. Run a clean build against the **release** profile to confirm it
    compiles (errors abort publish).
-5. Authenticate against the registry using `~/.qube/credentials.toml`.
-6. Upload the archive; the registry validates schema, checks ownership,
-   indexes effects.
-7. Cache the published version locally.
+6. Authenticate against the registry using `~/.qube/credentials.toml`.
+7. Upload the archive; the registry validates schema, checks ownership,
+   indexes effects, and re-checks `capabilities` as a backstop.
+8. Cache the published version locally.
 
 On failure, `qube` emits a diagnostic-envelope error with `severity:
 "error"` and exits with code `67`.

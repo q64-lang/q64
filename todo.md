@@ -323,6 +323,12 @@ concatenation for interpolation.
       archive the cache is missing (shared `downloadAndCacheArchive`
       with `add`). `--offline` turns a needed relock into PKG010 and a
       cache miss into PKG012. Hermetic CLI tests in `install.test.ts`.
+- [x] `capabilities` is generated, not authored: `qube publish` derives
+      the set from `q64 show capabilities` (effect→capability table in
+      `qube.json5.md`) and rewrites the manifest field in place before
+      packing; a non-compiling qube refuses to publish (exit 64); the
+      registry's ENV040/ENV041 check is reframed as a backstop across
+      `qube.json5.md` / `env.md` / `qube-cli.md` / `continuum-api.md`.
 - [ ] `--frozen` / `--locked` flags; `add` dedup.
 - [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
 - [ ] `qube remove` / `outdated` still stubs.
