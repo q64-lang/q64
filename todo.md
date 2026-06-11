@@ -612,10 +612,16 @@ verified, honest diagnostics throughout.
 
 ### Ladder A — semantic pass (name resolution + type checking)
 
-- [ ] **A0 — placement decision.** A `sema` stage (`q64/src/sema/`) between
-      parse and `build_hir`: produces a symbol table + resolved types that
-      `build_hir` *consumes* (no more ad-hoc inference there). HIR shape
-      unchanged at first; `lower`/backend untouched.
+- [x] **A0 — placement decision + scaffold.** `q64/src/sema/` landed:
+      README records the pass placement (parse → sema → build_hir; sema
+      imports `parser` only, additive until A3), `symbols.zig` builds the
+      file-level symbol table (items + selective/namespace import bindings,
+      first-binding-wins lookup, collisions recorded for the A1 NAM005
+      wiring; `fit`s listed but deliberately not name bindings — they key on
+      the (type, face) pair), and `q64 show symbols <file.q>` dumps it
+      (specced in q64-cli.md; covered by sema unit tests + a show.test.ts
+      CLI test). Emit path untouched. Verified: 278 unit + 76 CLI tests +
+      link-roundtrip green.
 - [ ] **A1 — symbol table + scopes.** File-level items, params, locals, import
       bindings. Every path expression resolves to a symbol or emits the honest
       NAM/NameNotFound diagnostic at the *sema* layer. Unblocks `PAR040`

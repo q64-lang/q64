@@ -1,0 +1,15 @@
+//! Umbrella for the sema package (name resolution + type checking).
+//! See README.md for the pass placement and the ladder rungs; today this
+//! re-exports the A0 scaffold (the file-level symbol table).
+
+pub const symbols = @import("symbols.zig");
+
+pub const SymbolTable = symbols.SymbolTable;
+pub const Symbol = symbols.Symbol;
+pub const SymbolKind = symbols.SymbolKind;
+pub const build = symbols.build;
+pub const showSymbols = symbols.showSymbols;
+
+test {
+    @import("std").testing.refAllDecls(@This());
+}

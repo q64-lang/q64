@@ -33,6 +33,17 @@ pub fn build(b: *std.Build) void {
     });
     ir_mod.addImport("parser", parser_mod);
 
+    // Named module for the sema package (src/sema/lib.zig) — name
+    // resolution + type checking between parse and build_hir. Imports
+    // `parser` only (never ir/, never Binaryen); see src/sema/README.md
+    // for the pass placement and ladder.
+    const sema_mod = b.createModule(.{
+        .root_source_file = b.path("src/sema/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sema_mod.addImport("parser", parser_mod);
+
     // -----------------------------------------------------------
     // The binary.
     // -----------------------------------------------------------
@@ -43,6 +54,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("parser", parser_mod);
     exe_mod.addImport("ir", ir_mod);
+    exe_mod.addImport("sema", sema_mod);
     linkBinaryen(exe_mod, target, binaryen_include, binaryen_lib);
 
     const exe = b.addExecutable(.{
@@ -79,6 +91,17 @@ pub fn build(b: *std.Build) void {
     ir_tests_mod.addImport("parser", parser_mod);
     const ir_tests = b.addTest(.{ .root_module = ir_tests_mod });
     test_step.dependOn(&b.addRunArtifact(ir_tests).step);
+
+    // Sema tests are pure Zig (no Binaryen link) but need `parser`,
+    // same shape as the IR tests.
+    const sema_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/sema/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sema_tests_mod.addImport("parser", parser_mod);
+    const sema_tests = b.addTest(.{ .root_module = sema_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(sema_tests).step);
 
     // `doc` (q64 doc --json) is parser-only — no Binaryen link — but needs the
     // `parser` import, so it gets its own test module like the IR tests.
