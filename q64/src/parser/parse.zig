@@ -320,8 +320,8 @@ const Parser = struct {
             .KW_TYPE => self.parseTypeDecl(),
             .KW_CONST => self.parseConstDecl(),
             .KW_STATE => self.parseStateDecl(),
-            .KW_FACE => self.parseFaceOrFit(.FACE_DECL),
-            .KW_FIT => self.parseFaceOrFit(.FIT_DECL),
+            .KW_FACE => self.parseFaceDecl(),
+            .KW_FIT => self.parseFitDecl(),
             .KW_SCREEN => self.parseScreenDecl(),
             else => unreachable,
         };
@@ -733,20 +733,169 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .STATE_DECL, children.items);
     }
 
-    /// `face`/`fit` shell: visibility, keyword, a raw header up to the
-    /// body, and a raw balanced `{ … }` body. Method signatures and fit
-    /// method bodies aren't structured yet.
-    fn parseFaceOrFit(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+    /// `FaceDecl := "face" IDENT GenericParams? FaceSuperList? FaceBody`
+    /// (spec/grammar.md §"Faces and fits"). B3: the super list's refs and
+    /// the body's method signatures parse structured; `type` aliases and
+    /// `law`s inside the body stay raw token runs (pending their grammars).
+    fn parseFaceDecl(self: *Parser) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
         try self.consumeVisibility(&children);
-        try children.append(self.arena, .{ .token = self.advance() }); // face / fit
+        try children.append(self.arena, .{ .token = self.advance() }); // face
         try self.eatTrivia(&children);
-        try self.captureHeaderUntilBrace(&children);
-        const body_kind: cst.SyntaxKind = if (kind == .FACE_DECL) .FACE_BODY else .FIT_BODY;
+        try self.consumeNameAndGenerics(&children);
+        // FaceSuperList := ":" FaceRef ("+" FaceRef)*
+        if (self.peek() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() });
+            try self.eatTrivia(&children);
+            while (self.peek() == .IDENT) {
+                try children.append(self.arena, .{ .node = try self.parseFaceRef() });
+                try self.eatTrivia(&children);
+                if (self.peek() != .PLUS) break;
+                try children.append(self.arena, .{ .token = self.advance() });
+                try self.eatTrivia(&children);
+            }
+        }
         if (self.peek() == .L_BRACE) {
-            try children.append(self.arena, .{ .node = try self.parseBalancedBraces(body_kind) });
+            try children.append(self.arena, .{ .node = try self.parseFaceFitBody(.FACE_BODY) });
+        }
+        return try cst.makeNode(self.arena, .FACE_DECL, children.items);
+    }
+
+    /// `FitDecl := "fit" FitSpec WhereClause? FitBody`;
+    /// `FitSpec := TypeExpr ":" FaceRef | FaceRef` (single- vs multi-param
+    /// face forms). Both forms *parse*; which one is correct for the
+    /// face's arity is sema's call (TYP201 / TYP202 — the B4 fit registry
+    /// reads the structured spec). The where clause stays a raw span.
+    fn parseFitDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // fit
+        try self.eatTrivia(&children);
+        if (self.peek() != .L_BRACE and !self.isEof()) {
+            var spec: std.ArrayList(cst.Element) = .empty;
+            try spec.append(self.arena, .{ .node = try self.parseType() });
+            try self.eatTrivia(&spec);
+            if (self.peek() == .COLON) {
+                try spec.append(self.arena, .{ .token = self.advance() });
+                try self.eatTrivia(&spec);
+                if (self.peek() == .IDENT) {
+                    try spec.append(self.arena, .{ .node = try self.parseFaceRef() });
+                }
+            }
+            try children.append(self.arena, .{ .node = try cst.makeNode(self.arena, .FIT_SPEC, spec.items) });
+        }
+        try self.eatTrivia(&children);
+        // WhereClause isn't structured yet; anything before the body's `{`
+        // collects raw so the lossless invariant holds.
+        try self.captureHeaderUntilBrace(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseFaceFitBody(.FIT_BODY) });
+        }
+        return try cst.makeNode(self.arena, .FIT_DECL, children.items);
+    }
+
+    /// `FaceRef` — a face reference (`Display`, `Convert<A, B>`): a path
+    /// type wrapped in a FACE_REF node.
+    fn parseFaceRef(self: *Parser) !*const cst.Node {
+        std.debug.assert(self.peek() == .IDENT);
+        const path = try self.parsePathType();
+        return try cst.makeNode(self.arena, .FACE_REF, &[_]cst.Element{.{ .node = path }});
+    }
+
+    /// The shared face/fit body: `{ (MethodSig | raw run)* }`. A `fn`
+    /// item parses as a structured METHOD_SIG; anything else (a `type`
+    /// alias, a `law`, junk) is captured as a raw token run with bracket
+    /// tracking, so a `{ … }` inside it can't be mistaken for the body's
+    /// close and the run can't swallow a following `fn`.
+    fn parseFaceFitBody(self: *Parser, kind: cst.SyntaxKind) !*const cst.Node {
+        std.debug.assert(self.peek() == .L_BRACE);
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // {
+        while (!self.isEof()) {
+            try self.eatTrivia(&children);
+            if (self.peek() == .R_BRACE) break;
+            if (self.peek() == .KW_FN) {
+                try children.append(self.arena, .{ .node = try self.parseMethodSig() });
+                continue;
+            }
+            // Raw run. eatTrivia just ran, so the first token is real —
+            // the run always makes progress.
+            var depth: i32 = 0;
+            while (!self.isEof()) {
+                const k = self.peek();
+                if (depth <= 0 and (k == .R_BRACE or k == .KW_FN or k == .NEWLINE)) break;
+                switch (k) {
+                    .L_BRACE, .L_PAREN, .L_BRACK => depth += 1,
+                    .R_BRACE, .R_PAREN, .R_BRACK => depth -= 1,
+                    else => {},
+                }
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+        }
+        if (self.peek() == .R_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() }); // }
         }
         return try cst.makeNode(self.arena, kind, children.items);
+    }
+
+    /// `MethodSig := "fn" IDENT GenericParams? "(" Params? ")"
+    /// ("->" TypeExpr)? EffectSpec? WhereClause? Block?` — a face/fit
+    /// body item. A body makes it a default impl (face) or the impl
+    /// itself (fit); whether one is *required* is sema's call, not the
+    /// grammar's. Inline trivia only between header pieces: a line break
+    /// ends a bodyless signature, so the parse can't swallow the next
+    /// `fn`. Effects (`@pure`) and where clauses stay raw tokens.
+    fn parseMethodSig(self: *Parser) !*const cst.Node {
+        std.debug.assert(self.peek() == .KW_FN);
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // fn
+        try self.eatInlineTrivia(&children);
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        try self.eatInlineTrivia(&children);
+        if (self.peek() == .L_ANGLE) {
+            try children.append(self.arena, .{ .node = try self.parseGenericParams() });
+            try self.eatInlineTrivia(&children);
+        }
+        if (self.peek() == .L_PAREN) {
+            try children.append(self.arena, .{ .node = try self.parseParams() });
+            try self.eatInlineTrivia(&children);
+        }
+        if (self.peek() == .ARROW) {
+            try children.append(self.arena, .{ .node = try self.parseReturnType() });
+        }
+        // EffectSpec / WhereClause: raw up to the body's `{`, the end of
+        // the line, or the enclosing body's `}` (a one-line face like
+        // `face G { fn hi() -> str }`) — any of which closes a bodyless
+        // signature.
+        var depth: i32 = 0;
+        while (!self.isEof()) {
+            const k = self.peek();
+            if (depth <= 0 and (k == .L_BRACE or k == .R_BRACE or k == .NEWLINE)) break;
+            switch (k) {
+                .L_PAREN, .L_BRACK, .L_ANGLE => depth += 1,
+                .R_PAREN, .R_BRACK, .R_ANGLE => depth -= 1,
+                .SHR => depth -= 2,
+                else => {},
+            }
+            try children.append(self.arena, .{ .token = self.advance() });
+        }
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .METHOD_SIG, children.items);
+    }
+
+    /// Trivia except NEWLINE — for header seams where a line break ends
+    /// the production (a bodyless method signature must not eat into the
+    /// next line's item).
+    fn eatInlineTrivia(self: *Parser, out: *std.ArrayList(cst.Element)) !void {
+        while (!self.isEof()) {
+            const k = self.peek();
+            if (k != .WHITESPACE and k != .LINE_COMMENT) break;
+            try out.append(self.arena, .{ .token = self.advance() });
+        }
     }
 
     // -----------------------------------------------------------------
@@ -928,9 +1077,10 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .PARAMS, children.items);
     }
 
-    /// `Param := ParamMode? IDENT ":" TypeExpr`. The mode (if any) is a
-    /// `PARAM_MODE` node; the type after `:` is a raw token span pending
-    /// the type-expression grammar. Always consumes at least one token
+    /// `Param := ParamMode? (IDENT | "self") (":" TypeExpr)?`. The mode
+    /// (if any) is a `PARAM_MODE` node. `self` (KW_SELF) is a valid
+    /// receiver parameter in face/fit method signatures — bare or with
+    /// an explicit `: Self` type. Always consumes at least one token
     /// when the caller guarantees a non-`)` start, so the params loop
     /// makes progress.
     fn parseParam(self: *Parser) !*const cst.Node {
@@ -944,7 +1094,7 @@ const Parser = struct {
             try self.eatTrivia(&children);
         }
 
-        if (self.peek() == .IDENT) {
+        if (self.peek() == .IDENT or self.peek() == .KW_SELF) {
             try children.append(self.arena, .{ .token = self.advance() }); // name
         }
         try self.eatTrivia(&children);
@@ -2935,4 +3085,125 @@ test "record body: a keyword-shaped field name cannot hang the parser" {
     const r = try parse(std.testing.allocator, "struct Flag { on: bool, n: i64 }\n", "<t>");
     defer r.deinit(std.testing.allocator);
     try std.testing.expect(ast.SourceFile.cast(r.root) != null);
+}
+
+test "B3: face body method signatures parse structured (incl. self + bodyless)" {
+    const src =
+        \\pub face Display {
+        \\    fn fmt(self) -> str @pure
+        \\    fn describe(self, prefix: str) -> str { prefix }
+        \\}
+        \\
+    ;
+    const r = try parse(testing.allocator, src, "face.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var it = sf.items();
+    const face = (it.next() orelse return error.TestExpectedItem).face_decl;
+    try testing.expectEqualStrings("Display", face.name().?.text);
+
+    var ms = face.methods();
+    const fmt = ms.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("fmt", fmt.name().?.text);
+    try testing.expect(!fmt.hasBody()); // signature only — `@pure` stays raw
+    var fps = fmt.params().?.iter();
+    const recv = fps.next() orelse return error.TestExpectedItem;
+    try testing.expect(recv.isSelf());
+    try testing.expect(fps.next() == null);
+    const rt = try fmt.returnType().?.text(testing.allocator);
+    defer testing.allocator.free(rt.?);
+    try testing.expectEqualStrings("str", rt.?);
+
+    const desc = ms.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("describe", desc.name().?.text);
+    try testing.expect(desc.hasBody()); // a default impl
+    var dps = desc.params().?.iter();
+    try testing.expect((dps.next() orelse return error.TestExpectedItem).isSelf());
+    const p2 = dps.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("prefix", p2.name().?.text);
+    try testing.expect(ms.next() == null);
+}
+
+test "B3: fit spec — colon form names target and face" {
+    const src =
+        \\pub fit Color : Display {
+        \\    fn fmt(self) -> str { "x" }
+        \\}
+        \\
+    ;
+    const r = try parse(testing.allocator, src, "fit.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var it = sf.items();
+    const fit = (it.next() orelse return error.TestExpectedItem).fit_decl;
+    try testing.expectEqualStrings("Color", fit.name().?.text);
+
+    const spec = fit.spec().?;
+    try testing.expect(spec.isColonForm());
+    const tgt = try spec.target().?.text(testing.allocator);
+    defer testing.allocator.free(tgt);
+    try testing.expectEqualStrings("Color", tgt);
+    const fc = try spec.face().?.text(testing.allocator);
+    defer testing.allocator.free(fc);
+    try testing.expectEqualStrings("Display", fc);
+
+    var ms = fit.methods();
+    const m = ms.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("fmt", m.name().?.text);
+    try testing.expect(m.hasBody());
+    try testing.expect(ms.next() == null);
+}
+
+test "B3: fit spec — bare multi-param form is one generic face path" {
+    // The *wrong-fit-form* fixtures depend on this distinction: sema's
+    // TYP201/TYP202 (B4) read which form was written and check it against
+    // the face's arity. The grammar admits both.
+    const src =
+        \\pub fit Eq<Point> {
+        \\    fn eq(self, other: Self) -> bool @pure { true }
+        \\}
+        \\
+    ;
+    const r = try parse(testing.allocator, src, "fit2.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var it = sf.items();
+    const fit = (it.next() orelse return error.TestExpectedItem).fit_decl;
+    try testing.expectEqualStrings("Eq", fit.name().?.text);
+
+    const spec = fit.spec().?;
+    try testing.expect(!spec.isColonForm());
+    try testing.expect(spec.target() == null);
+    const fc = spec.face().?;
+    try testing.expect(fc == .path);
+    try testing.expect(fc.path.hasGenericArgs());
+
+    var ms = fit.methods();
+    const m = ms.next() orelse return error.TestExpectedItem;
+    var ps = m.params().?.iter();
+    try testing.expect((ps.next() orelse return error.TestExpectedItem).isSelf());
+    const other = ps.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("other", other.name().?.text);
+}
+
+test "B3: face super list parses as FACE_REF nodes; type/law stay raw runs" {
+    const src =
+        \\face Ord : Eq + Display {
+        \\    type Key = i64
+        \\    fn cmp(self, other: Self) -> i64
+        \\    law reflexive: forall a => a.cmp(a) == 0
+        \\}
+        \\
+    ;
+    const r = try parse(testing.allocator, src, "super.q");
+    defer r.deinit(testing.allocator);
+    const sf = ast.SourceFile.cast(r.root).?;
+    var it = sf.items();
+    const face = (it.next() orelse return error.TestExpectedItem).face_decl;
+    try testing.expectEqualStrings("Ord", face.name().?.text);
+    // The `type`/`law` runs don't break method iteration: exactly one sig.
+    var ms = face.methods();
+    try testing.expectEqualStrings("cmp", (ms.next() orelse return error.TestExpectedItem).name().?.text);
+    try testing.expect(ms.next() == null);
+    try testing.expect(it.next() == null); // nothing leaked past the body
 }

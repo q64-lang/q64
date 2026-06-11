@@ -53,6 +53,15 @@ describe.skipIf(!binaryAvailable())("q64 check", () => {
     expect(hasDiagnostic(r.envelope, "TYP051", "error")).toBe(true);
   });
 
+  test("wrong fit form for a single-param face is TYP201 (spec/faces.md)", () => {
+    // The fit registry (q64/src/sema/fits.zig): `Eq` is a prelude
+    // single-param face, so the bare `fit Eq<Point>` form is rejected.
+    const r = runCli(["check", fixture("wrong-fit-form.q"), "--diagnostics", "json"]);
+    expect(r.envelope?.ok).toBe(false);
+    expect(hasDiagnostic(r.envelope, "TYP201", "error")).toBe(true);
+    expect(r.exitCode).not.toBe(0);
+  });
+
   test("missing file: input error, exit non-zero", () => {
     const r = runCli(["check", fixture("does-not-exist.q"), "--diagnostics", "json"]);
     expect(r.exitCode).not.toBe(0);

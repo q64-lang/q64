@@ -156,6 +156,8 @@ pub const codes = [_]CodeInfo{
     .{ .code = "TYP042", .subsystem = "Type checking", .severity = .err, .message = "implicit numeric conversion is forbidden", .summary = "An arithmetic site mixes two different numeric types (e.g. `i32 + i64`). q64 never converts implicitly; cast one side explicitly so the widths and signedness are visible. See spec/types.md §arithmetic." },
     .{ .code = "TYP051", .subsystem = "Type checking", .severity = .err, .message = "integer used as bool", .summary = "An `if`/`while` condition is an integer, but conditions require `bool` (e.g. `if 1 { … }`). Write the comparison out (`if x != 0`). See spec/types.md §bool." },
     .{ .code = "TYP061", .subsystem = "Type checking", .severity = .err, .message = "wrong number of call arguments", .summary = "A call supplies more or fewer arguments than the function declares. Match the declaration's parameter list (generic-argument count is TYP100). See spec/types.md." },
+    .{ .code = "TYP201", .subsystem = "Type checking", .severity = .err, .message = "wrong fit form for single-param face", .summary = "A single-parameter face (its methods take `self`) must be fit with the implementer first: `fit Type : Face`, not `fit Face<Type>`. See spec/faces.md §\"Fit declaration\"." },
+    .{ .code = "TYP202", .subsystem = "Type checking", .severity = .err, .message = "wrong fit form for multi-param face", .summary = "A multi-parameter face (no `self`; every type a named parameter) must be fit positionally: `fit Face<T1, T2>`, with no implementer prefix. See spec/faces.md §\"Fit declaration\"." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"

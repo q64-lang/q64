@@ -644,7 +644,16 @@ verified, honest diagnostics throughout.
       - [ ] `PAR040` re-land on name kinds (generic-call vs
             chained-comparison — the reverted parser heuristic, see "Other
             open items").
-      - [ ] Fit registry (with B3's structured face/fit method grammar).
+      - [x] Fit registry (`sema/fits.zig`, on B3's structured grammar):
+            classifies faces single- vs multi-param by the mechanical
+            spec/faces.md rule (any `self` method → single; methods but
+            no `self` → multi; prelude faces all single), registers fits
+            keyed (target, face) with a `find()` for B4 dispatch, and
+            emits **TYP201/TYP202** on the wrong written form. Wired
+            into `q64 check` + catalog. Conformance **18 → 20 of 48**
+            (both `faces/wrong-fit-form-*.q` flip); 4 sema unit tests +
+            a check.test.ts envelope case (79 CLI tests). Unknown
+            (cross-module) faces stay silent — the NAM story.
 - [x] **A2 — type representation (core).** `sema/types.zig`: an interned,
       structural `TypeStore` — the builtin tower (i8…i128/u8…u128/f16…f64/
       bool/str/void per `spec/types.md`), named types resolved against the
@@ -826,14 +835,36 @@ verified, honest diagnostics throughout.
             signatures across module boundaries (the table is per-file),
             `q64 show layout <type>`, and reclamation (the scope arena
             never frees). B4's `self` receiver can now build on this.
-- [ ] **B3 — face/fit method grammar.** Structure the raw-span method
-      signatures in `FACE_BODY`/`FIT_BODY` (parser-only; today
-      `parseFaceOrFit` keeps them as token spans).
+- [x] **B3 — face/fit method grammar.** `parseFaceOrFit` (raw header +
+      raw balanced body) split into `parseFaceDecl`/`parseFitDecl`:
+      face headers parse name + generic params + a structured super
+      list (`: Eq + Display` → FACE_REF nodes); fit headers parse a
+      structured FIT_SPEC distinguishing the two forms — `Type : Face`
+      (colon) vs `Face<Args>` (bare) — which is exactly what B4's
+      TYP201/TYP202 arity check reads. Bodies parse `fn` items as
+      METHOD_SIG (name, generic params, structured params incl. the
+      `self` receiver — KW_SELF is now a valid param name, `Param.
+      isSelf()` — return type, optional Block; effects/`where` stay raw
+      tokens); `type` aliases and `law`s stay bracket-tracked raw runs
+      that can't swallow a following `fn` or the body's close (incl.
+      one-line bodies). AST: `FaceDecl.methods()`, `FitDecl.spec()/
+      methods()`, `FitSpec.isColonForm()/target()/face()`, `MethodSig`.
+      Verified: 329/329 unit tests (4 new covering both fit forms,
+      self/bodyless/default-impl sigs, super list + type/law runs),
+      golden library-face-fit still checks clean, conformance 18/48
+      unchanged, roundtrips + 78/78 CLI green.
 - [ ] **B4 — fit registration + static dispatch.** Sema registers fits;
       `p.fmt()` on a concrete type with a non-generic fit resolves to a direct
       call. No vtables, no monomorphization, no `dyn`. Definition of done: the
       `spec/tests/golden/library-face-fit.q` program compiles and runs;
       `spec/tests/faces/wrong-fit-form-*.q` fixtures pass.
+      - [x] First slice done: the fit registry + TYP201/TYP202 (see the
+            A1 fit-registry item) — the `wrong-fit-form-*.q` half of the
+            definition of done. Remaining: `p.fmt()` static dispatch in
+            the emit path (registry lookup → direct call with `p` as the
+            `self` receiver — B2b's record params are the ABI), then the
+            golden program's other needs (u8 fields, `[T]` arrays +
+            `for`, format specs `{x:02x}`, generic `print_all<T: Face>`).
 - [ ] **B5 — later (separate ladders).** Face-bounded generics +
       monomorphization; `dyn` dispatch; enums + `match` lowering (can start
       after A2 in parallel with B).
