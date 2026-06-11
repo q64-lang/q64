@@ -1286,4 +1286,31 @@ if [[ "$pay32_out" != "$pay_expected" ]]; then
 fi
 echo "    ok: payload enums -> 14 / area = 12 / empty / 9 (wasm64 + wasm32)"
 
+# C4 (literal patterns): an integer scrutinee with literal arms + `_`.
+echo "==> C4: literal patterns — match n { 0 / 1 / _ }"
+lit_app="$tmp/lit.q"
+cat > "$lit_app" <<'Q64'
+fn main {
+    var n = 1
+    match n {
+        0 -> env.out("zero"),
+        1 -> env.out("one"),
+        _ -> env.out("many"),
+    }
+    let label = match n + 41 {
+        42 -> 200,
+        _ -> 300,
+    }
+    env.out(label)
+}
+Q64
+lit_expected=$'one\n200'
+"$Q64_BIN" emit "$lit_app" "$tmp/lit.wasm"
+lit_out="$("$HOST_BIN" "$tmp/lit.wasm")"
+[[ "$lit_out" == "$lit_expected" ]] || { echo "FAIL: literal-match (got: $lit_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$lit_app" "$tmp/lit32.wasm" --addr wasm32
+lit32_out="$("$HOST_BIN" "$tmp/lit32.wasm")"
+[[ "$lit32_out" == "$lit_expected" ]] || { echo "FAIL: literal-match wasm32 (got: $lit32_out)" >&2; exit 1; }
+echo "    ok: literal match -> one / 200 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
