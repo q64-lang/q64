@@ -953,6 +953,23 @@ verified, honest diagnostics throughout.
       **Boundary:** `i64(x)` of an in-range float works; the full
       int tower (`i32(x)`, `u8(x)`, …) waits on those types existing;
       `try_into` waits on Result.
+- [x] **Narrow integer storage (u8/i8/u16/i16/u32/i32).** The widths
+      land as *storage* types — the honest floor while the spec leaves
+      narrow arithmetic-overflow semantics (wrap vs trap) unpinned:
+      struct fields at their natural width/alignment (3×u8 packs to
+      size 3 align 1; `{i8, u16, u32}` lays out 0/2/4 → size 8 align
+      4), in-range literal inits and field assigns (out-of-range →
+      NotConstExpr, the build-time mirror of TYP040), width-true
+      loads/stores (sign-/zero-extension into the i64 compute floor;
+      MIR field ops carry explicit width+signedness now), formatting/
+      interpolation of narrow reads, and explicit `i64(c.r)` widening.
+      Narrow arithmetic, narrow bindings, and narrowing casts (`u8(x)`
+      — needs the trapping range check) are rejected; records with
+      narrow fields always materialize (SROA has no storage, so it
+      would silently widen — caught as a boundary leak and locked).
+      The golden program's `Color { r: u8 }` + `Display.fmt` shape
+      runs end-to-end. Verified wasm64 + wasm32 (roundtrip narrow-int
+      section) + 2 unit tests incl. the range/no-widening rejections.
 - [ ] **sin/cos/tan/exp/log → `q64.math` (decision recorded).** Wasm
       3.0 has no transcendental instructions (only `f64.sqrt`/`abs`/
       `ceil`/`floor`/`min`/`max`/`copysign` are native). Decision:

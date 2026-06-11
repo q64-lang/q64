@@ -44,7 +44,12 @@ pub const ModuleResolver = struct {
 /// `(ptr, len)`. Distinct from `i64` (a genuine integer value) so the backend
 /// realizes pointer locals at the build's address width. `str` itself stays
 /// abstract (the `(ptr, len)` pair is a lowering concern).
-pub const Type = enum { i64, i32, f32, f64, str, bool, ptr, void };
+// The narrow integer widths (`u8` … `i32`) are *storage* types in v0:
+// valid as struct fields (loads widen to the i64 compute floor, stores
+// truncate to the field width), formattable, and explicit-cast sources.
+// Arithmetic on them is deliberately unsupported until the spec pins
+// narrow-overflow semantics (wrap vs trap).
+pub const Type = enum { i64, i32, u32, i16, u16, i8, u8, f32, f64, str, bool, ptr, void };
 
 /// A definite semantic error the AST→HIR builder detected — distinct from
 /// "construct not yet supported" (which signals a fall-back). The codegen

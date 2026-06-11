@@ -24,11 +24,11 @@ pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
 
-/// One field initializer of a `record_make`: store `value` at `base + offset`.
-/// The store width follows the value's type: an `.i64` field is an 8-byte
-/// store, an `.i32` (bool) field a 1-byte store (spec/memory.md §"Linear
-/// struct layout").
-pub const FieldInit = struct { offset: u32, value: *Inst };
+/// One field initializer of a `record_make`: store `value` at `base +
+/// offset`, truncating to `width` bytes (spec/memory.md §"Linear struct
+/// layout"). A narrow integer field (`u8`…`i32`) carries an i64 compute
+/// value with width 1/2/4; floats and i64 store at their natural width.
+pub const FieldInit = struct { offset: u32, width: u8, value: *Inst };
 
 /// Wasm-level value types. A `str` is the `(ptr, len)` pair — the backend
 /// realizes it as a two-i64 multivalue (tuple); a str function returns it and
@@ -211,11 +211,13 @@ pub const Op = union(enum) {
     /// (width per the value's type — 8 bytes for `.i64`, 1 byte for `.i32`
     /// bools), and yield the base pointer (a `.ptr`).
     record_make: struct { size: u32, alignment: u32, inits: []const FieldInit },
-    /// Load a record field at `base + offset`. The result type is `inst.ty`:
-    /// `.i64` → an 8-byte load, `.i32` (bool) → a 1-byte zero-extending load.
-    field_get: struct { base: *Inst, offset: u32 },
-    /// Store a record field at `base + offset` (width per the value's type). Void.
-    field_set: struct { base: *Inst, offset: u32, value: *Inst },
+    /// Load a record field at `base + offset`: `width` bytes, sign- or
+    /// zero-extended per `signed`, yielding `inst.ty` (i64 for every
+    /// integer width — the compute floor; f64/f32/i32-bool natively).
+    field_get: struct { base: *Inst, offset: u32, width: u8, signed: bool },
+    /// Store a record field at `base + offset`, truncating the value to
+    /// `width` bytes. Void.
+    field_set: struct { base: *Inst, offset: u32, width: u8, value: *Inst },
     // Structured control flow. `if_` yields `inst.ty` (i64 value-if, or void).
     // `while_`/`loop` are void and diverge/iterate; the backend expands them
     // to labeled `block`/`loop`/`br_if` and resolves `br`/`br_cont` to the

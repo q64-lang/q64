@@ -809,4 +809,50 @@ if [[ "$f32w_out" != "$f32_expected" ]]; then
 fi
 echo "    ok: f32 -> 1.75 / 0.875 / 3.0 / 2 / 1.5 / true (wasm64 + wasm32)"
 
+# Narrow integer storage (u8/i8/u16/i16/u32/i32 struct fields): in-range
+# literal inits (out-of-range rejects at build), width-true loads/stores
+# (zero-/sign-extension on read: i8 -7 reads back -7, u32 max reads back
+# whole), formatting/interpolation of narrow reads, and explicit i64(x)
+# widening. Narrow arithmetic without a cast is rejected.
+echo "==> narrow ints: u8 fields (the golden Color shape) / sign-extension / widening"
+nar_app="$tmp/narrow.q"
+nar_wasm="$tmp/narrow.wasm"
+cat > "$nar_app" <<'Q64'
+struct Color { r: u8, g: u8, b: u8 }
+struct Mix { tag: i8, count: u16, id: u32 }
+face Display { fn fmt(self) -> str }
+fit Color : Display {
+    fn fmt(self) -> str { "rgb({self.r}, {self.g}, {self.b})" }
+}
+
+fn sum_rg(c: Color) -> i64 { i64(c.r) + i64(c.g) }
+
+fn main {
+    let c = Color { r: 255, g: 128, b: 0 }
+    env.out(c.fmt())
+    env.out(c.r)
+    env.out(sum_rg(c))
+    var m = Mix { tag: -5, count: 65535, id: 4294967295 }
+    m.tag = -7
+    env.out("tag = {m.tag}, count = {m.count}, id = {m.id}")
+    env.out(i64(m.id) + 1)
+}
+Q64
+"$Q64_BIN" emit "$nar_app" "$nar_wasm"
+nar_out="$("$HOST_BIN" "$nar_wasm")"
+nar_expected=$'rgb(255, 128, 0)\n255\n383\ntag = -7, count = 65535, id = 4294967295\n4294967296'
+if [[ "$nar_out" != "$nar_expected" ]]; then
+    echo "FAIL: narrow-int output mismatch" >&2
+    printf "  expected: %q\n" "$nar_expected" >&2
+    printf "  actual:   %q\n" "$nar_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$nar_app" "$tmp/narrow32.wasm" --addr wasm32
+nar32_out="$("$HOST_BIN" "$tmp/narrow32.wasm")"
+if [[ "$nar32_out" != "$nar_expected" ]]; then
+    echo "FAIL: narrow-int wasm32 output mismatch" >&2
+    exit 1
+fi
+echo "    ok: narrow ints -> rgb(255, 128, 0) / 255 / 383 / -7,65535,u32max / 2^32 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

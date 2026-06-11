@@ -485,6 +485,11 @@ fn witType(t: ir.hir.Type) []const u8 {
     return switch (t) {
         .i64 => "s64",
         .i32 => "s32",
+        .u32 => "u32",
+        .i16 => "s16",
+        .u16 => "u16",
+        .i8 => "s8",
+        .u8 => "u8",
         .f32 => "f32",
         .f64 => "f64",
         .bool => "bool",
@@ -1383,7 +1388,9 @@ const Lowerer = struct {
                 // field) → a 1-byte zero-extending load.
                 const base = try self.inst(fg.base);
                 return switch (n.ty) {
-                    .i64 => c.BinaryenLoad(module, 8, true, fg.offset, 0, self.i64_type, base, "0"),
+                    // Integer loads honor the field's storage width and
+                    // signedness (i64.load8_u … i64.load), widening into i64.
+                    .i64 => c.BinaryenLoad(module, fg.width, fg.signed, fg.offset, 0, self.i64_type, base, "0"),
                     .f64 => c.BinaryenLoad(module, 8, true, fg.offset, 0, c.BinaryenTypeFloat64(), base, "0"),
                     .f32 => c.BinaryenLoad(module, 4, true, fg.offset, 0, c.BinaryenTypeFloat32(), base, "0"),
                     .i32 => c.BinaryenLoad(module, 1, false, fg.offset, 0, self.i32_type, base, "0"),
@@ -1394,7 +1401,10 @@ const Lowerer = struct {
                 const base = try self.inst(fs.base);
                 const value = try self.inst(fs.value);
                 return switch (fs.value.ty) {
-                    .i64 => c.BinaryenStore(module, 8, fs.offset, 0, base, value, self.i64_type, "0"),
+                    // An i64 value stores at the field's width (i64.store8 …
+                    // i64.store — narrow stores truncate); floats and bool
+                    // at their natural widths.
+                    .i64 => c.BinaryenStore(module, fs.width, fs.offset, 0, base, value, self.i64_type, "0"),
                     .f64 => c.BinaryenStore(module, 8, fs.offset, 0, base, value, c.BinaryenTypeFloat64(), "0"),
                     .f32 => c.BinaryenStore(module, 4, fs.offset, 0, base, value, c.BinaryenTypeFloat32(), "0"),
                     .i32 => c.BinaryenStore(module, 1, fs.offset, 0, base, value, self.i32_type, "0"),
@@ -1668,7 +1678,7 @@ const Lowerer = struct {
             const value = try self.inst(fi.value);
             self.rec_level -= 1;
             const store = switch (fi.value.ty) {
-                .i64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, self.i64_type, "0"),
+                .i64 => c.BinaryenStore(m, fi.width, fi.offset, 0, self.ptrGet(ridx), value, self.i64_type, "0"),
                 .f64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, c.BinaryenTypeFloat64(), "0"),
                 .f32 => c.BinaryenStore(m, 4, fi.offset, 0, self.ptrGet(ridx), value, c.BinaryenTypeFloat32(), "0"),
                 .i32 => c.BinaryenStore(m, 1, fi.offset, 0, self.ptrGet(ridx), value, self.i32_type, "0"),
