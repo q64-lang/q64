@@ -1474,4 +1474,41 @@ sugar32_out="$("$HOST_BIN" "$tmp/sugar32.wasm")"
 [[ "$sugar32_out" == "$sugar_expected" ]] || { echo "FAIL: T-sugar wasm32 (got: $sugar32_out)" >&2; exit 1; }
 echo "    ok: T? sugar -> 42 / none (wasm64 + wasm32)"
 
+# `try` propagation (errors.md): Err returns early through the chain,
+# Ok binds the payload; leading let statements in Result bodies.
+echo "==> try: Err propagation through a call chain"
+try_app="$tmp/try.q"
+cat > "$try_app" <<'Q64'
+fn half(n: i64) -> Result<i64, i64> {
+    if n % 2 == 0 { Ok(n / 2) } else { Err(n) }
+}
+fn quarter(n: i64) -> Result<i64, i64> {
+    let h = try half(n)
+    let q = try half(h)
+    Ok(q)
+}
+fn main {
+    match quarter(12) {
+        Ok(v) -> env.out("ok {v}"),
+        Err(e) -> env.out("err {e}"),
+    }
+    match quarter(6) {
+        Ok(v) -> env.out("ok {v}"),
+        Err(e) -> env.out("err {e}"),
+    }
+    match quarter(7) {
+        Ok(v) -> env.out("ok {v}"),
+        Err(e) -> env.out("err {e}"),
+    }
+}
+Q64
+try_expected=$'ok 3\nerr 3\nerr 7'
+"$Q64_BIN" emit "$try_app" "$tmp/try.wasm"
+try_out="$("$HOST_BIN" "$tmp/try.wasm")"
+[[ "$try_out" == "$try_expected" ]] || { echo "FAIL: try (got: $try_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$try_app" "$tmp/try32.wasm" --addr wasm32
+try32_out="$("$HOST_BIN" "$tmp/try32.wasm")"
+[[ "$try32_out" == "$try_expected" ]] || { echo "FAIL: try wasm32 (got: $try32_out)" >&2; exit 1; }
+echo "    ok: try -> ok 3 / err 3 / err 7 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

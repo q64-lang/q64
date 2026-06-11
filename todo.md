@@ -972,9 +972,33 @@ verified, honest diagnostics throughout.
       literal patterns (landed) → exhaustiveness diagnostic (landed)
       → `Option`/`Result` in the prelude + generic enum declarations
       (landed) → enum returns from functions (landed) → `if let`
-      narrowing (landed) → `T?` sugar (landed) → next: `while let`,
-      `try` (its prerequisite — Result-returning fns — is in),
-      match/if-let in callee bodies.
+      narrowing (landed) → `T?` sugar (landed) → `try` (landed) →
+      next: `while let`, match/if-let in callee bodies, the `From`
+      conversion on `try` (cross-E propagation).
+      - [x] **`try` propagation + TYP300 (v0 floor).** `let x = try
+            half(n)` inside a Result-returning fn desugars to: bind
+            the operand's boxed value once, `if tag == Err { return
+            <the value> }` (same-E only — the From-conversion rung is
+            later, and at this floor the boxed representation is
+            identical either way), then bind the Ok payload slot
+            (`buildTryLet`). The enabler: record/enum-returning bodies
+            now take **leading statements** (`buildRecBody` walks all
+            statements — the shared callee-body set via `buildIntStmt`,
+            the try-let intercepted — and collects the declared locals;
+            previously single-tail-only). `q64 check` emits **TYP300**
+            (`try` where the enclosing return provably isn't `Result`:
+            void, builtins, prelude types, `T?`, structural types,
+            local structs/enums; an unknown named return — possibly an
+            alias — stays silent), catalog entry included. Conformance
+            `errors/try-without-result-return.q` flips → **24/51**;
+            roundtrip try section (`ok 3 / err 3 / err 7` — the middle
+            case propagates the *second* try's Err) wasm64 + wasm32;
+            393 unit / 81 CLI green. **Boundary:** `try` only as a
+            `let` initializer in a callee (no nested `Ok(try …)`, no
+            statement-position try, none in `main` — main isn't
+            Result-returning); E-type equality unchecked (generic args
+            are raw text; same boxed shape regardless); TYP305 (`?` on
+            Result) still unwired.
       - [x] **`T?` sugar.** `-> i64?` ≡ `-> Option<i64>` (errors.md):
             the optional TypeExpr (already parsed structured) maps to
             Option's boxed shape in `structOfType`/`enumOfRet` (emit)

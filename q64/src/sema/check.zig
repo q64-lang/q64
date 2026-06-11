@@ -170,6 +170,9 @@ const Checker = struct {
     enums: *const Enums,
     scope: Scope,
     diags: *std.ArrayList(Diag),
+    /// True when the function being walked provably does NOT return
+    /// `Result`, so a `try` inside it is TYP300.
+    try_forbidden: bool = false,
 
     // -- typing ------------------------------------------------------
 
@@ -377,6 +380,17 @@ const Checker = struct {
                 const n = elem orelse return .unknown;
                 if (!all_match) return .unknown;
                 return .{ .rec_array = n };
+            },
+            .@"try" => |te| {
+                // TYP300: `try` requires the enclosing function to
+                // return `Result` (spec/errors.md §type-system rules).
+                // Fires only when the return type provably isn't —
+                // an unknown named type (an alias) stays silent.
+                _ = try c.typeOfOpt(te.operand());
+                if (c.try_forbidden) {
+                    try c.diags.append(c.gpa, .{ .code = "TYP300", .offset = firstTokenOffset(te.cst) });
+                }
+                return .unknown;
             },
             else => return .unknown,
         }
@@ -892,6 +906,40 @@ fn firstTwoTokens(node: *const cst.Node, first: *?cst.Token, second: *?cst.Token
 
 /// The variant name an arm pattern opens with: a bare ident, or the
 /// last IDENT before a payload `(`.
+/// Does this function's declared return type provably NOT name
+/// `Result` — i.e. is a `try` inside it TYP300 (spec/errors.md)?
+/// Honesty rules: no return type (void), a builtin/prelude type, the
+/// `T?` sugar, a structural type, or a locally-declared struct/enum
+/// all forbid `try`; an *unknown* named type (it could be an alias of
+/// `Result`) stays silent.
+fn fnRetForbidsTry(gpa: std.mem.Allocator, store: *types.TypeStore, table: *const symbols.SymbolTable, fd: ast.FnDecl) bool {
+    const rt = fd.returnType() orelse return true; // void
+    const te = rt.type_() orelse return false; // unstructured: silent
+    switch (te) {
+        .path => |pt| {
+            const name = pt.name(gpa) catch return false;
+            defer gpa.free(name);
+            if (std.mem.eql(u8, name, "Result")) return false;
+            const id = types.lower(store, null, te) catch return false;
+            switch (store.get(id)) {
+                // A builtin scalar or a (non-Result) prelude type.
+                .builtin, .named => return true,
+                else => {},
+            }
+            if (table.lookup(name)) |sym| {
+                return switch (sym.kind) {
+                    .struct_, .enum_ => true,
+                    else => false,
+                };
+            }
+            return false;
+        },
+        // `T?` is Option, not Result; structural types aren't Result.
+        .optional, .tuple, .slice, .array, .ref => return true,
+        .raw => return false,
+    }
+}
+
 fn patternHead(node: *const cst.Node) ?[]const u8 {
     var head: ?[]const u8 = null;
     for (node.children) |c| switch (c) {
@@ -951,6 +999,7 @@ pub fn checkFile(
                 .enums = &enums,
                 .scope = .{ .gpa = gpa },
                 .diags = &diags,
+                .try_forbidden = fnRetForbidsTry(gpa, store, table, fd),
             };
             defer c.scope.deinit();
 
@@ -1359,6 +1408,46 @@ test "check: TYP062 across calls and annotations — enum-typed returns/lets" {
         \\}
         \\
     , &.{ "TYP062", "TYP062" });
+}
+
+test "check: TYP300 — `try` outside a Result-returning function" {
+    // Provably-not-Result returns fire: a builtin, void, the T? sugar.
+    try expectCodes(
+        \\fn read_size(path: str) -> i64 {
+        \\    let n = try parse(path)
+        \\    n
+        \\}
+        \\fn main {
+        \\    env.out(read_size("f"))
+        \\}
+        \\
+    , &.{"TYP300"});
+    try expectCodes(
+        \\fn lookup(n: i64) -> i64? {
+        \\    let v = try fetch(n)
+        \\    Some(v)
+        \\}
+        \\fn main {
+        \\    let o = lookup(1)
+        \\}
+        \\
+    , &.{"TYP300"});
+    // A Result return — and an unknown named return (it could alias
+    // Result) — stay silent.
+    try expectCodes(
+        \\fn read_size(path: str) -> Result<i64, IoError> {
+        \\    let n = try parse(path)
+        \\    Ok(n)
+        \\}
+        \\fn weird(path: str) -> SomeAlias {
+        \\    let n = try parse(path)
+        \\    n
+        \\}
+        \\fn main {
+        \\    let r = read_size("f")
+        \\}
+        \\
+    , &.{});
 }
 
 test "check: TYP062 stays silent on exhaustive / unjudgeable matches" {

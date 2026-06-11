@@ -1352,7 +1352,11 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     // { None }`). Leading statements land with a later slice.
     if (rec_ret) |want| {
         const block = try buildRecBody(b, fd.body() orelse return error.Unsupported, &scope, want);
-        b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .body = block };
+        // Leading statements (incl. the try desugar) declare locals.
+        const rec_extra = scope.extra();
+        const rec_locals = try b.a.alloc(hir.Type, rec_extra);
+        for (rec_locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
+        b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .locals = rec_locals, .body = block };
         return id;
     }
 
@@ -1371,16 +1375,96 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     return id;
 }
 
-/// A record-returning body at the v0 floor: a single tail statement,
-/// wrapped as the function's value block.
+/// A record-returning body: leading statements (the shared callee-body
+/// set, plus the `let x = try …` propagation form) and one
+/// record-yielding tail statement, as the function's value block.
 fn buildRecBody(b: *Builder, blk: ast.Block, scope: *Scope, want: *const StructInfo) BuildError!*hir.Stmt {
+    var ast_stmts: std.ArrayList(ast.Stmt) = .empty;
+    defer ast_stmts.deinit(b.a);
     var it = blk.statements();
-    const first = it.next() orelse return error.Unsupported;
-    if (it.next() != null) return error.Unsupported; // leading statements: later
-    const tail = try buildRecTailStmt(b, first, scope, want);
+    while (it.next()) |stmt| try ast_stmts.append(b.a, stmt);
+    const n = ast_stmts.items.len;
+    if (n == 0) return error.Unsupported;
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    for (ast_stmts.items[0 .. n - 1]) |stmt| {
+        try buildRecSetupStmt(b, stmt, scope, want, &stmts);
+    }
+    try stmts.append(b.a, try buildRecTailStmt(b, ast_stmts.items[n - 1], scope, want));
     const block = try b.a.create(hir.Stmt);
-    block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{tail}) };
+    block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
     return block;
+}
+
+/// A leading (non-tail) statement in a record/enum-returning body: the
+/// `let x = try <expr>` propagation form desugars here; everything
+/// else is the shared callee-body statement set.
+fn buildRecSetupStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, want: *const StructInfo, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    if (stmt == .let_stmt) {
+        const ls = stmt.let_stmt;
+        if (ls.initializer()) |init_expr| {
+            if (init_expr == .@"try") {
+                return buildTryLet(b, ls, init_expr.@"try", scope, want, out);
+            }
+        }
+    }
+    try out.append(b.a, try buildIntStmt(b, stmt, scope));
+}
+
+/// `let x = try <expr>` inside a Result-returning body (errors.md
+/// §"The `try` keyword", v0 floor): evaluate the operand — a Result
+/// value of the same boxed enum — once; on `Err` return the value
+/// as-is (same-E only; the `From`-conversion rung is later, and at
+/// this floor the boxed representation is identical either way); on
+/// `Ok` bind the payload slot (one i64).
+fn buildTryLet(b: *Builder, ls: ast.LetStmt, te: ast.TryExpr, scope: *Scope, want: *const StructInfo, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const res_info = b.enums.get("Result") orelse return error.Unsupported;
+    const resi = res_info.si orelse return error.Unsupported;
+    // `try` requires the *enclosing* function to return Result — the
+    // friendly diagnostic (TYP300) is `q64 check`'s.
+    if (want != resi) return error.Unsupported;
+    const err_tag: i64 = @intCast(res_info.variantTag("Err") orelse return error.Unsupported);
+    const operand = te.operand() orelse return error.Unsupported;
+    const info = (try enumOfExpr(b, scope, operand)) orelse return error.Unsupported;
+    if (info.si != resi) return error.Unsupported; // `try` takes a Result value
+    const rv = (try buildRecExpr(b, operand, scope)) orelse return error.Unsupported;
+
+    // tmp = <operand>, evaluated once.
+    const hidden = try std.fmt.allocPrint(b.a, "#try{d}", .{scope.locals.items.len});
+    const tmp_idx = try scope.declare(hidden, false, .ptr);
+    const set = try b.a.create(hir.Stmt);
+    set.* = .{ .let = .{ .idx = tmp_idx, .value = rv.e } };
+    try out.append(b.a, set);
+
+    // if (tmp.#tag == Err) { return tmp }
+    const base = try b.a.create(hir.Expr);
+    base.* = .{ .local = .{ .idx = tmp_idx, .ty = .ptr } };
+    const tag = try b.a.create(hir.Expr);
+    tag.* = .{ .field_get = .{ .base = base, .offset = 0, .ty = .i64 } };
+    const tagv = try b.a.create(hir.Expr);
+    tagv.* = .{ .int_const = err_tag };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = .eq, .lhs = tag, .rhs = tagv } };
+    const tmp_read = try b.a.create(hir.Expr);
+    tmp_read.* = .{ .local = .{ .idx = tmp_idx, .ty = .ptr } };
+    const ret = try b.a.create(hir.Stmt);
+    ret.* = .{ .ret = tmp_read };
+    const then_blk = try b.a.create(hir.Stmt);
+    then_blk.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{ret}) };
+    const iff = try b.a.create(hir.Stmt);
+    iff.* = .{ .if_ = .{ .cond = cond, .then_ = then_blk, .else_ = null } };
+    try out.append(b.a, iff);
+
+    // let x = tmp.#p0 — the Ok payload (an i64 at the floor).
+    const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+    const base2 = try b.a.create(hir.Expr);
+    base2.* = .{ .local = .{ .idx = tmp_idx, .ty = .ptr } };
+    const ld = try b.a.create(hir.Expr);
+    ld.* = .{ .field_get = .{ .base = base2, .offset = 8, .ty = .i64 } };
+    const idx = try scope.declare(nm.text, ls.isVar(), .i64);
+    const bindst = try b.a.create(hir.Stmt);
+    bindst.* = .{ .let = .{ .idx = idx, .value = ld } };
+    try out.append(b.a, bindst);
 }
 
 /// One record-yielding tail statement: a record expression, `return
@@ -6148,4 +6232,67 @@ test "T? sugar: `-> i64?` is `-> Option<i64>` (errors.md)" {
         \\
     )) orelse return error.TestUnexpectedResult;
     defer mod.deinit();
+}
+
+test "try: Err propagates, Ok binds the payload (errors.md v0 floor)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn half(n: i64) -> Result<i64, i64> {
+        \\    if n % 2 == 0 { Ok(n / 2) } else { Err(n) }
+        \\}
+        \\fn quarter(n: i64) -> Result<i64, i64> {
+        \\    let h = try half(n)
+        \\    let q = try half(h)
+        \\    Ok(q)
+        \\}
+        \\fn main {
+        \\    match quarter(12) {
+        \\        Ok(v) -> env.out(v),
+        \\        Err(e) -> env.out(e),
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The desugar: bind the Result, test the tag, early-return on Err.
+    try testing.expect(std.mem.indexOf(u8, dump, "ret local") != null);
+
+    // `try` outside a Result-returning function is unsupported (the
+    // TYP300 wire is `q64 check`'s).
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn half(n: i64) -> Result<i64, i64> {
+        \\    Ok(n / 2)
+        \\}
+        \\fn f(n: i64) -> Option<i64> {
+        \\    let h = try half(n)
+        \\    Some(h)
+        \\}
+        \\fn main {
+        \\    let o = f(4)
+        \\    env.out(1)
+        \\}
+        \\
+    )) == null);
+    // `try` of a non-Result value is unsupported.
+    var tr3 = TestResolver{ .a = testing.allocator };
+    defer tr3.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr3,
+        \\fn g(n: i64) -> Option<i64> {
+        \\    Some(n)
+        \\}
+        \\fn f(n: i64) -> Result<i64, i64> {
+        \\    let h = try g(n)
+        \\    Ok(h)
+        \\}
+        \\fn main {
+        \\    let r = f(4)
+        \\    env.out(1)
+        \\}
+        \\
+    )) == null);
 }
