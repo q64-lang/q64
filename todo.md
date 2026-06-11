@@ -599,6 +599,22 @@ spec/q64-cli.md `--component`).
 - [ ] **Later: native via LLVM.** A `codegen` sibling lowering `MIR → LLVM IR`,
       plus a native host ABI for the `env.*` capability faces (the one piece not
       inherited from the WASM component model).
+      **Decision recorded (2026-06): direct `MIR → LLVM IR`, no MLIR layer.**
+      HIR→MIR already is the multi-level lowering MLIR would provide; the
+      last hop is the *easy* direction (structured MIR → basic blocks is the
+      same label-stack walk the Binaryen `Lowerer` does — no relooper; the
+      `mir.Body.cfg` escape hatch isn't even needed for it), and MLIR's cost
+      (a huge C++ dep on a pure-Zig compiler, C API hostile from Zig, a third
+      IR) buys nothing at one CPU target. First rung when this activates:
+      emit **textual `.ll`** (zero link deps — data image as a global byte
+      array, `sp` global, structured-walk block emission, faces as `declare`d
+      externals; system `clang`/`llc` consume it), upgrade to the LLVM C API
+      later if warranted. The genuinely hard part is the native `env.*` host
+      ABI shim, not the lowering. Pin down the value-add vs `wasmtime
+      compile` (Cranelift AOT already runs the components natively) before
+      building. Revisit MLIR only if Q64 grows multi-target (GPU) or its own
+      mid-level optimization passes — and then as HIR/MIR *as dialects*, not
+      a layer on top.
 
 ## Semantic pass + struct values → static fits — NEXT (the slope-changing ladder)
 
