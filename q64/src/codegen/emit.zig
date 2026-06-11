@@ -658,6 +658,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var sc = Scratch{};
         scanScratch(inst, &sc);
         if (sc.has_concat) needs_arena = true;
+        if (sc.rec_depth > 0) needs_arena = true; // records live in the scope arena
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -754,11 +755,12 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         for (f.params) |p| params_width += if (p == .str) 2 else 1;
 
         // Scratch layout, just past the params + declared locals:
-        //   [tuple slots × n_tuples][buf][off][len].
+        //   [tuple slots × n_tuples][buf][off][len][record base ptrs × rec_depth].
         // The first tuple slot doubles as the host_out pair scratch.
         var sc = Scratch{};
         scanScratch(structured, &sc);
         const n_tuples: u32 = @max(@as(u32, if (sc.host_out) 1 else 0), sc.max_tuples);
+        const n_concat: u32 = if (sc.has_concat) 3 else 0;
         const base: u32 = @intCast(params_width + f.locals.len);
 
         var lw = Lowerer{
@@ -774,6 +776,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .buf_idx = base + n_tuples,
             .off_idx = base + n_tuples + 1,
             .len_idx = base + n_tuples + 2,
+            .rec_base = base + n_tuples + n_concat,
             .host_imports = &host_imports,
             .global_names = global_names,
             .stdout_abi = stdout_abi,
@@ -782,8 +785,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         defer lw.deinit();
 
         // varTypes (locals beyond params): declared locals, then tuple slots,
-        // then the concat scratch (buf/off/len) when concatenating.
-        const n_extra = f.locals.len + n_tuples + @as(usize, if (sc.has_concat) 3 else 0);
+        // then the concat scratch (buf/off/len) when concatenating, then one
+        // base-ptr scratch per record_make nesting level.
+        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
         for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type, ptr_type);
@@ -794,6 +798,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             vts[f.locals.len + n_tuples + 1] = ptr_type;
             vts[f.locals.len + n_tuples + 2] = ptr_type;
         }
+        for (0..sc.rec_depth) |j| vts[f.locals.len + n_tuples + n_concat + j] = ptr_type;
 
         // Parameter wasm types (a `str` param → two address-width ptr/len).
         var ptype = none_type;
@@ -890,6 +895,12 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .str_index_of => |m| bodyHasOut(m.str, want_int) or bodyHasOut(m.byte, want_int),
         .str_starts_with => |m| bodyHasOut(m.str, want_int) or bodyHasOut(m.prefix, want_int),
         .str_contains => |m| bodyHasOut(m.str, want_int) or bodyHasOut(m.sub, want_int),
+        .record_make => |rm| blk: {
+            for (rm.inits) |fi| if (bodyHasOut(fi.value, want_int)) break :blk true;
+            break :blk false;
+        },
+        .field_get => |fg| bodyHasOut(fg.base, want_int),
+        .field_set => |fs| bodyHasOut(fs.base, want_int) or bodyHasOut(fs.value, want_int),
         .host_out_const, .const_i64, .const_i32, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -948,10 +959,38 @@ const Scratch = struct {
     has_index_of: bool = false,
     has_starts_with: bool = false,
     has_contains: bool = false,
+    /// Max nesting depth of `record_make` (a record literal inside another's
+    /// field value, via a call argument): each level needs its own base-ptr
+    /// scratch local so an inner alloc can't clobber the outer's base.
+    rec_depth: u32 = 0,
 };
 
 fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
     switch (inst.op) {
+        .record_make => |rm| {
+            // Depth = 1 + the deepest record_make inside a field value (an
+            // inner literal evaluates while the outer's base is live).
+            var inner: u32 = 0;
+            for (rm.inits) |fi| {
+                var sub = Scratch{};
+                scanScratch(fi.value, &sub);
+                if (sub.rec_depth > inner) inner = sub.rec_depth;
+                // Merge the sub-scan's other findings into the parent.
+                s.host_out = s.host_out or sub.host_out;
+                s.has_concat = s.has_concat or sub.has_concat;
+                if (sub.max_tuples > s.max_tuples) s.max_tuples = sub.max_tuples;
+                s.has_str_eq = s.has_str_eq or sub.has_str_eq;
+                s.has_index_of = s.has_index_of or sub.has_index_of;
+                s.has_starts_with = s.has_starts_with or sub.has_starts_with;
+                s.has_contains = s.has_contains or sub.has_contains;
+            }
+            if (inner + 1 > s.rec_depth) s.rec_depth = inner + 1;
+        },
+        .field_get => |fg| scanScratch(fg.base, s),
+        .field_set => |fs| {
+            scanScratch(fs.base, s);
+            scanScratch(fs.value, s);
+        },
         .str_concat => |pieces| {
             s.has_concat = true;
             // A `call` and an `fmt_int_to_str` piece each return a (ptr, len)
@@ -1072,6 +1111,10 @@ const Lowerer = struct {
     buf_idx: c.BinaryenIndex = 0,
     off_idx: c.BinaryenIndex = 0,
     len_idx: c.BinaryenIndex = 0,
+    /// First record base-ptr scratch local; `rec_base + rec_level` holds the
+    /// base of the record currently being initialized at that nesting level.
+    rec_base: c.BinaryenIndex = 0,
+    rec_level: u32 = 0,
     label_ctr: u32 = 0,
     loops: std.ArrayList(LoopLabels) = .empty,
     /// Dotted host-face name (`qview.text`) → the declared wasm import's internal
@@ -1256,6 +1299,27 @@ const Lowerer = struct {
                 try self.strOperands(m.str, &operands);
                 try self.strOperands(m.sub, &operands);
                 return c.BinaryenCall(module, "__str_contains", operands.items.ptr, @intCast(operands.items.len), self.i32_type);
+            },
+            .record_make => |rm| return self.emitRecordMake(rm),
+            .field_get => |fg| {
+                // The loaded width follows the result type (spec/memory.md
+                // §"Linear struct layout"): i64 → an 8-byte load; i32 (a bool
+                // field) → a 1-byte zero-extending load.
+                const base = try self.inst(fg.base);
+                return switch (n.ty) {
+                    .i64 => c.BinaryenLoad(module, 8, true, fg.offset, 0, self.i64_type, base, "0"),
+                    .i32 => c.BinaryenLoad(module, 1, false, fg.offset, 0, self.i32_type, base, "0"),
+                    else => Error.UnsupportedCall,
+                };
+            },
+            .field_set => |fs| {
+                const base = try self.inst(fs.base);
+                const value = try self.inst(fs.value);
+                return switch (fs.value.ty) {
+                    .i64 => c.BinaryenStore(module, 8, fs.offset, 0, base, value, self.i64_type, "0"),
+                    .i32 => c.BinaryenStore(module, 1, fs.offset, 0, base, value, self.i32_type, "0"),
+                    else => Error.UnsupportedCall,
+                };
             },
             .if_ => |iff| {
                 const cond = try self.inst(iff.cond);
@@ -1493,6 +1557,52 @@ const Lowerer = struct {
         };
         try stmts.append(self.allocator, c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len));
         return c.BinaryenBlock(m, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), self.pair_type);
+    }
+
+    /// Materialize a record in the scope arena (spec/memory.md §"Linear
+    /// struct layout"): align `sp` up to the struct alignment, bump-allocate
+    /// `size` bytes with the base in this nesting level's scratch local,
+    /// store each field at its offset, and yield the base pointer. Field
+    /// values are emitted one level deeper so an inner record literal (via a
+    /// call argument) gets its own base scratch.
+    fn emitRecordMake(self: *Lowerer, rm: anytype) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const ridx = self.rec_base + self.rec_level;
+        var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        // sp = (sp + align-1) & -align — concat allocations are unaligned, so
+        // every record alloc re-aligns the bump pointer first.
+        if (rm.alignment > 1) {
+            const bumped = self.ptrAdd(c.BinaryenGlobalGet(m, "sp", self.ptr_type), self.ptrConst(rm.alignment - 1));
+            const mask = self.ptrConst(-@as(i64, rm.alignment));
+            try stmts.append(self.allocator, c.BinaryenGlobalSet(m, "sp", self.ptrAnd(bumped, mask)));
+        }
+        // base = sp; sp += size.
+        try stmts.append(self.allocator, c.BinaryenLocalSet(m, ridx, c.BinaryenGlobalGet(m, "sp", self.ptr_type)));
+        try stmts.append(self.allocator, c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(ridx), self.ptrConst(rm.size))));
+
+        // Store each field (width per the value's type, like field_set).
+        for (rm.inits) |fi| {
+            self.rec_level += 1;
+            const value = try self.inst(fi.value);
+            self.rec_level -= 1;
+            const store = switch (fi.value.ty) {
+                .i64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, self.i64_type, "0"),
+                .i32 => c.BinaryenStore(m, 1, fi.offset, 0, self.ptrGet(ridx), value, self.i32_type, "0"),
+                else => return Error.UnsupportedCall,
+            };
+            try stmts.append(self.allocator, store);
+        }
+
+        try stmts.append(self.allocator, self.ptrGet(ridx));
+        return c.BinaryenBlock(m, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), self.ptr_type);
+    }
+
+    /// Pointer-width bitwise AND — for aligning the arena bump pointer.
+    fn ptrAnd(self: *Lowerer, a: c.BinaryenExpressionRef, b: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        const op = if (self.ptr_type == self.i32_type) c.BinaryenAndInt32() else c.BinaryenAndInt64();
+        return c.BinaryenBinary(self.module, op, a, b);
     }
 
     fn wty(self: *const Lowerer, t: ir.mir.ValueType) c.BinaryenType {

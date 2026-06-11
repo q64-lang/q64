@@ -104,6 +104,13 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, sl.value);
             try app(gpa, out, "\n", .{});
         },
+        .field_set => |fs| {
+            try app(gpa, out, "field_set ", .{});
+            try hirExpr(gpa, out, fs.base);
+            try app(gpa, out, "+{d} : {s} = ", .{ fs.offset, @tagName(fs.ty) });
+            try hirExpr(gpa, out, fs.value);
+            try app(gpa, out, "\n", .{});
+        },
         .if_ => |iff| {
             try app(gpa, out, "if ", .{});
             try hirExpr(gpa, out, iff.cond);
@@ -217,6 +224,20 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try app(gpa, out, ".contains(", .{});
             try hirExpr(gpa, out, m.sub);
             try app(gpa, out, ")", .{});
+        },
+        .record_alloc => |ra| {
+            try app(gpa, out, "record_alloc size={d} align={d} [", .{ ra.size, ra.alignment });
+            for (ra.inits, 0..) |fi, i| {
+                if (i != 0) try app(gpa, out, ", ", .{});
+                try app(gpa, out, "+{d}: ", .{fi.offset});
+                try hirExpr(gpa, out, fi.value);
+            }
+            try app(gpa, out, "]", .{});
+        },
+        .field_get => |fg| {
+            try app(gpa, out, "field_get(", .{});
+            try hirExpr(gpa, out, fg.base);
+            try app(gpa, out, "+{d} : {s})", .{ fg.offset, @tagName(fg.ty) });
         },
     }
 }
@@ -348,6 +369,23 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "str_contains\n", .{});
             try mirInst(gpa, out, m.str, depth + 1);
             try mirInst(gpa, out, m.sub, depth + 1);
+        },
+        .record_make => |rm| {
+            try app(gpa, out, "record_make size={d} align={d}\n", .{ rm.size, rm.alignment });
+            for (rm.inits) |fi| {
+                try indent(gpa, out, depth + 1);
+                try app(gpa, out, "+{d}:\n", .{fi.offset});
+                try mirInst(gpa, out, fi.value, depth + 2);
+            }
+        },
+        .field_get => |fg| {
+            try app(gpa, out, "field_get +{d} : {s}\n", .{ fg.offset, @tagName(inst.ty) });
+            try mirInst(gpa, out, fg.base, depth + 1);
+        },
+        .field_set => |fs| {
+            try app(gpa, out, "field_set +{d}\n", .{fs.offset});
+            try mirInst(gpa, out, fs.base, depth + 1);
+            try mirInst(gpa, out, fs.value, depth + 1);
         },
         .if_ => |iff| {
             try app(gpa, out, "if : {s}\n", .{@tagName(inst.ty)});

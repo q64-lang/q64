@@ -523,8 +523,8 @@ echo "    ok: wasm32 string ABI -> ... / hi!: a=42, b=50 (matches wasm64)"
 # B2 (SROA): record-literal bindings in main lower to per-field scalar
 # locals named with the dotted path ("p.x"), so field reads, var field
 # assignment, and {p.x} interpolation all run through the plain local
-# machinery. No aggregate layout exists yet (struct copies/passing are
-# honestly Unsupported); this pins the slice end-to-end on both addrs.
+# machinery (the binding never escapes — see B2b below for the ones that
+# do); this pins the slice end-to-end on both addrs.
 echo "==> B2: record-literal bindings (SROA) — field reads / assign / interpolation"
 rec_app="$tmp/record.q"
 rec_wasm="$tmp/record.wasm"
@@ -558,5 +558,54 @@ if [[ "$rec32_out" != "$rec_expected" ]]; then
     exit 1
 fi
 echo "    ok: record bindings -> 42 / 43 / p = (42, 8); q.x = 43 (wasm64 + wasm32)"
+
+# ---------------------------------------------------------------------------
+# B2b (layout): records that escape SROA — passed whole, returned from a
+# callee, field-assigned through the pointer — materialize in the scope
+# arena per spec/memory.md §"Linear struct layout" (declaration order,
+# natural alignment: bool 1 byte, i64 at +8, size 16). A record param is
+# one address-width pointer; field access is a (ptr, offset) load/store.
+echo "==> B2b: record layout — passed / returned / field-assigned records"
+lay_app="$tmp/layout.q"
+lay_wasm="$tmp/layout.wasm"
+cat > "$lay_app" <<'Q64'
+struct Point { x: i64, y: i64 }
+struct Flag { hot: bool, n: i64 }
+
+fn make(x: i64, y: i64) -> Point { Point { x: x, y: y } }
+fn dot(a: Point, b: Point) -> i64 { a.x * b.x + a.y * b.y }
+fn norm2(p: Point) -> i64 { dot(p, p) }
+fn pick(f: Flag) -> i64 { if f.hot { f.n } else { 0 - f.n } }
+
+fn main {
+    let p = make(3, 4)
+    env.out(p.x)
+    env.out(dot(p, p))
+    env.out(norm2(make(1, 2)))
+    var c = Point { x: 2, y: p.y }
+    c.x = c.x + p.x
+    env.out(dot(c, p))
+    env.out("c = ({c.x}, {c.y})")
+    let f = Flag { hot: true, n: 7 }
+    env.out(f.hot)
+    env.out(pick(f))
+}
+Q64
+"$Q64_BIN" emit "$lay_app" "$lay_wasm"
+lay_out="$("$HOST_BIN" "$lay_wasm")"
+lay_expected=$'3\n25\n5\n31\nc = (5, 4)\ntrue\n7'
+if [[ "$lay_out" != "$lay_expected" ]]; then
+    echo "FAIL: record-layout output mismatch" >&2
+    printf "  expected: %q\n" "$lay_expected" >&2
+    printf "  actual:   %q\n" "$lay_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$lay_app" "$tmp/layout32.wasm" --addr wasm32
+lay32_out="$("$HOST_BIN" "$tmp/layout32.wasm")"
+if [[ "$lay32_out" != "$lay_expected" ]]; then
+    echo "FAIL: record-layout wasm32 output mismatch" >&2
+    exit 1
+fi
+echo "    ok: record layout -> 3 / 25 / 5 / 31 / c = (5, 4) / true / 7 (wasm64 + wasm32)"
 
 echo "PASS: $qube_out"

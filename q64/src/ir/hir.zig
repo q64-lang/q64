@@ -187,6 +187,11 @@ pub const Module = struct {
 
 pub const Param = struct { name: []const u8, ty: Type };
 
+/// One field initializer of a `record_alloc`: store `value` (typed `ty`) at
+/// `base + offset`. Offsets/sizes follow spec/memory.md §"Linear struct
+/// layout"; the builder computes them from the struct declaration.
+pub const FieldInit = struct { offset: u32, ty: Type, value: *Expr };
+
 pub const Func = struct {
     name: []const u8,
     params: []Param = &.{},
@@ -241,6 +246,9 @@ pub const Stmt = union(enum) {
     /// A runtime `str` binding (`let g = shout("hi")`): store the value's
     /// `(ptr, len)` into the two locals `ptr_idx`/`len_idx`.
     str_let: struct { ptr_idx: u32, len_idx: u32, value: *Expr },
+    /// Store a record field through its base pointer (`p.x = v` on a
+    /// materialized record): write `value` (typed `ty`) at `base + offset`.
+    field_set: struct { base: *Expr, offset: u32, ty: Type, value: *Expr },
     /// `then_`/`else_` are blocks (an `else if` is a block holding one `if_`).
     if_: struct { cond: *Expr, then_: *Stmt, else_: ?*Stmt },
     while_: struct { cond: *Expr, body: *Stmt },
@@ -303,4 +311,12 @@ pub const Expr = union(enum) {
     str_starts_with: struct { str: *Expr, prefix: *Expr },
     /// `s.contains(sub)` — does `sub` occur anywhere in `s`? bool (i32 0/1).
     str_contains: struct { str: *Expr, sub: *Expr },
+    /// A record value materialized in memory (a record literal that escapes
+    /// SROA): allocate `size` bytes in the scope arena at `alignment`, store
+    /// each field at its layout offset, yield the base pointer (a `ptr`).
+    /// Layout per spec/memory.md §"Linear struct layout".
+    record_alloc: struct { size: u32, alignment: u32, inits: []const FieldInit },
+    /// Read a record field through its base pointer (`p.x` where `p` is a
+    /// materialized record value): load the `ty`-typed field at `base + offset`.
+    field_get: struct { base: *Expr, offset: u32, ty: Type },
 };

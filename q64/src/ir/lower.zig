@@ -128,6 +128,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         },
         .global_set => |gs| return mk(ctx.a, .void, .{ .global_set = .{ .idx = gs.idx, .value = try lowerExpr(ctx, gs.value) } }),
         .str_let => |sl| return mk(ctx.a, .void, .{ .str_bind = .{ .ptr_idx = sl.ptr_idx, .len_idx = sl.len_idx, .value = try lowerStrExpr(ctx, sl.value) } }),
+        .field_set => |fs| return mk(ctx.a, .void, .{ .field_set = .{ .base = try lowerExpr(ctx, fs.base), .offset = fs.offset, .value = try lowerExpr(ctx, fs.value) } }),
         .let => |l| return mk(ctx.a, .void, .{ .local_set = .{ .idx = l.idx, .value = try lowerExpr(ctx, l.value) } }),
         // Void control flow — shared by `main` and function-body setup
         // statements (a non-tail `if`/`while`/`loop`/assign/break/continue).
@@ -349,6 +350,15 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             // i32 for a `-> bool`), so it validates against the callee sig.
             return mk(ctx.a, mapType(ctx.funcs[cl.func].ret), .{ .call = .{ .func = cl.func, .args = args } });
         },
+        // A materialized record: alloc in the scope arena, store the fields,
+        // yield the base pointer. The store width rides on each value's type.
+        .record_alloc => |ra| {
+            const inits = try ctx.a.alloc(mir.FieldInit, ra.inits.len);
+            for (ra.inits, 0..) |fi, i| inits[i] = .{ .offset = fi.offset, .value = try lowerExpr(ctx, fi.value) };
+            return mk(ctx.a, .ptr, .{ .record_make = .{ .size = ra.size, .alignment = ra.alignment, .inits = inits } });
+        },
+        // A field read through the base pointer; the loaded type rides on `ty`.
+        .field_get => |fg| return mk(ctx.a, mapType(fg.ty), .{ .field_get = .{ .base = try lowerExpr(ctx, fg.base), .offset = fg.offset } }),
         // `s.len` — lower the str operand to its (ptr, len) value; the backend
         // reads the len component and zero-extends it to i64.
         .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
@@ -578,4 +588,37 @@ test "lower: env.out(<bool>) interns true/false and lowers to a void if" {
         if (std.mem.eql(u8, f.name, "is_even")) saw_bool_ret = (f.ret == .i32);
     }
     try testing.expect(saw_bool_ret);
+}
+
+test "lower: a materialized record lowers to record_make + field_get loads" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct Point { x: i64, y: i64 }
+        \\
+        \\fn dot(a: Point, b: Point) -> i64 { a.x * b.x + a.y * b.y }
+        \\
+        \\fn main {
+        \\    let p = Point { x: 3, y: 4 }
+        \\    env.out(dot(p, p))
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const pr = try parser.parse.parse(testing.allocator, src, "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    // The literal allocates 16 aligned bytes; field reads are typed loads.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_make size=16 align=8") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get +8 : i64") != null);
 }

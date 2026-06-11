@@ -121,6 +121,10 @@ fn collectStmt(
         .let => |l| try collectExpr(a, l.value, d, e),
         .assign => |as| try collectExpr(a, as.value, d, e),
         .str_let => |sl| try collectExpr(a, sl.value, d, e),
+        .field_set => |fs| {
+            try collectExpr(a, fs.base, d, e);
+            try collectExpr(a, fs.value, d, e);
+        },
         .if_ => |iff| {
             try collectExpr(a, iff.cond, d, e);
             try collectStmt(a, iff.then_, d, e);
@@ -183,6 +187,8 @@ fn collectExpr(
             try collectExpr(a, m.str, d, e);
             try collectExpr(a, m.sub, d, e);
         },
+        .record_alloc => |ra| for (ra.inits) |fi| try collectExpr(a, fi.value, d, e),
+        .field_get => |fg| try collectExpr(a, fg.base, d, e),
         // Leaves: no calls, no faces.
         .str_const, .int_const, .bool_const, .local, .global_get, .str_binding => {},
     }
