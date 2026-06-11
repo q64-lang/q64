@@ -638,8 +638,9 @@ pub fn ChildIter(comptime View: type, comptime kind: cst.SyntaxKind) type {
     };
 }
 
-/// `FaceDecl := "face" IDENT … FaceBody`. The header (super-faces,
-/// generics) and method signatures are raw spans in v0.
+/// `FaceDecl := "face" IDENT GenericParams? FaceSuperList? FaceBody`
+/// (B3: the body's method signatures are structured; `type` aliases and
+/// `law`s stay raw token runs).
 pub const FaceDecl = struct {
     cst: *const cst.Node,
 
@@ -652,10 +653,17 @@ pub const FaceDecl = struct {
     pub fn name(self: FaceDecl) ?cst.Token {
         return itemName(self.cst);
     }
+
+    /// The structured method signatures in the face body.
+    pub fn methods(self: FaceDecl) MethodIter {
+        const body = firstChildRawNode(self.cst, .FACE_BODY) orelse
+            return .{ .children = &.{} };
+        return .{ .children = body.children };
+    }
 };
 
-/// `FitDecl := "fit" … FitBody`. Header and method bodies are raw spans
-/// in v0.
+/// `FitDecl := "fit" FitSpec WhereClause? FitBody` (B3: the spec and the
+/// body's method signatures are structured; the where clause is raw).
 pub const FitDecl = struct {
     cst: *const cst.Node,
 
@@ -666,9 +674,113 @@ pub const FitDecl = struct {
         return self.visibility() != null;
     }
 
-    /// The first name in the `fit` header (`fit Name : Face` → `Name`).
+    /// The first name in the `fit` header (`fit Name : Face` → `Name`,
+    /// `fit Eq<Point>` → `Eq`) — the spec's first path's head token.
     pub fn name(self: FitDecl) ?cst.Token {
+        const sp = self.spec() orelse return null;
+        const te = firstChildType(sp.cst) orelse return null;
+        return switch (te) {
+            .path => |pt| itemName(pt.cst),
+            else => null,
+        };
+    }
+
+    pub fn spec(self: FitDecl) ?FitSpec {
+        const node = firstChildRawNode(self.cst, .FIT_SPEC) orelse return null;
+        return .{ .cst = node };
+    }
+
+    /// The structured method declarations in the fit body.
+    pub fn methods(self: FitDecl) MethodIter {
+        const body = firstChildRawNode(self.cst, .FIT_BODY) orelse
+            return .{ .children = &.{} };
+        return .{ .children = body.children };
+    }
+};
+
+/// `FitSpec := TypeExpr ":" FaceRef | FaceRef` — which form was written.
+/// The single-param form names a target type and a face
+/// (`Color : Display`); the multi-param form is one generic face path
+/// (`Convert<A, B>`). Whether the written form matches the face's arity
+/// is sema's check (TYP201 / TYP202 — the B4 fit registry).
+pub const FitSpec = struct {
+    cst: *const cst.Node,
+
+    /// True for the `Type : Face` form (a COLON token is present).
+    pub fn isColonForm(self: FitSpec) bool {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .COLON) return true,
+            .node => {},
+        };
+        return false;
+    }
+
+    /// The target type before the `:` (`fit Color : Display` → `Color`),
+    /// or null in the bare multi-param form.
+    pub fn target(self: FitSpec) ?TypeExpr {
+        if (!self.isColonForm()) return null;
+        return firstChildType(self.cst);
+    }
+
+    /// The face reference: the FACE_REF after `:` in the colon form, or
+    /// the bare type itself in the multi-param form.
+    pub fn face(self: FitSpec) ?TypeExpr {
+        if (firstChildRawNode(self.cst, .FACE_REF)) |ref| {
+            return firstChildType(ref);
+        }
+        if (self.isColonForm()) return null; // `:` with a missing/degraded ref
+        return firstChildType(self.cst);
+    }
+};
+
+/// Iterates the METHOD_SIG children of a FACE_BODY / FIT_BODY.
+pub const MethodIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *MethodIter) ?MethodSig {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .METHOD_SIG) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// `MethodSig := "fn" IDENT GenericParams? "(" Params? ")"
+/// ("->" TypeExpr)? EffectSpec? WhereClause? Block?` — a face/fit body
+/// item. Effects and where clauses are raw tokens in v0. A body present
+/// means a default impl (in a face) or the impl itself (in a fit) —
+/// whether one is required is sema's call.
+pub const MethodSig = struct {
+    cst: *const cst.Node,
+
+    pub fn name(self: MethodSig) ?cst.Token {
         return itemName(self.cst);
+    }
+
+    pub fn params(self: MethodSig) ?Params {
+        const node = firstChildRawNode(self.cst, .PARAMS) orelse return null;
+        return .{ .cst = node };
+    }
+
+    pub fn returnType(self: MethodSig) ?ReturnType {
+        const node = firstChildRawNode(self.cst, .RETURN_TYPE) orelse return null;
+        return .{ .cst = node };
+    }
+
+    pub fn body(self: MethodSig) ?Block {
+        const node = firstChildRawNode(self.cst, .BLOCK) orelse return null;
+        return .{ .cst = node };
+    }
+
+    pub fn hasBody(self: MethodSig) bool {
+        return self.body() != null;
     }
 };
 
@@ -737,17 +849,24 @@ pub const Param = struct {
         return null;
     }
 
-    /// The parameter's binding name — the first `IDENT` before the `:`.
-    /// `null` for ill-formed input with no name token.
+    /// The parameter's binding name — the first `IDENT` (or the `self`
+    /// receiver keyword) before the `:`. `null` for ill-formed input
+    /// with no name token.
     pub fn name(self: Param) ?cst.Token {
         for (self.cst.children) |c| switch (c) {
             .token => |t| {
                 if (t.kind == .COLON) return null;
-                if (t.kind == .IDENT) return t;
+                if (t.kind == .IDENT or t.kind == .KW_SELF) return t;
             },
             .node => {},
         };
         return null;
+    }
+
+    /// True for the `self` receiver parameter of a face/fit method.
+    pub fn isSelf(self: Param) bool {
+        const nm = self.name() orelse return false;
+        return nm.kind == .KW_SELF;
     }
 
     /// The declared type as source text, trivia-trimmed. `null` when the
