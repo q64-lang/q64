@@ -93,6 +93,10 @@ const Builder = struct {
     /// spec/memory.md §"Linear struct layout". Struct-typed signatures resolve
     /// against this table (v0: the compiling file's structs only).
     structs: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
+    /// The fit registry (sema/fits.zig) over this file — B4 static
+    /// dispatch resolves `p.area()` through it. Arena-backed (never
+    /// deinit'd separately).
+    fitreg: ?sema.fits.Registry = null,
     /// FuncId → its record params/return, for functions with a record surface.
     fn_recs: std.AutoHashMapUnmanaged(hir.FuncId, FnRec) = .empty,
     /// `main`'s body block, for the record-binding escape scan (does a bare
@@ -204,6 +208,9 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // fields outside the v0 floor (i64 / bool) are skipped, not rejected —
     // a *use* of one surfaces the honest Unsupported.
     try registerStructs(b, sf);
+    // Pass 0.6: the fit registry (B4) — `p.area()` dispatches through it.
+    // Its form diagnostics (TYP201/202) belong to `q64 check`, not emit.
+    b.fitreg = try sema.fits.build(b.a, sf);
 
     // A module may have no `fn main` (a backend twin: just `state` + exported
     // commands). Then there's no entry — build only the screen functions.
@@ -1321,11 +1328,13 @@ fn recFieldExpr(b: *Builder, rf: RecField) BuildError!*hir.Expr {
     return out;
 }
 
-/// Does the bare name appear as a *whole-value* use anywhere in `main`'s
-/// body — a PATH_EXPR that is exactly `name` (a call argument, `env.out(p)`,
-/// …)? Field access (`p.x`) parses as one greedy dotted PATH_EXPR, so it
-/// never matches. Conservative: a match anywhere (even before the binding)
-/// materializes the record; SROA is the optimization, not the semantics.
+/// Does the name appear as a *whole-value* use anywhere in `main`'s body —
+/// a bare PATH_EXPR that is exactly `name` (a call argument, `env.out(p)`,
+/// …), or a *method call through it* (`p.area()` — the receiver passes as
+/// a pointer, so the record must exist in memory)? A plain field access
+/// (`p.x`) parses as one greedy dotted PATH_EXPR and never matches.
+/// Conservative: a match anywhere (even before the binding) materializes
+/// the record; SROA is the optimization, not the semantics.
 fn recordEscapes(b: *Builder, name: []const u8) BuildError!bool {
     const body = b.main_body orelse return false;
     return nodeHasWholePath(b, body.cst, name);
@@ -1337,11 +1346,108 @@ fn nodeHasWholePath(b: *Builder, node: *const parser.cst.Node, name: []const u8)
         defer b.a.free(txt);
         return std.mem.eql(u8, txt, name); // paths don't nest — no recursion
     }
+    if (node.kind == .CALL_EXPR) {
+        // A dotted callee whose head is `name` is a method call on the
+        // binding (`p.area()`) — a receiver use, so the record escapes.
+        // (A field can't be called, so any call through the path counts.)
+        for (node.children) |ch| switch (ch) {
+            .node => |nn| {
+                if (nn.kind != .PATH_EXPR) continue;
+                const txt = try (ast.PathExpr{ .cst = nn }).text(b.a);
+                defer b.a.free(txt);
+                if (std.mem.indexOfScalar(u8, txt, '.')) |dot| {
+                    if (std.mem.eql(u8, txt[0..dot], name)) return true;
+                }
+                break; // only the callee (the first path child) counts
+            },
+            .token => {},
+        };
+    }
     for (node.children) |ch| switch (ch) {
         .node => |nn| if (try nodeHasWholePath(b, nn, name)) return true,
         .token => {},
     };
     return false;
+}
+
+/// The fit method `<struct>.<name>` from the registry: every fit whose
+/// target is the struct (any face) is searched for a method signature
+/// with the name. v0 dispatch keys on (concrete type, method name) —
+/// unambiguous until two fits collide, which is a later TYP check.
+fn findFitMethod(b: *Builder, struct_name: []const u8, mname: []const u8) ?ast.MethodSig {
+    if (b.fitreg == null) return null;
+    const reg = &b.fitreg.?;
+    for (reg.fits.items) |f| {
+        const t = f.target orelse continue;
+        if (!std.mem.eql(u8, t, struct_name)) continue;
+        var ms = f.decl.methods();
+        while (ms.next()) |m| {
+            const nm = m.name() orelse continue;
+            if (std.mem.eql(u8, nm.text, mname)) return m;
+        }
+    }
+    return null;
+}
+
+/// Resolve `<si>.<mname>` to a registered HIR function, building the fit
+/// method's body the first time (deduped as "Struct.method" in `b.ids`,
+/// which is also its wasm name). The method must take `self` first — the
+/// dispatch receiver, passed as the record's base pointer per B2b's ABI;
+/// remaining params and the return stay on the scalar floor (i64/bool).
+/// Null when no fit for the struct declares the method.
+fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) BuildError!?hir.FuncId {
+    const key = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ si.name, mname });
+    if (b.ids.get(key)) |id| return id;
+    const m = findFitMethod(b, si.name, mname) orelse return null;
+    const body_blk = m.body() orelse return error.Unsupported; // a bodyless sig can't be called
+    const rt = m.returnType() orelse return error.Unsupported;
+    const rs = (try semaScalar(b, rt.type_())) orelse return error.Unsupported;
+    const ret_ty: hir.Type = switch (rs) {
+        .bool, .i64 => rs,
+        else => return error.Unsupported, // str/record-valued methods: later
+    };
+
+    var scope = Scope{ .a = b.a };
+    var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    const ps = m.params() orelse return error.Unsupported;
+    var pit = ps.iter();
+    const recv = pit.next() orelse return error.Unsupported;
+    if (!recv.isSelf()) return error.Unsupported; // dispatch needs a receiver
+    _ = try scope.declare("self", false, .ptr);
+    try scope.recs.put(b.a, "self", si);
+    try params.append(b.a, .{ .name = "self", .ty = .ptr });
+    try rec_params.append(b.a, si);
+    while (pit.next()) |p| {
+        const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+        const pty: hir.Type = switch (psc) {
+            .bool, .i64 => psc,
+            else => return error.Unsupported,
+        };
+        const pn = (p.name() orelse return error.Unsupported).text;
+        _ = try scope.declare(pn, false, pty);
+        try params.append(b.a, .{ .name = pn, .ty = pty });
+        try rec_params.append(b.a, null);
+    }
+    scope.n_params = @intCast(params.items.len);
+    const param_slice = try params.toOwnedSlice(b.a);
+
+    // Reserve before building the body so `self.other()` (and recursion)
+    // resolves with the correct arity.
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, key, id);
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy });
+    try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = null });
+
+    const body = try buildIntBlock(b, body_blk, &scope);
+    if (tailIsValueIfNoElse(body)) return reject(b, .unsupported_call);
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
+    b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
+    return id;
 }
 
 /// Bind a record value in `main`: one `.ptr` local (shared index space with
@@ -1414,7 +1520,7 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
             const cname = try callee_path.text(b.a);
             defer b.a.free(cname);
             const id = try registerFunc(b, cname);
-            const args = try buildCallArgs(b, id, cc, scope);
+            const args = try buildCallArgs(b, id, cc, scope, null);
             const out = try b.a.create(hir.Expr);
             out.* = .{ .call = .{ .func = id, .args = args } };
             return .{ .e = out, .si = si };
@@ -1424,9 +1530,12 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
 }
 
 /// Build + check a call's arguments against the callee's parameter kinds
-/// (int / bool / record). Shared by the i64 path and the record path. A
-/// record argument must be a record value of the parameter's exact struct.
-fn buildCallArgs(b: *Builder, id: hir.FuncId, cc: ast.CallExpr, scope: *Scope) BuildError![]const *hir.Expr {
+/// (int / bool / record). Shared by the i64 path, the record path, and
+/// fit-method dispatch: a non-null `recv` fills the callee's first
+/// parameter (the `self` receiver), and the source arguments fill the
+/// rest. A record argument must be a record value of the parameter's
+/// exact struct.
+fn buildCallArgs(b: *Builder, id: hir.FuncId, cc: ast.CallExpr, scope: *Scope, recv: ?*hir.Expr) BuildError![]const *hir.Expr {
     // Snapshot the parameter kinds before building the args — building an
     // argument may register a new callee and grow `b.funcs`, so we can't
     // hold a slice into it across the loop.
@@ -1447,6 +1556,10 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, cc: ast.CallExpr, scope: *Scope) B
     var args: std.ArrayList(*hir.Expr) = .empty;
     var ait = cc.args();
     var ai: usize = 0;
+    if (recv) |r| {
+        try args.append(b.a, r);
+        ai = 1;
+    }
     while (ait.next()) |a| : (ai += 1) {
         if (ai >= np) return reject(b, .unsupported_call);
         switch (kinds[ai]) {
@@ -1511,6 +1624,22 @@ const ExprTypeBridge = struct {
 
     fn callRet(ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
         const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
+        // A dotted call on a record binding (`r.wide()`): the fit
+        // method's declared return type.
+        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+            const mname = name[dot + 1 ..];
+            if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
+            const si = self.scope.recs.get(name[0..dot]) orelse return null;
+            const m = findFitMethod(self.b, si.name, mname) orelse return null;
+            const rt = m.returnType() orelse return null;
+            const rs = (try semaScalar(self.b, rt.type_())) orelse return null;
+            return switch (rs) {
+                .bool => .bool,
+                .i64 => .i64,
+                .str => .str,
+                else => null,
+            };
+        }
         const fd = self.b.resolver.lookup(name) orelse return null;
         const rs = (try fnRetScalar(self.b, fd)) orelse return null;
         return switch (rs) {
@@ -1748,6 +1877,30 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // B4 static dispatch: `r.area()` — a dotted call whose head is a
+            // materialized record binding/param resolves through the fit
+            // registry to a direct call, the receiver passed as the record's
+            // base pointer (no vtable, no monomorphization). `self.other()`
+            // inside a fit method resolves the same way (`self` is in recs).
+            if (std.mem.indexOfScalar(u8, cname, '.')) |dot| {
+                const head = cname[0..dot];
+                const mname = cname[dot + 1 ..];
+                if (std.mem.indexOfScalar(u8, mname, '.') == null) {
+                    if (scope.recs.get(head)) |si| {
+                        const loc = scope.find(head) orelse return error.Unsupported;
+                        const fid = (try registerFitMethod(b, si, mname)) orelse
+                            return reject(b, .name_not_found); // no fit declares it
+                        switch (b.funcs.items[fid].ret) {
+                            .i64, .bool => {},
+                            else => return reject(b, .unsupported_call),
+                        }
+                        const recv = try b.a.create(hir.Expr);
+                        recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                        out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, cc, scope, recv) } };
+                        return out;
+                    }
+                }
+            }
             // i64/bool str methods parse as dotted calls: `<str>.index_of(byte)`
             // -> i64, `<str>.starts_with(p)` / `<str>.contains(sub)` -> bool.
             if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
@@ -1775,7 +1928,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 .i64, .bool => {},
                 else => return reject(b, .unsupported_call),
             }
-            out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc, scope) } };
+            out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc, scope, null) } };
         },
         .field => |fe| {
             // `s.len` — the byte length of a str value, as i64. (The only field
@@ -2626,4 +2779,129 @@ test "B2b: assigning a field of a `let` record is ImmutableAssign" {
     try tr.addLib(src);
     const r = try rejectFromSource(testing.allocator, src, tr.resolver());
     try testing.expectEqual(hir.Reject.immutable_assign, r.?);
+}
+
+test "B4: r.area() dispatches through the fit registry to a direct call" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Area { fn area(self) -> i64 }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Area {
+        \\    fn area(self) -> i64 { self.w * self.h }
+        \\}
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6, h: 7 }
+        \\    env.out(r.area())
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The fit method is a plain function named Struct.method, its self a
+    // record (.ptr) param; the call site passes the binding's pointer.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.area -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get(") != null);
+    // The method call forces the binding to materialize (escape).
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+}
+
+test "B4: a method may call another fit method on self" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Area { fn area(self) -> i64 }
+        \\face Scalable { fn scaled(self, k: i64) -> i64 }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Area { fn area(self) -> i64 { self.w * self.h } }
+        \\fit Rect : Scalable { fn scaled(self, k: i64) -> i64 { self.area() * k } }
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6, h: 7 }
+        \\    env.out(r.scaled(10))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.scaled -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.area -> i64") != null);
+}
+
+test "B4: a `-> bool` fit method routes env.out to the bool path" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Wide { fn wide(self) -> bool }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Wide { fn wide(self) -> bool { self.w > self.h } }
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6, h: 7 }
+        \\    env.out(r.wide())
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.wide -> bool") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null);
+}
+
+test "B4: a method no fit declares is NameNotFound" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Area { fn area(self) -> i64 }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Area { fn area(self) -> i64 { self.w * self.h } }
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6, h: 7 }
+        \\    env.out(r.perimeter())
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.name_not_found, r.?);
+}
+
+test "B4: wrong fit-method arity is UnsupportedCall" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Scalable { fn scaled(self, k: i64) -> i64 }
+        \\
+        \\struct Rect { w: i64 }
+        \\
+        \\fit Rect : Scalable { fn scaled(self, k: i64) -> i64 { self.w * k } }
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6 }
+        \\    env.out(r.scaled(2, 3))
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
 }
