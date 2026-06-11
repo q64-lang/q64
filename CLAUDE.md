@@ -31,6 +31,34 @@ this file holds the rules that are easiest to get wrong.
 - ~~"Run Q64 build."~~ (CLI is `q64`, monospace)
 - ~~"qubes.q64.dev"~~ (old plural — the API host is `qubes.q64.dev`)
 
+## Secrets, identity, and audience
+
+This repo is **public**. Two classes of mistake have already cost a
+history rewrite; never repeat them.
+
+**1. Never commit identity or infrastructure values.** Not in docs, not
+in examples, not in comments:
+
+- credentials, API tokens, passwords (CI uses repo secrets);
+- account identifiers and **account emails** (Cloudflare or otherwise);
+- personal emails of any kind;
+- provider resource ids — D1 database ids, KV namespace ids, zone ids
+  (the pattern is `wrangler.example.jsonc` committed with placeholders,
+  real `wrangler.jsonc` gitignored — see `continuum-api/`).
+
+Use `<account-id>`-style placeholders plus "look it up with
+`wrangler whoami`" instructions. Treat everything committed as
+**permanently public** — a history rewrite is an emergency measure,
+not an undo button.
+
+**2. Write docs for their real audience.** Repo docs address
+contributors and users. Contributors change things **by PR**; they
+never deploy and hold no infrastructure access. Operator-only runbooks
+(how q64.dev itself ships, account setup, console steps) do not belong
+in this repo — keep them in the maintainers' private notes. If a doc
+says "you" and the reader can't actually do the action, the doc is
+addressed wrong.
+
 ## Continuum architecture (top-level layout)
 
 - [`continuum/`](./continuum) — UI Worker. Deployed as `q64-continuum`. Route `continuum.q64.dev`.

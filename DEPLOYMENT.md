@@ -11,6 +11,10 @@ them up:
 This page covers the first. For publishing libraries, see
 [`spec/qube-cli.md` §"qube publish"](./spec/qube-cli.md).
 
+> **qubepods is currently in private preview.** The build/manifest
+> steps below work for everyone; the deploy itself (step 3's
+> console-minted token onward) requires an invited account.
+
 ## TL;DR
 
 ```sh
@@ -84,7 +88,8 @@ wizard. Useful extras:
 
 ## 3. Authenticate
 
-Mint a token in the qubepods console, then:
+Mint a token in the qubepods console (**private preview** — invited
+accounts only for now), then:
 
 ```sh
 qube pod login        # reads the token from stdin (or --token <t>)
