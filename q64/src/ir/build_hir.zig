@@ -928,7 +928,7 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
                         if (b.funcs.items[fid].ret != .str) return error.Unsupported; // not a str value
                         const recv = try b.a.create(hir.Expr);
                         recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-                        out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, cc, scope, recv) } };
+                        out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, cc.args(), scope, recv) } };
                         return out;
                     }
                 }
@@ -1580,7 +1580,7 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
             const cname = try callee_path.text(b.a);
             defer b.a.free(cname);
             const id = try registerFunc(b, cname);
-            const args = try buildCallArgs(b, id, cc, scope, null);
+            const args = try buildCallArgs(b, id, cc.args(), scope, null);
             const out = try b.a.create(hir.Expr);
             out.* = .{ .call = .{ .func = id, .args = args } };
             return .{ .e = out, .si = si };
@@ -1595,7 +1595,7 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?struct {
 /// parameter (the `self` receiver), and the source arguments fill the
 /// rest. A record argument must be a record value of the parameter's
 /// exact struct.
-fn buildCallArgs(b: *Builder, id: hir.FuncId, cc: ast.CallExpr, scope: *Scope, recv: ?*hir.Expr) BuildError![]const *hir.Expr {
+fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Scope, recv: ?*hir.Expr) BuildError![]const *hir.Expr {
     // Snapshot the parameter kinds before building the args — building an
     // argument may register a new callee and grow `b.funcs`, so we can't
     // hold a slice into it across the loop.
@@ -1614,7 +1614,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, cc: ast.CallExpr, scope: *Scope, r
     }
 
     var args: std.ArrayList(*hir.Expr) = .empty;
-    var ait = cc.args();
+    var ait = args_iter;
     var ai: usize = 0;
     if (recv) |r| {
         try args.append(b.a, r);
@@ -1956,7 +1956,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         }
                         const recv = try b.a.create(hir.Expr);
                         recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-                        out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, cc, scope, recv) } };
+                        out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, cc.args(), scope, recv) } };
                         return out;
                     }
                 }
@@ -1988,7 +1988,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 .i64, .bool => {},
                 else => return reject(b, .unsupported_call),
             }
-            out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc, scope, null) } };
+            out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc.args(), scope, null) } };
         },
         .field => |fe| {
             // `s.len` — the byte length of a str value, as i64. (The only field
@@ -2013,9 +2013,23 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             out.* = .{ .str_index = .{ .str = sval, .idx = idx } };
         },
         .method => |me| {
+            const mname = (me.method() orelse return error.Unsupported).text;
+            // B4: a method on a record-valued receiver *expression* —
+            // `make(1, 2).area()`, `Point { x: 1, y: 2 }.norm()` — the
+            // receiver's base pointer is the self argument directly (the
+            // record lives in the scope arena either way).
+            if (try buildRecExpr(b, me.receiver() orelse return error.Unsupported, scope)) |rv| {
+                const fid = (try registerFitMethod(b, rv.si, mname)) orelse
+                    return reject(b, .name_not_found);
+                switch (b.funcs.items[fid].ret) {
+                    .i64, .bool => {},
+                    else => return reject(b, .unsupported_call),
+                }
+                out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, me.args(), scope, rv.e) } };
+                return out;
+            }
             // i64/bool str methods: `index_of(byte)` -> i64, `starts_with(p)` /
             // `contains(sub)` -> bool. (`slice` is str-valued — see buildStrExpr.)
-            const mname = (me.method() orelse return error.Unsupported).text;
             const sval = buildStrExpr(b, me.receiver() orelse return error.Unsupported, scope, null) catch |e| switch (e) {
                 error.Unsupported => return error.Unsupported, // method on a non-str
                 else => return e,
@@ -3021,4 +3035,33 @@ test "B4: dispatch works on a record param inside a plain callee" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "fn describe -> i64") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.area -> i64") != null);
+}
+
+test "B4: a method on a receiver expression (call result / literal) dispatches" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Area { fn area(self) -> i64 }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Area { fn area(self) -> i64 { self.w * self.h } }
+        \\
+        \\fn make(w: i64, h: i64) -> Rect { Rect { w: w, h: h } }
+        \\
+        \\fn main {
+        \\    env.out(make(6, 7).area())
+        \\    env.out((Rect { w: 3, h: 5 }).area())
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Both receivers feed Rect.area directly: a call result and a fresh
+    // record_alloc, each a `.ptr` value passed as `self`.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.area -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
 }

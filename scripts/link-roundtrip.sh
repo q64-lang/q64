@@ -636,6 +636,8 @@ fit Rect : Wide {
     fn wide(self) -> bool { self.w > self.h }
 }
 
+fn make(w: i64, h: i64) -> Rect { Rect { w: w, h: h } }
+
 fn main {
     let r = Rect { w: 6, h: 7 }
     env.out(r.area())
@@ -646,11 +648,12 @@ fn main {
     env.out(q.area())
     let a = r.area()
     env.out("area = {a}")
+    env.out(make(2, 4).area())
 }
 Q64
 "$Q64_BIN" emit "$fit_app" "$fit_wasm"
 fit_out="$("$HOST_BIN" "$fit_wasm")"
-fit_expected=$'42\n420\nfalse\n9\narea = 42'
+fit_expected=$'42\n420\nfalse\n9\narea = 42\n8'
 if [[ "$fit_out" != "$fit_expected" ]]; then
     echo "FAIL: fit-dispatch output mismatch" >&2
     printf "  expected: %q\n" "$fit_expected" >&2
@@ -663,7 +666,7 @@ if [[ "$fit32_out" != "$fit_expected" ]]; then
     echo "FAIL: fit-dispatch wasm32 output mismatch" >&2
     exit 1
 fi
-echo "    ok: fit dispatch -> 42 / 420 / false / 9 / area = 42 (wasm64 + wasm32)"
+echo "    ok: fit dispatch -> 42 / 420 / false / 9 / area = 42 / 8 (wasm64 + wasm32)"
 
 # str-returning fit methods (the Display.fmt pattern): the method body is
 # an interpolation over self's fields, built in the scope arena and

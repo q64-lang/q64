@@ -894,10 +894,11 @@ verified, honest diagnostics throughout.
             compiles AND runs): u8 struct fields, `[T]` array literals
             + `for` iteration, format specs (`{self.r:02x}`), and
             generic `print_all<T: Display>` (face-bounded generics —
-            the B5 ladder); plus dispatch on call results
-            (`make(1,2).area()` — today: bindings/params in scope,
-            `self`) and fit-method calls inside interpolation
-            (`"{r.fmt()}"` — bind first).
+            the B5 ladder); plus fit-method calls inside interpolation
+            (`"{r.fmt()}"` — bind first). Dispatch on receiver
+            *expressions* landed (`make(1,2).area()`,
+            `(Rect{…}).area()` — METHOD_EXPR receivers build through
+            buildRecExpr, the resulting `.ptr` is `self` directly).
 - [ ] **B5 — later (separate ladders).** Face-bounded generics +
       monomorphization; `dyn` dispatch; enums + `match` lowering (can start
       after A2 in parallel with B).
