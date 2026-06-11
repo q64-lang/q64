@@ -608,4 +608,61 @@ if [[ "$lay32_out" != "$lay_expected" ]]; then
 fi
 echo "    ok: record layout -> 3 / 25 / 5 / 31 / c = (5, 4) / true / 7 (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# B4 (static dispatch): `r.area()` resolves through the fit registry to a
+# direct call — the receiver passes as the record's base pointer (B2b's
+# ABI), no vtable, no monomorphization. Covers extra args, a method
+# calling another method on `self`, a `-> bool` method, and dispatch
+# after a field assignment.
+echo "==> B4: fit-method static dispatch — r.area() / self.area() / bool methods"
+fit_app="$tmp/fit.q"
+fit_wasm="$tmp/fit.wasm"
+cat > "$fit_app" <<'Q64'
+face Area { fn area(self) -> i64 }
+face Scalable { fn scaled(self, k: i64) -> i64 }
+face Wide { fn wide(self) -> bool }
+
+struct Rect { w: i64, h: i64 }
+
+fit Rect : Area {
+    fn area(self) -> i64 { self.w * self.h }
+}
+
+fit Rect : Scalable {
+    fn scaled(self, k: i64) -> i64 { self.area() * k }
+}
+
+fit Rect : Wide {
+    fn wide(self) -> bool { self.w > self.h }
+}
+
+fn main {
+    let r = Rect { w: 6, h: 7 }
+    env.out(r.area())
+    env.out(r.scaled(10))
+    env.out(r.wide())
+    var q = Rect { w: 2, h: 3 }
+    q.w = q.w + 1
+    env.out(q.area())
+    let a = r.area()
+    env.out("area = {a}")
+}
+Q64
+"$Q64_BIN" emit "$fit_app" "$fit_wasm"
+fit_out="$("$HOST_BIN" "$fit_wasm")"
+fit_expected=$'42\n420\nfalse\n9\narea = 42'
+if [[ "$fit_out" != "$fit_expected" ]]; then
+    echo "FAIL: fit-dispatch output mismatch" >&2
+    printf "  expected: %q\n" "$fit_expected" >&2
+    printf "  actual:   %q\n" "$fit_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$fit_app" "$tmp/fit32.wasm" --addr wasm32
+fit32_out="$("$HOST_BIN" "$tmp/fit32.wasm")"
+if [[ "$fit32_out" != "$fit_expected" ]]; then
+    echo "FAIL: fit-dispatch wasm32 output mismatch" >&2
+    exit 1
+fi
+echo "    ok: fit dispatch -> 42 / 420 / false / 9 / area = 42 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

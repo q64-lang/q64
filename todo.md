@@ -858,13 +858,33 @@ verified, honest diagnostics throughout.
       call. No vtables, no monomorphization, no `dyn`. Definition of done: the
       `spec/tests/golden/library-face-fit.q` program compiles and runs;
       `spec/tests/faces/wrong-fit-form-*.q` fixtures pass.
-      - [x] First slice done: the fit registry + TYP201/TYP202 (see the
-            A1 fit-registry item) — the `wrong-fit-form-*.q` half of the
-            definition of done. Remaining: `p.fmt()` static dispatch in
-            the emit path (registry lookup → direct call with `p` as the
-            `self` receiver — B2b's record params are the ABI), then the
-            golden program's other needs (u8 fields, `[T]` arrays +
-            `for`, format specs `{x:02x}`, generic `print_all<T: Face>`).
+      - [x] First slice: the fit registry + TYP201/TYP202 (see the A1
+            fit-registry item) — the `wrong-fit-form-*.q` half of the
+            definition of done.
+      - [x] **Static dispatch lands.** `r.area()` — a dotted call whose
+            head is a materialized record binding/param — resolves
+            through the fit registry (now also built on the emit path,
+            `Builder.fitreg`) to a **direct call**: the fit method
+            registers as a plain HIR function named `Struct.method`
+            with `self` as a B2b record param (`.ptr` base pointer);
+            no vtable, no monomorphization. `self.w` field access and
+            `self.other()` method-on-self composition work (`self`
+            joined `isPathStart`/`isPathToken` so receiver paths parse
+            and render like any other name); `-> bool` methods route
+            `env.out` correctly via the type bridge; a method call
+            counts as a whole-value escape so the receiver
+            materializes. Honest rejections: unknown method →
+            NameNotFound, wrong arity → UnsupportedCall, no-self /
+            str-ret methods → Unsupported. Verified end-to-end on
+            wasm64 + wasm32 (link-roundtrip B4 section: `42 / 420 /
+            false / 9 / area = 42`) + 5 build_hir tests. 338 unit /
+            79 CLI / conformance 20/48 / roundtrips all green.
+      - [ ] Remaining for the golden program (`library-face-fit.q`
+            compiles AND runs): u8 struct fields, `[T]` array literals
+            + `for` iteration, format specs (`{self.r:02x}`), str-
+            returning fit methods, and generic `print_all<T: Display>`
+            (face-bounded generics — the B5 ladder); plus dispatch on
+            params/call results (today: bindings in scope, `self`).
 - [ ] **B5 — later (separate ladders).** Face-bounded generics +
       monomorphization; `dyn` dispatch; enums + `match` lowering (can start
       after A2 in parallel with B).

@@ -2062,8 +2062,11 @@ const Parser = struct {
             // (the QView retained Renderer op, spec/qview-protocol.md) parses as
             // member access — the `on`-handler keyword only begins a member of a
             // `screen { … }` block, a distinct parse position, so there is no
-            // ambiguity here.
-            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON => true,
+            // ambiguity here. `self` joins so a method body's receiver
+            // access (`self.w`, `self.area()`) parses as the same greedy
+            // PATH_EXPR every other name uses (B4 fit-method dispatch
+            // reads it).
+            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF => true,
             else => false,
         };
     }

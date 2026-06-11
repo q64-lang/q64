@@ -1522,8 +1522,9 @@ pub const PathExpr = struct {
             // Keep in sync with Parser.isPathStart: keywords admissible as a
             // path/field segment. `on` is needed so the host-face op
             // `qview.on(...)` (spec/qview-protocol.md) reconstructs its dotted
-            // name including the `on` segment.
-            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON => true,
+            // name including the `on` segment; `self` so a method body's
+            // receiver access (`self.w`) reconstructs whole.
+            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF => true,
             else => false,
         };
     }
