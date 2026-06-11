@@ -853,11 +853,27 @@ verified, honest diagnostics throughout.
       self/bodyless/default-impl sigs, super list + type/law runs),
       golden library-face-fit still checks clean, conformance 18/48
       unchanged, roundtrips + 78/78 CLI green.
-- [ ] **B4 — fit registration + static dispatch.** Sema registers fits;
-      `p.fmt()` on a concrete type with a non-generic fit resolves to a direct
-      call. No vtables, no monomorphization, no `dyn`. Definition of done: the
-      `spec/tests/golden/library-face-fit.q` program compiles and runs;
-      `spec/tests/faces/wrong-fit-form-*.q` fixtures pass.
+- [x] **B4 — fit registration + static dispatch — DONE.** Definition of
+      done met in full: `spec/tests/golden/library-face-fit.q` **compiles
+      and runs** (prints its three colors, wasm64 + wasm32 — locked in
+      link-roundtrip.sh), and the `wrong-fit-form-*.q` fixtures pass
+      (TYP201/202). The closing slice was **B5's first rung,
+      monomorphization**: a call to `fn f<T: Face>(items: [T])` stamps
+      one private instance per inferred element type (`print_all<Color>`,
+      deduped in `b.ids`); the `[T]` param lowers to a (ptr, count) pair
+      (`Scope.arrs` with a *runtime* count — `Count` became
+      konst-or-local); the stamped body builds entry-style (it may
+      `env.out`) with its own locals list (`Builder.cur_locals`
+      indirection); `T`'s methods resolve through the fit registry inside
+      the body; the bound is checked at the call site (no fit →
+      UnsupportedCall on the emit path; the TYP200 diagnostic wire in
+      `q64 check` is a follow-up). Statement-position void calls landed
+      as part of it (`print_all(...)` in `main`; lowerEntryStmt accepts
+      void-returning call exprs). Generic declarations are skipped from
+      the pub surface (they exist only monomorphized). Verified: golden
+      runs both addrs + two-instantiation dedup (`show_all<A>` once,
+      `show_all<B>` once → A1/A2/B9) + missing-fit rejection; 355/355
+      unit (3 new), 79/79 CLI, conformance 20/48, roundtrips green.
       - [x] First slice: the fit registry + TYP201/TYP202 (see the A1
             fit-registry item) — the `wrong-fit-form-*.q` half of the
             definition of done.
@@ -931,14 +947,13 @@ verified, honest diagnostics throughout.
       need sema-typed field exprs; narrow-field arithmetic through
       `cs[0].r + 1` widens silently (same gap) — closes when field
       exprs are sema-typed.
-- [ ] **B5 — face-bounded generics + monomorphization — THE LAST GATE
-      to the golden program.** `print_all<T: Display>(items: [T])`:
-      monomorphize per concrete T at the call site (stamp
-      `print_all_Color` with `[Color]` slice params — (ptr, count)
-      pairs, the str-param ABI shape), `T.method()` resolving through
-      the fit registry inside the stamped body, and TYP200 ("type does
-      not fit face") when the argument's struct has no fit. Then `dyn`
-      dispatch; enums + `match` lowering (separate ladders).
+- [ ] **B5 — generics beyond the first rung.** Monomorphization's v0
+      floor landed with B4's close (one `<T: Face>` param, `[T]` slice
+      params, record element types, void returns, statement calls).
+      Remaining: value-returning generic calls, multiple type params,
+      bare `T` params (needs the receiver-by-value story), scalar
+      element types, TYP200 emission in `q64 check`, const generics;
+      then `dyn` dispatch; enums + `match` lowering (separate ladders).
 
 ## Numeric tower — floats (f64 landed; f32 next)
 

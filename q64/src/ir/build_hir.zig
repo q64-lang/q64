@@ -67,9 +67,23 @@ const FnRec = struct { params: []const ?*const StructInfo, ret: ?*const StructIn
 /// or an inline record (the element address IS the value — B2b's ABI).
 const ElemKind = union(enum) { scalar: hir.Type, rec: *const StructInfo };
 
-/// An array-literal binding: its base-ptr local, compile-time element
-/// count, element stride, and element kind.
-const ArrInfo = struct { ptr_idx: u32, count: u32, stride: u32, elem: ElemKind };
+/// An array's element count: compile-time for a literal binding, a
+/// runtime local for a stamped generic's `[T]` slice parameter.
+const Count = union(enum) { konst: u32, local_idx: u32 };
+
+/// An array binding/param: its base-ptr local, element count, stride,
+/// and element kind.
+const ArrInfo = struct { ptr_idx: u32, count: Count, stride: u32, elem: ElemKind };
+
+/// The count as an i64 expression.
+fn countExpr(b: *Builder, cnt: Count) BuildError!*hir.Expr {
+    const out = try b.a.create(hir.Expr);
+    out.* = switch (cnt) {
+        .konst => |k| .{ .int_const = k },
+        .local_idx => |i| .{ .local = .{ .idx = i, .ty = .i64 } },
+    };
+    return out;
+}
 
 /// A resolved `<binding>.<field>` access on a materialized record binding:
 /// the binding's ptr local, the field's layout offset/type, and whether the
@@ -93,6 +107,10 @@ const Builder = struct {
     /// i64 locals). Only `main` has these (callees use parameters).
     main_rt: RtMap = .empty,
     main_locals: std.ArrayList(hir.Type) = .empty,
+    /// The locals list `buildMainStmt`-style bodies append to: `main`'s
+    /// list normally, a stamped generic instance's during stamping (B5
+    /// monomorphization reuses the entry-style builder for its bodies).
+    cur_locals: *std.ArrayList(hir.Type) = undefined,
     /// Module-level `state` globals: name → index, plus init values + names by index.
     globals: std.StringHashMapUnmanaged(u32) = .empty,
     global_inits: std.ArrayList(i64) = .empty,
@@ -250,6 +268,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // its runtime str bindings live in `b.main_rt` (the `rt` scope below).
     var mscope = Scope{ .a = b.a };
     const rt = &b.main_rt;
+    b.cur_locals = &b.main_locals;
 
     var stmts: std.ArrayList(*hir.Stmt) = .empty;
     var it = body.statements();
@@ -295,11 +314,11 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     try buildConcat(b, init_expr.string_lit, scope, false, rt)
                 else
                     try buildStrExpr(b, init_expr, scope, rt);
-                const ptr_idx: u32 = @intCast(b.main_locals.items.len);
+                const ptr_idx: u32 = @intCast(b.cur_locals.items.len);
                 // The (ptr, len) backing locals are address-width pointers
                 // (i32 on wasm32, i64 on wasm64) — `.ptr`, not `.i64`.
-                try b.main_locals.append(b.a, .ptr);
-                try b.main_locals.append(b.a, .ptr);
+                try b.cur_locals.append(b.a, .ptr);
+                try b.cur_locals.append(b.a, .ptr);
                 try b.main_rt.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
@@ -329,10 +348,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     const fval = fi.value() orelse return error.Unsupported; // shorthand: later
                     const full = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ nm.text, fname.text });
                     const lty: hir.Type = scalarBindTy(try exprScalar(b, fval, scope));
-                    scope.next_idx = @intCast(b.main_locals.items.len);
+                    scope.next_idx = @intCast(b.cur_locals.items.len);
                     const value = try buildIntExpr(b, fval, scope);
                     const idx = try scope.declare(full, ls.isVar(), lty);
-                    try b.main_locals.append(b.a, lty);
+                    try b.cur_locals.append(b.a, lty);
                     const st = try b.a.create(hir.Stmt);
                     st.* = .{ .let = .{ .idx = idx, .value = value } };
                     try out.append(b.a, st);
@@ -343,10 +362,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // binding holds the base pointer (one .ptr local), the
                 // count/stride/element kind stay compile-time (Scope.arrs).
                 const arr = try buildArrayLit(b, init_expr.array, scope);
-                scope.next_idx = @intCast(b.main_locals.items.len);
+                scope.next_idx = @intCast(b.cur_locals.items.len);
                 const idx = try scope.declare(nm.text, ls.isVar(), .ptr);
-                try b.main_locals.append(b.a, .ptr);
-                try scope.arrs.put(b.a, nm.text, .{ .ptr_idx = idx, .count = arr.count, .stride = arr.stride, .elem = arr.elem });
+                try b.cur_locals.append(b.a, .ptr);
+                try scope.arrs.put(b.a, nm.text, .{ .ptr_idx = idx, .count = .{ .konst = arr.count }, .stride = arr.stride, .elem = arr.elem });
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = arr.e } };
                 try out.append(b.a, st);
@@ -368,10 +387,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // expressions can resolve it. The local index is the current
                 // size of `main_locals` (str bindings take two slots each,
                 // i64/bool bindings take one — the same shared index space).
-                scope.next_idx = @intCast(b.main_locals.items.len);
+                scope.next_idx = @intCast(b.cur_locals.items.len);
                 const value = try buildIntExpr(b, init_expr, scope);
                 const idx = try scope.declare(nm.text, ls.isVar(), lty);
-                try b.main_locals.append(b.a, lty);
+                try b.cur_locals.append(b.a, lty);
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = value } };
                 try out.append(b.a, st);
@@ -383,6 +402,20 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 .call => |cc| cc,
                 else => return error.Unsupported,
             };
+            // A statement-position call to a face-bounded generic function
+            // (`print_all(colors)` / `print_all([...])`): monomorphize per
+            // the inferred element type and call the stamped instance (B5).
+            if (callPathName(b, call)) |gn| {
+                defer b.a.free(gn);
+                if (std.mem.indexOfScalar(u8, gn, '.') == null) {
+                    if (b.resolver.lookup(gn)) |fd| {
+                        if (fd.isGeneric()) {
+                            try out.append(b.a, try buildGenericCallStmt(b, gn, fd, call, scope));
+                            return;
+                        }
+                    }
+                }
+            }
             // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`
             // or `qview.set_text(80, 9, "…")`): str args flow as (ptr, len), the
             // rest as i64; no return. The backend declares the matching import.
@@ -531,17 +564,17 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             const ai = scope.arrs.get(iname) orelse return error.Unsupported;
 
             // i (hidden) and x occupy fresh main locals.
-            scope.next_idx = @intCast(b.main_locals.items.len);
+            scope.next_idx = @intCast(b.cur_locals.items.len);
             const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{pat.text});
             const i_idx = try scope.declare(hidden, true, .i64);
-            try b.main_locals.append(b.a, .i64);
+            try b.cur_locals.append(b.a, .i64);
             const x_ty: hir.Type = switch (ai.elem) {
                 .scalar => |t| t,
                 .rec => .ptr,
             };
-            scope.next_idx = @intCast(b.main_locals.items.len);
+            scope.next_idx = @intCast(b.cur_locals.items.len);
             const x_idx = try scope.declare(pat.text, false, x_ty);
-            try b.main_locals.append(b.a, x_ty);
+            try b.cur_locals.append(b.a, x_ty);
             if (ai.elem == .rec) try scope.recs.put(b.a, pat.text, ai.elem.rec);
 
             // let i = 0
@@ -592,8 +625,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             // while i < count
             const iref2 = try b.a.create(hir.Expr);
             iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
-            const cnt = try b.a.create(hir.Expr);
-            cnt.* = .{ .int_const = ai.count };
+            const cnt = try countExpr(b, ai.count);
             const cond = try b.a.create(hir.Expr);
             cond.* = .{ .bin = .{ .kind = .lt, .lhs = iref2, .rhs = cnt } };
             const st = try b.a.create(hir.Stmt);
@@ -676,6 +708,7 @@ fn buildScreenFuncs(b: *Builder, sf: ast.SourceFile) BuildError!void {
         .fn_decl => |fd| {
             const nm = fd.name() orelse continue;
             if (std.mem.eql(u8, nm.text, "main")) continue;
+            if (fd.isGeneric()) continue; // exists only monomorphized (B5)
             if (fd.visibility() == null) continue; // private — built on demand if reached
             if (fd.returnType() == null) {
                 try buildScreenFunc(b, fd); // void-returning handler
@@ -1923,8 +1956,7 @@ fn buildArrayLit(b: *Builder, ae: ast.ArrayExpr, scope: *Scope) BuildError!struc
 /// The element address `base_ptr_local[index]` with the spec's trapping
 /// bounds check folded in.
 fn elemPtrExpr(b: *Builder, ai: ArrInfo, index: *hir.Expr) BuildError!*hir.Expr {
-    const cnt = try b.a.create(hir.Expr);
-    cnt.* = .{ .int_const = ai.count };
+    const cnt = try countExpr(b, ai.count);
     const checked = try b.a.create(hir.Expr);
     checked.* = .{ .bounds_check = .{ .index = index, .count = cnt } };
     const base = try b.a.create(hir.Expr);
@@ -1934,13 +1966,220 @@ fn elemPtrExpr(b: *Builder, ai: ArrInfo, index: *hir.Expr) BuildError!*hir.Expr 
     return out;
 }
 
+/// B5 monomorphization (the last gate to B4's golden program): a call
+/// to `fn f<T: Face>(items: [T])` stamps one concrete instance per
+/// element type — `f<Color>` — with the `[T]` parameter lowered to a
+/// (ptr, count) pair (base pointer + element count, the str-param ABI
+/// shape) and `T`'s methods resolving through the fit registry inside
+/// the stamped body. v0 floor: one type parameter, void return, params
+/// are `[T]` slices or non-generic scalars, the argument is an array
+/// binding or literal of records. No vtables; each instance is a plain
+/// function.
+const GenericSig = struct { tname: []const u8, bound: ?[]const u8 };
+
+/// Parse the raw `<T: Display>` span: one type parameter with an
+/// optional face bound. More parameters are a later slice.
+fn parseGenericSig(gp: *const parser.cst.Node) ?GenericSig {
+    var toks: [8]parser.cst.Token = undefined;
+    var n: usize = 0;
+    for (gp.children) |ch| switch (ch) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            if (n == toks.len) return null;
+            toks[n] = t;
+            n += 1;
+        },
+        .node => return null,
+    };
+    // < IDENT >  |  < IDENT : IDENT >
+    if (n == 3 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .R_ANGLE)
+        return .{ .tname = toks[1].text, .bound = null };
+    if (n == 5 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .COLON and toks[3].kind == .IDENT and toks[4].kind == .R_ANGLE)
+        return .{ .tname = toks[1].text, .bound = toks[3].text };
+    return null;
+}
+
+/// Is this param type `[T]` for the generic's T?
+fn isSliceOfT(p: ast.Param, tname: []const u8, a: std.mem.Allocator) bool {
+    const te = p.type_() orelse return false;
+    const sl = switch (te) {
+        .slice => |x| x,
+        else => return false,
+    };
+    const inner = sl.element() orelse return false;
+    const pt = switch (inner) {
+        .path => |x| x,
+        else => return false,
+    };
+    const nm = pt.name(a) catch return false;
+    defer a.free(nm);
+    return std.mem.eql(u8, nm, tname);
+}
+
+/// The array info an argument denotes: a binding name or an array
+/// literal (which is built — its value expr rides along).
+const ArrArg = struct { ptr: *hir.Expr, count: *hir.Expr, elem: ElemKind, stride: u32 };
+
+fn buildArrArg(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!?ArrArg {
+    switch (arg) {
+        .path => |p| {
+            const txt = try p.text(b.a);
+            defer b.a.free(txt);
+            const ai = scope.arrs.get(txt) orelse return null;
+            const ptr = try b.a.create(hir.Expr);
+            ptr.* = .{ .local = .{ .idx = ai.ptr_idx, .ty = .ptr } };
+            return .{ .ptr = ptr, .count = try countExpr(b, ai.count), .elem = ai.elem, .stride = ai.stride };
+        },
+        .array => |ae| {
+            const arr = try buildArrayLit(b, ae, scope);
+            const cnt = try b.a.create(hir.Expr);
+            cnt.* = .{ .int_const = arr.count };
+            return .{ .ptr = arr.e, .count = cnt, .elem = arr.elem, .stride = arr.stride };
+        },
+        else => return null,
+    }
+}
+
+/// Build `f(arg…)` against a generic declaration: infer T from the
+/// first `[T]` argument, fit-check the bound, stamp (or reuse) the
+/// instance, and emit the call statement.
+fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+    const sig = parseGenericSig(fd.genericParams().?) orelse return error.Unsupported;
+    const ps = fd.params() orelse return error.Unsupported;
+
+    // Walk params and args together: infer T at the first `[T]` arg.
+    var t_si: ?*const StructInfo = null;
+    var args: std.ArrayList(*hir.Expr) = .empty;
+    var arr_args: std.ArrayList(ArrArg) = .empty;
+    defer arr_args.deinit(b.a);
+    var pit = ps.iter();
+    var ait = call.args();
+    while (pit.next()) |p| {
+        const a0 = ait.next() orelse return reject(b, .unsupported_call);
+        if (isSliceOfT(p, sig.tname, b.a)) {
+            const aa = (try buildArrArg(b, a0, scope)) orelse return reject(b, .unsupported_call);
+            const si = switch (aa.elem) {
+                .rec => |r| r,
+                .scalar => return error.Unsupported, // scalar-element generics: later
+            };
+            if (t_si) |prev| {
+                if (prev != si) return reject(b, .unsupported_call); // T must infer consistently
+            } else t_si = si;
+            try args.append(b.a, aa.ptr);
+            try args.append(b.a, aa.count);
+            try arr_args.append(b.a, aa);
+        } else {
+            // A non-generic scalar parameter.
+            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+            const want: hir.Type = switch (psc) {
+                .bool, .i64, .f64, .f32 => psc,
+                else => return error.Unsupported,
+            };
+            const got = scalarBindTy(try exprScalar(b, a0, scope));
+            if (got != want and !(want == .i64 and got == .i64)) return reject(b, .unsupported_call);
+            try args.append(b.a, try buildIntExpr(b, a0, scope));
+        }
+    }
+    if (ait.next() != null) return reject(b, .unsupported_call);
+    const si = t_si orelse return error.Unsupported; // no `[T]` arg to infer from
+
+    // The bound: T must fit the face (TYP200's check; the emit path
+    // rejects honestly — the diagnostic wiring is `q64 check`'s side).
+    if (sig.bound) |face| {
+        if (b.fitreg == null or b.fitreg.?.find(si.name, face) == null)
+            return reject(b, .unsupported_call);
+    }
+
+    const fid = try stampGeneric(b, gname, fd, sig, si);
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .expr = e };
+    return st;
+}
+
+/// Stamp (or fetch) the concrete instance `gname<T>`. The body builds
+/// with the entry-style builder (it may env.out), `[T]` params as
+/// (ptr, count) pairs registered in `Scope.arrs` with a *runtime*
+/// count, and its own locals list.
+fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, si: *const StructInfo) BuildError!hir.FuncId {
+    const key = try std.fmt.allocPrint(b.a, "{s}<{s}>", .{ gname, si.name });
+    if (b.ids.get(key)) |id| return id;
+
+    var scope = Scope{ .a = b.a };
+    var params: std.ArrayList(hir.Param) = .empty;
+    const ps = fd.params() orelse return error.Unsupported;
+    var pit = ps.iter();
+    while (pit.next()) |p| {
+        const pn = (p.name() orelse return error.Unsupported).text;
+        if (isSliceOfT(p, sig.tname, b.a)) {
+            // (ptr, count): two wasm params, the arr registered on the name.
+            const ptr_idx = try scope.declare(pn, false, .ptr);
+            const hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{pn});
+            const cnt_idx = try scope.declare(hidden, false, .i64);
+            try params.append(b.a, .{ .name = pn, .ty = .ptr });
+            try params.append(b.a, .{ .name = hidden, .ty = .i64 });
+            try scope.arrs.put(b.a, pn, .{
+                .ptr_idx = ptr_idx,
+                .count = .{ .local_idx = cnt_idx },
+                .stride = si.size,
+                .elem = .{ .rec = si },
+            });
+        } else {
+            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+            const pty: hir.Type = switch (psc) {
+                .bool, .i64, .f64, .f32 => psc,
+                else => return error.Unsupported,
+            };
+            _ = try scope.declare(pn, false, pty);
+            try params.append(b.a, .{ .name = pn, .ty = pty });
+        }
+    }
+    scope.n_params = @intCast(params.items.len);
+    const param_slice = try params.toOwnedSlice(b.a);
+
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, key, id);
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = .void, .body = dummy, .is_screen = true });
+
+    // The body builds entry-style (host statements allowed) with its own
+    // locals list and rt map; locals index past the params.
+    var inst_locals: std.ArrayList(hir.Type) = .empty;
+    var inst_rt: RtMap = .empty;
+    const saved_locals = b.cur_locals;
+    b.cur_locals = &inst_locals;
+    defer b.cur_locals = saved_locals;
+    // Pad so `scope.next_idx = cur_locals.len` bookkeeping lands past the
+    // params (main has no params; stamped instances do).
+    try inst_locals.appendNTimes(b.a, .i64, param_slice.len);
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    var it = (fd.body() orelse return error.Unsupported).statements();
+    while (it.next()) |stmt| try buildMainStmt(b, stmt, &scope, &inst_rt, &stmts);
+
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try stmts.toOwnedSlice(b.a) };
+    const all = try inst_locals.toOwnedSlice(b.a);
+    b.funcs.items[id] = .{
+        .name = key,
+        .params = param_slice,
+        .ret = .void,
+        .locals = all[param_slice.len..], // past the param padding
+        .body = block,
+        .is_screen = true,
+    };
+    return id;
+}
+
 /// Bind a record value in `main`: one `.ptr` local (shared index space with
 /// the other main bindings) + a `Scope.recs` entry so field access and
 /// whole-value uses resolve.
 fn bindMainRecord(b: *Builder, scope: *Scope, name: []const u8, is_var: bool, value: *hir.Expr, si: *const StructInfo, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
-    scope.next_idx = @intCast(b.main_locals.items.len);
+    scope.next_idx = @intCast(b.cur_locals.items.len);
     const idx = try scope.declare(name, is_var, .ptr);
-    try b.main_locals.append(b.a, .ptr);
+    try b.cur_locals.append(b.a, .ptr);
     try scope.recs.put(b.a, name, si);
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .let = .{ .idx = idx, .value = value } };
@@ -2405,8 +2644,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             if (std.mem.lastIndexOfScalar(u8, txt, '.')) |dotl| {
                 if (std.mem.eql(u8, txt[dotl + 1 ..], "len")) {
                     if (scope.arrs.get(txt[0..dotl])) |ai| {
-                        out.* = .{ .int_const = ai.count };
-                        return out;
+                        return countExpr(b, ai.count);
                     }
                 }
             }
@@ -3964,4 +4202,104 @@ test "arrays: mixed element types are Unsupported; empty literal too" {
         try tr.addLib(src);
         try testing.expect((try buildFromSource(testing.allocator, src, tr.resolver())) == null);
     }
+}
+
+test "B5: the golden triangle — print_all<T: Display> stamps and runs" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\pub face Display {
+        \\    fn fmt(self) -> str @pure
+        \\}
+        \\
+        \\pub struct Color { r: u8, g: u8, b: u8 }
+        \\
+        \\pub fit Color : Display {
+        \\    fn fmt(self) -> str {
+        \\        "rgb({self.r}, {self.g}, {self.b})"
+        \\    }
+        \\}
+        \\
+        \\pub fn print_all<T: Display>(items: [T]) {
+        \\    for item in items {
+        \\        env.out("{item.fmt()}")
+        \\    }
+        \\}
+        \\
+        \\fn main {
+        \\    print_all([
+        \\        Color { r: 255, g: 0,   b: 0   },
+        \\        Color { r: 0,   g: 255, b: 0   },
+        \\    ])
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // One stamped private instance, named per T; its [T] param is a
+    // (ptr, count) pair; the fit method resolves inside the body.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn print_all<Color> -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Color.fmt -> str") != null);
+    // main calls the instance as a void statement.
+    try testing.expect(std.mem.indexOf(u8, dump, "expr call#") != null);
+}
+
+test "B5: two call sites with different T stamp two instances (dedup per T)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct A { x: i64 }
+        \\struct B { y: i64 }
+        \\fit A : D { fn fmt(self) -> str { "A{self.x}" } }
+        \\fit B : D { fn fmt(self) -> str { "B{self.y}" } }
+        \\fn show_all<T: D>(items: [T]) {
+        \\    for it in items {
+        \\        env.out(it.fmt())
+        \\    }
+        \\}
+        \\fn main {
+        \\    show_all([A { x: 1 }])
+        \\    show_all([B { y: 9 }])
+        \\    show_all([A { x: 2 }])
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    var count_a: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, dump, at, "fn show_all<A> -> void")) |hit| {
+        count_a += 1;
+        at = hit + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count_a); // deduped per T
+    try testing.expect(std.mem.indexOf(u8, dump, "fn show_all<B> -> void") != null);
+}
+
+test "B5: an element type with no fit for the bound is UnsupportedCall" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\struct NoFit { x: i64 }
+        \\fn show_all<T: D>(items: [T]) {
+        \\    for it in items {
+        \\        env.out(it.fmt())
+        \\    }
+        \\}
+        \\fn main {
+        \\    show_all([NoFit { x: 1 }])
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
 }

@@ -143,7 +143,15 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .ret => |e| return mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null }),
         .brk => return mk(ctx.a, .void, .br),
         .cont => return mk(ctx.a, .void, .br_cont),
-        else => return error.Unsupported, // a value/tail-only statement (e.g. bare expr)
+        // A statement-position call to a void function (a stamped generic
+        // instance, `print_all<Color>(...)`). Value-producing expression
+        // statements stay unsupported (nothing may be left on the stack).
+        .expr => |e| {
+            if (e.* != .call) return error.Unsupported;
+            if (ctx.funcs[e.call.func].ret != .void) return error.Unsupported;
+            return lowerExpr(ctx, e);
+        },
+        else => return error.Unsupported, // a value/tail-only statement
     }
 }
 
