@@ -2011,7 +2011,8 @@ fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: as
     const ps = fd.params() orelse return error.Unsupported;
 
     // Walk params and args together: infer T at the first `[T]` arg.
-    var t_si: ?*const StructInfo = null;
+    var t_elem: ?ElemKind = null;
+    var t_stride: u32 = 0;
     var args: std.ArrayList(*hir.Expr) = .empty;
     var arr_args: std.ArrayList(ArrArg) = .empty;
     defer arr_args.deinit(b.a);
@@ -2021,13 +2022,12 @@ fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: as
         const a0 = ait.next() orelse return reject(b, .unsupported_call);
         if (isSliceOfT(p, sig.tname, b.a)) {
             const aa = (try buildArrArg(b, a0, scope)) orelse return reject(b, .unsupported_call);
-            const si = switch (aa.elem) {
-                .rec => |r| r,
-                .scalar => return error.Unsupported, // scalar-element generics: later
-            };
-            if (t_si) |prev| {
-                if (prev != si) return reject(b, .unsupported_call); // T must infer consistently
-            } else t_si = si;
+            if (t_elem) |prev| {
+                if (!elemEql(prev, aa.elem)) return reject(b, .unsupported_call); // T must infer consistently
+            } else {
+                t_elem = aa.elem;
+                t_stride = aa.stride;
+            }
             try args.append(b.a, aa.ptr);
             try args.append(b.a, aa.count);
             try arr_args.append(b.a, aa);
@@ -2044,16 +2044,22 @@ fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: as
         }
     }
     if (ait.next() != null) return reject(b, .unsupported_call);
-    const si = t_si orelse return error.Unsupported; // no `[T]` arg to infer from
+    const elem = t_elem orelse return error.Unsupported; // no `[T]` arg to infer from
 
-    // The bound: T must fit the face (TYP200's check; the emit path
-    // rejects honestly — the diagnostic wiring is `q64 check`'s side).
+    // The bound: T must fit the face (TYP200 — `q64 check` emits it;
+    // the emit path rejects honestly). Scalars have no fits yet, so a
+    // *bounded* generic takes record elements only; an unbounded one
+    // stamps per scalar type as well.
     if (sig.bound) |face| {
+        const si = switch (elem) {
+            .rec => |r| r,
+            .scalar => return reject(b, .unsupported_call),
+        };
         if (b.fitreg == null or b.fitreg.?.find(si.name, face) == null)
             return reject(b, .unsupported_call);
     }
 
-    const fid = try stampGeneric(b, gname, fd, sig, si);
+    const fid = try stampGeneric(b, gname, fd, sig, elem, t_stride);
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
     const st = try b.a.create(hir.Stmt);
@@ -2061,12 +2067,25 @@ fn buildGenericCallStmt(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: as
     return st;
 }
 
-/// Stamp (or fetch) the concrete instance `gname<T>`. The body builds
-/// with the entry-style builder (it may env.out), `[T]` params as
-/// (ptr, count) pairs registered in `Scope.arrs` with a *runtime*
-/// count, and its own locals list.
-fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, si: *const StructInfo) BuildError!hir.FuncId {
-    const key = try std.fmt.allocPrint(b.a, "{s}<{s}>", .{ gname, si.name });
+/// Do two element kinds name the same T?
+fn elemEql(x: ElemKind, y: ElemKind) bool {
+    return switch (x) {
+        .rec => |r| y == .rec and y.rec == r,
+        .scalar => |t| y == .scalar and y.scalar == t,
+    };
+}
+
+/// Stamp (or fetch) the concrete instance `gname<T>` — T a record
+/// struct or a scalar type (`each<i64>`). The body builds with the
+/// entry-style builder (it may env.out), `[T]` params as (ptr, count)
+/// pairs registered in `Scope.arrs` with a *runtime* count, and its
+/// own locals list.
+fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, elem: ElemKind, stride: u32) BuildError!hir.FuncId {
+    const tname = switch (elem) {
+        .rec => |r| r.name,
+        .scalar => |t| @tagName(t),
+    };
+    const key = try std.fmt.allocPrint(b.a, "{s}<{s}>", .{ gname, tname });
     if (b.ids.get(key)) |id| return id;
 
     var scope = Scope{ .a = b.a };
@@ -2085,8 +2104,8 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
             try scope.arrs.put(b.a, pn, .{
                 .ptr_idx = ptr_idx,
                 .count = .{ .local_idx = cnt_idx },
-                .stride = si.size,
-                .elem = .{ .rec = si },
+                .stride = stride,
+                .elem = elem,
             });
         } else {
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
@@ -4244,6 +4263,58 @@ test "B5: two call sites with different T stamp two instances (dedup per T)" {
     }
     try testing.expectEqual(@as(usize, 1), count_a); // deduped per T
     try testing.expect(std.mem.indexOf(u8, dump, "fn show_all<B> -> void") != null);
+}
+
+test "B5: scalar element types stamp per type (each<i64>, each<f64>)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn each<T>(items: [T]) {
+        \\    for x in items {
+        \\        env.out("{x}")
+        \\    }
+        \\}
+        \\fn main {
+        \\    each([10, 20, 30])
+        \\    each([1.5, 2.5])
+        \\    each([40, 50])
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // One instance per scalar element type, deduped.
+    var count_i64: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, dump, at, "fn each<i64> -> void")) |hit| {
+        count_i64 += 1;
+        at = hit + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count_i64);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn each<f64> -> void") != null);
+}
+
+test "B5: a scalar element type never satisfies a face bound" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face D { fn fmt(self) -> str }
+        \\fn show_all<T: D>(items: [T]) {
+        \\    for it in items {
+        \\        env.out(it.fmt())
+        \\    }
+        \\}
+        \\fn main {
+        \\    show_all([1, 2])
+        \\}
+        \\
+    ;
+    try tr.addLib(src);
+    const r = try rejectFromSource(testing.allocator, src, tr.resolver());
+    try testing.expectEqual(hir.Reject.unsupported_call, r.?);
 }
 
 test "B5: an element type with no fit for the bound is UnsupportedCall" {

@@ -951,9 +951,24 @@ verified, honest diagnostics throughout.
       floor landed with B4's close (one `<T: Face>` param, `[T]` slice
       params, record element types, void returns, statement calls).
       Remaining: value-returning generic calls, multiple type params,
-      bare `T` params (needs the receiver-by-value story), scalar
-      element types, const generics; then `dyn` dispatch; enums +
-      `match` lowering (separate ladders).
+      bare `T` params (needs the receiver-by-value story), const
+      generics; then `dyn` dispatch; enums + `match` lowering
+      (separate ladders).
+      - [x] **Scalar element types.** An *unbounded* generic stamps per
+            scalar element type too: `each([10, 20])` → `each<i64>`,
+            `each([1.5])` → `each<f64>` (deduped per T like records;
+            literal and binding arguments). The gate was one rejection:
+            inference now carries `ElemKind` (record or scalar) instead
+            of a StructInfo, `stampGeneric` takes elem+stride and keys
+            the instance by `@tagName` for scalars, and the stamped
+            body reuses the existing scalar-array machinery (`for`
+            loads at width, `{x}` formats by local type). A *bounded*
+            generic still takes record elements only — scalars have no
+            fits yet, so `show_all<T: D>([1, 2])` rejects honestly.
+            Verified end-to-end wasm64 + wasm32 (link-roundtrip B5
+            section) + 2 unit tests (per-type stamp + dedup; the
+            scalar-vs-bound rejection). 359 unit / 80 CLI / 21-of-49 /
+            roundtrips green.
       - [x] **TYP200 emitted in `q64 check`** (B4's diagnostic
             follow-up). The check pass owns the generic bound check:
             `GenericSig` parsing + `[T]`-param detection moved to

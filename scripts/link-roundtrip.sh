@@ -964,4 +964,38 @@ if [[ "$gen_out" != $'A1\nA2\nB9' ]]; then
 fi
 echo "    ok: GOLDEN RUNS -> rgb(255,0,0)/rgb(0,255,0)/rgb(0,0,255) (wasm64 + wasm32); A1/A2/B9"
 
+# ---------------------------------------------------------------------------
+# B5 (scalar element types): an unbounded generic stamps per scalar type —
+# each<i64> / each<f64> — over literals and bindings, on both address spaces.
+# ---------------------------------------------------------------------------
+echo "==> B5: scalar-element generics — each<i64> / each<f64>"
+scal_app="$tmp/genscal.q"
+cat > "$scal_app" <<'Q64'
+fn each<T>(items: [T]) {
+    for x in items {
+        env.out("- {x}")
+    }
+}
+fn main {
+    each([10, 20, 30])
+    each([1.5, 2.5])
+    let xs = [7, 8]
+    each(xs)
+}
+Q64
+scal_expected=$'- 10\n- 20\n- 30\n- 1.5\n- 2.5\n- 7\n- 8'
+"$Q64_BIN" emit "$scal_app" "$tmp/genscal.wasm"
+scal_out="$("$HOST_BIN" "$tmp/genscal.wasm")"
+if [[ "$scal_out" != "$scal_expected" ]]; then
+    echo "FAIL: scalar-generic output mismatch (got: $scal_out)" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$scal_app" "$tmp/genscal32.wasm" --addr wasm32
+scal32_out="$("$HOST_BIN" "$tmp/genscal32.wasm")"
+if [[ "$scal32_out" != "$scal_expected" ]]; then
+    echo "FAIL: scalar-generic wasm32 output mismatch (got: $scal32_out)" >&2
+    exit 1
+fi
+echo "    ok: each<i64> + each<f64> -> 10/20/30, 1.5/2.5, 7/8 via binding (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
