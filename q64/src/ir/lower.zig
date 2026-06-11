@@ -211,8 +211,11 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         },
         .local => |l| return mk(ctx.a, .str, .{ .str_param = l.idx }),
         .call => |cl| {
+            // Mixed argument kinds: a str value lowers to its (ptr, len)
+            // pair, anything else (an i64, a record's `.ptr` receiver in
+            // a fit-method call) through the scalar path.
             const args = try ctx.a.alloc(*mir.Inst, cl.args.len);
-            for (cl.args, 0..) |arg, i| args[i] = try lowerStrExpr(ctx, arg);
+            for (cl.args, 0..) |arg, i| args[i] = if (isStrExpr(arg)) try lowerStrExpr(ctx, arg) else try lowerExpr(ctx, arg);
             return mk(ctx.a, .str, .{ .call = .{ .func = cl.func, .args = args } });
         },
         .concat => |pieces| {

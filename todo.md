@@ -879,12 +879,25 @@ verified, honest diagnostics throughout.
             wasm64 + wasm32 (link-roundtrip B4 section: `42 / 420 /
             false / 9 / area = 42`) + 5 build_hir tests. 338 unit /
             79 CLI / conformance 20/48 / roundtrips all green.
+      - [x] **str-returning fit methods** (the `Display.fmt` pattern):
+            `fn fmt(self) -> str { "Rect({self.w}x{self.h})" }` — the
+            body is a single tail str expr built like registerStrFunc;
+            `{self.w}` interpolation rides the existing rec-field concat
+            piece. `env.out(r.fmt())`, `let s = r.fmt()` (str binding),
+            and dispatch on a record *param* in a plain callee
+            (`describe(r) { r.area() }` — fell out of scope.recs, now
+            regression-locked) all verified end-to-end wasm64 + wasm32
+            (roundtrip: `Rect(6x7) / s = Rect(6x7) / 42`). isStrCall
+            learned fit methods; HIR→MIR str calls take mixed arg kinds
+            (the `.ptr` receiver lowers as a scalar operand).
       - [ ] Remaining for the golden program (`library-face-fit.q`
             compiles AND runs): u8 struct fields, `[T]` array literals
-            + `for` iteration, format specs (`{self.r:02x}`), str-
-            returning fit methods, and generic `print_all<T: Display>`
-            (face-bounded generics — the B5 ladder); plus dispatch on
-            params/call results (today: bindings in scope, `self`).
+            + `for` iteration, format specs (`{self.r:02x}`), and
+            generic `print_all<T: Display>` (face-bounded generics —
+            the B5 ladder); plus dispatch on call results
+            (`make(1,2).area()` — today: bindings/params in scope,
+            `self`) and fit-method calls inside interpolation
+            (`"{r.fmt()}"` — bind first).
 - [ ] **B5 — later (separate ladders).** Face-bounded generics +
       monomorphization; `dyn` dispatch; enums + `match` lowering (can start
       after A2 in parallel with B).

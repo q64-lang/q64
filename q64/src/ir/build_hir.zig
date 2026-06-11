@@ -279,7 +279,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             }
             // Otherwise a runtime str binding (`let g = shout("hi")`): build
             // the str value and store its (ptr, len) into two new locals.
-            if (init_expr == .string_lit or (try isStrCall(b, init_expr))) {
+            if (init_expr == .string_lit or (try isStrCall(b, init_expr, scope))) {
                 const value = if (init_expr == .string_lit)
                     try buildConcat(b, init_expr.string_lit, scope, false, rt)
                 else
@@ -390,7 +390,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // folded `host_out`; otherwise a runtime concat.
                 const v = try buildConcat(b, arg.string_lit, scope, false, rt);
                 st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
-            } else if (try isStrCall(b, arg)) {
+            } else if (try isStrCall(b, arg, scope)) {
                 // A real call to a str-returning function.
                 st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
             } else if (try exprIsBool(b, arg, scope)) {
@@ -915,6 +915,24 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // B4: a str-returning fit method on a record binding/param
+            // (`r.fmt()`) — same static dispatch as the i64 path.
+            if (std.mem.indexOfScalar(u8, cname, '.')) |dot| {
+                const head = cname[0..dot];
+                const mname = cname[dot + 1 ..];
+                if (std.mem.indexOfScalar(u8, mname, '.') == null) {
+                    if (scope.recs.get(head)) |si| {
+                        const loc = scope.find(head) orelse return error.Unsupported;
+                        const fid = (try registerFitMethod(b, si, mname)) orelse
+                            return reject(b, .name_not_found);
+                        if (b.funcs.items[fid].ret != .str) return error.Unsupported; // not a str value
+                        const recv = try b.a.create(hir.Expr);
+                        recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                        out.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, cc, scope, recv) } };
+                        return out;
+                    }
+                }
+            }
             // `<str>.slice(start, end)` parses as a call with a dotted path callee
             // (like `qview.set_attr(…)`). The str-VALUED method.
             if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
@@ -1155,9 +1173,11 @@ fn singleTailExpr(fd: ast.FnDecl) BuildError!?ast.Expr {
     return first;
 }
 
-/// True if `arg` is a call to a `str`-returning function (so `main` should
-/// emit a `host_out_str` rather than trying an i64 lowering).
-fn isStrCall(b: *Builder, arg: ast.Expr) BuildError!bool {
+/// True if `arg` is a call to a `str`-returning function — a named
+/// function, or a fit method on a record binding in `scope`
+/// (`r.fmt()`) — so `main` emits a `host_out_str` / str binding rather
+/// than trying an i64 lowering.
+fn isStrCall(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
     const call = switch (arg) {
         .call => |cc| cc,
         else => return false,
@@ -1169,6 +1189,15 @@ fn isStrCall(b: *Builder, arg: ast.Expr) BuildError!bool {
     };
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
+    if (std.mem.indexOfScalar(u8, cname, '.')) |dot| {
+        const mname = cname[dot + 1 ..];
+        if (std.mem.indexOfScalar(u8, mname, '.') != null) return false;
+        const si = scope.recs.get(cname[0..dot]) orelse return false;
+        const m = findFitMethod(b, si.name, mname) orelse return false;
+        const rt = m.returnType() orelse return false;
+        const rs = (try semaScalar(b, rt.type_())) orelse return false;
+        return rs == .str;
+    }
     const fd = b.resolver.lookup(cname) orelse return false;
     const rs = try fnRetScalar(b, fd);
     return rs != null and rs.? == .str;
@@ -1403,8 +1432,8 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     const rt = m.returnType() orelse return error.Unsupported;
     const rs = (try semaScalar(b, rt.type_())) orelse return error.Unsupported;
     const ret_ty: hir.Type = switch (rs) {
-        .bool, .i64 => rs,
-        else => return error.Unsupported, // str/record-valued methods: later
+        .bool, .i64, .str => rs,
+        else => return error.Unsupported, // record-valued methods: later
     };
 
     var scope = Scope{ .a = b.a };
@@ -1441,6 +1470,20 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy });
     try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = null });
 
+    // A str-returning method (`fn fmt(self) -> str { "..." }`): a single
+    // tail str expression, like registerStrFunc — interpolation resolves
+    // `{self.w}` through the rec-field concat piece.
+    if (ret_ty == .str) {
+        const tail = singleTailOfBlock(body_blk) orelse return error.Unsupported;
+        const value = try buildStrExpr(b, tail, &scope, null);
+        const vstmt = try b.a.create(hir.Stmt);
+        vstmt.* = .{ .expr = value };
+        const block = try b.a.create(hir.Stmt);
+        block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+        b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = .str, .body = block };
+        return id;
+    }
+
     const body = try buildIntBlock(b, body_blk, &scope);
     if (tailIsValueIfNoElse(body)) return reject(b, .unsupported_call);
     const extra = scope.extra();
@@ -1448,6 +1491,23 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     for (locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
     b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
+}
+
+/// The single tail expression of a one-statement block, or null.
+fn singleTailOfBlock(body: ast.Block) ?ast.Expr {
+    var it = body.statements();
+    var first: ?ast.Expr = null;
+    var count: usize = 0;
+    while (it.next()) |stmt| {
+        count += 1;
+        if (count > 1) return null;
+        first = switch (stmt) {
+            .expr_stmt => |es| es.expression(),
+            .return_stmt => |rsx| rsx.value(),
+            else => return null,
+        };
+    }
+    return first;
 }
 
 /// Bind a record value in `main`: one `.ptr` local (shared index space with
@@ -2904,4 +2964,61 @@ test "B4: wrong fit-method arity is UnsupportedCall" {
     try tr.addLib(src);
     const r = try rejectFromSource(testing.allocator, src, tr.resolver());
     try testing.expectEqual(hir.Reject.unsupported_call, r.?);
+}
+
+test "B4: a str-returning fit method (Display.fmt) builds a concat over self" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Display { fn fmt(self) -> str }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Display {
+        \\    fn fmt(self) -> str { "Rect({self.w}x{self.h})" }
+        \\}
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6, h: 7 }
+        \\    env.out(r.fmt())
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.fmt -> str") != null);
+    // The body interpolates self's fields: fmt_int over field_get pieces.
+    try testing.expect(std.mem.indexOf(u8, dump, "fmt_int(field_get(") != null);
+    // main routes the call to the str path.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null);
+}
+
+test "B4: dispatch works on a record param inside a plain callee" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Area { fn area(self) -> i64 }
+        \\
+        \\struct Rect { w: i64, h: i64 }
+        \\
+        \\fit Rect : Area { fn area(self) -> i64 { self.w * self.h } }
+        \\
+        \\fn describe(r: Rect) -> i64 { r.area() }
+        \\
+        \\fn main {
+        \\    let r = Rect { w: 6, h: 7 }
+        \\    env.out(describe(r))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn describe -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Rect.area -> i64") != null);
 }

@@ -665,4 +665,51 @@ if [[ "$fit32_out" != "$fit_expected" ]]; then
 fi
 echo "    ok: fit dispatch -> 42 / 420 / false / 9 / area = 42 (wasm64 + wasm32)"
 
+# str-returning fit methods (the Display.fmt pattern): the method body is
+# an interpolation over self's fields, built in the scope arena and
+# returned as (ptr, len); plus dispatch on a record *param* in a plain
+# callee (`describe(r)` calls `r.area()` inside).
+echo "==> B4: str-returning fit methods (Display.fmt) + param dispatch"
+sfit_app="$tmp/sfit.q"
+sfit_wasm="$tmp/sfit.wasm"
+cat > "$sfit_app" <<'Q64'
+face Display { fn fmt(self) -> str }
+face Area { fn area(self) -> i64 }
+
+struct Rect { w: i64, h: i64 }
+
+fit Rect : Display {
+    fn fmt(self) -> str { "Rect({self.w}x{self.h})" }
+}
+fit Rect : Area {
+    fn area(self) -> i64 { self.w * self.h }
+}
+
+fn describe(r: Rect) -> i64 { r.area() }
+
+fn main {
+    let r = Rect { w: 6, h: 7 }
+    env.out(r.fmt())
+    let s = r.fmt()
+    env.out("s = {s}")
+    env.out(describe(r))
+}
+Q64
+"$Q64_BIN" emit "$sfit_app" "$sfit_wasm"
+sfit_out="$("$HOST_BIN" "$sfit_wasm")"
+sfit_expected=$'Rect(6x7)\ns = Rect(6x7)\n42'
+if [[ "$sfit_out" != "$sfit_expected" ]]; then
+    echo "FAIL: str-fit output mismatch" >&2
+    printf "  expected: %q\n" "$sfit_expected" >&2
+    printf "  actual:   %q\n" "$sfit_out" >&2
+    exit 1
+fi
+"$Q64_BIN" emit "$sfit_app" "$tmp/sfit32.wasm" --addr wasm32
+sfit32_out="$("$HOST_BIN" "$tmp/sfit32.wasm")"
+if [[ "$sfit32_out" != "$sfit_expected" ]]; then
+    echo "FAIL: str-fit wasm32 output mismatch" >&2
+    exit 1
+fi
+echo "    ok: Display.fmt -> Rect(6x7) / s = Rect(6x7) / 42 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
