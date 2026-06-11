@@ -648,8 +648,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
 /// a `_` arm).
 fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     const scrut = ms.scrutinee() orelse return error.Unsupported;
-    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
-    const boxed = info.si != null;
+    const info_opt = try enumOfExpr(b, scope, scrut);
+    // C4: a non-enum scrutinee matches integer literals (`match n {
+    // 0 -> .., _ -> .. }`); it must be provably an integer, and the
+    // match needs a `_` arm (ints aren't enumerable).
+    if (info_opt == null and (try exprScalar(b, scrut, scope)) != .i64) return error.Unsupported;
+    const boxed = if (info_opt) |info| info.si != null else false;
 
     const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, out);
 
@@ -662,7 +666,10 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
         // Pattern first: payload bindings must be in scope for the body.
-        const rp = try resolveArmPattern(b, info, pat, scope, s_idx);
+        const rp = if (info_opt) |info|
+            try resolveArmPattern(b, info, pat, scope, s_idx)
+        else
+            try resolveLiteralPattern(b, pat);
         const body = try buildMatchArmBody(b, arm, scope, rt);
         const ap = rp orelse {
             if (default != null) return error.Unsupported; // two `_` arms
@@ -670,13 +677,42 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
             continue;
         };
         try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
-        seen |= @as(u64, 1) << @intCast(ap.tag);
+        // Coverage only counts for enums (a literal can be any i64).
+        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Exhaustiveness (spec/grammar.md leaves the rules open; the v0
-    // floor requires it structurally): every variant, or a default.
-    if (default == null and @popCount(seen) < info.variants.len) return error.Unsupported;
+    // floor requires it structurally): every variant or a default for
+    // an enum; literal matches always need the default.
+    if (default == null) {
+        const info = info_opt orelse return error.Unsupported;
+        if (@popCount(seen) < info.variants.len) return error.Unsupported;
+    }
 
     try foldMatchChain(b, s_idx, boxed, arms.items, default, out);
+}
+
+/// C4: a literal arm pattern (`0 ->`, `42 ->`) against an integer
+/// scrutinee; `null` = wildcard.
+fn resolveLiteralPattern(b: *Builder, pat: ast.Pattern) BuildError!?ArmPattern {
+    _ = b;
+    switch (pat.kind()) {
+        .WILD_PATTERN => return null,
+        .LITERAL_PATTERN => {
+            const tok = firstNonTriviaToken(pat.cst) orelse return error.Unsupported;
+            if (tok.kind != .INT_LIT) return error.Unsupported; // str/float literals: later
+            const v = consteval.parseIntLit(tok.text) catch return error.Unsupported;
+            return .{ .tag = v, .prelude = &.{} };
+        },
+        else => return error.Unsupported, // binders/ranges on scalars: later
+    }
+}
+
+fn firstNonTriviaToken(node: *const parser.cst.Node) ?parser.cst.Token {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) return t,
+        .node => |n| if (firstNonTriviaToken(n)) |t| return t,
+    };
+    return null;
 }
 
 /// Evaluate a match scrutinee once into a hidden local: the tag (i64)
@@ -844,8 +880,9 @@ fn matchValueTy(b: *Builder, me: ast.MatchExpr, scope: *const Scope) BuildError!
 fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt), target_idx: u32, ty: hir.Type) BuildError!void {
     _ = rt; // arm values are scalar expressions (str arms: later)
     const scrut = me.scrutinee() orelse return error.Unsupported;
-    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
-    const boxed = info.si != null;
+    const info_opt = try enumOfExpr(b, scope, scrut);
+    if (info_opt == null and (try exprScalar(b, scrut, scope)) != .i64) return error.Unsupported;
+    const boxed = if (info_opt) |info| info.si != null else false;
 
     const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, out);
 
@@ -857,7 +894,10 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, rt: *RtMap, out
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
         // Pattern first: payload bindings must be in scope for the value.
-        const rp = try resolveArmPattern(b, info, pat, scope, s_idx);
+        const rp = if (info_opt) |info|
+            try resolveArmPattern(b, info, pat, scope, s_idx)
+        else
+            try resolveLiteralPattern(b, pat);
         const e = arm.expression() orelse return error.Unsupported; // value arms only
         if (scalarBindTy(try exprScalar(b, e, scope)) != ty) return error.Unsupported;
         const value = try buildIntExpr(b, e, scope);
@@ -871,10 +911,14 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, rt: *RtMap, out
             continue;
         };
         try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
-        seen |= @as(u64, 1) << @intCast(ap.tag);
+        // Coverage only counts for enums (a literal can be any i64).
+        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Structural exhaustiveness, like the statement form.
-    if (default == null and @popCount(seen) < info.variants.len) return error.Unsupported;
+    if (default == null) {
+        const info = info_opt orelse return error.Unsupported;
+        if (@popCount(seen) < info.variants.len) return error.Unsupported;
+    }
 
     try foldMatchChain(b, s_idx, boxed, arms.items, default, out);
 }
@@ -5607,6 +5651,41 @@ test "C3: payload arity and sub-pattern mismatches reject honestly" {
         \\    match S.A(1) {
         \\        A -> env.out("a"),
         \\        B -> env.out("b"),
+        \\    }
+        \\}
+        \\
+    )) == null);
+}
+
+test "C4: literal patterns on an integer scrutinee (statement + value)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    var n = 1
+        \\    match n {
+        \\        0 -> env.out("zero"),
+        \\        1 -> env.out("one"),
+        \\        _ -> env.out("many"),
+        \\    }
+        \\    let label = match n + 41 {
+        \\        42 -> 200,
+        \\        _ -> 300,
+        \\    }
+        \\    env.out(label)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    // A literal match without `_` is honestly unsupported.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    var n = 1
+        \\    match n {
+        \\        0 -> env.out("zero"),
+        \\        1 -> env.out("one"),
         \\    }
         \\}
         \\

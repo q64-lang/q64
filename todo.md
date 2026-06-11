@@ -969,9 +969,20 @@ verified, honest diagnostics throughout.
       (the conformance corpus and `errors.md` lean on `match`).
       Rungs: C1 unit variants + statement `match` (landed) → C2
       value `match` (landed) → C3 payload variants (landed) → C4
-      `match` on scalars/strs with literal patterns → exhaustiveness
-      diagnostics in `q64 check` (the TYP3xx band) → `Option`/
-      `Result` in the prelude.
+      literal patterns (landed) → exhaustiveness diagnostics in
+      `q64 check` (the TYP3xx band) → `Option`/`Result` in the
+      prelude.
+      - [x] **C4 — integer literal patterns.** A non-enum scrutinee
+            that is provably an i64 matches integer-literal arms
+            (`match n { 0 -> .., 1 -> .., _ -> .. }`), statement and
+            value forms, riding the same chain (LoweredArm.tag holds
+            the literal). A `_` arm is required (ints aren't
+            enumerable — the coverage bitmask only applies to enums,
+            and is gated so large literals can't overflow it).
+            str/float literals, binders, and ranges on scalars are
+            later. Verified wasm64 + wasm32 (roundtrip C4 section:
+            one / 200) + 1 unit test (incl. the missing-`_`
+            rejection). 377 unit / 80 CLI / 21-of-49 green.
       - [x] **C3 — payload variants.** Boxed enums land, specced
             first (`spec/memory.md` §"Enum representation (v0)"): an
             enum with any tuple payload is an arena record
