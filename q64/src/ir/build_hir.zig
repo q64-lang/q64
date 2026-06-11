@@ -1781,9 +1781,77 @@ fn recvStruct(b: *Builder, scope: *const Scope, expr: ast.Expr) BuildError!?*con
                 .scalar => null,
             };
         },
-        .call => return recCallStruct(b, expr),
+        .call => |cc| {
+            if (try genericRetStruct(b, scope, cc)) |si| return si;
+            return recCallStruct(b, expr);
+        },
         else => return null,
     }
+}
+
+/// The struct a *generic* call returns, inferred WITHOUT building (the
+/// routing twin of `genericRecCall`): the callee is a generic decl with
+/// a `-> T` return, and T's slot peeks from the deciding argument — a
+/// record literal names its struct, other shapes resolve through
+/// `recvStruct` / the scope's array bindings.
+fn genericRetStruct(b: *Builder, scope: *const Scope, cc: ast.CallExpr) BuildError!?*const StructInfo {
+    const callee = cc.callee() orelse return null;
+    const cpath = switch (callee) {
+        .path => |p| p,
+        else => return null,
+    };
+    const cname = try cpath.text(b.a);
+    defer b.a.free(cname);
+    if (std.mem.indexOfScalar(u8, cname, '.') != null) return null;
+    const fd = b.resolver.lookup(cname) orelse return null;
+    if (!fd.isGeneric()) return null;
+    const sig = parseGenericSig(fd.genericParams().?) orelse return null;
+    const rt = fd.returnType() orelse return null;
+    const which = sema.fits.typeWhich(rt.type_() orelse return null, sig, b.a) orelse return null;
+    const ps = fd.params() orelse return null;
+    var pit = ps.iter();
+    var ait = cc.args();
+    while (pit.next()) |p| {
+        const a0 = ait.next() orelse return null;
+        if (bareWhich(p, sig, b.a)) |w| {
+            if (w != which) continue;
+            if (try recordLitStruct(b, a0)) |si| return si;
+            return recvStruct(b, scope, a0);
+        }
+        if (sliceOfWhich(p, sig, b.a)) |w| {
+            if (w != which) continue;
+            switch (a0) {
+                .path => |pp| {
+                    const txt = try pp.text(b.a);
+                    defer b.a.free(txt);
+                    const ai = scope.arrs.get(txt) orelse return null;
+                    return switch (ai.elem) {
+                        .rec => |r| r,
+                        .scalar => null,
+                    };
+                },
+                .array => |ae| {
+                    var eit = ae.elements();
+                    const e0 = eit.next() orelse return null;
+                    if (try recordLitStruct(b, e0)) |si| return si;
+                    return recvStruct(b, scope, e0);
+                },
+                else => return null,
+            }
+        }
+    }
+    return null;
+}
+
+/// The registered struct a record literal names, if the expression is one.
+fn recordLitStruct(b: *Builder, e: ast.Expr) BuildError!?*const StructInfo {
+    const re = switch (e) {
+        .record => |x| x,
+        else => return null,
+    };
+    const pname = try (re.path() orelse return null).text(b.a);
+    defer b.a.free(pname);
+    return b.structs.get(pname);
 }
 
 /// The fit method `<struct>.<name>` from the registry: every fit whose
@@ -4655,6 +4723,44 @@ test "B5: bare `T` params + `-> T` returns (records by ptr, scalars by value)" {
     try testing.expect(std.mem.indexOf(u8, dump, "fn twice<i64> -> i64") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn twice<f64> -> f64") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn first<i64> -> i64") != null);
+}
+
+test "B5: method dispatch directly on a generic call expression" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\face Display { fn fmt(self) -> str }
+        \\face Sized { fn area(self) -> i64 }
+        \\struct Color { r: i64, g: i64 }
+        \\fit Color : Display { fn fmt(self) -> str { "rgb({self.r}, {self.g})" } }
+        \\fit Color : Sized { fn area(self) -> i64 { self.r * self.g } }
+        \\fn first<T>(items: [T]) -> T {
+        \\    items[0]
+        \\}
+        \\fn idr<T>(x: T) -> T {
+        \\    x
+        \\}
+        \\fn main {
+        \\    env.out(first([Color { r: 9, g: 8 }]).fmt())
+        \\    env.out(first([Color { r: 9, g: 8 }]).area())
+        \\    env.out(idr(Color { r: 2, g: 3 }).fmt())
+        \\    let cs = [Color { r: 4, g: 5 }]
+        \\    env.out(first(cs).area())
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The routing predicate (recvStruct → genericRetStruct) sees the
+    // struct WITHOUT building, so both the str (host_out_str) and i64
+    // (host_out_int) method paths dispatch on the call expression.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn first<Color> -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn idr<Color> -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Color.fmt -> str") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Color.area -> i64") != null);
 }
 
 test "B5: record `-> T` returns bind and dispatch (first<Color> -> ptr)" {

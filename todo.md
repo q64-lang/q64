@@ -981,13 +981,29 @@ verified, honest diagnostics throughout.
             the name-based `recCallStruct` (a bare `let q = p` stays
             the documented copy-rejection, not a silent alias). So
             `let c = first([Color{…}, …]); c.fmt(); let d = idr(c)`
-            binds, dispatches, reads fields, and chains. **Boundary:**
-            method dispatch directly on a generic call expression
-            (`first([…]).fmt()`) wants recvStruct-without-building —
-            later; printing a whole record value stays unsupported.
-            Verified end-to-end wasm64 + wasm32 (roundtrip bare-T
-            section extended: `rgb(9, 8)` / `8`) + 2 unit tests.
-            368 unit / 80 CLI / 21-of-49 / roundtrips green.
+            binds, dispatches, reads fields, and chains. Printing a
+            whole record value stays unsupported. Verified end-to-end
+            wasm64 + wasm32 (roundtrip bare-T section extended:
+            `rgb(9, 8)` / `8`) + 2 unit tests. 368 unit / 80 CLI /
+            21-of-49 / roundtrips green.
+      - [x] **Method dispatch on generic call expressions.**
+            `first([Color{…}]).fmt()` / `.area()` and
+            `idr(Color{…}).r` work without binding first:
+            `genericRetStruct` is the non-building twin of
+            `genericRecCall` — `recvStruct`'s call arm peeks a generic
+            callee's `-> T` slot from the deciding argument (record
+            literal → `b.structs`; bindings/index/calls recurse through
+            `recvStruct`; slice args read `Scope.arrs` or the literal's
+            first element) so the str/int routing predicates
+            (`isStrCall` → fit-method return type) classify correctly;
+            the *building* method arms already went through the
+            generic-aware `buildRecExpr`. **Boundary (pre-existing, not
+            generic-specific):** a call-receiver method inside
+            interpolation (`"{first(cs).fmt()}"` — and equally
+            `"{make(1,2).fmt()}"`) isn't a recognized interpolation
+            piece shape; bind first. Verified end-to-end wasm64 +
+            wasm32 (roundtrip: `rgb(4, 5)` / `6`) + 1 unit test.
+            369 unit / 80 CLI / 21-of-49 / roundtrips green.
       - [x] **Bare `T` params + scalar `-> T` returns.** The feared
             "receiver-by-value story" mostly dissolved: a record T
             already crosses calls as its base pointer (B2b), so

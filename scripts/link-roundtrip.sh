@@ -1128,9 +1128,11 @@ fn main {
     env.out(f.fmt())
     let g = idr(f)
     env.out(g.g)
+    env.out(first([Color { r: 4, g: 5 }]).fmt())
+    env.out(idr(Color { r: 6, g: 7 }).r)
 }
 Q64
-bgen_expected=$'rgb(255, 0)\nrgb(1, 2)\n42\n3.0\n10\n107\nrgb(9, 8)\n8'
+bgen_expected=$'rgb(255, 0)\nrgb(1, 2)\n42\n3.0\n10\n107\nrgb(9, 8)\n8\nrgb(4, 5)\n6'
 "$Q64_BIN" emit "$bgen_app" "$tmp/genbare.wasm"
 bgen_out="$("$HOST_BIN" "$tmp/genbare.wasm")"
 if [[ "$bgen_out" != "$bgen_expected" ]]; then
@@ -1143,6 +1145,6 @@ if [[ "$bgen32_out" != "$bgen_expected" ]]; then
     echo "FAIL: bare-T generic wasm32 output mismatch (got: $bgen32_out)" >&2
     exit 1
 fi
-echo "    ok: show<Color> + twice<i64/f64> + first<i64/Color> + idr<Color> -> rgb/42/3.0/10/107/rgb(9, 8)/8 (wasm64 + wasm32)"
+echo "    ok: show<Color> + twice<i64/f64> + first<i64/Color> + idr<Color> + dispatch-on-call-expr -> rgb/42/3.0/10/107/rgb(9, 8)/8/rgb(4, 5)/6 (wasm64 + wasm32)"
 
 echo "PASS: $qube_out"
