@@ -73,7 +73,63 @@ pub const Registry = struct {
         }
         return null;
     }
+
+    /// Is `name` a face this file can judge — declared (and classified)
+    /// locally, or an auto-prelude face? Anything else is the NAM story
+    /// (cross-module faces), and bound checks stay silent on it.
+    pub fn knowsFace(self: *const Registry, name: []const u8) bool {
+        if (self.faces.contains(name)) return true;
+        const pk = prelude.kindOf(name) orelse return false;
+        return pk == .face;
+    }
 };
+
+// ---------------------------------------------------------------------
+// Generic signatures (the B5 v0 floor) — shared between the TYP200
+// bound check (sema/check.zig) and the emit path's monomorphization
+// (ir/build_hir.zig).
+// ---------------------------------------------------------------------
+
+pub const GenericSig = struct { tname: []const u8, bound: ?[]const u8 };
+
+/// Parse the raw `<T: Display>` span: one type parameter with an
+/// optional face bound. More parameters are a later slice.
+pub fn parseGenericSig(gp: *const cst.Node) ?GenericSig {
+    var toks: [8]cst.Token = undefined;
+    var n: usize = 0;
+    for (gp.children) |ch| switch (ch) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            if (n == toks.len) return null;
+            toks[n] = t;
+            n += 1;
+        },
+        .node => return null,
+    };
+    // < IDENT >  |  < IDENT : IDENT >
+    if (n == 3 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .R_ANGLE)
+        return .{ .tname = toks[1].text, .bound = null };
+    if (n == 5 and toks[0].kind == .L_ANGLE and toks[1].kind == .IDENT and toks[2].kind == .COLON and toks[3].kind == .IDENT and toks[4].kind == .R_ANGLE)
+        return .{ .tname = toks[1].text, .bound = toks[3].text };
+    return null;
+}
+
+/// Is this param type `[T]` for the generic's T?
+pub fn isSliceOfT(p: ast.Param, tname: []const u8, a: std.mem.Allocator) bool {
+    const te = p.type_() orelse return false;
+    const sl = switch (te) {
+        .slice => |x| x,
+        else => return false,
+    };
+    const inner = sl.element() orelse return false;
+    const pt = switch (inner) {
+        .path => |x| x,
+        else => return false,
+    };
+    const nm = pt.name(a) catch return false;
+    defer a.free(nm);
+    return std.mem.eql(u8, nm, tname);
+}
 
 /// Build the registry for `sf` and run the fit-form checks. The caller
 /// owns the result (`deinit`).

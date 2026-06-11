@@ -155,11 +155,17 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
         defer gpa.free(sema_diags);
         try all_diags.appendSlice(gpa, sema_diags);
 
+        // The fit registry: powers the fit-form checks (TYP201 / TYP202,
+        // spec/faces.md §"Fit declaration") and the check pass's generic
+        // bound check (TYP200).
+        var fitreg = try sema.fits.build(gpa, sf);
+        defer fitreg.deinit();
+
         var store = try sema.types.TypeStore.init(gpa);
         defer store.deinit();
         var sigs = try sema.types.collectSignatures(&store, &table, sf);
         defer sigs.deinit();
-        const check_diags = try sema.check.checkFile(gpa, sf, &table, &store, &sigs);
+        const check_diags = try sema.check.checkFile(gpa, sf, &table, &store, &sigs, &fitreg);
         defer gpa.free(check_diags);
         for (check_diags) |cd| {
             try all_diags.append(gpa, .{
@@ -171,10 +177,6 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
             });
         }
 
-        // The fit registry + fit-form checks (TYP201 / TYP202,
-        // spec/faces.md Â§"Fit declaration").
-        var fitreg = try sema.fits.build(gpa, sf);
-        defer fitreg.deinit();
         for (fitreg.diags.items) |fd| {
             try all_diags.append(gpa, .{
                 .code = fd.code,

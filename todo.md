@@ -952,8 +952,27 @@ verified, honest diagnostics throughout.
       params, record element types, void returns, statement calls).
       Remaining: value-returning generic calls, multiple type params,
       bare `T` params (needs the receiver-by-value story), scalar
-      element types, TYP200 emission in `q64 check`, const generics;
-      then `dyn` dispatch; enums + `match` lowering (separate ladders).
+      element types, const generics; then `dyn` dispatch; enums +
+      `match` lowering (separate ladders).
+      - [x] **TYP200 emitted in `q64 check`** (B4's diagnostic
+            follow-up). The check pass owns the generic bound check:
+            `GenericSig` parsing + `[T]`-param detection moved to
+            `sema/fits.zig` (shared with the emit path's
+            monomorphization — ir already imports sema), the checker
+            types record literals (`Info.record`, via the symbol table
+            that checkFile already received) and arrays-of-records
+            (`Info.rec_array`, all elements one local struct), and a
+            call argument bound to a face-bounded generic's `[T]`
+            param with no (target, face) fit in the registry emits
+            **TYP200** at the argument. Honesty rules: fires only when
+            the face is judgeable locally (declared or auto-prelude)
+            and the element type is a provable local-struct record
+            array; unbounded generics, unknown faces, unknown/mixed
+            elements stay silent. The fit registry now feeds `checkFile`
+            (built once in `cmdCheck`, also kept for TYP201/202). New
+            conformance fixture `faces/no-fit-for-bound.q` flips
+            (**21/49**, zero regressions); 357 unit (2 new) / 80 CLI
+            (1 new TYP200 envelope case) / link-roundtrip green.
 
 ## Numeric tower — floats (f64 landed; f32 next)
 

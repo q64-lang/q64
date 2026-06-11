@@ -62,6 +62,15 @@ describe.skipIf(!binaryAvailable())("q64 check", () => {
     expect(r.exitCode).not.toBe(0);
   });
 
+  test("bounded generic call with a non-fitting type is TYP200 (spec/faces.md)", () => {
+    // The check pass's generic bound check: `print_all<T: Display>`
+    // called with `[Plain { … }]` and no `fit Plain : Display`.
+    const r = runCli(["check", fixture("no-fit-for-bound.q"), "--diagnostics", "json"]);
+    expect(r.envelope?.ok).toBe(false);
+    expect(hasDiagnostic(r.envelope, "TYP200", "error")).toBe(true);
+    expect(r.exitCode).not.toBe(0);
+  });
+
   test("missing file: input error, exit non-zero", () => {
     const r = runCli(["check", fixture("does-not-exist.q"), "--diagnostics", "json"]);
     expect(r.exitCode).not.toBe(0);

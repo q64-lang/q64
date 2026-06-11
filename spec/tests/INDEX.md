@@ -97,7 +97,7 @@ no test.
 
 | Code     | Owner           | Short message                                     | Test                                                     |
 |----------|-----------------|---------------------------------------------------|----------------------------------------------------------|
-| `TYP200` | faces.md        | type does not fit face                            | —                                                        |
+| `TYP200` | faces.md        | type does not fit face                            | `faces/no-fit-for-bound.q`                               |
 | `TYP201` | faces.md        | wrong fit form for single-param face              | `faces/wrong-fit-form-single.q`                          |
 | `TYP202` | faces.md        | wrong fit form for multi-param face               | `faces/wrong-fit-form-multi.q`                           |
 | `TYP203` | faces.md        | overlapping fits                                  | —                                                        |
