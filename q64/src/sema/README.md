@@ -64,9 +64,16 @@ parse (CST/AST)
 - **A1 (remaining)** — resolution of import bindings against `--module`
   sources (NAM001/NAM006 at the sema layer), `PAR040` re-land on name
   kinds, the fit registry.
-- **A2** — interned types beyond the scalar floor (named struct/enum
-  types, tuples, optionals, `fn` types).
-- **A3** — `build_hir` consumes sema; ad-hoc inference
-  (`returnsBool`-style) deleted; unresolved-head recording becomes the
-  emitted diagnostic; diagnostics byte-stable.
+- **A2 (remaining)** — structured `fn` types (blocked on the parser's
+  raw fn/dyn/union spans) and struct field shapes (lands with ladder
+  B2). The core type store is in (`types.zig`): interned builtin tower,
+  named/optional/ref/slice/array/tuple lowering against the symbol
+  table, fn-signature collection, unresolved-type recording.
+- **A3 (in progress)** — signature lowering is migrated: `ir/build_hir`
+  imports sema and lowers every param/return annotation through
+  `types.lower` (the `typeNamed` text-matching family is gone).
+  Remaining: expression-level inference (`exprIsBool`, Scope local
+  typing) and replacing the codegen `Resolver`'s name lookup with the
+  sema symbol table, at which point the recorded unresolved heads
+  become the emitted diagnostic.
 - **A4** — first real TYP codes; conformance fixtures flip to passing.

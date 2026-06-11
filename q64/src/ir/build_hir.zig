@@ -25,6 +25,7 @@ const hir = @import("hir.zig");
 const ops = @import("ops.zig");
 const consteval = @import("consteval.zig");
 const effects = @import("effects.zig");
+const sema = @import("sema");
 
 pub const ModuleResolver = hir.ModuleResolver;
 
@@ -42,6 +43,12 @@ const Builder = struct {
     a: std.mem.Allocator,
     resolver: ModuleResolver,
     eval: consteval.Evaluator,
+    /// Sema type store (A3): signature annotations lower through sema's
+    /// `types.lower` instead of ad-hoc name matching. Arena-backed, so no
+    /// explicit deinit. The table is null until cross-module symbol
+    /// resolution lands — builtins resolve, named types stay unresolved,
+    /// which is exactly the scalar floor this builder compiles.
+    tstore: sema.types.TypeStore,
     funcs: std.ArrayList(hir.Func) = .empty,
     /// function name → FuncId, for dedup + recursion. Keys are arena-owned.
     ids: std.StringHashMapUnmanaged(hir.FuncId) = .empty,
@@ -101,7 +108,12 @@ pub fn tryBuild(
 ) std.mem.Allocator.Error!Result {
     var mod = hir.Module.init(gpa);
     const a = mod.alloc();
-    var b = Builder{ .a = a, .resolver = resolver, .eval = .{ .a = a, .resolver = resolver } };
+    var b = Builder{
+        .a = a,
+        .resolver = resolver,
+        .eval = .{ .a = a, .resolver = resolver },
+        .tstore = try sema.types.TypeStore.init(a),
+    };
     buildModule(&b, sf) catch |e| switch (e) {
         error.Unsupported => {
             mod.deinit();
@@ -448,7 +460,11 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
         var pit = ps.iter();
         while (pit.next()) |p| {
             const pn = (p.name() orelse return error.Unsupported).text;
-            const pty: hir.Type = if (try paramIsStr(b.a, p)) .str else if (try paramIsBool(b.a, p)) .bool else if (try paramIsI64(b.a, p)) .i64 else return error.Unsupported;
+            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+            const pty: hir.Type = switch (psc) {
+                .str, .bool, .i64 => psc,
+                else => return error.Unsupported,
+            };
             _ = try scope.declare(pn, false, pty);
             if (pty == .str) scope.next_idx += 1; // second slot (len)
             try params.append(b.a, .{ .name = pn, .ty = pty });
@@ -590,10 +606,14 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (b.ids.get(name)) |id| return id;
 
     const fd = b.resolver.lookup(name) orelse return reject(b, .name_not_found);
-    if (try returnsStr(b.a, fd)) return registerStrFunc(b, name, fd);
+    const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
+    if (rs == .str) return registerStrFunc(b, name, fd);
     // An i64 or a `-> bool` (i32 0/1) value function; both have i64 params and
     // a value body built by `buildIntBlock`.
-    const ret_ty: hir.Type = if (try returnsBool(b.a, fd)) .bool else if (try returnsI64(b.a, fd)) .i64 else return error.Unsupported;
+    const ret_ty: hir.Type = switch (rs) {
+        .bool, .i64 => rs,
+        else => return error.Unsupported,
+    };
 
     const owned = try b.a.dupe(u8, name);
 
@@ -603,7 +623,11 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
-            const pty: hir.Type = if (try paramIsBool(b.a, p)) .bool else if (try paramIsI64(b.a, p)) .i64 else return error.Unsupported;
+            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+            const pty: hir.Type = switch (psc) {
+                .bool, .i64 => psc,
+                else => return error.Unsupported,
+            };
             const pn = (p.name() orelse return error.Unsupported).text;
             _ = try scope.declare(pn, false, pty);
             try params.append(b.a, .{ .name = pn, .ty = pty });
@@ -659,7 +683,8 @@ fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
-            if (!(try paramIsStr(b.a, p))) return error.Unsupported; // all-str params for now
+            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+            if (psc != .str) return error.Unsupported; // all-str params for now
             const pn = (p.name() orelse return error.Unsupported).text;
             _ = try scope.declare(pn, false, .str);
             try params.append(b.a, .{ .name = pn, .ty = .str });
@@ -990,19 +1015,40 @@ fn isStrCall(b: *Builder, arg: ast.Expr) BuildError!bool {
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
     const fd = b.resolver.lookup(cname) orelse return false;
-    return returnsStr(b.a, fd);
+    const rs = try fnRetScalar(b, fd);
+    return rs != null and rs.? == .str;
 }
 
-fn returnsStr(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
-    const rt = fd.returnType() orelse return false;
-    const te = rt.type_() orelse return false;
-    return typeNamed(a, te, "str");
+/// A3: annotations lower through the sema type store; the result maps
+/// onto the codegen scalar floor. Anything beyond it — named types,
+/// compounds, the wider numeric tower (i8…u128/f16/f32) — is `null`,
+/// which callers turn into the honest `Unsupported`.
+fn semaScalar(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?hir.Type {
+    const id = try sema.types.lower(&b.tstore, null, te_opt);
+    return switch (b.tstore.get(id)) {
+        .builtin => |bi| switch (bi) {
+            .i64 => .i64,
+            .i32 => .i32,
+            .f64 => .f64,
+            .bool => .bool,
+            .str => .str,
+            .void => .void,
+            else => null,
+        },
+        else => null,
+    };
 }
 
-fn returnsBool(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
-    const rt = fd.returnType() orelse return false;
-    const te = rt.type_() orelse return false;
-    return typeNamed(a, te, "bool");
+/// Scalar return type of `fd`'s annotation; `null` when absent or
+/// outside the floor. (Absent ≠ void here: the void-returning handler
+/// path is chosen by the caller before consulting this.)
+fn fnRetScalar(b: *Builder, fd: ast.FnDecl) BuildError!?hir.Type {
+    const rt = fd.returnType() orelse return null;
+    return semaScalar(b, rt.type_());
+}
+
+fn paramScalar(b: *Builder, p: ast.Param) BuildError!?hir.Type {
+    return semaScalar(b, p.type_());
 }
 
 /// Syntactic check: does `arg` denote a boolean value? Covers the boolean
@@ -1049,17 +1095,8 @@ fn isBoolCall(b: *Builder, arg: ast.Expr) BuildError!bool {
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
     const fd = b.resolver.lookup(cname) orelse return false;
-    return returnsBool(b.a, fd);
-}
-
-fn paramIsStr(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
-    const te = p.type_() orelse return false;
-    return typeNamed(a, te, "str");
-}
-
-fn paramIsBool(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
-    const te = p.type_() orelse return false;
-    return typeNamed(a, te, "bool");
+    const rs = try fnRetScalar(b, fd);
+    return rs != null and rs.? == .bool;
 }
 
 /// Name → local-index resolution for a function body. Append-only with a
@@ -1460,27 +1497,6 @@ fn isEnvOut(a: std.mem.Allocator, call: ast.CallExpr) bool {
 fn firstArg(call: ast.CallExpr) ?ast.Expr {
     var args = call.args();
     return args.next();
-}
-
-fn returnsI64(a: std.mem.Allocator, fd: ast.FnDecl) BuildError!bool {
-    const rt = fd.returnType() orelse return false;
-    const te = rt.type_() orelse return false;
-    return typeNamed(a, te, "i64");
-}
-
-fn paramIsI64(a: std.mem.Allocator, p: ast.Param) BuildError!bool {
-    const te = p.type_() orelse return false;
-    return typeNamed(a, te, "i64");
-}
-
-fn typeNamed(a: std.mem.Allocator, te: ast.TypeExpr, name: []const u8) BuildError!bool {
-    const p = switch (te) {
-        .path => |x| x,
-        else => return false,
-    };
-    const nm = try p.name(a);
-    defer a.free(nm);
-    return std.mem.eql(u8, nm, name);
 }
 
 // ---------------------------------------------------------------------

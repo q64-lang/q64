@@ -23,16 +23,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Named module for the Q64 IR package (src/ir/lib.zig). The builder
-    // consumes parser AST views; nothing under ir/ links Binaryen, so the
-    // IR stays backend-neutral. Codegen + future passes import it.
-    const ir_mod = b.createModule(.{
-        .root_source_file = b.path("src/ir/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ir_mod.addImport("parser", parser_mod);
-
     // Named module for the sema package (src/sema/lib.zig) — name
     // resolution + type checking between parse and build_hir. Imports
     // `parser` only (never ir/, never Binaryen); see src/sema/README.md
@@ -43,6 +33,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     sema_mod.addImport("parser", parser_mod);
+
+    // Named module for the Q64 IR package (src/ir/lib.zig). The builder
+    // consumes parser AST views and sema's type lowering (A3); nothing
+    // under ir/ links Binaryen, so the IR stays backend-neutral.
+    const ir_mod = b.createModule(.{
+        .root_source_file = b.path("src/ir/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ir_mod.addImport("parser", parser_mod);
+    ir_mod.addImport("sema", sema_mod);
 
     // -----------------------------------------------------------
     // The binary.
@@ -89,6 +90,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ir_tests_mod.addImport("parser", parser_mod);
+    ir_tests_mod.addImport("sema", sema_mod);
     const ir_tests = b.addTest(.{ .root_module = ir_tests_mod });
     test_step.dependOn(&b.addRunArtifact(ir_tests).step);
 

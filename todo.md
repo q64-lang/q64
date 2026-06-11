@@ -645,13 +645,36 @@ verified, honest diagnostics throughout.
             chained-comparison — the reverted parser heuristic, see "Other
             open items").
       - [ ] Fit registry (with B3's structured face/fit method grammar).
-- [ ] **A2 — type representation.** Interned types beyond the scalar floor:
-      named struct/enum types, tuples, optionals, `fn` types
-      (`spec/types.md`). No generics yet.
-- [ ] **A3 — migrate the existing corpus.** i64/bool/str programs type-check in
-      sema; `build_hir` reads resolved types instead of inferring
-      (`returnsBool`/`exprIsBool`-style detection retired). Gate: 197+ unit
-      tests, `link-roundtrip.sh`, 81 CLI tests green, diagnostics byte-stable.
+- [x] **A2 — type representation (core).** `sema/types.zig`: an interned,
+      structural `TypeStore` — the builtin tower (i8…i128/u8…u128/f16…f64/
+      bool/str/void per `spec/types.md`), named types resolved against the
+      symbol table (struct/enum/alias/face/imported; a *value* symbol in
+      type position is `.unresolved`), optionals, refs, slices, arrays,
+      tuples (`()` normalizes to void). Generic args ride along as raw
+      text (structured generic args are still a parser item); fn/dyn/union
+      stay `.unparsed`. `collectSignatures` lowers every top-level fn
+      signature (missing `-> T` = void); `q64 show symbols` renders them
+      (`pub fn greet (str) -> str`). Unresolved type names are recorded,
+      not emitted — the A4 TYP wiring reads them. Remaining for A2-final:
+      structured `fn` types (needed for closure params) + struct field
+      shapes (lands with B2). Verified: 287 unit / 77 CLI / 11-of-45
+      conformance / link-roundtrip green.
+- [ ] **A3 — `build_hir` consumes sema.** In progress:
+      - [x] **Signature lowering goes through sema.** `ir` now imports
+            `sema` (one-directional, per the sema README plan); the
+            `typeNamed` text-matching family (`returnsStr/Bool/I64`,
+            `paramIsStr/Bool/I64`) is deleted, replaced by one
+            `semaScalar` query: annotation → `sema.types.lower`
+            (null table: builtins resolve, named stay unresolved — exactly
+            the scalar floor) → mapped onto `hir.Type`, with everything
+            beyond the floor staying the honest `Unsupported`. Verified
+            byte-stable: 287 unit / 77 CLI / 11-of-45 conformance /
+            link-roundtrip — all identical before and after.
+      - [ ] Expression-level inference (`exprIsBool`, Scope local typing)
+            reads sema instead of re-deriving.
+      - [ ] The codegen `Resolver`'s name lookup is replaced by the sema
+            symbol table (NameNotFound moves to the sema layer; the
+            recorded unresolved-heads become the emitted diagnostic).
 - [ ] **A4 — first real TYP codes.** Arg-count/type mismatches move from
       `UnsupportedCall` to their specced TYP codes; flip the matching
       `spec/tests/` fixtures from expected-future to passing. Conformance
