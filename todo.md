@@ -981,8 +981,12 @@ verified, honest diagnostics throughout.
       the str-payloads rung: a `Result<str, _>`-returning call now
       SKIPS frame reclamation entirely — `ret_ptr_bearing` through
       hir/mir — since the flat slide would dangle the payload; the
-      recursive slide lands with named regions) → next:,
-      `while let`, the `From` conversion on `try`,
+      recursive slide lands with named regions) → `while let` (landed:
+      the IF_COND_LET shape on `while`, desugared to a loop that
+      re-evaluates the scrutinee, breaks on tag mismatch, binds
+      payloads — roundtrip-locked wasm64+wasm32) → next:
+      the `From` conversion on `try`, record enum payloads
+      (`Ok(Config)` — the golden's last seam),
       statement-position callee matches, `let x = match …` in callees.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
