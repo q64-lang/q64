@@ -2067,6 +2067,8 @@ const Lowerer = struct {
             self.rec_level -= 1;
             const store = switch (fi.value.ty) {
                 .i64 => c.BinaryenStore(m, fi.width, fi.offset, 0, self.ptrGet(ridx), value, self.i64_type, "0"),
+                // A record-payload cell: the base pointer, widened.
+                .ptr => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), self.toI64(value), self.i64_type, "0"),
                 .f64 => c.BinaryenStore(m, 8, fi.offset, 0, self.ptrGet(ridx), value, c.BinaryenTypeFloat64(), "0"),
                 .f32 => c.BinaryenStore(m, 4, fi.offset, 0, self.ptrGet(ridx), value, c.BinaryenTypeFloat32(), "0"),
                 .i32 => c.BinaryenStore(m, 1, fi.offset, 0, self.ptrGet(ridx), value, self.i32_type, "0"),

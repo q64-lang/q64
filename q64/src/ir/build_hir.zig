@@ -794,6 +794,42 @@ fn resolveStrArm(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope: *S
     return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a) };
 }
 
+/// A record-payload arm (`Io(e)`): one ident sub-pattern binding the
+/// record's base pointer (field access + dispatch via `scope.recs`).
+fn resolveRecArm(b: *Builder, rsi: *const StructInfo, pat: ast.Pattern, scope: *Scope, s_idx: u32, tag: u32) BuildError!?ArmPattern {
+    var sub_name: ?[]const u8 = null;
+    var n: u32 = 0;
+    for (pat.cst.children) |c| switch (c) {
+        .node => |sub| {
+            const sp = ast.Pattern.cast(sub) orelse continue;
+            if (n > 0) return error.Unsupported;
+            switch (sp.kind()) {
+                .WILD_PATTERN => {},
+                .IDENT_PATTERN => sub_name = (sp.bindingName() orelse return error.Unsupported).text,
+                else => return error.Unsupported,
+            }
+            n += 1;
+        },
+        .token => {},
+    };
+    if (n != 1) return error.Unsupported;
+    var prelude: std.ArrayList(*hir.Stmt) = .empty;
+    if (sub_name) |nm| {
+        const idx = try declareBodyLocal(b, scope, nm, false, .ptr);
+        try scope.recs.put(b.a, nm, rsi);
+        const base = try b.a.create(hir.Expr);
+        base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+        const ld = try b.a.create(hir.Expr);
+        ld.* = .{ .field_get = .{ .base = base, .offset = 8, .ty = .i64 } };
+        const cast = try b.a.create(hir.Expr);
+        cast.* = .{ .num_cast = .{ .to = .ptr, .value = ld } };
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .let = .{ .idx = idx, .value = cast } };
+        try prelude.append(b.a, st);
+    }
+    return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a) };
+}
+
 /// Resolve a match-arm pattern against the enum. `null` = wildcard.
 fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope: *Scope, s_idx: u32) BuildError!?ArmPattern {
     switch (pat.kind()) {
@@ -814,6 +850,9 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
             const tag = info.variantTag(head) orelse return reject(b, .name_not_found);
             if (info.variants[tag].kind == .str_) {
                 return resolveStrArm(b, info, pat, scope, s_idx, @intCast(tag));
+            }
+            if (info.variants[tag].kind == .rec) {
+                return resolveRecArm(b, info.variants[tag].rec_si.?, pat, scope, s_idx, @intCast(tag));
             }
             const arity = info.variants[tag].arity;
             var prelude: std.ArrayList(*hir.Stmt) = .empty;
@@ -1598,6 +1637,22 @@ fn buildTryLet(b: *Builder, ls: ast.LetStmt, te: ast.TryExpr, scope: *Scope, wan
     // narrowed to address width) when the instantiation says so.
     const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
     const ok_tag = res_info.variantTag("Ok") orelse return error.Unsupported;
+    if (info.variants[ok_tag].kind == .rec) {
+        // A record Ok payload: bind the base pointer; field access +
+        // dispatch resolve through `recs`.
+        const idx = try declareBodyLocal(b, scope, nm.text, false, .ptr);
+        try scope.recs.put(b.a, nm.text, info.variants[ok_tag].rec_si.?);
+        const base3 = try b.a.create(hir.Expr);
+        base3.* = .{ .local = .{ .idx = tmp_idx, .ty = .ptr } };
+        const ld3 = try b.a.create(hir.Expr);
+        ld3.* = .{ .field_get = .{ .base = base3, .offset = 8, .ty = .i64 } };
+        const cast3 = try b.a.create(hir.Expr);
+        cast3.* = .{ .num_cast = .{ .to = .ptr, .value = ld3 } };
+        const st3 = try b.a.create(hir.Stmt);
+        st3.* = .{ .let = .{ .idx = idx, .value = cast3 } };
+        try out.append(b.a, st3);
+        return;
+    }
     if (info.variants[ok_tag].kind == .str_) {
         const ptr_idx = try declareStrBodyLocal(b, scope, nm.text);
         const len_idx = ptr_idx + 1;
@@ -1703,8 +1758,13 @@ fn buildRecMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, want: *const Str
 
 /// Does the enum's box carry a str payload in any variant?
 fn enumHasStrPayload(b: *Builder, si: *const StructInfo) bool {
-    const info = b.enums.get(si.name) orelse return false;
-    _ = info;
+    if (b.enums.get(si.name)) |info| {
+        if (info.si == si) {
+            for (info.variants) |v| {
+                if (v.kind == .str_ or v.kind == .rec) return true;
+            }
+        }
+    } else return false;
     // The si belongs to some instantiation; conservatively treat any
     // Result/Option-family return as pointer-bearing when its box is
     // wider than tag+1 cell would suggest a str slot. Exact: scan all
@@ -1713,11 +1773,30 @@ fn enumHasStrPayload(b: *Builder, si: *const StructInfo) bool {
     while (it.next()) |inst| {
         if (inst.*.si == si) {
             for (inst.*.variants) |v| {
-                if (v.kind == .str_) return true;
+                if (v.kind == .str_ or v.kind == .rec) return true;
             }
         }
     }
     return false;
+}
+
+/// A cheap non-building probe: the struct a record-valued argument
+/// carries (a binding/param in `recs`, or a record literal's path).
+fn recvStructQuiet(b: *Builder, scope: *const Scope, e: ast.Expr) ?*const StructInfo {
+    switch (e) {
+        .path => |p| {
+            const txt = p.text(b.a) catch return null;
+            defer b.a.free(txt);
+            return scope.recs.get(txt);
+        },
+        .record => |re| {
+            const pth = re.path() orelse return null;
+            const nm = pth.text(b.a) catch return null;
+            defer b.a.free(nm);
+            return b.structs.get(nm);
+        },
+        else => return null,
+    }
 }
 
 /// Two enum instantiations are layout-compatible when they share the
@@ -2347,8 +2426,12 @@ const PayKind = enum {
     /// One generic slot (`Some(T)`) — resolved per instantiation;
     /// unresolved uses default to one i64 cell.
     param,
+    /// One record slot (`Io(IoError)`): a cell holding the record's
+    /// base pointer (`rec_si` names the struct). The payload ALIASES
+    /// the stored record (the B2b whole-value boundary).
+    rec,
 };
-const EnumVariant = struct { name: []const u8, arity: u32, kind: PayKind = .ints, pidx: u8 = 0 };
+const EnumVariant = struct { name: []const u8, arity: u32, kind: PayKind = .ints, pidx: u8 = 0, rec_si: ?*const StructInfo = null };
 
 /// A registered enum: variant names in declaration order (a variant's
 /// tag is its index). All-unit enums are *immediate* — a value is its
@@ -2394,11 +2477,11 @@ fn registerEnums(b: *Builder, sf: ast.SourceFile) BuildError!void {
                     ok = false;
                     break;
                 };
-                const slots = variantSlots(v, sig) orelse {
+                const slots = variantSlots(b, v, sig) orelse {
                     ok = false; // record payloads / non-floor fields: later
                     break;
                 };
-                try vars.append(b.a, .{ .name = vname.text, .arity = slots.arity, .kind = slots.kind, .pidx = slots.pidx });
+                try vars.append(b.a, .{ .name = vname.text, .arity = slots.arity, .kind = slots.kind, .pidx = slots.pidx, .rec_si = slots.rec_si });
             }
             if (!ok or vars.items.len == 0) {
                 vars.deinit(b.a);
@@ -2460,8 +2543,8 @@ fn registerEnum(b: *Builder, name: []const u8, vars: []const EnumVariant) BuildE
 /// N `i64` slots; ONE `str` slot (two cells); or ONE type-param slot
 /// (`Some(T)` — resolved per instantiation). `null` for record
 /// payloads, mixed slot kinds, or anything else.
-const VariantSlots = struct { arity: u32, kind: PayKind, pidx: u8 };
-fn variantSlots(v: ast.Variant, sig: ?sema.fits.GenericSig) ?VariantSlots {
+const VariantSlots = struct { arity: u32, kind: PayKind, pidx: u8, rec_si: ?*const StructInfo = null };
+fn variantSlots(b: *Builder, v: ast.Variant, sig: ?sema.fits.GenericSig) ?VariantSlots {
     var buf: [4 * max_enum_payload]parser.cst.Token = undefined;
     var n: usize = 0;
     if (!flattenVariantTokens(v.cst, &buf, &n, true)) return null;
@@ -2477,6 +2560,8 @@ fn variantSlots(v: ast.Variant, sig: ?sema.fits.GenericSig) ?VariantSlots {
                 if (std.mem.eql(u8, t1, p.tname)) return .{ .arity = 1, .kind = .param, .pidx = @intCast(i) };
             }
         }
+        // A registered struct: the cell holds the record's base pointer.
+        if (b.structs.get(t1)) |rsi| return .{ .arity = 1, .kind = .rec, .pidx = 0, .rec_si = rsi };
     }
     // N i64 cells; a type-param name in a MULTI-slot payload stays at
     // the i64 floor (`Full(T, T)` — per-slot str instantiation is a
@@ -2509,7 +2594,7 @@ fn paramNameOk(text: []const u8, sig: ?sema.fits.GenericSig) bool {
 /// The instantiation a path type's generic args pick (`Result<str, i64>`
 /// → key "si"): each arg whose trimmed text is `str` maps to 's'.
 fn instFromGenericArgs(b: *Builder, info: *const EnumInfo, pt: ast.PathType) BuildError!*const EnumInfo {
-    var skey = [_]u8{ 'i', 'i', 'i', 'i' };
+    var descs = [_][]const u8{ "i", "i", "i", "i" };
     if (try pt.genericArgsText(b.a)) |raw| {
         defer b.a.free(raw);
         var txt = raw;
@@ -2517,46 +2602,64 @@ fn instFromGenericArgs(b: *Builder, info: *const EnumInfo, pt: ast.PathType) Bui
         var it = std.mem.splitScalar(u8, txt, ',');
         var i: usize = 0;
         while (it.next()) |part| : (i += 1) {
-            if (i >= skey.len) break;
+            if (i >= descs.len) break;
             const trimmed = std.mem.trim(u8, part, " \t");
-            if (std.mem.eql(u8, trimmed, "str")) skey[i] = 's';
+            if (std.mem.eql(u8, trimmed, "str")) {
+                descs[i] = "s";
+            } else if (b.structs.contains(trimmed)) {
+                descs[i] = try std.fmt.allocPrint(b.a, "r:{s}", .{trimmed});
+            }
         }
     }
-    return instantiateEnum(b, info, &skey);
+    return instantiateEnum(b, info, &descs);
 }
 
 /// The instantiation `T?` picks: `str?` → Option<str>.
 fn instFromOptionalInner(b: *Builder, info: *const EnumInfo, ot: ast.OptionalType) BuildError!*const EnumInfo {
-    var skey = [_]u8{ 'i', 'i', 'i', 'i' };
+    var descs = [_][]const u8{ "i", "i", "i", "i" };
     if (ot.inner()) |inner| {
         if (inner == .path) {
             const nm = try inner.path.name(b.a);
             defer b.a.free(nm);
-            if (std.mem.eql(u8, nm, "str")) skey[0] = 's';
+            if (std.mem.eql(u8, nm, "str")) {
+                descs[0] = "s";
+            } else if (b.structs.contains(nm)) {
+                descs[0] = try std.fmt.allocPrint(b.a, "r:{s}", .{nm});
+            }
         }
     }
-    return instantiateEnum(b, info, &skey);
+    return instantiateEnum(b, info, &descs);
 }
 
 /// Resolve a generic enum to a concrete instantiation. `skey` holds one
 /// 'i'/'s' per type param; the base registry entry IS the all-'i'
 /// instantiation (today's behavior). Cached, so equal keys share one
 /// EnumInfo (and one si — type identity is pointer identity).
-fn instantiateEnum(b: *Builder, info: *const EnumInfo, skey: []const u8) BuildError!*const EnumInfo {
+fn instantiateEnum(b: *Builder, info: *const EnumInfo, descs: []const []const u8) BuildError!*const EnumInfo {
     var all_int = true;
-    for (skey) |k| {
-        if (k != 'i') all_int = false;
+    for (descs) |d| {
+        if (!std.mem.eql(u8, d, "i")) all_int = false;
     }
     if (all_int) return info;
-    const key = try std.fmt.allocPrint(b.a, "{s}\x00{s}", .{ info.name, skey });
+    const key = try std.fmt.allocPrint(b.a, "{s}\x00{s},{s},{s},{s}", .{ info.name, descs[0], descs[1], descs[2], descs[3] });
     if (b.enum_insts.get(key)) |inst| return inst;
     const vars = try b.a.dupe(EnumVariant, info.variants);
     for (vars) |*v| {
         if (v.kind != .param) continue;
-        const k = if (v.pidx < skey.len) skey[v.pidx] else 'i';
-        if (k == 's') {
+        const d = if (v.pidx < descs.len) descs[v.pidx] else "i";
+        if (std.mem.eql(u8, d, "s")) {
             v.kind = .str_;
             v.arity = 2;
+        } else if (d.len > 2 and d[0] == 'r') {
+            // "r:Name" — a record slot holding the struct's base ptr.
+            v.rec_si = b.structs.get(d[2..]);
+            if (v.rec_si != null) {
+                v.kind = .rec;
+                v.arity = 1;
+            } else {
+                v.kind = .ints;
+                v.arity = 1;
+            }
         } else {
             v.kind = .ints;
             v.arity = 1;
@@ -2686,9 +2789,14 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
                     var a1 = cc.args();
                     if (a1.next()) |arg| {
                         if ((try exprScalar(b, arg, scope)) == .str) {
-                            var skey = [_]u8{ 'i', 'i', 'i', 'i' };
-                            skey[variant.pidx] = 's';
-                            return try instantiateEnum(b, ev.info, &skey);
+                            var descs = [_][]const u8{ "i", "i", "i", "i" };
+                            descs[variant.pidx] = "s";
+                            return try instantiateEnum(b, ev.info, &descs);
+                        }
+                        if (recvStructQuiet(b, scope, arg)) |rsi| {
+                            var descs = [_][]const u8{ "i", "i", "i", "i" };
+                            descs[variant.pidx] = try std.fmt.allocPrint(b.a, "r:{s}", .{rsi.name});
+                            return try instantiateEnum(b, ev.info, &descs);
                         }
                     }
                 }
@@ -2696,7 +2804,7 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             }
             if (std.mem.eql(u8, txt, "env.fs.read")) {
                 const base_info = b.enums.get("Result") orelse return null;
-                return try instantiateEnum(b, base_info, "siii");
+                return try instantiateEnum(b, base_info, &.{ "s", "i", "i", "i" });
             }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (b.resolver.lookup(txt)) |fd| return enumOfRet(b, fd);
@@ -3630,7 +3738,7 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                     const parg = fa.next() orelse return error.Unsupported;
                     if (fa.next() != null) return error.Unsupported;
                     const base_info = b.enums.get("Result") orelse return error.Unsupported;
-                    const inst = try instantiateEnum(b, base_info, "siii");
+                    const inst = try instantiateEnum(b, base_info, &.{ "s", "i", "i", "i" });
                     const e2 = try b.a.create(hir.Expr);
                     e2.* = .{ .fs_read = .{ .path = try buildStrExpr(b, parg, scope, null) } };
                     return .{ .e = e2, .si = inst.si.? };
@@ -3675,7 +3783,7 @@ fn enumCtorValue(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecVa
     // A str argument to a generic slot instantiates the enum (`Ok(s)` →
     // Result<str, _>); a declared `str` slot takes it directly.
     const variant = ev.info.variants[@intCast(ev.tag)];
-    if (variant.kind == .param or variant.kind == .str_) {
+    if (variant.kind == .param or variant.kind == .str_ or variant.kind == .rec) {
         var a1 = cc.args();
         const arg = a1.next() orelse return reject(b, .unsupported_call);
         if (a1.next() != null) return reject(b, .unsupported_call);
@@ -3684,13 +3792,29 @@ fn enumCtorValue(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecVa
         if (is_str) {
             var inst = ev.info;
             if (variant.kind == .param) {
-                var skey = [_]u8{ 'i', 'i', 'i', 'i' };
-                skey[variant.pidx] = 's';
-                inst = try instantiateEnum(b, ev.info, &skey);
+                var descs = [_][]const u8{ "i", "i", "i", "i" };
+                descs[variant.pidx] = "s";
+                inst = try instantiateEnum(b, ev.info, &descs);
             }
             const esi2 = inst.si.?;
             const sval = try buildStrExpr(b, arg, scope, null);
             return .{ .e = try enumAllocStr(b, esi2, ev.tag, sval), .si = esi2 };
+        }
+        // A record argument: the cell holds its base pointer (the
+        // payload aliases the record — the B2b whole-value boundary).
+        if (variant.kind == .rec or variant.kind == .param) {
+            if (try buildRecExpr(b, arg, scope)) |rv| {
+                var inst = ev.info;
+                if (variant.kind == .param) {
+                    var descs = [_][]const u8{ "i", "i", "i", "i" };
+                    descs[variant.pidx] = try std.fmt.allocPrint(b.a, "r:{s}", .{rv.si.name});
+                    inst = try instantiateEnum(b, ev.info, &descs);
+                } else if (variant.rec_si != rv.si) return reject(b, .unsupported_call);
+                const esi4 = inst.si.?;
+                var pvals = [_]*hir.Expr{rv.e};
+                return .{ .e = try enumAlloc(b, esi4, ev.tag, &pvals), .si = esi4 };
+            }
+            if (variant.kind == .rec) return error.Unsupported;
         }
         // An int argument to a generic slot: the base (all-int) info.
         const esi3 = ev.info.si.?;

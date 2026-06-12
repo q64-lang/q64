@@ -985,8 +985,14 @@ verified, honest diagnostics throughout.
       the IF_COND_LET shape on `while`, desugared to a loop that
       re-evaluates the scrutinee, breaks on tag mismatch, binds
       payloads — roundtrip-locked wasm64+wasm32) → next:
-      the `From` conversion on `try`, record enum payloads
-      (`Ok(Config)` — the golden's last seam),
+      record enum payloads (landed: `Ok(Config)` / declared
+      `Io(IoError)` slots — one cell holding the record's base
+      pointer; match arms + `try` bind the record into `recs` so
+      field access works; generic instantiation keys grew "r:Name"
+      descriptors; rec payloads count as pointer-bearing returns.
+      KNOWN ISSUE found: a user `fn start` collides with the MIR
+      entry's internal name — rename pending) → next: the `From`
+      conversion on `try`,
       statement-position callee matches, `let x = match …` in callees.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots

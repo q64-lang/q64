@@ -1831,4 +1831,47 @@ wl32_out="$("$HOST_BIN" "$tmp/wl32.wasm")"
 [[ "$wl32_out" == "$wl_expected" ]] || { echo "FAIL: while-let wasm32 (got: $wl32_out)" >&2; exit 1; }
 echo "    ok: while let -> 0..40 / done at 5 (wasm64 + wasm32)"
 
+# Record enum payloads: Ok(Config) / declared Io(IoError) slots + try.
+echo "==> record enum payloads: Ok(Config) / Io(IoError) / try"
+rp_app="$tmp/recpay.q"
+cat > "$rp_app" <<'Q64'
+struct IoError { code: i64, fatal: bool }
+struct Config { port: i64, debug: bool }
+enum LoadError { Io(IoError), Missing }
+fn load(n: i64) -> Result<Config, i64> {
+    if n > 0 { Ok(Config { port: 8080, debug: true }) } else { Err(7) }
+}
+fn boot(n: i64) -> Result<i64, i64> {
+    let cfg = try load(n)
+    Ok(cfg.port + 1)
+}
+fn main {
+    match load(1) {
+        Ok(cfg) -> env.out(cfg.port),
+        Err(e) -> env.out(e),
+    }
+    let e = LoadError.Io(IoError { code: 13, fatal: true })
+    match e {
+        Io(err) -> env.out(err.code),
+        Missing -> env.out("missing"),
+    }
+    match boot(1) {
+        Ok(p) -> env.out(p),
+        Err(c) -> env.out("err {c}"),
+    }
+    match boot(0 - 1) {
+        Ok(p) -> env.out(p),
+        Err(c) -> env.out("err {c}"),
+    }
+}
+Q64
+rp_expected=$'8080\n13\n8081\nerr 7'
+"$Q64_BIN" emit "$rp_app" "$tmp/recpay.wasm"
+rp_out="$("$HOST_BIN" "$tmp/recpay.wasm")"
+[[ "$rp_out" == "$rp_expected" ]] || { echo "FAIL: rec-payloads (got: $rp_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$rp_app" "$tmp/recpay32.wasm" --addr wasm32
+rp32_out="$("$HOST_BIN" "$tmp/recpay32.wasm")"
+[[ "$rp32_out" == "$rp_expected" ]] || { echo "FAIL: rec-payloads wasm32 (got: $rp32_out)" >&2; exit 1; }
+echo "    ok: record enum payloads -> 8080 / 13 / 8081 / err 7 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
