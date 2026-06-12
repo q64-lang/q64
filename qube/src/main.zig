@@ -3690,13 +3690,19 @@ fn cmdPodDeploy(
     // credentials. The first two are borrowed; the saved one is owned (freed).
     var saved_token: ?[]u8 = null;
     defer if (saved_token) |t| gpa.free(t);
-    const token: []const u8 = token_flag orelse env.get("QUBEPODS_TOKEN") orelse blk: {
+    var token_source: []const u8 = "--token";
+    const token: []const u8 = token_flag orelse blk0: {
+        if (env.get("QUBEPODS_TOKEN")) |t| {
+            token_source = "QUBEPODS_TOKEN";
+            break :blk0 t;
+        }
         const t = readPodToken(gpa, io, env) catch {
             try writeStderr(io, "qube pod deploy: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
             std.process.exit(@intFromEnum(ExitCode.registry));
         };
+        token_source = "saved login (~/.qube/pod-token)";
         saved_token = t;
-        break :blk t;
+        break :blk0 t;
     };
 
     // Pack target/deploy/<name>.zip (absolute, so the staged `zip` finds it).
@@ -3749,6 +3755,9 @@ fn cmdPodDeploy(
         return;
     }
     try printStderr(io, "qube pod deploy: api returned {d}:\n{s}\n", .{ status, body });
+    // A wrong/stale key is the usual cause — show exactly which token
+    // was sent and where it came from, so the mismatch is visible.
+    try printStderr(io, "  token used ({s}): QUBEPODS_TOKEN={s}\n", .{ token_source, token });
     std.process.exit(@intFromEnum(ExitCode.registry));
 }
 
@@ -3829,13 +3838,19 @@ fn cmdPodHostname(
     // Token: --token > QUBEPODS_TOKEN > saved login.
     var saved_token: ?[]u8 = null;
     defer if (saved_token) |t| gpa.free(t);
-    const token: []const u8 = token_flag orelse env.get("QUBEPODS_TOKEN") orelse blk: {
+    var token_source: []const u8 = "--token";
+    const token: []const u8 = token_flag orelse blk0: {
+        if (env.get("QUBEPODS_TOKEN")) |t| {
+            token_source = "QUBEPODS_TOKEN";
+            break :blk0 t;
+        }
         const t = readPodToken(gpa, io, env) catch {
             try writeStderr(io, "qube pod hostname: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
             std.process.exit(@intFromEnum(ExitCode.registry));
         };
+        token_source = "saved login (~/.qube/pod-token)";
         saved_token = t;
-        break :blk t;
+        break :blk0 t;
     };
 
     const base = try std.fmt.allocPrint(gpa, "{s}/me/projects/{s}/apps/{s}/hostname", .{ api_url, project, app_name });
@@ -3880,6 +3895,7 @@ fn cmdPodHostname(
         return;
     }
     try printStderr(io, "qube pod hostname: api returned {d}:\n{s}\n", .{ status, resp_body });
+    try printStderr(io, "  token used ({s}): QUBEPODS_TOKEN={s}\n", .{ token_source, token });
     std.process.exit(@intFromEnum(ExitCode.registry));
 }
 
