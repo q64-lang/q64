@@ -1806,4 +1806,29 @@ spay32_out="$("$HOST_BIN" "$tmp/strpay32.wasm")"
 [[ "$spay32_out" == "$spay_expected" ]] || { echo "FAIL: str-payloads wasm32 (got: $spay32_out)" >&2; exit 1; }
 echo "    ok: str enum payloads -> found it / error 404 / 12 / optional payload / chained / err 404 (wasm64 + wasm32)"
 
+# while let: loop on Option until None.
+echo "==> while let: Some(v) loop"
+wl_app="$tmp/wl.q"
+cat > "$wl_app" <<'Q64'
+fn take(n: i64) -> i64? {
+    if n < 5 { Some(n * 10) } else { None }
+}
+fn main {
+    var i = 0
+    while let Some(v) = take(i) {
+        env.out(v)
+        i = i + 1
+    }
+    env.out("done at {i}")
+}
+Q64
+wl_expected=$'0\n10\n20\n30\n40\ndone at 5'
+"$Q64_BIN" emit "$wl_app" "$tmp/wl.wasm"
+wl_out="$("$HOST_BIN" "$tmp/wl.wasm")"
+[[ "$wl_out" == "$wl_expected" ]] || { echo "FAIL: while-let (got: $wl_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$wl_app" "$tmp/wl32.wasm" --addr wasm32
+wl32_out="$("$HOST_BIN" "$tmp/wl32.wasm")"
+[[ "$wl32_out" == "$wl_expected" ]] || { echo "FAIL: while-let wasm32 (got: $wl32_out)" >&2; exit 1; }
+echo "    ok: while let -> 0..40 / done at 5 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

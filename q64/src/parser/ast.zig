@@ -1295,6 +1295,10 @@ pub const WhileStmt = struct {
     pub fn condition(self: WhileStmt) ?Expr {
         return firstChildExpr(self.cst);
     }
+    /// The `while let …` binding head, if this is the binding form.
+    pub fn ifLet(self: WhileStmt) ?IfCondLet {
+        return firstChildNode(self.cst, .IF_COND_LET, IfCondLet);
+    }
     pub fn body(self: WhileStmt) ?Block {
         return firstChildNode(self.cst, .BLOCK, Block);
     }

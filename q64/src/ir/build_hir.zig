@@ -628,6 +628,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             try out.append(b.a, st);
         },
         .while_stmt => |ws| {
+            if (ws.ifLet()) |il| {
+                try buildMainWhileLet(b, ws, il, scope, rt, out);
+                return;
+            }
             const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, scope);
             const wbody = try buildMainBlock(b, ws.body() orelse return error.Unsupported, scope, rt);
             const st = try b.a.create(hir.Stmt);
@@ -1109,6 +1113,55 @@ fn buildMainIfNode(b: *Builder, is: ast.IfStmt, scope: *Scope, rt: *RtMap) Build
     const out = try b.a.create(hir.Stmt);
     out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
     return out;
+}
+
+/// `while let <pattern> = <scrutinee> { … }` in `main`: a loop that
+/// re-evaluates the scrutinee each iteration, breaks when the tag
+/// doesn't match the pattern's variant, and otherwise runs the body
+/// with the payload bindings in scope.
+fn buildMainWhileLet(b: *Builder, ws: ast.WhileStmt, il: ast.IfCondLet, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const scrut = il.scrutinee() orelse return error.Unsupported;
+    const info = (try enumOfExpr(b, scope, scrut)) orelse return error.Unsupported;
+    const boxed = info.si != null;
+
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, &items);
+    const pat = il.pattern() orelse return error.Unsupported;
+    const ap = (try resolveArmPattern(b, info, pat, scope, s_idx)) orelse return error.Unsupported;
+
+    // if (tag != want) break
+    const sread = if (boxed) blk: {
+        const base = try b.a.create(hir.Expr);
+        base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+        const ld = try b.a.create(hir.Expr);
+        ld.* = .{ .field_get = .{ .base = base, .offset = 0, .ty = .i64 } };
+        break :blk ld;
+    } else blk: {
+        const r = try b.a.create(hir.Expr);
+        r.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
+        break :blk r;
+    };
+    const tagv = try b.a.create(hir.Expr);
+    tagv.* = .{ .int_const = ap.tag };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = .ne, .lhs = sread, .rhs = tagv } };
+    const brk = try b.a.create(hir.Stmt);
+    brk.* = .brk;
+    const then_blk = try b.a.create(hir.Stmt);
+    then_blk.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{brk}) };
+    const iff = try b.a.create(hir.Stmt);
+    iff.* = .{ .if_ = .{ .cond = cond, .then_ = then_blk, .else_ = null } };
+    try items.append(b.a, iff);
+
+    try items.appendSlice(b.a, ap.prelude);
+    var bit = (ws.body() orelse return error.Unsupported).statements();
+    while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, &items);
+
+    const lbody = try b.a.create(hir.Stmt);
+    lbody.* = .{ .block = try items.toOwnedSlice(b.a) };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .loop_ = lbody };
+    try out.append(b.a, st);
 }
 
 /// `if let <pattern> = <scrutinee> { … } else { … }` in `main`: a

@@ -1490,6 +1490,28 @@ const Parser = struct {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .token = self.advance() }); // while
         try self.eatTrivia(&children);
+        if (self.peek() == .KW_LET) {
+            // `while let Pattern = expr { … }` — the same condition
+            // shape as `if let` (IF_COND_LET).
+            var cl: std.ArrayList(cst.Element) = .empty;
+            try cl.append(self.arena, .{ .token = self.advance() }); // let
+            try self.eatTrivia(&cl);
+            try cl.append(self.arena, .{ .node = try self.parsePattern() });
+            try self.captureRawUntil(&cl, &.{.EQ});
+            if (self.peek() == .EQ) {
+                try cl.append(self.arena, .{ .token = self.advance() });
+                try self.eatTrivia(&cl);
+                self.no_record_depth += 1;
+                try cl.append(self.arena, .{ .node = try self.parseExpr() });
+                self.no_record_depth -= 1;
+            }
+            try children.append(self.arena, .{ .node = try cst.makeNode(self.arena, .IF_COND_LET, cl.items) });
+            try self.eatTrivia(&children);
+            if (self.peek() == .L_BRACE) {
+                try children.append(self.arena, .{ .node = try self.parseBlock() });
+            }
+            return try cst.makeNode(self.arena, .WHILE_STMT, children.items);
+        }
         self.no_record_depth += 1;
         try children.append(self.arena, .{ .node = try self.parseExpr() });
         self.no_record_depth -= 1;
