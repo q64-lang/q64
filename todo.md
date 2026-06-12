@@ -1658,9 +1658,30 @@ which option above we pick; (1) means hand-written decoders per face,
 (2) means generated bindings, (3) means very thin glue + Wasm GC
 interop.
 
-- [ ] Decide between (1) / (2) / (3). Probably (1) for v0 with a
-      clear migration path to (2). Capture the decision in
-      `spec/faces.md` and link from `spec/audio.md` when that lands.
+- [x] **Decided: (1) hand-specced per-face wire ABIs for v0**, with
+      the WIT migration path kept open (each face's wire section names
+      its WIT interface — the same table `show world` uses). Captured
+      in `spec/faces.md` §"Host ABI for capability faces". First
+      concrete instance: **`env.fs.read` landed** (spec/env.md §"Wire
+      ABI: fs.read") — `env.fs.read(path) -> str`, marks `@fs`, WIT
+      lift imports `wasi:filesystem/*` automatically via the effect
+      pass. Wire: `env.fs_read(dest, path_ptr, path_len) -> i64`
+      (negative = failure → guest traps; the host **grows guest
+      memory** for large files — verified with a 200KB read through
+      3+ pages of growth). IR `fs_read` through HIR/MIR/effects/print;
+      builder intercepts the dotted callee in buildStrExpr + isStrCall
+      + the typing bridge; backend declares the import, raises
+      `mem_max` when @fs is used, and emits the dest/len/trap/bump
+      sequence; the wasmtime host implements the callback
+      (introspected address width, like env.out). Verified end-to-end
+      wasm64 + wasm32 (roundtrip fs.read section: contents / len /
+      contains + the missing-file trap) + 1 unit test (HIR shape +
+      @fs effect). 399 unit / 81 CLI / 24-of-51 / roundtrips +
+      component green. **Boundary:** the `Result<Bytes, IoError>`
+      form waits on str enum payloads (then `try env.fs.read(…)` and
+      the golden fixture); writes (`fs.write`) and the browser host's
+      fs face are later; v0 host grants @fs unconditionally (ENV030
+      runtime denial later).
 - [ ] Spec the audio face wire format as the first concrete
       instance — drives the abstraction by example.
 - [ ] Sketch the browser-host JS glue API (`runQ64`, capability

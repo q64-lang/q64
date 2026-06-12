@@ -1715,6 +1715,15 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
                     }
                 }
             }
+            // `env.fs.read(path)` — the @fs capability face (spec/env.md
+            // §"Wire ABI: fs.read"): the file's bytes as a str value.
+            if (std.mem.eql(u8, cname, "env.fs.read")) {
+                var fit_args = cc.args();
+                const parg = fit_args.next() orelse return error.Unsupported;
+                if (fit_args.next() != null) return error.Unsupported;
+                out.* = .{ .fs_read = .{ .path = try buildStrExpr(b, parg, scope, rt) } };
+                return out;
+            }
             // `<str>.slice(start, end)` parses as a call with a dotted path callee
             // (like `qview.set_attr(…)`). The str-VALUED method.
             if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
@@ -2059,6 +2068,7 @@ fn isStrCall(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
     };
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
+    if (std.mem.eql(u8, cname, "env.fs.read")) return true;
     if (std.mem.indexOfScalar(u8, cname, '.')) |dot| {
         const mname = cname[dot + 1 ..];
         if (std.mem.indexOfScalar(u8, mname, '.') != null) return false;
@@ -3715,6 +3725,7 @@ const ExprTypeBridge = struct {
                 else => .i64,
             };
         }
+        if (std.mem.eql(u8, name, "env.fs.read")) return .str;
         // A dotted call on a record binding (`r.wide()`): the fit
         // method's declared return type — or a str method on a str
         // local (`s.contains(…)` parses as one dotted callee path).
@@ -6830,4 +6841,23 @@ test "Vec v0 floor: from/push/len/index/for, growth, honest boundaries" {
         \\}
         \\
     )) == null);
+}
+
+test "env.fs.read: a str-valued @fs capability face" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    let content = env.fs.read("config.txt")
+        \\    env.out(content)
+        \\    env.out(content.len)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
+    // The effect pass marks main @fs (closed over @io).
+    try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
 }

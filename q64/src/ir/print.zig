@@ -147,6 +147,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
 
 fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
     switch (e.*) {
+        .fs_read => |fr| {
+            try app(gpa, out, "fs_read(", .{});
+            try hirExpr(gpa, out, fr.path);
+            try app(gpa, out, ")", .{});
+        },
         .vec_new => try app(gpa, out, "vec_new", .{}),
         .vec_len => |vl| {
             try app(gpa, out, "vec_len(", .{});
@@ -335,6 +340,10 @@ fn mirCfg(gpa: std.mem.Allocator, out: *Buf, cfg: *const mir.Cfg, depth: usize) 
 fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usize) Error!void {
     try indent(gpa, out, depth);
     switch (inst.op) {
+        .fs_read => |fr| {
+            try app(gpa, out, "fs_read\n", .{});
+            try mirInst(gpa, out, fr.path, depth + 1);
+        },
         .vec_new => try app(gpa, out, "vec_new\n", .{}),
         .vec_push => |vp| {
             try app(gpa, out, "vec_push\n", .{});

@@ -184,6 +184,10 @@ fn collectExpr(
             try collectExpr(a, m.str, d, e);
             try collectExpr(a, m.byte, d, e);
         },
+        .fs_read => |fr| {
+            d.insert(.fs);
+            try collectExpr(a, fr.path, d, e);
+        },
         .vec_new => {},
         .vec_len => |vl| try collectExpr(a, vl.vec, d, e),
         .vec_get => |vg| {

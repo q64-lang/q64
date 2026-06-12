@@ -154,6 +154,42 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // -------------------------------------------------------------
+    // env.fs_read :: (dest, path_ptr, path_len) -> i64 (spec/env.md
+    // §"Wire ABI: fs.read"). Same address-width introspection as env.out.
+    // Defined unconditionally; modules that don't import it are unaffected.
+    // -------------------------------------------------------------
+    {
+        var fs_param_types = [_]?*c.wasm_valtype_t{
+            c.wasm_valtype_new(arg_valkind),
+            c.wasm_valtype_new(arg_valkind),
+            c.wasm_valtype_new(arg_valkind),
+        };
+        var fs_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&fs_params_vec, fs_param_types.len, @ptrCast(&fs_param_types));
+        var fs_result_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var fs_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&fs_results_vec, fs_result_types.len, @ptrCast(&fs_result_types));
+        const fs_type = c.wasm_functype_new(&fs_params_vec, &fs_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(fs_type);
+        const link_err = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "fs_read",
+            "fs_read".len,
+            fs_type,
+            envFsReadCallback,
+            null,
+            null,
+        );
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.fs_read");
+            std.process.exit(1);
+        }
+    }
+
+    // -------------------------------------------------------------
     // Instantiate.
     // -------------------------------------------------------------
     var instance: c.wasmtime_instance_t = undefined;
@@ -258,6 +294,85 @@ fn envOutCallback(
     w.interface.writeAll(slice) catch return trap("env.out: stdout write failed");
     w.interface.flush() catch return trap("env.out: stdout flush failed");
 
+    return null;
+}
+
+// =====================================================================
+// env.fs_read host callback (spec/env.md §"Wire ABI: fs.read")
+// =====================================================================
+//
+// (dest, path_ptr, path_len) -> i64: read the file named by the guest
+// path, grow the guest memory if the contents don't fit, write them at
+// `dest`, return the byte length. Negative = failure (the guest traps):
+// -1 unopenable, -2 doesn't fit in growable memory.
+
+fn envFsReadCallback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    if (nargs != 3 or nresults != 1) return trap("env.fs_read: expected (dest, ptr, len) -> i64");
+
+    const dest_i64 = argAddr(args[0]);
+    const path_ptr_i64 = argAddr(args[1]);
+    const path_len_i64 = argAddr(args[2]);
+    if (dest_i64 < 0 or path_ptr_i64 < 0 or path_len_i64 < 0) return trap("env.fs_read: negative ptr/len");
+
+    var memory_item: c.wasmtime_extern_t = undefined;
+    if (!c.wasmtime_caller_export_get(caller, "memory", "memory".len, &memory_item)) {
+        return trap("env.fs_read: module has no `memory` export");
+    }
+    if (memory_item.kind != c.WASMTIME_EXTERN_MEMORY) {
+        return trap("env.fs_read: `memory` export is not a memory");
+    }
+    const ctx = c.wasmtime_caller_context(caller);
+
+    const fail = struct {
+        fn ret(res: [*c]c.wasmtime_val_t, code: i64) ?*c.wasm_trap_t {
+            res[0].kind = c.WASMTIME_I64;
+            res[0].of.i64 = code;
+            return null;
+        }
+    };
+
+    // Read the path out of guest memory.
+    var data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
+    var data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
+    const ppath: usize = @intCast(path_ptr_i64);
+    const plen: usize = @intCast(path_len_i64);
+    if (ppath + plen > data_size) return trap("env.fs_read: path out of bounds");
+    var path_buf: [4096]u8 = undefined;
+    if (plen > path_buf.len) return fail.ret(results, -1);
+    @memcpy(path_buf[0..plen], data[ppath .. ppath + plen]);
+    const path = path_buf[0..plen];
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return fail.ret(results, -1);
+    defer file.close(io);
+    const size: usize = @intCast(file.length(io) catch return fail.ret(results, -1));
+
+    // Grow the guest memory if the contents don't fit past `dest`.
+    const dest: usize = @intCast(dest_i64);
+    if (dest + size > data_size) {
+        const page = 65536;
+        const needed_pages: u64 = @intCast((dest + size - data_size + page - 1) / page);
+        var prev: u64 = 0;
+        const gerr = c.wasmtime_memory_grow(ctx, &memory_item.of.memory, needed_pages, &prev);
+        if (gerr != null) return fail.ret(results, -2);
+        data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
+        data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
+        if (dest + size > data_size) return fail.ret(results, -2);
+    }
+
+    var reader = file.reader(io, data[dest .. dest + size]);
+    reader.interface.readSliceAll(data[dest .. dest + size]) catch return fail.ret(results, -1);
+
+    results[0].kind = c.WASMTIME_I64;
+    results[0].of.i64 = @intCast(size);
     return null;
 }
 

@@ -326,6 +326,9 @@ pub const Expr = union(enum) {
     /// Byte-wise equality of two `str` values (`a == b`) as a bool (i32 0/1).
     /// `!=` is this wrapped in `un{.not}`. Lowers to a `__str_eq` helper call.
     str_eq: struct { lhs: *Expr, rhs: *Expr },
+    /// `env.fs.read(path)` — the file's bytes as a str value
+    /// (spec/env.md §"Wire ABI: fs.read"). Marks the function `@fs`.
+    fs_read: struct { path: *Expr },
     /// `Vec` v0 floor: a fresh empty vec (header base pointer).
     vec_new,
     /// `v.len` — a live read of the vec's length, i64.

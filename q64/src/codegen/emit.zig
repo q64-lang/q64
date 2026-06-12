@@ -630,7 +630,19 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // `kUnlimitedSize` sentinel emits no max) because the WASI adapter grows the
     // memory to carve its own stack at startup — a fixed 1-page max would trap
     // `allocate_stack`. The raw `env.out`/library paths keep the 1-page cap.
-    const mem_max: c.BinaryenIndex = if (preview1) 0xffff_ffff else 1;
+    // fs.read lets the HOST grow memory for file contents (spec/env.md
+    // §"Wire ABI: fs.read"), so the max must allow it.
+    var any_fs = false;
+    for (m.funcs) |*f2| {
+        const st2 = switch (f2.body) {
+            .structured => |inst| inst,
+            .cfg => continue,
+        };
+        var sc2 = Scratch{};
+        scanScratch(st2, &sc2);
+        if (sc2.has_fs) any_fs = true;
+    }
+    const mem_max: c.BinaryenIndex = if (preview1) 0xffff_ffff else if (any_fs) 256 else 1;
 
     // One active data segment at offset 0 holds the whole memory image.
     if (m.data.len == 0) {
@@ -655,6 +667,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_arena = false;
     var needs_str_eq = false;
     var needs_vec = false;
+    var needs_fs = false;
     var needs_index_of = false;
     var needs_starts_with = false;
     var needs_contains = false;
@@ -676,6 +689,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             needs_vec = true;
             needs_arena = true;
         }
+        if (sc.has_fs) {
+            needs_fs = true;
+            needs_arena = true;
+        }
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -693,6 +710,12 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         else
             c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(arena_start)));
         _ = c.BinaryenAddGlobal(module, "sp", ptr_type, true, sp_init);
+    }
+    if (needs_fs) {
+        // env.fs_read : (dest, path_ptr, path_len) -> i64 (spec/env.md).
+        var fsp = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type };
+        const fs_params = c.BinaryenTypeCreate(&fsp, fsp.len);
+        c.BinaryenAddFunctionImport(module, "env_fs_read", "env", "fs_read", fs_params, i64_type);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
     if (needs_fmt_f64) try emitFmtF64(module, allocator, i64_type, pair_type, ptr_type, mem64);
@@ -800,6 +823,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .rec_base = base + n_tuples + n_concat,
             .bounds_idx = base + n_tuples + n_concat + sc.rec_depth,
             .region_base = base + n_tuples + n_concat + sc.rec_depth + n_bounds,
+            .fs_dest_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7,
+            .fs_len_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + 1,
             .host_imports = &host_imports,
             .global_names = global_names,
             .stdout_abi = stdout_abi,
@@ -810,7 +835,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         // varTypes (locals beyond params): declared locals, then tuple slots,
         // then the concat scratch (buf/off/len) when concatenating, then one
         // base-ptr scratch per record_make nesting level.
-        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7;
+        const n_fs: u32 = if (sc.has_fs) 2 else 0;
+        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
         for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type, ptr_type);
@@ -834,6 +860,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             vts[g + 4] = c.BinaryenTypeFloat32();
             vts[g + 5] = pair_type;
             vts[g + 6] = ptr_type;
+        }
+        if (sc.has_fs) {
+            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7;
+            vts[g] = ptr_type; // fs dest
+            vts[g + 1] = i64_type; // fs len
         }
 
         // Parameter wasm types (a `str` param → two address-width ptr/len).
@@ -947,6 +978,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .elem_ptr => |ep| bodyHasOut(ep.base, want_int) or bodyHasOut(ep.index, want_int),
         .bounds_check => |bc| bodyHasOut(bc.index, want_int) or bodyHasOut(bc.count, want_int),
+        .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .vec_new => false,
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
@@ -1018,6 +1050,8 @@ const Scratch = struct {
     has_float_fmt: bool = false,
     /// Contains a bounds_check → needs the i64 index scratch local.
     has_bounds: bool = false,
+    /// Contains an `env.fs.read` → declare the import + fs scratch.
+    has_fs: bool = false,
     /// Contains a Vec op → emit the __vec_* helpers (+ the arena).
     has_vec: bool = false,
     /// Max nesting depth of frame-reclamation regions (a `.call` or a host
@@ -1038,6 +1072,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_float_fmt = s.has_float_fmt or sub.has_float_fmt;
     s.has_bounds = s.has_bounds or sub.has_bounds;
     s.has_vec = s.has_vec or sub.has_vec;
+    s.has_fs = s.has_fs or sub.has_fs;
     if (sub.rec_depth > s.rec_depth) s.rec_depth = sub.rec_depth;
     if (sub.region_depth > s.region_depth) s.region_depth = sub.region_depth;
 }
@@ -1188,6 +1223,11 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(m.str, s);
             scanScratch(m.sub, s);
         },
+        .fs_read => |fr| {
+            s.has_fs = true;
+            s.host_out = true; // uses the pair scratch to split the path
+            scanScratch(fr.path, s);
+        },
         .vec_new => s.has_vec = true,
         .vec_push => |vp| {
             s.has_vec = true;
@@ -1263,6 +1303,9 @@ const Lowerer = struct {
     /// one level deeper than its caller's wrap).
     region_base: c.BinaryenIndex = 0,
     region_lvl: u32 = 0,
+    /// fs.read scratch: the dest pointer + the returned i64 length.
+    fs_dest_idx: c.BinaryenIndex = 0,
+    fs_len_idx: c.BinaryenIndex = 0,
     label_ctr: u32 = 0,
     loops: std.ArrayList(LoopLabels) = .empty,
     /// Dotted host-face name (`qview.text`) → the declared wasm import's internal
@@ -1456,6 +1499,29 @@ const Lowerer = struct {
                 return self.resetAfter(d, c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type));
             },
             .global_get => |idx| return c.BinaryenGlobalGet(module, self.global_names[idx], self.i64_type),
+            .fs_read => |fr| {
+                // dest = sp; len = env.fs_read(dest, path…); trap if len < 0;
+                // sp = dest + len; yield (dest, len).
+                const pget = c.BinaryenLocalGet(module, self.pair_idx, self.pair_type);
+                var call_args = [_]c.BinaryenExpressionRef{
+                    self.ptrGet(self.fs_dest_idx),
+                    c.BinaryenTupleExtract(module, pget, 0),
+                    c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
+                };
+                var pair_elems = [_]c.BinaryenExpressionRef{
+                    self.ptrGet(self.fs_dest_idx),
+                    self.toPtr(c.BinaryenLocalGet(module, self.fs_len_idx, self.i64_type)),
+                };
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(module, self.pair_idx, try self.inst(fr.path)),
+                    c.BinaryenLocalSet(module, self.fs_dest_idx, c.BinaryenGlobalGet(module, "sp", self.ptr_type)),
+                    c.BinaryenLocalSet(module, self.fs_len_idx, c.BinaryenCall(module, "env_fs_read", @ptrCast(&call_args), call_args.len, self.i64_type)),
+                    c.BinaryenIf(module, c.BinaryenBinary(module, c.BinaryenLtSInt64(), c.BinaryenLocalGet(module, self.fs_len_idx, self.i64_type), c.BinaryenConst(module, c.BinaryenLiteralInt64(0))), c.BinaryenUnreachable(module), null),
+                    c.BinaryenGlobalSet(module, "sp", self.ptrAdd(self.ptrGet(self.fs_dest_idx), self.toPtr(c.BinaryenLocalGet(module, self.fs_len_idx, self.i64_type)))),
+                    c.BinaryenTupleMake(module, @ptrCast(&pair_elems), pair_elems.len),
+                };
+                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.pair_type);
+            },
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
             .vec_push => |vp| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vp.vec), try self.inst(vp.value) };

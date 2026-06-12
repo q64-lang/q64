@@ -813,6 +813,20 @@ pub fn write_to_log(items: [dyn Display]) {
 }
 ```
 
+## Host ABI for capability faces (v0 decision)
+
+**Decided (v0): hand-specced per-face wire ABIs**, documented in each
+face's spec section — not WIT/component-model lowering (option 2) and
+not WasmGC references (option 3). Rationale: the v0 face surface is
+small, the adapters (`runtime/wasmtime/`, `runtime/web/`) are
+hand-written anyway, and the component-model story already exists at
+the *module* boundary (`q64 emit --component`) where it belongs. The
+migration path to WIT-defined face ABIs stays open: each face's wire
+section names its WIT interface (the same table `q64 show world`
+uses), so a face can move from the hand ABI to a generated binding
+without changing q64 source. First concrete instance: `env.fs.read`
+([`env.md`](./env.md) §"Wire ABI: `fs.read` (v0)").
+
 ## Related specs
 
 - [`modules.md`](./modules.md) — `pub face` and `pub fit` follow the

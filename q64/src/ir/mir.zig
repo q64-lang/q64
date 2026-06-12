@@ -202,6 +202,10 @@ pub const Op = union(enum) {
     /// Byte-wise equality of two str values as i32 (0/1). Both are str-typed
     /// insts; lowers to a `__str_eq(pa, la, pb, lb)` helper call.
     str_eq: struct { lhs: *Inst, rhs: *Inst },
+    /// `env.fs.read(path)` (spec/env.md §"Wire ABI: fs.read"): call the
+    /// `env.fs_read` import with (dest=sp, path ptr, path len), trap on a
+    /// negative length, bump `sp`, yield the (dest, len) str value.
+    fs_read: struct { path: *Inst },
     /// `Vec` v0 floor (spec/types.md §Growable): a fresh empty vec —
     /// a 3-slot {data, len, cap} header in the scope arena, yielding
     /// its base pointer. Lowers to the `__vec_new` helper.
