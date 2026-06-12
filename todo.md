@@ -1416,8 +1416,31 @@ analysis.
       `let` (not a host statement) in `main`. Next rungs:
       per-iteration reset via the existing escape scan; explicit
       `scope { }` reset (parser: scope blocks are still unstructured).
-- [ ] **Growth for collections** (`Vec` copy-on-grow inside the owning
-      region) — the gate for the collections ladder.
+- [x] **Growth for collections — the `Vec` v0 floor landed.**
+      Specced first (types.md §Growable, "v0 floor"): `Vec.from([…])`,
+      `v.push(x)`, `v.len` (live), bounds-checked `v[i]` (trap), and
+      `for x in v` (the loop bound reads the live len, so a pushing
+      body still terminates). Representation: a 3-slot {data, len,
+      cap} header at address width; i64 elements; copy-on-grow ×2
+      (min 4). The runtime lives in three backend helpers
+      (`__vec_new`/`__vec_push`/`__vec_get` + `__vec_len`) — direct
+      Binaryen calls, NOT MIR calls, so the frame-reclamation slide
+      never reclaims a grown block out from under a live vec. IR:
+      `vec_new/vec_push/vec_len/vec_get` through HIR/MIR/print/
+      effects; builder: `Scope.vecs`, the `Vec.from` let arm,
+      statement `v.push`, path/index/for arms. **Parser fix:** `from`
+      lexes KW_FROM (reserved, used by no production) — it now joins
+      path segments (parse + ast `isPathToken`) so `Vec.from` parses
+      as one dotted path. Verified end-to-end wasm64 + wasm32
+      (roundtrip Vec section incl. 200 pushes through several growth
+      cycles: `3 / 10 / 30 / 5 / 50 / sum = 150 / 205 / 199`) + 1
+      unit test (ops + the vec-across-fn-boundary rejection). 398
+      unit / 81 CLI / 24-of-51 / roundtrips green. **Boundary:**
+      i64 elements; main-only (a vec param/return is honestly
+      rejected — callee growth would allocate into a dying frame;
+      the escape story lands with named regions); `Vec<T>.new()`
+      waits on generic-args expressions; pop/insert/remove and
+      record elements are later slices.
 
 ## Strings beyond the floor — methods landed
 

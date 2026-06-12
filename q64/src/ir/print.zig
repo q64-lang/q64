@@ -134,12 +134,32 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirStmt(gpa, out, body, depth + 1);
         },
         .brk => try app(gpa, out, "break\n", .{}),
+        .vec_push => |vp| {
+            try app(gpa, out, "vec_push ", .{});
+            try hirExpr(gpa, out, vp.vec);
+            try app(gpa, out, " <- ", .{});
+            try hirExpr(gpa, out, vp.value);
+            try app(gpa, out, "\n", .{});
+        },
         .cont => try app(gpa, out, "continue\n", .{}),
     }
 }
 
 fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
     switch (e.*) {
+        .vec_new => try app(gpa, out, "vec_new", .{}),
+        .vec_len => |vl| {
+            try app(gpa, out, "vec_len(", .{});
+            try hirExpr(gpa, out, vl.vec);
+            try app(gpa, out, ")", .{});
+        },
+        .vec_get => |vg| {
+            try app(gpa, out, "vec_get(", .{});
+            try hirExpr(gpa, out, vg.vec);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, vg.idx);
+            try app(gpa, out, ")", .{});
+        },
         .str_const => |b| try app(gpa, out, "\"{s}\"", .{b}),
         .int_const => |v| try app(gpa, out, "{d}", .{v}),
         .float_const => |v| try app(gpa, out, "{d}f", .{v}),
@@ -315,6 +335,21 @@ fn mirCfg(gpa: std.mem.Allocator, out: *Buf, cfg: *const mir.Cfg, depth: usize) 
 fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usize) Error!void {
     try indent(gpa, out, depth);
     switch (inst.op) {
+        .vec_new => try app(gpa, out, "vec_new\n", .{}),
+        .vec_push => |vp| {
+            try app(gpa, out, "vec_push\n", .{});
+            try mirInst(gpa, out, vp.vec, depth + 1);
+            try mirInst(gpa, out, vp.value, depth + 1);
+        },
+        .vec_len => |vl| {
+            try app(gpa, out, "vec_len\n", .{});
+            try mirInst(gpa, out, vl.vec, depth + 1);
+        },
+        .vec_get => |vg| {
+            try app(gpa, out, "vec_get\n", .{});
+            try mirInst(gpa, out, vg.vec, depth + 1);
+            try mirInst(gpa, out, vg.idx, depth + 1);
+        },
         .block => |items| {
             try app(gpa, out, "block : {s}\n", .{@tagName(inst.ty)});
             for (items) |child| try mirInst(gpa, out, child, depth + 1);

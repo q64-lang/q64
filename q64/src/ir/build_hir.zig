@@ -403,6 +403,8 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = arr.e } };
                 try out.append(b.a, st);
+            } else if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let v = Vec.from([…])` — handled (vec_new + pushes).
             } else if (if (init_expr == .call or isBoxedVariantPath(b, init_expr)) try buildRecExpr(b, init_expr, scope) else null) |rv| {
                 // `let p = make(3, 4)` / `let c = first([...])` — a
                 // record-returning call (incl. a generic whose `-> T`
@@ -546,6 +548,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 else => return error.Unsupported, // v0 iterates array bindings (ranges later)
             };
             defer b.a.free(iname);
+            if (scope.vecs.contains(iname)) {
+                try buildForVec(b, fs, iname, pat.text, scope, rt, out);
+                return;
+            }
             const ai = scope.arrs.get(iname) orelse return error.Unsupported;
 
             // i (hidden) and x occupy fresh main locals.
@@ -960,6 +966,11 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                         }
                     }
                 }
+            }
+            // `v.push(x)` on a vec binding (the v0 Vec floor).
+            if (try tryVecPush(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
             }
             // A host face call other than env.out (e.g. `qview.text(24, 80, 0)`
             // or `qview.set_text(80, 9, "…")`): str args flow as (ptr, len), the
@@ -3420,6 +3431,123 @@ fn genericRecCall(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecV
     return .{ .e = e, .si = si };
 }
 
+/// `Vec.from([…])` as a `let`/`var` initializer (the v0 Vec floor,
+/// spec/types.md §Growable): bind a fresh header and push each literal
+/// element (i64 expressions). Returns false when the initializer isn't
+/// the form; growth/representation live in the `__vec_*` helpers.
+fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cname = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cname);
+    if (!std.mem.eql(u8, cname, "Vec.from")) return false;
+    var ait = cc.args();
+    const arg = ait.next() orelse return error.Unsupported;
+    if (ait.next() != null) return error.Unsupported;
+    const arr = switch (arg) {
+        .array => |x| x,
+        else => return error.Unsupported, // Vec.from takes a slice literal
+    };
+
+    // let v = vec_new()
+    const v_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
+    try scope.vecs.put(b.a, name, {});
+    const nv = try b.a.create(hir.Expr);
+    nv.* = .vec_new;
+    const bind = try b.a.create(hir.Stmt);
+    bind.* = .{ .let = .{ .idx = v_idx, .value = nv } };
+    try out.append(b.a, bind);
+
+    // one vec_push per element
+    var eit = arr.elements();
+    while (eit.next()) |el| {
+        const vref = try b.a.create(hir.Expr);
+        vref.* = .{ .local = .{ .idx = v_idx, .ty = .ptr } };
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .vec_push = .{ .vec = vref, .value = try buildIntExpr(b, el, scope) } };
+        try out.append(b.a, st);
+    }
+    return true;
+}
+
+/// `for x in v { … }` over a vec binding: an index loop reading the
+/// live length each test (`while i < vec_len(v) { x = v[i]; …; i += 1 }`),
+/// so a body that pushes still terminates against the grown bound.
+fn buildForVec(b: *Builder, fs: ast.ForStmt, vname: []const u8, xname: []const u8, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const vloc = scope.find(vname) orelse return error.Unsupported;
+    const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{xname});
+    const i_idx = try declareBodyLocal(b, scope, hidden, true, .i64);
+    const x_idx = try declareBodyLocal(b, scope, xname, false, .i64);
+
+    // let i = 0
+    const zero = try b.a.create(hir.Expr);
+    zero.* = .{ .int_const = 0 };
+    const st0 = try b.a.create(hir.Stmt);
+    st0.* = .{ .let = .{ .idx = i_idx, .value = zero } };
+    try out.append(b.a, st0);
+
+    // body: x = v[i]; <source body>; i = i + 1
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    {
+        const vref = try b.a.create(hir.Expr);
+        vref.* = .{ .local = .{ .idx = vloc.idx, .ty = .ptr } };
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const get = try b.a.create(hir.Expr);
+        get.* = .{ .vec_get = .{ .vec = vref, .idx = iref } };
+        const setx = try b.a.create(hir.Stmt);
+        setx.* = .{ .assign = .{ .idx = x_idx, .value = get } };
+        try items.append(b.a, setx);
+    }
+    var bit = (fs.body() orelse return error.Unsupported).statements();
+    while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, &items);
+    {
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const one = try b.a.create(hir.Expr);
+        one.* = .{ .int_const = 1 };
+        const inc = try b.a.create(hir.Expr);
+        inc.* = .{ .bin = .{ .kind = .add, .lhs = iref, .rhs = one } };
+        const sti = try b.a.create(hir.Stmt);
+        sti.* = .{ .assign = .{ .idx = i_idx, .value = inc } };
+        try items.append(b.a, sti);
+    }
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
+    // while i < v.len (read live)
+    const iref2 = try b.a.create(hir.Expr);
+    iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+    const vref2 = try b.a.create(hir.Expr);
+    vref2.* = .{ .local = .{ .idx = vloc.idx, .ty = .ptr } };
+    const lenx = try b.a.create(hir.Expr);
+    lenx.* = .{ .vec_len = .{ .vec = vref2 } };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = .lt, .lhs = iref2, .rhs = lenx } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try out.append(b.a, st);
+}
+
+/// A statement-position `v.push(x)` on a vec binding, or null.
+fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
+    const cname = (callPathName(b, call)) orelse return null;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return null;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "push")) return null;
+    if (!scope.vecs.contains(cname[0..dot])) return null;
+    const loc = scope.find(cname[0..dot]) orelse return null;
+    var ait = call.args();
+    const arg = ait.next() orelse return error.Unsupported;
+    if (ait.next() != null) return error.Unsupported;
+    const vref = try b.a.create(hir.Expr);
+    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .vec_push = .{ .vec = vref, .value = try buildIntExpr(b, arg, scope) } };
+    return st;
+}
+
 /// Build + check a call's arguments against the callee's parameter kinds
 /// (int / bool / record). Shared by the i64 path, the record path, and
 /// fit-method dispatch: a non-null `recv` fills the callee's first
@@ -3715,6 +3843,10 @@ const Scope = struct {
     /// i64 local under the same name. `match` reads this to resolve
     /// bare variant names in arm patterns.
     enum_binds: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
+    /// Vec bindings (the v0 floor, spec/types.md §Growable): name →
+    /// present. The header base pointer lives in `locals` under the
+    /// same name (a `.ptr`); elements are i64.
+    vecs: std.StringHashMapUnmanaged(void) = .empty,
     /// True for a plain callee body (registerFunc), whose locals are
     /// tracked by `declare` alone — entry-style bodies (`main`,
     /// stamped generics) mirror every local into `b.cur_locals` too.
@@ -3958,11 +4090,19 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     }
                 }
             }
-            // `xs.len` of an array binding is its compile-time count.
+            // `xs.len` of an array binding is its compile-time count;
+            // `v.len` of a vec is a live header read (i64).
             if (std.mem.lastIndexOfScalar(u8, txt, '.')) |dotl| {
                 if (std.mem.eql(u8, txt[dotl + 1 ..], "len")) {
                     if (scope.arrs.get(txt[0..dotl])) |ai| {
                         return countExpr(b, ai.count);
+                    }
+                    if (scope.vecs.contains(txt[0..dotl])) {
+                        const loc = scope.find(txt[0..dotl]) orelse return error.Unsupported;
+                        const vref = try b.a.create(hir.Expr);
+                        vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                        out.* = .{ .vec_len = .{ .vec = vref } };
+                        return out;
                     }
                 }
             }
@@ -4163,6 +4303,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             if (base == .path) {
                 const bn = try base.path.text(b.a);
                 defer b.a.free(bn);
+                // `v[i]` on a vec binding: bounds-checked in __vec_get.
+                if (scope.vecs.contains(bn)) {
+                    const loc = scope.find(bn) orelse return error.Unsupported;
+                    const vref = try b.a.create(hir.Expr);
+                    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                    const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
+                    out.* = .{ .vec_get = .{ .vec = vref, .idx = idx } };
+                    return out;
+                }
                 if (scope.arrs.get(bn)) |ai| {
                     const ety = switch (ai.elem) {
                         .scalar => |t| t,
@@ -6641,4 +6790,44 @@ test "str params: a second str param reads its own wasm slots (2, 3)" {
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "str_binding[2,3]") != null);
+}
+
+test "Vec v0 floor: from/push/len/index/for, growth, honest boundaries" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    var v = Vec.from([10, 20, 30])
+        \\    env.out(v.len)
+        \\    env.out(v[0])
+        \\    v.push(40)
+        \\    var sum = 0
+        \\    for x in v {
+        \\        sum = sum + x
+        \\    }
+        \\    env.out(sum)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+    // A vec crossing a function boundary is honestly unsupported
+    // (growth inside a callee would allocate into a dying frame).
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn sum_of(n: i64) -> i64 {
+        \\    n
+        \\}
+        \\fn main {
+        \\    var v = Vec.from([1, 2])
+        \\    env.out(sum_of(v))
+        \\}
+        \\
+    )) == null);
 }

@@ -279,6 +279,21 @@ specified by `memory.md` §"Region parameters in types". `Vec`
 takes a region parameter; the default is the enclosing scope's
 arena.
 
+**v0 floor (implementation status).** The compiler implements a
+`Vec` subset on the implicit scope arena: `Vec.from([…])`
+construction (element type inferred from the literal; i64
+elements), `v.push(x)`, `v.len`, bounds-checked `v[i]` (a trap on
+out-of-range, like arrays), and `for x in v`. Representation: a
+three-slot header `{data, len, cap}` at address width; growth is
+copy-on-grow (capacity doubles, the old block is abandoned to the
+owning region — finite since frames reclaim, see
+[`memory.md`](./memory.md) §"Frame reclamation"). Out of the
+floor (honest compile errors): `Vec<T>.new()` (explicit generic
+args wait on the generics grammar), region arguments, non-i64
+elements, and a `Vec` crossing a function boundary (param/return
+— growth inside a callee would allocate into a dying frame; the
+escape story lands with named regions).
+
 ### Slice literals
 
 `[1, 2, 3]` is a `[T; N]` literal with `N` inferred from the

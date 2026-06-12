@@ -2080,8 +2080,10 @@ const Parser = struct {
             // ambiguity here. `self` joins so a method body's receiver
             // access (`self.w`, `self.area()`) parses as the same greedy
             // PATH_EXPR every other name uses (B4 fit-method dispatch
-            // reads it).
-            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF => true,
+            // reads it). `from` joins for `Vec.from([…])` (spec/types.md
+            // §"Slice literals") — KW_FROM appears in no expression
+            // production, so admitting it as a segment is unambiguous.
+            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM => true,
             else => false,
         };
     }

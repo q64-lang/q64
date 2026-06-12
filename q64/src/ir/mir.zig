@@ -202,6 +202,18 @@ pub const Op = union(enum) {
     /// Byte-wise equality of two str values as i32 (0/1). Both are str-typed
     /// insts; lowers to a `__str_eq(pa, la, pb, lb)` helper call.
     str_eq: struct { lhs: *Inst, rhs: *Inst },
+    /// `Vec` v0 floor (spec/types.md §Growable): a fresh empty vec —
+    /// a 3-slot {data, len, cap} header in the scope arena, yielding
+    /// its base pointer. Lowers to the `__vec_new` helper.
+    vec_new,
+    /// `v.push(x)` — append an i64 element, copy-on-grow. `vec` is the
+    /// header pointer (`.ptr`), `value` i64. `__vec_push`.
+    vec_push: struct { vec: *Inst, value: *Inst },
+    /// `v.len` -> i64 (a live header read).
+    vec_len: struct { vec: *Inst },
+    /// `v[i]` -> i64, bounds-checked against the live len (a trap on
+    /// out-of-range, like arrays). `__vec_get`.
+    vec_get: struct { vec: *Inst, idx: *Inst },
     /// `s.slice(start, end)` -> str (ptr+start, end-start). `str` is str-typed;
     /// `start`/`end` are i64. Lowers inline to a (ptr, len) pair.
     str_slice: struct { str: *Inst, start: *Inst, end: *Inst },

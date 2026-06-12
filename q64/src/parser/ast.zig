@@ -1584,7 +1584,7 @@ pub const PathExpr = struct {
             // `qview.on(...)` (spec/qview-protocol.md) reconstructs its dotted
             // name including the `on` segment; `self` so a method body's
             // receiver access (`self.w`) reconstructs whole.
-            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF => true,
+            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM => true,
             else => false,
         };
     }

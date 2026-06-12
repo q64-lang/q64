@@ -149,6 +149,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .ret => |e| return mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null }),
         .brk => return mk(ctx.a, .void, .br),
         .cont => return mk(ctx.a, .void, .br_cont),
+        .vec_push => |vp| return mk(ctx.a, .void, .{ .vec_push = .{ .vec = try lowerExpr(ctx, vp.vec), .value = try lowerExpr(ctx, vp.value) } }),
         // A statement-position block (an `if let` desugar: the hidden
         // scrutinee set + the tag test ride together).
         .block => |items| {
@@ -347,6 +348,9 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .bool_const => |v| return mk(ctx.a, .i32, .{ .const_i32 = @intFromBool(v) }),
         .local => |l| return mk(ctx.a, mapType(l.ty), .{ .local_get = l.idx }),
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
+        .vec_new => return mk(ctx.a, .ptr, .vec_new),
+        .vec_len => |vl| return mk(ctx.a, .i64, .{ .vec_len = .{ .vec = try lowerExpr(ctx, vl.vec) } }),
+        .vec_get => |vg| return mk(ctx.a, .i64, .{ .vec_get = .{ .vec = try lowerExpr(ctx, vg.vec), .idx = try lowerExpr(ctx, vg.idx) } }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg` preserves the
             // operand's numeric type (f64 stays f64); `bit_not` is i64.

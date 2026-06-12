@@ -230,6 +230,8 @@ pub const Func = struct {
 /// to `assign(idx, bin(op, local(idx), rhs))`.
 pub const Stmt = union(enum) {
     block: []const *Stmt,
+    /// `v.push(x)` — append an i64 element to a vec (copy-on-grow).
+    vec_push: struct { vec: *Expr, value: *Expr },
     /// `env.out(expr)` — `expr` is `str`-typed. The trailing newline is the
     /// capability ABI's, materialized during lowering.
     host_out: *Expr,
@@ -324,6 +326,12 @@ pub const Expr = union(enum) {
     /// Byte-wise equality of two `str` values (`a == b`) as a bool (i32 0/1).
     /// `!=` is this wrapped in `un{.not}`. Lowers to a `__str_eq` helper call.
     str_eq: struct { lhs: *Expr, rhs: *Expr },
+    /// `Vec` v0 floor: a fresh empty vec (header base pointer).
+    vec_new,
+    /// `v.len` — a live read of the vec's length, i64.
+    vec_len: struct { vec: *Expr },
+    /// `v[i]` — a bounds-checked i64 element load.
+    vec_get: struct { vec: *Expr, idx: *Expr },
     /// `s.slice(start, end)` — a str sub-view (ptr+start, end-start). No bounds
     /// check; caller guards with `s.len`. `start`/`end` are i64. str-valued.
     str_slice: struct { str: *Expr, start: *Expr, end: *Expr },

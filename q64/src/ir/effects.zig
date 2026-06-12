@@ -125,6 +125,10 @@ fn collectStmt(
             try collectExpr(a, fs.base, d, e);
             try collectExpr(a, fs.value, d, e);
         },
+        .vec_push => |vp| {
+            try collectExpr(a, vp.vec, d, e);
+            try collectExpr(a, vp.value, d, e);
+        },
         .if_ => |iff| {
             try collectExpr(a, iff.cond, d, e);
             try collectStmt(a, iff.then_, d, e);
@@ -179,6 +183,12 @@ fn collectExpr(
         .str_index_of => |m| {
             try collectExpr(a, m.str, d, e);
             try collectExpr(a, m.byte, d, e);
+        },
+        .vec_new => {},
+        .vec_len => |vl| try collectExpr(a, vl.vec, d, e),
+        .vec_get => |vg| {
+            try collectExpr(a, vg.vec, d, e);
+            try collectExpr(a, vg.idx, d, e);
         },
         .str_starts_with => |m| {
             try collectExpr(a, m.str, d, e);

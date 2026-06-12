@@ -1672,4 +1672,46 @@ strm32_out="$("$HOST_BIN" "$tmp/strm32.wasm")"
 [[ "$strm32_out" == "$strm_expected" ]] || { echo "FAIL: str-methods wasm32 (got: $strm32_out)" >&2; exit 1; }
 echo "    ok: str methods -> len/index/slice/contains + mixed signatures (wasm64 + wasm32)"
 
+# ---------------------------------------------------------------------------
+# Vec v0 floor (spec/types.md §Growable): Vec.from / push / len / [i] /
+# for-iteration, through multiple copy-on-grow cycles.
+# ---------------------------------------------------------------------------
+echo "==> Vec: from / push / len / index / for + growth"
+vec_app="$tmp/vec.q"
+cat > "$vec_app" <<'Q64'
+fn double(n: i64) -> i64 {
+    n + n
+}
+fn main {
+    var v = Vec.from([10, 20, 30])
+    env.out(v.len)
+    env.out(v[0])
+    env.out(v[2])
+    v.push(40)
+    v.push(double(25))
+    env.out(v.len)
+    env.out(v[4])
+    var sum = 0
+    for x in v {
+        sum = sum + x
+    }
+    env.out("sum = {sum}")
+    var i = 0
+    while i < 200 {
+        v.push(i)
+        i = i + 1
+    }
+    env.out(v.len)
+    env.out(v[204])
+}
+Q64
+vec_expected=$'3\n10\n30\n5\n50\nsum = 150\n205\n199'
+"$Q64_BIN" emit "$vec_app" "$tmp/vec.wasm"
+vec_out="$("$HOST_BIN" "$tmp/vec.wasm")"
+[[ "$vec_out" == "$vec_expected" ]] || { echo "FAIL: vec (got: $vec_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$vec_app" "$tmp/vec32.wasm" --addr wasm32
+vec32_out="$("$HOST_BIN" "$tmp/vec32.wasm")"
+[[ "$vec32_out" == "$vec_expected" ]] || { echo "FAIL: vec wasm32 (got: $vec32_out)" >&2; exit 1; }
+echo "    ok: Vec -> 3 / 10 / 30 / 5 / 50 / sum = 150 / 205 / 199 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

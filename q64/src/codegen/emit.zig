@@ -654,6 +654,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_fmt_f64 = false;
     var needs_arena = false;
     var needs_str_eq = false;
+    var needs_vec = false;
     var needs_index_of = false;
     var needs_starts_with = false;
     var needs_contains = false;
@@ -671,6 +672,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         // Any frame-reclamation region (a call / host statement wrap)
         // reads + writes `sp`, so the arena global must exist.
         if (sc.region_depth > 0) needs_arena = true;
+        if (sc.has_vec) {
+            needs_vec = true;
+            needs_arena = true;
+        }
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -696,6 +701,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // `contains` is implemented on top of `starts_with`, so emit the latter when
     // either is used.
     if (needs_starts_with or needs_contains) try emitStrStartsWith(module, allocator, i32_type, ptr_type, mem64);
+    if (needs_vec) try emitVecHelpers(module, allocator, i64_type, i32_type, ptr_type, mem64);
     if (needs_contains) try emitStrContains(module, allocator, i32_type, ptr_type, mem64);
 
     // Host-face imports (e.g. `qview.text`): declare one wasm import per distinct
@@ -941,6 +947,10 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .elem_ptr => |ep| bodyHasOut(ep.base, want_int) or bodyHasOut(ep.index, want_int),
         .bounds_check => |bc| bodyHasOut(bc.index, want_int) or bodyHasOut(bc.count, want_int),
+        .vec_new => false,
+        .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
+        .vec_len => |vl| bodyHasOut(vl.vec, want_int),
+        .vec_get => |vg| bodyHasOut(vg.vec, want_int) or bodyHasOut(vg.idx, want_int),
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -1008,6 +1018,8 @@ const Scratch = struct {
     has_float_fmt: bool = false,
     /// Contains a bounds_check → needs the i64 index scratch local.
     has_bounds: bool = false,
+    /// Contains a Vec op → emit the __vec_* helpers (+ the arena).
+    has_vec: bool = false,
     /// Max nesting depth of frame-reclamation regions (a `.call` or a host
     /// statement — spec/memory.md §"Frame reclamation"): each level needs
     /// its own watermark + result-stash scratch group, since a nested call
@@ -1025,6 +1037,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_contains = s.has_contains or sub.has_contains;
     s.has_float_fmt = s.has_float_fmt or sub.has_float_fmt;
     s.has_bounds = s.has_bounds or sub.has_bounds;
+    s.has_vec = s.has_vec or sub.has_vec;
     if (sub.rec_depth > s.rec_depth) s.rec_depth = sub.rec_depth;
     if (sub.region_depth > s.region_depth) s.region_depth = sub.region_depth;
 }
@@ -1174,6 +1187,21 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_contains = true;
             scanScratch(m.str, s);
             scanScratch(m.sub, s);
+        },
+        .vec_new => s.has_vec = true,
+        .vec_push => |vp| {
+            s.has_vec = true;
+            scanScratch(vp.vec, s);
+            scanScratch(vp.value, s);
+        },
+        .vec_len => |vl| {
+            s.has_vec = true;
+            scanScratch(vl.vec, s);
+        },
+        .vec_get => |vg| {
+            s.has_vec = true;
+            scanScratch(vg.vec, s);
+            scanScratch(vg.idx, s);
         },
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
@@ -1428,6 +1456,19 @@ const Lowerer = struct {
                 return self.resetAfter(d, c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type));
             },
             .global_get => |idx| return c.BinaryenGlobalGet(module, self.global_names[idx], self.i64_type),
+            .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
+            .vec_push => |vp| {
+                var args = [_]c.BinaryenExpressionRef{ try self.inst(vp.vec), try self.inst(vp.value) };
+                return c.BinaryenCall(module, "__vec_push", @ptrCast(&args), args.len, self.none_type);
+            },
+            .vec_len => |vl| {
+                var args = [_]c.BinaryenExpressionRef{try self.inst(vl.vec)};
+                return c.BinaryenCall(module, "__vec_len", @ptrCast(&args), args.len, self.i64_type);
+            },
+            .vec_get => |vg| {
+                var args = [_]c.BinaryenExpressionRef{ try self.inst(vg.vec), try self.inst(vg.idx) };
+                return c.BinaryenCall(module, "__vec_get", @ptrCast(&args), args.len, self.i64_type);
+            },
             .global_set => |gs| return c.BinaryenGlobalSet(module, self.global_names[gs.idx], try self.inst(gs.value)),
             .fmt_int_to_str => |inner| {
                 // __fmt_i64(value) → (ptr, len). The (pair) result is the str
@@ -3188,4 +3229,127 @@ test "emitFromSource: continue outside a loop is rejected" {
         Error.BreakOutsideLoop,
         emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
+}
+
+/// The `Vec` v0 floor's runtime (spec/types.md §Growable, "v0 floor"):
+/// a 3-slot header {data, len, cap} at address width; i64 elements;
+/// copy-on-grow ×2 (min capacity 4). Growth bumps `sp` directly — these
+/// are not MIR calls, so the frame-reclamation slide never reclaims a
+/// grown block out from under a live vec.
+fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_type: c.BinaryenType, i32_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
+    _ = i32_type;
+    const none = c.BinaryenTypeNone();
+    const W: i64 = if (mem64) 8 else 4;
+    const wbytes: u32 = if (mem64) 8 else 4;
+    const add_p = if (mem64) c.BinaryenAddInt64() else c.BinaryenAddInt32();
+    const and_p = if (mem64) c.BinaryenAndInt64() else c.BinaryenAndInt32();
+    const shl_p = if (mem64) c.BinaryenShlInt64() else c.BinaryenShlInt32();
+    const eq_p = if (mem64) c.BinaryenEqInt64() else c.BinaryenEqInt32();
+    const eqz_p = if (mem64) c.BinaryenEqZInt64() else c.BinaryenEqZInt32();
+
+    const h = struct {
+        fn loadW(m: c.BinaryenModuleRef, off: u32, w: u32, pt: c.BinaryenType, base: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+            return c.BinaryenLoad(m, @intCast(w), false, off, 0, pt, base, "0");
+        }
+        fn storeW(m: c.BinaryenModuleRef, off: u32, w: u32, pt: c.BinaryenType, base: c.BinaryenExpressionRef, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+            return c.BinaryenStore(m, @intCast(w), off, 0, base, v, pt, "0");
+        }
+        /// (sp + 7) & ~7 — an 8-aligned allocation base.
+        fn align8(m: c.BinaryenModuleRef, m64: bool, pt: c.BinaryenType, addp: c.BinaryenOp, andp: c.BinaryenOp) c.BinaryenExpressionRef {
+            return c.BinaryenBinary(m, andp, c.BinaryenBinary(m, addp, c.BinaryenGlobalGet(m, "sp", pt), K.ptrc(m, m64, 7)), K.ptrc(m, m64, -8));
+        }
+        /// Widen an address-width value to i64 (identity on wasm64).
+        fn toI64(m: c.BinaryenModuleRef, m64: bool, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+            return if (m64) v else c.BinaryenUnary(m, c.BinaryenExtendUInt32(), v);
+        }
+        /// Narrow an i64 to address width (identity on wasm64).
+        fn toW(m: c.BinaryenModuleRef, m64: bool, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+            return if (m64) v else c.BinaryenUnary(m, c.BinaryenWrapInt64(), v);
+        }
+    };
+
+    // __vec_new() -> ptr: hdr = align8(sp); sp = hdr + 3W; zero the slots.
+    {
+        const HDR: c.BinaryenIndex = 0; // local
+        var stmts = [_]c.BinaryenExpressionRef{
+            c.BinaryenLocalSet(module, HDR, h.align8(module, mem64, ptr_type, add_p, and_p)),
+            c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(module, add_p, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 3 * W))),
+            h.storeW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 0)),
+            h.storeW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 0)),
+            h.storeW(module, @intCast(2 * W), wbytes, ptr_type, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 0)),
+            K.get(module, HDR, ptr_type),
+        };
+        const body = c.BinaryenBlock(module, null, @ptrCast(&stmts), stmts.len, ptr_type);
+        var var_types = [_]c.BinaryenType{ptr_type};
+        _ = c.BinaryenAddFunction(module, "__vec_new", none, ptr_type, @ptrCast(&var_types), var_types.len, body);
+    }
+
+    // __vec_push(hdr: ptr, v: i64): copy-on-grow, then store + len++.
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const V: c.BinaryenIndex = 1;
+        const LEN: c.BinaryenIndex = 2; // ptr-width locals
+        const CAP: c.BinaryenIndex = 3;
+        const ND: c.BinaryenIndex = 4;
+        var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer stmts.deinit(allocator);
+        try stmts.append(allocator, c.BinaryenLocalSet(module, LEN, h.loadW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        try stmts.append(allocator, c.BinaryenLocalSet(module, CAP, h.loadW(module, @intCast(2 * W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        // if (len == cap) grow
+        var grow: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer grow.deinit(allocator);
+        // cap = cap == 0 ? 4 : cap << 1
+        try grow.append(allocator, c.BinaryenLocalSet(module, CAP, c.BinaryenIf(module, eqz_p_wrap(module, eqz_p, K.get(module, CAP, ptr_type)), K.ptrc(module, mem64, 4), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 1)))));
+        // nd = align8(sp); sp = nd + cap*8
+        try grow.append(allocator, c.BinaryenLocalSet(module, ND, h.align8(module, mem64, ptr_type, add_p, and_p)));
+        try grow.append(allocator, c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(module, add_p, K.get(module, ND, ptr_type), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 3)))));
+        // memory.copy(nd, data, len*8)
+        try grow.append(allocator, c.BinaryenMemoryCopy(module, K.get(module, ND, ptr_type), h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 3)), "0", "0"));
+        // hdr.data = nd; hdr.cap = cap
+        try grow.append(allocator, h.storeW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type), K.get(module, ND, ptr_type)));
+        try grow.append(allocator, h.storeW(module, @intCast(2 * W), wbytes, ptr_type, K.get(module, HDR, ptr_type), K.get(module, CAP, ptr_type)));
+        const grow_blk = c.BinaryenBlock(module, null, @ptrCast(grow.items.ptr), @intCast(grow.items.len), none);
+        try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, eq_p, K.get(module, LEN, ptr_type), K.get(module, CAP, ptr_type)), grow_blk, null));
+        // store i64 at data + len*8 = v
+        const slot = c.BinaryenBinary(module, add_p, h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 3)));
+        try stmts.append(allocator, c.BinaryenStore(module, 8, 0, 0, slot, K.get(module, V, i64_type), i64_type, "0"));
+        // hdr.len = len + 1
+        try stmts.append(allocator, h.storeW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type), c.BinaryenBinary(module, add_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 1))));
+        const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), none);
+        var params = [_]c.BinaryenType{ ptr_type, i64_type };
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        var var_types = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type };
+        _ = c.BinaryenAddFunction(module, "__vec_push", ptype, none, @ptrCast(&var_types), var_types.len, body);
+    }
+
+    // __vec_len(hdr) -> i64
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const body = h.toI64(module, mem64, h.loadW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type)));
+        var params = [_]c.BinaryenType{ptr_type};
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        _ = c.BinaryenAddFunction(module, "__vec_len", ptype, i64_type, null, 0, body);
+    }
+
+    // __vec_get(hdr, idx: i64) -> i64: trap on out-of-range (unsigned, so
+    // a negative index also traps), then load data[idx].
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const IDX: c.BinaryenIndex = 1;
+        const oob = c.BinaryenBinary(module, c.BinaryenGeUInt64(), K.get(module, IDX, i64_type), h.toI64(module, mem64, h.loadW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        const slot = c.BinaryenBinary(module, add_p, h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, h.toW(module, mem64, K.get(module, IDX, i64_type)), K.ptrc(module, mem64, 3)));
+        var stmts = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(module, oob, c.BinaryenUnreachable(module), null),
+            c.BinaryenLoad(module, 8, true, 0, 0, i64_type, slot, "0"),
+        };
+        const body = c.BinaryenBlock(module, null, @ptrCast(&stmts), stmts.len, i64_type);
+        var params = [_]c.BinaryenType{ ptr_type, i64_type };
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        _ = c.BinaryenAddFunction(module, "__vec_get", ptype, i64_type, null, 0, body);
+    }
+}
+
+/// `eqz` as an i32 condition regardless of operand width.
+fn eqz_p_wrap(module: c.BinaryenModuleRef, eqz_op: c.BinaryenOp, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+    return c.BinaryenUnary(module, eqz_op, v);
 }
