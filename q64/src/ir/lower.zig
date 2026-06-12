@@ -73,6 +73,7 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
                 .linkage = if (is_entry) .entry else .local,
                 .exported = (!is_entry and hf.visibility == .public),
                 .ret_size = hf.ret_size,
+                .ret_ptr_bearing = hf.ret_ptr_bearing,
             };
         } else {
             funcs[i] = try lowerCallee(ctx, hf);
@@ -199,6 +200,7 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
         // name so a host — or the component lift — can reach it.
         .exported = (hf.visibility == .public),
         .ret_size = hf.ret_size,
+        .ret_ptr_bearing = hf.ret_ptr_bearing,
     };
 }
 
@@ -221,7 +223,7 @@ fn singleTail(body: *const hir.Stmt) ?*hir.Expr {
 /// an i64 (only appears inside concat today, but classify it as str for safety).
 fn isStrExpr(e: *const hir.Expr) bool {
     return switch (e.*) {
-        .str_const, .concat, .str_binding, .fmt_int, .fmt_float, .str_slice, .fs_read => true,
+        .str_const, .concat, .str_binding, .fmt_int, .fmt_float, .str_slice => true,
         .local => |l| l.ty == .str,
         else => false,
     };
@@ -230,7 +232,6 @@ fn isStrExpr(e: *const hir.Expr) bool {
 /// Lower a `str`-valued expression to a `str`-typed MIR instruction.
 fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
-        .fs_read => |fr| return mk(ctx.a, .str, .{ .fs_read = .{ .path = try lowerStrExpr(ctx, fr.path) } }),
         .str_const => |bytes| {
             const off: u32 = @intCast(ctx.data.items.len);
             try ctx.data.appendSlice(ctx.a, bytes);
@@ -343,9 +344,8 @@ fn lowerCond(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
 
 fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
-        // A str value reached the scalar path (a let initializer routed
-        // by the builder): lower on the str path.
-        .fs_read => return lowerStrExpr(ctx, e),
+        // `env.fs.read` yields a boxed Result<str, i64> base pointer.
+        .fs_read => |fr| return mk(ctx.a, .ptr, .{ .fs_read = .{ .path = try lowerStrExpr(ctx, fr.path) } }),
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .float_const => |v| return mk(ctx.a, .f64, .{ .const_f64 = v }),
         .num_cast => |nc| return mk(ctx.a, mapType(nc.to), .{ .num_cast = try lowerExpr(ctx, nc.value) }),

@@ -975,7 +975,13 @@ verified, honest diagnostics throughout.
       narrowing (landed) → `T?` sugar (landed) → `try` (landed) →
       match in callee bodies + enum params (landed) → match in
       record-returning bodies (landed) → str enum payloads (landed)
-      → next: Result-shaped `env.fs.read` (the golden's seam),
+      → Result-shaped `env.fs.read` (landed: `try env.fs.read(path)`
+      propagates — the backend boxes Ok/Err directly, spec/env.md
+      updated; ALSO fixed the latent pointer-bearing-return bug from
+      the str-payloads rung: a `Result<str, _>`-returning call now
+      SKIPS frame reclamation entirely — `ret_ptr_bearing` through
+      hir/mir — since the flat slide would dangle the payload; the
+      recursive slide lands with named regions) → next:,
       `while let`, the `From` conversion on `try`,
       statement-position callee matches, `let x = match …` in callees.
       - [x] **str enum payloads + generic-enum instantiation.**

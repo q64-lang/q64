@@ -1718,37 +1718,42 @@ echo "    ok: Vec -> 3 / 10 / 30 / 5 / 50 / sum = 150 / 205 / 199 (wasm64 + wasm
 # env.fs.read (spec/env.md §"Wire ABI: fs.read"): the @fs capability face —
 # real file contents as a str value; host-grown memory for large files.
 # ---------------------------------------------------------------------------
-echo "==> env.fs.read: the @fs capability face"
+echo "==> env.fs.read: Result<str, i64> + try"
 fs_file="$tmp/q64-fs-test.txt"
 printf 'hello from the disk' > "$fs_file"
 fs_app="$tmp/fsread.q"
 cat > "$fs_app" <<Q64
+fn read_it(path: str) -> Result<str, i64> {
+    let c = try env.fs.read(path)
+    Ok(c)
+}
 fn main {
-    let content = env.fs.read("$fs_file")
-    env.out(content)
-    env.out(content.len)
-    env.out(content.contains("disk"))
+    match env.fs.read("$fs_file") {
+        Ok(content) -> env.out(content),
+        Err(code) -> env.out("error {code}"),
+    }
+    match env.fs.read("/no/such/file-q64") {
+        Ok(content) -> env.out(content),
+        Err(code) -> env.out("error {code}"),
+    }
+    match read_it("$fs_file") {
+        Ok(c) -> env.out(c.len),
+        Err(e) -> env.out("propagated {e}"),
+    }
+    match read_it("/no/such") {
+        Ok(c) -> env.out(c),
+        Err(e) -> env.out("propagated {e}"),
+    }
 }
 Q64
-fs_expected=$'hello from the disk\n19\ntrue'
+fs_expected=$'hello from the disk\nerror 1\n19\npropagated 1'
 "$Q64_BIN" emit "$fs_app" "$tmp/fsread.wasm"
 fs_out="$("$HOST_BIN" "$tmp/fsread.wasm")"
 [[ "$fs_out" == "$fs_expected" ]] || { echo "FAIL: fs.read (got: $fs_out)" >&2; exit 1; }
 "$Q64_BIN" emit "$fs_app" "$tmp/fsread32.wasm" --addr wasm32
 fs32_out="$("$HOST_BIN" "$tmp/fsread32.wasm")"
 [[ "$fs32_out" == "$fs_expected" ]] || { echo "FAIL: fs.read wasm32 (got: $fs32_out)" >&2; exit 1; }
-# A missing file traps (the Result form waits on str enum payloads).
-cat > "$tmp/fsmiss.q" <<'Q64'
-fn main {
-    let c = env.fs.read("/does/not/exist-q64")
-    env.out(c)
-}
-Q64
-"$Q64_BIN" emit "$tmp/fsmiss.q" "$tmp/fsmiss.wasm"
-if "$HOST_BIN" "$tmp/fsmiss.wasm" 2>/dev/null; then
-    echo "FAIL: fs.read of a missing file should trap" >&2; exit 1
-fi
-echo "    ok: env.fs.read -> contents / len / contains + missing-file trap (wasm64 + wasm32)"
+echo "    ok: env.fs.read -> Result Ok/Err + try propagation (wasm64 + wasm32)"
 
 # str enum payloads: Result<str, i64> / Msg.Text(str) / Option<str> + try.
 echo "==> str enum payloads: Result<str, _> / Option<str> / try"

@@ -222,6 +222,11 @@ pub const Func = struct {
     /// returned value's byte size, read by the backend's frame-reclamation
     /// slide (spec/memory.md §"Frame reclamation"). 0 otherwise.
     ret_size: u32 = 0,
+    /// The returned aggregate contains pointers (a str enum payload):
+    /// the flat slide would dangle them, so the call site skips
+    /// reclamation entirely (the spec's pinned interior-pointer
+    /// boundary — recursive slides land with named regions).
+    ret_ptr_bearing: bool = false,
 };
 
 /// High-level statements. `block` is shared; the `host_out*` forms appear in

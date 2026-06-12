@@ -465,11 +465,12 @@ streaming agent) paints its own UI while the host stays in control.
 
 The first hand-specced capability wire ABI beyond `env.out` (decision
 recorded in [`faces.md`](./faces.md) §"Host ABI for capability
-faces"). The v0 surface is `env.fs.read(path: str) -> str` — the
-file's bytes as a `str` value; a missing or unreadable file **traps**
-(the `Result<Bytes, IoError>` form lands when enum payloads grow
-beyond scalar slots). Marks the function `@fs`; the WIT lift imports
-`wasi:filesystem/*`.
+faces"). The v0 surface is `env.fs.read(path: str) ->
+Result<str, i64>` — `Ok(contents)` with the file's bytes as a `str`,
+or `Err(code)` (1 unopenable, 2 doesn't fit in growable memory), so
+`try env.fs.read(path)` propagates. (`IoError`/`Bytes` refine the
+types when those land.) Marks the function `@fs`; the WIT lift
+imports `wasi:filesystem/*`.
 
 Import: `env.fs_read : (dest, path_ptr, path_len) -> i64`, all three
 parameters address-width (i32 on wasm32, i64 on wasm64).
@@ -479,10 +480,9 @@ parameters address-width (i32 on wasm32, i64 on wasm64).
    (relative paths resolve against the host's working directory),
    **grows the guest memory if needed**, writes the contents at
    `dest`, and returns the byte length.
-2. A negative return means failure (`-1` unopenable, `-2` doesn't fit
-   in growable memory); the guest traps on it.
-3. On success the guest bumps `sp` past the contents and yields the
-   `(dest, len)` str value.
+2. A negative return means failure; the guest boxes `Err(-len)`.
+3. On success the guest bumps `sp` past the contents and boxes
+   `Ok((dest, len))` — a `Result<str, i64>` value.
 
 The v0 host grants `@fs` unconditionally; the runtime-denial story
 (ENV030, `with_capabilities`) gates it later.

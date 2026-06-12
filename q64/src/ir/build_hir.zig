@@ -1437,7 +1437,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         const ty = scope.locals.items[scope.n_params + j].ty;
         t.* = if (ty == .str) .ptr else ty;
     }
-        b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .locals = rec_locals, .body = block, .ret_size = want.size };
+        b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .locals = rec_locals, .body = block, .ret_size = want.size, .ret_ptr_bearing = enumHasStrPayload(b, want) };
         return id;
     }
 
@@ -1648,6 +1648,25 @@ fn buildRecMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, want: *const Str
     return out;
 }
 
+/// Does the enum's box carry a str payload in any variant?
+fn enumHasStrPayload(b: *Builder, si: *const StructInfo) bool {
+    const info = b.enums.get(si.name) orelse return false;
+    _ = info;
+    // The si belongs to some instantiation; conservatively treat any
+    // Result/Option-family return as pointer-bearing when its box is
+    // wider than tag+1 cell would suggest a str slot. Exact: scan all
+    // cached instantiations for this si.
+    var it = b.enum_insts.valueIterator();
+    while (it.next()) |inst| {
+        if (inst.*.si == si) {
+            for (inst.*.variants) |v| {
+                if (v.kind == .str_) return true;
+            }
+        }
+    }
+    return false;
+}
+
 /// Two enum instantiations are layout-compatible when they share the
 /// enum (`Err(404)` constructed standalone is the base layout; in a
 /// `-> Result<str, i64>` context the tag + int cells coincide, and the
@@ -1797,15 +1816,6 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
                         return out;
                     }
                 }
-            }
-            // `env.fs.read(path)` — the @fs capability face (spec/env.md
-            // §"Wire ABI: fs.read"): the file's bytes as a str value.
-            if (std.mem.eql(u8, cname, "env.fs.read")) {
-                var fit_args = cc.args();
-                const parg = fit_args.next() orelse return error.Unsupported;
-                if (fit_args.next() != null) return error.Unsupported;
-                out.* = .{ .fs_read = .{ .path = try buildStrExpr(b, parg, scope, rt) } };
-                return out;
             }
             // `<str>.slice(start, end)` parses as a call with a dotted path callee
             // (like `qview.set_attr(…)`). The str-VALUED method.
@@ -2151,7 +2161,6 @@ fn isStrCall(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
     };
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
-    if (std.mem.eql(u8, cname, "env.fs.read")) return true;
     if (std.mem.indexOfScalar(u8, cname, '.')) |dot| {
         const mname = cname[dot + 1 ..];
         if (std.mem.indexOfScalar(u8, mname, '.') != null) return false;
@@ -2631,6 +2640,10 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
                     }
                 }
                 return ev.info;
+            }
+            if (std.mem.eql(u8, txt, "env.fs.read")) {
+                const base_info = b.enums.get("Result") orelse return null;
+                return try instantiateEnum(b, base_info, "siii");
             }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (b.resolver.lookup(txt)) |fd| return enumOfRet(b, fd);
@@ -3554,6 +3567,22 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
             return .{ .e = try elemPtrExpr(b, ai, idx), .si = si };
         },
         .call => |cc| {
+            // `env.fs.read(path)` yields a boxed Result<str, i64>
+            // (spec/env.md §"Wire ABI: fs.read").
+            if (callPathName(b, cc)) |fsname| {
+                defer b.a.free(fsname);
+                if (std.mem.eql(u8, fsname, "Vec.from")) return null;
+                if (std.mem.eql(u8, fsname, "env.fs.read")) {
+                    var fa = cc.args();
+                    const parg = fa.next() orelse return error.Unsupported;
+                    if (fa.next() != null) return error.Unsupported;
+                    const base_info = b.enums.get("Result") orelse return error.Unsupported;
+                    const inst = try instantiateEnum(b, base_info, "siii");
+                    const e2 = try b.a.create(hir.Expr);
+                    e2.* = .{ .fs_read = .{ .path = try buildStrExpr(b, parg, scope, null) } };
+                    return .{ .e = e2, .si = inst.si.? };
+                }
+            }
             // C3: a payload-variant construction (`Shape.Circle(7)`):
             // allocate the boxed value {tag, p0 ..} in the scope arena.
             if (try enumCtorValue(b, cc, scope)) |ev| return ev;
@@ -3966,7 +3995,6 @@ const ExprTypeBridge = struct {
                 else => .i64,
             };
         }
-        if (std.mem.eql(u8, name, "env.fs.read")) return .str;
         // A dotted call on a record binding (`r.wide()`): the fit
         // method's declared return type — or a str method on a str
         // local (`s.contains(…)` parses as one dotted callee path).
@@ -7102,14 +7130,15 @@ test "Vec v0 floor: from/push/len/index/for, growth, honest boundaries" {
     )) == null);
 }
 
-test "env.fs.read: a str-valued @fs capability face" {
+test "env.fs.read: a Result<str, i64> @fs capability face" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
     var mod = (try buildLocal(testing.allocator, &tr,
         \\fn main {
-        \\    let content = env.fs.read("config.txt")
-        \\    env.out(content)
-        \\    env.out(content.len)
+        \\    match env.fs.read("config.txt") {
+        \\        Ok(content) -> env.out(content.len),
+        \\        Err(code) -> env.out(code),
+        \\    }
         \\}
         \\
     )) orelse return error.TestUnexpectedResult;

@@ -82,6 +82,11 @@ pub const Func = struct {
     /// this many bytes down to the call-site watermark
     /// (spec/memory.md §"Frame reclamation"). 0 otherwise.
     ret_size: u32 = 0,
+    /// The returned aggregate contains pointers (a str enum payload):
+    /// the flat slide would dangle them, so the call site skips
+    /// reclamation entirely (the spec's pinned interior-pointer
+    /// boundary — recursive slides land with named regions).
+    ret_ptr_bearing: bool = false,
 };
 
 /// A function body in one of two interchangeable forms. **Structured is the

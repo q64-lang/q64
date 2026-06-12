@@ -1429,6 +1429,10 @@ const Lowerer = struct {
                 }
                 const callee = self.funcs[cl.func];
                 const callex = c.BinaryenCall(module, callee.name.ptr, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.wty(n.ty));
+                // A pointer-bearing aggregate return (a str enum payload)
+                // cannot slide flat — skip reclamation entirely (the
+                // spec's pinned interior-pointer boundary).
+                if (callee.ret_ptr_bearing) return callex;
                 return self.slideCall(d, n.ty, callee.ret_size, callex);
             },
             .str_param => |idx| {
@@ -1511,27 +1515,47 @@ const Lowerer = struct {
             },
             .global_get => |idx| return c.BinaryenGlobalGet(module, self.global_names[idx], self.i64_type),
             .fs_read => |fr| {
-                // dest = sp; len = env.fs_read(dest, path…); trap if len < 0;
-                // sp = dest + len; yield (dest, len).
+                // A boxed Result<str, i64> (spec/env.md §"Wire ABI: fs.read"):
+                // hdr = align8(sp); sp = hdr+24; dest = sp;
+                // len = env.fs_read(dest, path…);
+                // len < 0 → {tag=Err, cell8 = -len}; else sp = dest+len,
+                // {tag=Ok, cell8 = dest, cell16 = len}. Yields hdr.
+                const hdr = self.fs_dest_idx; // reuse: hdr ptr scratch
+                const lenl = self.fs_len_idx;
+                const i64c0 = c.BinaryenConst(module, c.BinaryenLiteralInt64(0));
                 const pget = c.BinaryenLocalGet(module, self.pair_idx, self.pair_type);
                 var call_args = [_]c.BinaryenExpressionRef{
-                    self.ptrGet(self.fs_dest_idx),
+                    c.BinaryenGlobalGet(module, "sp", self.ptr_type),
                     c.BinaryenTupleExtract(module, pget, 0),
                     c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
                 };
-                var pair_elems = [_]c.BinaryenExpressionRef{
-                    self.ptrGet(self.fs_dest_idx),
-                    self.toPtr(c.BinaryenLocalGet(module, self.fs_len_idx, self.i64_type)),
+                const lget = c.BinaryenLocalGet(module, lenl, self.i64_type);
+                // Err branch: tag=1, cell8 = -len.
+                var errseq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenStore(module, 8, 0, 0, self.ptrGet(hdr), c.BinaryenConst(module, c.BinaryenLiteralInt64(1)), self.i64_type, "0"),
+                    c.BinaryenStore(module, 8, 8, 0, self.ptrGet(hdr), c.BinaryenBinary(module, c.BinaryenSubInt64(), i64c0, lget), self.i64_type, "0"),
+                };
+                // Ok branch: sp = dest+len; tag=0; cell8 = dest; cell16 = len.
+                var okseq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenGlobalSet(module, "sp", self.ptrAdd(c.BinaryenGlobalGet(module, "sp", self.ptr_type), self.toPtr(lget))),
+                    c.BinaryenStore(module, 8, 0, 0, self.ptrGet(hdr), i64c0, self.i64_type, "0"),
+                    c.BinaryenStore(module, 8, 8, 0, self.ptrGet(hdr), self.toI64(self.ptrAdd(self.ptrGet(hdr), self.ptrConst(24))), self.i64_type, "0"),
+                    c.BinaryenStore(module, 8, 16, 0, self.ptrGet(hdr), lget, self.i64_type, "0"),
                 };
                 var seq = [_]c.BinaryenExpressionRef{
                     c.BinaryenLocalSet(module, self.pair_idx, try self.inst(fr.path)),
-                    c.BinaryenLocalSet(module, self.fs_dest_idx, c.BinaryenGlobalGet(module, "sp", self.ptr_type)),
-                    c.BinaryenLocalSet(module, self.fs_len_idx, c.BinaryenCall(module, "env_fs_read", @ptrCast(&call_args), call_args.len, self.i64_type)),
-                    c.BinaryenIf(module, c.BinaryenBinary(module, c.BinaryenLtSInt64(), c.BinaryenLocalGet(module, self.fs_len_idx, self.i64_type), c.BinaryenConst(module, c.BinaryenLiteralInt64(0))), c.BinaryenUnreachable(module), null),
-                    c.BinaryenGlobalSet(module, "sp", self.ptrAdd(self.ptrGet(self.fs_dest_idx), self.toPtr(c.BinaryenLocalGet(module, self.fs_len_idx, self.i64_type)))),
-                    c.BinaryenTupleMake(module, @ptrCast(&pair_elems), pair_elems.len),
+                    c.BinaryenLocalSet(module, hdr, self.ptrAnd(self.ptrAdd(c.BinaryenGlobalGet(module, "sp", self.ptr_type), self.ptrConst(7)), self.ptrConst(-8))),
+                    c.BinaryenGlobalSet(module, "sp", self.ptrAdd(self.ptrGet(hdr), self.ptrConst(24))),
+                    c.BinaryenLocalSet(module, lenl, c.BinaryenCall(module, "env_fs_read", @ptrCast(&call_args), call_args.len, self.i64_type)),
+                    c.BinaryenIf(
+                        module,
+                        c.BinaryenBinary(module, c.BinaryenLtSInt64(), lget, i64c0),
+                        c.BinaryenBlock(module, null, @ptrCast(&errseq), errseq.len, self.none_type),
+                        c.BinaryenBlock(module, null, @ptrCast(&okseq), okseq.len, self.none_type),
+                    ),
+                    self.ptrGet(hdr),
                 };
-                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.pair_type);
+                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.ptr_type);
             },
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
             .vec_push => |vp| {
