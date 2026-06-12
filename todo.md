@@ -974,10 +974,35 @@ verified, honest diagnostics throughout.
       (landed) → enum returns from functions (landed) → `if let`
       narrowing (landed) → `T?` sugar (landed) → `try` (landed) →
       match in callee bodies + enum params (landed) → match in
-      record-returning bodies (landed) → next: `while let`, the
-      `From` conversion on `try` (cross-E propagation),
-      statement-position callee matches with side-effecting arms,
-      `let x = match …` inside callees.
+      record-returning bodies (landed) → str enum payloads (landed)
+      → next: Result-shaped `env.fs.read` (the golden's seam),
+      `while let`, the `From` conversion on `try`,
+      statement-position callee matches, `let x = match …` in callees.
+      - [x] **str enum payloads + generic-enum instantiation.**
+            `Result<str, i64>`, `Option<str>`, and declared str slots
+            (`Msg.Text(str)`) work end-to-end: construction
+            (`Ok("found it")` — a str arg to a generic slot picks the
+            str instantiation; `Err(404)` rides the layout-compatible
+            base, relaxed by `enumCompatible`), match arms binding str
+            payloads (`Ok(content)` → two .ptr locals read from cells
+            8/16 via `num_cast .ptr`), and **`try` with a str Ok
+            payload** (`let s = try lookup(n)` binds a str). The
+            pieces: `EnumVariant` gains `kind` (ints / str_ / param) +
+            `pidx`; `instantiateEnum` caches per-key (`"Name\0siii"`)
+            clones with resolved kinds and a re-sized box —
+            annotations (`-> Result<str, i64>`, `str?`) and
+            construction inference share the cache so type identity
+            stays pointer identity; `record_alloc`/`record_make` grew
+            a `str_inits` channel (the pair stored widened into two
+            8-byte cells); str body bindings declare via
+            `declareStrBodyLocal` (scope `.str` entry backed by two
+            address-width locals — the callee locals collectors map
+            `.str` → `.ptr`). Verified end-to-end wasm64 + wasm32
+            (roundtrip str-payloads section) + 1 unit test. 400 unit /
+            81 CLI / 24-of-51 / roundtrips green. **Boundary:**
+            single-slot str/param payloads (multi-slot stays the i64
+            floor); record payloads later; `env.out` of a whole enum
+            still unsupported.
       - [x] **Match in record-returning bodies.** Transform functions
             close the loop: `fn flip(o: Option<i64>) -> Option<i64> {
             match o { Some(v) -> Some(v * 2), None -> Some(0) } }` and

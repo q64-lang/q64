@@ -1750,4 +1750,55 @@ if "$HOST_BIN" "$tmp/fsmiss.wasm" 2>/dev/null; then
 fi
 echo "    ok: env.fs.read -> contents / len / contains + missing-file trap (wasm64 + wasm32)"
 
+# str enum payloads: Result<str, i64> / Msg.Text(str) / Option<str> + try.
+echo "==> str enum payloads: Result<str, _> / Option<str> / try"
+spay_app="$tmp/strpay.q"
+cat > "$spay_app" <<'Q64'
+enum Msg { Text(str), Code(i64), Nothing }
+fn lookup(n: i64) -> Result<str, i64> {
+    if n > 0 { Ok("found it") } else { Err(404) }
+}
+fn chain(n: i64) -> Result<str, i64> {
+    let s = try lookup(n)
+    Ok(s)
+}
+fn main {
+    match lookup(1) {
+        Ok(content) -> env.out(content),
+        Err(code) -> env.out(code),
+    }
+    match lookup(0 - 1) {
+        Ok(content) -> env.out(content),
+        Err(code) -> env.out("error {code}"),
+    }
+    let m = Msg.Text("boxed string")
+    match m {
+        Text(t) -> env.out(t.len),
+        Code(c) -> env.out(c),
+        Nothing -> env.out("none"),
+    }
+    let o = Some("optional payload")
+    match o {
+        Some(v) -> env.out(v),
+        None -> env.out("none"),
+    }
+    match chain(5) {
+        Ok(s) -> env.out("chained: {s}"),
+        Err(c) -> env.out(c),
+    }
+    match chain(0 - 2) {
+        Ok(s) -> env.out(s),
+        Err(c) -> env.out("err {c}"),
+    }
+}
+Q64
+spay_expected=$'found it\nerror 404\n12\noptional payload\nchained: found it\nerr 404'
+"$Q64_BIN" emit "$spay_app" "$tmp/strpay.wasm"
+spay_out="$("$HOST_BIN" "$tmp/strpay.wasm")"
+[[ "$spay_out" == "$spay_expected" ]] || { echo "FAIL: str-payloads (got: $spay_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$spay_app" "$tmp/strpay32.wasm" --addr wasm32
+spay32_out="$("$HOST_BIN" "$tmp/strpay32.wasm")"
+[[ "$spay32_out" == "$spay_expected" ]] || { echo "FAIL: str-payloads wasm32 (got: $spay32_out)" >&2; exit 1; }
+echo "    ok: str enum payloads -> found it / error 404 / 12 / optional payload / chained / err 404 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

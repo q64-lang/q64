@@ -122,6 +122,10 @@ const Builder = struct {
     /// This file's all-unit enum declarations (C1): a variant value is
     /// its declaration-order tag (an i64 at the compute floor).
     enums: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
+    /// Generic-enum instantiations (`Option<str>`): "Name\x00key" →
+    /// the resolved EnumInfo (key = one 'i'/'s' char per type param).
+    /// The base registry entry IS the all-'i' instantiation.
+    enum_insts: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
     /// The fit registry (sema/fits.zig) over this file — B4 static
     /// dispatch resolves `p.area()` through it. Arena-backed (never
     /// deinit'd separately).
@@ -747,6 +751,45 @@ fn declareMatchScrutinee(b: *Builder, scope: *Scope, scrut: ast.Expr, boxed: boo
 /// statements that bind its payload slots into fresh locals.
 const ArmPattern = struct { tag: i64, prelude: []const *hir.Stmt };
 
+/// A str-payload arm (`Ok(content)`): one ident sub-pattern binding a
+/// str — ptr/len locals loaded from the boxed value's cells 8 and 16.
+fn resolveStrArm(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope: *Scope, s_idx: u32, tag: u32) BuildError!?ArmPattern {
+    _ = info;
+    var sub_name: ?[]const u8 = null;
+    var n: u32 = 0;
+    for (pat.cst.children) |c| switch (c) {
+        .node => |sub| {
+            const sp = ast.Pattern.cast(sub) orelse continue;
+            if (n > 0) return error.Unsupported; // one slot
+            switch (sp.kind()) {
+                .WILD_PATTERN => {},
+                .IDENT_PATTERN => sub_name = (sp.bindingName() orelse return error.Unsupported).text,
+                else => return error.Unsupported,
+            }
+            n += 1;
+        },
+        .token => {},
+    };
+    if (n != 1) return error.Unsupported;
+    var prelude: std.ArrayList(*hir.Stmt) = .empty;
+    if (sub_name) |nm| {
+        const ptr_idx = try declareStrBodyLocal(b, scope, nm);
+        const len_idx = ptr_idx + 1;
+        for ([_]struct { idx: u32, off: u32 }{ .{ .idx = ptr_idx, .off = 8 }, .{ .idx = len_idx, .off = 16 } }) |cell| {
+            const base = try b.a.create(hir.Expr);
+            base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+            const ld = try b.a.create(hir.Expr);
+            ld.* = .{ .field_get = .{ .base = base, .offset = cell.off, .ty = .i64 } };
+            const cast = try b.a.create(hir.Expr);
+            cast.* = .{ .num_cast = .{ .to = .ptr, .value = ld } };
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .let = .{ .idx = cell.idx, .value = cast } };
+            try prelude.append(b.a, st);
+        }
+    }
+    return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a) };
+}
+
 /// Resolve a match-arm pattern against the enum. `null` = wildcard.
 fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope: *Scope, s_idx: u32) BuildError!?ArmPattern {
     switch (pat.kind()) {
@@ -760,9 +803,14 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
         .TUPLE_STRUCT_PATTERN, .ENUM_VARIANT_PATTERN => {
             // `Circle(r)` / `Rect(w, _)`: head variant + sub-patterns,
             // one per payload slot. Each ident binds a fresh i64 local
-            // loaded from the boxed value.
+            // loaded from the boxed value. A str payload (`Ok(content)`
+            // on a Result<str, _>) binds a str: two .ptr locals read
+            // from cells 8/16, narrowed to address width.
             const head = patternHeadName(pat.cst) orelse return error.Unsupported;
             const tag = info.variantTag(head) orelse return reject(b, .name_not_found);
+            if (info.variants[tag].kind == .str_) {
+                return resolveStrArm(b, info, pat, scope, s_idx, @intCast(tag));
+            }
             const arity = info.variants[tag].arity;
             var prelude: std.ArrayList(*hir.Stmt) = .empty;
             var n: u32 = 0;
@@ -1385,7 +1433,10 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         // Leading statements (incl. the try desugar) declare locals.
         const rec_extra = scope.extra();
         const rec_locals = try b.a.alloc(hir.Type, rec_extra);
-        for (rec_locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
+        for (rec_locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty;
+    }
         b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .ptr, .locals = rec_locals, .body = block, .ret_size = want.size };
         return id;
     }
@@ -1399,7 +1450,10 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     const locals = try b.a.alloc(hir.Type, extra);
     // The non-parameter locals, in index order, carry their declared types
     // (i64 by default, bool for a boolean `let`/`var` binding).
-    for (locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
+    for (locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty; // a str binding's backing slots are address-width
+    }
 
     b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
@@ -1449,14 +1503,16 @@ fn buildRecSetupStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, want: *const St
 /// `Ok` bind the payload slot (one i64).
 fn buildTryLet(b: *Builder, ls: ast.LetStmt, te: ast.TryExpr, scope: *Scope, want: *const StructInfo, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     const res_info = b.enums.get("Result") orelse return error.Unsupported;
-    const resi = res_info.si orelse return error.Unsupported;
+    if (res_info.si == null) return error.Unsupported;
     // `try` requires the *enclosing* function to return Result — the
-    // friendly diagnostic (TYP300) is `q64 check`'s.
-    if (want != resi) return error.Unsupported;
+    // friendly diagnostic (TYP300) is `q64 check`'s. Instantiations
+    // share the enum name; the box layout is per-instantiation.
+    if (!std.mem.eql(u8, want.name, "Result")) return error.Unsupported;
     const err_tag: i64 = @intCast(res_info.variantTag("Err") orelse return error.Unsupported);
     const operand = te.operand() orelse return error.Unsupported;
     const info = (try enumOfExpr(b, scope, operand)) orelse return error.Unsupported;
-    if (info.si != resi) return error.Unsupported; // `try` takes a Result value
+    const isi = info.si orelse return error.Unsupported;
+    if (!std.mem.eql(u8, isi.name, "Result")) return error.Unsupported; // `try` takes a Result
     const rv = (try buildRecExpr(b, operand, scope)) orelse return error.Unsupported;
 
     // tmp = <operand>, evaluated once.
@@ -1485,8 +1541,26 @@ fn buildTryLet(b: *Builder, ls: ast.LetStmt, te: ast.TryExpr, scope: *Scope, wan
     iff.* = .{ .if_ = .{ .cond = cond, .then_ = then_blk, .else_ = null } };
     try out.append(b.a, iff);
 
-    // let x = tmp.#p0 — the Ok payload (an i64 at the floor).
+    // let x = the Ok payload: an i64 cell, or a str (ptr/len cells 8/16,
+    // narrowed to address width) when the instantiation says so.
     const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+    const ok_tag = res_info.variantTag("Ok") orelse return error.Unsupported;
+    if (info.variants[ok_tag].kind == .str_) {
+        const ptr_idx = try declareStrBodyLocal(b, scope, nm.text);
+        const len_idx = ptr_idx + 1;
+        for ([_]struct { idx: u32, off: u32 }{ .{ .idx = ptr_idx, .off = 8 }, .{ .idx = len_idx, .off = 16 } }) |cell| {
+            const base2 = try b.a.create(hir.Expr);
+            base2.* = .{ .local = .{ .idx = tmp_idx, .ty = .ptr } };
+            const ld = try b.a.create(hir.Expr);
+            ld.* = .{ .field_get = .{ .base = base2, .offset = cell.off, .ty = .i64 } };
+            const cast = try b.a.create(hir.Expr);
+            cast.* = .{ .num_cast = .{ .to = .ptr, .value = ld } };
+            const st2 = try b.a.create(hir.Stmt);
+            st2.* = .{ .let = .{ .idx = cell.idx, .value = cast } };
+            try out.append(b.a, st2);
+        }
+        return;
+    }
     const base2 = try b.a.create(hir.Expr);
     base2.* = .{ .local = .{ .idx = tmp_idx, .ty = .ptr } };
     const ld = try b.a.create(hir.Expr);
@@ -1574,10 +1648,19 @@ fn buildRecMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, want: *const Str
     return out;
 }
 
+/// Two enum instantiations are layout-compatible when they share the
+/// enum (`Err(404)` constructed standalone is the base layout; in a
+/// `-> Result<str, i64>` context the tag + int cells coincide, and the
+/// declared instantiation's size governs the caller's slide).
+fn enumCompatible(b: *Builder, got: *const StructInfo, want: *const StructInfo) bool {
+    if (!std.mem.eql(u8, got.name, want.name)) return false;
+    return b.enums.contains(got.name);
+}
+
 /// Build `e` as a record value of exactly `want`, as a tail statement.
 fn recValueStmt(b: *Builder, e: ast.Expr, scope: *Scope, want: *const StructInfo) BuildError!*hir.Stmt {
     const rv = (try buildRecExpr(b, e, scope)) orelse return error.Unsupported;
-    if (rv.si != want) return reject(b, .unsupported_call); // a different struct/enum
+    if (rv.si != want and !enumCompatible(b, rv.si, want)) return reject(b, .unsupported_call); // a different struct/enum
     const vstmt = try b.a.create(hir.Stmt);
     vstmt.* = .{ .expr = rv.e };
     return vstmt;
@@ -2191,7 +2274,19 @@ fn buildNarrowValue(b: *Builder, ty: hir.Type, fval: ast.Expr) BuildError!*hir.E
 /// field outside the v0 floor — or with no record fields at all — is not
 /// registered; a use of it stays the honest `Unsupported`.
 /// One enum variant: its name and tuple-payload arity (0 = unit).
-const EnumVariant = struct { name: []const u8, arity: u32 };
+/// What a variant's payload holds (the v0 floor). `arity` is the
+/// physical 8-byte cell count (`ints` n → n, `str_` → 2, `param` → per
+/// instantiation).
+const PayKind = enum {
+    /// N i64 cells (the C3 floor).
+    ints,
+    /// One str payload: (ptr, len) in two cells (offset 8 / 16).
+    str_,
+    /// One generic slot (`Some(T)`) — resolved per instantiation;
+    /// unresolved uses default to one i64 cell.
+    param,
+};
+const EnumVariant = struct { name: []const u8, arity: u32, kind: PayKind = .ints, pidx: u8 = 0 };
 
 /// A registered enum: variant names in declaration order (a variant's
 /// tag is its index). All-unit enums are *immediate* — a value is its
@@ -2237,11 +2332,11 @@ fn registerEnums(b: *Builder, sf: ast.SourceFile) BuildError!void {
                     ok = false;
                     break;
                 };
-                const arity = variantArity(v, sig) orelse {
-                    ok = false; // record payloads / non-i64 fields: later
+                const slots = variantSlots(v, sig) orelse {
+                    ok = false; // record payloads / non-floor fields: later
                     break;
                 };
-                try vars.append(b.a, .{ .name = vname.text, .arity = arity });
+                try vars.append(b.a, .{ .name = vname.text, .arity = slots.arity, .kind = slots.kind, .pidx = slots.pidx });
             }
             if (!ok or vars.items.len == 0) {
                 vars.deinit(b.a);
@@ -2256,14 +2351,14 @@ fn registerEnums(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // so the prelude entry is skipped).
     if (!b.enums.contains("Option")) {
         try registerEnum(b, "Option", try b.a.dupe(EnumVariant, &.{
-            .{ .name = "Some", .arity = 1 },
+            .{ .name = "Some", .arity = 1, .kind = .param, .pidx = 0 },
             .{ .name = "None", .arity = 0 },
         }));
     }
     if (!b.enums.contains("Result")) {
         try registerEnum(b, "Result", try b.a.dupe(EnumVariant, &.{
-            .{ .name = "Ok", .arity = 1 },
-            .{ .name = "Err", .arity = 1 },
+            .{ .name = "Ok", .arity = 1, .kind = .param, .pidx = 0 },
+            .{ .name = "Err", .arity = 1, .kind = .param, .pidx = 1 },
         }));
     }
 }
@@ -2299,22 +2394,36 @@ fn registerEnum(b: *Builder, name: []const u8, vars: []const EnumVariant) BuildE
     try b.enums.put(b.a, name, info);
 }
 
-/// The tuple-payload arity of a variant at the v0 floor: 0 for a unit
-/// variant, N for `(slot, … slot)` where each slot is exactly `i64`
-/// or one of the enum's type params (N ≤ 4). `null` for record
-/// payloads or anything else.
-fn variantArity(v: ast.Variant, sig: ?sema.fits.GenericSig) ?u32 {
+/// A variant's payload at the v0 floor: 0 cells for a unit variant;
+/// N `i64` slots; ONE `str` slot (two cells); or ONE type-param slot
+/// (`Some(T)` — resolved per instantiation). `null` for record
+/// payloads, mixed slot kinds, or anything else.
+const VariantSlots = struct { arity: u32, kind: PayKind, pidx: u8 };
+fn variantSlots(v: ast.Variant, sig: ?sema.fits.GenericSig) ?VariantSlots {
     var buf: [4 * max_enum_payload]parser.cst.Token = undefined;
     var n: usize = 0;
     if (!flattenVariantTokens(v.cst, &buf, &n, true)) return null;
-    if (n == 0) return 0; // unit
+    if (n == 0) return .{ .arity = 0, .kind = .ints, .pidx = 0 }; // unit
     // Expect exactly: ( slot (, slot)* ,? )
     if (buf[0].kind != .L_PAREN or buf[n - 1].kind != .R_PAREN) return null;
+    // One str / one type-param slot: `(str)` / `(T)`.
+    if (n == 3 and buf[1].kind == .IDENT) {
+        const t1 = buf[1].text;
+        if (std.mem.eql(u8, t1, "str")) return .{ .arity = 2, .kind = .str_, .pidx = 0 };
+        if (sig) |sg| {
+            for (sg.params[0..sg.n], 0..) |p, i| {
+                if (std.mem.eql(u8, t1, p.tname)) return .{ .arity = 1, .kind = .param, .pidx = @intCast(i) };
+            }
+        }
+    }
+    // N i64 cells; a type-param name in a MULTI-slot payload stays at
+    // the i64 floor (`Full(T, T)` — per-slot str instantiation is a
+    // later slice; the single-slot form above handles `Some(T)`).
     var arity: u32 = 0;
     var i: usize = 1;
     while (i < n - 1) {
         const t = buf[i];
-        if (t.kind == .IDENT and payloadSlotOk(t.text, sig)) {
+        if (t.kind == .IDENT and (std.mem.eql(u8, t.text, "i64") or paramNameOk(t.text, sig))) {
             arity += 1;
             i += 1;
             if (i < n - 1) {
@@ -2324,18 +2433,89 @@ fn variantArity(v: ast.Variant, sig: ?sema.fits.GenericSig) ?u32 {
         } else return null;
     }
     if (arity == 0 or arity > max_enum_payload) return null;
-    return arity;
+    return .{ .arity = arity, .kind = .ints, .pidx = 0 };
 }
 
-/// A payload slot type at the v0 floor: `i64`, or a type param of the
-/// declaring enum (stored as an 8-byte slot, the i64 compute floor).
-fn payloadSlotOk(text: []const u8, sig: ?sema.fits.GenericSig) bool {
-    if (std.mem.eql(u8, text, "i64")) return true;
-    const s = sig orelse return false;
-    for (s.params[0..s.n]) |p| {
+fn paramNameOk(text: []const u8, sig: ?sema.fits.GenericSig) bool {
+    const sg = sig orelse return false;
+    for (sg.params[0..sg.n]) |p| {
         if (std.mem.eql(u8, text, p.tname)) return true;
     }
     return false;
+}
+
+/// The instantiation a path type's generic args pick (`Result<str, i64>`
+/// → key "si"): each arg whose trimmed text is `str` maps to 's'.
+fn instFromGenericArgs(b: *Builder, info: *const EnumInfo, pt: ast.PathType) BuildError!*const EnumInfo {
+    var skey = [_]u8{ 'i', 'i', 'i', 'i' };
+    if (try pt.genericArgsText(b.a)) |raw| {
+        defer b.a.free(raw);
+        var txt = raw;
+        if (txt.len >= 2 and txt[0] == '<') txt = txt[1 .. txt.len - 1];
+        var it = std.mem.splitScalar(u8, txt, ',');
+        var i: usize = 0;
+        while (it.next()) |part| : (i += 1) {
+            if (i >= skey.len) break;
+            const trimmed = std.mem.trim(u8, part, " \t");
+            if (std.mem.eql(u8, trimmed, "str")) skey[i] = 's';
+        }
+    }
+    return instantiateEnum(b, info, &skey);
+}
+
+/// The instantiation `T?` picks: `str?` → Option<str>.
+fn instFromOptionalInner(b: *Builder, info: *const EnumInfo, ot: ast.OptionalType) BuildError!*const EnumInfo {
+    var skey = [_]u8{ 'i', 'i', 'i', 'i' };
+    if (ot.inner()) |inner| {
+        if (inner == .path) {
+            const nm = try inner.path.name(b.a);
+            defer b.a.free(nm);
+            if (std.mem.eql(u8, nm, "str")) skey[0] = 's';
+        }
+    }
+    return instantiateEnum(b, info, &skey);
+}
+
+/// Resolve a generic enum to a concrete instantiation. `skey` holds one
+/// 'i'/'s' per type param; the base registry entry IS the all-'i'
+/// instantiation (today's behavior). Cached, so equal keys share one
+/// EnumInfo (and one si — type identity is pointer identity).
+fn instantiateEnum(b: *Builder, info: *const EnumInfo, skey: []const u8) BuildError!*const EnumInfo {
+    var all_int = true;
+    for (skey) |k| {
+        if (k != 'i') all_int = false;
+    }
+    if (all_int) return info;
+    const key = try std.fmt.allocPrint(b.a, "{s}\x00{s}", .{ info.name, skey });
+    if (b.enum_insts.get(key)) |inst| return inst;
+    const vars = try b.a.dupe(EnumVariant, info.variants);
+    for (vars) |*v| {
+        if (v.kind != .param) continue;
+        const k = if (v.pidx < skey.len) skey[v.pidx] else 'i';
+        if (k == 's') {
+            v.kind = .str_;
+            v.arity = 2;
+        } else {
+            v.kind = .ints;
+            v.arity = 1;
+        }
+    }
+    var max_arity: u32 = 0;
+    for (vars) |v| {
+        if (v.arity > max_arity) max_arity = v.arity;
+    }
+    const sz: u32 = 8 * (max_arity + 1);
+    const si = try b.a.create(StructInfo);
+    si.* = .{
+        .name = info.name,
+        .fields = info.si.?.fields, // the #tag field; payload cells are untyped
+        .size = sz,
+        .alignment = 8,
+    };
+    const inst = try b.a.create(EnumInfo);
+    inst.* = .{ .name = info.name, .variants = vars, .si = si };
+    try b.enum_insts.put(b.a, key, inst);
+    return inst;
 }
 
 /// Flatten a variant's non-trivia tokens (past the name) into `buf`.
@@ -2436,7 +2616,22 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             };
             const txt = try cp.text(b.a);
             defer b.a.free(txt);
-            if (enumVariantTag(b, txt)) |ev| return ev.info;
+            if (enumVariantTag(b, txt)) |ev| {
+                // Mirror enumCtorValue's inference: a str argument to a
+                // generic slot picks the str instantiation.
+                const variant = ev.info.variants[@intCast(ev.tag)];
+                if (variant.kind == .param) {
+                    var a1 = cc.args();
+                    if (a1.next()) |arg| {
+                        if ((try exprScalar(b, arg, scope)) == .str) {
+                            var skey = [_]u8{ 'i', 'i', 'i', 'i' };
+                            skey[variant.pidx] = 's';
+                            return try instantiateEnum(b, ev.info, &skey);
+                        }
+                    }
+                }
+                return ev.info;
+            }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (b.resolver.lookup(txt)) |fd| return enumOfRet(b, fd);
             }
@@ -2452,11 +2647,11 @@ fn enumOfRet(b: *Builder, fd: ast.FnDecl) BuildError!?*const EnumInfo {
     const rt = fd.returnType() orelse return null;
     const pt = switch (rt.type_() orelse return null) {
         .path => |x| x,
-        .optional => {
+        .optional => |ot| {
             // `T?` ≡ `Option<T>`.
             const info = b.enums.get("Option") orelse return null;
             if (info.si == null) return null;
-            return info;
+            return try instFromOptionalInner(b, info, ot);
         },
         else => return null,
     };
@@ -2464,7 +2659,7 @@ fn enumOfRet(b: *Builder, fd: ast.FnDecl) BuildError!?*const EnumInfo {
     defer b.a.free(nm);
     const info = b.enums.get(nm) orelse return null;
     if (info.si == null) return null; // immediate enums return as i64: later
-    return info;
+    return try instFromGenericArgs(b, info, pt);
 }
 
 fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
@@ -2518,20 +2713,24 @@ fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInf
             const nm = try pt.name(b.a);
             defer b.a.free(nm);
             // A boxed enum value is a record (`-> Option<i64>`,
-            // `o: Shape`). Generic args only parameterize the payload
-            // slots, which are uniformly 8 bytes at this floor, so
-            // `Option<i64>` and `Option<bool>` share the shape. An
+            // `o: Shape`). Generic args pick the payload-slot kinds
+            // (`Result<str, i64>` instantiates Ok with a str slot). An
             // *immediate* (all-unit) enum is an i64 value, not a
             // record — null here, and the scalar path stays honest.
-            if (b.enums.get(nm)) |info| return info.si;
+            if (b.enums.get(nm)) |info| {
+                if (info.si == null) return null;
+                const inst = try instFromGenericArgs(b, info, pt);
+                return inst.si;
+            }
             if (pt.hasGenericArgs()) return null;
             return b.structs.get(nm);
         },
-        .optional => {
-            // `T?` ≡ `Option<T>` (errors.md §"Result and Option") — the
-            // same uniform boxed shape regardless of T at this floor.
+        .optional => |ot| {
+            // `T?` ≡ `Option<T>` (errors.md §"Result and Option").
             const info = b.enums.get("Option") orelse return null;
-            return info.si;
+            if (info.si == null) return null;
+            const inst = try instFromOptionalInner(b, info, ot);
+            return inst.si;
         },
         else => return null,
     }
@@ -2843,7 +3042,10 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     if (tailIsValueIfNoElse(body)) return reject(b, .unsupported_call);
     const extra = scope.extra();
     const locals = try b.a.alloc(hir.Type, extra);
-    for (locals, 0..) |*t, j| t.* = scope.locals.items[scope.n_params + j].ty;
+    for (locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty; // a str binding's backing slots are address-width
+    }
     b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
 }
@@ -3387,8 +3589,34 @@ fn enumCtorValue(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecVa
     const txt = try cp.text(b.a);
     defer b.a.free(txt);
     const ev = enumVariantTag(b, txt) orelse return null;
-    const esi = ev.info.si orelse return null; // an immediate enum has no ctor calls
-    const arity = ev.info.variants[@intCast(ev.tag)].arity;
+    if (ev.info.si == null) return null; // an immediate enum has no ctor calls
+    // A str argument to a generic slot instantiates the enum (`Ok(s)` →
+    // Result<str, _>); a declared `str` slot takes it directly.
+    const variant = ev.info.variants[@intCast(ev.tag)];
+    if (variant.kind == .param or variant.kind == .str_) {
+        var a1 = cc.args();
+        const arg = a1.next() orelse return reject(b, .unsupported_call);
+        if (a1.next() != null) return reject(b, .unsupported_call);
+        const is_str = (try exprScalar(b, arg, scope)) == .str;
+        if (variant.kind == .str_ and !is_str) return error.Unsupported;
+        if (is_str) {
+            var inst = ev.info;
+            if (variant.kind == .param) {
+                var skey = [_]u8{ 'i', 'i', 'i', 'i' };
+                skey[variant.pidx] = 's';
+                inst = try instantiateEnum(b, ev.info, &skey);
+            }
+            const esi2 = inst.si.?;
+            const sval = try buildStrExpr(b, arg, scope, null);
+            return .{ .e = try enumAllocStr(b, esi2, ev.tag, sval), .si = esi2 };
+        }
+        // An int argument to a generic slot: the base (all-int) info.
+        const esi3 = ev.info.si.?;
+        var ivals = [_]*hir.Expr{try buildIntExpr(b, arg, scope)};
+        return .{ .e = try enumAlloc(b, esi3, ev.tag, &ivals), .si = esi3 };
+    }
+    const esi = ev.info.si.?;
+    const arity = variant.arity;
     var vals: std.ArrayList(*hir.Expr) = .empty;
     defer vals.deinit(b.a);
     var ait = cc.args();
@@ -3400,6 +3628,19 @@ fn enumCtorValue(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecVa
     }
     if (vals.items.len != arity) return reject(b, .unsupported_call);
     return .{ .e = try enumAlloc(b, esi, ev.tag, vals.items), .si = esi };
+}
+
+/// Allocate a boxed enum value carrying one str payload: {tag} + the
+/// value's (ptr, len) widened into cells at offsets 8 / 16.
+fn enumAllocStr(b: *Builder, esi: *const StructInfo, tag: i64, sval: *hir.Expr) BuildError!*hir.Expr {
+    var inits: std.ArrayList(hir.FieldInit) = .empty;
+    const tagv = try b.a.create(hir.Expr);
+    tagv.* = .{ .int_const = tag };
+    try inits.append(b.a, .{ .offset = 0, .ty = .i64, .value = tagv });
+    const sinits = try b.a.dupe(hir.StrFieldInit, &.{.{ .offset = 8, .value = sval }});
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .record_alloc = .{ .size = esi.size, .alignment = esi.alignment, .inits = try inits.toOwnedSlice(b.a), .str_inits = sinits } };
+    return out;
 }
 
 /// Allocate a boxed enum value: {tag, payloadâ¦} in the scope arena.
@@ -3597,7 +3838,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
         switch (kinds[ai]) {
             .rec => |want| {
                 const rv = (try buildRecExpr(b, a, scope)) orelse return reject(b, .unsupported_call);
-                if (rv.si != want) return reject(b, .unsupported_call); // a different struct
+                if (rv.si != want and !enumCompatible(b, rv.si, want)) return reject(b, .unsupported_call); // a different struct
                 try args.append(b.a, rv.e);
             },
             // No implicit conversion: each arg's scalar kind must match
@@ -3882,6 +4123,24 @@ const Scope = struct {
         return self.next_idx - self.n_params;
     }
 };
+
+/// Declare a str-valued body binding: a scope entry typed `.str` at the
+/// ptr slot (name resolution) backed by TWO address-width locals
+/// (ptr at idx, len at idx+1) in either bookkeeping mode.
+fn declareStrBodyLocal(b: *Builder, scope: *Scope, name: []const u8) BuildError!u32 {
+    const hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{name});
+    if (scope.callee) {
+        const idx = try scope.declare(name, false, .str);
+        _ = try scope.declare(hidden, false, .ptr);
+        return idx;
+    }
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const idx = try scope.declare(name, false, .str);
+    try b.cur_locals.append(b.a, .ptr);
+    _ = try scope.declare(hidden, false, .ptr);
+    try b.cur_locals.append(b.a, .ptr);
+    return idx;
+}
 
 /// Declare a body local with the right bookkeeping for the context:
 /// entry-style bodies (`main`, stamped generics) mirror each local into
@@ -6860,4 +7119,41 @@ test "env.fs.read: a str-valued @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "str enum payloads: Result<str, i64>, Msg.Text(str), Option<str>, try" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\enum Msg { Text(str), Code(i64), Nothing }
+        \\fn lookup(n: i64) -> Result<str, i64> {
+        \\    if n > 0 { Ok("found it") } else { Err(404) }
+        \\}
+        \\fn chain(n: i64) -> Result<str, i64> {
+        \\    let s = try lookup(n)
+        \\    Ok(s)
+        \\}
+        \\fn main {
+        \\    match lookup(1) {
+        \\        Ok(content) -> env.out(content),
+        \\        Err(code) -> env.out(code),
+        \\    }
+        \\    let m = Msg.Text("boxed")
+        \\    match m {
+        \\        Text(t) -> env.out(t.len),
+        \\        Code(c) -> env.out(c),
+        \\        Nothing -> env.out("none"),
+        \\    }
+        \\    match chain(5) {
+        \\        Ok(s) -> env.out(s),
+        \\        Err(c) -> env.out(c),
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The Ok(str) instantiation boxes to {tag, ptr, len} = 24 bytes.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=24") != null);
 }

@@ -29,6 +29,7 @@ pub const FuncId = u32;
 /// layout"). A narrow integer field (`u8`…`i32`) carries an i64 compute
 /// value with width 1/2/4; floats and i64 store at their natural width.
 pub const FieldInit = struct { offset: u32, width: u8, value: *Inst };
+pub const StrFieldInit = struct { offset: u32, value: *Inst };
 
 /// Wasm-level value types. A `str` is the `(ptr, len)` pair — the backend
 /// realizes it as a two-i64 multivalue (tuple); a str function returns it and
@@ -231,7 +232,14 @@ pub const Op = union(enum) {
     /// `alignment`, allocate `size` bytes, store each field at its offset
     /// (width per the value's type — 8 bytes for `.i64`, 1 byte for `.i32`
     /// bools), and yield the base pointer (a `.ptr`).
-    record_make: struct { size: u32, alignment: u32, inits: []const FieldInit },
+    record_make: struct {
+        size: u32,
+        alignment: u32,
+        inits: []const FieldInit,
+        /// str payload cells: store the value's (ptr, len) at offset /
+        /// offset+8, widened to 8-byte cells.
+        str_inits: []const StrFieldInit = &.{},
+    },
     /// Load a record field at `base + offset`: `width` bytes, sign- or
     /// zero-extended per `signed`, yielding `inst.ty` (i64 for every
     /// integer width — the compute floor; f64/f32/i32-bool natively).

@@ -196,6 +196,7 @@ pub const Param = struct { name: []const u8, ty: Type };
 /// `base + offset`. Offsets/sizes follow spec/memory.md §"Linear struct
 /// layout"; the builder computes them from the struct declaration.
 pub const FieldInit = struct { offset: u32, ty: Type, value: *Expr };
+pub const StrFieldInit = struct { offset: u32, value: *Expr };
 
 pub const Func = struct {
     name: []const u8,
@@ -348,7 +349,15 @@ pub const Expr = union(enum) {
     /// SROA): allocate `size` bytes in the scope arena at `alignment`, store
     /// each field at its layout offset, yield the base pointer (a `ptr`).
     /// Layout per spec/memory.md §"Linear struct layout".
-    record_alloc: struct { size: u32, alignment: u32, inits: []const FieldInit },
+    record_alloc: struct {
+        size: u32,
+        alignment: u32,
+        inits: []const FieldInit,
+        /// str-valued payload cells (a boxed enum's `Some("hi")`): the
+        /// value's (ptr, len) stores into two 8-byte cells at offset /
+        /// offset+8 (zero-extended to i64 on wasm32).
+        str_inits: []const StrFieldInit = &.{},
+    },
     /// Read a record field through its base pointer (`p.x` where `p` is a
     /// materialized record value): load the `ty`-typed field at `base + offset`.
     field_get: struct { base: *Expr, offset: u32, ty: Type },

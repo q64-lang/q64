@@ -968,6 +968,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .str_contains => |m| bodyHasOut(m.str, want_int) or bodyHasOut(m.sub, want_int),
         .record_make => |rm| blk: {
             for (rm.inits) |fi| if (bodyHasOut(fi.value, want_int)) break :blk true;
+            for (rm.str_inits) |si| if (bodyHasOut(si.value, want_int)) break :blk true;
             break :blk false;
         },
         .field_get => |fg| bodyHasOut(fg.base, want_int),
@@ -1096,6 +1097,13 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             for (rm.inits) |fi| {
                 var sub = Scratch{};
                 scanScratch(fi.value, &sub);
+                if (sub.rec_depth > inner) inner = sub.rec_depth;
+                mergeScratch(s, &sub);
+            }
+            for (rm.str_inits) |si| {
+                s.host_out = true; // pair scratch for the (ptr, len) split
+                var sub = Scratch{};
+                scanScratch(si.value, &sub);
                 if (sub.rec_depth > inner) inner = sub.rec_depth;
                 mergeScratch(s, &sub);
             }
@@ -1343,7 +1351,10 @@ const Lowerer = struct {
             .const_f64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralFloat64(v)),
             .num_cast => |src| {
                 // (source type, target type) → the wasm conversion. float→int
-                // is the TRAPPING trunc per spec/types.md §Casts.
+                // is the TRAPPING trunc per spec/types.md §Casts. An i64 →
+                // .ptr cast narrows to address width (a boxed str payload
+                // cell read).
+                if (n.ty == .ptr) return self.toPtr(try self.inst(src));
                 const x = try self.inst(src);
                 const from = src.ty;
                 const to = n.ty;
@@ -2040,8 +2051,26 @@ const Lowerer = struct {
             try stmts.append(self.allocator, store);
         }
 
+        // str payload cells: stash the (ptr, len) pair, store each half
+        // widened to an 8-byte cell at offset / offset+8.
+        for (rm.str_inits) |si| {
+            self.rec_level += 1;
+            const value = try self.inst(si.value);
+            self.rec_level -= 1;
+            try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, value));
+            const pp = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0);
+            const ll = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1);
+            try stmts.append(self.allocator, c.BinaryenStore(m, 8, si.offset, 0, self.ptrGet(ridx), self.toI64(pp), self.i64_type, "0"));
+            try stmts.append(self.allocator, c.BinaryenStore(m, 8, si.offset + 8, 0, self.ptrGet(ridx), self.toI64(ll), self.i64_type, "0"));
+        }
+
         try stmts.append(self.allocator, self.ptrGet(ridx));
         return c.BinaryenBlock(m, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), self.ptr_type);
+    }
+
+    /// Widen an address-width value to i64 (identity on wasm64).
+    fn toI64(self: *Lowerer, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        return if (self.ptr_type == self.i64_type) v else c.BinaryenUnary(self.module, c.BinaryenExtendUInt32(), v);
     }
 
     /// Materialize an array literal in the scope arena (mirrors

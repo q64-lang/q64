@@ -407,7 +407,9 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .record_alloc => |ra| {
             const inits = try ctx.a.alloc(mir.FieldInit, ra.inits.len);
             for (ra.inits, 0..) |fi, i| inits[i] = .{ .offset = fi.offset, .width = storageOf(fi.ty).width, .value = try lowerExpr(ctx, fi.value) };
-            return mk(ctx.a, .ptr, .{ .record_make = .{ .size = ra.size, .alignment = ra.alignment, .inits = inits } });
+            const sinits = try ctx.a.alloc(mir.StrFieldInit, ra.str_inits.len);
+            for (ra.str_inits, 0..) |si, i| sinits[i] = .{ .offset = si.offset, .value = try lowerStrExpr(ctx, si.value) };
+            return mk(ctx.a, .ptr, .{ .record_make = .{ .size = ra.size, .alignment = ra.alignment, .inits = inits, .str_inits = sinits } });
         },
         .array_lit => |al| {
             const inits = try ctx.a.alloc(*mir.Inst, al.inits.len);
