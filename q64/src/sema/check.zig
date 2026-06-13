@@ -1509,6 +1509,72 @@ fn checkPanicPayload(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.Arr
     try scanPanicPayload(gpa, sf.cst, &panic_fits, diags);
 }
 
+/// Recursively flag a direct `<name>.field` / `<name>.method()` access on
+/// an optional `name` (a `PATH_EXPR` headed by `name` that has a `.`).
+/// `?.` is a `QUESTION_DOT_EXPR`, a different node, so Option-chaining is
+/// not matched.
+fn scanOptionalUse(
+    gpa: std.mem.Allocator,
+    node: *const cst.Node,
+    name: []const u8,
+    diags: *std.ArrayList(Diag),
+) std.mem.Allocator.Error!void {
+    if (node.kind == .PATH_EXPR) {
+        if (pathFirstIdent(node)) |head| {
+            if (std.mem.eql(u8, head.text, name)) {
+                if (dottedLastSegment(node) != null) {
+                    try diags.append(gpa, .{ .code = "TYP047", .offset = head.offset });
+                }
+            }
+        }
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try scanOptionalUse(gpa, n, name, diags),
+        .token => {},
+    };
+}
+
+/// **TYP047** — a value of type `T?` used as a `T` without narrowing
+/// (types.md §"optional types and flow narrowing"). The safe reads of an
+/// optional go through a *different* binding (`if let Some(x)` / `match`)
+/// or `?.`; a direct `param.field` on an optional parameter is the
+/// unsafe pattern. v0: for each optional parameter, unless it is re-bound
+/// via `if let Some(<name>)` somewhere (a same-name narrowing we can't
+/// scope-track), flag a direct dotted access on it.
+fn checkOptionalNarrowing(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.ArrayList(Diag)) !void {
+    const ps = fd.params() orelse return;
+    const body = fd.body() orelse return;
+
+    // Body tokens, to detect a same-name `if let Some(name)` reshadow.
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, body.cst, &toks);
+    const ts = toks.items;
+
+    var it = ps.iter();
+    while (it.next()) |p| {
+        const ty = p.type_() orelse continue;
+        if (ty != .optional) continue;
+        const pn = p.name() orelse continue;
+
+        // Skip if the param is re-bound by `Some(<name>)` (narrowed under
+        // the same name) — we can't scope-track that in v0.
+        var reshadowed = false;
+        var k: usize = 0;
+        while (k + 2 < ts.len) : (k += 1) {
+            if (ts[k].kind == .IDENT and std.mem.eql(u8, ts[k].text, "Some") and
+                ts[k + 1].kind == .L_PAREN and ts[k + 2].kind == .IDENT and
+                std.mem.eql(u8, ts[k + 2].text, pn.text))
+            {
+                reshadowed = true;
+                break;
+            }
+        }
+        if (reshadowed) continue;
+        try scanOptionalUse(gpa, body.cst, pn.text, diags);
+    }
+}
+
 const StreamKind = enum { signal, event };
 
 fn streamKindOf(name: []const u8) ?StreamKind {
@@ -2310,6 +2376,7 @@ pub fn checkFile(
             }
             try checkEventPre(gpa, item.fn_decl, &diags);
             try checkCancelAwareFor(gpa, item.fn_decl, &diags);
+            try checkOptionalNarrowing(gpa, item.fn_decl, &diags);
         }
     }
 
@@ -2906,6 +2973,32 @@ test "check: TYP306 — panic payload that doesn't fit Panic" {
     , &.{});
     // A blessed prelude payload is fine.
     try expectCodes("fn main { panic RuntimeDenied { code: \"E\", detail: \"d\" } }\n", &.{});
+}
+
+test "check: TYP047 — optional used without narrowing" {
+    // Direct `.name` on an un-narrowed optional param.
+    try expectCodes(
+        \\struct User { name: str }
+        \\fn process(user: User?) -> str {
+        \\    if let None = user { let _ = "missing" }
+        \\    user.name
+        \\}
+        \\
+    , &.{"TYP047"});
+    // A non-optional param accessed directly is fine.
+    try expectCodes(
+        \\struct User { name: str }
+        \\fn process(user: User) -> str { user.name }
+        \\
+    , &.{});
+    // A same-name `if let Some(user)` re-bind suppresses it (conservative).
+    try expectCodes(
+        \\struct User { name: str }
+        \\fn process(user: User?) -> str {
+        \\    if let Some(user) = user { user.name } else { "none" }
+        \\}
+        \\
+    , &.{});
 }
 
 test "check: STR020 — dataflow type mismatch (Event into Signal stage)" {

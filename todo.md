@@ -1244,11 +1244,24 @@ verified, honest diagnostics throughout.
       untouched, so `unknown-transfer-verb`'s Arena blocks stay REG050-only.
       Catalog entry + 1 check case (3 asserts: leak / freed / Arena);
       conformance `memory/region-exit-live-allocs` flips → **48/51**) →
-      remaining 3, each genuinely blocked on a subsystem: optional
-      flow-narrowing (TYP047 — needs flow analysis), qube-root resolution
-      (NAM002 — standalone `q64 check` reads no manifest, and the spec
-      treats `../shared/util.q` as valid so it's depth-dependent), and the
-      reverted PAR040 generic-vs-chained-comparison parser heuristic.
+      TYP047 wired (landed: a `T?` used as a `T` without narrowing —
+      types.md §"optional types and flow narrowing"; v0 narrowing is
+      shallow/syntactic. The safe reads of an optional go through a
+      *different* binding (`if let Some(x)` / `match`) or `?.`
+      (a `QUESTION_DOT_EXPR`, distinct node), so a **direct** `param.field`
+      on an optional parameter is the unsafe pattern. `checkOptionalNarrowing`:
+      for each `.optional`-typed param, unless it's re-bound via a
+      same-name `if let Some(<name>)` (conservative skip — no scope
+      tracking in v0), `scanOptionalUse` flags a `PATH_EXPR` headed by the
+      param with a `.`. Catalog entry + 1 check case (3 asserts: unnarrowed
+      / non-optional / Some-reshadow); conformance
+      `types/optional-not-narrowed` flips → **49/51**) → remaining 2, both
+      genuinely blocked: NAM002 (qube-root resolution — standalone
+      `q64 check` reads no manifest, and `../shared/util.q` is a valid spec
+      example so it's depth-dependent) and PAR040 (generic-vs-chained-
+      comparison — `Box<i64, heap>` and `a < b > c` have identical token
+      shapes; needs parse-context, which is why the parser heuristic was
+      reverted).
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
