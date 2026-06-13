@@ -1235,10 +1235,20 @@ verified, honest diagnostics throughout.
       by construction: annotated lets / turbofish / inferrable params /
       other call positions are all skipped. Catalog entry + 1 check case
       (3 asserts); conformance `generics/missing-generic-arg` flips →
-      **47/51**) → next: the remaining 4 — optional flow-narrowing
-      (TYP047), region escape analysis (REG040), qube-root resolution
-      (NAM002), and the reverted PAR040 heuristic. These need real
-      analysis passes or structured parsing of currently-raw constructs.
+      **47/51**) → REG040 wired (landed: a `FreeList` region exited with
+      live allocations — memory.md §"Region literal syntax". v0 heuristic
+      — full drop-liveness is a spec-deferred item: `checkFreeListRegion`
+      token-scans for `region <name>: FreeList { … }`, matches the block's
+      braces, and flags it when the body has a `.new(` allocation but no
+      `.free(`/`.drop(`. `Arena`/`Pool` regions (bulk-freed on exit) are
+      untouched, so `unknown-transfer-verb`'s Arena blocks stay REG050-only.
+      Catalog entry + 1 check case (3 asserts: leak / freed / Arena);
+      conformance `memory/region-exit-live-allocs` flips → **48/51**) →
+      remaining 3, each genuinely blocked on a subsystem: optional
+      flow-narrowing (TYP047 — needs flow analysis), qube-root resolution
+      (NAM002 — standalone `q64 check` reads no manifest, and the spec
+      treats `../shared/util.q` as valid so it's depth-dependent), and the
+      reverted PAR040 generic-vs-chained-comparison parser heuristic.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

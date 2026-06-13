@@ -1187,6 +1187,57 @@ fn checkPureEnv(gpa: std.mem.Allocator, fd: ast.FnDecl, es: ast.EffectSpec, diag
     }
 }
 
+/// True when `ts[i]` begins a `. <name> (` method call (a DOT, the named
+/// IDENT, then `(`).
+fn isMethodCallAt(ts: []const cst.Token, i: usize, name: []const u8) bool {
+    return i + 2 < ts.len and ts[i].kind == .DOT and
+        ts[i + 1].kind == .IDENT and std.mem.eql(u8, ts[i + 1].text, name) and
+        ts[i + 2].kind == .L_PAREN;
+}
+
+/// **REG040** — a `FreeList` region exited with live allocations
+/// (memory.md §"Region literal syntax"). v0 heuristic (full drop-liveness
+/// is a spec-deferred item): a `region <name>: FreeList { … }` block that
+/// contains a `.new(` allocation but no `.free(` / `.drop(` is flagged.
+/// `Arena`/`Pool` regions (bulk-freed on exit) are untouched.
+fn checkFreeListRegion(gpa: std.mem.Allocator, root: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, root, &toks);
+    const ts = toks.items;
+
+    var i: usize = 0;
+    while (i + 3 < ts.len) : (i += 1) {
+        if (ts[i].kind != .KW_REGION) continue;
+        if (ts[i + 1].kind != .IDENT or ts[i + 2].kind != .COLON or ts[i + 3].kind != .IDENT) continue;
+        if (!std.mem.eql(u8, ts[i + 3].text, "FreeList")) continue;
+
+        // Find the block: the first `{` after the policy, then its match.
+        var j = i + 4;
+        while (j < ts.len and ts[j].kind != .L_BRACE) : (j += 1) {}
+        if (j >= ts.len) continue;
+        var depth: i32 = 0;
+        var has_alloc = false;
+        var has_free = false;
+        var k = j;
+        while (k < ts.len) : (k += 1) {
+            switch (ts[k].kind) {
+                .L_BRACE => depth += 1,
+                .R_BRACE => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                else => {},
+            }
+            if (isMethodCallAt(ts, k, "new")) has_alloc = true;
+            if (isMethodCallAt(ts, k, "free") or isMethodCallAt(ts, k, "drop")) has_free = true;
+        }
+        if (has_alloc and !has_free) {
+            try diags.append(gpa, .{ .code = "REG040", .offset = ts[i].offset });
+        }
+    }
+}
+
 /// Reserved non-verbs the language deliberately omits: the only
 /// cross-region move is `transfer(to: …)`. `copy_to` / `pin_to` /
 /// `intern` are absent (memory.md §"Cross-region transfers"), so a
@@ -2284,6 +2335,8 @@ pub fn checkFile(
     try checkDataflowTypes(gpa, sf, &diags);
     // TYP102: a required generic argument that can't be inferred.
     try checkMissingGenericArg(gpa, sf, &diags);
+    // REG040: a FreeList region exited with live (unfreed) allocations.
+    try checkFreeListRegion(gpa, sf.cst, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2997,6 +3050,37 @@ test "check: REG020 — linear ref in a @managed struct" {
         \\@managed
         \\struct Ok { a: i64, b: bool }
         \\fn main { env.out("hi") }
+        \\
+    , &.{});
+}
+
+test "check: REG040 — FreeList region exited with live allocations" {
+    // An allocation with no matching free.
+    try expectCodes(
+        \\fn leak {
+        \\    region heap: FreeList {
+        \\        let b = Box<i64, heap>.new(42)
+        \\    }
+        \\}
+        \\
+    , &.{"REG040"});
+    // An explicit free clears it.
+    try expectCodes(
+        \\fn ok {
+        \\    region heap: FreeList {
+        \\        let b = Box<i64, heap>.new(42)
+        \\        b.free()
+        \\    }
+        \\}
+        \\
+    , &.{});
+    // An Arena region is bulk-freed; not flagged.
+    try expectCodes(
+        \\fn fine {
+        \\    region a: Arena<1.MB> {
+        \\        let v = Vec.new()
+        \\    }
+        \\}
         \\
     , &.{});
 }
