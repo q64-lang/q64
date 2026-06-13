@@ -1645,35 +1645,9 @@ fn buildVoidBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.
 /// statements are `env.out`, host-face calls, or void user calls.
 fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     switch (stmt) {
-        .expr_stmt => |es| {
-            const call = switch (es.expression() orelse return error.Unsupported) {
-                .call => |cc| cc,
-                else => return error.Unsupported,
-            };
-            if (isEnvOut(b.a, call)) {
-                try out.append(b.a, try buildVoidEnvOut(b, call, scope));
-                return;
-            }
-            if (try hostFaceName(b, call)) |fname| {
-                try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
-                return;
-            }
-            // A statement-position call to another void procedure; its result
-            // (there is none) is discarded. A value-returning call here is
-            // rejected — nothing may be left on the stack (lower.zig enforces
-            // the same on `.expr`).
-            const cname = callPathName(b, call) orelse return error.Unsupported;
-            defer b.a.free(cname);
-            if (std.mem.indexOfScalar(u8, cname, '.') != null) return error.Unsupported;
-            const id = try registerFunc(b, cname);
-            if (b.funcs.items[id].ret != .void) return reject(b, .unsupported_call);
-            const e = try b.a.create(hir.Expr);
-            e.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, call.args(), scope, null) } };
-            const st = try b.a.create(hir.Stmt);
-            st.* = .{ .expr = e };
-            try out.append(b.a, st);
-        },
+        .expr_stmt => |es| try buildVoidExprStmt(b, es.expression() orelse return error.Unsupported, scope, out),
         .if_stmt => |is| try out.append(b.a, try buildVoidIfNode(b, is, scope)),
+        .match_stmt => |ms| try buildVoidMatch(b, ms, scope, out),
         .while_stmt => |ws| {
             const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, scope);
             const body = try buildVoidBlock(b, ws.body() orelse return error.Unsupported, scope);
@@ -1692,6 +1666,88 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
         .let_stmt, .assign_stmt, .break_stmt, .continue_stmt => try out.append(b.a, try buildIntStmt(b, stmt, scope)),
         else => return error.Unsupported,
     }
+}
+
+/// A void expression statement: `env.out(…)`, a host-face call, or a
+/// statement-position call to another void procedure. Shared by
+/// `buildVoidStmt` and `buildVoidMatch`'s single-expression arms.
+fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const call = switch (expr) {
+        .call => |cc| cc,
+        else => return error.Unsupported,
+    };
+    if (isEnvOut(b.a, call)) {
+        try out.append(b.a, try buildVoidEnvOut(b, call, scope));
+        return;
+    }
+    if (try hostFaceName(b, call)) |fname| {
+        try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
+        return;
+    }
+    // A statement-position call to another void procedure; its result (there
+    // is none) is discarded. A value-returning call here is rejected — nothing
+    // may be left on the stack (lower.zig enforces the same on `.expr`).
+    const cname = callPathName(b, call) orelse return error.Unsupported;
+    defer b.a.free(cname);
+    if (std.mem.indexOfScalar(u8, cname, '.') != null) return error.Unsupported;
+    const id = try registerFunc(b, cname);
+    if (b.funcs.items[id].ret != .void) return reject(b, .unsupported_call);
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, call.args(), scope, null) } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .expr = e };
+    try out.append(b.a, st);
+}
+
+/// A statement-position `match` in a void procedure — the side-effecting
+/// form. Same scrutinee/tag/exhaustiveness machinery as `buildMainMatch`,
+/// but each arm body is built through the void statement set (`env.out`,
+/// nested control flow, void calls), so no value need be yielded.
+fn buildVoidMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const scrut = ms.scrutinee() orelse return error.Unsupported;
+    const info_opt = try enumOfExpr(b, scope, scrut);
+    if (info_opt == null and (try exprScalar(b, scrut, scope)) != .i64) return error.Unsupported;
+    const boxed = if (info_opt) |info| info.si != null else false;
+
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, out);
+
+    var arms: std.ArrayList(LoweredArm) = .empty;
+    defer arms.deinit(b.a);
+    var default: ?*hir.Stmt = null;
+    var seen: u64 = 0;
+    var it = ms.arms();
+    while (it.next()) |arm| {
+        const pat = arm.pattern() orelse return error.Unsupported;
+        const rp = if (info_opt) |info|
+            try resolveArmPattern(b, info, pat, scope, s_idx)
+        else
+            try resolveLiteralPattern(b, pat);
+        const body = try buildVoidMatchArmBody(b, arm, scope);
+        const ap = rp orelse {
+            if (default != null) return error.Unsupported; // two `_` arms
+            default = body;
+            continue;
+        };
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
+        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
+    }
+    if (default == null) {
+        const info = info_opt orelse return error.Unsupported;
+        if (@popCount(seen) < info.variants.len) return error.Unsupported;
+    }
+    try foldMatchChain(b, s_idx, boxed, arms.items, default, out);
+}
+
+/// A void match arm's body as one HIR block: a `{ … }` block of void
+/// statements, or a single `->` void expression statement.
+fn buildVoidMatchArmBody(b: *Builder, arm: ast.MatchArm, scope: *Scope) BuildError!*hir.Stmt {
+    if (arm.block()) |blk| return buildVoidBlock(b, blk, scope);
+    const e = arm.expression() orelse return error.Unsupported;
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    try buildVoidExprStmt(b, e, scope, &items);
+    const blkst = try b.a.create(hir.Stmt);
+    blkst.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return blkst;
 }
 
 /// The void-procedure analogue of `buildIfStmtNode`: an `if`/`else(-if)` whose
@@ -7429,6 +7485,52 @@ test "void procedures: env.out / while / if-else / value let / void call from ma
         \\fn main {
         \\    p(1)
         \\}
+        \\
+    )) == null);
+}
+
+test "void procedures: statement-position match (enum payloads, block arms, literals)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\enum Shape { Empty, Circle(i64), Rect(i64, i64) }
+        \\fn describe(s: Shape) {
+        \\    match s {
+        \\        Empty -> env.out("empty"),
+        \\        Circle(r) -> env.out(r * r * 3),
+        \\        Rect(w, h) -> {
+        \\            env.out("rect")
+        \\            env.out(w * h)
+        \\        },
+        \\    }
+        \\}
+        \\fn grade(n: i64) {
+        \\    match n {
+        \\        0 -> env.out("zero"),
+        \\        _ -> env.out("many"),
+        \\    }
+        \\}
+        \\fn main {
+        \\    describe(Shape.Rect(3, 5))
+        \\    grade(0)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn describe -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn grade -> void") != null);
+    // A non-exhaustive void match (no wildcard, missing a variant) is rejected.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn report(o: Option<i64>) {
+        \\    match o {
+        \\        Some(v) -> env.out(v),
+        \\    }
+        \\}
+        \\fn main { report(None) }
         \\
     )) == null);
 }

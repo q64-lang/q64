@@ -1020,10 +1020,20 @@ verified, honest diagnostics throughout.
       `describe` program and a void-calls-void program; 402 unit / 81
       CLI / 24-of-51 / roundtrips green. Boundary: no `match`, records,
       arrays, `for`, generics, or runtime str bindings in a void body
-      yet — those are follow-ons) → next: statement-position callee
-      matches (now unblocked — a `match` with side-effecting void arm
-      bodies inside a void procedure), then the `From` conversion on
-      `try`.
+      yet — those are follow-ons) → statement-position callee matches
+      (landed: a `match` with side-effecting void arm bodies inside a
+      void procedure now works — `buildVoidMatch` reuses the
+      `buildMainMatch` scrutinee/tag/exhaustiveness machinery but
+      builds each arm through the void statement set, so arms run
+      `env.out`, nested control flow, and void calls instead of
+      yielding; block arms with multiple statements work. The void
+      expr-statement logic was factored into `buildVoidExprStmt`,
+      shared by `buildVoidStmt` and the single-`->`-expression arms.
+      Enum (unit + payload), Option, and integer-literal scrutinees
+      verified; non-exhaustive still rejected. wasm64+wasm32:
+      `describe`/`report`/`grade` → `empty 48 rect 15 42 none zero one
+      many`; 403 unit / 81 CLI / 24-of-51 / roundtrips green) → next:
+      the `From` conversion on `try`.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
