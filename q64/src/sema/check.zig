@@ -1329,6 +1329,77 @@ fn checkWithCapabilities(gpa: std.mem.Allocator, root: *const cst.Node, diags: *
     }
 }
 
+/// The function name of a call whose closing `)` is at `ts[end]`, found
+/// by matching back to the opening `(` and reading the IDENT before it
+/// (`play(env.audio)` ending at `)` → `play`). A bare IDENT at `end`
+/// returns itself. `ts` is trivia-free.
+fn callNameBefore(ts: []const cst.Token, end: usize) ?[]const u8 {
+    if (ts[end].kind == .IDENT) return ts[end].text;
+    if (ts[end].kind != .R_PAREN) return null;
+    var depth: i32 = 0;
+    var i = end;
+    while (true) {
+        if (ts[i].kind == .R_PAREN) depth += 1;
+        if (ts[i].kind == .L_PAREN) {
+            depth -= 1;
+            if (depth == 0) break;
+        }
+        if (i == 0) return null;
+        i -= 1;
+    }
+    if (i == 0) return null;
+    return if (ts[i - 1].kind == .IDENT) ts[i - 1].text else null;
+}
+
+/// **STR060** — a `@realtime` stage piped (`|>`) into a non-`@realtime`
+/// stage (streams.md §"Effects on stages"). Builds the declared-fn and
+/// `@realtime`-fn name sets from the file's signatures, then flags any
+/// `|>` whose upstream call is `@realtime` and whose downstream call is a
+/// declared non-`@realtime` stage. (The reverse "buffered stream into a
+/// `@realtime` stage" shape needs stream-type info and is a follow-on.)
+fn checkRealtimePipe(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.ArrayList(Diag)) !void {
+    var declared = std.StringHashMap(void).init(gpa);
+    defer declared.deinit();
+    var realtime = std.StringHashMap(void).init(gpa);
+    defer realtime.deinit();
+
+    var it = sf.items();
+    while (it.next()) |item| {
+        if (item != .fn_decl) continue;
+        const fd = item.fn_decl;
+        const nm = fd.name() orelse continue;
+        try declared.put(nm.text, {});
+        if (fd.effectSpec()) |es| {
+            var mit = es.markers();
+            while (mit.next()) |m| {
+                const mn = m.name() orelse continue;
+                if (std.mem.eql(u8, mn.text, "realtime")) {
+                    try realtime.put(nm.text, {});
+                    break;
+                }
+            }
+        }
+    }
+    if (realtime.count() == 0) return;
+
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, sf.cst, &toks);
+    const ts = toks.items;
+
+    var p: usize = 0;
+    while (p < ts.len) : (p += 1) {
+        if (ts[p].kind != .PIPE_GT) continue;
+        if (p + 1 >= ts.len or ts[p + 1].kind != .IDENT) continue;
+        const down = ts[p + 1].text;
+        if (p == 0) continue;
+        const up = callNameBefore(ts, p - 1) orelse continue;
+        if (realtime.contains(up) and declared.contains(down) and !realtime.contains(down)) {
+            try diags.append(gpa, .{ .code = "STR060", .offset = ts[p].offset });
+        }
+    }
+}
+
 /// **CONC050** — `channel<T>(…)` with no `policy:` argument; the
 /// constructor has no default policy (concurrency.md §"Channel
 /// construction"). Scans the flat token stream: at an `channel` call
@@ -1852,6 +1923,8 @@ pub fn checkFile(
     try checkActorTell(gpa, sf.cst, &diags);
     // CONC050: `channel<T>(…)` with no `policy:` argument.
     try checkChannelPolicy(gpa, sf.cst, &diags);
+    // STR060: a `@realtime` stage piped into a non-`@realtime` stage.
+    try checkRealtimePipe(gpa, sf, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2373,6 +2446,27 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: STR060 — @realtime stage piped into a non-realtime stage" {
+    // `play` (@realtime) piped into `http_post` (not @realtime).
+    try expectCodes(
+        \\fn play(a: Audio) @realtime { a.write() }
+        \\fn http_post(n: Net) { n.post() }
+        \\fn main { scope { let g = graph p {
+        \\    let _ = mic(env.audio) |> play(env.audio) |> http_post(env.net)
+        \\} } }
+        \\
+    , &.{"STR060"});
+    // All-realtime pipeline is clean.
+    try expectCodes(
+        \\fn play(a: Audio) @realtime { a.write() }
+        \\fn gain(a: Audio) @realtime { a.amp() }
+        \\fn main { scope { let g = graph p {
+        \\    let _ = mic(env.audio) |> gain(env.audio) |> play(env.audio)
+        \\} } }
+        \\
+    , &.{});
 }
 
 test "check: CONC050 — channel requires a policy" {

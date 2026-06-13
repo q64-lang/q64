@@ -1177,13 +1177,25 @@ verified, honest diagnostics throughout.
       flags a `FOR_STMT` whose iterable head is such a receiver. Catalog
       entries + 2 check cases (5 asserts); conformance
       `concurrency/channel-policy-required` +
-      `concurrency/for-cancel-aware-without-ctx` flip → **42/51**) → next:
-      the `From` conversion on `try`, EFF110, and the remaining gaps. The
-      rest need bigger subsystems — dataflow types (STR020/STR060),
-      generic inference (TYP102), optional flow-narrowing (TYP047),
-      face/dyn-safety (TYP306/not-dyn-safe/no-fit-for-bound), region
-      escape analysis (REG040), qube-root resolution (NAM002), and the
-      reverted PAR040 heuristic.
+      `concurrency/for-cancel-aware-without-ctx` flip → **42/51**) →
+      STR060 wired (landed: a `@realtime` stage piped (`|>`) into a
+      non-`@realtime` stage — streams.md §"Effects on stages".
+      `checkRealtimePipe` builds the declared-fn + `@realtime`-fn name
+      sets from the file's signatures (via the structured effect spec),
+      then token-scans for each `PIPE_GT` (`|>`): `callNameBefore`
+      back-matches the upstream call's `)` to its `(` to read the upstream
+      stage name, the downstream name is the IDENT after `|>`, and it
+      flags upstream-`@realtime` → downstream-declared-non-realtime. Fires
+      exactly once on the test's `play |> http_post` (the `mic |> play`
+      hop is non-realtime upstream, silent). Catalog entry + 1 check case
+      (2 asserts); conformance `streams/realtime-pipe-violation` flips →
+      **43/51**; the reverse "buffered stream → `@realtime`" shape needs
+      stream-type info and is a follow-on) → next: the `From` conversion
+      on `try`, EFF110, and the remaining gaps — dataflow type matching
+      (STR020), generic inference (TYP102), optional flow-narrowing
+      (TYP047), face/dyn-safety (TYP306/not-dyn-safe/no-fit-for-bound),
+      region escape analysis (REG040), qube-root resolution (NAM002), and
+      the reverted PAR040 heuristic.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
