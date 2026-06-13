@@ -2056,4 +2056,46 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> match guards: P if cond -> … (scalar binder, literal + enum arms; fall-through)"
+grd_app="$tmp/guard.q"
+cat > "$grd_app" <<'Q64'
+enum Light { Red, Yellow, Green }
+fn classify(n: i64) -> i64 {
+    let r = match n {
+        x if x > 100 -> x * 2,
+        x if x > 10 -> x + 1,
+        _ -> 0,
+    }
+    r
+}
+fn main {
+    env.out(classify(200))
+    env.out(classify(50))
+    env.out(classify(5))
+    var ready = false
+    var n = 1
+    match n {
+        1 if ready -> env.out("one-ready"),
+        1 -> env.out("one-plain"),
+        _ -> env.out("other"),
+    }
+    var hurry = true
+    var l = Light.Yellow
+    match l {
+        Yellow if hurry -> env.out("go-fast"),
+        Yellow -> env.out("slow"),
+        Red -> env.out("stop"),
+        Green -> env.out("go"),
+    }
+}
+Q64
+grd_expected=$'400\n51\n0\none-plain\ngo-fast'
+"$Q64_BIN" emit "$grd_app" "$tmp/guard.wasm"
+grd_out="$("$HOST_BIN" "$tmp/guard.wasm")"
+[[ "$grd_out" == "$grd_expected" ]] || { echo "FAIL: match guards (got: $grd_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$grd_app" "$tmp/guard32.wasm" --addr wasm32
+grd32_out="$("$HOST_BIN" "$tmp/guard32.wasm")"
+[[ "$grd32_out" == "$grd_expected" ]] || { echo "FAIL: match guards wasm32 (got: $grd32_out)" >&2; exit 1; }
+echo "    ok: match guards -> 400/51/0 / one-plain / go-fast (wasm64 + wasm32; binder, literal, enum; fall-through)"
+
 echo "PASS: $qube_out"

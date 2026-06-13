@@ -1761,7 +1761,19 @@ const Parser = struct {
     fn parseMatchArm(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .node = try self.parseOrPattern() });
-        // Any remainder before `->` (e.g. a guard `if cond`) is raw for now.
+        // An optional guard `if <expr>` between the pattern and `->`.
+        {
+            const save = self.pos;
+            var lead: std.ArrayList(cst.Element) = .empty;
+            try self.eatTrivia(&lead);
+            if (self.peek() == .KW_IF) {
+                try children.appendSlice(self.arena, lead.items);
+                try children.append(self.arena, .{ .node = try self.parseMatchGuard() });
+            } else {
+                self.pos = save;
+            }
+        }
+        // Any remaining remainder before `->` is raw for recovery.
         try self.captureRawUntil(&children, &.{.ARROW});
         if (self.peek() == .ARROW) {
             try children.append(self.arena, .{ .token = self.advance() });
@@ -1773,6 +1785,19 @@ const Parser = struct {
             }
         }
         return try cst.makeNode(self.arena, .MATCH_ARM, children.items);
+    }
+
+    /// `MatchGuard := "if" Expr`. Wraps the keyword + condition so the arm
+    /// body (after `->`) is not mistaken for the guard condition.
+    fn parseMatchGuard(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // if
+        try self.eatTrivia(&children);
+        // Suppress record-literal parsing so `if c { … }` stays unambiguous.
+        self.no_record_depth += 1;
+        try children.append(self.arena, .{ .node = try self.parseExpr() });
+        self.no_record_depth -= 1;
+        return try cst.makeNode(self.arena, .MATCH_GUARD, children.items);
     }
 
     /// `Pattern ("|" Pattern)*` — an or-pattern wraps the alternatives in an
@@ -1788,6 +1813,7 @@ const Parser = struct {
         }
         var children: std.ArrayList(cst.Element) = .empty;
         try children.append(self.arena, .{ .node = first });
+        try children.appendSlice(self.arena, lead.items); // trivia before the first `|`
         while (true) {
             try self.eatTrivia(&children);
             if (self.peek() != .PIPE) break;
@@ -3007,6 +3033,7 @@ test "pattern losslessness in let / for / match / if-let" {
         "fn m {\n    for (k, v) in entries {\n        use(k)\n    }\n}\n",
         "fn m {\n    if let Some(n) = opt {\n        use(n)\n    }\n}\n",
         "fn m {\n    match r {\n        Ok(v) -> v,\n        Err(e) -> panic e,\n        _ -> 0,\n    }\n}\n",
+        "fn m {\n    match n {\n        x if x > 10 -> 1,\n        0 | 1 -> 2,\n        _ -> 0,\n    }\n}\n",
     };
     for (sources) |src| {
         const r = try parse(testing.allocator, src, "p.q");

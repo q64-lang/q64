@@ -131,10 +131,24 @@ needs the platform audit, so it's the highest-leverage near-term work.
           into one `(tag, body)` per alternative sharing the body, marking each
           for exhaustiveness. v0: unit-variant + integer-literal alternatives
           (no payload binders across alts). Runs wasm64 + wasm32 (roundtrip
-          `caution / 10 / 20`). **Next:** guards (`P if cond ->`), range
-          patterns (`1..5 ->`), nested/record destructuring. (Orthogonal
-          pre-existing gap: a callee whose whole body is a value `match` —
-          only `let r = match …` works in callees today.)
+          `caution / 10 / 20`).
+    - [x] **Guards** (`P if cond -> …`): `parseMatchGuard` parses `if <expr>`
+          into a `MATCH_GUARD` cst node between the (or-)pattern and `->`
+          (`ast.MatchArm.guard()`); all four match builders AND the guard onto
+          the arm's tag test in `foldMatchChain` (a failing guard falls through
+          to the rest of the chain). A scalar `x if cond -> …` binder arm
+          aliases the scrutinee value (`aliasLocal`) so the guard and body can
+          read it; it matches any value, so its `LoweredArm.any` condition is
+          the bare guard. A guarded arm never satisfies exhaustiveness on its
+          own — an unguarded fallback (a plain arm or `_`) is still required.
+          v0: guards on unit/literal/scalar-binder arms (no payload-binding
+          arms — the prelude loads run inside the body, after the guard). Runs
+          wasm64 + wasm32 (roundtrip `400/51/0 / one-plain / go-fast`). Also
+          fixed a pre-existing or-pattern losslessness bug (trivia before the
+          first `|` was dropped). **Next:** range patterns (`1..5 ->`),
+          nested/record destructuring. (Orthogonal pre-existing gap: a callee
+          whose whole body is a value `match` — only `let r = match …` works in
+          callees today.)
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the

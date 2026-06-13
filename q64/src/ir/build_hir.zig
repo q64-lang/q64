@@ -706,6 +706,7 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
         // (tag, body) sharing one body. v0: unit/literal alternatives only —
         // no payload bindings (they'd need consistent binders across alts).
         if (pat.kind() == .OR_PATTERN) {
+            if (arm.guard() != null) return error.Unsupported; // guards on or-patterns: later
             const body = try buildMatchArmBody(b, arm, scope, rt);
             var alts = pat.alternatives();
             var n: usize = 0;
@@ -722,6 +723,23 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
             if (n == 0) return error.Unsupported;
             continue;
         }
+        // A scalar binder arm (`x [if cond] -> …`): `x` aliases the scrutinee
+        // value. Unguarded it is the catch-all default; guarded it is a
+        // value-conditioned arm that falls through when the guard fails.
+        if (info_opt == null and pat.kind() == .IDENT_PATTERN) {
+            const nm = pat.bindingName() orelse return error.Unsupported;
+            try aliasLocal(scope, nm.text, s_idx, .i64);
+            const body = try buildMatchArmBody(b, arm, scope, rt);
+            if (arm.guard()) |gexpr| {
+                if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+                const guard = try buildIntExpr(b, gexpr, scope);
+                try arms.append(b.a, .{ .tag = 0, .body = body, .guard = guard, .any = true });
+            } else {
+                if (default != null) return error.Unsupported;
+                default = body;
+            }
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the body.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -729,13 +747,23 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
             try resolveLiteralPattern(b, pat);
         const body = try buildMatchArmBody(b, arm, scope, rt);
         const ap = rp orelse {
+            if (arm.guard() != null) return error.Unsupported; // guarded `_`: later
             if (default != null) return error.Unsupported; // two `_` arms
             default = body;
             continue;
         };
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
-        // Coverage only counts for enums (a literal can be any i64).
-        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        // A guard (`P if cond -> …`) AND-ed onto the tag test; payload-binding
+        // arms are out of v0 scope (the prelude loads run inside the body).
+        var guard: ?*hir.Expr = null;
+        if (arm.guard()) |gexpr| {
+            if (ap.prelude.len != 0) return error.Unsupported;
+            if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+            guard = try buildIntExpr(b, gexpr, scope);
+        }
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
+        // Coverage only counts for enums (a literal can be any i64); a guarded
+        // arm may fail, so it never contributes to exhaustiveness.
+        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Exhaustiveness (spec/grammar.md leaves the rules open; the v0
     // floor requires it structurally): every variant or a default for
@@ -953,8 +981,11 @@ fn prependPrelude(b: *Builder, prelude: []const *hir.Stmt, body: *hir.Stmt) Buil
     return out;
 }
 
-/// One lowered match arm: the variant's tag + the body block.
-const LoweredArm = struct { tag: i64, body: *hir.Stmt };
+/// One lowered match arm: the variant's tag + the body block, plus an
+/// optional guard condition (`P if cond -> …`) AND-ed onto the tag test.
+/// `any` marks a scalar binder arm (`x if cond -> …`): it matches every
+/// value, so its only condition is the guard (no tag comparison).
+const LoweredArm = struct { tag: i64, body: *hir.Stmt, guard: ?*hir.Expr = null, any: bool = false };
 
 /// Fold lowered arms back-to-front into an if/else chain comparing the
 /// scrutinee local against each tag. The lowering reads branch
@@ -966,23 +997,34 @@ fn foldMatchChain(b: *Builder, s_idx: u32, boxed: bool, arms: []const LoweredArm
     while (i > 0) {
         i -= 1;
         const a = arms[i];
-        // The tag: the scrutinee local itself (immediate), or a load
-        // from the boxed value's slot 0.
-        const sread = if (boxed) blk: {
-            const base = try b.a.create(hir.Expr);
-            base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
-            const ld = try b.a.create(hir.Expr);
-            ld.* = .{ .field_get = .{ .base = base, .offset = 0, .ty = .i64 } };
-            break :blk ld;
-        } else blk: {
-            const r = try b.a.create(hir.Expr);
-            r.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
-            break :blk r;
+        // A scalar binder arm (`x if cond`) has no tag — it matches any value,
+        // gated solely by its guard.
+        const cond = if (a.any) a.guard.? else blk: {
+            // The tag: the scrutinee local itself (immediate), or a load
+            // from the boxed value's slot 0.
+            const sread = if (boxed) sb: {
+                const base = try b.a.create(hir.Expr);
+                base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+                const ld = try b.a.create(hir.Expr);
+                ld.* = .{ .field_get = .{ .base = base, .offset = 0, .ty = .i64 } };
+                break :sb ld;
+            } else sb: {
+                const r = try b.a.create(hir.Expr);
+                r.* = .{ .local = .{ .idx = s_idx, .ty = .i64 } };
+                break :sb r;
+            };
+            const tagv = try b.a.create(hir.Expr);
+            tagv.* = .{ .int_const = a.tag };
+            const tagcmp = try b.a.create(hir.Expr);
+            tagcmp.* = .{ .bin = .{ .kind = .eq, .lhs = sread, .rhs = tagv } };
+            // A guarded arm fires only when its tag matches AND the guard holds;
+            // a failing guard falls through to the rest of the chain.
+            break :blk if (a.guard) |g| gb: {
+                const c = try b.a.create(hir.Expr);
+                c.* = .{ .logical = .{ .op = .and_, .lhs = tagcmp, .rhs = g } };
+                break :gb c;
+            } else tagcmp;
         };
-        const tagv = try b.a.create(hir.Expr);
-        tagv.* = .{ .int_const = a.tag };
-        const cond = try b.a.create(hir.Expr);
-        cond.* = .{ .bin = .{ .kind = .eq, .lhs = sread, .rhs = tagv } };
         var else_part = chain;
         if (else_part) |ep| {
             if (ep.* == .if_) {
@@ -1001,10 +1043,19 @@ fn foldMatchChain(b: *Builder, s_idx: u32, boxed: bool, arms: []const LoweredArm
 /// The scalar a value `match` yields: the first arm's expression type
 /// (every arm is checked against it during the build). Scalars only —
 /// str/record arms are later rungs.
-fn matchValueTy(b: *Builder, me: ast.MatchExpr, scope: *const Scope) BuildError!hir.Type {
+fn matchValueTy(b: *Builder, me: ast.MatchExpr, scope: *Scope) BuildError!hir.Type {
     var it = me.arms();
     const arm = it.next() orelse return error.Unsupported;
     const e = arm.expression() orelse return error.Unsupported;
+    // A scalar binder arm (`x [if …] -> <expr using x>`): alias the name to an
+    // i64 so the value's type can be probed; the alias is dropped after.
+    const saved = scope.locals.items.len;
+    defer scope.locals.shrinkRetainingCapacity(saved);
+    if (arm.pattern()) |pat| {
+        if (pat.kind() == .IDENT_PATTERN) {
+            if (pat.bindingName()) |nm| try aliasLocal(scope, nm.text, 0, .i64);
+        }
+    }
     const sc = try exprScalar(b, e, scope);
     if (sc == .narrow_int or sc == .str) return error.Unsupported;
     return scalarBindTy(sc);
@@ -1034,6 +1085,7 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
         // An or-pattern arm: build the value once, share it across the
         // alternatives' tags (unit/literal alternatives only — see below).
         if (pat.kind() == .OR_PATTERN) {
+            if (arm.guard() != null) return error.Unsupported; // guards on or-patterns: later
             const e = arm.expression() orelse return error.Unsupported;
             if (scalarBindTy(try exprScalar(b, e, scope)) != ty) return error.Unsupported;
             const value = try buildIntExpr(b, e, scope);
@@ -1056,6 +1108,26 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
             if (n == 0) return error.Unsupported;
             continue;
         }
+        if (info_opt == null and pat.kind() == .IDENT_PATTERN) {
+            const nm = pat.bindingName() orelse return error.Unsupported;
+            try aliasLocal(scope, nm.text, s_idx, .i64);
+            const e = arm.expression() orelse return error.Unsupported;
+            if (scalarBindTy(try exprScalar(b, e, scope)) != ty) return error.Unsupported;
+            const value = try buildIntExpr(b, e, scope);
+            const asn = try b.a.create(hir.Stmt);
+            asn.* = .{ .assign = .{ .idx = target_idx, .value = value } };
+            const body = try b.a.create(hir.Stmt);
+            body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{asn}) };
+            if (arm.guard()) |gexpr| {
+                if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+                const guard = try buildIntExpr(b, gexpr, scope);
+                try arms.append(b.a, .{ .tag = 0, .body = body, .guard = guard, .any = true });
+            } else {
+                if (default != null) return error.Unsupported;
+                default = body;
+            }
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the value.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -1069,13 +1141,24 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
         const body = try b.a.create(hir.Stmt);
         body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{asn}) };
         const ap = rp orelse {
+            if (arm.guard() != null) return error.Unsupported; // guarded `_`: later
             if (default != null) return error.Unsupported; // two `_` arms
             default = body;
             continue;
         };
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
-        // Coverage only counts for enums (a literal can be any i64).
-        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        // A guard (`P if cond -> …`): build the condition in the arm's scope.
+        // Payload-binding arms are out of v0 scope (the prelude loads run in
+        // the body, after the guard would read them).
+        var guard: ?*hir.Expr = null;
+        if (arm.guard()) |gexpr| {
+            if (ap.prelude.len != 0) return error.Unsupported;
+            if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+            guard = try buildIntExpr(b, gexpr, scope);
+        }
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
+        // Coverage only counts for enums (a literal can be any i64); a
+        // guarded arm may fail, so it never contributes to exhaustiveness.
+        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Structural exhaustiveness, like the statement form.
     if (default == null) {
@@ -1793,6 +1876,7 @@ fn buildVoidMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, out: *std.Array
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
         if (pat.kind() == .OR_PATTERN) {
+            if (arm.guard() != null) return error.Unsupported; // guards on or-patterns: later
             const body = try buildVoidMatchArmBody(b, arm, scope);
             var alts = pat.alternatives();
             var n: usize = 0;
@@ -1809,18 +1893,39 @@ fn buildVoidMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, out: *std.Array
             if (n == 0) return error.Unsupported;
             continue;
         }
+        if (info_opt == null and pat.kind() == .IDENT_PATTERN) {
+            const nm = pat.bindingName() orelse return error.Unsupported;
+            try aliasLocal(scope, nm.text, s_idx, .i64);
+            const body = try buildVoidMatchArmBody(b, arm, scope);
+            if (arm.guard()) |gexpr| {
+                if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+                const guard = try buildIntExpr(b, gexpr, scope);
+                try arms.append(b.a, .{ .tag = 0, .body = body, .guard = guard, .any = true });
+            } else {
+                if (default != null) return error.Unsupported;
+                default = body;
+            }
+            continue;
+        }
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
         else
             try resolveLiteralPattern(b, pat);
         const body = try buildVoidMatchArmBody(b, arm, scope);
         const ap = rp orelse {
+            if (arm.guard() != null) return error.Unsupported; // guarded `_`: later
             if (default != null) return error.Unsupported; // two `_` arms
             default = body;
             continue;
         };
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
-        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        var guard: ?*hir.Expr = null;
+        if (arm.guard()) |gexpr| {
+            if (ap.prelude.len != 0) return error.Unsupported;
+            if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+            guard = try buildIntExpr(b, gexpr, scope);
+        }
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
+        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     if (default == null) {
         const info = info_opt orelse return error.Unsupported;
@@ -5414,6 +5519,13 @@ fn declareStrBodyLocal(b: *Builder, scope: *Scope, name: []const u8) BuildError!
 /// Declare a body local with the right bookkeeping for the context:
 /// entry-style bodies (`main`, stamped generics) mirror each local into
 /// `b.cur_locals`; a plain callee body tracks them in the scope alone.
+/// Bind a name to an *existing* local slot (no new slot): a scalar match's
+/// `x` ident pattern aliases the scrutinee local so the guard and body can
+/// read its value. Idempotent across arms — every alias points at `idx`.
+fn aliasLocal(scope: *Scope, name: []const u8, idx: u32, ty: hir.Type) BuildError!void {
+    try scope.locals.append(scope.a, .{ .name = name, .idx = idx, .mutable = false, .ty = ty });
+}
+
 fn declareBodyLocal(b: *Builder, scope: *Scope, name: []const u8, mutable: bool, ty: hir.Type) BuildError!u32 {
     if (scope.callee) return scope.declare(name, mutable, ty);
     scope.next_idx = @intCast(b.cur_locals.items.len);
@@ -5546,6 +5658,7 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
         if (pat.kind() == .OR_PATTERN) {
+            if (arm.guard() != null) return error.Unsupported; // guards on or-patterns: later
             const e = arm.expression() orelse return error.Unsupported;
             const sc = scalarBindTy(try exprScalar(b, e, scope));
             if (vty) |t| {
@@ -5571,6 +5684,29 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
             if (n == 0) return error.Unsupported;
             continue;
         }
+        if (info_opt == null and pat.kind() == .IDENT_PATTERN) {
+            const nm = pat.bindingName() orelse return error.Unsupported;
+            try aliasLocal(scope, nm.text, s_idx, .i64);
+            const e = arm.expression() orelse return error.Unsupported;
+            const sc = scalarBindTy(try exprScalar(b, e, scope));
+            if (vty) |t| {
+                if (sc != t) return error.Unsupported;
+            } else vty = sc;
+            const value = try buildIntExpr(b, e, scope);
+            const vstmt = try b.a.create(hir.Stmt);
+            vstmt.* = .{ .expr = value };
+            const body = try b.a.create(hir.Stmt);
+            body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+            if (arm.guard()) |gexpr| {
+                if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+                const guard = try buildIntExpr(b, gexpr, scope);
+                try arms.append(b.a, .{ .tag = 0, .body = body, .guard = guard, .any = true });
+            } else {
+                if (default != null) return error.Unsupported;
+                default = body;
+            }
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the value.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -5587,12 +5723,19 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
         const body = try b.a.create(hir.Stmt);
         body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
         const ap = rp orelse {
+            if (arm.guard() != null) return error.Unsupported; // guarded `_`: later
             if (default != null) return error.Unsupported; // two `_` arms
             default = body;
             continue;
         };
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body) });
-        if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        var guard: ?*hir.Expr = null;
+        if (arm.guard()) |gexpr| {
+            if (ap.prelude.len != 0) return error.Unsupported;
+            if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+            guard = try buildIntExpr(b, gexpr, scope);
+        }
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
+        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     if (default == null) {
         const info = info_opt orelse return error.Unsupported;
@@ -6606,6 +6749,43 @@ test "match or-patterns: A | B -> body expands to multiple tags sharing the body
     const d2 = try print.hirToString(testing.allocator, &m2);
     defer testing.allocator.free(d2);
     try testing.expect(std.mem.indexOf(u8, d2, "if") != null);
+}
+
+test "match guards: P if cond gates an arm with a logical-and on the tag test" {
+    // A scalar binder guard (`x if x > 10`): the binder aliases the scrutinee,
+    // and an unguarded `_` provides the exhaustive fallback.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var n = 15\n let r = match n { x if x > 10 -> x * 2, _ -> 0 }\n env.out(r)\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The binder arm matches any value, so its condition is the bare guard.
+    try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
+
+    // A literal arm with a guard ANDs the tag comparison with the condition.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    var m2 = (try buildFromSource(testing.allocator,
+        "fn main {\n var n = 1\n var ready = true\n match n { 1 if ready -> env.out(\"a\"), _ -> env.out(\"b\") }\n}\n", tr2.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer m2.deinit();
+    const d2 = try print.hirToString(testing.allocator, &m2);
+    defer testing.allocator.free(d2);
+    try testing.expect(std.mem.indexOf(u8, d2, "and_") != null);
+}
+
+test "match guards: a guarded arm never satisfies exhaustiveness on its own" {
+    // `Yellow if hurry` does not cover Yellow (the guard may fail), so without
+    // a plain Yellow (or `_`) arm the match is honestly unsupported.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const res = try buildFromSource(testing.allocator,
+        "enum Light { Red, Yellow, Green }\nfn main {\n var hurry = true\n var l = Light.Yellow\n match l {\n Yellow if hurry -> env.out(\"a\"),\n Red -> env.out(\"r\"),\n Green -> env.out(\"g\"),\n }\n}\n", tr.resolver());
+    try testing.expect(res == null);
 }
 
 test "Vec method chaining: xs.filter(...).map(...) materializes the inner stage" {

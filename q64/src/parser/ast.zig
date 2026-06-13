@@ -1545,6 +1545,19 @@ pub const MatchArm = struct {
     pub fn pattern(self: MatchArm) ?Pattern {
         return firstChildPattern(self.cst);
     }
+    /// The guard condition when the arm has one (`P if cond -> …`).
+    pub fn guard(self: MatchArm) ?Expr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (n.kind == .MATCH_GUARD) {
+                for (n.children) |gc| switch (gc) {
+                    .node => |gn| if (Expr.cast(gn)) |e| return e,
+                    else => {},
+                };
+            },
+            else => {},
+        };
+        return null;
+    }
     /// The arm body when it is a block (`-> { … }`).
     pub fn block(self: MatchArm) ?Block {
         return firstChildNode(self.cst, .BLOCK, Block);
@@ -2671,6 +2684,40 @@ test "Pattern.bindingName: ident binds, wildcard does not" {
     // A non-pattern node doesn't cast.
     const not_pat = try cst.makeNode(a, .BLOCK, &.{});
     try testing.expect(Pattern.cast(not_pat) == null);
+}
+
+test "MatchArm.guard: present when `if cond` precedes the arrow, else null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `x if x -> 1`: pattern, guard (if + cond expr), arrow, body.
+    const cond = try cst.makeNode(a, .PATH_EXPR, &[_]cst.Element{cst.makeToken(.IDENT, "x", 5)});
+    const guard_node = try cst.makeNode(a, .MATCH_GUARD, &[_]cst.Element{
+        cst.makeToken(.KW_IF, "if", 2),
+        cst.makeToken(.WHITESPACE, " ", 4),
+        .{ .node = cond },
+    });
+    const body = try cst.makeNode(a, .LITERAL_EXPR, &[_]cst.Element{cst.makeToken(.INT_LIT, "1", 10)});
+    const pat = try cst.makeNode(a, .IDENT_PATTERN, &[_]cst.Element{cst.makeToken(.IDENT, "x", 0)});
+    const guarded = try cst.makeNode(a, .MATCH_ARM, &[_]cst.Element{
+        .{ .node = pat },
+        .{ .node = guard_node },
+        cst.makeToken(.ARROW, "->", 7),
+        .{ .node = body },
+    });
+    const arm = MatchArm{ .cst = guarded };
+    try testing.expect(arm.guard() != null);
+    // The body expression is the arm value, not the guard condition.
+    try testing.expect(arm.expression() != null);
+
+    // An arm without a guard reports null.
+    const plain = try cst.makeNode(a, .MATCH_ARM, &[_]cst.Element{
+        .{ .node = pat },
+        cst.makeToken(.ARROW, "->", 7),
+        .{ .node = body },
+    });
+    try testing.expect((MatchArm{ .cst = plain }).guard() == null);
 }
 
 test "Params: empty parens, iteration, and Param accessors" {
