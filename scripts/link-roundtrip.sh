@@ -1919,15 +1919,17 @@ fn main {
     env.out(twice(|n| n * 10, 3))
     let gain = 4
     env.out(apply(|n| n * gain, 5))
+    var base = 100
+    env.out(apply(|n| n + base, 7))
 }
 Q64
-clo_expected=$'42\n6\n60\n20'
+clo_expected=$'42\n6\n60\n20\n107'
 "$Q64_BIN" emit "$clo_app" "$tmp/closures.wasm"
 clo_out="$("$HOST_BIN" "$tmp/closures.wasm")"
 [[ "$clo_out" == "$clo_expected" ]] || { echo "FAIL: closures (got: $clo_out)" >&2; exit 1; }
 "$Q64_BIN" emit "$clo_app" "$tmp/closures32.wasm" --addr wasm32
 clo32_out="$("$HOST_BIN" "$tmp/closures32.wasm")"
 [[ "$clo32_out" == "$clo_expected" ]] || { echo "FAIL: closures wasm32 (got: $clo32_out)" >&2; exit 1; }
-echo "    ok: closures -> 42 / 6 / 60 / 20 (wasm64 + wasm32)"
+echo "    ok: closures -> 42 / 6 / 60 / 20 / 107 (wasm64 + wasm32; incl. runtime var capture)"
 
 echo "PASS: $qube_out"

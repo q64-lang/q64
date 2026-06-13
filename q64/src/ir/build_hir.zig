@@ -4400,6 +4400,54 @@ fn lambdaBodyExpr(lam: ast.LambdaExpr) ?ast.Expr {
     return ast.Expr.cast(bn);
 }
 
+/// A lambda's runtime capture: a free scalar variable resolved at the
+/// call site, threaded into the stamped instance as an extra parameter.
+const Capture = struct { name: []const u8, ty: hir.Type, idx: u32 };
+
+fn isLambdaParam(lam: ast.LambdaExpr, name: []const u8) bool {
+    var it = lam.params();
+    while (it.next()) |p| if (std.mem.eql(u8, p.text, name)) return true;
+    return false;
+}
+
+/// Collect the lambda's runtime captures: single-segment identifiers in its
+/// body that aren't its parameters and resolve to a *scalar local* in the
+/// call-site `caller` scope. (A const `let` folds and isn't a local, so it
+/// keeps folding; a `var` / call-bound value is captured.) Deduped, in
+/// first-seen order. v0: scalar captures only.
+fn collectCaptures(b: *Builder, node: *const parser.cst.Node, lam: ast.LambdaExpr, caller: *const Scope, out: *std.ArrayList(Capture)) BuildError!void {
+    if (node.kind == .PATH_EXPR) {
+        var head: ?[]const u8 = null;
+        var dotted = false;
+        for (node.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind.isTrivia()) continue;
+                if (t.kind == .DOT) dotted = true else if (t.kind == .IDENT and head == null) head = t.text;
+            },
+            .node => {},
+        };
+        if (!dotted) if (head) |h| {
+            if (!isLambdaParam(lam, h)) {
+                if (caller.find(h)) |loc| switch (loc.ty) {
+                    .i64, .f64, .f32, .bool => {
+                        var seen = false;
+                        for (out.items) |cap| if (std.mem.eql(u8, cap.name, h)) {
+                            seen = true;
+                            break;
+                        };
+                        if (!seen) try out.append(b.a, .{ .name = h, .ty = loc.ty, .idx = loc.idx });
+                    },
+                    else => {}, // non-scalar capture deferred (the body ref will reject honestly)
+                };
+            }
+        };
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try collectCaptures(b, n, lam, caller, out),
+        .token => {},
+    };
+}
+
 fn firstTokOffset(node: *const parser.cst.Node) u32 {
     for (node.children) |c| switch (c) {
         .token => |t| if (!t.kind.isTrivia()) return t.offset,
@@ -4456,7 +4504,22 @@ fn buildHofCall(b: *Builder, fname: []const u8, fd: ast.FnDecl, call: ast.CallEx
         }
     }
     if (ait.next() != null) return reject(b, .unsupported_call);
-    const fid = try stampHof(b, fname, fd, fpname orelse return error.Unsupported, lam orelse return error.Unsupported);
+    const the_lam = lam orelse return error.Unsupported;
+
+    // Runtime captures: free scalar locals referenced in the lambda body. They
+    // ride into the stamped instance as extra parameters (capture by value —
+    // a sound alias for a downward-only, non-mutating closure), so append the
+    // captured values to the call here, after the ordinary arguments.
+    var captures: std.ArrayList(Capture) = .empty;
+    defer captures.deinit(b.a);
+    if (the_lam.body()) |lbody| try collectCaptures(b, lbody, the_lam, scope, &captures);
+    for (captures.items) |cap| {
+        const cv = try b.a.create(hir.Expr);
+        cv.* = .{ .local = .{ .idx = cap.idx, .ty = cap.ty } };
+        try args.append(b.a, cv);
+    }
+
+    const fid = try stampHof(b, fname, fd, fpname orelse return error.Unsupported, the_lam, captures.items);
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
     return e;
@@ -4465,7 +4528,7 @@ fn buildHofCall(b: *Builder, fname: []const u8, fd: ast.FnDecl, call: ast.CallEx
 /// Stamp a specialized instance of higher-order `fd` for the given lambda:
 /// the `fn`-typed parameter is dropped (inlined in the body), the rest stay
 /// runtime parameters. Deduped per (callee, lambda site).
-fn stampHof(b: *Builder, fname: []const u8, fd: ast.FnDecl, fpname: []const u8, lam: ast.LambdaExpr) BuildError!hir.FuncId {
+fn stampHof(b: *Builder, fname: []const u8, fd: ast.FnDecl, fpname: []const u8, lam: ast.LambdaExpr, captures: []const Capture) BuildError!hir.FuncId {
     const key = try std.fmt.allocPrint(b.a, "{s}#L{d}", .{ fname, firstTokOffset(lam.cst) });
     if (b.ids.get(key)) |id| {
         b.a.free(key);
@@ -4484,6 +4547,12 @@ fn stampHof(b: *Builder, fname: []const u8, fd: ast.FnDecl, fpname: []const u8, 
     var rec_params: std.ArrayList(?*const StructInfo) = .empty;
     _ = try collectCalleeParams(b, fd, &scope, &params, &rec_params); // skips the fn param
     rec_params.deinit(b.a);
+    // Captures follow the ordinary parameters (matching the call site's
+    // appended capture values), readable in the body by name.
+    for (captures) |cap| {
+        _ = try scope.declare(cap.name, false, cap.ty);
+        try params.append(b.a, .{ .name = cap.name, .ty = cap.ty });
+    }
     scope.n_params = scope.next_idx;
     const param_slice = try params.toOwnedSlice(b.a);
 
@@ -5862,6 +5931,22 @@ test "closures: a higher-order fn specializes per lambda (inlined call)" {
     try tr2.addLib("pub fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }\n");
     const m2 = try buildFromSource(testing.allocator, "fn main {\n env.out(apply(7, 5))\n}\n", tr2.resolver());
     try testing.expect(m2 == null);
+}
+
+test "closures: a lambda captures a runtime local (capture-by-extra-param)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }\n");
+    // `g` is a runtime `var` local — captured into the stamped instance.
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var g = 4\n env.out(apply(|n| n + g, 10))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The capture rides as an extra param `g`, and the body adds it.
+    try testing.expect(std.mem.indexOf(u8, dump, "apply#L") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "add") != null);
 }
 
 test "tryBuild: a bool is not an int — assigning an int to a bool is rejected" {

@@ -72,6 +72,17 @@ needs the platform audit, so it's the highest-leverage near-term work.
     complex arg to `f(...)` used multiply (shared expr → would double-eval);
     str/record/closure-returning HOFs. **TYP352** (assign to an immutable
     capture) also still pending. Real `.map`/iterator HOFs build on this.
+    **Runtime alias-capture done:** a lambda's free scalar locals
+    (`var g = …; apply(|n| n + g, 10)` → 14) are now **capture-by-extra-
+    parameter** — `collectCaptures` finds the free single-segment scalar idents
+    that resolve in the call-site scope, `buildHofCall` appends their values to
+    the call, and `stampHof` declares them as extra params after the ordinary
+    ones (read by name in the inlined body). Sound for a downward-only,
+    non-mutating closure (capture-by-value of the current binding). Verified
+    end-to-end wasm64 + wasm32 (roundtrip: `+107` from a `var base` capture) +
+    a build_hir test. **Still deferred:** capture *mutation* / write-back
+    (TYP352-adjacent), non-scalar (record/str) captures, block-body lambdas,
+    multiple fn params.
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
