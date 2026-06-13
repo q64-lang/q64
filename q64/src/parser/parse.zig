@@ -439,9 +439,16 @@ const Parser = struct {
             try self.eatTrivia(&children);
         }
 
-        // EffectSpec / WhereClause aren't parsed yet. Anything
-        // between the return type and the body's `{` collects here
-        // so the lossless invariant holds.
+        // EffectSpec: `@marker (+ @marker)*` after the return type
+        // (spec/grammar.md §Functions). Structured so the check pass can
+        // read the declared effect set (EFF120, …).
+        if (self.peek() == .AT) {
+            try children.append(self.arena, .{ .node = try self.parseEffectSpec() });
+            try self.eatTrivia(&children);
+        }
+
+        // WhereClause isn't parsed yet. Anything between the effect spec
+        // and the body's `{` collects here so the lossless invariant holds.
         while (!self.isEof() and self.peek() != .L_BRACE) {
             try children.append(self.arena, .{ .token = self.advance() });
         }
@@ -732,6 +739,42 @@ const Parser = struct {
             }
         }
         return try cst.makeNode(self.arena, .EFFECT_DECL, children.items);
+    }
+
+    /// `EffectSpec := EffectMarker ("+" EffectMarker)*` (spec/grammar.md).
+    /// Parsed after a function's return type; each `@name` becomes an
+    /// EFFECT_MARKER node so the check pass can read the declared set.
+    /// Trivia around the `+` is tolerated and preserved.
+    fn parseEffectSpec(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .node = try self.parseEffectMarker() });
+        while (true) {
+            const save = self.pos;
+            var pending: std.ArrayList(cst.Element) = .empty;
+            try self.eatTrivia(&pending);
+            if (self.peek() != .PLUS) {
+                self.pos = save; // leave trailing trivia for the caller
+                break;
+            }
+            try children.appendSlice(self.arena, pending.items);
+            try children.append(self.arena, .{ .token = self.advance() }); // +
+            try self.eatTrivia(&children);
+            if (self.peek() != .AT) break;
+            try children.append(self.arena, .{ .node = try self.parseEffectMarker() });
+        }
+        return try cst.makeNode(self.arena, .EFFECT_SPEC, children.items);
+    }
+
+    /// `EffectMarker := "@" IDENT` (spec/grammar.md). The IDENT names a
+    /// core or user marker; validity/contradiction is the check pass's
+    /// concern (EFF120/EFF140/EFF141).
+    fn parseEffectMarker(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // @
+        if (self.peek() == .IDENT) {
+            try children.append(self.arena, .{ .token = self.advance() }); // name
+        }
+        return try cst.makeNode(self.arena, .EFFECT_MARKER, children.items);
     }
 
     /// `StateDecl := "state" IDENT (":" TypeExpr)? "=" Expr` — module-level
@@ -3184,6 +3227,31 @@ test "effect declaration parses as an item and round-trips" {
     const first = iter.next() orelse return error.TestExpectedItem;
     try testing.expectEqualStrings("logging", first.effect_decl.name().?.text);
     try testing.expect(first.effect_decl.isPublic());
+}
+
+test "function effect spec parses structured and round-trips" {
+    const src = "pub fn render(x: i64) -> i64 @realtime + @io {\n    x\n}\n";
+    const r = try parse(testing.allocator, src, "eff.q");
+    defer r.deinit(testing.allocator);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+    // The two markers surface in order from the structured EFFECT_SPEC.
+    const sf = ast.SourceFile.cast(r.root).?;
+    var iter = sf.items();
+    const fd = (iter.next() orelse return error.TestExpectedItem).fn_decl;
+    const es = fd.effectSpec() orelse return error.TestExpectedEffectSpec;
+    var mit = es.markers();
+    try testing.expectEqualStrings("realtime", (mit.next().?).name().?.text);
+    try testing.expectEqualStrings("io", (mit.next().?).name().?.text);
+    try testing.expect(mit.next() == null);
+    // A function with no effect annotation has no spec.
+    const r2 = try parse(testing.allocator, "fn main { 0 }\n", "plain.q");
+    defer r2.deinit(testing.allocator);
+    const sf2 = ast.SourceFile.cast(r2.root).?;
+    var it2 = sf2.items();
+    try testing.expect((it2.next().?).fn_decl.effectSpec() == null);
 }
 
 test "LEX021: `&` in a type position is flagged and recovers losslessly" {

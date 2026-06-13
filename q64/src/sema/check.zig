@@ -1047,6 +1047,61 @@ fn checkEffectDecl(gpa: std.mem.Allocator, ed: ast.EffectDecl, diags: *std.Array
     }
 }
 
+/// Capability markers (effects.md §"The core effect set" — the
+/// capabilities). A capability declares a power the function exercises.
+const capability_effects = [_][]const u8{
+    "io",   "network", "fs",   "kv",       "stdout",
+    "stderr", "audio", "midi", "ui",       "inference",
+    "time", "random",  "exit", "envvars",  "wire",
+};
+
+/// Capabilities a `@realtime` function may still declare — the
+/// realtime-safe surfaces (effects.md §"`@realtime` and capabilities":
+/// the `@time`/`@random`/`@audio` carve-outs). Every other capability is
+/// forbidden under `@realtime`.
+const realtime_safe_caps = [_][]const u8{ "time", "random", "audio" };
+
+fn inEffectSet(set: []const []const u8, name: []const u8) bool {
+    for (set) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
+
+/// **EFF120** — a function's declared effect set is internally
+/// contradictory: an assert that forbids a capability appears alongside
+/// that capability (effects.md §"Effect annotations on functions": "A `+`
+/// between an assert and a capability is EFF120"). v0 covers the two
+/// asserts the spec defines as forbidding capabilities — `@pure` (forbids
+/// every capability) and `@realtime` (forbids all but the realtime-safe
+/// `@time`/`@random`/`@audio`). The `@no_*` asserts bound *operations*,
+/// checked at the body level (EFF110/EFF103), not the declaration. Two
+/// asserts compose (`@realtime + @pure` is fine); unknown user markers
+/// are neither assert nor capability, so they never contradict.
+fn checkEffectContradiction(gpa: std.mem.Allocator, es: ast.EffectSpec, diags: *std.ArrayList(Diag)) !void {
+    var has_pure = false;
+    var has_realtime = false;
+    var it = es.markers();
+    while (it.next()) |m| {
+        const nt = m.name() orelse continue;
+        if (std.mem.eql(u8, nt.text, "pure")) has_pure = true;
+        if (std.mem.eql(u8, nt.text, "realtime")) has_realtime = true;
+    }
+    if (!has_pure and !has_realtime) return;
+
+    var it2 = es.markers();
+    while (it2.next()) |m| {
+        const nt = m.name() orelse continue;
+        if (!inEffectSet(&capability_effects, nt.text)) continue;
+        const forbidden = has_pure or
+            (has_realtime and !inEffectSet(&realtime_safe_caps, nt.text));
+        if (forbidden) {
+            try diags.append(gpa, .{ .code = "EFF120", .offset = nt.offset });
+            return; // one EFF120 per function
+        }
+    }
+}
+
 /// The auto-prelude typed-string prefixes (modules.md §"Typed-prefix
 /// string literals", types.md §"Typed-prefix form"). v0 ships the one
 /// the prelude blesses: `url"…"`, reachable because `Url` appears in
@@ -1249,6 +1304,9 @@ pub fn checkFile(
         };
         if (gp) |g| try checkGenericDefaults(gpa, g, &diags);
         if (item == .effect_decl) try checkEffectDecl(gpa, item.effect_decl, &diags);
+        if (item == .fn_decl) {
+            if (item.fn_decl.effectSpec()) |es| try checkEffectContradiction(gpa, es, &diags);
+        }
     }
 
     // LEX020: unknown typed-string prefixes (`xyz"…"`) anywhere in the file.
@@ -1731,6 +1789,26 @@ test "check: EFF140 / EFF141 — user effect name collisions and shape" {
     // A well-formed, non-colliding user effect is silent.
     try expectCodes("pub effect @logging\nfn main { env.out(\"hi\") }\n", &.{});
     try expectCodes("pub effect @audit_trail\nfn main { env.out(\"hi\") }\n", &.{});
+}
+
+test "check: EFF120 — contradictory effect sets" {
+    // An assert + a forbidden capability.
+    try expectCodes("pub fn render @realtime + @io { env.out(\"x\") }\n", &.{"EFF120"});
+    try expectCodes("fn f() -> i64 @pure + @network { 0 }\n", &.{"EFF120"});
+    // `@wire` ⇒ `@io`, so `@realtime + @wire` is EFF120 (the capability is
+    // forbidden directly here — `@wire` is itself a capability marker).
+    try expectCodes("fn g() @realtime + @wire { env.out(\"x\") }\n", &.{"EFF120"});
+    // Realtime-safe carve-outs stay silent.
+    try expectCodes("fn h() @realtime + @audio { env.out(\"x\") }\n", &.{});
+    try expectCodes("fn k() @realtime + @time { env.out(\"x\") }\n", &.{});
+    // Two asserts compose; a lone assert or lone capability is fine.
+    try expectCodes("fn a() @realtime + @pure { env.out(\"x\") }\n", &.{});
+    try expectCodes("fn b() @realtime { env.out(\"x\") }\n", &.{});
+    try expectCodes("fn c() @io { env.out(\"x\") }\n", &.{});
+    // A user marker is neither assert nor capability — no contradiction.
+    try expectCodes("fn d() @realtime + @logging { env.out(\"x\") }\n", &.{});
+    // `@pure` forbids every capability.
+    try expectCodes("fn e() @pure + @audio { env.out(\"x\") }\n", &.{"EFF120"});
 }
 
 test "check: LEX020 — unknown typed-string prefix" {

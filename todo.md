@@ -1085,10 +1085,27 @@ verified, honest diagnostics throughout.
       the per-prefix multi-flag); conformance
       `lexical/string-typed-prefix-unknown` flips → **32/51**; no
       regression on `streams/realtime-pipe-violation.q`'s `url"`
-      usage) → next: the `From` conversion on `try`, and more
-      negative-diagnostic gaps (the remaining effects/concurrency tests
-      need effect *annotation* parsing on functions — currently raw —
-      for EFF120/ENV056).
+      usage) → effect annotations on functions + EFF120 wired (landed:
+      `EffectSpec := EffectMarker ("+" EffectMarker)*` after a function's
+      return type is no longer a raw token run — `parseFnDecl` parses a
+      structured `EFFECT_SPEC` of `EFFECT_MARKER` (`@ IDENT`) nodes
+      (round-trips losslessly; a `where` clause still collects raw), and
+      `ast.FnDecl.effectSpec()` / `EffectSpec.markers()` / `EffectMarker.
+      name()` expose the declared set. The check pass emits **EFF120**
+      when an assert forbids a capability it's combined with —
+      `checkEffectContradiction`: `@pure` forbids every capability,
+      `@realtime` forbids all but the realtime-safe `@time`/`@random`/
+      `@audio` carve-outs (effects.md §"`@realtime` and capabilities");
+      the `@no_*` asserts bound *operations*, checked at the body level,
+      not the declaration, so they don't contradict capability decls; two
+      asserts compose and unknown user markers never contradict. Catalog
+      entry + parser round-trip/structure test + 1 check case (11
+      asserts); conformance `effects/contradictory-effects` flips →
+      **33/51**; no regression on the `@realtime`-only / `@realtime +
+      @stage` functions in golden/streams). The structured effect spec
+      also unblocks EFF110 (assert/operation violations in the body) and
+      ENV056. → next: the `From` conversion on `try`, EFF110/ENV056, and
+      the remaining negative-diagnostic gaps.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

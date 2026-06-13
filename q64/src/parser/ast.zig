@@ -372,6 +372,67 @@ pub const FnDecl = struct {
     pub fn body(self: FnDecl) ?Block {
         return firstChildNode(self.cst, .BLOCK, Block);
     }
+
+    /// The declared effect spec (`@realtime + @io`), or null if the
+    /// signature carries no `@`-annotation. Read by the check pass (EFF120).
+    pub fn effectSpec(self: FnDecl) ?EffectSpec {
+        return firstChildNode(self.cst, .EFFECT_SPEC, EffectSpec);
+    }
+};
+
+/// `EffectSpec := EffectMarker ("+" EffectMarker)*` — the effect set
+/// declared after a function's return type (spec/grammar.md §Functions).
+pub const EffectSpec = struct {
+    cst: *const cst.Node,
+
+    pub fn cast(node: *const cst.Node) ?EffectSpec {
+        if (node.kind == .EFFECT_SPEC) return .{ .cst = node };
+        return null;
+    }
+
+    pub fn markers(self: EffectSpec) MarkerIter {
+        return .{ .children = self.cst.children };
+    }
+
+    pub const MarkerIter = struct {
+        children: []const cst.Element,
+        i: usize = 0,
+
+        pub fn next(self: *MarkerIter) ?EffectMarker {
+            while (self.i < self.children.len) : (self.i += 1) {
+                switch (self.children[self.i]) {
+                    .node => |n| if (n.kind == .EFFECT_MARKER) {
+                        self.i += 1;
+                        return .{ .cst = n };
+                    },
+                    .token => {},
+                }
+            }
+            return null;
+        }
+    };
+};
+
+/// `EffectMarker := "@" IDENT` — a single effect marker.
+pub const EffectMarker = struct {
+    cst: *const cst.Node,
+
+    /// The marker name token (the IDENT after `@`, without the `@`).
+    /// `null` if malformed (`@` with no following name).
+    pub fn name(self: EffectMarker) ?cst.Token {
+        var seen_at = false;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind == .AT) {
+                    seen_at = true;
+                } else if (seen_at and t.kind == .IDENT) {
+                    return t;
+                }
+            },
+            .node => {},
+        };
+        return null;
+    }
 };
 
 // =====================================================================
