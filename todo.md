@@ -1055,9 +1055,18 @@ verified, honest diagnostics throughout.
       by treating it as a `ref` type, so the rest of the signature
       parses and the source round-trips. A bitwise `&` in *expression*
       position is untouched. 2 unit cases; conformance
-      `lexical/ampersand-in-type` flips → **28/51**) → next: the `From`
-      conversion on `try`, and more negative-diagnostic conformance
-      gaps (LEX020 needs the auto-prelude prefix set — deferred).
+      `lexical/ampersand-in-type` flips → **28/51**) → TYP108 (generic
+      default ordering) wired (landed: `checkGenericDefaults` scans a
+      `GENERIC_PARAMS` token span, splits on top-level commas, detects a
+      top-level `=` per param, and flags a non-defaulted param that
+      follows a defaulted one — applied to fn/struct/enum via a new
+      `StructDecl.genericParams()`. Nested `<>`/`[]`/`()` in a default
+      value are depth-skipped; the TYP102 test, whose default is last,
+      stays silent. 3 unit cases; conformance
+      `generics/non-default-after-default` flips → **29/51**) → next:
+      the `From` conversion on `try`, and more negative-diagnostic
+      conformance gaps (LEX020 needs the auto-prelude prefix set —
+      deferred).
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

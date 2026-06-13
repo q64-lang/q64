@@ -407,6 +407,9 @@ pub const StructDecl = struct {
     pub fn name(self: StructDecl) ?cst.Token {
         return itemName(self.cst);
     }
+    pub fn genericParams(self: StructDecl) ?*const cst.Node {
+        return firstChildRawNode(self.cst, .GENERIC_PARAMS);
+    }
 
     /// Record-struct fields (`struct S { a: T, … }`). Empty for tuple
     /// structs (`struct S(T, …)`) and unit structs (`struct S`).

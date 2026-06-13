@@ -164,6 +164,7 @@ pub const codes = [_]CodeInfo{
     .{ .code = "TYP202", .subsystem = "Type checking", .severity = .err, .message = "wrong fit form for multi-param face", .summary = "A multi-parameter face (no `self`; every type a named parameter) must be fit positionally: `fit Face<T1, T2>`, with no implementer prefix. See spec/faces.md §\"Fit declaration\"." },
     .{ .code = "ENV050", .subsystem = "Capabilities", .severity = .err, .message = "`main` Form 2 ends without return", .summary = "A `fn main -> Result<…>` falls off the end without an explicit `return` or a `Result` tail expression. End the body with `Ok(())` (or a `return`). See spec/env.md §\"main signature\"." },
     .{ .code = "ENV052", .subsystem = "Capabilities", .severity = .err, .message = "`main` signature mismatch", .summary = "`main` must be one of the four permitted shapes: `fn main`, `fn main -> Result<…>`, `fn main(env: Env)`, or `fn main(env: Env) -> Result<…>`. Adjust the parameters or return type. See spec/env.md §\"main signature\"." },
+    .{ .code = "TYP108", .subsystem = "Type checking", .severity = .err, .message = "non-default generic parameter after a default", .summary = "Once a generic parameter declares a default (`T = i64`), every parameter after it must also have a default — a required parameter can't follow a defaulted one. Reorder the parameters or give the later one a default. See spec/generics.md." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"

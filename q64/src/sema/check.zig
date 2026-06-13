@@ -1005,6 +1005,60 @@ fn checkMainSignature(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.ArrayL
     }
 }
 
+/// **TYP108**: in a generic parameter list, no parameter without a default
+/// may follow one that has a default (spec/generics.md). Scans the raw
+/// `GENERIC_PARAMS` token span, splitting on top-level commas and detecting a
+/// top-level `=` per parameter (nested `<>`/`[]`/`()` in a default value are
+/// skipped via depth tracking). `const N: i64` after `T = i64` trips it.
+fn checkGenericDefaults(gpa: std.mem.Allocator, gp: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
+    var depth: i32 = 0;
+    var seen_default = false; // a previous parameter carried a default
+    var cur_default = false; // the current parameter carries a default
+    var in_param = false;
+    var cur_off: u32 = 0; // first-token offset of the current parameter
+    var first_angle = true; // skip the opening `<`
+    for (gp.children) |ch| {
+        const t = switch (ch) {
+            .token => |x| x,
+            .node => continue,
+        };
+        if (t.kind.isTrivia()) continue;
+        if (first_angle) { // the outer `<`
+            first_angle = false;
+            continue;
+        }
+        switch (t.kind) {
+            .L_ANGLE, .L_PAREN, .L_BRACK => depth += 1,
+            .R_ANGLE, .R_PAREN, .R_BRACK => {
+                if (depth == 0) continue; // the outer `>` — list complete
+                depth -= 1;
+            },
+            .SHR => depth -= 2,
+            .EQ => if (depth == 0) {
+                cur_default = true;
+            },
+            .COMMA => if (depth == 0) {
+                if (seen_default and !cur_default) {
+                    try diags.append(gpa, .{ .code = "TYP108", .offset = cur_off });
+                }
+                if (cur_default) seen_default = true;
+                in_param = false;
+                cur_default = false;
+                continue;
+            },
+            else => {},
+        }
+        if (!in_param) {
+            in_param = true;
+            cur_off = t.offset;
+        }
+    }
+    // The final parameter (after the last comma).
+    if (in_param and seen_default and !cur_default) {
+        try diags.append(gpa, .{ .code = "TYP108", .offset = cur_off });
+    }
+}
+
 /// Does the optional type expression name `want` (a plain path type)?
 fn typeIsNamed(gpa: std.mem.Allocator, te_opt: ?ast.TypeExpr, want: []const u8) bool {
     const te = te_opt orelse return false;
@@ -1109,6 +1163,19 @@ pub fn checkFile(
     defer generics.deinit(gpa);
     var enums = try collectEnums(gpa, sf);
     defer deinitEnums(gpa, &enums);
+
+    // TYP108: generic default-ordering, on every item kind that carries a
+    // generic parameter list (fn / struct / enum).
+    var git = sf.items();
+    while (git.next()) |item| {
+        const gp: ?*const cst.Node = switch (item) {
+            .fn_decl => |fd| fd.genericParams(),
+            .struct_decl => |sd| sd.genericParams(),
+            .enum_decl => |ed| ed.genericParams(),
+            else => null,
+        };
+        if (gp) |g| try checkGenericDefaults(gpa, g, &diags);
+    }
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -1574,6 +1641,24 @@ test "check: TYP300 — `try` outside a Result-returning function" {
         \\fn main {
         \\    let r = read_size("f")
         \\}
+        \\
+    , &.{});
+}
+
+test "check: TYP108 — a non-default generic parameter after a default" {
+    // A `const` param with no default follows a defaulted type param.
+    try expectCodes(
+        \\pub struct Buffer<T = i64, const N: i64> {
+        \\    data: [T; N],
+        \\}
+        \\fn main { env.out("hi") }
+        \\
+    , &.{"TYP108"});
+    // Valid orderings stay silent: no defaults, all defaults, default last.
+    try expectCodes("fn pair<T, U>() { }\nfn main { env.out(\"hi\") }\n", &.{});
+    try expectCodes(
+        \\fn buffer<T, const N: i64 = 16>() { }
+        \\fn main { env.out("hi") }
         \\
     , &.{});
 }
