@@ -1200,12 +1200,21 @@ verified, honest diagnostics throughout.
       `RuntimeDenied`). String / bare-path / call payloads are left to the
       full payload-type check. Catalog entry + 1 check case (3 asserts);
       conformance `errors/panic-payload-not-panic-fitting` flips →
-      **44/51**) → next: the `From` conversion on `try`, EFF110, and the
-      remaining 7 — dataflow type matching (STR020), generic inference
-      (TYP102), optional flow-narrowing (TYP047), face dyn-safety
-      (TYP207/not-dyn-safe; no-fit-for-bound TYP200), region escape
-      analysis (REG040), qube-root resolution (NAM002), and the reverted
-      PAR040 heuristic.
+      **44/51**) → TYP207 wired (landed: a non-dyn-safe face used in `dyn`
+      position — faces.md §"dyn-safety": every method must take `self`,
+      not return `Self`, and carry no method type params.
+      `checkDynSafety` builds the non-dyn-safe set — curated prelude
+      `{Clone, Default}` (both return `Self`; the rest of the prelude
+      predicate is spec-deferred) plus file-defined faces where
+      `faceIsNonDynSafe` finds a static or `Self`-returning method — then
+      token-scans `dyn <Face>` and flags a match. Catalog entry + 1 check
+      case (3 asserts, incl. `dyn Display` staying silent and a
+      file-defined `-> Self` face); conformance `faces/not-dyn-safe` flips
+      → **45/51**) → next: the `From` conversion on `try`, EFF110, and the
+      remaining 6 — dataflow type matching (STR020), generic inference
+      (TYP102), optional flow-narrowing (TYP047), no-fit-for-bound
+      (TYP200), region escape analysis (REG040), qube-root resolution
+      (NAM002), and the reverted PAR040 heuristic.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

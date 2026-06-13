@@ -1329,6 +1329,70 @@ fn checkWithCapabilities(gpa: std.mem.Allocator, root: *const cst.Node, diags: *
     }
 }
 
+/// Prelude faces that are not dyn-safe: `Clone.clone -> Self` and
+/// `Default.default() -> Self` both return `Self` (Default is also
+/// static). The full dyn-safety predicate for the rest of the prelude is
+/// deferred in faces.md §"Open items"; file-defined faces are checked
+/// mechanically below.
+const nondyn_prelude_faces = [_][]const u8{ "Clone", "Default" };
+
+/// A file-defined face is not dyn-safe if any method is static (no `self`
+/// receiver) or returns `Self` (faces.md §"dyn-safety").
+fn faceIsNonDynSafe(gpa: std.mem.Allocator, fd: ast.FaceDecl) bool {
+    var mit = fd.methods();
+    while (mit.next()) |m| {
+        var has_self = false;
+        if (m.params()) |ps| {
+            var it = ps.iter();
+            while (it.next()) |p| {
+                if (p.isSelf()) has_self = true;
+            }
+        }
+        if (!has_self) return true; // static / associated function
+        if (m.returnType()) |rt| {
+            const txt = (rt.text(gpa) catch null) orelse continue;
+            defer gpa.free(txt);
+            if (std.mem.eql(u8, std.mem.trim(u8, txt, " \t"), "Self")) return true;
+        }
+    }
+    return false;
+}
+
+/// **TYP207** — a non-dyn-safe face used in `dyn` position (faces.md
+/// §"dyn-safety"). Builds the non-dyn-safe face set (curated prelude +
+/// file-defined faces with a `Self`-returning or static method), then
+/// token-scans for `dyn <Face>` and flags a match.
+fn checkDynSafety(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.ArrayList(Diag)) !void {
+    var nondyn = std.StringHashMap(void).init(gpa);
+    defer {
+        var kit = nondyn.keyIterator();
+        while (kit.next()) |k| gpa.free(k.*);
+        nondyn.deinit();
+    }
+    for (nondyn_prelude_faces) |f| try nondyn.put(try gpa.dupe(u8, f), {});
+    var it = sf.items();
+    while (it.next()) |item| {
+        if (item != .face_decl) continue;
+        const fd = item.face_decl;
+        const nm = fd.name() orelse continue;
+        if (faceIsNonDynSafe(gpa, fd)) {
+            if (!nondyn.contains(nm.text)) try nondyn.put(try gpa.dupe(u8, nm.text), {});
+        }
+    }
+
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, sf.cst, &toks);
+    const ts = toks.items;
+    var i: usize = 0;
+    while (i + 1 < ts.len) : (i += 1) {
+        if (ts[i].kind != .KW_DYN or ts[i + 1].kind != .IDENT) continue;
+        if (nondyn.contains(ts[i + 1].text)) {
+            try diags.append(gpa, .{ .code = "TYP207", .offset = ts[i + 1].offset });
+        }
+    }
+}
+
 /// The blessed auto-prelude `Panic`-fitting payload types (errors.md
 /// §"Auto-prelude payload types"). User types fit via `fit T : Panic`.
 const prelude_panic_types = [_][]const u8{ "PanicMessage", "Cancelled", "Closed", "RuntimeDenied" };
@@ -1992,6 +2056,8 @@ pub fn checkFile(
     try checkRealtimePipe(gpa, sf, &diags);
     // TYP306: a `panic` payload whose type doesn't fit `Panic`.
     try checkPanicPayload(gpa, sf, &diags);
+    // TYP207: a non-dyn-safe face used in `dyn` position.
+    try checkDynSafety(gpa, sf, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2513,6 +2579,19 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: TYP207 — non-dyn-safe face in dyn position" {
+    // `dyn Clone` — prelude face returning Self.
+    try expectCodes("fn render(target: dyn Clone) { let _ = target.clone() }\n", &.{"TYP207"});
+    // A dyn-safe prelude face (`Display.fmt(self) -> str`) is fine.
+    try expectCodes("fn show(x: dyn Display) { let _ = x.fmt() }\n", &.{});
+    // A file-defined face with a `-> Self` method is non-dyn-safe.
+    try expectCodes(
+        \\face Dup { fn dup(self) -> Self }
+        \\fn use_it(x: dyn Dup) { let _ = x.dup() }
+        \\
+    , &.{"TYP207"});
 }
 
 test "check: TYP306 — panic payload that doesn't fit Panic" {
