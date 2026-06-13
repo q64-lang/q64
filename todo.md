@@ -1136,12 +1136,24 @@ verified, honest diagnostics throughout.
       up to the next item node, then `flagLinearFields` flags each
       `ref`-typed field via the structured `Field.type_()`. Catalog entry
       + 1 check case (3 asserts); conformance `memory/linear-in-managed`
-      flips → **37/51**) → next: the `From` conversion on `try`, EFF110
-      (assert/operation violations in the body), NAM002 (import path
-      escapes qube), and the remaining negative-diagnostic gaps. Note:
+      flips → **37/51**) → STR051 wired (landed: `Event<T>` is pointwise
+      and has no previous-tick value, so `.pre()` (the feedback one-tick
+      delay, valid only on `Signal`) can't be called on an event
+      (streams.md §"`pre()` for feedback cycles"). `checkEventPre`
+      collects `Event<…>`-typed *parameters* (via the structured
+      `Param.type_()` → `PathType.name()` head), then `scanEventPre`
+      flags any `<event>.pre` `PATH_EXPR` in the body. `Signal.pre()` and
+      non-`pre` methods stay silent. Catalog entry + STR subsystem
+      mapping + 1 check case (3 asserts); conformance `streams/pre-on-event`
+      flips → **38/51**; Event-typed `let` bindings are a follow-on) →
+      next: the `From` conversion on `try`, EFF110 (assert/operation
+      violations in the body), and the remaining gaps. Several remaining
+      tests need bigger subsystems — dataflow types (STR020/STR060),
+      actor/channel model (CONC0xx), generic inference (TYP102), optional
+      flow-narrowing (TYP047), qube-root resolution (NAM002). Note:
       structured leading-annotation parsing (attaching `@managed`/`@stage`
-      to the item) would let REG021 + the stream-stage checks read them
-      directly rather than scanning sibling tokens.
+      to the item) would let REG021 + the stage checks read them directly
+      rather than scanning sibling tokens.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

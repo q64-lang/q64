@@ -1249,6 +1249,79 @@ fn checkTransferVerbs(
     };
 }
 
+/// True when a parameter's declared type is a `PathType` headed by
+/// `Event` (`Event<Point>`, `Event<T>`), i.e. a pointwise event stream.
+fn paramTypeIsEvent(gpa: std.mem.Allocator, p: ast.Param) bool {
+    const ty = p.type_() orelse return false;
+    switch (ty) {
+        .path => |pt| {
+            const nm = pt.name(gpa) catch return false;
+            defer gpa.free(nm);
+            return std.mem.eql(u8, nm, "Event");
+        },
+        else => return false,
+    }
+}
+
+/// The head identifier of a `PATH_EXPR` (`clicks.pre` → `clicks`), or
+/// null if the path doesn't start with an IDENT.
+fn pathFirstIdent(node: *const cst.Node) ?cst.Token {
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            return if (t.kind == .IDENT) t else null;
+        },
+        .node => return null,
+    };
+    return null;
+}
+
+/// Recursively flag `<event>.pre` `PATH_EXPR`s — `.pre()` on an event
+/// receiver (STR051). `events` holds the names known to be `Event<…>`.
+fn scanEventPre(
+    gpa: std.mem.Allocator,
+    node: *const cst.Node,
+    events: *const std.StringHashMap(void),
+    diags: *std.ArrayList(Diag),
+) std.mem.Allocator.Error!void {
+    if (node.kind == .PATH_EXPR) {
+        if (pathFirstIdent(node)) |head| {
+            if (events.contains(head.text)) {
+                if (dottedLastSegment(node)) |last| {
+                    if (std.mem.eql(u8, last.text, "pre")) {
+                        try diags.append(gpa, .{ .code = "STR051", .offset = last.offset });
+                    }
+                }
+            }
+        }
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try scanEventPre(gpa, n, events, diags),
+        .token => {},
+    };
+}
+
+/// **STR051** — `Event<T>` has no previous-tick notion, so `.pre()` (the
+/// feedback one-tick delay, valid only on `Signal`) can't be called on an
+/// event (streams.md §"`pre()` for feedback cycles"). v0 resolves the
+/// receiver type from `Event<…>` *parameters*; `<event>.pre()` on any of
+/// them is flagged. (Event-typed `let` bindings are a follow-on.)
+fn checkEventPre(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.ArrayList(Diag)) !void {
+    var events = std.StringHashMap(void).init(gpa);
+    defer events.deinit();
+    if (fd.params()) |ps| {
+        var it = ps.iter();
+        while (it.next()) |p| {
+            if (paramTypeIsEvent(gpa, p)) {
+                if (p.name()) |nm| try events.put(nm.text, {});
+            }
+        }
+    }
+    if (events.count() == 0) return;
+    const body = fd.body() orelse return;
+    try scanEventPre(gpa, body.cst, &events, diags);
+}
+
 /// **REG020** — a `@managed` (WasmGC) struct may only hold managed or
 /// value-type fields; a `ref` into linear memory is rejected (memory.md
 /// §"Marking a struct `@managed`"). Flags each `ref`-typed field.
@@ -1505,6 +1578,7 @@ pub fn checkFile(
                 try checkCancelCtx(gpa, item.fn_decl, es, &diags);
                 try checkPureEnv(gpa, item.fn_decl, es, &diags);
             }
+            try checkEventPre(gpa, item.fn_decl, &diags);
         }
     }
 
@@ -2035,6 +2109,15 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: STR051 — `pre()` on an Event parameter" {
+    // `.pre()` on an `Event<…>` parameter.
+    try expectCodes("fn echo(clicks: Event<Point>) -> Event<Point> { clicks.pre() }\n", &.{"STR051"});
+    // `.pre()` on a `Signal<…>` parameter is valid (feedback).
+    try expectCodes("fn fb(s: Signal<f32, 48.kHz>) -> Signal<f32, 48.kHz> { s.pre() }\n", &.{});
+    // A non-`pre` method on an event is fine.
+    try expectCodes("fn m(clicks: Event<Point>) { let _ = clicks.map(f) }\n", &.{});
 }
 
 test "check: REG020 — linear ref in a @managed struct" {
