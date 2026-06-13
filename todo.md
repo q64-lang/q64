@@ -1039,7 +1039,18 @@ verified, honest diagnostics throughout.
       emits TYP305 pointing at the `?`; `?.` Option-chaining and the
       `T?` type sugar are untouched. Catalog entry + 2 unit cases +
       conformance `errors/question-on-result.q` flips → **25/51**) →
-      next: the `From` conversion on `try`.
+      `main` signature checks ENV050/ENV052 (landed: `checkMainSignature`
+      in the check pass validates `main` against the four permitted
+      shapes — `fn main`, `fn main -> Result<…>`, `fn main(env: Env)`,
+      `fn main(env: Env) -> Result<…>` — emitting **ENV052** on a
+      wrong-typed/extra param or a structured non-Result return, and
+      **ENV050** when a Form-2 `main` falls off the end through a void
+      op (e.g. `env.out`) with no `return`/Result tail; trailing
+      `return`/`panic`/`if`/`match` and `Ok(())` tails stay silent,
+      raw/unparsed returns are lenient. Catalog entries + 4 unit cases;
+      conformance `env/main-signature-mismatch` + `env/main-form2-no-
+      return` flip → **27/51**) → next: the `From` conversion on
+      `try`, and more negative-diagnostic conformance gaps.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

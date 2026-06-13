@@ -949,6 +949,111 @@ fn fnRetForbidsTry(gpa: std.mem.Allocator, store: *types.TypeStore, table: *cons
     }
 }
 
+/// `main` must match one of four shapes (env.md §"main signature"):
+/// `fn main`, `fn main -> Result<…>`, `fn main(env: Env)`, or
+/// `fn main(env: Env) -> Result<…>`. Anything else is **ENV052**. A Form-2
+/// `main` (a `Result` return) whose body falls off the end through a void
+/// operation — no explicit `return` and no `Result` tail expression — is
+/// **ENV050**. Honesty: a non-`main` function, or an unstructured/raw return
+/// (it might alias `Result`), is left alone.
+fn checkMainSignature(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.ArrayList(Diag)) !void {
+    const name_tok = fd.name() orelse return;
+    if (!std.mem.eql(u8, name_tok.text, "main")) return;
+
+    // Parameters: none, or exactly one of type `Env`.
+    var nparams: usize = 0;
+    var params_ok = true;
+    if (fd.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| : (nparams += 1) {
+            if (nparams == 0) params_ok = typeIsNamed(gpa, p.type_(), "Env");
+        }
+    }
+    if (nparams > 1) params_ok = false;
+
+    // Return: absent, or `Result<…>`. A structured non-`Result` return (a
+    // scalar, `T?`, a tuple, a ref, …) is a mismatch; a raw/unparsed return
+    // stays lenient.
+    var ret_ok = true;
+    var ret_is_result = false;
+    if (fd.returnType()) |rt| {
+        if (rt.type_()) |te| switch (te) {
+            .path => |pt| {
+                const nm = pt.name(gpa) catch return;
+                defer gpa.free(nm);
+                ret_is_result = std.mem.eql(u8, nm, "Result");
+                ret_ok = ret_is_result;
+            },
+            .raw => {}, // uncertain — lenient
+            else => ret_ok = false,
+        };
+    }
+
+    if (!params_ok or !ret_ok) {
+        try diags.append(gpa, .{ .code = "ENV052", .offset = name_tok.offset });
+        return;
+    }
+
+    // ENV050: a Form-2 `main` must end with an explicit `return`/diverge or a
+    // `Result` tail expression — a fall-off through `env.out(…)` is flagged.
+    if (ret_is_result) {
+        if (fd.body()) |body| {
+            if (!form2Yields(gpa, body)) {
+                try diags.append(gpa, .{ .code = "ENV050", .offset = name_tok.offset });
+            }
+        }
+    }
+}
+
+/// Does the optional type expression name `want` (a plain path type)?
+fn typeIsNamed(gpa: std.mem.Allocator, te_opt: ?ast.TypeExpr, want: []const u8) bool {
+    const te = te_opt orelse return false;
+    switch (te) {
+        .path => |pt| {
+            const nm = pt.name(gpa) catch return false;
+            defer gpa.free(nm);
+            return std.mem.eql(u8, nm, want);
+        },
+        else => return false,
+    }
+}
+
+/// Conservative tail check for a Form-2 `main`: does the body provide a value
+/// or diverge on its last statement? An explicit `return`, a `panic`, or a
+/// trailing `if`/`match` (whose arms may each yield) counts; a bare `env.*`
+/// void call or a non-tail statement (`let`/`assign`/`while`/…) does not.
+fn form2Yields(gpa: std.mem.Allocator, body: ast.Block) bool {
+    var last: ?ast.Stmt = null;
+    var it = body.statements();
+    while (it.next()) |s| last = s;
+    const ls = last orelse return false; // empty body: no tail
+    switch (ls) {
+        .return_stmt, .panic_stmt, .if_stmt, .match_stmt => return true,
+        .expr_stmt => |es| {
+            const e = es.expression() orelse return false;
+            return !isVoidEnvCall(gpa, e);
+        },
+        else => return false, // let/assign/while/for/loop/break/continue
+    }
+}
+
+/// Is `e` a call into the ambient `env` capability (`env.out(…)`,
+/// `env.exit(…)`, …)? Such calls are void, so they are not a `Result` tail.
+fn isVoidEnvCall(gpa: std.mem.Allocator, e: ast.Expr) bool {
+    const cc = switch (e) {
+        .call => |c| c,
+        else => return false,
+    };
+    const callee = cc.callee() orelse return false;
+    const pe = switch (callee) {
+        .path => |p| p,
+        else => return false,
+    };
+    const txt = pe.text(gpa) catch return false;
+    defer gpa.free(txt);
+    return std.mem.startsWith(u8, txt, "env.");
+}
+
 fn patternHead(node: *const cst.Node) ?[]const u8 {
     var head: ?[]const u8 = null;
     for (node.children) |c| switch (c) {
@@ -1009,6 +1114,7 @@ pub fn checkFile(
     while (it.next()) |item| switch (item) {
         .fn_decl => |fd| {
             const name_tok = fd.name() orelse continue;
+            try checkMainSignature(gpa, fd, &diags);
             const body = fd.body() orelse continue;
 
             var c = Checker{
@@ -1467,6 +1573,49 @@ test "check: TYP300 — `try` outside a Result-returning function" {
         \\}
         \\fn main {
         \\    let r = read_size("f")
+        \\}
+        \\
+    , &.{});
+}
+
+test "check: ENV052 — `main` signature mismatch (wrong param / return)" {
+    // A wrong-typed parameter.
+    try expectCodes(
+        \\fn main(args: [str]) {
+        \\    let _ = args
+        \\}
+        \\
+    , &.{"ENV052"});
+    // A non-Result return type.
+    try expectCodes(
+        \\fn main -> i64 {
+        \\    0
+        \\}
+        \\
+    , &.{"ENV052"});
+    // The four valid shapes stay silent.
+    try expectCodes("fn main { env.out(\"hi\") }\n", &.{});
+    try expectCodes("fn main(env: Env) { env.out(\"hi\") }\n", &.{});
+    try expectCodes(
+        \\fn main -> Result<(), Error> {
+        \\    Ok(())
+        \\}
+        \\
+    , &.{});
+}
+
+test "check: ENV050 — Form-2 `main` falls off the end without a Result tail" {
+    try expectCodes(
+        \\fn main -> Result<(), Error> {
+        \\    env.out("hello")
+        \\}
+        \\
+    , &.{"ENV050"});
+    // An explicit `Ok(())` tail or a trailing `match` is silent.
+    try expectCodes(
+        \\fn main -> Result<(), Error> {
+        \\    env.out("hello")
+        \\    Ok(())
         \\}
         \\
     , &.{});

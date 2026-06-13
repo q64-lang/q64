@@ -162,6 +162,8 @@ pub const codes = [_]CodeInfo{
     .{ .code = "TYP200", .subsystem = "Type checking", .severity = .err, .message = "type does not fit face", .summary = "A generic call requires `T: Face`, but the inferred type has no fit for that face. Declare `fit Type : Face { … }`, or pass a type that fits. See spec/faces.md §\"Diagnostic codes\"." },
     .{ .code = "TYP201", .subsystem = "Type checking", .severity = .err, .message = "wrong fit form for single-param face", .summary = "A single-parameter face (its methods take `self`) must be fit with the implementer first: `fit Type : Face`, not `fit Face<Type>`. See spec/faces.md §\"Fit declaration\"." },
     .{ .code = "TYP202", .subsystem = "Type checking", .severity = .err, .message = "wrong fit form for multi-param face", .summary = "A multi-parameter face (no `self`; every type a named parameter) must be fit positionally: `fit Face<T1, T2>`, with no implementer prefix. See spec/faces.md §\"Fit declaration\"." },
+    .{ .code = "ENV050", .subsystem = "Capabilities", .severity = .err, .message = "`main` Form 2 ends without return", .summary = "A `fn main -> Result<…>` falls off the end without an explicit `return` or a `Result` tail expression. End the body with `Ok(())` (or a `return`). See spec/env.md §\"main signature\"." },
+    .{ .code = "ENV052", .subsystem = "Capabilities", .severity = .err, .message = "`main` signature mismatch", .summary = "`main` must be one of the four permitted shapes: `fn main`, `fn main -> Result<…>`, `fn main(env: Env)`, or `fn main(env: Env) -> Result<…>`. Adjust the parameters or return type. See spec/env.md §\"main signature\"." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"
