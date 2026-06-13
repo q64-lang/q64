@@ -1329,6 +1329,131 @@ fn checkWithCapabilities(gpa: std.mem.Allocator, root: *const cst.Node, diags: *
     }
 }
 
+/// **CONC050** — `channel<T>(…)` with no `policy:` argument; the
+/// constructor has no default policy (concurrency.md §"Channel
+/// construction"). Scans the flat token stream: at an `channel` call
+/// (`channel` then optional `<…>` then `(…)`), flag if the arg list has
+/// no top-level `policy:` named argument.
+fn checkChannelPolicy(gpa: std.mem.Allocator, root: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, root, &toks);
+    const ts = toks.items;
+
+    var i: usize = 0;
+    while (i < ts.len) : (i += 1) {
+        if (ts[i].kind != .IDENT or !std.mem.eql(u8, ts[i].text, "channel")) continue;
+        var j = i + 1;
+        // Optional `<…>` generic arguments.
+        if (j < ts.len and ts[j].kind == .L_ANGLE) {
+            var ad: i32 = 0;
+            while (j < ts.len) {
+                if (ts[j].kind == .L_ANGLE) ad += 1;
+                if (ts[j].kind == .R_ANGLE) {
+                    ad -= 1;
+                    if (ad == 0) {
+                        j += 1;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+        }
+        if (j >= ts.len or ts[j].kind != .L_PAREN) continue; // not a call
+
+        var depth: i32 = 1;
+        var k = j + 1;
+        var has_policy = false;
+        while (k < ts.len and depth > 0) : (k += 1) {
+            switch (ts[k].kind) {
+                .L_PAREN, .L_BRACE, .L_BRACK => depth += 1,
+                .R_PAREN, .R_BRACE, .R_BRACK => depth -= 1,
+                .IDENT => if (depth == 1 and std.mem.eql(u8, ts[k].text, "policy") and
+                    k + 1 < ts.len and ts[k + 1].kind == .COLON)
+                {
+                    has_policy = true;
+                },
+                else => {},
+            }
+        }
+        if (!has_policy) try diags.append(gpa, .{ .code = "CONC050", .offset = ts[i].offset });
+    }
+}
+
+/// The iterable head identifier of a `FOR_STMT` (`for x in rx` → `rx`),
+/// reading the first name after `in`. Null if it isn't a simple path.
+fn forIterableHead(node: *const cst.Node) ?cst.Token {
+    var seen_in = false;
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind == .KW_IN) {
+                seen_in = true;
+            } else if (seen_in and !t.kind.isTrivia()) {
+                return if (t.kind == .IDENT) t else null;
+            }
+        },
+        .node => |n| if (seen_in) return pathFirstIdent(n),
+    };
+    return null;
+}
+
+fn scanCancelFor(
+    gpa: std.mem.Allocator,
+    node: *const cst.Node,
+    recv: *const std.StringHashMap(void),
+    diags: *std.ArrayList(Diag),
+) std.mem.Allocator.Error!void {
+    if (node.kind == .FOR_STMT) {
+        if (forIterableHead(node)) |h| {
+            if (recv.contains(h.text)) {
+                try diags.append(gpa, .{ .code = "CONC053", .offset = firstTokenOffset(node) });
+            }
+        }
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try scanCancelFor(gpa, n, recv, diags),
+        .token => {},
+    };
+}
+
+/// **CONC053** — `for x in rx` over a cancel-aware receiver
+/// (`Receiver<_, Backpressure|LatestValue>`) when no `ctx: Cancel` is in
+/// scope; the desugaring's suspending `recv` needs `ctx`
+/// (concurrency.md §"`for x in rx` loop form"). v0 resolves the receiver
+/// from cancel-aware `Receiver<…>` *parameters* and treats a `ctx`/
+/// `Cancel` parameter as providing the token.
+fn checkCancelAwareFor(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.ArrayList(Diag)) !void {
+    var recv = std.StringHashMap(void).init(gpa);
+    defer recv.deinit();
+    var has_ctx = false;
+    if (fd.params()) |ps| {
+        var it = ps.iter();
+        while (it.next()) |p| {
+            const ty = p.type_() orelse continue;
+            if (ty != .path) continue;
+            const nm = ty.path.name(gpa) catch continue;
+            defer gpa.free(nm);
+            if (std.mem.eql(u8, nm, "Cancel")) has_ctx = true;
+            if (p.name()) |pn| if (std.mem.eql(u8, pn.text, "ctx")) {
+                has_ctx = true;
+            };
+            if (std.mem.eql(u8, nm, "Receiver")) {
+                if (try ty.path.genericArgsText(gpa)) |ga| {
+                    defer gpa.free(ga);
+                    if (std.mem.indexOf(u8, ga, "Backpressure") != null or
+                        std.mem.indexOf(u8, ga, "LatestValue") != null)
+                    {
+                        if (p.name()) |pn| try recv.put(pn.text, {});
+                    }
+                }
+            }
+        }
+    }
+    if (has_ctx or recv.count() == 0) return;
+    const body = fd.body() orelse return;
+    try scanCancelFor(gpa, body.cst, &recv, diags);
+}
+
 /// **CONC020** — `c.tell(Msg)` (fire-and-forget) on a message whose
 /// handler declares a reply (`handle Msg -> T`); the caller should use
 /// `c.ask(Msg)` (concurrency.md §"`tell` vs `ask`"). The actor body
@@ -1711,6 +1836,7 @@ pub fn checkFile(
                 try checkPureEnv(gpa, item.fn_decl, es, &diags);
             }
             try checkEventPre(gpa, item.fn_decl, &diags);
+            try checkCancelAwareFor(gpa, item.fn_decl, &diags);
         }
     }
 
@@ -1724,6 +1850,8 @@ pub fn checkFile(
     try checkWithCapabilities(gpa, sf.cst, &diags);
     // CONC020: `tell` on a reply-bearing actor handler.
     try checkActorTell(gpa, sf.cst, &diags);
+    // CONC050: `channel<T>(…)` with no `policy:` argument.
+    try checkChannelPolicy(gpa, sf.cst, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2245,6 +2373,37 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: CONC050 — channel requires a policy" {
+    // No `policy:` argument.
+    try expectCodes("fn main { scope { let (tx, rx) = channel<i64>(capacity: 16) } }\n", &.{"CONC050"});
+    // A `policy:` argument is present.
+    try expectCodes("fn main { scope { let (tx, rx) = channel<i64>(policy: Backpressure, capacity: 4) } }\n", &.{});
+}
+
+test "check: CONC053 — for over a cancel-aware receiver without ctx" {
+    // Cancel-aware receiver (`Backpressure`), no ctx.
+    try expectCodes(
+        \\fn drain(rx: Receiver<i64, Backpressure>) {
+        \\    for x in rx { let _ = x }
+        \\}
+        \\
+    , &.{"CONC053"});
+    // A `ctx: Cancel` parameter satisfies the requirement.
+    try expectCodes(
+        \\fn drain(ctx: Cancel, rx: Receiver<i64, Backpressure>) {
+        \\    for x in rx { let _ = x }
+        \\}
+        \\
+    , &.{});
+    // A non-cancel-aware policy doesn't require ctx.
+    try expectCodes(
+        \\fn drain(rx: Receiver<i64, RingBuffer>) {
+        \\    for x in rx { let _ = x }
+        \\}
+        \\
+    , &.{});
 }
 
 test "check: CONC020 — `tell` on a reply-bearing handler" {

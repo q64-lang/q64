@@ -1166,13 +1166,24 @@ verified, honest diagnostics throughout.
       non-reply handler and `ask` on a reply handler stay silent. Catalog
       entry + CONC subsystem mapping + 1 check case (2 asserts);
       conformance `concurrency/tell-on-reply-handler` flips → **40/51**) →
-      next: the `From` conversion on `try`, EFF110, and the remaining
-      gaps. The rest need bigger subsystems — dataflow types
-      (STR020/STR060), the rest of the channel/cancel model
-      (CONC051/CONC053), generic inference (TYP102), optional
-      flow-narrowing (TYP047), face/dyn-safety (TYP306/not-dyn-safe/
-      no-fit-for-bound), region escape analysis (REG040), qube-root
-      resolution (NAM002), and the reverted PAR040 heuristic.
+      CONC050 + CONC053 wired (landed: two more concurrency checks.
+      **CONC050** — `channel<T>(…)` has no default policy, so a call with
+      no top-level `policy:` argument is flagged (flat-token scan over the
+      `channel … <…>? (…)` shape). **CONC053** — `for x in rx` over a
+      cancel-aware receiver (`Receiver<_, Backpressure|LatestValue>`) with
+      no `ctx`/`Cancel` parameter in scope; `checkCancelAwareFor` collects
+      cancel-aware `Receiver<…>` params (via `PathType.genericArgsText`),
+      treats a `ctx`/`Cancel` param as the token, and `scanCancelFor`
+      flags a `FOR_STMT` whose iterable head is such a receiver. Catalog
+      entries + 2 check cases (5 asserts); conformance
+      `concurrency/channel-policy-required` +
+      `concurrency/for-cancel-aware-without-ctx` flip → **42/51**) → next:
+      the `From` conversion on `try`, EFF110, and the remaining gaps. The
+      rest need bigger subsystems — dataflow types (STR020/STR060),
+      generic inference (TYP102), optional flow-narrowing (TYP047),
+      face/dyn-safety (TYP306/not-dyn-safe/no-fit-for-bound), region
+      escape analysis (REG040), qube-root resolution (NAM002), and the
+      reverted PAR040 heuristic.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
