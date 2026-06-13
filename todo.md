@@ -89,9 +89,12 @@ needs the platform audit, so it's the highest-leverage near-term work.
     exposes `lo()`/`hi()`/`inclusive()`; `buildForRange` desugars a `for` over a
     range to a counted `let i = lo; while i < hi { body; i = i+1 }` (`<=` for
     `..=`), bounds evaluated once. Runs wasm64 + wasm32 (roundtrip ranges
-    section: exclusive / inclusive / variable bounds → 3/15/14). **Boundary:**
-    main-only (like the other aggregate `for`s); ranges as general values
-    (`let r = 0..n`, slicing) and callee-body range `for` are follow-ons.
+    section: exclusive / inclusive / variable bounds → 3/15/14). Now works in
+    **callee bodies too** (`buildIntForRange`: same counted-loop desugar, body
+    via `buildIntStmt`, returned as one block) — `fn sum_to(n) { var s=0\n for i
+    in 1..=n { s=s+i }\n s }` → 5050. **Boundary:** array/vec `for` is still
+    main-only; ranges as general values (`let r = 0..n`, slicing) are a
+    follow-on.
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**

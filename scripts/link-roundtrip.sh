@@ -1935,6 +1935,11 @@ echo "    ok: closures -> 42 / 6 / 60 / 20 / 107 (wasm64 + wasm32; incl. runtime
 echo "==> ranges: for i in lo..hi / lo..=hi (counted loop)"
 rng_app="$tmp/ranges.q"
 cat > "$rng_app" <<'Q64'
+fn sum_to(n: i64) -> i64 {
+    var s = 0
+    for i in 1..=n { s = s + i }
+    s
+}
 fn main {
     var a = 0
     for i in 0..3 { a = a + i }
@@ -1947,15 +1952,16 @@ fn main {
     var c = 0
     for j in lo..hi { c = c + j }
     env.out(c)
+    env.out(sum_to(100))
 }
 Q64
-rng_expected=$'3\n15\n14'
+rng_expected=$'3\n15\n14\n5050'
 "$Q64_BIN" emit "$rng_app" "$tmp/ranges.wasm"
 rng_out="$("$HOST_BIN" "$tmp/ranges.wasm")"
 [[ "$rng_out" == "$rng_expected" ]] || { echo "FAIL: ranges (got: $rng_out)" >&2; exit 1; }
 "$Q64_BIN" emit "$rng_app" "$tmp/ranges32.wasm" --addr wasm32
 rng32_out="$("$HOST_BIN" "$tmp/ranges32.wasm")"
 [[ "$rng32_out" == "$rng_expected" ]] || { echo "FAIL: ranges wasm32 (got: $rng32_out)" >&2; exit 1; }
-echo "    ok: ranges -> 3 / 15 / 14 (wasm64 + wasm32; exclusive, inclusive, var bounds)"
+echo "    ok: ranges -> 3 / 15 / 14 / 5050 (wasm64 + wasm32; main + callee-body for, var bounds)"
 
 echo "PASS: $qube_out"

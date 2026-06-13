@@ -4291,6 +4291,57 @@ fn buildForRange(b: *Builder, fs: ast.ForStmt, range: ast.RangeExpr, xname: []co
     try out.append(b.a, st);
 }
 
+/// `for i in lo..hi { … }` inside a *callee* body — same counted-loop
+/// desugar as `buildForRange`, but the body builds through `buildIntStmt`
+/// (value statements) and the whole thing returns as one block.
+fn buildIntForRange(b: *Builder, fs: ast.ForStmt, range: ast.RangeExpr, xname: []const u8, scope: *Scope) BuildError!*hir.Stmt {
+    const lo_e = try buildIntExpr(b, range.lo() orelse return error.Unsupported, scope);
+    const hi_e = try buildIntExpr(b, range.hi() orelse return error.Unsupported, scope);
+    const hidden_hi = try std.fmt.allocPrint(b.a, "{s}#hi", .{xname});
+    const hi_idx = try declareBodyLocal(b, scope, hidden_hi, false, .i64);
+    const i_idx = try declareBodyLocal(b, scope, xname, true, .i64);
+
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    const sthi = try b.a.create(hir.Stmt);
+    sthi.* = .{ .let = .{ .idx = hi_idx, .value = hi_e } };
+    try items.append(b.a, sthi);
+    const sti0 = try b.a.create(hir.Stmt);
+    sti0.* = .{ .let = .{ .idx = i_idx, .value = lo_e } };
+    try items.append(b.a, sti0);
+
+    // while i (< | <=) #hi { <body>; i = i + 1 }
+    var binner: std.ArrayList(*hir.Stmt) = .empty;
+    var bit = (fs.body() orelse return error.Unsupported).statements();
+    while (bit.next()) |bs| try binner.append(b.a, try buildIntStmt(b, bs, scope));
+    {
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const one = try b.a.create(hir.Expr);
+        one.* = .{ .int_const = 1 };
+        const inc = try b.a.create(hir.Expr);
+        inc.* = .{ .bin = .{ .kind = .add, .lhs = iref, .rhs = one } };
+        const sti = try b.a.create(hir.Stmt);
+        sti.* = .{ .assign = .{ .idx = i_idx, .value = inc } };
+        try binner.append(b.a, sti);
+    }
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try binner.toOwnedSlice(b.a) };
+
+    const iref2 = try b.a.create(hir.Expr);
+    iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+    const hiref = try b.a.create(hir.Expr);
+    hiref.* = .{ .local = .{ .idx = hi_idx, .ty = .i64 } };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = if (range.inclusive()) .le else .lt, .lhs = iref2, .rhs = hiref } };
+    const wst = try b.a.create(hir.Stmt);
+    wst.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try items.append(b.a, wst);
+
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return out;
+}
+
 /// A statement-position `v.push(x)` on a vec binding, or null.
 fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
     const cname = (callPathName(b, call)) orelse return null;
@@ -4971,6 +5022,12 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             out.* = .{ .while_ = .{ .cond = cond, .body = body } };
         },
         .loop_stmt => |lp| out.* = .{ .loop_ = try buildIntBlock(b, lp.body() orelse return error.Unsupported, scope) },
+        .for_stmt => |fs| {
+            const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            const iter = fs.iterable() orelse return error.Unsupported;
+            if (iter == .range) return buildIntForRange(b, fs, iter.range, pat.text, scope);
+            return error.Unsupported; // array/vec `for` in a callee body: a follow-on
+        },
         .break_stmt => |bs| {
             if (bs.value() != null) return error.Unsupported; // value-break not supported
             out.* = .brk;
@@ -6001,6 +6058,20 @@ test "closures: a lambda captures a runtime local (capture-by-extra-param)" {
     // The capture rides as an extra param `g`, and the body adds it.
     try testing.expect(std.mem.indexOf(u8, dump, "apply#L") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "add") != null);
+}
+
+test "for-range in a callee body: `for i in 1..=n` counted loop" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn sum_to(n: i64) -> i64 {\n var s = 0\n for i in 1..=n { s = s + i }\n s\n}\n");
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(sum_to(5))\n}\n", tr.resolver())) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The range `for` desugared to a `while` inside `sum_to`.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn sum_to") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
 }
 
 test "tryBuild: a bool is not an int — assigning an int to a bool is rejected" {
