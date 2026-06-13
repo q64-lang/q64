@@ -1874,4 +1874,27 @@ rp32_out="$("$HOST_BIN" "$tmp/recpay32.wasm")"
 [[ "$rp32_out" == "$rp_expected" ]] || { echo "FAIL: rec-payloads wasm32 (got: $rp32_out)" >&2; exit 1; }
 echo "    ok: record enum payloads -> 8080 / 13 / 8081 / err 7 (wasm64 + wasm32)"
 
+echo "==> native float-math builtins: x.sqrt() / x.abs() / x.floor() / x.ceil()"
+fm_app="$tmp/floatmath.q"
+cat > "$fm_app" <<'Q64'
+fn root(x: f64) -> f64 { x.sqrt() }
+fn mag(x: f64) -> f64 { x.abs() }
+fn fl(x: f64) -> f64 { x.floor() }
+fn r32(x: f32) -> f32 { x.sqrt() }
+fn main {
+    env.out(root(16.0))
+    env.out(mag(0.0 - 3.5))
+    env.out(fl(2.9))
+    env.out(r32(f32(9.0)))
+}
+Q64
+fm_expected=$'4.0\n3.5\n2.0\n3.0'
+"$Q64_BIN" emit "$fm_app" "$tmp/floatmath.wasm"
+fm_out="$("$HOST_BIN" "$tmp/floatmath.wasm")"
+[[ "$fm_out" == "$fm_expected" ]] || { echo "FAIL: float-math builtins (got: $fm_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$fm_app" "$tmp/floatmath32.wasm" --addr wasm32
+fm32_out="$("$HOST_BIN" "$tmp/floatmath32.wasm")"
+[[ "$fm32_out" == "$fm_expected" ]] || { echo "FAIL: float-math builtins wasm32 (got: $fm32_out)" >&2; exit 1; }
+echo "    ok: float-math builtins -> 4.0 / 3.5 / 2.0 / 3.0 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"

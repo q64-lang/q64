@@ -369,7 +369,8 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             const operand = try lowerExpr(ctx, u.operand);
             const ty: mir.ValueType = switch (u.kind) {
                 .not => .i32,
-                .neg => operand.ty,
+                // `neg` and the float-math builtins keep the operand's type.
+                .neg, .fabs, .fsqrt, .ffloor, .fceil => operand.ty,
                 else => .i64,
             };
             return mk(ctx.a, ty, .{ .un = .{ .kind = u.kind, .operand = operand } });

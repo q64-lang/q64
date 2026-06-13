@@ -21,7 +21,10 @@ Continuum registry (live), and the QView reactive-state architecture POC
 parallel).** Grow how much of the language actually executes. None of this
 needs the platform audit, so it's the highest-leverage near-term work.
   - Generics beyond v0 monomorphization (§"B5 — generics beyond the first rung").
-  - `f32` + the rest of the numeric tower (§"Numeric tower").
+  - Numeric tower (§"Numeric tower"): f64/f32/narrow-int **and** native
+    float-math builtins (`x.sqrt()`/`.abs()`/`.floor()`/`.ceil()`) **done**;
+    remaining = `min`/`max`/`copysign`, and the transcendentals via `q64.math`
+    (gated on loadable stdlib qubes).
   - Strings/lists beyond the floor + `str`/list **component exports** (§"Strings…", §"Component emission").
   - Closures / lambdas (specced in `spec/closures.md`; not yet lowered).
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
@@ -1896,7 +1899,7 @@ analysis.
       (split, replace, …) wait on the collections story.
 
 
-## Numeric tower — floats (f64 landed; f32 next)
+## Numeric tower — floats (f64 + f32 + narrow-int storage + native float-math builtins landed)
 
 - [x] **The f64 floor, end-to-end.** Floats are first-class scalars now:
       FLOAT_LIT → `hir.float_const` (floats never const-fold — the
@@ -1953,6 +1956,24 @@ analysis.
       The golden program's `Color { r: u8 }` + `Display.fmt` shape
       runs end-to-end. Verified wasm64 + wasm32 (roundtrip narrow-int
       section) + 2 unit tests incl. the range/no-widening rejections.
+- [x] **Native float-math builtins — `x.sqrt()`/`x.abs()`/`x.floor()`/
+      `x.ceil()`.** The ops Wasm 3.0 ships natively, so they land now as
+      builtins (the transcendentals below still need the `q64.math` stdlib).
+      They parse as a dotted call on a float local (`x.sqrt()` → callee
+      path `x.sqrt`), so `buildIntExpr`'s `.call` arm recognizes
+      `floatBuiltinKind(method)` on an f64/f32 receiver (niladic) and emits a
+      `hir.un` reusing the existing unary pipeline — `ops.UnKind` gained
+      `fabs`/`fsqrt`/`ffloor`/`fceil`, `lower` types the result as the
+      operand (like `neg`), and `emit`'s `.un` arm maps each to the
+      `BinaryenAbs/Sqrt/Floor/CeilFloat{32,64}` instruction by operand type.
+      `exprScalar.callRet` types `x.sqrt()` as the receiver's float type so
+      it validates as a return/arg. Non-float receivers fall through (honest
+      `NameNotFound`). Verified end-to-end wasm64 + wasm32
+      (link-roundtrip float-math section: `4.0 / 3.5 / 2.0 / 3.0`) + a
+      build_hir unit test. **Boundary:** `min`/`max`/`copysign` (binary) and
+      `trunc`/`nearest` are the obvious follow-ons; receiver-*expression*
+      forms (`make().sqrt()`) and float record fields as receivers aren't
+      wired yet.
 - [ ] **sin/cos/tan/exp/log → `q64.math` (decision recorded).** Wasm
       3.0 has no transcendental instructions (only `f64.sqrt`/`abs`/
       `ceil`/`floor`/`min`/`max`/`copysign` are native). Decision:

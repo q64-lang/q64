@@ -4363,6 +4363,16 @@ fn isFloatSc(sc: sema.exprtype.ScalarType) bool {
     return sc == .f64 or sc == .f32;
 }
 
+/// The native float-math builtin named by a method (`sqrt`/`abs`/`floor`/
+/// `ceil`) — each a single wasm instruction on a float operand — or null.
+fn floatBuiltinKind(method: []const u8) ?ops.UnKind {
+    if (std.mem.eql(u8, method, "abs")) return .fabs;
+    if (std.mem.eql(u8, method, "sqrt")) return .fsqrt;
+    if (std.mem.eql(u8, method, "floor")) return .ffloor;
+    if (std.mem.eql(u8, method, "ceil")) return .fceil;
+    return null;
+}
+
 /// The cast target named by a builtin numeric-cast callee (`f32(x)`,
 /// `f64(x)`, `i64(x)` — spec/types.md §Casts), or null.
 fn castTarget(cname: []const u8) ?hir.Type {
@@ -4425,6 +4435,14 @@ const ExprTypeBridge = struct {
         if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
             const mname = name[dot + 1 ..];
             if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
+            // A native float-math builtin (`x.sqrt()`) types as its float
+            // receiver: f64 stays f64, f32 stays f32.
+            if (floatBuiltinKind(mname) != null) {
+                if (self.scope.find(name[0..dot])) |head| {
+                    if (head.ty == .f64) return .f64;
+                    if (head.ty == .f32) return .f32;
+                }
+            }
             if (self.scope.find(name[0..dot])) |head| {
                 if (head.ty == .str) return sema.exprtype.strMethodType(mname);
             }
@@ -4949,6 +4967,26 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 if (src_sc == .bool or src_sc == .str) return error.Unsupported;
                 out.* = .{ .num_cast = .{ .to = ct, .value = try buildIntExpr(b, a0, scope) } };
                 return out;
+            }
+            // Native float-math builtins parse as a dotted call on a float
+            // local: `x.sqrt()`, `x.abs()`, `x.floor()`, `x.ceil()` — one wasm
+            // instruction, result type = the operand's float type. Zero args.
+            if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
+                const head = cname[0..dot];
+                if (std.mem.indexOfScalar(u8, head, '.') == null) {
+                    if (floatBuiltinKind(cname[dot + 1 ..])) |uk| {
+                        if (scope.find(head)) |loc| {
+                            if (loc.ty == .f64 or loc.ty == .f32) {
+                                var fit = cc.args();
+                                if (fit.next() != null) return reject(b, .unsupported_call); // niladic
+                                const operand = try b.a.create(hir.Expr);
+                                operand.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                                out.* = .{ .un = .{ .kind = uk, .operand = operand } };
+                                return out;
+                            }
+                        }
+                    }
+                }
             }
             // B4 static dispatch: `r.area()` — a dotted call whose head is a
             // materialized record binding/param resolves through the fit
@@ -5592,6 +5630,29 @@ test "tryBuild: a bool `let` binding is read back as a bool (host_out_bool)" {
     // `env.out(flag)` where flag is a bool binding → the bool path.
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") == null);
+}
+
+test "float-math builtins: x.sqrt()/x.abs() lower to the float un ops; non-float rejected" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn root(x: f64) -> f64 { x.sqrt() }\npub fn mag(x: f64) -> f64 { x.abs() }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(root(16.0))\n env.out(mag(-3.5))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "fsqrt") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fabs") != null);
+
+    // The same method on a non-float (i64) receiver isn't a builtin — it
+    // falls through to dispatch and finds no such method.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try tr2.addLib("pub fn bad(n: i64) -> i64 { n.sqrt() }\n");
+    const m2 = try buildFromSource(testing.allocator, "fn main {\n env.out(bad(4))\n}\n", tr2.resolver());
+    try testing.expect(m2 == null);
 }
 
 test "tryBuild: a bool is not an int — assigning an int to a bool is rejected" {

@@ -28,7 +28,18 @@ pub const BinKind = enum {
 /// not. `not` is the only one that yields a boolean (an `i32` 0/1 in MIR) —
 /// it is truthiness on its operand (`x == 0 ? 1 : 0`), so it accepts any
 /// integer operand, not just a 0/1.
-pub const UnKind = enum { neg, bit_not, not };
+pub const UnKind = enum {
+    neg,
+    bit_not,
+    not,
+    // Native float-math builtins (each is one wasm instruction; the operand
+    // type, f64/f32, picks the variant). Spelled as method calls in source:
+    // `x.sqrt()`, `x.abs()`, `x.floor()`, `x.ceil()`. Result type = operand.
+    fabs,
+    fsqrt,
+    ffloor,
+    fceil,
+};
 
 /// Short-circuit logical operators. Unlike `BinKind`, these are *control
 /// flow*, not value ops: the right operand is only evaluated when the left

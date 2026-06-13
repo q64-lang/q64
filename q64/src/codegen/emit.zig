@@ -1394,6 +1394,7 @@ const Lowerer = struct {
             },
             .un => |u| {
                 const x = try self.inst(u.operand);
+                const is32 = u.operand.ty == .f32;
                 if (u.kind == .neg and u.operand.ty == .f64) {
                     return c.BinaryenUnary(module, c.BinaryenNegFloat64(), x);
                 }
@@ -1407,6 +1408,11 @@ const Lowerer = struct {
                     // yields an i32 0/1; pick the width of the operand (a
                     // comparison is i32, any other integer expr is i64).
                     .not => c.BinaryenUnary(module, if (u.operand.ty == .i32) c.BinaryenEqZInt32() else c.BinaryenEqZInt64(), x),
+                    // Native float-math builtins — one instruction, f32/f64 variant.
+                    .fabs => c.BinaryenUnary(module, if (is32) c.BinaryenAbsFloat32() else c.BinaryenAbsFloat64(), x),
+                    .fsqrt => c.BinaryenUnary(module, if (is32) c.BinaryenSqrtFloat32() else c.BinaryenSqrtFloat64(), x),
+                    .ffloor => c.BinaryenUnary(module, if (is32) c.BinaryenFloorFloat32() else c.BinaryenFloorFloat64(), x),
+                    .fceil => c.BinaryenUnary(module, if (is32) c.BinaryenCeilFloat32() else c.BinaryenCeilFloat64(), x),
                 };
             },
             .call => |cl| {
