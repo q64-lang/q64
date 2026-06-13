@@ -18,6 +18,14 @@ const mir = @import("mir.zig");
 /// to fall back to the legacy emitter.
 pub const Error = error{Unsupported} || std.mem.Allocator.Error;
 
+/// Reserved internal name for the entry function in MIR. It carries a `#`
+/// prefix — illegal in a q64 identifier (`[A-Za-z_][A-Za-z0-9_]*`) — so it can
+/// never collide with a user function the program defines (e.g. `fn start`),
+/// while staying distinct in `show mir`. The name is a backend handle only:
+/// calls resolve by `FuncId`, and the entry always exports as `_start`
+/// regardless of this name.
+pub const entry_name = "#start";
+
 const Ctx = struct {
     a: std.mem.Allocator,
     data: *std.ArrayList(u8),
@@ -65,7 +73,7 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
             // tail. The entry and void handlers stay the void lowering.
             const vty: ?mir.ValueType = if (!is_entry and hf.ret != .void) mapType(hf.ret) else null;
             funcs[i] = .{
-                .name = if (is_entry) "start" else try a.dupeZ(u8, hf.name),
+                .name = if (is_entry) entry_name else try a.dupeZ(u8, hf.name),
                 .params = params,
                 .ret = vty orelse .void,
                 .locals = locals,

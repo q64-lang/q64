@@ -19,7 +19,7 @@ describe.skipIf(!binaryAvailable())("q64 show hir|mir", () => {
   test("show mir dumps the MIR for hello (lowered host_out_const)", () => {
     const r = runCli(["show", "mir", fixture("hello.q")]);
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toContain("fn start -> void [entry]");
+    expect(r.stdout).toContain("fn #start -> void [entry]");
     expect(r.stdout).toContain("host_out_const");
   });
 
