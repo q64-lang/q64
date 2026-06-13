@@ -1575,6 +1575,111 @@ fn checkOptionalNarrowing(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.Ar
     }
 }
 
+fn isRelationalOp(k: cst.SyntaxKind) bool {
+    return switch (k) {
+        .L_ANGLE, .R_ANGLE, .LT_EQ, .GT_EQ => true,
+        else => false,
+    };
+}
+
+/// The binary operator token of a `BIN_EXPR` — the first non-trivia
+/// *token* child (the lhs is a node, so the operator comes first).
+fn binOpToken(node: *const cst.Node) ?cst.Token {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) return t,
+        .node => {},
+    };
+    return null;
+}
+
+/// The first child *node* of `node` (a `BIN_EXPR`'s left operand).
+fn firstNodeChild(node: *const cst.Node) ?*const cst.Node {
+    for (node.children) |c| switch (c) {
+        .node => |n| return n,
+        .token => {},
+    };
+    return null;
+}
+
+/// The leftmost identifier leaf (`(a < b) > c` → `a`).
+fn leftmostIdent(node: *const cst.Node) ?cst.Token {
+    for (node.children) |c| switch (c) {
+        .node => |n| return leftmostIdent(n),
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            return if (t.kind == .IDENT) t else null;
+        },
+    };
+    return null;
+}
+
+/// Recursively flag chained relational comparisons (`a < b > c`) whose
+/// head is a known local value (PAR040). `locals` holds this function's
+/// value-binding names.
+fn scanChainedComparison(
+    gpa: std.mem.Allocator,
+    node: *const cst.Node,
+    locals: *const std.StringHashMap(void),
+    diags: *std.ArrayList(Diag),
+) std.mem.Allocator.Error!void {
+    if (node.kind == .BIN_EXPR) {
+        if (binOpToken(node)) |op| {
+            if (isRelationalOp(op.kind)) {
+                if (firstNodeChild(node)) |lhs| {
+                    if (lhs.kind == .BIN_EXPR) {
+                        if (binOpToken(lhs)) |lop| {
+                            if (isRelationalOp(lop.kind)) {
+                                if (leftmostIdent(node)) |head| {
+                                    if (locals.contains(head.text)) {
+                                        try diags.append(gpa, .{ .code = "PAR040", .offset = head.offset });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try scanChainedComparison(gpa, n, locals, diags),
+        .token => {},
+    };
+}
+
+/// **PAR040** — a chained relational comparison (`a < b > c`) that the
+/// `<`/generic-args ambiguity can't resolve (spec/generics.md §"Why no
+/// turbofish"). In expression position `<`/`>` parse as binary operators,
+/// so `a < b > c` becomes a chained `BIN_EXPR`; a chain headed by a value
+/// binding (definitely not a generic item) is the forbidden form, while a
+/// type-headed `Foo<T>(…)` constructor (head not a local) is left alone.
+fn checkChainedComparison(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.ArrayList(Diag)) !void {
+    const body = fd.body() orelse return;
+
+    var locals = std.StringHashMap(void).init(gpa);
+    defer locals.deinit();
+    if (fd.params()) |ps| {
+        var it = ps.iter();
+        while (it.next()) |p| {
+            if (p.name()) |n| try locals.put(n.text, {});
+        }
+    }
+    // `let`/`var` binding names in the body.
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, body.cst, &toks);
+    const ts = toks.items;
+    var k: usize = 0;
+    while (k + 1 < ts.len) : (k += 1) {
+        if ((ts[k].kind == .KW_LET or ts[k].kind == .KW_VAR) and ts[k + 1].kind == .IDENT) {
+            try locals.put(ts[k + 1].text, {});
+        }
+    }
+    if (locals.count() == 0) return;
+
+    try scanChainedComparison(gpa, body.cst, &locals, diags);
+}
+
 const StreamKind = enum { signal, event };
 
 fn streamKindOf(name: []const u8) ?StreamKind {
@@ -2377,6 +2482,7 @@ pub fn checkFile(
             try checkEventPre(gpa, item.fn_decl, &diags);
             try checkCancelAwareFor(gpa, item.fn_decl, &diags);
             try checkOptionalNarrowing(gpa, item.fn_decl, &diags);
+            try checkChainedComparison(gpa, item.fn_decl, &diags);
         }
     }
 
@@ -2973,6 +3079,25 @@ test "check: TYP306 — panic payload that doesn't fit Panic" {
     , &.{});
     // A blessed prelude payload is fine.
     try expectCodes("fn main { panic RuntimeDenied { code: \"E\", detail: \"d\" } }\n", &.{});
+}
+
+test "check: PAR040 — chained relational comparison on value bindings" {
+    // `a < b > (c)` where a/b/c are locals → ambiguous chain.
+    try expectCodes(
+        \\fn main {
+        \\    let a = 1
+        \\    let b = 2
+        \\    let c = 3
+        \\    if a < b > (c) { env.out("x") }
+        \\}
+        \\
+    , &.{"PAR040"});
+    // A single comparison is fine.
+    try expectCodes("fn f(a: i64, b: i64) { if a < b { env.out(\"x\") } }\n", &.{});
+    // Two comparisons joined by `&&` are separate — not a chain.
+    try expectCodes("fn f(a: i64, b: i64, c: i64, d: i64) { if a < b && c > d { env.out(\"x\") } }\n", &.{});
+    // A type-headed generic constructor (head not a local) is not flagged.
+    try expectCodes("fn m { let _ = PCM<f32>(0.0) }\n", &.{});
 }
 
 test "check: TYP047 — optional used without narrowing" {

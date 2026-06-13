@@ -1255,13 +1255,27 @@ verified, honest diagnostics throughout.
       tracking in v0), `scanOptionalUse` flags a `PATH_EXPR` headed by the
       param with a `.`. Catalog entry + 1 check case (3 asserts: unnarrowed
       / non-optional / Some-reshadow); conformance
-      `types/optional-not-narrowed` flips → **49/51**) → remaining 2, both
-      genuinely blocked: NAM002 (qube-root resolution — standalone
-      `q64 check` reads no manifest, and `../shared/util.q` is a valid spec
-      example so it's depth-dependent) and PAR040 (generic-vs-chained-
-      comparison — `Box<i64, heap>` and `a < b > c` have identical token
-      shapes; needs parse-context, which is why the parser heuristic was
-      reverted).
+      `types/optional-not-narrowed` flips → **49/51**) → PAR040 wired
+      (landed: a chained relational comparison `a < b > c` — the
+      generic-args/less-than ambiguity (generics.md §"Why no turbofish").
+      Key realization: the disambiguation needs to know whether the head
+      is a *value* (→ less-than) or a *generic item* (→ generic-args), and
+      the **check pass has scope info**, so PAR040 moved there from the
+      parser (where it was deferred). In expression position `<`/`>` parse
+      as binary ops (bp 4), so `a < b > c` is a left-assoc chained
+      `BIN_EXPR`; `checkChainedComparison` collects the fn's value-binding
+      names (params + `let`/`var`) and `scanChainedComparison` flags a
+      `BIN_EXPR` (relational op) whose lhs is itself a relational
+      `BIN_EXPR` and whose leftmost identifier is a local value. A
+      type-headed `PCM<f32>(0.0)` (head not a local) and `&&`-separated
+      comparisons (`a < b && c > d`, outer op not relational) are left
+      alone; `Box<i64, heap>` stops at the comma (single op). Catalog
+      entry already present; 1 check case (4 asserts); conformance
+      `parser/generic-vs-less-than` flips → **50/51**) → remaining 1:
+      NAM002 (qube-root resolution — standalone `q64 check` reads no
+      manifest, and `../shared/util.q` is a valid spec example, so whether
+      a relative path escapes is depth-dependent; needs a qube-root walked
+      up from the file or passed via a flag).
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
