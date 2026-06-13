@@ -1680,6 +1680,114 @@ fn checkChainedComparison(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.Ar
     try scanChainedComparison(gpa, body.cst, &locals, diags);
 }
 
+/// The cst node behind any `TypeExpr` variant.
+fn typeExprNode(te: ast.TypeExpr) *const cst.Node {
+    return switch (te) {
+        inline else => |x| x.cst,
+    };
+}
+
+/// Recursively: does `node` contain a `KW_FN` token (a `fn(...)` type)?
+fn containsFnKeyword(node: *const cst.Node) bool {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (t.kind == .KW_FN) return true,
+        .node => |n| if (containsFnKeyword(n)) return true,
+    };
+    return false;
+}
+
+/// If `annot` is a `fn(...)` type, its parameter arity; else null. Counts
+/// top-level commas in the first `( … )` after `fn` (`fn()`→0, `fn(a)`→1,
+/// `fn(a,b)`→2).
+fn fnTypeArity(gpa: std.mem.Allocator, annot: *const cst.Node) ?usize {
+    if (!containsFnKeyword(annot)) return null;
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    collectTokens(gpa, annot, &toks) catch return null;
+    const ts = toks.items;
+    var i: usize = 0;
+    while (i < ts.len and ts[i].kind != .KW_FN) : (i += 1) {}
+    while (i < ts.len and ts[i].kind != .L_PAREN) : (i += 1) {}
+    if (i >= ts.len) return null;
+    // Count top-level commas inside the params parens.
+    var depth: i32 = 0;
+    var commas: usize = 0;
+    var any = false;
+    var k = i;
+    while (k < ts.len) : (k += 1) {
+        switch (ts[k].kind) {
+            .L_PAREN, .L_BRACK, .L_ANGLE => depth += 1,
+            .R_PAREN, .R_BRACK, .R_ANGLE => {
+                depth -= 1;
+                if (depth == 0) break;
+            },
+            .COMMA => if (depth == 1) {
+                commas += 1;
+            },
+            else => if (depth == 1) {
+                any = true;
+            },
+        }
+    }
+    return if (!any) 0 else commas + 1;
+}
+
+fn lambdaArity(lam: ast.LambdaExpr) usize {
+    var n: usize = 0;
+    var it = lam.params();
+    while (it.next()) |_| n += 1;
+    return n;
+}
+
+/// **TYP350 / TYP351** — a lambda needs an expected `fn` type (closures.md).
+/// v0 checks the directly-detectable site: a lambda that is a `let`/`var`
+/// initializer. With a `fn`-type annotation, the arity must match (TYP351);
+/// with no `fn`-type annotation (none, or a non-fn type), there's no expected
+/// function type (TYP350). A bare `|x| …` expression statement is also TYP350.
+/// Lambdas in call-argument position are left alone (the callee may expect a
+/// `fn`; resolving that is a follow-on).
+fn scanLambdaContext(gpa: std.mem.Allocator, node: *const cst.Node, diags: *std.ArrayList(Diag)) std.mem.Allocator.Error!void {
+    switch (node.kind) {
+        .LET_STMT, .VAR_STMT => {
+            const ls = ast.LetStmt{ .cst = node };
+            if (ls.initializer()) |init| {
+                if (init == .lambda) {
+                    const off = firstTokenOffset(init.lambda.cst);
+                    if (ls.type_()) |annot| {
+                        if (fnTypeArity(gpa, typeExprNode(annot))) |arity| {
+                            if (lambdaArity(init.lambda) != arity) {
+                                try diags.append(gpa, .{ .code = "TYP351", .offset = off });
+                            }
+                        } else {
+                            try diags.append(gpa, .{ .code = "TYP350", .offset = off });
+                        }
+                    } else {
+                        try diags.append(gpa, .{ .code = "TYP350", .offset = off });
+                    }
+                }
+            }
+        },
+        .EXPR_STMT => for (node.children) |c| switch (c) {
+            .node => |n| {
+                if (n.kind == .LAMBDA_EXPR) {
+                    try diags.append(gpa, .{ .code = "TYP350", .offset = firstTokenOffset(n) });
+                }
+                break;
+            },
+            .token => {},
+        },
+        else => {},
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try scanLambdaContext(gpa, n, diags),
+        .token => {},
+    };
+}
+
+fn checkLambdas(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.ArrayList(Diag)) !void {
+    try scanLambdaContext(gpa, sf.cst, diags);
+}
+
 const StreamKind = enum { signal, event };
 
 fn streamKindOf(name: []const u8) ?StreamKind {
@@ -2487,6 +2595,8 @@ pub fn checkFile(
     try checkDataflowTypes(gpa, sf, &diags);
     // TYP102: a required generic argument that can't be inferred.
     try checkMissingGenericArg(gpa, sf, &diags);
+    // TYP350/TYP351: a lambda needs an expected `fn` type / arity match.
+    try checkLambdas(gpa, sf, &diags);
     // REG040: a FreeList region exited with live (unfreed) allocations.
     try checkFreeListRegion(gpa, sf.cst, &diags);
 
@@ -3058,6 +3168,19 @@ test "check: TYP306 — panic payload that doesn't fit Panic" {
     , &.{});
     // A blessed prelude payload is fine.
     try expectCodes("fn main { panic RuntimeDenied { code: \"E\", detail: \"d\" } }\n", &.{});
+}
+
+test "check: TYP350 / TYP351 — lambda needs an expected fn type / arity" {
+    // Unannotated `let` → no expected fn type.
+    try expectCodes("fn main { let f = |x| x * 2\n env.out(\"ok\") }\n", &.{"TYP350"});
+    // A `fn`-typed annotation makes it OK.
+    try expectCodes("fn main { let f: fn(i64) -> i64 = |x| x * 2\n env.out(\"ok\") }\n", &.{});
+    // Arity mismatch against the annotation.
+    try expectCodes("fn main { let f: fn(i64, i64) -> i64 = |x| x\n env.out(\"ok\") }\n", &.{"TYP351"});
+    // `fn()` zero-arity vs a one-param lambda.
+    try expectCodes("fn main { let f: fn() -> i64 = |x| x\n env.out(\"ok\") }\n", &.{"TYP351"});
+    // A lambda in call-argument position is left alone (callee may expect fn).
+    try expectCodes("fn main { let r = run(|x| x)\n env.out(\"ok\") }\n", &.{});
 }
 
 test "check: PAR040 — chained relational comparison on value bindings" {

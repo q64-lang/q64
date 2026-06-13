@@ -32,11 +32,19 @@ needs the platform audit, so it's the highest-leverage near-term work.
     `|a,b| { … }`) — a leading `|`/`||` in primary position is
     unambiguously a lambda (bitwise/logical-or are infix); `ast.LambdaExpr`
     exposes `params()`/`body()`; lossless round-trip + the `graph-pipe-stages`
-    golden's `|x| …` now parses structured. **Next:** sema typing (params
-    typed from the expected `fn` type at the use site — TYP350/351/352) then
-    monomorphizing, non-escaping lowering (the spec's zero-cost v0 — specialize
-    the higher-order fn per lambda, captures as aliases; builds on the B5
-    monomorphization machinery).
+    golden's `|x| …` now parses structured. **Slice 2 (sema typing) done:**
+    `checkLambdas` emits **TYP350** when a lambda has no expected `fn` type
+    (an unannotated/non-`fn`-annotated `let`, or a bare `|x| …` statement)
+    and **TYP351** on an arity mismatch against a `fn(...)`-typed annotation
+    (`fnTypeArity` counts the annotation's params). Lambdas in call-argument
+    position are left alone (the callee may expect a `fn` — resolving that is
+    a follow-on); TYP352 (assign to an immutable capture) needs capture
+    analysis, deferred. 1 check case (5 asserts); no conformance test (closures
+    aren't in the corpus) but the golden's `.map(|x| …)` stays clean.
+    **Next (slice 3, the big one):** monomorphizing, non-escaping lowering —
+    specialize the higher-order fn per lambda, captures as aliases; builds on
+    the B5 monomorphization machinery. Needs `fn`-typed params on user
+    functions + a higher-order call site to specialize into.
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
