@@ -53,11 +53,25 @@ needs the platform audit, so it's the highest-leverage near-term work.
     touches `registerFunc`/`collectCalleeParams`/the body builders (load-
     bearing — every function) and mirrors the B5 `stampGeneric` machinery; it's
     a multi-increment change to do carefully with the suite green at each step.
-    Plan: (i) `collectCalleeParams` recognizes + skips an fn-typed param (no
-    runtime slot — it's inlined); (ii) a per-call-site specialization keyed by
-    the lambda; (iii) the body builder's `.call` arm inlines `f(args)` →
-    lambda body with the lambda params bound. Start with non-capturing lambdas;
-    alias-capture follows.
+    **Slice 3b done — closures run.** `fn apply(f: fn(i64)->i64, x: i64) -> i64
+    { f(x) }` + `apply(|n| n*2, 21)` → 42, end-to-end on wasmtime (wasm64 +
+    wasm32). The lowering, as planned: (i) `collectCalleeParams` skips a
+    `fn`-typed param (no runtime slot — `paramIsFnTyped`, via 3a's structured
+    FN_TYPE); (ii) `buildHofCall` → `stampHof` specializes the callee per
+    lambda (deduped by `callee#L<offset>`, mirrors `stampGeneric`), the lambda
+    riding on `Scope.hof_name`/`hof_lambda`; (iii) `buildIntExpr`'s `.call` arm
+    inlines a `hof_name(args)` call (`inlineLambda`) by building the lambda body
+    with its params substituted (`Scope.subst`, read in the `.path` arm) by the
+    built args. Verified: two lambdas → two stamped instances; richer bodies
+    (`let a = f(x)\n a + f(x)` → 60); a **const-capture** (`|n| n*gain` where
+    `gain` folds) → 20; non-lambda arg to a fn param rejected. link-roundtrip
+    closures section + build_hir test; conformance 51/51, all round-trips + CLI
+    green. **Boundaries (follow-ons):** true *runtime* alias-capture (a `var`
+    or non-const captured binding — only const-foldable captures resolve
+    today); multiple fn-typed params; block-body lambdas (`|x| { … }`); a
+    complex arg to `f(...)` used multiply (shared expr → would double-eval);
+    str/record/closure-returning HOFs. **TYP352** (assign to an immutable
+    capture) also still pending. Real `.map`/iterator HOFs build on this.
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").

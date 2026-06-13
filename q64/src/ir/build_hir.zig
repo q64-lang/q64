@@ -1470,6 +1470,9 @@ fn collectCalleeParams(
         var pit = ps.iter();
         while (pit.next()) |p| {
             const pn = (p.name() orelse return error.Unsupported).text;
+            // A `fn`-typed parameter is a closure slot — inlined at lowering,
+            // so it has no runtime ABI and occupies no local slot.
+            if (paramIsFnTyped(p)) continue;
             if (try paramScalar(b, p)) |psc| {
                 if (psc == .str) {
                     // A `str` param: one hir param (two wasm locals — ptr at
@@ -4375,6 +4378,132 @@ fn floatBuiltinKind(method: []const u8) ?ops.UnKind {
     return null;
 }
 
+/// True when a parameter is `fn`-typed (`f: fn(i64) -> i64`) — a closure
+/// slot, inlined at lowering (no runtime ABI). Relies on slice 3a's
+/// structured `FN_TYPE` parsing.
+fn paramIsFnTyped(p: ast.Param) bool {
+    const ty = p.type_() orelse return false;
+    return ty == .raw and ty.raw.cst.kind == .FN_TYPE;
+}
+
+/// Does `fd` have a `fn`-typed parameter (i.e. is it higher-order)?
+fn hasFnParam(fd: ast.FnDecl) bool {
+    const ps = fd.params() orelse return false;
+    var it = ps.iter();
+    while (it.next()) |p| if (paramIsFnTyped(p)) return true;
+    return false;
+}
+
+/// A lambda's body as an `Expr` (null when it's a block — deferred in v0).
+fn lambdaBodyExpr(lam: ast.LambdaExpr) ?ast.Expr {
+    const bn = lam.body() orelse return null;
+    return ast.Expr.cast(bn);
+}
+
+fn firstTokOffset(node: *const parser.cst.Node) u32 {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) return t.offset,
+        .node => |n| return firstTokOffset(n),
+    };
+    return 0;
+}
+
+/// **Closures, slice 3b — inline a `hof_name(args)` call.** Builds the bound
+/// lambda's body with its parameters substituted by the (built) `args`. v0:
+/// the lambda body is one expression; arguments are shared into the body, so
+/// they should be simple (a local / const) when a parameter is used more than
+/// once.
+fn inlineLambda(b: *Builder, lam: ast.LambdaExpr, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Expr {
+    const body = lambdaBodyExpr(lam) orelse return error.Unsupported; // block body deferred
+    var bound: std.ArrayList([]const u8) = .empty;
+    defer bound.deinit(b.a);
+    var pit = lam.params();
+    var ait = call.args();
+    while (pit.next()) |pn| {
+        const a0 = ait.next() orelse return reject(b, .unsupported_call); // too few args
+        const av = try buildIntExpr(b, a0, scope);
+        try scope.subst.put(b.a, pn.text, av);
+        try bound.append(b.a, pn.text);
+    }
+    if (ait.next() != null) return reject(b, .unsupported_call); // too many args
+    const result = try buildIntExpr(b, body, scope);
+    for (bound.items) |nm| _ = scope.subst.remove(nm);
+    return result;
+}
+
+/// **Closures, slice 3b — a higher-order call** `apply(|n| …, x)`. The
+/// `fn`-typed parameter takes the lambda (inlined); the rest are ordinary
+/// arguments. Stamps a specialized instance of the callee per lambda and
+/// returns a direct call to it (the spec's zero-cost, no-env-box model).
+fn buildHofCall(b: *Builder, fname: []const u8, fd: ast.FnDecl, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Expr {
+    const ps = fd.params() orelse return error.Unsupported;
+    var lam: ?ast.LambdaExpr = null;
+    var fpname: ?[]const u8 = null;
+    var args: std.ArrayList(*hir.Expr) = .empty;
+    var pit = ps.iter();
+    var ait = call.args();
+    while (pit.next()) |p| {
+        const a0 = ait.next() orelse return reject(b, .unsupported_call);
+        if (paramIsFnTyped(p)) {
+            if (lam != null) return error.Unsupported; // v0: one fn-typed param
+            switch (a0) {
+                .lambda => |l| lam = l,
+                else => return reject(b, .unsupported_call), // must pass a lambda literal (v0)
+            }
+            fpname = (p.name() orelse return error.Unsupported).text;
+        } else {
+            try args.append(b.a, try buildIntExpr(b, a0, scope));
+        }
+    }
+    if (ait.next() != null) return reject(b, .unsupported_call);
+    const fid = try stampHof(b, fname, fd, fpname orelse return error.Unsupported, lam orelse return error.Unsupported);
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
+    return e;
+}
+
+/// Stamp a specialized instance of higher-order `fd` for the given lambda:
+/// the `fn`-typed parameter is dropped (inlined in the body), the rest stay
+/// runtime parameters. Deduped per (callee, lambda site).
+fn stampHof(b: *Builder, fname: []const u8, fd: ast.FnDecl, fpname: []const u8, lam: ast.LambdaExpr) BuildError!hir.FuncId {
+    const key = try std.fmt.allocPrint(b.a, "{s}#L{d}", .{ fname, firstTokOffset(lam.cst) });
+    if (b.ids.get(key)) |id| {
+        b.a.free(key);
+        return id;
+    }
+    const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
+    const ret_ty: hir.Type = switch (rs) {
+        .bool, .i64, .f64, .f32 => rs,
+        else => return error.Unsupported, // v0: scalar-returning HOFs
+    };
+
+    var scope = Scope{ .a = b.a, .callee = true };
+    scope.hof_name = fpname;
+    scope.hof_lambda = lam;
+    var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    _ = try collectCalleeParams(b, fd, &scope, &params, &rec_params); // skips the fn param
+    rec_params.deinit(b.a);
+    scope.n_params = scope.next_idx;
+    const param_slice = try params.toOwnedSlice(b.a);
+
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, key, id);
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy });
+
+    const body = try buildIntBlock(b, fd.body() orelse return error.Unsupported, &scope);
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty;
+    }
+    b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
+    return id;
+}
+
 /// The native binary float-math builtin named by a method (`min`/`max`/
 /// `copysign`) — one wasm instruction on two same-type float operands.
 fn floatBinBuiltinKind(method: []const u8) ?ops.BinKind {
@@ -4585,6 +4714,14 @@ const Scope = struct {
     /// stamped generics) mirror every local into `b.cur_locals` too.
     /// `declareBodyLocal` picks the right bookkeeping.
     callee: bool = false,
+    /// Closure inlining (slice 3b): while building a higher-order function's
+    /// stamped body, `hof_name` is its `fn`-typed parameter and `hof_lambda`
+    /// the lambda bound to it at the call site — a call `hof_name(args)` in the
+    /// body inlines the lambda. `subst` maps a lambda parameter name to the
+    /// (already-built) argument expression during that inlining.
+    hof_name: ?[]const u8 = null,
+    hof_lambda: ?ast.LambdaExpr = null,
+    subst: std.StringHashMapUnmanaged(*hir.Expr) = .empty,
 
     fn find(self: *const Scope, name: []const u8) ?Local {
         var i = self.locals.items.len;
@@ -4853,6 +4990,9 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
         .path => |p| {
             const txt = try p.text(b.a);
             defer b.a.free(txt);
+            // Closure inlining (slice 3b): a lambda parameter resolves to the
+            // argument expression substituted at the inlined call site.
+            if (scope.subst.get(txt)) |se| return se;
             // `s.len` parses as the dotted path "s.len" (like `qview.set_attr`),
             // not a FieldExpr. If the prefix names a `str` local, it's the i64
             // byte-length read. (`loc.idx` is the ptr slot, `+1` the len slot.)
@@ -4967,6 +5107,11 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // Closure inlining (slice 3b): a call to the enclosing HOF's
+            // `fn`-typed parameter inlines the bound lambda's body.
+            if (scope.hof_name) |hn| {
+                if (std.mem.eql(u8, cname, hn)) return inlineLambda(b, scope.hof_lambda.?, cc, scope);
+            }
             // A builtin numeric cast (`f32(x)`, `f64(x)`, `i64(x)` —
             // spec/types.md §Casts): the only conversions; the source
             // must itself be numeric.
@@ -5066,6 +5211,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             // statement form (B5). The stamped instance must produce a
             // scalar value here.
             if (b.resolver.lookup(cname)) |gfd| {
+                // Higher-order call (`apply(|n| …, x)`): specialize per lambda.
+                if (hasFnParam(gfd)) {
+                    const he = try buildHofCall(b, cname, gfd, cc, scope);
+                    switch (b.funcs.items[he.call.func].ret) {
+                        .i64, .bool, .f64, .f32 => {},
+                        else => return reject(b, .unsupported_call),
+                    }
+                    return he;
+                }
                 if (gfd.isGeneric()) {
                     const ge = try buildGenericCall(b, cname, gfd, cc, scope);
                     switch (b.funcs.items[ge.call.func].ret) {
@@ -5682,6 +5836,31 @@ test "float-math builtins: x.sqrt()/x.abs() lower to the float un ops; non-float
     defer tr2.deinit();
     try tr2.addLib("pub fn bad(n: i64) -> i64 { n.sqrt() }\n");
     const m2 = try buildFromSource(testing.allocator, "fn main {\n env.out(bad(4))\n}\n", tr2.resolver());
+    try testing.expect(m2 == null);
+}
+
+test "closures: a higher-order fn specializes per lambda (inlined call)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }\n");
+
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(apply(|n| n * 2, 21))\n env.out(apply(|n| n + 1, 5))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Two stamped specializations (one per lambda), and the inlined bodies
+    // (`n*2` → a mul, `n+1` → an add) rather than a call to `f`.
+    try testing.expect(std.mem.indexOf(u8, dump, "apply#L") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "add") != null);
+
+    // A non-lambda argument to a fn-typed parameter is rejected.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try tr2.addLib("pub fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }\n");
+    const m2 = try buildFromSource(testing.allocator, "fn main {\n env.out(apply(7, 5))\n}\n", tr2.resolver());
     try testing.expect(m2 == null);
 }
 

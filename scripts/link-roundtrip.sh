@@ -1905,4 +1905,29 @@ fm32_out="$("$HOST_BIN" "$tmp/floatmath32.wasm")"
 [[ "$fm32_out" == "$fm_expected" ]] || { echo "FAIL: float-math builtins wasm32 (got: $fm32_out)" >&2; exit 1; }
 echo "    ok: float-math builtins -> 4.0 / 3.5 / 2.0 / 3.0 / 3.0 / 7.0 / -5.0 / 2.0 (wasm64 + wasm32)"
 
+echo "==> closures: higher-order fn specialized per lambda (inlined, no env box)"
+clo_app="$tmp/closures.q"
+cat > "$clo_app" <<'Q64'
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { f(x) }
+fn twice(f: fn(i64) -> i64, x: i64) -> i64 {
+    let a = f(x)
+    a + f(x)
+}
+fn main {
+    env.out(apply(|n| n * 2, 21))
+    env.out(apply(|n| n + 1, 5))
+    env.out(twice(|n| n * 10, 3))
+    let gain = 4
+    env.out(apply(|n| n * gain, 5))
+}
+Q64
+clo_expected=$'42\n6\n60\n20'
+"$Q64_BIN" emit "$clo_app" "$tmp/closures.wasm"
+clo_out="$("$HOST_BIN" "$tmp/closures.wasm")"
+[[ "$clo_out" == "$clo_expected" ]] || { echo "FAIL: closures (got: $clo_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$clo_app" "$tmp/closures32.wasm" --addr wasm32
+clo32_out="$("$HOST_BIN" "$tmp/closures32.wasm")"
+[[ "$clo32_out" == "$clo_expected" ]] || { echo "FAIL: closures wasm32 (got: $clo32_out)" >&2; exit 1; }
+echo "    ok: closures -> 42 / 6 / 60 / 20 (wasm64 + wasm32)"
+
 echo "PASS: $qube_out"
