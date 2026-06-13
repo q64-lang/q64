@@ -1249,6 +1249,54 @@ fn checkTransferVerbs(
     };
 }
 
+/// **REG020** — a `@managed` (WasmGC) struct may only hold managed or
+/// value-type fields; a `ref` into linear memory is rejected (memory.md
+/// §"Marking a struct `@managed`"). Flags each `ref`-typed field.
+fn flagLinearFields(gpa: std.mem.Allocator, sd: ast.StructDecl, diags: *std.ArrayList(Diag)) !void {
+    var it = sd.fields();
+    while (it.next()) |f| {
+        const ty = f.type_() orelse continue;
+        if (ty == .ref) {
+            const off = if (f.name()) |nm| nm.offset else firstTokenOffset(f.cst);
+            try diags.append(gpa, .{ .code = "REG020", .offset = off });
+        }
+    }
+}
+
+/// Scan top-level items for a `@managed` annotation immediately preceding
+/// a `struct`, then check its fields for linear `ref`s (REG020). The
+/// `@managed` annotation isn't attached to the struct node — it passes
+/// through as sibling `@`/IDENT tokens — so we track it across the
+/// SOURCE_FILE child stream up to the next item node.
+fn checkManagedStructs(gpa: std.mem.Allocator, root: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
+    var seen_managed = false;
+    var after_at = false;
+    for (root.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            if (t.kind == .AT) {
+                after_at = true;
+                continue;
+            }
+            if (after_at and t.kind == .IDENT) {
+                if (std.mem.eql(u8, t.text, "managed")) seen_managed = true;
+                after_at = false;
+                continue;
+            }
+            after_at = false;
+            if (t.kind == .KW_PUB) continue; // `@managed pub struct …`
+            seen_managed = false; // a stray token breaks the annotation run
+        },
+        .node => |n| {
+            if (n.kind == .STRUCT_DECL and seen_managed) {
+                try flagLinearFields(gpa, ast.StructDecl{ .cst = n }, diags);
+            }
+            seen_managed = false;
+            after_at = false;
+        },
+    };
+}
+
 /// The auto-prelude typed-string prefixes (modules.md §"Typed-prefix
 /// string literals", types.md §"Typed-prefix form"). v0 ships the one
 /// the prelude blesses: `url"…"`, reachable because `Url` appears in
@@ -1464,6 +1512,8 @@ pub fn checkFile(
     try checkTypedPrefixes(gpa, sf.cst, &diags);
     // REG050: unknown transfer verbs (`a.copy_to(r)`, …) anywhere in the file.
     try checkTransferVerbs(gpa, sf.cst, &diags);
+    // REG020: linear `ref` fields in a `@managed` struct.
+    try checkManagedStructs(gpa, sf.cst, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -1985,6 +2035,25 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: REG020 — linear ref in a @managed struct" {
+    // A `ref` field in a `@managed` struct.
+    try expectCodes(
+        \\@managed
+        \\struct GameState { label: ref [u8], counter: i64 }
+        \\fn main { env.out("hi") }
+        \\
+    , &.{"REG020"});
+    // No `@managed` annotation → a `ref` field is fine here.
+    try expectCodes("struct S { p: ref [u8] }\nfn main { env.out(\"hi\") }\n", &.{});
+    // `@managed` with only value fields is clean.
+    try expectCodes(
+        \\@managed
+        \\struct Ok { a: i64, b: bool }
+        \\fn main { env.out("hi") }
+        \\
+    , &.{});
 }
 
 test "check: REG050 — unknown transfer verbs" {

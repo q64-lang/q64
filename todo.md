@@ -1126,10 +1126,22 @@ verified, honest diagnostics throughout.
       the verb is the path's last dotted segment) — and flags the verb
       token. A bare (non-dotted) name isn't treated as a verb. Catalog
       entry + 1 check case (5 asserts); conformance
-      `memory/unknown-transfer-verb` flips → **36/51**) → next: the
-      `From` conversion on `try`, EFF110 (assert/operation violations in
-      the body), NAM002 (import path escapes qube), and the remaining
-      negative-diagnostic gaps.
+      `memory/unknown-transfer-verb` flips → **36/51**) → REG020 wired
+      (landed: a `@managed` (WasmGC) struct may only hold managed or
+      value-type fields; a `ref` into linear memory is rejected
+      (memory.md §"Marking a struct `@managed`"). The `@managed`
+      annotation passes through as sibling `@`/IDENT tokens (leading
+      annotations aren't attached to the item node yet), so
+      `checkManagedStructs` tracks it across the SOURCE_FILE child stream
+      up to the next item node, then `flagLinearFields` flags each
+      `ref`-typed field via the structured `Field.type_()`. Catalog entry
+      + 1 check case (3 asserts); conformance `memory/linear-in-managed`
+      flips → **37/51**) → next: the `From` conversion on `try`, EFF110
+      (assert/operation violations in the body), NAM002 (import path
+      escapes qube), and the remaining negative-diagnostic gaps. Note:
+      structured leading-annotation parsing (attaching `@managed`/`@stage`
+      to the item) would let REG021 + the stream-stage checks read them
+      directly rather than scanning sibling tokens.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
