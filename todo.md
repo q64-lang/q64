@@ -1210,11 +1210,22 @@ verified, honest diagnostics throughout.
       token-scans `dyn <Face>` and flags a match. Catalog entry + 1 check
       case (3 asserts, incl. `dyn Display` staying silent and a
       file-defined `-> Self` face); conformance `faces/not-dyn-safe` flips
-      → **45/51**) → next: the `From` conversion on `try`, EFF110, and the
-      remaining 6 — dataflow type matching (STR020), generic inference
-      (TYP102), optional flow-narrowing (TYP047), no-fit-for-bound
-      (TYP200), region escape analysis (REG040), qube-root resolution
-      (NAM002), and the reverted PAR040 heuristic.
+      → **45/51**) → STR020 wired (landed: a stage handed the wrong
+      dataflow type — an `Event<T>` where a `Signal<T>` is expected, or
+      vice-versa — streams.md §"Why three types instead of one".
+      `checkDataflowTypes` builds a fn→decl map (for positional param
+      types) and a stream-binding map from `let|var x: Signal|Event<…>`
+      annotations (flat-token scan), then walks each `fn(arg0, arg1, …)`
+      call, splitting args at depth-1 commas, and flags a bare-binding
+      argument whose stream kind differs from the matching parameter's
+      (`paramStreamKind`). Only stream↔stream mismatches fire, so the
+      `graph-pipe-stages` golden (no annotated stream `let`s) stays clean.
+      Catalog entry + 1 check case (2 asserts); conformance
+      `streams/dataflow-type-mismatch` flips → **46/51**) → next: the
+      remaining 5 — generic inference (TYP102), optional flow-narrowing
+      (TYP047), region escape analysis (REG040), qube-root resolution
+      (NAM002), and the reverted PAR040 heuristic. These need real
+      analysis passes or structured parsing of currently-raw constructs.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

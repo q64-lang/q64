@@ -1458,6 +1458,120 @@ fn checkPanicPayload(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.Arr
     try scanPanicPayload(gpa, sf.cst, &panic_fits, diags);
 }
 
+const StreamKind = enum { signal, event };
+
+fn streamKindOf(name: []const u8) ?StreamKind {
+    if (std.mem.eql(u8, name, "Signal")) return .signal;
+    if (std.mem.eql(u8, name, "Event")) return .event;
+    return null;
+}
+
+/// The stream kind of a function's `idx`-th parameter (`Signal<…>` /
+/// `Event<…>`), or null if that parameter isn't a stream type.
+fn paramStreamKind(gpa: std.mem.Allocator, fd: ast.FnDecl, idx: usize) ?StreamKind {
+    const ps = fd.params() orelse return null;
+    var it = ps.iter();
+    var i: usize = 0;
+    while (it.next()) |p| : (i += 1) {
+        if (i != idx) continue;
+        const ty = p.type_() orelse return null;
+        if (ty != .path) return null;
+        const nm = ty.path.name(gpa) catch return null;
+        defer gpa.free(nm);
+        return streamKindOf(nm);
+    }
+    return null;
+}
+
+/// **STR020** — a stage is handed the wrong dataflow type: an `Event<T>`
+/// where a `Signal<T>` is expected, or vice-versa (streams.md §"Why
+/// three types instead of one"). v0 resolves stream types from
+/// `let x: Signal|Event<…>` bindings and stage signatures, then flags a
+/// `stage(binding)` call whose argument's stream kind differs from the
+/// matching parameter's.
+fn checkDataflowTypes(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.ArrayList(Diag)) !void {
+    // fn name -> declaration (for positional parameter types).
+    var fns = std.StringHashMap(ast.FnDecl).init(gpa);
+    defer fns.deinit();
+    var hasStreamParam = false;
+    var fit = sf.items();
+    while (fit.next()) |item| {
+        if (item != .fn_decl) continue;
+        const fd = item.fn_decl;
+        const nm = fd.name() orelse continue;
+        try fns.put(nm.text, fd);
+        if (paramStreamKind(gpa, fd, 0) != null or paramStreamKind(gpa, fd, 1) != null) hasStreamParam = true;
+    }
+    if (!hasStreamParam) return;
+
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, sf.cst, &toks);
+    const ts = toks.items;
+
+    // Stream-typed bindings: `let|var IDENT : (Signal|Event) …`.
+    var binds = std.StringHashMap(StreamKind).init(gpa);
+    defer binds.deinit();
+    var b: usize = 0;
+    while (b + 3 < ts.len) : (b += 1) {
+        if ((ts[b].kind != .KW_LET and ts[b].kind != .KW_VAR)) continue;
+        if (ts[b + 1].kind != .IDENT or ts[b + 2].kind != .COLON or ts[b + 3].kind != .IDENT) continue;
+        if (streamKindOf(ts[b + 3].text)) |sk| try binds.put(ts[b + 1].text, sk);
+    }
+    if (binds.count() == 0) return;
+
+    // Calls: `fn ( arg0 , arg1 , … )` — flag a bare-binding argument whose
+    // stream kind differs from the matching parameter's.
+    var i: usize = 0;
+    while (i + 1 < ts.len) : (i += 1) {
+        if (ts[i].kind != .IDENT or ts[i + 1].kind != .L_PAREN) continue;
+        const fd = fns.get(ts[i].text) orelse continue;
+        // Walk the argument list, tracking the positional index and whether
+        // the current argument is exactly one bare IDENT.
+        var depth: i32 = 1;
+        var k = i + 2;
+        var arg_idx: usize = 0;
+        var arg_tok: ?cst.Token = null;
+        var arg_count: usize = 0;
+        while (k < ts.len and depth > 0) : (k += 1) {
+            switch (ts[k].kind) {
+                .L_PAREN, .L_BRACE, .L_BRACK, .L_ANGLE => depth += 1,
+                .R_PAREN, .R_BRACE, .R_BRACK, .R_ANGLE => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        if (arg_count == 1) if (arg_tok) |at| try flagDataflow(gpa, fd, arg_idx, at, &binds, diags);
+                    }
+                },
+                .COMMA => if (depth == 1) {
+                    if (arg_count == 1) if (arg_tok) |at| try flagDataflow(gpa, fd, arg_idx, at, &binds, diags);
+                    arg_idx += 1;
+                    arg_tok = null;
+                    arg_count = 0;
+                },
+                else => if (depth == 1) {
+                    arg_count += 1;
+                    if (ts[k].kind == .IDENT) arg_tok = ts[k] else arg_tok = null;
+                },
+            }
+        }
+    }
+}
+
+fn flagDataflow(
+    gpa: std.mem.Allocator,
+    fd: ast.FnDecl,
+    arg_idx: usize,
+    arg: cst.Token,
+    binds: *const std.StringHashMap(StreamKind),
+    diags: *std.ArrayList(Diag),
+) !void {
+    const arg_kind = binds.get(arg.text) orelse return;
+    const param_kind = paramStreamKind(gpa, fd, arg_idx) orelse return;
+    if (arg_kind != param_kind) {
+        try diags.append(gpa, .{ .code = "STR020", .offset = arg.offset });
+    }
+}
+
 /// The function name of a call whose closing `)` is at `ts[end]`, found
 /// by matching back to the opening `(` and reading the IDENT before it
 /// (`play(env.audio)` ending at `)` → `play`). A bare IDENT at `end`
@@ -2058,6 +2172,8 @@ pub fn checkFile(
     try checkPanicPayload(gpa, sf, &diags);
     // TYP207: a non-dyn-safe face used in `dyn` position.
     try checkDynSafety(gpa, sf, &diags);
+    // STR020: a stage handed the wrong dataflow type (Signal vs Event).
+    try checkDataflowTypes(gpa, sf, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2606,6 +2722,27 @@ test "check: TYP306 — panic payload that doesn't fit Panic" {
     , &.{});
     // A blessed prelude payload is fine.
     try expectCodes("fn main { panic RuntimeDenied { code: \"E\", detail: \"d\" } }\n", &.{});
+}
+
+test "check: STR020 — dataflow type mismatch (Event into Signal stage)" {
+    // `render` wants a Signal; `clicks` is an Event.
+    try expectCodes(
+        \\fn render(scene: Signal<Scene, 60.Hz>) -> i64 { 0 }
+        \\fn main { scope {
+        \\    let clicks: Event<Point> = ui()
+        \\    let _ = render(clicks)
+        \\} }
+        \\
+    , &.{"STR020"});
+    // Matching stream kinds are clean.
+    try expectCodes(
+        \\fn render(scene: Signal<Scene, 60.Hz>) -> i64 { 0 }
+        \\fn main { scope {
+        \\    let s: Signal<Scene, 60.Hz> = src()
+        \\    let _ = render(s)
+        \\} }
+        \\
+    , &.{});
 }
 
 test "check: STR060 — @realtime stage piped into a non-realtime stage" {
