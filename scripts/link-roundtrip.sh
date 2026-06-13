@@ -1932,4 +1932,30 @@ clo32_out="$("$HOST_BIN" "$tmp/closures32.wasm")"
 [[ "$clo32_out" == "$clo_expected" ]] || { echo "FAIL: closures wasm32 (got: $clo32_out)" >&2; exit 1; }
 echo "    ok: closures -> 42 / 6 / 60 / 20 / 107 (wasm64 + wasm32; incl. runtime var capture)"
 
+echo "==> ranges: for i in lo..hi / lo..=hi (counted loop)"
+rng_app="$tmp/ranges.q"
+cat > "$rng_app" <<'Q64'
+fn main {
+    var a = 0
+    for i in 0..3 { a = a + i }
+    env.out(a)
+    var b = 0
+    for k in 1..=5 { b = b + k }
+    env.out(b)
+    var lo = 2
+    var hi = 6
+    var c = 0
+    for j in lo..hi { c = c + j }
+    env.out(c)
+}
+Q64
+rng_expected=$'3\n15\n14'
+"$Q64_BIN" emit "$rng_app" "$tmp/ranges.wasm"
+rng_out="$("$HOST_BIN" "$tmp/ranges.wasm")"
+[[ "$rng_out" == "$rng_expected" ]] || { echo "FAIL: ranges (got: $rng_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$rng_app" "$tmp/ranges32.wasm" --addr wasm32
+rng32_out="$("$HOST_BIN" "$tmp/ranges32.wasm")"
+[[ "$rng32_out" == "$rng_expected" ]] || { echo "FAIL: ranges wasm32 (got: $rng32_out)" >&2; exit 1; }
+echo "    ok: ranges -> 3 / 15 / 14 (wasm64 + wasm32; exclusive, inclusive, var bounds)"
+
 echo "PASS: $qube_out"

@@ -547,6 +547,11 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             // `x.fmt()` dispatches and `x.field` reads work in the body.
             const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
             const iter = fs.iterable() orelse return error.Unsupported;
+            // `for i in lo..hi { … }` — a counted range loop.
+            if (iter == .range) {
+                try buildForRange(b, fs, iter.range, pat.text, scope, rt, out);
+                return;
+            }
             const iname = switch (iter) {
                 .path => |p| try p.text(b.a),
                 else => return error.Unsupported, // v0 iterates array bindings (ranges later)
@@ -4232,6 +4237,55 @@ fn buildForVec(b: *Builder, fs: ast.ForStmt, vname: []const u8, xname: []const u
     lenx.* = .{ .vec_len = .{ .vec = vref2 } };
     const cond = try b.a.create(hir.Expr);
     cond.* = .{ .bin = .{ .kind = .lt, .lhs = iref2, .rhs = lenx } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try out.append(b.a, st);
+}
+
+/// `for i in lo..hi { body }` (or `lo..=hi`): the loop variable is the
+/// counter. The bounds evaluate once (the upper bound into a hidden local);
+/// then `let i = lo; while i < hi { body; i = i + 1 }` (`<=` for inclusive).
+fn buildForRange(b: *Builder, fs: ast.ForStmt, range: ast.RangeExpr, xname: []const u8, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const lo_e = try buildIntExpr(b, range.lo() orelse return error.Unsupported, scope);
+    const hi_e = try buildIntExpr(b, range.hi() orelse return error.Unsupported, scope);
+    const hidden_hi = try std.fmt.allocPrint(b.a, "{s}#hi", .{xname});
+    const hi_idx = try declareBodyLocal(b, scope, hidden_hi, false, .i64);
+    const i_idx = try declareBodyLocal(b, scope, xname, true, .i64);
+
+    // let #hi = hi  (evaluate the bound once)
+    const sthi = try b.a.create(hir.Stmt);
+    sthi.* = .{ .let = .{ .idx = hi_idx, .value = hi_e } };
+    try out.append(b.a, sthi);
+    // let i = lo
+    const sti0 = try b.a.create(hir.Stmt);
+    sti0.* = .{ .let = .{ .idx = i_idx, .value = lo_e } };
+    try out.append(b.a, sti0);
+
+    // body: <source body>; i = i + 1
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    var bit = (fs.body() orelse return error.Unsupported).statements();
+    while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, &items);
+    {
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const one = try b.a.create(hir.Expr);
+        one.* = .{ .int_const = 1 };
+        const inc = try b.a.create(hir.Expr);
+        inc.* = .{ .bin = .{ .kind = .add, .lhs = iref, .rhs = one } };
+        const sti = try b.a.create(hir.Stmt);
+        sti.* = .{ .assign = .{ .idx = i_idx, .value = inc } };
+        try items.append(b.a, sti);
+    }
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
+
+    // while i (< | <=) #hi
+    const iref2 = try b.a.create(hir.Expr);
+    iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+    const hiref = try b.a.create(hir.Expr);
+    hiref.* = .{ .local = .{ .idx = hi_idx, .ty = .i64 } };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = if (range.inclusive()) .le else .lt, .lhs = iref2, .rhs = hiref } };
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
     try out.append(b.a, st);

@@ -1952,15 +1952,16 @@ const Parser = struct {
     fn binBindingPower(k: cst.SyntaxKind) ?u8 {
         return switch (k) {
             .PIPE_GT => 1,
-            .PIPE_PIPE => 2,
-            .AMP_AMP => 3,
-            .EQ_EQ, .BANG_EQ, .L_ANGLE, .R_ANGLE, .LT_EQ, .GT_EQ => 4,
-            .PIPE => 5,
-            .CARET => 6,
-            .AMP => 7,
-            .SHL, .SHR => 8,
-            .PLUS, .MINUS => 9,
-            .STAR, .SLASH, .PERCENT => 10,
+            .DOT_DOT, .DOT_DOT_EQ => 2, // ranges bind loosest above the pipe
+            .PIPE_PIPE => 3,
+            .AMP_AMP => 4,
+            .EQ_EQ, .BANG_EQ, .L_ANGLE, .R_ANGLE, .LT_EQ, .GT_EQ => 5,
+            .PIPE => 6,
+            .CARET => 7,
+            .AMP => 8,
+            .SHL, .SHR => 9,
+            .PLUS, .MINUS => 10,
+            .STAR, .SLASH, .PERCENT => 11,
             else => null,
         };
     }
@@ -1999,7 +2000,12 @@ const Parser = struct {
             const rhs = try self.parseBinExpr(bp + 1);
             try children.append(self.arena, .{ .node = rhs });
 
-            const kind: cst.SyntaxKind = if (k == .PIPE_GT) .PIPE_EXPR else .BIN_EXPR;
+            const kind: cst.SyntaxKind = if (k == .PIPE_GT)
+                .PIPE_EXPR
+            else if (k == .DOT_DOT or k == .DOT_DOT_EQ)
+                .RANGE_EXPR
+            else
+                .BIN_EXPR;
             lhs = try cst.makeNode(self.arena, kind, children.items);
         }
         return lhs;
@@ -3368,6 +3374,28 @@ test "effect declaration parses as an item and round-trips" {
     const first = iter.next() orelse return error.TestExpectedItem;
     try testing.expectEqualStrings("logging", first.effect_decl.name().?.text);
     try testing.expect(first.effect_decl.isPublic());
+}
+
+test "integer ranges parse as RANGE_EXPR and round-trip" {
+    const src = "fn main {\n    for i in 0..3 { env.out(i) }\n    for k in 1..=n { env.out(k) }\n}\n";
+    const r = try parse(testing.allocator, src, "rng.q");
+    defer r.deinit(testing.allocator);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+
+    const sf = ast.SourceFile.cast(r.root).?;
+    var it = sf.items();
+    const fd = (it.next() orelse return error.TestExpectedItem).fn_decl;
+    var stmts = fd.body().?.statements();
+    // The first `for`'s iterable is an exclusive range.
+    const fs = (stmts.next() orelse return error.TestExpectedStmt).for_stmt;
+    const rng = (fs.iterable() orelse return error.TestExpectedExpr).range;
+    try testing.expect(!rng.inclusive());
+    // The second is inclusive.
+    const fs2 = (stmts.next() orelse return error.TestExpectedStmt).for_stmt;
+    try testing.expect((fs2.iterable().?).range.inclusive());
 }
 
 test "fn types parse structured and round-trip" {

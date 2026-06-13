@@ -84,6 +84,14 @@ needs the platform audit, so it's the highest-leverage near-term work.
     (TYP352-adjacent), non-scalar (record/str) captures, block-body lambdas,
     multiple fn params.
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
+  - Integer ranges + `for i in lo..hi` **done:** `..`/`..=` parse as a
+    `RANGE_EXPR` (a low-precedence binary op in `parseBinExpr`); `ast.RangeExpr`
+    exposes `lo()`/`hi()`/`inclusive()`; `buildForRange` desugars a `for` over a
+    range to a counted `let i = lo; while i < hi { body; i = i+1 }` (`<=` for
+    `..=`), bounds evaluated once. Runs wasm64 + wasm32 (roundtrip ranges
+    section: exclusive / inclusive / variable bounds → 3/15/14). **Boundary:**
+    main-only (like the other aggregate `for`s); ranges as general values
+    (`let r = 0..n`, slicing) and callee-body range `for` are follow-ons.
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**

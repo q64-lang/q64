@@ -1645,6 +1645,7 @@ pub const Expr = union(enum) {
     record: RecordExpr,
     match: MatchExpr,
     lambda: LambdaExpr,
+    range: RangeExpr,
 
     pub fn cast(node: *const cst.Node) ?Expr {
         return switch (node.kind) {
@@ -1669,6 +1670,7 @@ pub const Expr = union(enum) {
             .PAREN_EXPR => .{ .paren = .{ .cst = node } },
             .ARRAY_EXPR => .{ .array = .{ .cst = node } },
             .LAMBDA_EXPR => .{ .lambda = .{ .cst = node } },
+            .RANGE_EXPR => .{ .range = .{ .cst = node } },
             else => null,
         };
     }
@@ -1717,6 +1719,27 @@ pub const LambdaParamIter = struct {
             }
         }
         return null;
+    }
+};
+
+/// `RangeExpr := Expr (".." | "..=") Expr` — an integer range. Exclusive
+/// (`a..b`) or inclusive (`a..=b`). Used as a `for` iterable in v0.
+pub const RangeExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn lo(self: RangeExpr) ?Expr {
+        return nthChildExpr(self.cst, 0);
+    }
+    pub fn hi(self: RangeExpr) ?Expr {
+        return nthChildExpr(self.cst, 1);
+    }
+    /// True for `a..=b` (inclusive upper bound).
+    pub fn inclusive(self: RangeExpr) bool {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .DOT_DOT_EQ) return true,
+            .node => {},
+        };
+        return false;
     }
 };
 
