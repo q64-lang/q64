@@ -241,11 +241,33 @@ const Parser = struct {
         }
     }
 
-    /// The item keyword introducing the upcoming item, skipping an
-    /// optional leading `pub`. Returns `.EOF` if there's no item keyword
-    /// there (so a stray `pub {` doesn't read as an item).
+    /// The item keyword introducing the upcoming item, skipping any leading
+    /// annotation run (`@name`, `@name(args)`) and an optional `pub`. Returns
+    /// `.EOF` if there's no item keyword there (so a stray `pub {` or a bare
+    /// `@` doesn't read as an item).
     fn itemKeyword(self: *const Parser) cst.SyntaxKind {
         var i = self.pos;
+        // Leading annotations: `@ IDENT ( balanced )?`, repeated.
+        while (i < self.tokens.len and self.tokens[i].kind == .AT) {
+            i += 1; // @
+            while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+            if (i < self.tokens.len and self.tokens[i].kind == .IDENT) i += 1; // name
+            while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+            if (i < self.tokens.len and self.tokens[i].kind == .L_PAREN) {
+                var depth: i32 = 0;
+                while (i < self.tokens.len) : (i += 1) {
+                    if (self.tokens[i].kind == .L_PAREN) depth += 1;
+                    if (self.tokens[i].kind == .R_PAREN) {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+            }
+        }
         if (i < self.tokens.len and self.tokens[i].kind == .KW_PUB) {
             i += 1;
             while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
@@ -310,22 +332,51 @@ const Parser = struct {
     // FnDecl
     // -----------------------------------------------------------------
 
-    /// Dispatch to the parser for the item introduced by `kw` (the
-    /// keyword `itemKeyword` already peeked past any `pub`).
+    /// Dispatch to the parser for the item introduced by `kw`. Leading
+    /// annotations (`@stage`, `@managed`, …) are consumed first and prepended
+    /// to the item node, so `FnDecl`/`StructDecl`/… own their decorators
+    /// instead of leaving them as loose sibling tokens. (`itemKeyword` already
+    /// peeked past the annotation run and any `pub`.)
     fn parseItem(self: *Parser, kw: cst.SyntaxKind) std.mem.Allocator.Error!*const cst.Node {
-        return switch (kw) {
-            .KW_FN => self.parseFnDecl(),
-            .KW_STRUCT => self.parseStructDecl(),
-            .KW_ENUM => self.parseEnumDecl(),
-            .KW_TYPE => self.parseTypeDecl(),
-            .KW_CONST => self.parseConstDecl(),
-            .KW_STATE => self.parseStateDecl(),
-            .KW_FACE => self.parseFaceDecl(),
-            .KW_FIT => self.parseFitDecl(),
-            .KW_SCREEN => self.parseScreenDecl(),
-            .KW_EFFECT => self.parseEffectDecl(),
+        var anns: std.ArrayList(cst.Element) = .empty;
+        try self.consumeAnnotations(&anns);
+
+        const node = switch (kw) {
+            .KW_FN => try self.parseFnDecl(),
+            .KW_STRUCT => try self.parseStructDecl(),
+            .KW_ENUM => try self.parseEnumDecl(),
+            .KW_TYPE => try self.parseTypeDecl(),
+            .KW_CONST => try self.parseConstDecl(),
+            .KW_STATE => try self.parseStateDecl(),
+            .KW_FACE => try self.parseFaceDecl(),
+            .KW_FIT => try self.parseFitDecl(),
+            .KW_SCREEN => try self.parseScreenDecl(),
+            .KW_EFFECT => try self.parseEffectDecl(),
             else => unreachable,
         };
+        if (anns.items.len == 0) return node;
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.appendSlice(self.arena, anns.items);
+        try children.appendSlice(self.arena, node.children);
+        return try cst.makeNode(self.arena, node.kind, children.items);
+    }
+
+    /// Consume a run of leading item annotations (`@name`, `@name(args)`) into
+    /// `out`, each as an `ANNOTATION` node, preserving trivia between them.
+    fn consumeAnnotations(self: *Parser, out: *std.ArrayList(cst.Element)) !void {
+        while (self.peek() == .AT) {
+            var ann: std.ArrayList(cst.Element) = .empty;
+            try ann.append(self.arena, .{ .token = self.advance() }); // @
+            try self.eatTrivia(&ann);
+            if (self.peek() == .IDENT) {
+                try ann.append(self.arena, .{ .token = self.advance() }); // name
+            }
+            if (self.peek() == .L_PAREN) {
+                try ann.append(self.arena, .{ .node = try self.parseBalancedParen(.ANNOTATION_ARGS) });
+            }
+            try out.append(self.arena, .{ .node = try cst.makeNode(self.arena, .ANNOTATION, ann.items) });
+            try self.eatTrivia(out);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3227,6 +3278,31 @@ test "effect declaration parses as an item and round-trips" {
     const first = iter.next() orelse return error.TestExpectedItem;
     try testing.expectEqualStrings("logging", first.effect_decl.name().?.text);
     try testing.expect(first.effect_decl.isPublic());
+}
+
+test "leading item annotations attach to the item and round-trip" {
+    const src = "@stage @fuse\npub fn play(x: i64) -> i64 {\n    x\n}\n@managed\nstruct G { p: i64 }\n";
+    const r = try parse(testing.allocator, src, "ann.q");
+    defer r.deinit(testing.allocator);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+
+    const sf = ast.SourceFile.cast(r.root).?;
+    var iter = sf.items();
+    const fd = (iter.next() orelse return error.TestExpectedItem).fn_decl;
+    // The fn still surfaces its name + visibility despite the leading decorators.
+    try testing.expectEqualStrings("play", fd.name().?.text);
+    try testing.expect(fd.isPublic());
+    var ait = fd.annotations();
+    try testing.expectEqualStrings("stage", (ait.next().?).name().?.text);
+    try testing.expectEqualStrings("fuse", (ait.next().?).name().?.text);
+    try testing.expect(ait.next() == null);
+    // The struct carries `@managed`.
+    const sd = (iter.next() orelse return error.TestExpectedItem).struct_decl;
+    try testing.expect(ast.hasAnnotation(sd.cst, "managed"));
+    try testing.expectEqualStrings("G", sd.name().?.text);
 }
 
 test "function effect spec parses structured and round-trips" {

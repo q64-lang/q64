@@ -2129,38 +2129,17 @@ fn flagLinearFields(gpa: std.mem.Allocator, sd: ast.StructDecl, diags: *std.Arra
     }
 }
 
-/// Scan top-level items for a `@managed` annotation immediately preceding
-/// a `struct`, then check its fields for linear `ref`s (REG020). The
-/// `@managed` annotation isn't attached to the struct node — it passes
-/// through as sibling `@`/IDENT tokens — so we track it across the
-/// SOURCE_FILE child stream up to the next item node.
-fn checkManagedStructs(gpa: std.mem.Allocator, root: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
-    var seen_managed = false;
-    var after_at = false;
-    for (root.children) |c| switch (c) {
-        .token => |t| {
-            if (t.kind.isTrivia()) continue;
-            if (t.kind == .AT) {
-                after_at = true;
-                continue;
-            }
-            if (after_at and t.kind == .IDENT) {
-                if (std.mem.eql(u8, t.text, "managed")) seen_managed = true;
-                after_at = false;
-                continue;
-            }
-            after_at = false;
-            if (t.kind == .KW_PUB) continue; // `@managed pub struct …`
-            seen_managed = false; // a stray token breaks the annotation run
-        },
-        .node => |n| {
-            if (n.kind == .STRUCT_DECL and seen_managed) {
-                try flagLinearFields(gpa, ast.StructDecl{ .cst = n }, diags);
-            }
-            seen_managed = false;
-            after_at = false;
-        },
-    };
+/// Check each `@managed` struct's fields for linear `ref`s (REG020). The
+/// `@managed` decorator is now a structured leading annotation on the
+/// `STRUCT_DECL`, so we read it directly via `ast.hasAnnotation`.
+fn checkManagedStructs(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.ArrayList(Diag)) !void {
+    var it = sf.items();
+    while (it.next()) |item| {
+        if (item != .struct_decl) continue;
+        if (ast.hasAnnotation(item.struct_decl.cst, "managed")) {
+            try flagLinearFields(gpa, item.struct_decl, diags);
+        }
+    }
 }
 
 /// The auto-prelude typed-string prefixes (modules.md §"Typed-prefix
@@ -2491,7 +2470,7 @@ pub fn checkFile(
     // REG050: unknown transfer verbs (`a.copy_to(r)`, …) anywhere in the file.
     try checkTransferVerbs(gpa, sf.cst, &diags);
     // REG020: linear `ref` fields in a `@managed` struct.
-    try checkManagedStructs(gpa, sf.cst, &diags);
+    try checkManagedStructs(gpa, sf, &diags);
     // ENV055: `with_capabilities(use: {…})` keys not on `Env`.
     try checkWithCapabilities(gpa, sf.cst, &diags);
     // CONC020: `tell` on a reply-bearing actor handler.

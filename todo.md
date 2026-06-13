@@ -31,6 +31,14 @@ needs the platform audit, so it's the highest-leverage near-term work.
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the
     token-scan diagnostics (STR/CONC/REG/EFF) become precise AST-level checks,
     and is a prerequisite for clean concurrency/stream *lowering* later.
+    - [x] **Leading item annotations** (`@stage`/`@managed`/`@http_handler`):
+          `itemKeyword` skips a leading `@name(args)?` run, `parseItem`
+          consumes them into `ANNOTATION` nodes and prepends them to the item,
+          and `ast.Annotation`/`FnDecl.annotations()`/`StructDecl.annotations()`
+          /`ast.hasAnnotation` expose them. REG020 now reads `@managed` from
+          the struct node instead of scanning sibling tokens (lossless
+          round-trip held; 51/51 + goldens green). Block bodies
+          (`graph`/`scope`/`region`/`actor`) are the next slice.
   - `screen`/`draw` → `main` **lowering** + the browser-host glue wiring
     (§"QView…" — parse/AST done; lowering + `runtime/web` reading the i32
     `env.out` args remain).

@@ -387,7 +387,63 @@ pub const FnDecl = struct {
     pub fn effectSpec(self: FnDecl) ?EffectSpec {
         return firstChildNode(self.cst, .EFFECT_SPEC, EffectSpec);
     }
+
+    /// The function's leading decorator annotations (`@stage`, `@http_handler`).
+    pub fn annotations(self: FnDecl) AnnotationIter {
+        return .{ .children = self.cst.children };
+    }
 };
+
+/// `Annotation := "@" IDENT AnnotationArgs?` — a leading item decorator
+/// (`@stage`, `@managed`, `@http_handler`). Any args are a raw span.
+pub const Annotation = struct {
+    cst: *const cst.Node,
+
+    /// The marker name — the IDENT after `@`, without the `@`.
+    pub fn name(self: Annotation) ?cst.Token {
+        var seen_at = false;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind == .AT) {
+                    seen_at = true;
+                } else if (seen_at and t.kind == .IDENT) {
+                    return t;
+                }
+            },
+            .node => {},
+        };
+        return null;
+    }
+};
+
+pub const AnnotationIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *AnnotationIter) ?Annotation {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .ANNOTATION) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// True when an item node carries a leading `@<want>` annotation.
+pub fn hasAnnotation(node: *const cst.Node, want: []const u8) bool {
+    var it = AnnotationIter{ .children = node.children };
+    while (it.next()) |a| {
+        if (a.name()) |nm| {
+            if (std.mem.eql(u8, nm.text, want)) return true;
+        }
+    }
+    return false;
+}
 
 /// `EffectSpec := EffectMarker ("+" EffectMarker)*` — the effect set
 /// declared after a function's return type (spec/grammar.md §Functions).
@@ -481,6 +537,11 @@ pub const StructDecl = struct {
     }
     pub fn genericParams(self: StructDecl) ?*const cst.Node {
         return firstChildRawNode(self.cst, .GENERIC_PARAMS);
+    }
+
+    /// The struct's leading decorator annotations (`@managed`).
+    pub fn annotations(self: StructDecl) AnnotationIter {
+        return .{ .children = self.cst.children };
     }
 
     /// Record-struct fields (`struct S { a: T, … }`). Empty for tuple
