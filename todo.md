@@ -1049,8 +1049,15 @@ verified, honest diagnostics throughout.
       `return`/`panic`/`if`/`match` and `Ok(())` tails stay silent,
       raw/unparsed returns are lenient. Catalog entries + 4 unit cases;
       conformance `env/main-signature-mismatch` + `env/main-form2-no-
-      return` flip → **27/51**) → next: the `From` conversion on
-      `try`, and more negative-diagnostic conformance gaps.
+      return` flip → **27/51**) → LEX021 (`&` in type position) wired
+      (landed: `parseTypePrimary` flags a `&` opening a type — q64's
+      reference syntax is `ref T`, not `&T` — with LEX021 and recovers
+      by treating it as a `ref` type, so the rest of the signature
+      parses and the source round-trips. A bitwise `&` in *expression*
+      position is untouched. 2 unit cases; conformance
+      `lexical/ampersand-in-type` flips → **28/51**) → next: the `From`
+      conversion on `try`, and more negative-diagnostic conformance
+      gaps (LEX020 needs the auto-prelude prefix set — deferred).
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

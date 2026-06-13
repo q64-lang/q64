@@ -1175,6 +1175,18 @@ const Parser = struct {
             .L_BRACK => return self.parseBracketType(),
             .L_PAREN => return self.parseTupleType(),
             .IDENT => return self.parsePathType(),
+            .AMP => {
+                // `&T` is not q64's reference syntax — references are `ref T`
+                // (spec/types.md). Flag LEX021 and recover by treating the
+                // `&` like `ref`, so the rest of the signature still parses.
+                const amp = self.advance(); // &
+                try self.emitDiag("LEX021", amp.offset);
+                var children: std.ArrayList(cst.Element) = .empty;
+                try children.append(self.arena, .{ .token = amp });
+                try self.eatTrivia(&children);
+                try children.append(self.arena, .{ .node = try self.parseType() });
+                return try cst.makeNode(self.arena, .REF_TYPE, children.items);
+            },
             else => return self.parseRawType(),
         }
     }
@@ -3135,6 +3147,23 @@ test "a well-formed import emits no diagnostics" {
     const r = try parse(testing.allocator, "import q64.math.{Vec3, dot}\n", "ok.q");
     defer r.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), r.diagnostics.len);
+}
+
+test "LEX021: `&` in a type position is flagged and recovers losslessly" {
+    const src = "fn first(buf: &[u8]) -> u8 {\n    buf[0]\n}\n";
+    const r = try parse(testing.allocator, src, "amp.q");
+    defer r.deinit(testing.allocator);
+    try testing.expect(hasDiag(r, "LEX021"));
+    // The `&` is preserved in the CST (recovered as a ref type), so the
+    // source round-trips byte-for-byte.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+    // A bitwise `&` in *expression* position is fine — not flagged.
+    const ok = try parse(testing.allocator, "fn f(a: i64, b: i64) -> i64 { a & b }\n", "and.q");
+    defer ok.deinit(testing.allocator);
+    try testing.expect(!hasDiag(ok, "LEX021"));
 }
 
 test "mixed items round-trip losslessly and all surface" {
