@@ -58,11 +58,11 @@ pub fn lower(gpa: std.mem.Allocator, h: *const hir.Module) Error!mir.Module {
     const funcs = try a.alloc(mir.Func, h.funcs.len);
     for (h.funcs, 0..) |hf, i| {
         const is_entry = (h.entry != null and h.entry.? == i);
-        // The entry and any `is_screen` function (e.g. `on_press`) share the
-        // entry lowering: their bodies are screen statements (host_call / global
-        // assign / let), which `lowerEntryStmt` handles. Other functions are
-        // i64/str callees.
-        if (is_entry or hf.is_screen) {
+        // The entry, any `is_screen` function (e.g. `on_press`), and any
+        // void-returning procedure share the void lowering: their bodies are
+        // statement sequences (host_out / host_call / call / let / if / while),
+        // which `lowerEntryStmt` handles. The rest are i64/str value callees.
+        if (is_entry or hf.is_screen or hf.ret == .void) {
             const params = try a.alloc(mir.ValueType, hf.params.len);
             for (hf.params, 0..) |p, j| params[j] = mapType(p.ty);
             const locals = try a.alloc(mir.ValueType, hf.locals.len);

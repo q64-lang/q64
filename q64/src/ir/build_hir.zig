@@ -1076,7 +1076,23 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 try out.append(b.a, st);
                 return;
             }
-            if (!isEnvOut(b.a, call)) return reject(b, .unsupported_call);
+            // A statement-position call to a void procedure (`log(5)`): build
+            // the call and discard its (absent) result. A non-void call here
+            // is rejected — a value may not be left on the stack.
+            if (!isEnvOut(b.a, call)) {
+                const cname = callPathName(b, call) orelse return reject(b, .unsupported_call);
+                defer b.a.free(cname);
+                if (std.mem.indexOfScalar(u8, cname, '.') != null) return reject(b, .unsupported_call);
+                if (b.resolver.lookup(cname) == null) return reject(b, .name_not_found);
+                const id = try registerFunc(b, cname);
+                if (b.funcs.items[id].ret != .void) return reject(b, .unsupported_call);
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, call.args(), scope, null) } };
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .expr = e };
+                try out.append(b.a, st);
+                return;
+            }
             const arg = firstArg(call) orelse return error.Unsupported;
 
             const st = try b.a.create(hir.Stmt);
@@ -1436,44 +1452,28 @@ fn callPathName(b: *Builder, call: ast.CallExpr) ?[]const u8 {
     return cpath.text(b.a) catch null;
 }
 
-/// Resolve `name` to a registered i64 function, building it (and anything it
-/// calls) the first time. Returns its FuncId. The id and the parameter list
-/// are reserved *before* the body is built, so a recursive call inside the
-/// body sees the correct arity (not the placeholder's).
-fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
-    if (b.ids.get(name)) |id| return id;
-
-    const fd = b.resolver.lookup(name) orelse return reject(b, .name_not_found);
-    const rec_ret = try structOfRet(b, fd);
-    const ret_ty: hir.Type = if (rec_ret != null) .ptr else blk: {
-        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
-        if (rs == .str) return registerStrFunc(b, name, fd);
-        // An i64, f64, or `-> bool` (i32 0/1) value function; the value
-        // body builds through `buildIntBlock` whatever the scalar.
-        break :blk switch (rs) {
-            .bool, .i64, .f64, .f32 => rs,
-            else => return error.Unsupported,
-        };
-    };
-
-    const owned = try b.a.dupe(u8, name);
-
-    // Parameters (i64, bool, or a record — one `.ptr` slot) occupy local
-    // indices 0..n; seed the body scope. Callee bookkeeping: locals are
-    // tracked by `scope.declare` alone (no cur_locals mirror).
-    var scope = Scope{ .a = b.a, .callee = true };
-    var params: std.ArrayList(hir.Param) = .empty;
-    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
-    var any_rec = (rec_ret != null);
+/// Seed a callee body scope with the function's parameters and fill the
+/// parallel `params` / `rec_params` lists. Scalars (i64/bool/f64/f32) take one
+/// slot; a `str` param takes two (ptr at idx, len at idx+1); a record param is
+/// one `.ptr` into the caller's arena (registered in `scope.recs`). Returns
+/// whether any param is a record (the caller folds in a record *return*).
+/// Shared by the value-, str-, and void-returning callee registrations.
+fn collectCalleeParams(
+    b: *Builder,
+    fd: ast.FnDecl,
+    scope: *Scope,
+    params: *std.ArrayList(hir.Param),
+    rec_params: *std.ArrayList(?*const StructInfo),
+) BuildError!bool {
+    var any_rec = false;
     if (fd.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
             const pn = (p.name() orelse return error.Unsupported).text;
             if (try paramScalar(b, p)) |psc| {
                 if (psc == .str) {
-                    // A `str` param in a value function: one hir param
-                    // (two wasm locals — ptr at idx, len at idx+1, the
-                    // str-binding convention `strReceiver` resolves).
+                    // A `str` param: one hir param (two wasm locals — ptr at
+                    // idx, len at idx+1, the str-binding convention).
                     _ = try scope.declare(pn, false, .str);
                     const len_hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{pn});
                     _ = try scope.declare(len_hidden, false, .ptr);
@@ -1499,6 +1499,41 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
             } else return error.Unsupported;
         }
     }
+    return any_rec;
+}
+
+/// Resolve `name` to a registered i64 function, building it (and anything it
+/// calls) the first time. Returns its FuncId. The id and the parameter list
+/// are reserved *before* the body is built, so a recursive call inside the
+/// body sees the correct arity (not the placeholder's).
+fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
+    if (b.ids.get(name)) |id| return id;
+
+    const fd = b.resolver.lookup(name) orelse return reject(b, .name_not_found);
+    const rec_ret = try structOfRet(b, fd);
+    // No return type and no record return: a void-returning procedure (a
+    // helper run for its side effects — `env.out`, calls, host faces).
+    if (rec_ret == null and fd.returnType() == null) return registerVoidFunc(b, name, fd);
+    const ret_ty: hir.Type = if (rec_ret != null) .ptr else blk: {
+        const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
+        if (rs == .str) return registerStrFunc(b, name, fd);
+        // An i64, f64, or `-> bool` (i32 0/1) value function; the value
+        // body builds through `buildIntBlock` whatever the scalar.
+        break :blk switch (rs) {
+            .bool, .i64, .f64, .f32 => rs,
+            else => return error.Unsupported,
+        };
+    };
+
+    const owned = try b.a.dupe(u8, name);
+
+    // Parameters occupy local indices 0..n; seed the body scope. Callee
+    // bookkeeping: locals are tracked by `scope.declare` alone (no cur_locals
+    // mirror).
+    var scope = Scope{ .a = b.a, .callee = true };
+    var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    const any_rec = (try collectCalleeParams(b, fd, &scope, &params, &rec_params)) or (rec_ret != null);
     // Param-occupied scope slots (a str param takes two: ptr + len).
     scope.n_params = scope.next_idx;
     const param_slice = try params.toOwnedSlice(b.a);
@@ -1550,6 +1585,161 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
 
     b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
+}
+
+/// Register a void-returning procedure — a helper run for its side effects.
+/// Body statements: `env.out(…)`, value `let`/`var` bindings, local
+/// reassignment, `if`/`else`, `while`, statement-position calls (void user
+/// calls + host faces), and a bare `return`. The body lowers through the
+/// entry/void path (every statement is a void inst — see lower.zig's
+/// `lowerEntryStmt`, routed by `hf.ret == .void`). v0 boundary: no `match`,
+/// records, arrays, or `for` in the body, and no runtime str bindings
+/// (`let s = shout(x)`) — str *arguments* to `env.out` are fine.
+fn registerVoidFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
+    const owned = try b.a.dupe(u8, name);
+    var scope = Scope{ .a = b.a, .callee = true };
+    var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    const any_rec = try collectCalleeParams(b, fd, &scope, &params, &rec_params);
+    scope.n_params = scope.next_idx;
+    const param_slice = try params.toOwnedSlice(b.a);
+
+    // Reserve the id (with the real params) before the body so a recursive
+    // call inside it sees the correct arity.
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, owned, id);
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = .void, .body = dummy });
+    if (any_rec) {
+        try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = null });
+    } else {
+        rec_params.deinit(b.a);
+    }
+
+    const block = try buildVoidBlock(b, fd.body() orelse return error.Unsupported, &scope);
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty; // a str binding's backing slots are address-width
+    }
+    const vis: hir.Visibility = if (fd.visibility() != null) .public else .private;
+    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .void, .locals = locals, .body = block, .visibility = vis };
+    return id;
+}
+
+/// Build a `{ … }` block of void-procedure statements into one HIR block.
+fn buildVoidBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.Stmt {
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    var it = block.statements();
+    while (it.next()) |stmt| try buildVoidStmt(b, stmt, scope, &items);
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return out;
+}
+
+/// Build one void-procedure statement. Value-only statements (`let`, `assign`)
+/// reuse the callee statement builder; control flow whose bodies may contain
+/// side effects (`if`/`while`) recurses through `buildVoidBlock`; expression
+/// statements are `env.out`, host-face calls, or void user calls.
+fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    switch (stmt) {
+        .expr_stmt => |es| {
+            const call = switch (es.expression() orelse return error.Unsupported) {
+                .call => |cc| cc,
+                else => return error.Unsupported,
+            };
+            if (isEnvOut(b.a, call)) {
+                try out.append(b.a, try buildVoidEnvOut(b, call, scope));
+                return;
+            }
+            if (try hostFaceName(b, call)) |fname| {
+                try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
+                return;
+            }
+            // A statement-position call to another void procedure; its result
+            // (there is none) is discarded. A value-returning call here is
+            // rejected — nothing may be left on the stack (lower.zig enforces
+            // the same on `.expr`).
+            const cname = callPathName(b, call) orelse return error.Unsupported;
+            defer b.a.free(cname);
+            if (std.mem.indexOfScalar(u8, cname, '.') != null) return error.Unsupported;
+            const id = try registerFunc(b, cname);
+            if (b.funcs.items[id].ret != .void) return reject(b, .unsupported_call);
+            const e = try b.a.create(hir.Expr);
+            e.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, call.args(), scope, null) } };
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .expr = e };
+            try out.append(b.a, st);
+        },
+        .if_stmt => |is| try out.append(b.a, try buildVoidIfNode(b, is, scope)),
+        .while_stmt => |ws| {
+            const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, scope);
+            const body = try buildVoidBlock(b, ws.body() orelse return error.Unsupported, scope);
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .while_ = .{ .cond = cond, .body = body } };
+            try out.append(b.a, st);
+        },
+        .return_stmt => |rs| {
+            if (rs.value() != null) return error.Unsupported; // a void procedure returns no value
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .ret = null };
+            try out.append(b.a, st);
+        },
+        // `let`/`var` bindings and reassignment carry no side effects of their
+        // own — the value-callee statement builder handles them identically.
+        .let_stmt, .assign_stmt, .break_stmt, .continue_stmt => try out.append(b.a, try buildIntStmt(b, stmt, scope)),
+        else => return error.Unsupported,
+    }
+}
+
+/// The void-procedure analogue of `buildIfStmtNode`: an `if`/`else(-if)` whose
+/// bodies may contain side effects, built through `buildVoidBlock`.
+fn buildVoidIfNode(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.Stmt {
+    const cond = try buildIntExpr(b, is.condition() orelse return error.Unsupported, scope);
+    const then_ = try buildVoidBlock(b, is.thenBody() orelse return error.Unsupported, scope);
+    const else_: ?*hir.Stmt = if (is.elseIf()) |eif| blk: {
+        const inner = try buildVoidIfNode(b, eif, scope);
+        const wrap = try b.a.create(hir.Stmt);
+        wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+        break :blk wrap;
+    } else if (is.elseBody()) |eb|
+        try buildVoidBlock(b, eb, scope)
+    else
+        null;
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
+    return out;
+}
+
+/// `env.out(<arg>)` in a void procedure: the same str/bool/float/i64
+/// classification as `main`'s form, but without const-folding or runtime
+/// str-binding lookups (callee bodies have neither).
+fn buildVoidEnvOut(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+    const arg = firstArg(call) orelse return error.Unsupported;
+    const st = try b.a.create(hir.Stmt);
+    if (arg == .string_lit) {
+        // A string literal, possibly interpolated: a fully-constant run folds
+        // to `host_out`, otherwise a runtime concat.
+        const v = try buildConcat(b, arg.string_lit, scope, true, null);
+        st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
+    } else if ((try isStrCall(b, arg, scope)) or (try exprScalar(b, arg, scope)) == .str) {
+        st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, null) };
+    } else if (try exprIsBool(b, arg, scope)) {
+        st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
+    } else if (isFloatSc(try exprScalar(b, arg, scope))) {
+        var fv = try buildIntExpr(b, arg, scope);
+        if ((try exprScalar(b, arg, scope)) == .f32) {
+            const w = try b.a.create(hir.Expr);
+            w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
+            fv = w;
+        }
+        st.* = .{ .host_out_float = fv };
+    } else {
+        st.* = .{ .host_out_int = try buildIntExpr(b, arg, scope) };
+    }
+    return st;
 }
 
 /// A record-returning body: leading statements (the shared callee-body
@@ -7187,6 +7377,57 @@ test "callee-body match: enum params + value if-chain tails" {
         \\}
         \\fn main {
         \\    env.out(f(Some(7)))
+        \\}
+        \\
+    )) == null);
+}
+
+test "void procedures: env.out / while / if-else / value let / void call from main" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn line(n: i64) {
+        \\    let doubled = n * 2
+        \\    env.out(doubled)
+        \\}
+        \\fn count_down(n: i64) {
+        \\    var i = n
+        \\    while i > 0 {
+        \\        line(i)
+        \\        i = i - 1
+        \\    }
+        \\    if n > 0 { env.out("done") } else { env.out("nothing") }
+        \\}
+        \\fn main {
+        \\    count_down(3)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Both procedures register as void functions, callable from main and
+    // from each other.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn line -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn count_down -> void") != null);
+    // A void call in *value* position (`env.out(line(1))`) is rejected — a
+    // value may not be left on the stack.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn line(n: i64) { env.out(n) }
+        \\fn main {
+        \\    env.out(line(1))
+        \\}
+        \\
+    )) == null);
+    // A `return <value>` inside a void procedure is rejected.
+    var tr3 = TestResolver{ .a = testing.allocator };
+    defer tr3.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr3,
+        \\fn p(n: i64) { return n }
+        \\fn main {
+        \\    p(1)
         \\}
         \\
     )) == null);

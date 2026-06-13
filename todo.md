@@ -1004,8 +1004,26 @@ verified, honest diagnostics throughout.
       enum + literal scrutinees both work, mixed-arm-type still
       rejected. Verified wasm64+wasm32: `classify`/`unwrap_or` →
       `101 201 1000 50 30`; 401 unit / 81 CLI / 24-of-51 / roundtrips
-      green) → next: the `From` conversion on `try`,
-      statement-position callee matches.
+      green) → void-returning procedures (landed: a `fn` with no
+      return type — a helper run for its side effects — now builds and
+      runs. `registerVoidFunc` + `buildVoidStmt`/`buildVoidBlock`/
+      `buildVoidIfNode`/`buildVoidEnvOut` build a body of `env.out(…)`,
+      value `let`/`var` + reassignment, `if`/`else`, `while`, bare
+      `return`, host-face calls, and statement-position void calls;
+      `main` gained the same void-call statement. The body lowers
+      through the existing entry/void path — `lowerEntryStmt` already
+      handles every void inst — routed by `hf.ret == .void` in
+      lower.zig. The callee param loop was factored into the shared
+      `collectCalleeParams`. A void call in *value* position
+      (`env.out(log(5))`) and a `return <value>` from a void proc are
+      both rejected. Verified wasm64+wasm32: a `banner`/`count_down`/
+      `describe` program and a void-calls-void program; 402 unit / 81
+      CLI / 24-of-51 / roundtrips green. Boundary: no `match`, records,
+      arrays, `for`, generics, or runtime str bindings in a void body
+      yet — those are follow-ons) → next: statement-position callee
+      matches (now unblocked — a `match` with side-effecting void arm
+      bodies inside a void procedure), then the `From` conversion on
+      `try`.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
