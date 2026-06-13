@@ -383,6 +383,7 @@ fn itemKind(item: ast.Item) []const u8 {
         .face_decl => "face",
         .fit_decl => "fit",
         .screen_decl => "screen",
+        .effect_decl => "effect",
     };
 }
 

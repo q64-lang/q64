@@ -169,6 +169,9 @@ pub fn build(gpa: std.mem.Allocator, sf: ast.SourceFile) !SymbolTable {
                 .public = d.isPublic(),
             });
         },
+        // Effect markers live in their own namespace (not value/type symbols);
+        // their validity is checked directly (EFF140/EFF141).
+        .effect_decl => {},
     };
 
     return t;

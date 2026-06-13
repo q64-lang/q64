@@ -1005,6 +1005,48 @@ fn checkMainSignature(gpa: std.mem.Allocator, fd: ast.FnDecl, diags: *std.ArrayL
     }
 }
 
+/// The blessed core effect markers (effects.md §"The core effect set").
+/// A `pub effect @<name>` colliding with one of these is EFF140.
+const core_effects = [_][]const u8{
+    // asserts
+    "pure",         "realtime",  "no_alloc", "no_suspend", "no_panic",
+    "no_trap",      "uncancellable",
+    // capabilities
+    "io",           "network",   "fs",       "kv",         "stdout",
+    "stderr",       "audio",     "midi",     "ui",         "inference",
+    "time",         "random",    "exit",     "envvars",    "wire",
+    // observation + type marker
+    "cancel",       "send",
+};
+
+/// A user effect name (the IDENT after `@`, without the `@`) must match
+/// `^[a-z][a-z_]*$` — lowercase letters and underscores, leading letter.
+fn isValidEffectName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] < 'a' or name[0] > 'z') return false;
+    for (name[1..]) |ch| {
+        if (!((ch >= 'a' and ch <= 'z') or ch == '_')) return false;
+    }
+    return true;
+}
+
+/// Check a `pub effect @<name>` declaration:
+/// - **EFF141** if the name doesn't match `^@[a-z][a-z_]*$`;
+/// - **EFF140** if a (valid) name collides with a core marker.
+fn checkEffectDecl(gpa: std.mem.Allocator, ed: ast.EffectDecl, diags: *std.ArrayList(Diag)) !void {
+    const name_tok = ed.name() orelse return;
+    if (!isValidEffectName(name_tok.text)) {
+        try diags.append(gpa, .{ .code = "EFF141", .offset = name_tok.offset });
+        return;
+    }
+    for (core_effects) |core| {
+        if (std.mem.eql(u8, core, name_tok.text)) {
+            try diags.append(gpa, .{ .code = "EFF140", .offset = name_tok.offset });
+            return;
+        }
+    }
+}
+
 /// **TYP108**: in a generic parameter list, no parameter without a default
 /// may follow one that has a default (spec/generics.md). Scans the raw
 /// `GENERIC_PARAMS` token span, splitting on top-level commas and detecting a
@@ -1164,8 +1206,8 @@ pub fn checkFile(
     var enums = try collectEnums(gpa, sf);
     defer deinitEnums(gpa, &enums);
 
-    // TYP108: generic default-ordering, on every item kind that carries a
-    // generic parameter list (fn / struct / enum).
+    // Item-level checks: TYP108 generic default-ordering (fn / struct / enum)
+    // and EFF140/EFF141 on `pub effect @<name>` declarations.
     var git = sf.items();
     while (git.next()) |item| {
         const gp: ?*const cst.Node = switch (item) {
@@ -1175,6 +1217,7 @@ pub fn checkFile(
             else => null,
         };
         if (gp) |g| try checkGenericDefaults(gpa, g, &diags);
+        if (item == .effect_decl) try checkEffectDecl(gpa, item.effect_decl, &diags);
     }
 
     var it = sf.items();
@@ -1643,6 +1686,17 @@ test "check: TYP300 — `try` outside a Result-returning function" {
         \\}
         \\
     , &.{});
+}
+
+test "check: EFF140 / EFF141 — user effect name collisions and shape" {
+    // Shadows a core marker.
+    try expectCodes("pub effect @realtime\nfn main { env.out(\"hi\") }\n", &.{"EFF140"});
+    try expectCodes("effect @io\nfn main { env.out(\"hi\") }\n", &.{"EFF140"});
+    // Invalid name (uppercase / not `^[a-z][a-z_]*$`).
+    try expectCodes("pub effect @Logging\nfn main { env.out(\"hi\") }\n", &.{"EFF141"});
+    // A well-formed, non-colliding user effect is silent.
+    try expectCodes("pub effect @logging\nfn main { env.out(\"hi\") }\n", &.{});
+    try expectCodes("pub effect @audit_trail\nfn main { env.out(\"hi\") }\n", &.{});
 }
 
 test "check: TYP108 — a non-default generic parameter after a default" {

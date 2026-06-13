@@ -1063,10 +1063,21 @@ verified, honest diagnostics throughout.
       `StructDecl.genericParams()`. Nested `<>`/`[]`/`()` in a default
       value are depth-skipped; the TYP102 test, whose default is last,
       stays silent. 3 unit cases; conformance
-      `generics/non-default-after-default` flips → **29/51**) → next:
-      the `From` conversion on `try`, and more negative-diagnostic
-      conformance gaps (LEX020 needs the auto-prelude prefix set —
-      deferred).
+      `generics/non-default-after-default` flips → **29/51**) →
+      effect declarations + EFF140/EFF141 (landed: `effect @name` is
+      now a parsed item — `KW_EFFECT` joined the item keywords,
+      `parseEffectDecl` structures `pub? effect @IDENT` into an
+      `EFFECT_DECL` (round-trips losslessly), and `ast.EffectDecl`
+      exposes the marker name. The check pass emits **EFF141** when the
+      name fails `^[a-z][a-z_]*$` and **EFF140** when a valid name
+      collides with a core marker (the full blessed set from
+      effects.md). Catalog entries + parser round-trip test + 5 check
+      cases; conformance `effects/invalid-effect-name` +
+      `effects/user-effect-shadows-core` flip → **31/51**) → next: the
+      `From` conversion on `try`, and more negative-diagnostic gaps
+      (the remaining effects/concurrency tests need effect *annotation*
+      parsing on functions — currently raw — for EFF120/ENV056; LEX020
+      needs the auto-prelude prefix set).
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

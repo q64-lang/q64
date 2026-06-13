@@ -257,7 +257,7 @@ const Parser = struct {
 
     fn isItemKeyword(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN => true,
+            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN, .KW_EFFECT => true,
             else => false,
         };
     }
@@ -323,6 +323,7 @@ const Parser = struct {
             .KW_FACE => self.parseFaceDecl(),
             .KW_FIT => self.parseFitDecl(),
             .KW_SCREEN => self.parseScreenDecl(),
+            .KW_EFFECT => self.parseEffectDecl(),
             else => unreachable,
         };
     }
@@ -712,6 +713,25 @@ const Parser = struct {
             try children.append(self.arena, .{ .node = try self.parseExpr() });
         }
         return try cst.makeNode(self.arena, .CONST_DECL, children.items);
+    }
+
+    /// `EffectDecl := "effect" "@" IDENT` (spec/grammar.md, effects.md
+    /// §"User-defined effects"). A pure declaration of a marker — no body.
+    /// The name's validity (`^@[a-z][a-z_]*$`, no core collision) is the
+    /// check pass's concern (EFF140 / EFF141); here we just structure it.
+    fn parseEffectDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // effect
+        try self.eatTrivia(&children);
+        if (self.peek() == .AT) {
+            try children.append(self.arena, .{ .token = self.advance() }); // @
+            try self.eatTrivia(&children);
+            if (self.peek() == .IDENT) {
+                try children.append(self.arena, .{ .token = self.advance() }); // name
+            }
+        }
+        return try cst.makeNode(self.arena, .EFFECT_DECL, children.items);
     }
 
     /// `StateDecl := "state" IDENT (":" TypeExpr)? "=" Expr` — module-level
@@ -3147,6 +3167,23 @@ test "a well-formed import emits no diagnostics" {
     const r = try parse(testing.allocator, "import q64.math.{Vec3, dot}\n", "ok.q");
     defer r.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), r.diagnostics.len);
+}
+
+test "effect declaration parses as an item and round-trips" {
+    const src = "pub effect @logging\nfn main { env.out(\"hi\") }\n";
+    const r = try parse(testing.allocator, src, "eff.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r.diagnostics.len);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+    // The effect decl surfaces as an item with its marker name.
+    const sf = ast.SourceFile.cast(r.root).?;
+    var iter = sf.items();
+    const first = iter.next() orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("logging", first.effect_decl.name().?.text);
+    try testing.expect(first.effect_decl.isPublic());
 }
 
 test "LEX021: `&` in a type position is flagged and recovers losslessly" {

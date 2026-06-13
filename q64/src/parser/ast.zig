@@ -145,6 +145,7 @@ pub const Item = union(enum) {
     face_decl: FaceDecl,
     fit_decl: FitDecl,
     screen_decl: ScreenDecl,
+    effect_decl: EffectDecl,
 
     pub fn cast(node: *const cst.Node) ?Item {
         return switch (node.kind) {
@@ -157,6 +158,7 @@ pub const Item = union(enum) {
             .FACE_DECL => .{ .face_decl = .{ .cst = node } },
             .FIT_DECL => .{ .fit_decl = .{ .cst = node } },
             .SCREEN_DECL => .{ .screen_decl = .{ .cst = node } },
+            .EFFECT_DECL => .{ .effect_decl = .{ .cst = node } },
             else => null,
         };
     }
@@ -543,6 +545,36 @@ pub const TypeDecl = struct {
 };
 
 /// `ConstDecl := "const" IDENT ":" TypeExpr "=" Expr`.
+/// `EffectDecl := "effect" "@" IDENT` — a user-defined effect marker
+/// (effects.md §"User-defined effects"). No body.
+pub const EffectDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: EffectDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn isPublic(self: EffectDecl) bool {
+        return self.visibility() != null;
+    }
+
+    /// The marker name — the IDENT after `@`, without the `@`. `null` if
+    /// the declaration is malformed (missing `@name`).
+    pub fn name(self: EffectDecl) ?cst.Token {
+        var seen_at = false;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind == .AT) {
+                    seen_at = true;
+                } else if (seen_at and t.kind == .IDENT) {
+                    return t;
+                }
+            },
+            .node => {},
+        };
+        return null;
+    }
+};
+
 pub const ConstDecl = struct {
     cst: *const cst.Node,
 
