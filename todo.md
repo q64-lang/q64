@@ -166,10 +166,14 @@ needs the platform audit, so it's the highest-leverage near-term work.
           whose value uses them type-probes. v0: integer slots. Runs wasm64 +
           wasm32 (roundtrip `7 / 5 / 999`). **Next:** nested enum/record
           sub-patterns (`Wrapper(Some(x))`, `Circle { r }` field destructuring).
-          (Orthogonal pre-existing gap: a callee `let r = match …` over a
-          *multi-slot or unit* payload enum — single-slot `Some(v)` works, but
-          `Move(x, y)` / all-unit enums in a callee value match are still
-          unsupported; main-position value + statement matches are fine.)
+    - [x] **Immediate (all-unit) enum params in callees** (fixed a pre-existing
+          gap): `collectCalleeParams` rejected an all-unit enum param because
+          `structOfType` returns null for it (only *boxed* enums are records).
+          Now `enumOfType` recognizes it and the param rides as an i64 tag,
+          registered in `scope.enum_binds` so `match c { … }` resolves bare
+          variants — in both the value-`let` and statement-return callee forms.
+          Runs wasm64 + wasm32 (roundtrip `2/3/10/30`). (Boxed-payload enum
+          params already worked.)
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the

@@ -2056,6 +2056,41 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> callee immediate-enum param: match c { … } over an all-unit enum argument"
+cee_app="$tmp/calleeenum.q"
+cat > "$cee_app" <<'Q64'
+enum Color { Red, Green, Blue }
+fn rank(c: Color) -> i64 {
+    let r = match c {
+        Red -> 1,
+        Green -> 2,
+        Blue -> 3,
+    }
+    r
+}
+fn tag(c: Color) -> i64 {
+    match c {
+        Red -> 10,
+        Green -> 20,
+        Blue -> 30,
+    }
+}
+fn main {
+    env.out(rank(Color.Green))
+    env.out(rank(Color.Blue))
+    env.out(tag(Color.Red))
+    env.out(tag(Color.Blue))
+}
+Q64
+cee_expected=$'2\n3\n10\n30'
+"$Q64_BIN" emit "$cee_app" "$tmp/calleeenum.wasm"
+cee_out="$("$HOST_BIN" "$tmp/calleeenum.wasm")"
+[[ "$cee_out" == "$cee_expected" ]] || { echo "FAIL: callee immediate-enum param (got: $cee_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$cee_app" "$tmp/calleeenum32.wasm" --addr wasm32
+cee32_out="$("$HOST_BIN" "$tmp/calleeenum32.wasm")"
+[[ "$cee32_out" == "$cee_expected" ]] || { echo "FAIL: callee immediate-enum param wasm32 (got: $cee32_out)" >&2; exit 1; }
+echo "    ok: callee immediate-enum param -> 2/3/10/30 (wasm64 + wasm32; value + statement match)"
+
 echo "==> match literal sub-patterns: V(0, y) -> … (slot-equality condition in payload arms)"
 sub_app="$tmp/subpat.q"
 cat > "$sub_app" <<'Q64'

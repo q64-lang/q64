@@ -1758,6 +1758,14 @@ fn collectCalleeParams(
                 try params.append(b.a, .{ .name = pn, .ty = .ptr });
                 try rec_params.append(b.a, si);
                 any_rec = true;
+            } else if (try enumOfType(b, p.type_())) |einfo| {
+                // An immediate (all-unit) enum param: the tag travels as an
+                // i64; register it so `match c { … }` resolves bare variants.
+                if (einfo.si != null) return error.Unsupported; // boxed: handled above
+                _ = try scope.declare(pn, false, .i64);
+                try scope.enum_binds.put(b.a, pn, einfo);
+                try params.append(b.a, .{ .name = pn, .ty = .i64 });
+                try rec_params.append(b.a, null);
             } else return error.Unsupported;
         }
     }
@@ -3470,6 +3478,22 @@ fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInf
 fn structOfRet(b: *Builder, fd: ast.FnDecl) BuildError!?*const StructInfo {
     const rt = fd.returnType() orelse return null;
     return structOfType(b, rt.type_());
+}
+
+/// The enum a type-expr names directly, if any (`c: Color`). Lets a callee
+/// give an *immediate* (all-unit) enum param the right ABI — an i64 tag —
+/// since `structOfType` returns null for it (only boxed enums are records).
+fn enumOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const EnumInfo {
+    const te = te_opt orelse return null;
+    switch (te) {
+        .path => |pt| {
+            if (pt.hasGenericArgs()) return null;
+            const nm = try pt.name(b.a);
+            defer b.a.free(nm);
+            return b.enums.get(nm);
+        },
+        else => return null,
+    }
 }
 
 /// If `expr` is a call to a record-returning function (resolvable, bare
@@ -8882,6 +8906,44 @@ test "callee-body match: enum params + value if-chain tails" {
         \\}
         \\
     )) == null);
+}
+
+test "callee-body match: immediate (all-unit) enum param — i64 tag ABI" {
+    // An all-unit enum is an i64 tag, not a boxed record. As a callee param it
+    // must still register so `match c { … }` resolves bare variants — in both
+    // the value-`let` and statement-return forms.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\enum Color { Red, Green, Blue }
+        \\fn rank(c: Color) -> i64 {
+        \\    let r = match c {
+        \\        Red -> 1,
+        \\        Green -> 2,
+        \\        Blue -> 3,
+        \\    }
+        \\    r
+        \\}
+        \\fn tag(c: Color) -> i64 {
+        \\    match c {
+        \\        Red -> 10,
+        \\        Green -> 20,
+        \\        Blue -> 30,
+        \\    }
+        \\}
+        \\fn main {
+        \\    env.out(rank(Color.Green))
+        \\    env.out(tag(Color.Blue))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Both callees build (the tag rides as an i64); before the fix an
+    // immediate-enum param made the whole function unsupported.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn rank -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn tag -> i64") != null);
 }
 
 test "void procedures: env.out / while / if-else / value let / void call from main" {
