@@ -1032,8 +1032,14 @@ verified, honest diagnostics throughout.
       Enum (unit + payload), Option, and integer-literal scrutinees
       verified; non-exhaustive still rejected. wasm64+wasm32:
       `describe`/`report`/`grade` → `empty 48 rect 15 42 none zero one
-      many`; 403 unit / 81 CLI / 24-of-51 / roundtrips green) → next:
-      the `From` conversion on `try`.
+      many`; 403 unit / 81 CLI / 24-of-51 / roundtrips green) → TYP305
+      (`?` postfix) wired (landed: postfix `?` in expression position
+      — the error sigil q64 deliberately omits in favour of the `try`
+      keyword — now parses to a `QUESTION_EXPR` node and the check pass
+      emits TYP305 pointing at the `?`; `?.` Option-chaining and the
+      `T?` type sugar are untouched. Catalog entry + 2 unit cases +
+      conformance `errors/question-on-result.q` flips → **25/51**) →
+      next: the `From` conversion on `try`.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
@@ -1126,7 +1132,7 @@ verified, honest diagnostics throughout.
             statement-position try, none in `main` — main isn't
             Result-returning); E-type equality unchecked (generic args
             are raw text; same boxed shape regardless); TYP305 (`?` on
-            Result) still unwired.
+            Result) still unwired. (TYP305 NOW WIRED — see the rung below.)
       - [x] **`T?` sugar.** `-> i64?` ≡ `-> Option<i64>` (errors.md):
             the optional TypeExpr (already parsed structured) maps to
             Option's boxed shape in `structOfType`/`enumOfRet` (emit)

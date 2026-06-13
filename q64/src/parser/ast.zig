@@ -1472,6 +1472,7 @@ pub const Expr = union(enum) {
     method: MethodExpr,
     tuple_field: TupleFieldExpr,
     question_dot: QuestionDotExpr,
+    question: QuestionExpr,
     tuple: TupleExpr,
     paren: ParenExpr,
     array: ArrayExpr,
@@ -1496,6 +1497,7 @@ pub const Expr = union(enum) {
             .METHOD_EXPR => .{ .method = .{ .cst = node } },
             .TUPLE_FIELD_EXPR => .{ .tuple_field = .{ .cst = node } },
             .QUESTION_DOT_EXPR => .{ .question_dot = .{ .cst = node } },
+            .QUESTION_EXPR => .{ .question = .{ .cst = node } },
             .TUPLE_EXPR => .{ .tuple = .{ .cst = node } },
             .PAREN_EXPR => .{ .paren = .{ .cst = node } },
             .ARRAY_EXPR => .{ .array = .{ .cst = node } },
@@ -1791,6 +1793,16 @@ pub const QuestionDotExpr = struct {
     }
     pub fn field(self: QuestionDotExpr) ?cst.Token {
         return lastNonTriviaToken(self.cst);
+    }
+};
+
+/// `QuestionExpr := Expr "?"` — the postfix error sigil q64 omits (it uses
+/// the `try` keyword). Parsed only so the check pass can flag it (TYP305).
+pub const QuestionExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn operand(self: QuestionExpr) ?Expr {
+        return firstChildExpr(self.cst);
     }
 };
 

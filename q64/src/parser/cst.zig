@@ -326,6 +326,7 @@ pub const SyntaxKind = enum {
     FIELD_EXPR, // expr.name
     TUPLE_FIELD_EXPR, // expr.0
     QUESTION_DOT_EXPR, // expr?.name (Option chain)
+    QUESTION_EXPR, // expr? — the rejected error sigil (q64 uses `try`); TYP305
     METHOD_EXPR, // expr.name(args)
     PATH_EXPR,
     LITERAL_EXPR,

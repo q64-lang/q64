@@ -392,6 +392,15 @@ const Checker = struct {
                 }
                 return .unknown;
             },
+            .question => |qe| {
+                // TYP305: postfix `?` is not q64's error operator — the
+                // language uses the `try` keyword instead (spec/errors.md
+                // §"why a keyword not a sigil"). Always an error wherever it
+                // appears in expression position.
+                _ = try c.typeOfOpt(qe.operand());
+                try c.diags.append(c.gpa, .{ .code = "TYP305", .offset = lastTokenOffset(qe.cst) });
+                return .unknown;
+            },
             else => return .unknown,
         }
     }
@@ -965,6 +974,19 @@ fn firstTokenOffset(node: *const cst.Node) u32 {
     return 0;
 }
 
+/// Offset of the node's last non-trivia token (e.g. the `?` of a
+/// QUESTION_EXPR, so the diagnostic points at the offending sigil).
+fn lastTokenOffset(node: *const cst.Node) u32 {
+    var off: u32 = firstTokenOffset(node);
+    for (node.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) {
+            off = t.offset;
+        },
+        .node => |n| off = lastTokenOffset(n),
+    };
+    return off;
+}
+
 /// Check every function body in `sf`. `fitreg` (when supplied) powers
 /// the TYP200 generic-bound check. Caller frees the returned slice.
 pub fn checkFile(
@@ -1445,6 +1467,31 @@ test "check: TYP300 — `try` outside a Result-returning function" {
         \\}
         \\fn main {
         \\    let r = read_size("f")
+        \\}
+        \\
+    , &.{});
+}
+
+test "check: TYP305 — postfix `?` is rejected (q64 uses `try`)" {
+    // `expr?` in a let initializer fires regardless of the return type —
+    // even in a Result-returning function, where `try` would be valid.
+    try expectCodes(
+        \\fn read_size(path: str) -> Result<i64, IoError> {
+        \\    let bytes = env.fs.read(path)?
+        \\    Ok(bytes)
+        \\}
+        \\fn main {
+        \\    let r = read_size("f")
+        \\}
+        \\
+    , &.{"TYP305"});
+    // `T?` in type position is the Option sugar, not the `?` operator — silent.
+    try expectCodes(
+        \\fn find(n: i64) -> i64? {
+        \\    Some(n)
+        \\}
+        \\fn main {
+        \\    let o = find(1)
         \\}
         \\
     , &.{});

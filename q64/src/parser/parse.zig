@@ -1947,6 +1947,16 @@ const Parser = struct {
                     }
                     base = try cst.makeNode(self.arena, .QUESTION_DOT_EXPR, children.items);
                 },
+                .QUESTION => {
+                    // Postfix `?` in expression position — the error sigil q64
+                    // deliberately omits (it uses the `try` keyword instead, see
+                    // errors.md). Captured as a node so the check pass can emit
+                    // TYP305 with a precise offset rather than dropping it.
+                    var children: std.ArrayList(cst.Element) = .empty;
+                    try children.append(self.arena, .{ .node = base });
+                    try children.append(self.arena, .{ .token = self.advance() }); // ?
+                    base = try cst.makeNode(self.arena, .QUESTION_EXPR, children.items);
+                },
                 else => break,
             }
         }
