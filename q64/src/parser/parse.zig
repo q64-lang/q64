@@ -1870,7 +1870,23 @@ const Parser = struct {
                 var children: std.ArrayList(cst.Element) = .empty;
                 try children.append(self.arena, .{ .token = self.advance() });
                 if (self.peek() == .NUM_SUFFIX) try children.append(self.arena, .{ .token = self.advance() });
-                return try cst.makeNode(self.arena, .LITERAL_PATTERN, children.items);
+                const lo = try cst.makeNode(self.arena, .LITERAL_PATTERN, children.items);
+                // A range pattern `lo..hi` / `lo..=hi`: the literal is the low
+                // bound; a `..`/`..=` then a high-bound literal follows.
+                const save = self.pos;
+                var lead: std.ArrayList(cst.Element) = .empty;
+                try self.eatTrivia(&lead);
+                if (self.peek() == .DOT_DOT or self.peek() == .DOT_DOT_EQ) {
+                    var rc: std.ArrayList(cst.Element) = .empty;
+                    try rc.append(self.arena, .{ .node = lo });
+                    try rc.appendSlice(self.arena, lead.items);
+                    try rc.append(self.arena, .{ .token = self.advance() }); // .. / ..=
+                    try self.eatTrivia(&rc);
+                    try rc.append(self.arena, .{ .node = try self.parsePattern() }); // high bound
+                    return try cst.makeNode(self.arena, .RANGE_PATTERN, rc.items);
+                }
+                self.pos = save;
+                return lo;
             },
             .STR_PLAIN, .STR_RAW, .KW_TRUE, .KW_FALSE => {
                 var children: std.ArrayList(cst.Element) = .empty;
@@ -3024,6 +3040,8 @@ test "pattern kinds in match arms" {
     try testing.expectEqual(cst.SyntaxKind.TUPLE_STRUCT_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        Ok(v) -> 0,\n    }\n}\n"));
     try testing.expectEqual(cst.SyntaxKind.ENUM_VARIANT_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        McpError.Unsupported -> 0,\n    }\n}\n"));
     try testing.expectEqual(cst.SyntaxKind.RECORD_STRUCT_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        Tool { name } -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.RANGE_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        0..5 -> 0,\n    }\n}\n"));
+    try testing.expectEqual(cst.SyntaxKind.RANGE_PATTERN, try firstArmPatternKind("fn m {\n    match x {\n        0..=5 -> 0,\n    }\n}\n"));
 }
 
 test "pattern losslessness in let / for / match / if-let" {
@@ -3034,6 +3052,7 @@ test "pattern losslessness in let / for / match / if-let" {
         "fn m {\n    if let Some(n) = opt {\n        use(n)\n    }\n}\n",
         "fn m {\n    match r {\n        Ok(v) -> v,\n        Err(e) -> panic e,\n        _ -> 0,\n    }\n}\n",
         "fn m {\n    match n {\n        x if x > 10 -> 1,\n        0 | 1 -> 2,\n        _ -> 0,\n    }\n}\n",
+        "fn m {\n    match n {\n        0..60 -> 0,\n        60..=100 if ok -> 1,\n        _ -> 9,\n    }\n}\n",
     };
     for (sources) |src| {
         const r = try parse(testing.allocator, src, "p.q");

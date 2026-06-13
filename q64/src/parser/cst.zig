@@ -312,6 +312,7 @@ pub const SyntaxKind = enum {
     FIELD_PATTERN,
     ENUM_VARIANT_PATTERN,
     OR_PATTERN,
+    RANGE_PATTERN,
     MATCH_GUARD,
 
     // Expressions

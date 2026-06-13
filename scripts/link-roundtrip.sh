@@ -2056,6 +2056,43 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> match range patterns: lo..hi / lo..=hi -> … (exclusive vs inclusive bounds)"
+rng_app="$tmp/range.q"
+cat > "$rng_app" <<'Q64'
+fn grade(n: i64) -> i64 {
+    let g = match n {
+        0..60 -> 0,
+        60..=79 -> 1,
+        80..=100 -> 2,
+        _ -> 9,
+    }
+    g
+}
+fn main {
+    env.out(grade(45))
+    env.out(grade(60))
+    env.out(grade(80))
+    env.out(grade(100))
+    env.out(grade(200))
+    var n = 7
+    var allow = true
+    match n {
+        1..5 -> env.out("low"),
+        5..=10 if allow -> env.out("mid-ok"),
+        5..=10 -> env.out("mid"),
+        _ -> env.out("hi"),
+    }
+}
+Q64
+rng_expected=$'0\n1\n2\n2\n9\nmid-ok'
+"$Q64_BIN" emit "$rng_app" "$tmp/range.wasm"
+rng_out="$("$HOST_BIN" "$tmp/range.wasm")"
+[[ "$rng_out" == "$rng_expected" ]] || { echo "FAIL: range patterns (got: $rng_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$rng_app" "$tmp/range32.wasm" --addr wasm32
+rng32_out="$("$HOST_BIN" "$tmp/range32.wasm")"
+[[ "$rng32_out" == "$rng_expected" ]] || { echo "FAIL: range patterns wasm32 (got: $rng32_out)" >&2; exit 1; }
+echo "    ok: range patterns -> 0/1/2/2/9 / mid-ok (wasm64 + wasm32; exclusive, inclusive, +guard)"
+
 echo "==> match guards: P if cond -> … (scalar binder, literal + enum arms; fall-through)"
 grd_app="$tmp/guard.q"
 cat > "$grd_app" <<'Q64'

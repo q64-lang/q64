@@ -145,10 +145,19 @@ needs the platform audit, so it's the highest-leverage near-term work.
           arms — the prelude loads run inside the body, after the guard). Runs
           wasm64 + wasm32 (roundtrip `400/51/0 / one-plain / go-fast`). Also
           fixed a pre-existing or-pattern losslessness bug (trivia before the
-          first `|` was dropped). **Next:** range patterns (`1..5 ->`),
-          nested/record destructuring. (Orthogonal pre-existing gap: a callee
-          whose whole body is a value `match` — only `let r = match …` works in
-          callees today.)
+          first `|` was dropped).
+    - [x] **Range patterns** (`1..5 ->`, `10..=20 ->`): a literal low bound
+          followed by `..`/`..=` and a high bound parses into a `RANGE_PATTERN`
+          (`ast.Pattern.rangeParts()` → `{lo, hi, inclusive}`). On a scalar
+          (non-enum) match, `buildRangePatternCond` lowers it to the bounded
+          test `(scrut >= lo) and (scrut <op> hi)` (`<` for `..`, `<=` for
+          `..=`) read from the scrutinee local, ANDed with a user guard if
+          present; it rides the `any`-arm machinery (no tag), so it needs an
+          unguarded `_` fallback. v0: integer bounds only. Runs wasm64 + wasm32
+          (roundtrip `0/1/2/2/9 / mid-ok`). **Next:** nested/record
+          destructuring. (Orthogonal pre-existing gap: a callee whose whole
+          body is a value `match` — only `let r = match …` works in callees
+          today.)
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the

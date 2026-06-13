@@ -1623,6 +1623,24 @@ pub const Pattern = struct {
         return .{ .children = self.cst.children };
     }
 
+    /// The low/high bound patterns of a `RANGE_PATTERN` (`lo..hi` /
+    /// `lo..=hi`) plus whether the high bound is inclusive (`..=`). `null`
+    /// for any non-range pattern.
+    pub fn rangeParts(self: Pattern) ?struct { lo: Pattern, hi: Pattern, inclusive: bool } {
+        if (self.cst.kind != .RANGE_PATTERN) return null;
+        var it = PatternIter{ .children = self.cst.children };
+        const lo = it.next() orelse return null;
+        const hi = it.next() orelse return null;
+        var inclusive = false;
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .DOT_DOT_EQ) {
+                inclusive = true;
+            },
+            .node => {},
+        };
+        return .{ .lo = lo, .hi = hi, .inclusive = inclusive };
+    }
+
     pub fn isPatternKind(k: cst.SyntaxKind) bool {
         return switch (k) {
             .WILD_PATTERN,
@@ -1633,6 +1651,7 @@ pub const Pattern = struct {
             .TUPLE_STRUCT_PATTERN,
             .RECORD_STRUCT_PATTERN,
             .OR_PATTERN,
+            .RANGE_PATTERN,
             => true,
             else => false,
         };
@@ -2684,6 +2703,35 @@ test "Pattern.bindingName: ident binds, wildcard does not" {
     // A non-pattern node doesn't cast.
     const not_pat = try cst.makeNode(a, .BLOCK, &.{});
     try testing.expect(Pattern.cast(not_pat) == null);
+}
+
+test "Pattern.rangeParts: low/high bounds and `..=` inclusivity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const lo = try cst.makeNode(a, .LITERAL_PATTERN, &[_]cst.Element{cst.makeToken(.INT_LIT, "0", 0)});
+    const hi = try cst.makeNode(a, .LITERAL_PATTERN, &[_]cst.Element{cst.makeToken(.INT_LIT, "5", 4)});
+    const excl = try cst.makeNode(a, .RANGE_PATTERN, &[_]cst.Element{
+        .{ .node = lo },
+        cst.makeToken(.DOT_DOT, "..", 1),
+        .{ .node = hi },
+    });
+    const ep = Pattern.cast(excl).?.rangeParts().?;
+    try testing.expectEqualStrings("0", ep.lo.cst.children[0].token.text);
+    try testing.expectEqualStrings("5", ep.hi.cst.children[0].token.text);
+    try testing.expect(!ep.inclusive);
+
+    const incl = try cst.makeNode(a, .RANGE_PATTERN, &[_]cst.Element{
+        .{ .node = lo },
+        cst.makeToken(.DOT_DOT_EQ, "..=", 1),
+        .{ .node = hi },
+    });
+    try testing.expect(Pattern.cast(incl).?.rangeParts().?.inclusive);
+
+    // A non-range pattern reports null.
+    const lit = try cst.makeNode(a, .LITERAL_PATTERN, &[_]cst.Element{cst.makeToken(.INT_LIT, "0", 0)});
+    try testing.expect(Pattern.cast(lit).?.rangeParts() == null);
 }
 
 test "MatchArm.guard: present when `if cond` precedes the arrow, else null" {

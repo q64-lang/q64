@@ -740,6 +740,14 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
             }
             continue;
         }
+        // A scalar range-pattern arm (`lo..hi -> …`): a value-range condition,
+        // never a tag — like a binder arm, it requires an unguarded fallback.
+        if (info_opt == null and pat.kind() == .RANGE_PATTERN) {
+            const cond = try buildRangePatternCond(b, scope, pat, arm, s_idx);
+            const body = try buildMatchArmBody(b, arm, scope, rt);
+            try arms.append(b.a, .{ .tag = 0, .body = body, .guard = cond, .any = true });
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the body.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -1040,6 +1048,43 @@ fn foldMatchChain(b: *Builder, s_idx: u32, boxed: bool, arms: []const LoweredArm
     if (chain) |c| try out.append(b.a, c);
 }
 
+/// A scalar range-pattern arm (`lo..hi` / `lo..=hi`, optionally `if g`): the
+/// match condition `(scrut >= lo) and (scrut <op> hi)` read from the scrutinee
+/// local, with the user guard ANDed on if present. v0: integer bounds only.
+fn buildRangePatternCond(b: *Builder, scope: *Scope, pat: ast.Pattern, arm: ast.MatchArm, s_idx: u32) BuildError!*hir.Expr {
+    const parts = pat.rangeParts() orelse return error.Unsupported;
+    const lo_tok = firstNonTriviaToken(parts.lo.cst) orelse return error.Unsupported;
+    const hi_tok = firstNonTriviaToken(parts.hi.cst) orelse return error.Unsupported;
+    if (lo_tok.kind != .INT_LIT or hi_tok.kind != .INT_LIT) return error.Unsupported;
+    const lo = consteval.parseIntLit(lo_tok.text) catch return error.Unsupported;
+    const hi = consteval.parseIntLit(hi_tok.text) catch return error.Unsupported;
+    if (hi < lo) return error.Unsupported; // an empty range is a bug, not a feature
+
+    const bound = struct {
+        fn cmp(bb: *Builder, idx: u32, kind: ops.BinKind, val: i64) BuildError!*hir.Expr {
+            const l = try bb.a.create(hir.Expr);
+            l.* = .{ .local = .{ .idx = idx, .ty = .i64 } };
+            const r = try bb.a.create(hir.Expr);
+            r.* = .{ .int_const = val };
+            const c = try bb.a.create(hir.Expr);
+            c.* = .{ .bin = .{ .kind = kind, .lhs = l, .rhs = r } };
+            return c;
+        }
+    };
+    const ge = try bound.cmp(b, s_idx, .ge, lo);
+    const hicmp = try bound.cmp(b, s_idx, if (parts.inclusive) .le else .lt, hi);
+    var cond = try b.a.create(hir.Expr);
+    cond.* = .{ .logical = .{ .op = .and_, .lhs = ge, .rhs = hicmp } };
+    if (arm.guard()) |gexpr| {
+        if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+        const g = try buildIntExpr(b, gexpr, scope);
+        const c = try b.a.create(hir.Expr);
+        c.* = .{ .logical = .{ .op = .and_, .lhs = cond, .rhs = g } };
+        cond = c;
+    }
+    return cond;
+}
+
 /// The scalar a value `match` yields: the first arm's expression type
 /// (every arm is checked against it during the build). Scalars only —
 /// str/record arms are later rungs.
@@ -1126,6 +1171,18 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
                 if (default != null) return error.Unsupported;
                 default = body;
             }
+            continue;
+        }
+        if (info_opt == null and pat.kind() == .RANGE_PATTERN) {
+            const e = arm.expression() orelse return error.Unsupported;
+            if (scalarBindTy(try exprScalar(b, e, scope)) != ty) return error.Unsupported;
+            const value = try buildIntExpr(b, e, scope);
+            const asn = try b.a.create(hir.Stmt);
+            asn.* = .{ .assign = .{ .idx = target_idx, .value = value } };
+            const body = try b.a.create(hir.Stmt);
+            body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{asn}) };
+            const cond = try buildRangePatternCond(b, scope, pat, arm, s_idx);
+            try arms.append(b.a, .{ .tag = 0, .body = body, .guard = cond, .any = true });
             continue;
         }
         // Pattern first: payload bindings must be in scope for the value.
@@ -1905,6 +1962,12 @@ fn buildVoidMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, out: *std.Array
                 if (default != null) return error.Unsupported;
                 default = body;
             }
+            continue;
+        }
+        if (info_opt == null and pat.kind() == .RANGE_PATTERN) {
+            const cond = try buildRangePatternCond(b, scope, pat, arm, s_idx);
+            const body = try buildVoidMatchArmBody(b, arm, scope);
+            try arms.append(b.a, .{ .tag = 0, .body = body, .guard = cond, .any = true });
             continue;
         }
         const rp = if (info_opt) |info|
@@ -5707,6 +5770,21 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
             }
             continue;
         }
+        if (info_opt == null and pat.kind() == .RANGE_PATTERN) {
+            const e = arm.expression() orelse return error.Unsupported;
+            const sc = scalarBindTy(try exprScalar(b, e, scope));
+            if (vty) |t| {
+                if (sc != t) return error.Unsupported;
+            } else vty = sc;
+            const value = try buildIntExpr(b, e, scope);
+            const vstmt = try b.a.create(hir.Stmt);
+            vstmt.* = .{ .expr = value };
+            const body = try b.a.create(hir.Stmt);
+            body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+            const cond = try buildRangePatternCond(b, scope, pat, arm, s_idx);
+            try arms.append(b.a, .{ .tag = 0, .body = body, .guard = cond, .any = true });
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the value.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -6785,6 +6863,30 @@ test "match guards: a guarded arm never satisfies exhaustiveness on its own" {
     defer tr.deinit();
     const res = try buildFromSource(testing.allocator,
         "enum Light { Red, Yellow, Green }\nfn main {\n var hurry = true\n var l = Light.Yellow\n match l {\n Yellow if hurry -> env.out(\"a\"),\n Red -> env.out(\"r\"),\n Green -> env.out(\"g\"),\n }\n}\n", tr.resolver());
+    try testing.expect(res == null);
+}
+
+test "match range patterns: lo..hi lowers to a bounded value test (ge + lt/le)" {
+    // `0..60` is exclusive (ge + lt); `60..=100` is inclusive (ge + le). Both
+    // need an unguarded `_` fallback — a range never satisfies exhaustiveness.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var n = 70\n let g = match n { 0..60 -> 0, 60..=100 -> 1, _ -> 9 }\n env.out(g)\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The bounded test is two comparisons joined by a logical and.
+    try testing.expect(std.mem.indexOf(u8, dump, "and_") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
+}
+
+test "match range patterns: a range arm alone is not exhaustive" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const res = try buildFromSource(testing.allocator,
+        "fn main {\n var n = 1\n let g = match n { 0..10 -> 0 }\n env.out(g)\n}\n", tr.resolver());
     try testing.expect(res == null);
 }
 
