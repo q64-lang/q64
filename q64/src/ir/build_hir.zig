@@ -4200,12 +4200,12 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
     return true;
 }
 
-/// `let d = xs.map(|x| body)` (the v0 Vec floor): build a fresh vec and,
-/// for each element of `xs`, push the lambda body evaluated with the element
-/// bound to the lambda parameter. Desugars to `var d = Vec.new(); for x in xs
-/// { d.push(body) }` — the loop variable IS the lambda parameter, so the body
-/// resolves it by ordinary scoping (no capture machinery needed). Returns
-/// false when the initializer isn't `<vec>.map(<lambda>)`. i64 elements (v0).
+/// `let d = xs.map(|x| body)` / `xs.filter(|x| pred)` (the v0 Vec floor):
+/// build a fresh vec. **map** pushes the body (i64) per element; **filter**
+/// pushes the element when the predicate (bool) holds. Desugars to `var d =
+/// Vec.new(); for x in xs { … }` — the loop variable IS the lambda parameter,
+/// so the body resolves it (and any captured local) by ordinary scoping.
+/// Returns false when the initializer isn't `<vec>.map|filter(<lambda>)`.
 fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
     const cc = switch (init_expr) {
         .call => |x| x,
@@ -4215,7 +4215,9 @@ fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool,
     defer b.a.free(cname);
     const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
     const src = cname[0..dot];
-    if (!std.mem.eql(u8, cname[dot + 1 ..], "map")) return false;
+    const method = cname[dot + 1 ..];
+    const is_filter = std.mem.eql(u8, method, "filter");
+    if (!is_filter and !std.mem.eql(u8, method, "map")) return false;
     if (!scope.vecs.contains(src)) return false;
 
     var ait = cc.args();
@@ -4263,13 +4265,30 @@ fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool,
         setx.* = .{ .assign = .{ .idx = x_idx, .value = get } };
         try items.append(b.a, setx);
     }
-    { // d.push(<body, reads x>)
-        const val = try buildIntExpr(b, body, scope);
+    { // d.push(<body>)  /  if <pred> { d.push(x) }
         const dref = try b.a.create(hir.Expr);
         dref.* = .{ .local = .{ .idx = d_idx, .ty = .ptr } };
-        const push = try b.a.create(hir.Stmt);
-        push.* = .{ .vec_push = .{ .vec = dref, .value = val } };
-        try items.append(b.a, push);
+        if (is_filter) {
+            // filter: push the element when the predicate holds.
+            const xref = try b.a.create(hir.Expr);
+            xref.* = .{ .local = .{ .idx = x_idx, .ty = .i64 } };
+            const push = try b.a.create(hir.Stmt);
+            push.* = .{ .vec_push = .{ .vec = dref, .value = xref } };
+            const then_items = try b.a.alloc(*hir.Stmt, 1);
+            then_items[0] = push;
+            const then_blk = try b.a.create(hir.Stmt);
+            then_blk.* = .{ .block = then_items };
+            const cond = try buildIntExpr(b, body, scope);
+            const iff = try b.a.create(hir.Stmt);
+            iff.* = .{ .if_ = .{ .cond = cond, .then_ = then_blk, .else_ = null } };
+            try items.append(b.a, iff);
+        } else {
+            // map: push the transformed value.
+            const val = try buildIntExpr(b, body, scope);
+            const push = try b.a.create(hir.Stmt);
+            push.* = .{ .vec_push = .{ .vec = dref, .value = val } };
+            try items.append(b.a, push);
+        }
     }
     { // i = i + 1
         const iref = try b.a.create(hir.Expr);
@@ -6305,6 +6324,21 @@ test "Vec.map: a closure-mapped vec (vec_new + per-element push)" {
     try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
+}
+
+test "Vec.filter: a predicate-filtered vec (vec_new + guarded push)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var v = Vec.from([1, 2, 3, 4])\n let d = v.filter(|x| x > 2)\n env.out(d[0])\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The element is pushed under an `if` guarding the predicate.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
 }
 
 test "Vec parameter: a callee iterates a Vec passed by the caller" {
