@@ -1146,14 +1146,23 @@ verified, honest diagnostics throughout.
       non-`pre` methods stay silent. Catalog entry + STR subsystem
       mapping + 1 check case (3 asserts); conformance `streams/pre-on-event`
       flips → **38/51**; Event-typed `let` bindings are a follow-on) →
-      next: the `From` conversion on `try`, EFF110 (assert/operation
-      violations in the body), and the remaining gaps. Several remaining
-      tests need bigger subsystems — dataflow types (STR020/STR060),
-      actor/channel model (CONC0xx), generic inference (TYP102), optional
-      flow-narrowing (TYP047), qube-root resolution (NAM002). Note:
-      structured leading-annotation parsing (attaching `@managed`/`@stage`
-      to the item) would let REG021 + the stage checks read them directly
-      rather than scanning sibling tokens.
+      ENV055 wired (landed: a `with_capabilities(use: { field: … })` key
+      that isn't a field of `Env` (env.md §"Overriding the ambient
+      binding"; the 14-field set: out/err/exit/args/envvars/time/random/
+      net/fs/kv/audio/midi/ai/ui). The construct still parses raw, so
+      `checkWithCapabilities` scans the flat token stream — after
+      `with_capabilities (`, find the `use : {` map, then flag each
+      top-level `IDENT :` key not on `Env` (depth tracking skips a value's
+      own nested braces / `:` keys). Catalog entry + 1 check case (2
+      asserts, incl. the nested-value non-fire); conformance
+      `env/use-field-not-on-env` flips → **39/51**) → next: the `From`
+      conversion on `try`, EFF110 (assert/operation violations in the
+      body), and the remaining gaps. The rest need bigger subsystems —
+      structured `graph`/`scope`/`actor` parsing then dataflow/actor
+      types (STR020/STR060/CONC0xx), generic inference (TYP102), optional
+      flow-narrowing (TYP047), face/dyn-safety (TYP306/not-dyn-safe/
+      no-fit-for-bound), region escape analysis (REG040), qube-root
+      resolution (NAM002), and the reverted PAR040 heuristic.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

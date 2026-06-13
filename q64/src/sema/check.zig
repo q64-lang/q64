@@ -1249,6 +1249,86 @@ fn checkTransferVerbs(
     };
 }
 
+/// `Env`'s sub-capability fields (env.md §"`Env` and its fields"). A
+/// `with_capabilities(use: { … })` key outside this set is ENV055.
+const env_fields = [_][]const u8{
+    "out",   "err",  "exit",  "args", "envvars", "time", "random",
+    "net",   "fs",   "kv",    "audio", "midi",   "ai",   "ui",
+};
+
+fn isEnvField(name: []const u8) bool {
+    for (env_fields) |f| {
+        if (std.mem.eql(u8, f, name)) return true;
+    }
+    return false;
+}
+
+/// Append every non-trivia leaf token of the tree to `out`, in source order.
+fn collectTokens(gpa: std.mem.Allocator, node: *const cst.Node, out: *std.ArrayList(cst.Token)) std.mem.Allocator.Error!void {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (!t.kind.isTrivia()) try out.append(gpa, t),
+        .node => |n| try collectTokens(gpa, n, out),
+    };
+}
+
+/// **ENV055** — a `with_capabilities(use: { field: … })` key that isn't a
+/// field of `Env` (env.md §"Overriding the ambient binding"). The
+/// construct parses raw in v0, so this scans the flat token stream:
+/// after `with_capabilities (`, find the `use : {` map and check each
+/// top-level `IDENT :` key against the Env field set.
+fn checkWithCapabilities(gpa: std.mem.Allocator, root: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, root, &toks);
+    const ts = toks.items;
+
+    var i: usize = 0;
+    while (i < ts.len) : (i += 1) {
+        if (ts[i].kind != .KW_WITH_CAPABILITIES) continue;
+        if (i + 1 >= ts.len or ts[i + 1].kind != .L_PAREN) continue;
+
+        // Find the `use : {` map within the `( … )` argument group.
+        var j = i + 1;
+        var paren: i32 = 0;
+        var map_open: ?usize = null;
+        while (j < ts.len) : (j += 1) {
+            switch (ts[j].kind) {
+                .L_PAREN => paren += 1,
+                .R_PAREN => {
+                    paren -= 1;
+                    if (paren == 0) break;
+                },
+                .KW_USE => if (paren == 1 and j + 2 < ts.len and
+                    ts[j + 1].kind == .COLON and ts[j + 2].kind == .L_BRACE)
+                {
+                    map_open = j + 2;
+                    break;
+                },
+                else => {},
+            }
+        }
+        const open = map_open orelse continue;
+
+        // Walk the use-map `{ … }`. A key is an `IDENT :` at the map's
+        // immediate level (depth 1); nested braces/parens in a value are
+        // skipped via depth tracking.
+        var depth: i32 = 1;
+        var m = open + 1;
+        while (m < ts.len and depth > 0) : (m += 1) {
+            switch (ts[m].kind) {
+                .L_BRACE, .L_PAREN, .L_BRACK => depth += 1,
+                .R_BRACE, .R_PAREN, .R_BRACK => depth -= 1,
+                .IDENT => if (depth == 1 and m + 1 < ts.len and ts[m + 1].kind == .COLON) {
+                    if (!isEnvField(ts[m].text)) {
+                        try diags.append(gpa, .{ .code = "ENV055", .offset = ts[m].offset });
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+}
+
 /// True when a parameter's declared type is a `PathType` headed by
 /// `Event` (`Event<Point>`, `Event<T>`), i.e. a pointwise event stream.
 fn paramTypeIsEvent(gpa: std.mem.Allocator, p: ast.Param) bool {
@@ -1588,6 +1668,8 @@ pub fn checkFile(
     try checkTransferVerbs(gpa, sf.cst, &diags);
     // REG020: linear `ref` fields in a `@managed` struct.
     try checkManagedStructs(gpa, sf.cst, &diags);
+    // ENV055: `with_capabilities(use: {…})` keys not on `Env`.
+    try checkWithCapabilities(gpa, sf.cst, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2109,6 +2191,28 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: ENV055 — `with_capabilities(use:)` field not on Env" {
+    // `quack` is not an Env field.
+    try expectCodes(
+        \\fn main {
+        \\    with_capabilities(use: { quack: MockQuack.new() }) {
+        \\        env.out("hi")
+        \\    }
+        \\}
+        \\
+    , &.{"ENV055"});
+    // A real Env field (`net`) is silent; a value with nested braces /
+    // its own `:` keys doesn't false-fire.
+    try expectCodes(
+        \\fn main {
+        \\    with_capabilities(use: { net: MockNet { region: r } }) {
+        \\        env.out("hi")
+        \\    }
+        \\}
+        \\
+    , &.{});
 }
 
 test "check: STR051 — `pre()` on an Event parameter" {
