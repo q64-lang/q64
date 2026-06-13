@@ -1977,6 +1977,114 @@ fn checkTypedPrefixes(
 /// `GENERIC_PARAMS` token span, splitting on top-level commas and detecting a
 /// top-level `=` per parameter (nested `<>`/`[]`/`()` in a default value are
 /// skipped via depth tracking). `const N: i64` after `T = i64` trips it.
+/// Collect every IDENT token text under `node` into `set` (borrowed
+/// keys, valid for the caller's scope).
+fn collectIdents(gpa: std.mem.Allocator, node: *const cst.Node, set: *std.StringHashMap(void)) std.mem.Allocator.Error!void {
+    for (node.children) |c| switch (c) {
+        .token => |t| if (t.kind == .IDENT) try set.put(t.text, {}),
+        .node => |n| try collectIdents(gpa, n, set),
+    };
+}
+
+/// True when a function has a non-`const`, non-defaulted generic type
+/// parameter that appears in **no** value-parameter type — so it can't be
+/// inferred from arguments and must be supplied explicitly (TYP102).
+fn fnNeedsExplicitGeneric(gpa: std.mem.Allocator, fd: ast.FnDecl) bool {
+    const gp = fd.genericParams() orelse return false;
+
+    var pidents = std.StringHashMap(void).init(gpa);
+    defer pidents.deinit();
+    if (fd.params()) |ps| collectIdents(gpa, ps.cst, &pidents) catch return false;
+
+    var depth: i32 = 0;
+    var first_angle = true;
+    var seg_const = false;
+    var seg_default = false;
+    var seg_name: ?[]const u8 = null;
+    var needs = false;
+
+    const process = struct {
+        fn run(c: bool, d: bool, nm: ?[]const u8, pid: *const std.StringHashMap(void)) bool {
+            if (nm) |n| return (!c and !d and !pid.contains(n));
+            return false;
+        }
+    }.run;
+
+    for (gp.children) |ch| {
+        const t = switch (ch) {
+            .token => |x| x,
+            .node => continue,
+        };
+        if (t.kind.isTrivia()) continue;
+        if (first_angle) {
+            first_angle = false;
+            continue;
+        }
+        switch (t.kind) {
+            .L_ANGLE, .L_PAREN, .L_BRACK => depth += 1,
+            .R_ANGLE, .R_PAREN, .R_BRACK => {
+                if (depth == 0) {
+                    if (process(seg_const, seg_default, seg_name, &pidents)) needs = true;
+                    break;
+                }
+                depth -= 1;
+            },
+            .SHR => depth -= 2,
+            .EQ => if (depth == 0) {
+                seg_default = true;
+            },
+            .KW_CONST => if (depth == 0) {
+                seg_const = true;
+            },
+            .COMMA => if (depth == 0) {
+                if (process(seg_const, seg_default, seg_name, &pidents)) needs = true;
+                seg_const = false;
+                seg_default = false;
+                seg_name = null;
+            },
+            .IDENT => if (depth == 0 and seg_name == null) {
+                seg_name = t.text;
+            },
+            else => {},
+        }
+    }
+    return needs;
+}
+
+/// **TYP102** — a generic call with a required generic argument that has
+/// no default and can't be inferred (spec/generics.md §"inference then
+/// default"). v0 fires on the unambiguous shape: an unannotated
+/// `let x = f()` whose callee `f` has an uninferrable required type
+/// parameter and the call supplies no explicit generic arguments.
+fn checkMissingGenericArg(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.ArrayList(Diag)) !void {
+    var needs = std.StringHashMap(void).init(gpa);
+    defer needs.deinit();
+    var it = sf.items();
+    while (it.next()) |item| {
+        if (item != .fn_decl) continue;
+        const fd = item.fn_decl;
+        const nm = fd.name() orelse continue;
+        if (fnNeedsExplicitGeneric(gpa, fd)) try needs.put(nm.text, {});
+    }
+    if (needs.count() == 0) return;
+
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, sf.cst, &toks);
+    const ts = toks.items;
+
+    var b: usize = 0;
+    while (b + 4 < ts.len) : (b += 1) {
+        if (ts[b].kind != .KW_LET and ts[b].kind != .KW_VAR) continue;
+        // `let IDENT = callee (` — unannotated (EQ, not COLON), no turbofish.
+        if (ts[b + 1].kind != .IDENT or ts[b + 2].kind != .EQ) continue;
+        if (ts[b + 3].kind != .IDENT or ts[b + 4].kind != .L_PAREN) continue;
+        if (needs.contains(ts[b + 3].text)) {
+            try diags.append(gpa, .{ .code = "TYP102", .offset = ts[b + 3].offset });
+        }
+    }
+}
+
 fn checkGenericDefaults(gpa: std.mem.Allocator, gp: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
     var depth: i32 = 0;
     var seen_default = false; // a previous parameter carried a default
@@ -2174,6 +2282,8 @@ pub fn checkFile(
     try checkDynSafety(gpa, sf, &diags);
     // STR020: a stage handed the wrong dataflow type (Signal vs Event).
     try checkDataflowTypes(gpa, sf, &diags);
+    // TYP102: a required generic argument that can't be inferred.
+    try checkMissingGenericArg(gpa, sf, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2695,6 +2805,27 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: TYP102 — missing required generic argument" {
+    // `T` has no default and appears in no value param → can't be inferred.
+    try expectCodes(
+        \\pub fn buffer<T, const N: i64 = 16>() -> [T; N] { make() }
+        \\fn main { let c = buffer() }
+        \\
+    , &.{"TYP102"});
+    // `T` appears in a value param → inferrable, no error.
+    try expectCodes(
+        \\fn id<T>(x: T) -> T { x }
+        \\fn main { let c = id(5) }
+        \\
+    , &.{});
+    // Explicit generic argument suppresses it.
+    try expectCodes(
+        \\pub fn buffer<T>() -> i64 { 0 }
+        \\fn main { let c = buffer<i64>() }
+        \\
+    , &.{});
 }
 
 test "check: TYP207 — non-dyn-safe face in dyn position" {

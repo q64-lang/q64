@@ -1221,8 +1221,21 @@ verified, honest diagnostics throughout.
       (`paramStreamKind`). Only stream↔stream mismatches fire, so the
       `graph-pipe-stages` golden (no annotated stream `let`s) stays clean.
       Catalog entry + 1 check case (2 asserts); conformance
-      `streams/dataflow-type-mismatch` flips → **46/51**) → next: the
-      remaining 5 — generic inference (TYP102), optional flow-narrowing
+      `streams/dataflow-type-mismatch` flips → **46/51**) → TYP102 wired
+      (landed: a required generic argument that has no default and can't
+      be inferred — spec/generics.md §"inference then default".
+      `fnNeedsExplicitGeneric` parses a fn's GENERIC_PARAMS span (segments
+      split on depth-0 commas, like checkGenericDefaults) for a
+      non-`const`, non-defaulted type param whose name appears in **no**
+      value-parameter type (`collectIdents` over the PARAMS subtree); such
+      a param can only come from an explicit arg. `checkMissingGenericArg`
+      then fires on the unambiguous shape — an unannotated `let x = f()`
+      whose callee is such a fn and the call supplies no explicit generic
+      args (EQ not COLON before the callee; `(` not `<` after it). Sound
+      by construction: annotated lets / turbofish / inferrable params /
+      other call positions are all skipped. Catalog entry + 1 check case
+      (3 asserts); conformance `generics/missing-generic-arg` flips →
+      **47/51**) → next: the remaining 4 — optional flow-narrowing
       (TYP047), region escape analysis (REG040), qube-root resolution
       (NAM002), and the reverted PAR040 heuristic. These need real
       analysis passes or structured parsing of currently-raw constructs.
