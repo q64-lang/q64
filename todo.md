@@ -154,10 +154,22 @@ needs the platform audit, so it's the highest-leverage near-term work.
           `..=`) read from the scrutinee local, ANDed with a user guard if
           present; it rides the `any`-arm machinery (no tag), so it needs an
           unguarded `_` fallback. v0: integer bounds only. Runs wasm64 + wasm32
-          (roundtrip `0/1/2/2/9 / mid-ok`). **Next:** nested/record
-          destructuring. (Orthogonal pre-existing gap: a callee whose whole
-          body is a value `match` — only `let r = match …` works in callees
-          today.)
+          (roundtrip `0/1/2/2/9 / mid-ok`).
+    - [x] **Literal sub-patterns in payload arms** (`Move(0, y) -> …`): a
+          literal in a tuple-struct/enum-variant slot adds a slot-equality
+          condition. `resolveArmPattern` reads the slot directly (no binding)
+          and ANDs `(slot == lit)` onto the arm via `ArmPattern.cond`; the
+          builders fold it together with any user guard (`andOpt`), and a
+          conditional payload arm never satisfies exhaustiveness on its own
+          (it falls through to the unconditional binder arm). `matchValueTy`
+          now aliases payload binders (`aliasPatternBinders`) so a first arm
+          whose value uses them type-probes. v0: integer slots. Runs wasm64 +
+          wasm32 (roundtrip `7 / 5 / 999`). **Next:** nested enum/record
+          sub-patterns (`Wrapper(Some(x))`, `Circle { r }` field destructuring).
+          (Orthogonal pre-existing gap: a callee `let r = match …` over a
+          *multi-slot or unit* payload enum — single-slot `Some(v)` works, but
+          `Move(x, y)` / all-unit enums in a callee value match are still
+          unsupported; main-position value + statement matches are fine.)
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the

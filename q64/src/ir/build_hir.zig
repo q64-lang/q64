@@ -716,7 +716,7 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
                     try resolveArmPattern(b, info, alt, scope, s_idx)
                 else
                     try resolveLiteralPattern(b, alt)) orelse return error.Unsupported; // no `_` in an or-pattern
-                if (ap.prelude.len != 0) return error.Unsupported; // payload binders: later
+                if (ap.prelude.len != 0 or ap.cond != null) return error.Unsupported; // payload binders/conditions: later
                 try arms.append(b.a, .{ .tag = ap.tag, .body = body });
                 if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
             }
@@ -768,10 +768,12 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
             if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
             guard = try buildIntExpr(b, gexpr, scope);
         }
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
+        // A literal sub-pattern condition (`Move(0, y)`) ANDs onto the guard.
+        const combined = try andOpt(b, ap.cond, guard);
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = combined });
         // Coverage only counts for enums (a literal can be any i64); a guarded
         // arm may fail, so it never contributes to exhaustiveness.
-        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        if (info_opt != null and combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Exhaustiveness (spec/grammar.md leaves the rules open; the v0
     // floor requires it structurally): every variant or a default for
@@ -823,9 +825,22 @@ fn declareMatchScrutinee(b: *Builder, scope: *Scope, scrut: ast.Expr, boxed: boo
     return s_idx;
 }
 
-/// A resolved (non-wildcard) arm pattern: the variant's tag plus the
-/// statements that bind its payload slots into fresh locals.
-const ArmPattern = struct { tag: i64, prelude: []const *hir.Stmt };
+/// A resolved (non-wildcard) arm pattern: the variant's tag, the statements
+/// that bind its payload slots into fresh locals, and an optional condition
+/// from literal sub-patterns (`Move(0, y)` — slot 0 must equal 0). The
+/// condition is ANDed onto the tag test like a guard, so a conditional
+/// payload arm never satisfies exhaustiveness on its own.
+const ArmPattern = struct { tag: i64, prelude: []const *hir.Stmt, cond: ?*hir.Expr = null };
+
+/// AND two optional conditions, collapsing the `null`s (an absent condition
+/// is "always true"). Returns `null` only when both are absent.
+fn andOpt(b: *Builder, lhs: ?*hir.Expr, rhs: ?*hir.Expr) BuildError!?*hir.Expr {
+    const l = lhs orelse return rhs;
+    const r = rhs orelse return l;
+    const c = try b.a.create(hir.Expr);
+    c.* = .{ .logical = .{ .op = .and_, .lhs = l, .rhs = r } };
+    return c;
+}
 
 /// A str-payload arm (`Ok(content)`): one ident sub-pattern binding a
 /// str — ptr/len locals loaded from the boxed value's cells 8 and 16.
@@ -928,6 +943,7 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
             }
             const arity = info.variants[tag].arity;
             var prelude: std.ArrayList(*hir.Stmt) = .empty;
+            var cond: ?*hir.Expr = null;
             var n: u32 = 0;
             for (pat.cst.children) |c| switch (c) {
                 .node => |sub| {
@@ -946,14 +962,31 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
                             st.* = .{ .let = .{ .idx = idx, .value = ld } };
                             try prelude.append(b.a, st);
                         },
-                        else => return error.Unsupported, // nested patterns: later
+                        .LITERAL_PATTERN => {
+                            // `Move(0, y)`: slot n must equal an integer literal.
+                            // Read the slot directly (no binding) and AND an
+                            // equality test onto the arm condition.
+                            const lit = firstNonTriviaToken(sp.cst) orelse return error.Unsupported;
+                            if (lit.kind != .INT_LIT) return error.Unsupported; // int slots only (v0)
+                            const v = consteval.parseIntLit(lit.text) catch return error.Unsupported;
+                            const base = try b.a.create(hir.Expr);
+                            base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+                            const ld = try b.a.create(hir.Expr);
+                            ld.* = .{ .field_get = .{ .base = base, .offset = 8 * (n + 1), .ty = .i64 } };
+                            const lv = try b.a.create(hir.Expr);
+                            lv.* = .{ .int_const = v };
+                            const eq = try b.a.create(hir.Expr);
+                            eq.* = .{ .bin = .{ .kind = .eq, .lhs = ld, .rhs = lv } };
+                            cond = try andOpt(b, cond, eq);
+                        },
+                        else => return error.Unsupported, // nested enum/record sub-patterns: later
                     }
                     n += 1;
                 },
                 .token => {},
             };
             if (n != arity) return error.Unsupported; // too few sub-patterns
-            return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a) };
+            return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a), .cond = cond };
         },
         else => return error.Unsupported, // literal patterns: later
     }
@@ -1088,19 +1121,33 @@ fn buildRangePatternCond(b: *Builder, scope: *Scope, pat: ast.Pattern, arm: ast.
 /// The scalar a value `match` yields: the first arm's expression type
 /// (every arm is checked against it during the build). Scalars only —
 /// str/record arms are later rungs.
+///
+/// Alias every ident binder a pattern introduces (`x`, or the sub-patterns of
+/// `Move(x, y)`) to a dummy i64 local, so a value-type probe over an arm whose
+/// value uses those binders resolves. Caller restores `scope.locals`.
+fn aliasPatternBinders(scope: *Scope, pat: ast.Pattern) BuildError!void {
+    switch (pat.kind()) {
+        .IDENT_PATTERN => if (pat.bindingName()) |nm| try aliasLocal(scope, nm.text, 0, .i64),
+        .TUPLE_STRUCT_PATTERN, .ENUM_VARIANT_PATTERN, .TUPLE_PATTERN => {
+            for (pat.cst.children) |c| switch (c) {
+                .node => |sub| if (ast.Pattern.cast(sub)) |sp| try aliasPatternBinders(scope, sp),
+                .token => {},
+            };
+        },
+        else => {},
+    }
+}
+
 fn matchValueTy(b: *Builder, me: ast.MatchExpr, scope: *Scope) BuildError!hir.Type {
     var it = me.arms();
     const arm = it.next() orelse return error.Unsupported;
     const e = arm.expression() orelse return error.Unsupported;
-    // A scalar binder arm (`x [if …] -> <expr using x>`): alias the name to an
-    // i64 so the value's type can be probed; the alias is dropped after.
+    // The first arm's value may reference names its pattern binds (a scalar
+    // binder `x`, or payload binders `Move(x, y) -> x + y`). Alias each to an
+    // i64 so the value's type can be probed; the aliases are dropped after.
     const saved = scope.locals.items.len;
     defer scope.locals.shrinkRetainingCapacity(saved);
-    if (arm.pattern()) |pat| {
-        if (pat.kind() == .IDENT_PATTERN) {
-            if (pat.bindingName()) |nm| try aliasLocal(scope, nm.text, 0, .i64);
-        }
-    }
+    if (arm.pattern()) |pat| try aliasPatternBinders(scope, pat);
     const sc = try exprScalar(b, e, scope);
     if (sc == .narrow_int or sc == .str) return error.Unsupported;
     return scalarBindTy(sc);
@@ -1146,7 +1193,7 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
                     try resolveArmPattern(b, info, alt, scope, s_idx)
                 else
                     try resolveLiteralPattern(b, alt)) orelse return error.Unsupported;
-                if (ap2.prelude.len != 0) return error.Unsupported;
+                if (ap2.prelude.len != 0 or ap2.cond != null) return error.Unsupported;
                 try arms.append(b.a, .{ .tag = ap2.tag, .body = body });
                 if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap2.tag);
             }
@@ -1212,10 +1259,12 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
             if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
             guard = try buildIntExpr(b, gexpr, scope);
         }
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
+        // A literal sub-pattern condition (`Move(0, y)`) ANDs onto the guard.
+        const combined = try andOpt(b, ap.cond, guard);
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = combined });
         // Coverage only counts for enums (a literal can be any i64); a
         // guarded arm may fail, so it never contributes to exhaustiveness.
-        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        if (info_opt != null and combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     // Structural exhaustiveness, like the statement form.
     if (default == null) {
@@ -1943,7 +1992,7 @@ fn buildVoidMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, out: *std.Array
                     try resolveArmPattern(b, info, alt, scope, s_idx)
                 else
                     try resolveLiteralPattern(b, alt)) orelse return error.Unsupported;
-                if (ap2.prelude.len != 0) return error.Unsupported;
+                if (ap2.prelude.len != 0 or ap2.cond != null) return error.Unsupported;
                 try arms.append(b.a, .{ .tag = ap2.tag, .body = body });
                 if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap2.tag);
             }
@@ -1987,8 +2036,10 @@ fn buildVoidMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, out: *std.Array
             if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
             guard = try buildIntExpr(b, gexpr, scope);
         }
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
-        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        // A literal sub-pattern condition (`Move(0, y)`) ANDs onto the guard.
+        const combined = try andOpt(b, ap.cond, guard);
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = combined });
+        if (info_opt != null and combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     if (default == null) {
         const info = info_opt orelse return error.Unsupported;
@@ -5740,7 +5791,7 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
                     try resolveArmPattern(b, info, alt, scope, s_idx)
                 else
                     try resolveLiteralPattern(b, alt)) orelse return error.Unsupported;
-                if (ap2.prelude.len != 0) return error.Unsupported;
+                if (ap2.prelude.len != 0 or ap2.cond != null) return error.Unsupported;
                 try arms.append(b.a, .{ .tag = ap2.tag, .body = body });
                 if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap2.tag);
             }
@@ -5812,8 +5863,10 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
             if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
             guard = try buildIntExpr(b, gexpr, scope);
         }
-        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = guard });
-        if (info_opt != null and guard == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        // A literal sub-pattern condition (`Move(0, y)`) ANDs onto the guard.
+        const combined = try andOpt(b, ap.cond, guard);
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = combined });
+        if (info_opt != null and combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
     }
     if (default == null) {
         const info = info_opt orelse return error.Unsupported;
@@ -6887,6 +6940,28 @@ test "match range patterns: a range arm alone is not exhaustive" {
     defer tr.deinit();
     const res = try buildFromSource(testing.allocator,
         "fn main {\n var n = 1\n let g = match n { 0..10 -> 0 }\n env.out(g)\n}\n", tr.resolver());
+    try testing.expect(res == null);
+}
+
+test "match literal sub-patterns: Move(0, y) tests slot 0 and binds y" {
+    // A literal sub-pattern adds a slot-equality condition (a logical and onto
+    // the tag test); the conditional arm falls through to the binder arm.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "enum Msg { Move(i64, i64), Quit }\nfn main {\n var m = Msg.Move(0, 7)\n let r = match m { Move(0, y) -> y, Move(x, y) -> x + y, Quit -> 0 }\n env.out(r)\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "and_") != null);
+
+    // A conditional payload arm alone doesn't cover its variant: without the
+    // unconditional Move(x, y) (or `_`) the match is non-exhaustive.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    const res = try buildFromSource(testing.allocator,
+        "enum Msg { Move(i64, i64), Quit }\nfn main {\n var m = Msg.Move(0, 7)\n let r = match m { Move(0, y) -> y, Quit -> 0 }\n env.out(r)\n}\n", tr2.resolver());
     try testing.expect(res == null);
 }
 

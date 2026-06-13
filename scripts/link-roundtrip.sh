@@ -2056,6 +2056,47 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> match literal sub-patterns: V(0, y) -> … (slot-equality condition in payload arms)"
+sub_app="$tmp/subpat.q"
+cat > "$sub_app" <<'Q64'
+enum Msg { Move(i64, i64), Write(i64), Quit }
+fn main {
+    var a = Msg.Move(0, 7)
+    let r1 = match a {
+        Move(0, y) -> y,
+        Move(x, 0) -> x,
+        Move(x, y) -> x + y,
+        Write(0) -> 999,
+        Write(n) -> n,
+        Quit -> 42,
+    }
+    env.out(r1)
+    var b = Msg.Move(5, 0)
+    let r2 = match b {
+        Move(0, y) -> y,
+        Move(x, 0) -> x,
+        Move(x, y) -> x + y,
+        _ -> 42,
+    }
+    env.out(r2)
+    var c = Msg.Write(0)
+    match c {
+        Write(0) -> env.out(999),
+        Write(n) -> env.out(n),
+        Move(x, y) -> env.out(x + y),
+        Quit -> env.out(1),
+    }
+}
+Q64
+sub_expected=$'7\n5\n999'
+"$Q64_BIN" emit "$sub_app" "$tmp/subpat.wasm"
+sub_out="$("$HOST_BIN" "$tmp/subpat.wasm")"
+[[ "$sub_out" == "$sub_expected" ]] || { echo "FAIL: literal sub-patterns (got: $sub_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$sub_app" "$tmp/subpat32.wasm" --addr wasm32
+sub32_out="$("$HOST_BIN" "$tmp/subpat32.wasm")"
+[[ "$sub32_out" == "$sub_expected" ]] || { echo "FAIL: literal sub-patterns wasm32 (got: $sub32_out)" >&2; exit 1; }
+echo "    ok: literal sub-patterns -> 7 / 5 / 999 (wasm64 + wasm32; slot-equality + fall-through)"
+
 echo "==> match range patterns: lo..hi / lo..=hi -> … (exclusive vs inclusive bounds)"
 rng_app="$tmp/range.q"
 cat > "$rng_app" <<'Q64'

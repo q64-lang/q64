@@ -3053,6 +3053,7 @@ test "pattern losslessness in let / for / match / if-let" {
         "fn m {\n    match r {\n        Ok(v) -> v,\n        Err(e) -> panic e,\n        _ -> 0,\n    }\n}\n",
         "fn m {\n    match n {\n        x if x > 10 -> 1,\n        0 | 1 -> 2,\n        _ -> 0,\n    }\n}\n",
         "fn m {\n    match n {\n        0..60 -> 0,\n        60..=100 if ok -> 1,\n        _ -> 9,\n    }\n}\n",
+        "fn m {\n    match msg {\n        Move(0, y) -> y,\n        Move(x, _) -> x,\n        _ -> 0,\n    }\n}\n",
     };
     for (sources) |src| {
         const r = try parse(testing.allocator, src, "p.q");
