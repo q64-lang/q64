@@ -4,6 +4,73 @@ Active work tracker. Things to do, things to decide, kept short and
 ticked off as they land. Long-form design questions are tracked separately; this file is
 for items the next session should be able to pick up and act on.
 
+## Roadmap — sequenced phases (the map over the sections below)
+
+A dependency-ordered view of the backlog. The detailed, line-level items
+live in the topic sections further down; this is the *order* to do them in
+and what gates what. Each phase links the section(s) that hold the work.
+
+**Phase 0 — front-end + core codegen — DONE.** Lexer, structured parser
+(items/exprs/stmts), the sema check pass, the **diagnostic ladder at
+51/51 conformance**, the HIR/MIR two-tier IR, cross-module linking,
+wasm32/wasm64 dual address space, component emission v0, the `qube` CLI +
+Continuum registry (live), and the QView reactive-state architecture POC
+(iPad-verified). This is the "you can lint + run real q64" milestone.
+
+**Phase 1 — Codegen & language breadth — IN PROGRESS, *no gate* (do in
+parallel).** Grow how much of the language actually executes. None of this
+needs the platform audit, so it's the highest-leverage near-term work.
+  - Generics beyond v0 monomorphization (§"B5 — generics beyond the first rung").
+  - `f32` + the rest of the numeric tower (§"Numeric tower").
+  - Strings/lists beyond the floor + `str`/list **component exports** (§"Strings…", §"Component emission").
+  - Closures / lambdas (specced in `spec/closures.md`; not yet lowered).
+  - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
+  - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
+  - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
+  - **Structured parsing of the currently-raw block constructs**
+    (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the
+    token-scan diagnostics (STR/CONC/REG/EFF) become precise AST-level checks,
+    and is a prerequisite for clean concurrency/stream *lowering* later.
+  - `screen`/`draw` → `main` **lowering** + the browser-host glue wiring
+    (§"QView…" — parse/AST done; lowering + `runtime/web` reading the i32
+    `env.out` args remain).
+
+**Phase 2 — Platform feature audit — THE GATE (do before any scheduler
+code).** §"Wasm 3.0 feature audit". Probe matrix (stack-switching, threads
++ SAB + atomics, WasmGC, exception handling, tail calls) × hosts (WebKit/
+iPad, Chrome, Firefox, wasmtime, wasmer); record the matrix in the specs;
+**pick the v0 concurrency floor** for hosts without stack-switching
+(restrict / cooperative-scheduler / asyncify). Everything in Phase 3+
+depends on this decision.
+
+**Phase 3 — Concurrency runtime — gated on Phase 2.** Implement the chosen
+floor: the scheduler, `spawn` + structured `scope` execution, `channel`
+send/recv with the policies already diagnosed (Backpressure/LatestValue/
+RingBuffer/Unbounded), and `actor` `tell`/`ask` dispatch. Then the runtime
+effect checks the front end can't do statically (EFF110 assert/operation
+violations, `@cancel` propagation). Specs: `concurrency.md`,
+`concurrency-model.md`.
+
+**Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
+scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream
+sampling semantics. The STR0xx diagnostics already guard the front end;
+this makes graphs *run*. Spec: `streams.md`.
+
+**Phase 5 — Reactivity productionization — builds on the QView POC +
+Phase 3/4.** `@state(scope)` as first-class syntax + AST partitioning, the
+typed twin `face`/RPC API beyond `inc`, MSDF text, and the full retained
+`Renderer` face. Specs: `reactivity.md`, `agent-ui.md`.
+
+**Cross-cutting / later (independent of the critical path).** RPC + `@wire`
+(`rpc.md`); the full memory model — `Managed`/WasmGC heap, named regions,
+`transfer` runtime (`memory.md`); C bindings / vendoring Binaryen
+(§"C bindings"); the host ABI for non-trivial faces (§"Host ABI…"); `spec/
+ffi.md` (unwritten); and the native **LLVM** backend (explicitly "Later").
+
+**Critical path:** Phase 2 → 3 → 4, with 5 depending on 3/4. Phase 1 and
+the cross-cutting bucket run in parallel and need no gate. The single
+hard ordering constraint in the whole plan is **audit-before-scheduler**.
+
 ## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
 
 The registry and the package up/download loop are **done and live**. The
