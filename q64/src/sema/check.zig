@@ -1047,6 +1047,37 @@ fn checkEffectDecl(gpa: std.mem.Allocator, ed: ast.EffectDecl, diags: *std.Array
     }
 }
 
+/// The auto-prelude typed-string prefixes (modules.md §"Typed-prefix
+/// string literals", types.md §"Typed-prefix form"). v0 ships the one
+/// the prelude blesses: `url"…"`, reachable because `Url` appears in
+/// `Net.get`'s signature. User-imported `StringLit` fits aren't resolved
+/// yet, so any prefix outside this set is LEX020.
+const prelude_str_prefixes = [_][]const u8{"url"};
+
+fn isKnownStrPrefix(name: []const u8) bool {
+    for (prelude_str_prefixes) |p| {
+        if (std.mem.eql(u8, p, name)) return true;
+    }
+    return false;
+}
+
+/// **LEX020** — an `<ident>"…"` typed-string prefix whose identifier
+/// doesn't name a reachable `StringLit` fit. A STR_PREFIX token can sit
+/// in any expression position, so the scan recurses over the whole CST
+/// and flags each unknown prefix at the identifier's offset.
+fn checkTypedPrefixes(
+    gpa: std.mem.Allocator,
+    node: *const cst.Node,
+    diags: *std.ArrayList(Diag),
+) std.mem.Allocator.Error!void {
+    for (node.children) |ch| switch (ch) {
+        .token => |t| if (t.kind == .STR_PREFIX and !isKnownStrPrefix(t.text)) {
+            try diags.append(gpa, .{ .code = "LEX020", .offset = t.offset });
+        },
+        .node => |n| try checkTypedPrefixes(gpa, n, diags),
+    };
+}
+
 /// **TYP108**: in a generic parameter list, no parameter without a default
 /// may follow one that has a default (spec/generics.md). Scans the raw
 /// `GENERIC_PARAMS` token span, splitting on top-level commas and detecting a
@@ -1219,6 +1250,9 @@ pub fn checkFile(
         if (gp) |g| try checkGenericDefaults(gpa, g, &diags);
         if (item == .effect_decl) try checkEffectDecl(gpa, item.effect_decl, &diags);
     }
+
+    // LEX020: unknown typed-string prefixes (`xyz"…"`) anywhere in the file.
+    try checkTypedPrefixes(gpa, sf.cst, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -1697,6 +1731,25 @@ test "check: EFF140 / EFF141 — user effect name collisions and shape" {
     // A well-formed, non-colliding user effect is silent.
     try expectCodes("pub effect @logging\nfn main { env.out(\"hi\") }\n", &.{});
     try expectCodes("pub effect @audit_trail\nfn main { env.out(\"hi\") }\n", &.{});
+}
+
+test "check: LEX020 — unknown typed-string prefix" {
+    // An unknown prefix is flagged.
+    try expectCodes("fn main { let b = xyz\"hello\" }\n", &.{"LEX020"});
+    // The auto-prelude `url` prefix is silent.
+    try expectCodes("fn main { let u = url\"https://q64.dev\" }\n", &.{});
+    // A plain string (no prefix) is untouched; a space before the quote
+    // means it's an ordinary identifier, not a prefix.
+    try expectCodes("fn main { env.out(\"hi\") }\n", &.{});
+    // Each unknown prefix in the file is flagged independently.
+    try expectCodes(
+        \\fn main {
+        \\    let a = foo"x"
+        \\    let b = url"https://q64.dev"
+        \\    let c = bar"y"
+        \\}
+        \\
+    , &.{ "LEX020", "LEX020" });
 }
 
 test "check: TYP108 — a non-default generic parameter after a default" {

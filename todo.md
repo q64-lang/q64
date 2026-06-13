@@ -1073,11 +1073,22 @@ verified, honest diagnostics throughout.
       collides with a core marker (the full blessed set from
       effects.md). Catalog entries + parser round-trip test + 5 check
       cases; conformance `effects/invalid-effect-name` +
-      `effects/user-effect-shadows-core` flip → **31/51**) → next: the
-      `From` conversion on `try`, and more negative-diagnostic gaps
-      (the remaining effects/concurrency tests need effect *annotation*
-      parsing on functions — currently raw — for EFF120/ENV056; LEX020
-      needs the auto-prelude prefix set).
+      `effects/user-effect-shadows-core` flip → **31/51**) → LEX020
+      (unknown typed-string prefix) wired (landed: the lexer already
+      emits a `STR_PREFIX` token for `<ident>"…"`; the check pass now
+      recursively scans the CST (`checkTypedPrefixes`) and emits
+      **LEX020** for any prefix outside the auto-prelude set — v0 ships
+      the one the prelude blesses, `url"…"` (reachable because `Url`
+      shows up in `Net.get`'s signature, per modules.md / types.md).
+      User-imported `StringLit` fits aren't resolved yet, so everything
+      else flags. 1 check case (4 asserts incl. the `url"` non-fire and
+      the per-prefix multi-flag); conformance
+      `lexical/string-typed-prefix-unknown` flips → **32/51**; no
+      regression on `streams/realtime-pipe-violation.q`'s `url"`
+      usage) → next: the `From` conversion on `try`, and more
+      negative-diagnostic gaps (the remaining effects/concurrency tests
+      need effect *annotation* parsing on functions — currently raw —
+      for EFF120/ENV056).
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
