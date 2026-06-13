@@ -2013,15 +2013,17 @@ fn main {
     env.out(sum(evens))
     let prod = v.reduce(1, |acc, x| acc * x)
     env.out(prod)
+    let chained = w.filter(|x| x % 2 == 0).map(|y| y * 10)
+    env.out(sum(chained))
 }
 Q64
-map_expected=$'10\n3\n306\n12\n6'
+map_expected=$'10\n3\n306\n12\n6\n120'
 "$Q64_BIN" emit "$map_app" "$tmp/vecmap.wasm"
 map_out="$("$HOST_BIN" "$tmp/vecmap.wasm")"
 [[ "$map_out" == "$map_expected" ]] || { echo "FAIL: Vec.map (got: $map_out)" >&2; exit 1; }
 "$Q64_BIN" emit "$map_app" "$tmp/vecmap32.wasm" --addr wasm32
 map32_out="$("$HOST_BIN" "$tmp/vecmap32.wasm")"
 [[ "$map32_out" == "$map_expected" ]] || { echo "FAIL: Vec.map wasm32 (got: $map32_out)" >&2; exit 1; }
-echo "    ok: Vec.map/filter/reduce -> 10 / 3 / 306 / 12 / 6 (wasm64 + wasm32; closure + captured local)"
+echo "    ok: Vec.map/filter/reduce + chaining -> 10 / 3 / 306 / 12 / 6 / 120 (wasm64 + wasm32)"
 
 echo "PASS: $qube_out"

@@ -136,6 +136,9 @@ const Builder = struct {
     /// like a record, but iterated/indexed as a vec). Parallel to the hir
     /// param list. Absent when the function has no vec params.
     fn_vec_params: std.AutoHashMapUnmanaged(hir.FuncId, []const bool) = .empty,
+    /// Counter for hidden temp-vec names in iterator method chains
+    /// (`xs.filter(…).map(…)` materializes the inner stage into `#chainN`).
+    vec_tmp: u32 = 0,
     /// `main`'s body block, for the record-binding escape scan (does a bare
     /// `name` appear as a whole value anywhere in `main`?).
     main_body: ?ast.Block = null,
@@ -4202,33 +4205,97 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
     return true;
 }
 
-/// `let d = xs.map(|x| body)` / `xs.filter(|x| pred)` (the v0 Vec floor):
-/// build a fresh vec. **map** pushes the body (i64) per element; **filter**
-/// pushes the element when the predicate (bool) holds. Desugars to `var d =
-/// Vec.new(); for x in xs { … }` — the loop variable IS the lambda parameter,
-/// so the body resolves it (and any captured local) by ordinary scoping.
-/// Returns false when the initializer isn't `<vec>.map|filter(<lambda>)`.
-fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
-    const cc = switch (init_expr) {
-        .call => |x| x,
-        else => return false,
-    };
-    const cname = (callPathName(b, cc)) orelse return false;
-    defer b.a.free(cname);
-    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
-    const src = cname[0..dot];
-    const method = cname[dot + 1 ..];
-    const is_filter = std.mem.eql(u8, method, "filter");
-    if (!is_filter and !std.mem.eql(u8, method, "map")) return false;
-    if (!scope.vecs.contains(src)) return false;
+/// map/filter method name → is-filter (true=filter, false=map), or null.
+fn mapFilterKind(method: []const u8) ?bool {
+    if (std.mem.eql(u8, method, "filter")) return true;
+    if (std.mem.eql(u8, method, "map")) return false;
+    return null;
+}
 
-    var ait = cc.args();
-    const arg = ait.next() orelse return error.Unsupported;
-    if (ait.next() != null) return error.Unsupported;
-    const lam = switch (arg) {
+/// The single lambda argument of a `map`/`filter` call, or null.
+fn mapFilterLambda(args: anytype) ?ast.LambdaExpr {
+    var it = args;
+    const a0 = it.next() orelse return null;
+    if (it.next() != null) return null;
+    return switch (a0) {
         .lambda => |l| l,
-        else => return reject(b, .unsupported_call),
+        else => null,
     };
+}
+
+/// A fresh hidden temp-vec name for an iterator method chain.
+fn freshTmp(b: *Builder) BuildError![]const u8 {
+    const n = b.vec_tmp;
+    b.vec_tmp += 1;
+    return std.fmt.allocPrint(b.a, "#chain{d}", .{n});
+}
+
+/// Resolve a vec-producing receiver to a binding name, materializing inner
+/// `map`/`filter` stages into hidden `#chainN` temps (so `xs.filter(p).map(f)`
+/// works). Returns null when it isn't a vec source.
+fn vecReceiverName(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!?[]const u8 {
+    switch (expr) {
+        .path => |p| {
+            const nm = try p.text(b.a);
+            if (scope.vecs.contains(nm)) return nm;
+            b.a.free(nm);
+            return null;
+        },
+        .call => |cc| {
+            // `<vecname>.map|filter(lam)` — the receiver is a plain name.
+            const cn = (callPathName(b, cc)) orelse return null;
+            defer b.a.free(cn);
+            const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return null;
+            const is_filter = mapFilterKind(cn[dot + 1 ..]) orelse return null;
+            if (!scope.vecs.contains(cn[0..dot])) return null;
+            const lam = mapFilterLambda(cc.args()) orelse return null;
+            const tmp = try freshTmp(b);
+            try buildMapFilterInto(b, cn[0..dot], tmp, true, is_filter, lam, scope, out);
+            return tmp;
+        },
+        .method => |me| {
+            const is_filter = mapFilterKind((me.method() orelse return null).text) orelse return null;
+            const inner = (try vecReceiverName(b, me.receiver() orelse return null, scope, out)) orelse return null;
+            const lam = mapFilterLambda(me.args()) orelse return null;
+            const tmp = try freshTmp(b);
+            try buildMapFilterInto(b, inner, tmp, true, is_filter, lam, scope, out);
+            return tmp;
+        },
+        else => return null,
+    }
+}
+
+/// `let d = xs.map(|x| body)` / `xs.filter(|x| pred)`, and chains thereof
+/// (`xs.filter(p).map(f)`) — the v0 Vec floor. Inner stages materialize into
+/// hidden temps (`vecReceiverName`); the final stage builds into `dname`.
+fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    switch (init_expr) {
+        .call => |cc| {
+            const cn = (callPathName(b, cc)) orelse return false;
+            defer b.a.free(cn);
+            const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return false;
+            const is_filter = mapFilterKind(cn[dot + 1 ..]) orelse return false;
+            if (!scope.vecs.contains(cn[0..dot])) return false;
+            const lam = mapFilterLambda(cc.args()) orelse return reject(b, .unsupported_call);
+            try buildMapFilterInto(b, cn[0..dot], dname, mutable, is_filter, lam, scope, out);
+            return true;
+        },
+        .method => |me| {
+            const is_filter = mapFilterKind((me.method() orelse return false).text) orelse return false;
+            const inner = (try vecReceiverName(b, me.receiver() orelse return false, scope, out)) orelse return false;
+            const lam = mapFilterLambda(me.args()) orelse return reject(b, .unsupported_call);
+            try buildMapFilterInto(b, inner, dname, mutable, is_filter, lam, scope, out);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Build the map/filter loop from source vec `src_name` into a fresh vec
+/// binding `dname`: `var d = Vec.new(); for x in src { d.push(body) }` (map)
+/// or `{ if pred { d.push(x) } }` (filter). The loop variable is the lambda
+/// parameter, so the body resolves it and any captured local by scoping.
+fn buildMapFilterInto(b: *Builder, src: []const u8, dname: []const u8, mutable: bool, is_filter: bool, lam: ast.LambdaExpr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     const body = lambdaBodyExpr(lam) orelse return error.Unsupported; // expr body only (v0)
     var pit = lam.params();
     const xname = (pit.next() orelse return error.Unsupported).text;
@@ -4317,7 +4384,6 @@ fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool,
     const wst = try b.a.create(hir.Stmt);
     wst.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
     try out.append(b.a, wst);
-    return true;
 }
 
 /// `let total = xs.reduce(init, |acc, x| body)` (the v0 Vec floor): fold the
@@ -6427,6 +6493,22 @@ test "Vec.map: a closure-mapped vec (vec_new + per-element push)" {
     // `d` is a fresh vec (vec_new) filled by a loop pushing the mapped value.
     try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
+}
+
+test "Vec method chaining: xs.filter(...).map(...) materializes the inner stage" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var v = Vec.from([1, 2, 3, 4])\n let r = v.filter(|x| x > 1).map(|y| y * 2)\n env.out(r[0])\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Two stages → two fresh vecs (the inner filter into a temp, the outer map
+    // into the binding), so more than one vec_new + both an `if` and a `mul`.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
 }
 

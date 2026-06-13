@@ -36,8 +36,16 @@ needs the platform audit, so it's the highest-leverage near-term work.
     the loop var, the 1st (`acc`) is substituted to the accumulator via
     `Scope.subst`). `v.map(|x| x*10)` → [10,20,30]; `v.filter(|x| x%2==0)` keeps
     evens; `v.reduce(0, |acc,x| acc+x)` = 15, `reduce(1, |a,x| a*x)` = 120; all
-    capture locals. Runs wasm64 + wasm32. **Boundary:** main-only; i64;
-    expr-body lambdas; method-chaining (`xs.filter(…).map(…)`) is a follow-on.
+    capture locals. **Method chaining done:** `xs.filter(p).map(f)` (and deeper)
+    works — the outer parses as a `METHOD_EXPR` over the inner call;
+    `vecReceiverName` recursively resolves the receiver, materializing each
+    inner `map`/`filter` stage into a hidden `#chainN` temp vec
+    (`buildMapFilterInto` is the shared loop), and the final stage builds into
+    the binding. `v.filter(|x| x%2==0).map(|y| y*10)` → sum 120;
+    `v.map(…).filter(…).map(…)` (3 stages) → 44. Runs wasm64 + wasm32.
+    **Boundary:** main-only; i64; expr-body lambdas; `.reduce` mid-chain
+    (it ends a chain since it yields a scalar) is fine, but chaining *after* a
+    reduce isn't a vec source.
   - Closures / lambdas (`spec/closures.md`). **Slice 1 (parsing) done:**
     `LambdaExpr := "|" IDENT,* "|" Expr` parses (`|x| x*2`, `|| 42`,
     `|a,b| { … }`) — a leading `|`/`||` in primary position is
