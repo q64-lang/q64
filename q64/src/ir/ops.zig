@@ -22,6 +22,11 @@ pub const BinKind = enum {
     le,
     gt,
     ge,
+    // Native binary float-math builtins (`x.min(y)`, `x.max(y)`,
+    // `x.copysign(y)`) — one wasm instruction each, float operands only.
+    fmin,
+    fmax,
+    fcopysign,
 };
 
 /// Unary operators: arithmetic negation, bitwise complement, and logical
@@ -39,6 +44,8 @@ pub const UnKind = enum {
     fsqrt,
     ffloor,
     fceil,
+    ftrunc,
+    fnearest,
 };
 
 /// Short-circuit logical operators. Unlike `BinKind`, these are *control

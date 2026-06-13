@@ -21,10 +21,11 @@ Continuum registry (live), and the QView reactive-state architecture POC
 parallel).** Grow how much of the language actually executes. None of this
 needs the platform audit, so it's the highest-leverage near-term work.
   - Generics beyond v0 monomorphization (§"B5 — generics beyond the first rung").
-  - Numeric tower (§"Numeric tower"): f64/f32/narrow-int **and** native
-    float-math builtins (`x.sqrt()`/`.abs()`/`.floor()`/`.ceil()`) **done**;
-    remaining = `min`/`max`/`copysign`, and the transcendentals via `q64.math`
-    (gated on loadable stdlib qubes).
+  - Numeric tower (§"Numeric tower"): f64/f32/narrow-int **and** the full
+    native float-math builtin set (`sqrt`/`abs`/`floor`/`ceil`/`trunc`/
+    `nearest`/`min`/`max`/`copysign`) **done**; remaining = the
+    transcendentals (`sin`/`cos`/…) via `q64.math` (gated on loadable stdlib
+    qubes), and receiver-expression / record-field float receivers.
   - Strings/lists beyond the floor + `str`/list **component exports** (§"Strings…", §"Component emission").
   - Closures / lambdas (specced in `spec/closures.md`; not yet lowered).
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
@@ -1970,10 +1971,16 @@ analysis.
       it validates as a return/arg. Non-float receivers fall through (honest
       `NameNotFound`). Verified end-to-end wasm64 + wasm32
       (link-roundtrip float-math section: `4.0 / 3.5 / 2.0 / 3.0`) + a
-      build_hir unit test. **Boundary:** `min`/`max`/`copysign` (binary) and
-      `trunc`/`nearest` are the obvious follow-ons; receiver-*expression*
-      forms (`make().sqrt()`) and float record fields as receivers aren't
-      wired yet.
+      build_hir unit test. The **binary** builtins (`x.min(y)`/`x.max(y)`/
+      `x.copysign(y)`) + `x.trunc()`/`x.nearest()` followed the same pattern:
+      `ops.BinKind` gained `fmin`/`fmax`/`fcopysign` (`binOpF64`/`binOpF32`
+      map them; the int `binOp` is `unreachable` — float-only), `UnKind`
+      gained `ftrunc`/`fnearest`, and the `.call` arm recognizes a one-arg
+      `x.min(y)` (rhs must be the same float type — no mixing) → a `hir.bin`.
+      Verified wasm64 + wasm32 (roundtrip: `3.0 / 7.0 / -5.0 / 2.0`). The
+      full native float-math surface (everything Wasm 3.0 has an instruction
+      for) is now in. **Boundary:** receiver-*expression* forms
+      (`make().sqrt()`) and float record fields as receivers aren't wired.
 - [ ] **sin/cos/tan/exp/log → `q64.math` (decision recorded).** Wasm
       3.0 has no transcendental instructions (only `f64.sqrt`/`abs`/
       `ceil`/`floor`/`min`/`max`/`copysign` are native). Decision:

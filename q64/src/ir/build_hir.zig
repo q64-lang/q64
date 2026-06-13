@@ -4370,6 +4370,17 @@ fn floatBuiltinKind(method: []const u8) ?ops.UnKind {
     if (std.mem.eql(u8, method, "sqrt")) return .fsqrt;
     if (std.mem.eql(u8, method, "floor")) return .ffloor;
     if (std.mem.eql(u8, method, "ceil")) return .fceil;
+    if (std.mem.eql(u8, method, "trunc")) return .ftrunc;
+    if (std.mem.eql(u8, method, "nearest")) return .fnearest;
+    return null;
+}
+
+/// The native binary float-math builtin named by a method (`min`/`max`/
+/// `copysign`) — one wasm instruction on two same-type float operands.
+fn floatBinBuiltinKind(method: []const u8) ?ops.BinKind {
+    if (std.mem.eql(u8, method, "min")) return .fmin;
+    if (std.mem.eql(u8, method, "max")) return .fmax;
+    if (std.mem.eql(u8, method, "copysign")) return .fcopysign;
     return null;
 }
 
@@ -4435,9 +4446,9 @@ const ExprTypeBridge = struct {
         if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
             const mname = name[dot + 1 ..];
             if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
-            // A native float-math builtin (`x.sqrt()`) types as its float
-            // receiver: f64 stays f64, f32 stays f32.
-            if (floatBuiltinKind(mname) != null) {
+            // A native float-math builtin (`x.sqrt()`, `x.min(y)`) types as
+            // its float receiver: f64 stays f64, f32 stays f32.
+            if (floatBuiltinKind(mname) != null or floatBinBuiltinKind(mname) != null) {
                 if (self.scope.find(name[0..dot])) |head| {
                     if (head.ty == .f64) return .f64;
                     if (head.ty == .f32) return .f32;
@@ -4982,6 +4993,24 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                                 const operand = try b.a.create(hir.Expr);
                                 operand.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
                                 out.* = .{ .un = .{ .kind = uk, .operand = operand } };
+                                return out;
+                            }
+                        }
+                    }
+                    // Binary float-math builtins: `x.min(y)`, `x.max(y)`,
+                    // `x.copysign(y)` — both operands the same float type.
+                    if (floatBinBuiltinKind(cname[dot + 1 ..])) |bk| {
+                        if (scope.find(head)) |loc| {
+                            if (loc.ty == .f64 or loc.ty == .f32) {
+                                var bit = cc.args();
+                                const a0 = bit.next() orelse return reject(b, .unsupported_call);
+                                if (bit.next() != null) return reject(b, .unsupported_call); // exactly one
+                                const want: sema.exprtype.ScalarType = if (loc.ty == .f64) .f64 else .f32;
+                                if ((try exprScalar(b, a0, scope)) != want) return error.Unsupported; // no mixing
+                                const lhs = try b.a.create(hir.Expr);
+                                lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                                const rhs = try buildIntExpr(b, a0, scope);
+                                out.* = .{ .bin = .{ .kind = bk, .lhs = lhs, .rhs = rhs } };
                                 return out;
                             }
                         }
@@ -5635,16 +5664,17 @@ test "tryBuild: a bool `let` binding is read back as a bool (host_out_bool)" {
 test "float-math builtins: x.sqrt()/x.abs() lower to the float un ops; non-float rejected" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
-    try tr.addLib("pub fn root(x: f64) -> f64 { x.sqrt() }\npub fn mag(x: f64) -> f64 { x.abs() }\n");
+    try tr.addLib("pub fn root(x: f64) -> f64 { x.sqrt() }\npub fn mag(x: f64) -> f64 { x.abs() }\npub fn lo(a: f64, b: f64) -> f64 { a.min(b) }\n");
 
     var mod = (try buildFromSource(testing.allocator,
-        "fn main {\n env.out(root(16.0))\n env.out(mag(-3.5))\n}\n", tr.resolver())) orelse
+        "fn main {\n env.out(root(16.0))\n env.out(mag(-3.5))\n env.out(lo(1.0, 2.0))\n}\n", tr.resolver())) orelse
         return error.TestUnexpectedResult;
     defer mod.deinit();
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "fsqrt") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fabs") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fmin") != null);
 
     // The same method on a non-float (i64) receiver isn't a builtin — it
     // falls through to dispatch and finds no such method.

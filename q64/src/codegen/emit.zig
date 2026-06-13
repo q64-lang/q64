@@ -1413,6 +1413,8 @@ const Lowerer = struct {
                     .fsqrt => c.BinaryenUnary(module, if (is32) c.BinaryenSqrtFloat32() else c.BinaryenSqrtFloat64(), x),
                     .ffloor => c.BinaryenUnary(module, if (is32) c.BinaryenFloorFloat32() else c.BinaryenFloorFloat64(), x),
                     .fceil => c.BinaryenUnary(module, if (is32) c.BinaryenCeilFloat32() else c.BinaryenCeilFloat64(), x),
+                    .ftrunc => c.BinaryenUnary(module, if (is32) c.BinaryenTruncFloat32() else c.BinaryenTruncFloat64(), x),
+                    .fnearest => c.BinaryenUnary(module, if (is32) c.BinaryenNearestFloat32() else c.BinaryenNearestFloat64(), x),
                 };
             },
             .call => |cl| {
@@ -2207,6 +2209,9 @@ fn binOp(kind: ir.ops.BinKind) c.BinaryenOp {
         .le => c.BinaryenLeSInt64(),
         .gt => c.BinaryenGtSInt64(),
         .ge => c.BinaryenGeSInt64(),
+        // Float-only builtins never reach the int family (the builder emits
+        // them only on float operands).
+        .fmin, .fmax, .fcopysign => unreachable,
     };
 }
 
@@ -2225,6 +2230,9 @@ fn binOpF64(kind: ir.ops.BinKind) ?c.BinaryenOp {
         .le => c.BinaryenLeFloat64(),
         .gt => c.BinaryenGtFloat64(),
         .ge => c.BinaryenGeFloat64(),
+        .fmin => c.BinaryenMinFloat64(),
+        .fmax => c.BinaryenMaxFloat64(),
+        .fcopysign => c.BinaryenCopySignFloat64(),
         .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => null,
     };
 }
@@ -2242,6 +2250,9 @@ fn binOpF32(kind: ir.ops.BinKind) ?c.BinaryenOp {
         .le => c.BinaryenLeFloat32(),
         .gt => c.BinaryenGtFloat32(),
         .ge => c.BinaryenGeFloat32(),
+        .fmin => c.BinaryenMinFloat32(),
+        .fmax => c.BinaryenMaxFloat32(),
+        .fcopysign => c.BinaryenCopySignFloat32(),
         .rem, .bit_and, .bit_or, .bit_xor, .shl, .shr => null,
     };
 }
