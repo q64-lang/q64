@@ -27,6 +27,14 @@ needs the platform audit, so it's the highest-leverage near-term work.
     transcendentals (`sin`/`cos`/…) via `q64.math` (gated on loadable stdlib
     qubes), and receiver-expression / record-field float receivers.
   - Strings/lists beyond the floor + `str`/list **component exports** (§"Strings…", §"Component emission").
+  - **`Vec.map` done:** `let d = xs.map(|x| body)` builds a fresh vec and
+    pushes the body per element — `tryVecMap` desugars to `var d = Vec.new();
+    for x in xs { d.push(body) }` where the loop var IS the lambda parameter, so
+    the body resolves it (and any captured local like `base`) by ordinary
+    scoping — no inline-substitution needed. `v.map(|x| x*10)` → [10,20,30];
+    `v.map(|x| x + base)` captures `base`. Runs wasm64 + wasm32. **Boundary:**
+    main-only (vec bindings are main-only); i64 elements; expr-body lambdas;
+    `.filter`/`.reduce` and method-chaining are follow-ons.
   - Closures / lambdas (`spec/closures.md`). **Slice 1 (parsing) done:**
     `LambdaExpr := "|" IDENT,* "|" Expr` parses (`|x| x*2`, `|| 42`,
     `|a,b| { … }`) — a leading `|`/`||` in primary position is

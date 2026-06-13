@@ -413,6 +413,8 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 try out.append(b.a, st);
             } else if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let v = Vec.from([…])` — handled (vec_new + pushes).
+            } else if (try tryVecMap(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let d = xs.map(|x| …)` — handled (vec_new + mapped pushes).
             } else if (if (init_expr == .call or isBoxedVariantPath(b, init_expr)) try buildRecExpr(b, init_expr, scope) else null) |rv| {
                 // `let p = make(3, 4)` / `let c = first([...])` — a
                 // record-returning call (incl. a generic whose `-> T`
@@ -4198,6 +4200,105 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
     return true;
 }
 
+/// `let d = xs.map(|x| body)` (the v0 Vec floor): build a fresh vec and,
+/// for each element of `xs`, push the lambda body evaluated with the element
+/// bound to the lambda parameter. Desugars to `var d = Vec.new(); for x in xs
+/// { d.push(body) }` — the loop variable IS the lambda parameter, so the body
+/// resolves it by ordinary scoping (no capture machinery needed). Returns
+/// false when the initializer isn't `<vec>.map(<lambda>)`. i64 elements (v0).
+fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cname = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
+    const src = cname[0..dot];
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "map")) return false;
+    if (!scope.vecs.contains(src)) return false;
+
+    var ait = cc.args();
+    const arg = ait.next() orelse return error.Unsupported;
+    if (ait.next() != null) return error.Unsupported;
+    const lam = switch (arg) {
+        .lambda => |l| l,
+        else => return reject(b, .unsupported_call),
+    };
+    const body = lambdaBodyExpr(lam) orelse return error.Unsupported; // expr body only (v0)
+    var pit = lam.params();
+    const xname = (pit.next() orelse return error.Unsupported).text;
+    if (pit.next() != null) return error.Unsupported; // exactly one parameter
+
+    const sloc = scope.find(src) orelse return error.Unsupported;
+
+    // var d = Vec.new()
+    const d_idx = try declareBodyLocal(b, scope, dname, mutable, .ptr);
+    try scope.vecs.put(b.a, dname, {});
+    const nv = try b.a.create(hir.Expr);
+    nv.* = .vec_new;
+    const bind = try b.a.create(hir.Stmt);
+    bind.* = .{ .let = .{ .idx = d_idx, .value = nv } };
+    try out.append(b.a, bind);
+
+    // for x in src { d.push(body) } — index loop over the source's length.
+    const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{xname});
+    const i_idx = try declareBodyLocal(b, scope, hidden, true, .i64);
+    const x_idx = try declareBodyLocal(b, scope, xname, false, .i64);
+    const zero = try b.a.create(hir.Expr);
+    zero.* = .{ .int_const = 0 };
+    const st0 = try b.a.create(hir.Stmt);
+    st0.* = .{ .let = .{ .idx = i_idx, .value = zero } };
+    try out.append(b.a, st0);
+
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    { // x = src[i]
+        const sref = try b.a.create(hir.Expr);
+        sref.* = .{ .local = .{ .idx = sloc.idx, .ty = .ptr } };
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const get = try b.a.create(hir.Expr);
+        get.* = .{ .vec_get = .{ .vec = sref, .idx = iref } };
+        const setx = try b.a.create(hir.Stmt);
+        setx.* = .{ .assign = .{ .idx = x_idx, .value = get } };
+        try items.append(b.a, setx);
+    }
+    { // d.push(<body, reads x>)
+        const val = try buildIntExpr(b, body, scope);
+        const dref = try b.a.create(hir.Expr);
+        dref.* = .{ .local = .{ .idx = d_idx, .ty = .ptr } };
+        const push = try b.a.create(hir.Stmt);
+        push.* = .{ .vec_push = .{ .vec = dref, .value = val } };
+        try items.append(b.a, push);
+    }
+    { // i = i + 1
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const one = try b.a.create(hir.Expr);
+        one.* = .{ .int_const = 1 };
+        const inc = try b.a.create(hir.Expr);
+        inc.* = .{ .bin = .{ .kind = .add, .lhs = iref, .rhs = one } };
+        const sti = try b.a.create(hir.Stmt);
+        sti.* = .{ .assign = .{ .idx = i_idx, .value = inc } };
+        try items.append(b.a, sti);
+    }
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
+
+    const iref2 = try b.a.create(hir.Expr);
+    iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+    const sref2 = try b.a.create(hir.Expr);
+    sref2.* = .{ .local = .{ .idx = sloc.idx, .ty = .ptr } };
+    const lenx = try b.a.create(hir.Expr);
+    lenx.* = .{ .vec_len = .{ .vec = sref2 } };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = .lt, .lhs = iref2, .rhs = lenx } };
+    const wst = try b.a.create(hir.Stmt);
+    wst.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try out.append(b.a, wst);
+    return true;
+}
+
 /// `for x in v { … }` over a vec binding: an index loop reading the
 /// live length each test (`while i < vec_len(v) { x = v[i]; …; i += 1 }`),
 /// so a body that pushes still terminates against the grown bound.
@@ -6189,6 +6290,21 @@ test "closures: a lambda captures a runtime local (capture-by-extra-param)" {
     // The capture rides as an extra param `g`, and the body adds it.
     try testing.expect(std.mem.indexOf(u8, dump, "apply#L") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "add") != null);
+}
+
+test "Vec.map: a closure-mapped vec (vec_new + per-element push)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var v = Vec.from([1, 2, 3])\n let d = v.map(|x| x * 10)\n env.out(d[0])\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `d` is a fresh vec (vec_new) filled by a loop pushing the mapped value.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
 }
 
 test "Vec parameter: a callee iterates a Vec passed by the caller" {

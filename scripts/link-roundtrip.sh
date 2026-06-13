@@ -1992,4 +1992,31 @@ vpr32_out="$("$HOST_BIN" "$tmp/vecparam32.wasm")"
 [[ "$vpr32_out" == "$vpr_expected" ]] || { echo "FAIL: vec params wasm32 (got: $vpr32_out)" >&2; exit 1; }
 echo "    ok: vec params -> 35 / 20 (wasm64 + wasm32; callee for-over-Vec)"
 
+echo "==> Vec.map: closure-mapped new vec (incl. a captured local)"
+map_app="$tmp/vecmap.q"
+cat > "$map_app" <<'Q64'
+fn sum(xs: Vec<i64>) -> i64 {
+    var s = 0
+    for x in xs { s = s + x }
+    s
+}
+fn main {
+    var v = Vec.from([1, 2, 3])
+    let d = v.map(|x| x * 10)
+    env.out(d[0])
+    env.out(d.len)
+    var base = 100
+    let e = v.map(|x| x + base)
+    env.out(sum(e))
+}
+Q64
+map_expected=$'10\n3\n306'
+"$Q64_BIN" emit "$map_app" "$tmp/vecmap.wasm"
+map_out="$("$HOST_BIN" "$tmp/vecmap.wasm")"
+[[ "$map_out" == "$map_expected" ]] || { echo "FAIL: Vec.map (got: $map_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$map_app" "$tmp/vecmap32.wasm" --addr wasm32
+map32_out="$("$HOST_BIN" "$tmp/vecmap32.wasm")"
+[[ "$map32_out" == "$map_expected" ]] || { echo "FAIL: Vec.map wasm32 (got: $map32_out)" >&2; exit 1; }
+echo "    ok: Vec.map -> 10 / 3 / 306 (wasm64 + wasm32; closure + captured local)"
+
 echo "PASS: $qube_out"
