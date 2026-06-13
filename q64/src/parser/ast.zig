@@ -1644,6 +1644,7 @@ pub const Expr = union(enum) {
     array: ArrayExpr,
     record: RecordExpr,
     match: MatchExpr,
+    lambda: LambdaExpr,
 
     pub fn cast(node: *const cst.Node) ?Expr {
         return switch (node.kind) {
@@ -1667,8 +1668,55 @@ pub const Expr = union(enum) {
             .TUPLE_EXPR => .{ .tuple = .{ .cst = node } },
             .PAREN_EXPR => .{ .paren = .{ .cst = node } },
             .ARRAY_EXPR => .{ .array = .{ .cst = node } },
+            .LAMBDA_EXPR => .{ .lambda = .{ .cst = node } },
             else => null,
         };
+    }
+};
+
+/// `LambdaExpr := "|" LambdaParams? "|" Expr` — a lambda literal. Parameters
+/// are untyped (their types come from the expected `fn` type at the use site,
+/// per closures.md). The body is a single expression (a block `{ … }` for
+/// multi-statement bodies).
+pub const LambdaExpr = struct {
+    cst: *const cst.Node,
+
+    /// Iterate the parameter name tokens (`|x, y|` → `x`, `y`).
+    pub fn params(self: LambdaExpr) LambdaParamIter {
+        const lp = firstChildRawNode(self.cst, .LAMBDA_PARAMS) orelse
+            return .{ .children = &.{} };
+        return .{ .children = lp.children };
+    }
+
+    /// The body — the last child node (an `Expr`, or a `BLOCK` for a
+    /// `|x| { … }` body). Returned raw so a block body is reachable too.
+    pub fn body(self: LambdaExpr) ?*const cst.Node {
+        var last: ?*const cst.Node = null;
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (n.kind != .LAMBDA_PARAMS) {
+                last = n;
+            },
+            .token => {},
+        };
+        return last;
+    }
+};
+
+pub const LambdaParamIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *LambdaParamIter) ?cst.Token {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .token => |t| if (t.kind == .IDENT) {
+                    self.i += 1;
+                    return t;
+                },
+                .node => {},
+            }
+        }
+        return null;
     }
 };
 

@@ -27,7 +27,16 @@ needs the platform audit, so it's the highest-leverage near-term work.
     transcendentals (`sin`/`cos`/…) via `q64.math` (gated on loadable stdlib
     qubes), and receiver-expression / record-field float receivers.
   - Strings/lists beyond the floor + `str`/list **component exports** (§"Strings…", §"Component emission").
-  - Closures / lambdas (specced in `spec/closures.md`; not yet lowered).
+  - Closures / lambdas (`spec/closures.md`). **Slice 1 (parsing) done:**
+    `LambdaExpr := "|" IDENT,* "|" Expr` parses (`|x| x*2`, `|| 42`,
+    `|a,b| { … }`) — a leading `|`/`||` in primary position is
+    unambiguously a lambda (bitwise/logical-or are infix); `ast.LambdaExpr`
+    exposes `params()`/`body()`; lossless round-trip + the `graph-pipe-stages`
+    golden's `|x| …` now parses structured. **Next:** sema typing (params
+    typed from the expected `fn` type at the use site — TYP350/351/352) then
+    monomorphizing, non-escaping lowering (the spec's zero-cost v0 — specialize
+    the higher-order fn per lambda, captures as aliases; builds on the B5
+    monomorphization machinery).
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").

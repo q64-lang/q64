@@ -2158,8 +2158,54 @@ const Parser = struct {
         if (k == .L_PAREN) return self.parseParenOrTuple();
         if (k == .L_BRACK) return self.parseArrayExpr();
         if (k == .KW_MATCH) return self.parseMatch(.MATCH_EXPR);
+        // A leading `|` / `||` opens a lambda — bitwise-or / logical-or are
+        // infix, so they never reach primary position.
+        if (k == .PIPE or k == .PIPE_PIPE) return self.parseLambda();
         if (isPathStart(k)) return self.parsePath();
         return self.parseUnknownExpr();
+    }
+
+    /// `LambdaExpr := "|" LambdaParams? "|" Expr` (spec/grammar.md). `||` is
+    /// the no-parameter form (the `||` token is the empty delimiter pair).
+    /// Parameters are untyped IDENTs; the body is one expression, or a block
+    /// for `|x| { … }`.
+    fn parseLambda(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        if (self.peek() == .PIPE_PIPE) {
+            try children.append(self.arena, .{ .token = self.advance() }); // `||` — no params
+        } else {
+            try children.append(self.arena, .{ .token = self.advance() }); // opening `|`
+            try self.eatTrivia(&children);
+            if (self.peek() != .PIPE) {
+                try children.append(self.arena, .{ .node = try self.parseLambdaParams() });
+                try self.eatTrivia(&children);
+            }
+            if (self.peek() == .PIPE) {
+                try children.append(self.arena, .{ .token = self.advance() }); // closing `|`
+            }
+        }
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        } else {
+            try children.append(self.arena, .{ .node = try self.parseExpr() });
+        }
+        return try cst.makeNode(self.arena, .LAMBDA_EXPR, children.items);
+    }
+
+    /// `LambdaParams := IDENT ("," IDENT)*` — untyped parameter names.
+    fn parseLambdaParams(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        while (true) {
+            if (self.peek() == .IDENT) {
+                try children.append(self.arena, .{ .token = self.advance() });
+            }
+            try self.eatTrivia(&children);
+            if (self.peek() != .COMMA) break;
+            try children.append(self.arena, .{ .token = self.advance() }); // ,
+            try self.eatTrivia(&children);
+        }
+        return try cst.makeNode(self.arena, .LAMBDA_PARAMS, children.items);
     }
 
     /// `(` Expr `)` → `PAREN_EXPR`; `(` Expr (`,` Expr)* `)` →
@@ -3278,6 +3324,46 @@ test "effect declaration parses as an item and round-trips" {
     const first = iter.next() orelse return error.TestExpectedItem;
     try testing.expectEqualStrings("logging", first.effect_decl.name().?.text);
     try testing.expect(first.effect_decl.isPublic());
+}
+
+test "lambda literals parse, surface params, and round-trip" {
+    const src = "fn main {\n    let f = |x| x * 2\n    let g = || 42\n    let h = |a, b| { a + b }\n    env.out(\"ok\")\n}\n";
+    const r = try parse(testing.allocator, src, "lam.q");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r.diagnostics.len);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+
+    // Walk to the three `let` initializers and check the lambda shapes.
+    const sf = ast.SourceFile.cast(r.root).?;
+    var iter = sf.items();
+    const fd = (iter.next() orelse return error.TestExpectedItem).fn_decl;
+    var stmts = fd.body().?.statements();
+    // `|x| x*2` — one param.
+    {
+        const e = (stmts.next() orelse return error.TestExpectedStmt);
+        const lam = e.let_stmt.initializer().?.lambda;
+        var pit = lam.params();
+        try testing.expectEqualStrings("x", (pit.next().?).text);
+        try testing.expect(pit.next() == null);
+    }
+    // `|| 42` — no params.
+    {
+        const e = (stmts.next() orelse return error.TestExpectedStmt);
+        var pit = e.let_stmt.initializer().?.lambda.params();
+        try testing.expect(pit.next() == null);
+    }
+    // `|a, b| { … }` — two params, a block body.
+    {
+        const e = (stmts.next() orelse return error.TestExpectedStmt);
+        const lam = e.let_stmt.initializer().?.lambda;
+        var pit = lam.params();
+        try testing.expectEqualStrings("a", (pit.next().?).text);
+        try testing.expectEqualStrings("b", (pit.next().?).text);
+        try testing.expect(lam.body().?.kind == .BLOCK);
+    }
 }
 
 test "leading item annotations attach to the item and round-trip" {
