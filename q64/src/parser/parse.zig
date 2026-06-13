@@ -1760,7 +1760,7 @@ const Parser = struct {
     /// `MatchArm := Pattern "->" (Block | Expr)`. Pattern is a raw span.
     fn parseMatchArm(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
-        try children.append(self.arena, .{ .node = try self.parsePattern() });
+        try children.append(self.arena, .{ .node = try self.parseOrPattern() });
         // Any remainder before `->` (e.g. a guard `if cond`) is raw for now.
         try self.captureRawUntil(&children, &.{.ARROW});
         if (self.peek() == .ARROW) {
@@ -1773,6 +1773,29 @@ const Parser = struct {
             }
         }
         return try cst.makeNode(self.arena, .MATCH_ARM, children.items);
+    }
+
+    /// `Pattern ("|" Pattern)*` — an or-pattern wraps the alternatives in an
+    /// `OR_PATTERN`; a single pattern is returned as-is.
+    fn parseOrPattern(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        const first = try self.parsePattern();
+        const save = self.pos;
+        var lead: std.ArrayList(cst.Element) = .empty;
+        try self.eatTrivia(&lead);
+        if (self.peek() != .PIPE) {
+            self.pos = save;
+            return first;
+        }
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .node = first });
+        while (true) {
+            try self.eatTrivia(&children);
+            if (self.peek() != .PIPE) break;
+            try children.append(self.arena, .{ .token = self.advance() }); // |
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parsePattern() });
+        }
+        return try cst.makeNode(self.arena, .OR_PATTERN, children.items);
     }
 
     /// Fallback: an expression statement, or an assignment when an

@@ -2026,4 +2026,34 @@ map32_out="$("$HOST_BIN" "$tmp/vecmap32.wasm")"
 [[ "$map32_out" == "$map_expected" ]] || { echo "FAIL: Vec.map wasm32 (got: $map32_out)" >&2; exit 1; }
 echo "    ok: Vec.map/filter/reduce + chaining -> 10 / 3 / 306 / 12 / 6 / 120 (wasm64 + wasm32)"
 
+echo "==> match or-patterns: A | B -> … (enum unit + integer-literal alternatives)"
+orp_app="$tmp/orpat.q"
+cat > "$orp_app" <<'Q64'
+enum Light { Red, Yellow, Green }
+fn classify(n: i64) -> i64 {
+    let r = match n {
+        1 | 2 | 3 -> 10,
+        _ -> 20,
+    }
+    r
+}
+fn main {
+    var l = Light.Yellow
+    match l {
+        Red | Yellow -> env.out("caution"),
+        Green -> env.out("go"),
+    }
+    env.out(classify(2))
+    env.out(classify(9))
+}
+Q64
+orp_expected=$'caution\n10\n20'
+"$Q64_BIN" emit "$orp_app" "$tmp/orpat.wasm"
+orp_out="$("$HOST_BIN" "$tmp/orpat.wasm")"
+[[ "$orp_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns (got: $orp_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$orp_app" "$tmp/orpat32.wasm" --addr wasm32
+orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
+[[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
+echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
+
 echo "PASS: $qube_out"

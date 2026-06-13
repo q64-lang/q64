@@ -124,6 +124,17 @@ needs the platform audit, so it's the highest-leverage near-term work.
     `Vec.new()` as an initializer still isn't a recognized form (`Vec.from`
     only); ranges as general values (`let r = 0..n`) too.
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
+    - [x] **Or-patterns** (`Red | Yellow -> …`, `1 | 2 | 3 -> …`): `parseOrPattern`
+          wraps `Pattern ("|" Pattern)*` in an `OR_PATTERN` (`ast.Pattern.
+          alternatives()`); the match builders (`buildMainMatch`,
+          `buildMatchInto`, `buildVoidMatch`, `buildIntMatch`) expand an or-arm
+          into one `(tag, body)` per alternative sharing the body, marking each
+          for exhaustiveness. v0: unit-variant + integer-literal alternatives
+          (no payload binders across alts). Runs wasm64 + wasm32 (roundtrip
+          `caution / 10 / 20`). **Next:** guards (`P if cond ->`), range
+          patterns (`1..5 ->`), nested/record destructuring. (Orthogonal
+          pre-existing gap: a callee whose whole body is a value `match` —
+          only `let r = match …` works in callees today.)
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the

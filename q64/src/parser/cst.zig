@@ -311,6 +311,7 @@ pub const SyntaxKind = enum {
     RECORD_STRUCT_PATTERN,
     FIELD_PATTERN,
     ENUM_VARIANT_PATTERN,
+    OR_PATTERN,
 
     // Expressions
     BLOCK,

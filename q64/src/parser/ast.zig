@@ -1603,6 +1603,13 @@ pub const Pattern = struct {
         return null;
     }
 
+    /// Iterate the alternatives of an `OR_PATTERN` (`A | B | C`). Empty for
+    /// any non-or pattern.
+    pub fn alternatives(self: Pattern) PatternIter {
+        if (self.cst.kind != .OR_PATTERN) return .{ .children = &.{} };
+        return .{ .children = self.cst.children };
+    }
+
     pub fn isPatternKind(k: cst.SyntaxKind) bool {
         return switch (k) {
             .WILD_PATTERN,
@@ -1612,9 +1619,28 @@ pub const Pattern = struct {
             .TUPLE_PATTERN,
             .TUPLE_STRUCT_PATTERN,
             .RECORD_STRUCT_PATTERN,
+            .OR_PATTERN,
             => true,
             else => false,
         };
+    }
+};
+
+pub const PatternIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *PatternIter) ?Pattern {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (Pattern.isPatternKind(n.kind)) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
     }
 };
 

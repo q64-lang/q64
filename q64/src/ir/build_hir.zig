@@ -702,6 +702,26 @@ fn buildMainMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, rt: *RtMap, out
     var it = ms.arms();
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
+        // An or-pattern (`Red | Yellow -> …`): each alternative is a separate
+        // (tag, body) sharing one body. v0: unit/literal alternatives only —
+        // no payload bindings (they'd need consistent binders across alts).
+        if (pat.kind() == .OR_PATTERN) {
+            const body = try buildMatchArmBody(b, arm, scope, rt);
+            var alts = pat.alternatives();
+            var n: usize = 0;
+            while (alts.next()) |alt| {
+                n += 1;
+                const ap = (if (info_opt) |info|
+                    try resolveArmPattern(b, info, alt, scope, s_idx)
+                else
+                    try resolveLiteralPattern(b, alt)) orelse return error.Unsupported; // no `_` in an or-pattern
+                if (ap.prelude.len != 0) return error.Unsupported; // payload binders: later
+                try arms.append(b.a, .{ .tag = ap.tag, .body = body });
+                if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap.tag);
+            }
+            if (n == 0) return error.Unsupported;
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the body.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -1011,6 +1031,31 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
     var it = me.arms();
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
+        // An or-pattern arm: build the value once, share it across the
+        // alternatives' tags (unit/literal alternatives only — see below).
+        if (pat.kind() == .OR_PATTERN) {
+            const e = arm.expression() orelse return error.Unsupported;
+            if (scalarBindTy(try exprScalar(b, e, scope)) != ty) return error.Unsupported;
+            const value = try buildIntExpr(b, e, scope);
+            const asn = try b.a.create(hir.Stmt);
+            asn.* = .{ .assign = .{ .idx = target_idx, .value = value } };
+            const body = try b.a.create(hir.Stmt);
+            body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{asn}) };
+            var alts = pat.alternatives();
+            var n: usize = 0;
+            while (alts.next()) |alt| {
+                n += 1;
+                const ap2 = (if (info_opt) |info|
+                    try resolveArmPattern(b, info, alt, scope, s_idx)
+                else
+                    try resolveLiteralPattern(b, alt)) orelse return error.Unsupported;
+                if (ap2.prelude.len != 0) return error.Unsupported;
+                try arms.append(b.a, .{ .tag = ap2.tag, .body = body });
+                if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap2.tag);
+            }
+            if (n == 0) return error.Unsupported;
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the value.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -1747,6 +1792,23 @@ fn buildVoidMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope, out: *std.Array
     var it = ms.arms();
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
+        if (pat.kind() == .OR_PATTERN) {
+            const body = try buildVoidMatchArmBody(b, arm, scope);
+            var alts = pat.alternatives();
+            var n: usize = 0;
+            while (alts.next()) |alt| {
+                n += 1;
+                const ap2 = (if (info_opt) |info|
+                    try resolveArmPattern(b, info, alt, scope, s_idx)
+                else
+                    try resolveLiteralPattern(b, alt)) orelse return error.Unsupported;
+                if (ap2.prelude.len != 0) return error.Unsupported;
+                try arms.append(b.a, .{ .tag = ap2.tag, .body = body });
+                if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap2.tag);
+            }
+            if (n == 0) return error.Unsupported;
+            continue;
+        }
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
         else
@@ -5483,6 +5545,32 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
     var it = ms.arms();
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
+        if (pat.kind() == .OR_PATTERN) {
+            const e = arm.expression() orelse return error.Unsupported;
+            const sc = scalarBindTy(try exprScalar(b, e, scope));
+            if (vty) |t| {
+                if (sc != t) return error.Unsupported;
+            } else vty = sc;
+            const value = try buildIntExpr(b, e, scope);
+            const vstmt = try b.a.create(hir.Stmt);
+            vstmt.* = .{ .expr = value };
+            const body = try b.a.create(hir.Stmt);
+            body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+            var alts = pat.alternatives();
+            var n: usize = 0;
+            while (alts.next()) |alt| {
+                n += 1;
+                const ap2 = (if (info_opt) |info|
+                    try resolveArmPattern(b, info, alt, scope, s_idx)
+                else
+                    try resolveLiteralPattern(b, alt)) orelse return error.Unsupported;
+                if (ap2.prelude.len != 0) return error.Unsupported;
+                try arms.append(b.a, .{ .tag = ap2.tag, .body = body });
+                if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap2.tag);
+            }
+            if (n == 0) return error.Unsupported;
+            continue;
+        }
         // Pattern first: payload bindings must be in scope for the value.
         const rp = if (info_opt) |info|
             try resolveArmPattern(b, info, pat, scope, s_idx)
@@ -6494,6 +6582,30 @@ test "Vec.map: a closure-mapped vec (vec_new + per-element push)" {
     try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
+}
+
+test "match or-patterns: A | B -> body expands to multiple tags sharing the body" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "enum Light { Red, Yellow, Green }\nfn main {\n var l = Light.Yellow\n match l {\n Red | Yellow -> env.out(\"caution\"),\n Green -> env.out(\"go\"),\n }\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The or-arm expands into the tag-comparison chain (an `if`).
+    try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
+
+    // An integer-literal or-pattern in a value `let = match`.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    var m2 = (try buildFromSource(testing.allocator,
+        "fn main {\n var n = 2\n let c = match n { 1 | 2 | 3 -> 10, _ -> 20 }\n env.out(c)\n}\n", tr2.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer m2.deinit();
+    const d2 = try print.hirToString(testing.allocator, &m2);
+    defer testing.allocator.free(d2);
+    try testing.expect(std.mem.indexOf(u8, d2, "if") != null);
 }
 
 test "Vec method chaining: xs.filter(...).map(...) materializes the inner stage" {
