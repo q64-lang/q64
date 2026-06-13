@@ -1155,11 +1155,21 @@ verified, honest diagnostics throughout.
       top-level `IDENT :` key not on `Env` (depth tracking skips a value's
       own nested braces / `:` keys). Catalog entry + 1 check case (2
       asserts, incl. the nested-value non-fire); conformance
-      `env/use-field-not-on-env` flips → **39/51**) → next: the `From`
-      conversion on `try`, EFF110 (assert/operation violations in the
-      body), and the remaining gaps. The rest need bigger subsystems —
-      structured `graph`/`scope`/`actor` parsing then dataflow/actor
-      types (STR020/STR060/CONC0xx), generic inference (TYP102), optional
+      `env/use-field-not-on-env` flips → **39/51**) → CONC020 wired
+      (landed: `c.tell(Msg)` is fire-and-forget, but a reply-bearing
+      handler (`handle Msg -> T`) needs `c.ask(Msg)` — concurrency.md
+      §"`tell` vs `ask`". Same flat-token technique (the actor body parses
+      raw): pass 1 collects reply-bearing message names — a `handle Name …
+      -> …` with a top-level `->` before the body `{` (the message
+      pattern's own `( … )` is depth-skipped); pass 2 flags each
+      `tell(Name)` (KW_TELL) whose first arg is reply-bearing. `tell` on a
+      non-reply handler and `ask` on a reply handler stay silent. Catalog
+      entry + CONC subsystem mapping + 1 check case (2 asserts);
+      conformance `concurrency/tell-on-reply-handler` flips → **40/51**) →
+      next: the `From` conversion on `try`, EFF110, and the remaining
+      gaps. The rest need bigger subsystems — dataflow types
+      (STR020/STR060), the rest of the channel/cancel model
+      (CONC051/CONC053), generic inference (TYP102), optional
       flow-narrowing (TYP047), face/dyn-safety (TYP306/not-dyn-safe/
       no-fit-for-bound), region escape analysis (REG040), qube-root
       resolution (NAM002), and the reverted PAR040 heuristic.

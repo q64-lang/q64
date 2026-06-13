@@ -123,6 +123,7 @@ pub fn subsystemFor(code: []const u8) []const u8 {
     if (std.mem.startsWith(u8, code, "EFF")) return "Effects";
     if (std.mem.startsWith(u8, code, "REG")) return "Regions";
     if (std.mem.startsWith(u8, code, "STR")) return "Streams";
+    if (std.mem.startsWith(u8, code, "CONC")) return "Concurrency";
     if (std.mem.startsWith(u8, code, "Q9")) return "Internal";
     return "Other";
 }
@@ -173,6 +174,7 @@ pub const codes = [_]CodeInfo{
     .{ .code = "EFF140", .subsystem = "Effects", .severity = .err, .message = "user effect shadows a core marker", .summary = "A `pub effect @<name>` reuses the name of a blessed core marker (e.g. `@realtime`, `@io`, `@pure`). Pick a non-colliding name for the user-defined effect. See spec/effects.md §\"User-defined effects\"." },
     .{ .code = "EFF141", .subsystem = "Effects", .severity = .err, .message = "invalid effect name", .summary = "A user-defined effect name must match `^@[a-z][a-z_]*$` — lowercase letters and underscores, leading letter (e.g. `@logging`, `@audit`). See spec/effects.md §\"User-defined effects\"." },
     .{ .code = "REG020", .subsystem = "Regions", .severity = .err, .message = "linear pointer in `@managed` struct", .summary = "A `@managed` struct (WasmGC) may only hold managed or `Copy`-style value fields. A `ref` into linear memory can't be a field — store a managed reference (`ManagedBox<T>`, `Vec<T, Managed>`) or a value type instead. See spec/memory.md §\"Marking a struct `@managed`\"." },
+    .{ .code = "CONC020", .subsystem = "Concurrency", .severity = .err, .message = "`tell` on a reply-bearing handler", .summary = "`c.tell(Msg)` is fire-and-forget, but `Msg`'s handler declares a reply (`handle Msg -> T`). Use `c.ask(Msg)` to receive the `Future<T>`. See spec/concurrency.md §\"`tell` vs `ask`\"." },
     .{ .code = "STR051", .subsystem = "Streams", .severity = .err, .message = "`pre()` on `Event<T>`", .summary = "`Event<T>` is pointwise and has no previous-tick value, so `.pre()` (the one-tick feedback delay) doesn't apply. `pre()` is for `Signal<T>` feedback cycles. See spec/streams.md §\"`pre()` for feedback cycles\"." },
     .{ .code = "REG050", .subsystem = "Regions", .severity = .err, .message = "unknown transfer verb", .summary = "The only cross-region/cross-heap move is `transfer(to: …)`. `copy_to`, `pin_to`, and `intern` are not in the language — rewrite the call as `value.transfer(to: <region>)`. See spec/memory.md §\"Cross-region transfers\"." },
 };

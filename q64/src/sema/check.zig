@@ -1329,6 +1329,58 @@ fn checkWithCapabilities(gpa: std.mem.Allocator, root: *const cst.Node, diags: *
     }
 }
 
+/// **CONC020** — `c.tell(Msg)` (fire-and-forget) on a message whose
+/// handler declares a reply (`handle Msg -> T`); the caller should use
+/// `c.ask(Msg)` (concurrency.md §"`tell` vs `ask`"). The actor body
+/// parses raw, so this works on the flat token stream: first collect the
+/// reply-bearing message names (a `handle Name … -> …` with a top-level
+/// `->` before the body `{`), then flag each `tell(Name)` whose message
+/// is reply-bearing.
+fn checkActorTell(gpa: std.mem.Allocator, root: *const cst.Node, diags: *std.ArrayList(Diag)) !void {
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(gpa);
+    try collectTokens(gpa, root, &toks);
+    const ts = toks.items;
+
+    // Pass 1: reply-bearing handler message names.
+    var reply = std.StringHashMap(void).init(gpa);
+    defer reply.deinit();
+    var i: usize = 0;
+    while (i < ts.len) : (i += 1) {
+        if (ts[i].kind != .KW_HANDLE) continue;
+        if (i + 1 >= ts.len or ts[i + 1].kind != .IDENT) continue;
+        const name = ts[i + 1].text;
+        // From after the name, a top-level `->` before the body `{` means
+        // the handler replies. The message pattern's own `( … )` is skipped.
+        var depth: i32 = 0;
+        var j = i + 2;
+        while (j < ts.len) : (j += 1) {
+            const k = ts[j].kind;
+            if (depth == 0 and k == .ARROW) {
+                try reply.put(name, {});
+                break;
+            }
+            if (depth == 0 and k == .L_BRACE) break; // body, no reply
+            switch (k) {
+                .L_PAREN, .L_BRACK, .L_ANGLE => depth += 1,
+                .R_PAREN, .R_BRACK, .R_ANGLE => depth -= 1,
+                else => {},
+            }
+        }
+    }
+    if (reply.count() == 0) return;
+
+    // Pass 2: `tell ( Name … )` where Name is reply-bearing.
+    i = 0;
+    while (i < ts.len) : (i += 1) {
+        if (ts[i].kind != .KW_TELL) continue;
+        if (i + 2 >= ts.len or ts[i + 1].kind != .L_PAREN or ts[i + 2].kind != .IDENT) continue;
+        if (reply.contains(ts[i + 2].text)) {
+            try diags.append(gpa, .{ .code = "CONC020", .offset = ts[i].offset });
+        }
+    }
+}
+
 /// True when a parameter's declared type is a `PathType` headed by
 /// `Event` (`Event<Point>`, `Event<T>`), i.e. a pointwise event stream.
 fn paramTypeIsEvent(gpa: std.mem.Allocator, p: ast.Param) bool {
@@ -1670,6 +1722,8 @@ pub fn checkFile(
     try checkManagedStructs(gpa, sf.cst, &diags);
     // ENV055: `with_capabilities(use: {…})` keys not on `Env`.
     try checkWithCapabilities(gpa, sf.cst, &diags);
+    // CONC020: `tell` on a reply-bearing actor handler.
+    try checkActorTell(gpa, sf.cst, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2191,6 +2245,29 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: CONC020 — `tell` on a reply-bearing handler" {
+    // `Get` declares a reply (`-> i64`), so `tell(Get)` is wrong.
+    try expectCodes(
+        \\actor Counter {
+        \\    handle Get -> i64 { state.count }
+        \\}
+        \\fn main { scope { let c = Counter.spawn()
+        \\    c.tell(Get) } }
+        \\
+    , &.{"CONC020"});
+    // `tell` on a non-reply handler is fine; `ask` on a reply handler is fine.
+    try expectCodes(
+        \\actor Counter {
+        \\    handle Inc { state.count = state.count + 1 }
+        \\    handle Get -> i64 { state.count }
+        \\}
+        \\fn main { scope { let c = Counter.spawn()
+        \\    c.tell(Inc)
+        \\    let n = c.ask(Get) } }
+        \\
+    , &.{});
 }
 
 test "check: ENV055 — `with_capabilities(use:)` field not on Env" {
