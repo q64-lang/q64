@@ -27,15 +27,17 @@ needs the platform audit, so it's the highest-leverage near-term work.
     transcendentals (`sin`/`cos`/…) via `q64.math` (gated on loadable stdlib
     qubes), and receiver-expression / record-field float receivers.
   - Strings/lists beyond the floor + `str`/list **component exports** (§"Strings…", §"Component emission").
-  - **`Vec.map` + `Vec.filter` done:** `let d = xs.map(|x| body)` /
-    `xs.filter(|x| pred)` build a fresh vec — `tryVecMap` desugars to `var d =
-    Vec.new(); for x in xs { … }` where the loop var IS the lambda parameter, so
-    the body resolves it (and any captured local) by ordinary scoping — no
-    inline-substitution needed. map pushes the body (i64); filter pushes the
-    element under an `if pred`. `v.map(|x| x*10)` → [10,20,30]; `v.map(|x| x +
-    base)` captures `base`; `v.filter(|x| x % 2 == 0)` keeps evens. Runs wasm64
-    + wasm32. **Boundary:** main-only (vec bindings are main-only); i64
-    elements; expr-body lambdas; `.reduce` and method-chaining are follow-ons.
+  - **`Vec.map` + `Vec.filter` + `Vec.reduce` done.** map/filter build a fresh
+    vec (`tryVecMap`, desugar `var d = Vec.new(); for x in xs { … }` — loop var
+    IS the lambda param, so body + captures resolve by ordinary scoping; map
+    pushes the body, filter pushes the element under an `if pred`). reduce folds
+    to a **scalar** (`tryVecReduce`, desugar `var total = init; for x in xs {
+    total = body }` — the binding IS the accumulator, the 2nd lambda param is
+    the loop var, the 1st (`acc`) is substituted to the accumulator via
+    `Scope.subst`). `v.map(|x| x*10)` → [10,20,30]; `v.filter(|x| x%2==0)` keeps
+    evens; `v.reduce(0, |acc,x| acc+x)` = 15, `reduce(1, |a,x| a*x)` = 120; all
+    capture locals. Runs wasm64 + wasm32. **Boundary:** main-only; i64;
+    expr-body lambdas; method-chaining (`xs.filter(…).map(…)`) is a follow-on.
   - Closures / lambdas (`spec/closures.md`). **Slice 1 (parsing) done:**
     `LambdaExpr := "|" IDENT,* "|" Expr` parses (`|x| x*2`, `|| 42`,
     `|a,b| { … }`) — a leading `|`/`||` in primary position is

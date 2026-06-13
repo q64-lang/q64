@@ -414,7 +414,9 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             } else if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let v = Vec.from([…])` — handled (vec_new + pushes).
             } else if (try tryVecMap(b, init_expr, nm.text, ls.isVar(), scope, out)) {
-                // `let d = xs.map(|x| …)` — handled (vec_new + mapped pushes).
+                // `let d = xs.map|filter(|x| …)` — handled (vec_new + pushes).
+            } else if (try tryVecReduce(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let r = xs.reduce(init, |acc, x| …)` — handled (scalar fold).
             } else if (if (init_expr == .call or isBoxedVariantPath(b, init_expr)) try buildRecExpr(b, init_expr, scope) else null) |rv| {
                 // `let p = make(3, 4)` / `let c = first([...])` — a
                 // record-returning call (incl. a generic whose `-> T`
@@ -4318,6 +4320,108 @@ fn tryVecMap(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool,
     return true;
 }
 
+/// `let total = xs.reduce(init, |acc, x| body)` (the v0 Vec floor): fold the
+/// vec to a scalar. Desugars to `var total = init; for x in xs { total =
+/// body }` — the let binding *is* the accumulator (init-seeded, mutated each
+/// step), the loop variable IS the lambda's second parameter, and the first
+/// parameter (`acc`) is substituted to the accumulator. Returns false when
+/// the initializer isn't `<vec>.reduce(<init>, <lambda>)`. i64 (v0).
+fn tryVecReduce(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cname = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
+    const src = cname[0..dot];
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "reduce")) return false;
+    if (!scope.vecs.contains(src)) return false;
+
+    var ait = cc.args();
+    const init_arg = ait.next() orelse return error.Unsupported;
+    const lam_arg = ait.next() orelse return reject(b, .unsupported_call); // reduce(init, |acc,x| …)
+    if (ait.next() != null) return error.Unsupported;
+    const lam = switch (lam_arg) {
+        .lambda => |l| l,
+        else => return reject(b, .unsupported_call),
+    };
+    const body = lambdaBodyExpr(lam) orelse return error.Unsupported;
+    var pit = lam.params();
+    const acc_param = (pit.next() orelse return error.Unsupported).text;
+    const x_param = (pit.next() orelse return error.Unsupported).text;
+    if (pit.next() != null) return error.Unsupported; // exactly two parameters
+
+    const sloc = scope.find(src) orelse return error.Unsupported;
+
+    // var total = init   (the accumulator IS the binding)
+    const init_val = try buildIntExpr(b, init_arg, scope);
+    const acc_idx = try declareBodyLocal(b, scope, dname, true, .i64);
+    const seed = try b.a.create(hir.Stmt);
+    seed.* = .{ .let = .{ .idx = acc_idx, .value = init_val } };
+    try out.append(b.a, seed);
+
+    // for x in src { total = body }  — `acc` resolves to the accumulator.
+    const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{x_param});
+    const i_idx = try declareBodyLocal(b, scope, hidden, true, .i64);
+    const x_idx = try declareBodyLocal(b, scope, x_param, false, .i64);
+    const zero = try b.a.create(hir.Expr);
+    zero.* = .{ .int_const = 0 };
+    const st0 = try b.a.create(hir.Stmt);
+    st0.* = .{ .let = .{ .idx = i_idx, .value = zero } };
+    try out.append(b.a, st0);
+
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    { // x = src[i]
+        const sref = try b.a.create(hir.Expr);
+        sref.* = .{ .local = .{ .idx = sloc.idx, .ty = .ptr } };
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const get = try b.a.create(hir.Expr);
+        get.* = .{ .vec_get = .{ .vec = sref, .idx = iref } };
+        const setx = try b.a.create(hir.Stmt);
+        setx.* = .{ .assign = .{ .idx = x_idx, .value = get } };
+        try items.append(b.a, setx);
+    }
+    { // total = <body>, with `acc` substituted to the accumulator
+        const accref = try b.a.create(hir.Expr);
+        accref.* = .{ .local = .{ .idx = acc_idx, .ty = .i64 } };
+        try scope.subst.put(b.a, acc_param, accref);
+        const newval = try buildIntExpr(b, body, scope);
+        _ = scope.subst.remove(acc_param);
+        const setacc = try b.a.create(hir.Stmt);
+        setacc.* = .{ .assign = .{ .idx = acc_idx, .value = newval } };
+        try items.append(b.a, setacc);
+    }
+    { // i = i + 1
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const one = try b.a.create(hir.Expr);
+        one.* = .{ .int_const = 1 };
+        const inc = try b.a.create(hir.Expr);
+        inc.* = .{ .bin = .{ .kind = .add, .lhs = iref, .rhs = one } };
+        const sti = try b.a.create(hir.Stmt);
+        sti.* = .{ .assign = .{ .idx = i_idx, .value = inc } };
+        try items.append(b.a, sti);
+    }
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
+
+    const iref2 = try b.a.create(hir.Expr);
+    iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+    const sref2 = try b.a.create(hir.Expr);
+    sref2.* = .{ .local = .{ .idx = sloc.idx, .ty = .ptr } };
+    const lenx = try b.a.create(hir.Expr);
+    lenx.* = .{ .vec_len = .{ .vec = sref2 } };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = .lt, .lhs = iref2, .rhs = lenx } };
+    const wst = try b.a.create(hir.Stmt);
+    wst.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try out.append(b.a, wst);
+    _ = mutable;
+    return true;
+}
+
 /// `for x in v { … }` over a vec binding: an index loop reading the
 /// live length each test (`while i < vec_len(v) { x = v[i]; …; i += 1 }`),
 /// so a body that pushes still terminates against the grown bound.
@@ -6339,6 +6443,20 @@ test "Vec.filter: a predicate-filtered vec (vec_new + guarded push)" {
     try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
+}
+
+test "Vec.reduce: a closure fold to a scalar (accumulator + per-element update)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var v = Vec.from([1, 2, 3, 4])\n let total = v.reduce(0, |acc, x| acc + x)\n env.out(total)\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // A scalar accumulator updated by a loop reading the elements.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "add") != null);
 }
 
 test "Vec parameter: a callee iterates a Vec passed by the caller" {
