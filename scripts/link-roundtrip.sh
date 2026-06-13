@@ -2056,6 +2056,34 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> record destructuring: let P { x, y } = p (rename, partial, callee body)"
+des_app="$tmp/destructure.q"
+cat > "$des_app" <<'Q64'
+struct P { x: i64, y: i64 }
+fn dist2(p: P) -> i64 {
+    let P { x, y } = p
+    x * x + y * y
+}
+fn main {
+    let p = P { x: 3, y: 4 }
+    let P { x, y } = p
+    env.out(x + y)
+    let P { x: a, y: b } = p
+    env.out(a * b)
+    env.out(dist2(p))
+    let P { x } = p
+    env.out(x)
+}
+Q64
+des_expected=$'7\n12\n25\n3'
+"$Q64_BIN" emit "$des_app" "$tmp/destructure.wasm"
+des_out="$("$HOST_BIN" "$tmp/destructure.wasm")"
+[[ "$des_out" == "$des_expected" ]] || { echo "FAIL: record destructuring (got: $des_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$des_app" "$tmp/destructure32.wasm" --addr wasm32
+des32_out="$("$HOST_BIN" "$tmp/destructure32.wasm")"
+[[ "$des32_out" == "$des_expected" ]] || { echo "FAIL: record destructuring wasm32 (got: $des32_out)" >&2; exit 1; }
+echo "    ok: record destructuring -> 7 / 12 / 25 / 3 (wasm64 + wasm32; rename + partial + callee)"
+
 echo "==> callee immediate-enum param: match c { … } over an all-unit enum argument"
 cee_app="$tmp/calleeenum.q"
 cat > "$cee_app" <<'Q64'

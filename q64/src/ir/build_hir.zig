@@ -300,6 +300,43 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     try buildScreenFuncs(b, sf);
 }
 
+/// `let P { x, y } = rec` — single-level record destructuring. Stashes the
+/// record's base pointer in a hidden local, then binds each named field to a
+/// fresh local read from it. v0: i64 fields, plain (non-nested) field binders
+/// — `x` binds the field to its own name, `x: other` renames. Emits its
+/// statements into `out`; works in `main` and callee bodies alike.
+fn buildRecordDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const rv = (try buildRecExpr(b, init_expr, scope)) orelse return error.Unsupported;
+    const base_idx = try declareBodyLocal(b, scope, "#destr", false, .ptr);
+    const set = try b.a.create(hir.Stmt);
+    set.* = .{ .let = .{ .idx = base_idx, .value = rv.e } };
+    try out.append(b.a, set);
+
+    var it = pat.recordFields();
+    var any = false;
+    while (it.next()) |fp| {
+        any = true;
+        const fname = (fp.name() orelse return error.Unsupported).text;
+        // `x: <sub>` — only a plain ident rename is in v0 scope; a nested
+        // pattern (`pos: Point { … }`, a literal) is deferred.
+        const bind_name = if (fp.subPattern()) |sp| blk: {
+            if (sp.kind() != .IDENT_PATTERN) return error.Unsupported;
+            break :blk (sp.bindingName() orelse return error.Unsupported).text;
+        } else fname;
+        const fld = rv.si.field(fname) orelse return reject(b, .name_not_found);
+        if (fld.ty != .i64) return error.Unsupported; // bool/narrow/str/record fields: later
+        const idx = try declareBodyLocal(b, scope, bind_name, false, .i64);
+        const base = try b.a.create(hir.Expr);
+        base.* = .{ .local = .{ .idx = base_idx, .ty = .ptr } };
+        const ld = try b.a.create(hir.Expr);
+        ld.* = .{ .field_get = .{ .base = base, .offset = fld.offset, .ty = .i64 } };
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .let = .{ .idx = idx, .value = ld } };
+        try out.append(b.a, st);
+    }
+    if (!any) return error.Unsupported; // `P {}` binds nothing
+}
+
 /// Build one statement of `main`'s body, appending 0+ HIR statements to `out`.
 /// Unlike a function body, `main` statements can write the host (`env.out`,
 /// `qview.*`) and have no value/tail — so this handles the host shapes *and*
@@ -308,7 +345,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
     switch (stmt) {
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
-            const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            const lpat = ls.pattern() orelse return error.Unsupported;
+            // `let P { x, y } = rec` — single-level record destructuring.
+            if (lpat.kind() == .RECORD_STRUCT_PATTERN) {
+                return buildRecordDestructure(b, lpat, init_expr, scope, out);
+            }
+            const nm = lpat.bindingName() orelse return error.Unsupported;
             // An immutable `let` whose initializer const-folds (incl. a
             // const-bodied call, e.g. `let v = version()`) becomes a
             // compile-time binding. A `var` is mutable, so it must stay a real
@@ -5691,7 +5733,16 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         },
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
-            const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            const lpat = ls.pattern() orelse return error.Unsupported;
+            // `let P { x, y } = rec` — single-level record destructuring; the
+            // binding statements ride in one block (callee bodies are i64-typed).
+            if (lpat.kind() == .RECORD_STRUCT_PATTERN) {
+                var items: std.ArrayList(*hir.Stmt) = .empty;
+                try buildRecordDestructure(b, lpat, init_expr, scope, &items);
+                out.* = .{ .block = try items.toOwnedSlice(b.a) };
+                return out;
+            }
+            const nm = lpat.bindingName() orelse return error.Unsupported;
             // The bind-the-match form (`let label = match s { … }`) in a callee:
             // same desugar as `main`'s C2 — a hidden result local assigned per
             // arm, then the name reads it. The whole thing rides in one block.
@@ -7282,6 +7333,49 @@ test "B2b: a non-escaping record binding still SROAs (no record_alloc)" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") == null);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null);
+}
+
+test "record destructuring: `let P { x, y } = p` binds fields (main + callee, rename + partial)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct P { x: i64, y: i64 }
+        \\
+        \\fn dist2(p: P) -> i64 {
+        \\    let P { x, y } = p
+        \\    x * x + y * y
+        \\}
+        \\
+        \\fn main {
+        \\    let p = P { x: 3, y: 4 }
+        \\    let P { x, y } = p
+        \\    env.out(x + y)
+        \\    let P { x: a, y: b } = p
+        \\    env.out(a * b)
+        \\    env.out(dist2(p))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Each field is a field_get off the stashed base pointer.
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null);
+
+    // A field the struct doesn't have is an honest NameNotFound.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\struct P { x: i64, y: i64 }
+        \\fn main {
+        \\    let p = P { x: 1, y: 2 }
+        \\    let P { z } = p
+        \\    env.out(z)
+        \\}
+        \\
+    )) == null);
 }
 
 test "B2b: a record-returning call binds the base pointer (`fn make -> ptr`)" {

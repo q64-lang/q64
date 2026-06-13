@@ -174,6 +174,18 @@ needs the platform audit, so it's the highest-leverage near-term work.
           variants — in both the value-`let` and statement-return callee forms.
           Runs wasm64 + wasm32 (roundtrip `2/3/10/30`). (Boxed-payload enum
           params already worked.)
+    - [x] **Record `let`-destructuring** (`let P { x, y } = p`): single-level
+          record destructuring (spec/grammar.md §Patterns `RecordStructPattern`).
+          `buildRecordDestructure` stashes the record's base pointer in a hidden
+          local, then binds each named field to a fresh local via `field_get`
+          at the field's offset (`ast.Pattern.recordFields()` →
+          `FieldPattern{name, subPattern}`). Supports rename (`x: a`) and
+          partial (`P { x }`) forms, in `main` and callee bodies. v0: i64
+          fields, plain (non-nested) binders. Runs wasm64 + wasm32 (roundtrip
+          `7 / 12 / 25 / 3`). **Next (deferred per spec):** nested struct
+          destructuring beyond one level (`P { pos: Point { x } }`), tuple
+          destructuring (`let (a, b) = pair`), plain struct-value `match`,
+          bool/str/narrow/record fields.
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the

@@ -1641,6 +1641,13 @@ pub const Pattern = struct {
         return .{ .lo = lo, .hi = hi, .inclusive = inclusive };
     }
 
+    /// Iterate the field patterns of a `RECORD_STRUCT_PATTERN` (`P { x, y }`).
+    /// Empty for any other pattern kind.
+    pub fn recordFields(self: Pattern) FieldPatternIter {
+        if (self.cst.kind != .RECORD_STRUCT_PATTERN) return .{ .children = &.{} };
+        return .{ .children = self.cst.children };
+    }
+
     pub fn isPatternKind(k: cst.SyntaxKind) bool {
         return switch (k) {
             .WILD_PATTERN,
@@ -1666,6 +1673,46 @@ pub const PatternIter = struct {
         while (self.i < self.children.len) : (self.i += 1) {
             switch (self.children[self.i]) {
                 .node => |n| if (Pattern.isPatternKind(n.kind)) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// One `FieldPattern` of a `RECORD_STRUCT_PATTERN` (`P { x, y: inner }`): the
+/// field name plus an optional sub-pattern (`y: inner`; plain `x` binds the
+/// field to its own name).
+pub const FieldPattern = struct {
+    cst: *const cst.Node,
+
+    pub fn name(self: FieldPattern) ?cst.Token {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .IDENT) return t,
+            .node => {},
+        };
+        return null;
+    }
+    pub fn subPattern(self: FieldPattern) ?Pattern {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Pattern.cast(n)) |p| return p,
+            .token => {},
+        };
+        return null;
+    }
+};
+
+pub const FieldPatternIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *FieldPatternIter) ?FieldPattern {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .FIELD_PATTERN) {
                     self.i += 1;
                     return .{ .cst = n };
                 },
