@@ -92,9 +92,18 @@ needs the platform audit, so it's the highest-leverage near-term work.
     section: exclusive / inclusive / variable bounds → 3/15/14). Now works in
     **callee bodies too** (`buildIntForRange`: same counted-loop desugar, body
     via `buildIntStmt`, returned as one block) — `fn sum_to(n) { var s=0\n for i
-    in 1..=n { s=s+i }\n s }` → 5050. **Boundary:** array/vec `for` is still
-    main-only; ranges as general values (`let r = 0..n`, slicing) are a
-    follow-on.
+    in 1..=n { s=s+i }\n s }` → 5050.
+  - **Vec parameters + callee `for`-over-Vec done:** a function can take a
+    `Vec<i64>` parameter and iterate it. `collectCalleeParams` recognizes a
+    `Vec<…>` param (one `.ptr`, registered in `scope.vecs`); a per-fn
+    `fn_vec_params` flag list lets `buildCallArgs` pass a caller's Vec by its
+    base pointer (a new `.vec` ParamKind); `buildIntForVec` lowers `for x in
+    xs` in the callee (index loop with `vec_get`/`vec_len`). `fn total(xs:
+    Vec<i64>) { for x in xs {…} }` + `total(Vec.from([10,20,5]))` → 35/20,
+    wasm64 + wasm32. **Boundary:** local `Vec.new()`/`for` *inside* a callee
+    (vec creation in callee bodies) and array `for` in callees are follow-ons;
+    `Vec.new()` as an initializer still isn't a recognized form (`Vec.from`
+    only); ranges as general values (`let r = 0..n`) too.
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**

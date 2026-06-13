@@ -132,6 +132,10 @@ const Builder = struct {
     fitreg: ?sema.fits.Registry = null,
     /// FuncId → its record params/return, for functions with a record surface.
     fn_recs: std.AutoHashMapUnmanaged(hir.FuncId, FnRec) = .empty,
+    /// Which of a function's parameters are `Vec<…>` (passed as a `.ptr`,
+    /// like a record, but iterated/indexed as a vec). Parallel to the hir
+    /// param list. Absent when the function has no vec params.
+    fn_vec_params: std.AutoHashMapUnmanaged(hir.FuncId, []const bool) = .empty,
     /// `main`'s body block, for the record-binding escape scan (does a bare
     /// `name` appear as a whole value anywhere in `main`?).
     main_body: ?ast.Block = null,
@@ -1478,6 +1482,15 @@ fn collectCalleeParams(
             // A `fn`-typed parameter is a closure slot — inlined at lowering,
             // so it has no runtime ABI and occupies no local slot.
             if (paramIsFnTyped(p)) continue;
+            // A `Vec<…>` parameter: one address-width pointer (like a record),
+            // registered as a vec so `for x in xs` / `xs[i]` resolve in the body.
+            if (paramIsVec(b, p)) {
+                _ = try scope.declare(pn, false, .ptr);
+                try scope.vecs.put(b.a, pn, {});
+                try params.append(b.a, .{ .name = pn, .ty = .ptr });
+                try rec_params.append(b.a, null);
+                continue;
+            }
             if (try paramScalar(b, p)) |psc| {
                 if (psc == .str) {
                     // A `str` param: one hir param (two wasm locals — ptr at
@@ -1558,6 +1571,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
     } else {
         rec_params.deinit(b.a);
     }
+    try recordVecParams(b, id, fd);
 
     // A record-returning function: v0 bodies are one tail statement — a
     // record expression (a literal, a passthrough param, an enum
@@ -4342,6 +4356,69 @@ fn buildIntForRange(b: *Builder, fs: ast.ForStmt, range: ast.RangeExpr, xname: [
     return out;
 }
 
+/// `for x in xs { … }` over a vec inside a *callee* body — the index loop
+/// `let i = 0; while i < xs.len { x = xs[i]; <body>; i = i+1 }`, body built
+/// through `buildIntStmt`, returned as one block. (i64 elements, v0 floor.)
+fn buildIntForVec(b: *Builder, fs: ast.ForStmt, vname: []const u8, xname: []const u8, scope: *Scope) BuildError!*hir.Stmt {
+    const vloc = scope.find(vname) orelse return error.Unsupported;
+    const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{xname});
+    const i_idx = try declareBodyLocal(b, scope, hidden, true, .i64);
+    const x_idx = try declareBodyLocal(b, scope, xname, false, .i64);
+
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    const zero = try b.a.create(hir.Expr);
+    zero.* = .{ .int_const = 0 };
+    const st0 = try b.a.create(hir.Stmt);
+    st0.* = .{ .let = .{ .idx = i_idx, .value = zero } };
+    try items.append(b.a, st0);
+
+    // body: x = xs[i]; <source body>; i = i + 1
+    var binner: std.ArrayList(*hir.Stmt) = .empty;
+    {
+        const vref = try b.a.create(hir.Expr);
+        vref.* = .{ .local = .{ .idx = vloc.idx, .ty = .ptr } };
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const get = try b.a.create(hir.Expr);
+        get.* = .{ .vec_get = .{ .vec = vref, .idx = iref } };
+        const setx = try b.a.create(hir.Stmt);
+        setx.* = .{ .assign = .{ .idx = x_idx, .value = get } };
+        try binner.append(b.a, setx);
+    }
+    var bit = (fs.body() orelse return error.Unsupported).statements();
+    while (bit.next()) |bs| try binner.append(b.a, try buildIntStmt(b, bs, scope));
+    {
+        const iref = try b.a.create(hir.Expr);
+        iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+        const one = try b.a.create(hir.Expr);
+        one.* = .{ .int_const = 1 };
+        const inc = try b.a.create(hir.Expr);
+        inc.* = .{ .bin = .{ .kind = .add, .lhs = iref, .rhs = one } };
+        const sti = try b.a.create(hir.Stmt);
+        sti.* = .{ .assign = .{ .idx = i_idx, .value = inc } };
+        try binner.append(b.a, sti);
+    }
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try binner.toOwnedSlice(b.a) };
+
+    // while i < xs.len (live header read)
+    const iref2 = try b.a.create(hir.Expr);
+    iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
+    const vref2 = try b.a.create(hir.Expr);
+    vref2.* = .{ .local = .{ .idx = vloc.idx, .ty = .ptr } };
+    const lenx = try b.a.create(hir.Expr);
+    lenx.* = .{ .vec_len = .{ .vec = vref2 } };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = .lt, .lhs = iref2, .rhs = lenx } };
+    const wst = try b.a.create(hir.Stmt);
+    wst.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try items.append(b.a, wst);
+
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try items.toOwnedSlice(b.a) };
+    return out;
+}
+
 /// A statement-position `v.push(x)` on a vec binding, or null.
 fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
     const cname = (callPathName(b, call)) orelse return null;
@@ -4370,10 +4447,11 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
     // Snapshot the parameter kinds before building the args — building an
     // argument may register a new callee and grow `b.funcs`, so we can't
     // hold a slice into it across the loop.
-    const ParamKind = union(enum) { int, float: hir.Type, bool_, str_, rec: *const StructInfo };
+    const ParamKind = union(enum) { int, float: hir.Type, bool_, str_, rec: *const StructInfo, vec };
     const np = b.funcs.items[id].params.len;
     const kinds = try b.a.alloc(ParamKind, np);
     const frec = b.fn_recs.get(id);
+    const vflags = b.fn_vec_params.get(id);
     for (b.funcs.items[id].params, 0..) |p, k| {
         kinds[k] = switch (p.ty) {
             .bool => .bool_,
@@ -4381,8 +4459,11 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
             .f64 => .{ .float = .f64 },
             .f32 => .{ .float = .f32 },
             .str => .str_,
-            // A `.ptr` param is a record on this path (str callees never get here).
-            .ptr => .{ .rec = (frec orelse return error.Unsupported).params[k] orelse return error.Unsupported },
+            // A `.ptr` param is a vec or a record (str callees never get here).
+            .ptr => if (vflags != null and k < vflags.?.len and vflags.?[k])
+                .vec
+            else
+                .{ .rec = (frec orelse return error.Unsupported).params[k] orelse return error.Unsupported },
             else => return error.Unsupported,
         };
     }
@@ -4401,6 +4482,19 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
                 const rv = (try buildRecExpr(b, a, scope)) orelse return reject(b, .unsupported_call);
                 if (rv.si != want and !enumCompatible(b, rv.si, want)) return reject(b, .unsupported_call); // a different struct
                 try args.append(b.a, rv.e);
+            },
+            .vec => {
+                // Pass a vec binding's base pointer (the arg is a vec name).
+                const vn = switch (a) {
+                    .path => |pp| try pp.text(b.a),
+                    else => return reject(b, .unsupported_call),
+                };
+                defer b.a.free(vn);
+                if (!scope.vecs.contains(vn)) return reject(b, .unsupported_call);
+                const loc = scope.find(vn) orelse return reject(b, .unsupported_call);
+                const vref = try b.a.create(hir.Expr);
+                vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                try args.append(b.a, vref);
             },
             // No implicit conversion: each arg's scalar kind must match
             // its parameter (bool ≠ int ≠ float).
@@ -4489,6 +4583,37 @@ fn floatBuiltinKind(method: []const u8) ?ops.UnKind {
 fn paramIsFnTyped(p: ast.Param) bool {
     const ty = p.type_() orelse return false;
     return ty == .raw and ty.raw.cst.kind == .FN_TYPE;
+}
+
+/// True when a parameter is `Vec<…>`-typed (passed as a `.ptr`, iterated
+/// as a vec in the callee body).
+fn paramIsVec(b: *Builder, p: ast.Param) bool {
+    const ty = p.type_() orelse return false;
+    if (ty != .path) return false;
+    const nm = ty.path.name(b.a) catch return false;
+    defer b.a.free(nm);
+    return std.mem.eql(u8, nm, "Vec");
+}
+
+/// Build the vec-param flags (parallel to the hir param list) for `fd`, and
+/// record them on `id` if any parameter is a vec. Call after the params are
+/// collected (it re-scans `fd`, skipping the inlined `fn`-typed params).
+fn recordVecParams(b: *Builder, id: hir.FuncId, fd: ast.FnDecl) BuildError!void {
+    const ps = fd.params() orelse return;
+    var flags: std.ArrayList(bool) = .empty;
+    var any = false;
+    var it = ps.iter();
+    while (it.next()) |p| {
+        if (paramIsFnTyped(p)) continue; // not a runtime param
+        const is_vec = paramIsVec(b, p);
+        if (is_vec) any = true;
+        try flags.append(b.a, is_vec);
+    }
+    if (any) {
+        try b.fn_vec_params.put(b.a, id, try flags.toOwnedSlice(b.a));
+    } else {
+        flags.deinit(b.a);
+    }
 }
 
 /// Does `fd` have a `fn`-typed parameter (i.e. is it higher-order)?
@@ -5026,7 +5151,13 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
             const iter = fs.iterable() orelse return error.Unsupported;
             if (iter == .range) return buildIntForRange(b, fs, iter.range, pat.text, scope);
-            return error.Unsupported; // array/vec `for` in a callee body: a follow-on
+            // `for x in xs` over a vec parameter/binding.
+            if (iter == .path) {
+                const nm = try iter.path.text(b.a);
+                defer b.a.free(nm);
+                if (scope.vecs.contains(nm)) return buildIntForVec(b, fs, nm, pat.text, scope);
+            }
+            return error.Unsupported; // array `for` in a callee body: a follow-on
         },
         .break_stmt => |bs| {
             if (bs.value() != null) return error.Unsupported; // value-break not supported
@@ -6058,6 +6189,22 @@ test "closures: a lambda captures a runtime local (capture-by-extra-param)" {
     // The capture rides as an extra param `g`, and the body adds it.
     try testing.expect(std.mem.indexOf(u8, dump, "apply#L") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "add") != null);
+}
+
+test "Vec parameter: a callee iterates a Vec passed by the caller" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn total(xs: Vec<i64>) -> i64 {\n var s = 0\n for x in xs { s = s + x }\n s\n}\n");
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var v = Vec.from([1, 2, 3])\n env.out(total(v))\n}\n", tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The callee iterates the vec param (vec_get/vec_len in `total`).
+    try testing.expect(std.mem.indexOf(u8, dump, "fn total") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
 }
 
 test "for-range in a callee body: `for i in 1..=n` counted loop" {

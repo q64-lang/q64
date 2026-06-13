@@ -1964,4 +1964,32 @@ rng32_out="$("$HOST_BIN" "$tmp/ranges32.wasm")"
 [[ "$rng32_out" == "$rng_expected" ]] || { echo "FAIL: ranges wasm32 (got: $rng32_out)" >&2; exit 1; }
 echo "    ok: ranges -> 3 / 15 / 14 / 5050 (wasm64 + wasm32; main + callee-body for, var bounds)"
 
+echo "==> Vec parameters: a function iterates a Vec passed by the caller"
+vpr_app="$tmp/vecparam.q"
+cat > "$vpr_app" <<'Q64'
+fn total(xs: Vec<i64>) -> i64 {
+    var s = 0
+    for x in xs { s = s + x }
+    s
+}
+fn biggest(xs: Vec<i64>) -> i64 {
+    var m = 0
+    for x in xs { if x > m { m = x } }
+    m
+}
+fn main {
+    var v = Vec.from([10, 20, 5])
+    env.out(total(v))
+    env.out(biggest(v))
+}
+Q64
+vpr_expected=$'35\n20'
+"$Q64_BIN" emit "$vpr_app" "$tmp/vecparam.wasm"
+vpr_out="$("$HOST_BIN" "$tmp/vecparam.wasm")"
+[[ "$vpr_out" == "$vpr_expected" ]] || { echo "FAIL: vec params (got: $vpr_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$vpr_app" "$tmp/vecparam32.wasm" --addr wasm32
+vpr32_out="$("$HOST_BIN" "$tmp/vecparam32.wasm")"
+[[ "$vpr32_out" == "$vpr_expected" ]] || { echo "FAIL: vec params wasm32 (got: $vpr32_out)" >&2; exit 1; }
+echo "    ok: vec params -> 35 / 20 (wasm64 + wasm32; callee for-over-Vec)"
+
 echo "PASS: $qube_out"
