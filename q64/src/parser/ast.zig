@@ -1118,14 +1118,14 @@ pub const TypeExpr = union(enum) {
             .ARRAY_TYPE => .{ .array = .{ .cst = node } },
             .TUPLE_TYPE => .{ .tuple = .{ .cst = node } },
             .OPTIONAL_TYPE => .{ .optional = .{ .cst = node } },
-            .TYPE_EXPR => .{ .raw = .{ .cst = node } },
+            .TYPE_EXPR, .FN_TYPE => .{ .raw = .{ .cst = node } },
             else => null,
         };
     }
 
     pub fn isTypeKind(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .PATH_TYPE, .REF_TYPE, .SLICE_TYPE, .ARRAY_TYPE, .TUPLE_TYPE, .OPTIONAL_TYPE, .TYPE_EXPR => true,
+            .PATH_TYPE, .REF_TYPE, .SLICE_TYPE, .ARRAY_TYPE, .TUPLE_TYPE, .OPTIONAL_TYPE, .TYPE_EXPR, .FN_TYPE => true,
             else => false,
         };
     }

@@ -1288,6 +1288,7 @@ const Parser = struct {
             },
             .L_BRACK => return self.parseBracketType(),
             .L_PAREN => return self.parseTupleType(),
+            .KW_FN => return self.parseFnType(),
             .IDENT => return self.parsePathType(),
             .AMP => {
                 // `&T` is not q64's reference syntax — references are `ref T`
@@ -1303,6 +1304,49 @@ const Parser = struct {
             },
             else => return self.parseRawType(),
         }
+    }
+
+    /// `FnType := "fn" "(" FnTypeParams? ")" ("->" TypeExpr)?` (spec/grammar.md
+    /// §Type expressions). Parameters are bare `TypeExpr`s in v0 usage
+    /// (`fn(i64, i64) -> i64`); each is wrapped in an FN_TYPE_PARAM. An effect
+    /// spec after the return type isn't parsed yet (rare on a `fn` type).
+    fn parseFnType(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // fn
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_PAREN) {
+            try children.append(self.arena, .{ .node = try self.parseFnTypeParams() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .ARROW) {
+            try children.append(self.arena, .{ .token = self.advance() }); // ->
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .node = try self.parseType() });
+        }
+        return try cst.makeNode(self.arena, .FN_TYPE, children.items);
+    }
+
+    /// `"(" (TypeExpr ("," TypeExpr)*)? ")"` — the parameter types of a `fn`
+    /// type, each wrapped in an FN_TYPE_PARAM.
+    fn parseFnTypeParams(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // (
+        try self.eatTrivia(&children);
+        while (!self.isEof() and self.peek() != .R_PAREN) {
+            const before = self.pos;
+            const ty = try self.parseType();
+            try children.append(self.arena, .{ .node = try cst.makeNode(self.arena, .FN_TYPE_PARAM, &[_]cst.Element{.{ .node = ty }}) });
+            try self.eatTrivia(&children);
+            if (self.peek() == .COMMA) {
+                try children.append(self.arena, .{ .token = self.advance() });
+                try self.eatTrivia(&children);
+            }
+            if (self.pos == before) break; // no progress — degrade safely
+        }
+        if (self.peek() == .R_PAREN) {
+            try children.append(self.arena, .{ .token = self.advance() }); // )
+        }
+        return try cst.makeNode(self.arena, .FN_TYPE_PARAMS, children.items);
     }
 
     /// `PathType := IDENT ("." IDENT)* GenericArgs?`. Generic args are a
@@ -3324,6 +3368,26 @@ test "effect declaration parses as an item and round-trips" {
     const first = iter.next() orelse return error.TestExpectedItem;
     try testing.expectEqualStrings("logging", first.effect_decl.name().?.text);
     try testing.expect(first.effect_decl.isPublic());
+}
+
+test "fn types parse structured and round-trip" {
+    const src = "fn main {\n    let f: fn(i64) -> i64 = |x| x\n    let g: fn(i64, f64) -> bool = |a, b| a > 0\n    let h: fn() -> i64 = || 0\n    env.out(\"ok\")\n}\n";
+    const r = try parse(testing.allocator, src, "fnty.q");
+    defer r.deinit(testing.allocator);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try cst.serialize(r.root, testing.allocator, &out);
+    try testing.expectEqualStrings(src, out.items);
+
+    // The first `let`'s annotation is a structured FN_TYPE.
+    const sf = ast.SourceFile.cast(r.root).?;
+    var it = sf.items();
+    const fd = (it.next() orelse return error.TestExpectedItem).fn_decl;
+    var stmts = fd.body().?.statements();
+    const ls = (stmts.next() orelse return error.TestExpectedStmt).let_stmt;
+    const annot = ls.type_() orelse return error.TestExpectedType;
+    try testing.expect(annot == .raw);
+    try testing.expect(annot.raw.cst.kind == .FN_TYPE);
 }
 
 test "lambda literals parse, surface params, and round-trip" {

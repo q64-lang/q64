@@ -41,10 +41,23 @@ needs the platform audit, so it's the highest-leverage near-term work.
     a follow-on); TYP352 (assign to an immutable capture) needs capture
     analysis, deferred. 1 check case (5 asserts); no conformance test (closures
     aren't in the corpus) but the golden's `.map(|x| …)` stays clean.
-    **Next (slice 3, the big one):** monomorphizing, non-escaping lowering —
-    specialize the higher-order fn per lambda, captures as aliases; builds on
-    the B5 monomorphization machinery. Needs `fn`-typed params on user
-    functions + a higher-order call site to specialize into.
+    **Slice 3a (fn-type parsing) done:** `FnType := "fn" "(" TypeExpr,* ")"
+    ("->" TypeExpr)?` parses structured (FN_TYPE / FN_TYPE_PARAMS /
+    FN_TYPE_PARAM) instead of a raw blob; `TypeExpr.cast` maps `FN_TYPE` →
+    `.raw` so `let f: fn(i64)->i64 = …` annotations are recognized (TYP350/351
+    read them). Round-trips losslessly; parser test. **Slice 3b (the big one,
+    the lowering):** monomorphizing, non-escaping specialization — at a call
+    `apply(|n| n*2, x)` where `apply(f: fn(i64)->i64, …)` has a fn-typed param,
+    stamp a specialized `apply` whose `f(args)` sites are **inlined** with the
+    lambda body (params bound to the args; captures aliased; no env box). This
+    touches `registerFunc`/`collectCalleeParams`/the body builders (load-
+    bearing — every function) and mirrors the B5 `stampGeneric` machinery; it's
+    a multi-increment change to do carefully with the suite green at each step.
+    Plan: (i) `collectCalleeParams` recognizes + skips an fn-typed param (no
+    runtime slot — it's inlined); (ii) a per-call-site specialization keyed by
+    the lambda; (iii) the body builder's `.call` arm inlines `f(args)` →
+    lambda body with the lambda params bound. Start with non-capturing lambdas;
+    alias-capture follows.
   - Units & dimensional arithmetic (`spec/units.md`; lexed, not evaluated).
   - Pattern-grammar completion (§"Other open items" — close the `(* open *)` markers).
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
