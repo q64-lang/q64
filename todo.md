@@ -1190,12 +1190,22 @@ verified, honest diagnostics throughout.
       hop is non-realtime upstream, silent). Catalog entry + 1 check case
       (2 asserts); conformance `streams/realtime-pipe-violation` flips →
       **43/51**; the reverse "buffered stream → `@realtime`" shape needs
-      stream-type info and is a follow-on) → next: the `From` conversion
-      on `try`, EFF110, and the remaining gaps — dataflow type matching
-      (STR020), generic inference (TYP102), optional flow-narrowing
-      (TYP047), face/dyn-safety (TYP306/not-dyn-safe/no-fit-for-bound),
-      region escape analysis (REG040), qube-root resolution (NAM002), and
-      the reverted PAR040 heuristic.
+      stream-type info and is a follow-on) → TYP306 wired (landed: a
+      `panic <payload>` whose type doesn't fit the `Panic` face —
+      errors.md §"`panic` and `trap`". `checkPanicPayload` collects this
+      file's `fit T : Panic` targets (via `FitSpec.target()`/`.face()`),
+      then `scanPanicPayload` flags a **record-literal** panic payload
+      (`NotAPanic { … }`) whose type is outside that set ∪ the blessed
+      prelude payloads (`PanicMessage`/`Cancelled`/`Closed`/
+      `RuntimeDenied`). String / bare-path / call payloads are left to the
+      full payload-type check. Catalog entry + 1 check case (3 asserts);
+      conformance `errors/panic-payload-not-panic-fitting` flips →
+      **44/51**) → next: the `From` conversion on `try`, EFF110, and the
+      remaining 7 — dataflow type matching (STR020), generic inference
+      (TYP102), optional flow-narrowing (TYP047), face dyn-safety
+      (TYP207/not-dyn-safe; no-fit-for-bound TYP200), region escape
+      analysis (REG040), qube-root resolution (NAM002), and the reverted
+      PAR040 heuristic.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

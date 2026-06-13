@@ -1329,6 +1329,71 @@ fn checkWithCapabilities(gpa: std.mem.Allocator, root: *const cst.Node, diags: *
     }
 }
 
+/// The blessed auto-prelude `Panic`-fitting payload types (errors.md
+/// §"Auto-prelude payload types"). User types fit via `fit T : Panic`.
+const prelude_panic_types = [_][]const u8{ "PanicMessage", "Cancelled", "Closed", "RuntimeDenied" };
+
+/// Recursively flag `panic <RecordLit>` whose type doesn't fit `Panic`
+/// (TYP306). `fits` holds this file's `fit T : Panic` target names.
+fn scanPanicPayload(
+    gpa: std.mem.Allocator,
+    node: *const cst.Node,
+    panic_fits: *const std.StringHashMap(void),
+    diags: *std.ArrayList(Diag),
+) std.mem.Allocator.Error!void {
+    if (node.kind == .PANIC_STMT) {
+        const ps = ast.PanicStmt{ .cst = node };
+        if (ps.value()) |v| switch (v) {
+            // A record-literal payload (`NotAPanic { … }`) names its type
+            // outright; a string / bare path / call payload is left to the
+            // (future) full payload-type check.
+            .record => |rec| if (rec.path()) |p| {
+                if (pathFirstIdent(p.cst)) |head| {
+                    var ok = panic_fits.contains(head.text);
+                    for (prelude_panic_types) |t| {
+                        if (std.mem.eql(u8, t, head.text)) ok = true;
+                    }
+                    if (!ok) try diags.append(gpa, .{ .code = "TYP306", .offset = head.offset });
+                }
+            },
+            else => {},
+        };
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try scanPanicPayload(gpa, n, panic_fits, diags),
+        .token => {},
+    };
+}
+
+/// **TYP306** — a `panic <payload>` whose payload type doesn't fit the
+/// `Panic` face (errors.md §"`panic` and `trap`"). Collects this file's
+/// `fit T : Panic` targets, then flags a record-literal panic payload
+/// outside that set ∪ the blessed prelude payload types.
+fn checkPanicPayload(gpa: std.mem.Allocator, sf: ast.SourceFile, diags: *std.ArrayList(Diag)) !void {
+    var panic_fits = std.StringHashMap(void).init(gpa);
+    defer {
+        var kit = panic_fits.keyIterator();
+        while (kit.next()) |k| gpa.free(k.*);
+        panic_fits.deinit();
+    }
+    var it = sf.items();
+    while (it.next()) |item| {
+        if (item != .fit_decl) continue;
+        const spec = item.fit_decl.spec() orelse continue;
+        const face = spec.face() orelse continue;
+        const target = spec.target() orelse continue;
+        if (face != .path or target != .path) continue;
+        const fname = face.path.name(gpa) catch continue;
+        defer gpa.free(fname);
+        if (!std.mem.eql(u8, fname, "Panic")) continue;
+        const tname = target.path.name(gpa) catch continue;
+        // `panic_fits` keeps a copy; dupe so it outlives this iteration.
+        try panic_fits.put(try gpa.dupe(u8, tname), {});
+        gpa.free(tname);
+    }
+    try scanPanicPayload(gpa, sf.cst, &panic_fits, diags);
+}
+
 /// The function name of a call whose closing `)` is at `ts[end]`, found
 /// by matching back to the opening `(` and reading the IDENT before it
 /// (`play(env.audio)` ending at `)` → `play`). A bare IDENT at `end`
@@ -1925,6 +1990,8 @@ pub fn checkFile(
     try checkChannelPolicy(gpa, sf.cst, &diags);
     // STR060: a `@realtime` stage piped into a non-`@realtime` stage.
     try checkRealtimePipe(gpa, sf, &diags);
+    // TYP306: a `panic` payload whose type doesn't fit `Panic`.
+    try checkPanicPayload(gpa, sf, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -2446,6 +2513,20 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: TYP306 — panic payload that doesn't fit Panic" {
+    // A user struct with no `fit … : Panic`.
+    try expectCodes("struct NotAPanic { x: i64 }\nfn main { panic NotAPanic { x: 42 } }\n", &.{"TYP306"});
+    // A declared `fit T : Panic` makes the payload valid.
+    try expectCodes(
+        \\struct MyErr { code: i64 }
+        \\fit MyErr : Panic { fn code(self) -> i64 { self.code } }
+        \\fn main { panic MyErr { code: 1 } }
+        \\
+    , &.{});
+    // A blessed prelude payload is fine.
+    try expectCodes("fn main { panic RuntimeDenied { code: \"E\", detail: \"d\" } }\n", &.{});
 }
 
 test "check: STR060 — @realtime stage piped into a non-realtime stage" {
