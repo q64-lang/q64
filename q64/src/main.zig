@@ -155,6 +155,27 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
         defer gpa.free(sema_diags);
         try all_diags.appendSlice(gpa, sema_diags);
 
+        // NAM002 — a quoted-relative import that escapes the qube. Needs the
+        // filesystem (the qube root, walked up to the nearest `qube.json5`), so
+        // it lives here rather than in the pure sema pass.
+        const qube_root = findQubeRoot(gpa, io, path) catch null;
+        defer if (qube_root) |r| gpa.free(r);
+        var iit = sf.imports();
+        while (iit.next()) |imp| {
+            if (!imp.isRelative()) continue;
+            const ipath = (try imp.path(gpa)) orelse continue;
+            defer gpa.free(ipath);
+            if (importEscapesQube(gpa, io, path, ipath, qube_root) catch false) {
+                try all_diags.append(gpa, .{
+                    .code = "NAM002",
+                    .severity = .err,
+                    .message = diag.messageFor("NAM002"),
+                    .file = path,
+                    .offset = imp.offset(),
+                });
+            }
+        }
+
         // The fit registry: powers the fit-form checks (TYP201 / TYP202,
         // spec/faces.md §"Fit declaration") and the check pass's generic
         // bound check (TYP200).
@@ -428,6 +449,71 @@ fn termCode(term: std.process.Child.Term) ?u8 {
         .exited => |code| code,
         else => null,
     };
+}
+
+/// Walk up from `file_path`'s directory looking for `qube.json5`; return the
+/// owned absolute directory of the nearest one (the qube root), or null when no
+/// manifest is found (a loose file checked outside any qube).
+fn findQubeRoot(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8) !?[]u8 {
+    const dir = std.fs.path.dirname(file_path) orelse ".";
+    const abs = if (std.fs.path.isAbsolute(dir))
+        try gpa.dupe(u8, dir)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd);
+        break :blk try std.fs.path.join(gpa, &.{ cwd, dir });
+    };
+    defer gpa.free(abs);
+
+    var cur: []const u8 = abs;
+    while (true) {
+        const candidate = try std.fs.path.join(gpa, &.{ cur, "qube.json5" });
+        defer gpa.free(candidate);
+        const ok = blk: {
+            std.Io.Dir.cwd().access(io, candidate, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (ok) return try gpa.dupe(u8, cur);
+        const parent = std.fs.path.dirname(cur) orelse return null;
+        if (std.mem.eql(u8, parent, cur)) return null;
+        cur = parent;
+    }
+}
+
+/// True when `child` is `parent` or lies beneath it (path-prefix with a `/`
+/// boundary), both assumed normalized + absolute.
+fn isPathUnder(child: []const u8, parent: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    return child.len == parent.len or child[parent.len] == std.fs.path.sep;
+}
+
+/// NAM002 test: does a quoted-relative `import_str` (resolved against the
+/// importing file's directory) escape the qube? The boundary is the qube root
+/// when a `qube.json5` was found; otherwise the file's own directory (a loose
+/// file is treated as its own root, so any `../` that climbs out is flagged).
+fn importEscapesQube(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+    import_str: []const u8,
+    qube_root: ?[]const u8,
+) !bool {
+    const dir = std.fs.path.dirname(file_path) orelse ".";
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const file_abs = if (std.fs.path.isAbsolute(dir))
+        try gpa.dupe(u8, dir)
+    else
+        try std.fs.path.join(gpa, &.{ cwd, dir });
+    defer gpa.free(file_abs);
+
+    const resolved = try std.fs.path.resolve(gpa, &.{ file_abs, import_str });
+    defer gpa.free(resolved);
+
+    const root_norm = try std.fs.path.resolve(gpa, &.{qube_root orelse file_abs});
+    defer gpa.free(root_norm);
+
+    return !isPathUnder(resolved, root_norm);
 }
 
 /// Walk up from `start` to the repo root — the directory holding `vendor/zig`.

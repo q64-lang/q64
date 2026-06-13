@@ -1271,11 +1271,30 @@ verified, honest diagnostics throughout.
       comparisons (`a < b && c > d`, outer op not relational) are left
       alone; `Box<i64, heap>` stops at the comma (single op). Catalog
       entry already present; 1 check case (4 asserts); conformance
-      `parser/generic-vs-less-than` flips → **50/51**) → remaining 1:
-      NAM002 (qube-root resolution — standalone `q64 check` reads no
-      manifest, and `../shared/util.q` is a valid spec example, so whether
-      a relative path escapes is depth-dependent; needs a qube-root walked
-      up from the file or passed via a flag).
+      `parser/generic-vs-less-than` flips → **50/51**) → NAM002 wired
+      (landed: a quoted-relative import that escapes the qube — modules.md
+      §"Resolution algorithm". Needs the filesystem, so it lives in
+      `cmdCheck` (main.zig), not the pure sema pass: `findQubeRoot` walks
+      up from the file's directory to the nearest `qube.json5` (the qube
+      root); `importEscapesQube` resolves+normalizes the import against the
+      importing file's directory and flags it when it lands outside the
+      root. When no manifest is found (a loose file checked standalone, as
+      in the conformance corpus) the file's own directory is the boundary,
+      so `../../../other-qube/...` is flagged while a real qube's in-tree
+      `../shared/util.q` resolves correctly under its manifest root. Uses
+      `ast.ImportStmt.isRelative()/.path()` + a new `.offset()`. Conformance
+      `modules/import-path-escapes-qube` flips → **51/51 — FULL CONFORMANCE**;
+      unit / 81 CLI / round-trips all green.)
+
+**Conformance corpus complete: 51 of 51.** The diagnostic ladder (begun
+from the 31/51 floor) is finished — every spec/tests case passes, message
+text aside. Net-new diagnostics this arc: LEX020, EFF120/EFF140/EFF141,
+EFF160, ENV055/ENV056, REG020/REG040/REG050, STR020/STR051/STR060,
+CONC020/CONC050/CONC053, TYP047/TYP102/TYP207/TYP306, PAR040, NAM002, plus
+structured fn effect-spec parsing. Next frontiers are no longer the
+negative-diagnostic corpus: positive codegen surface (the IR/codegen
+ladder) and the deferred parser items (structured `graph`/`scope`/`actor`
+bodies, leading annotations).
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction

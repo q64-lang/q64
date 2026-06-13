@@ -201,6 +201,15 @@ pub const ImportStmt = struct {
         return firstChildRawNode(self.cst, .IMPORT_PATH);
     }
 
+    /// The offset of the `import` keyword (for diagnostics).
+    pub fn offset(self: ImportStmt) u32 {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (!t.kind.isTrivia()) return t.offset,
+            .node => {},
+        };
+        return 0;
+    }
+
     /// True for `import "./util.q"` forms; false for bare-dotted module
     /// paths like `import dev.q64.foo`.
     pub fn isRelative(self: ImportStmt) bool {
