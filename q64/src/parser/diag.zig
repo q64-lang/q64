@@ -170,6 +170,7 @@ pub const codes = [_]CodeInfo{
     .{ .code = "EFF160", .subsystem = "Effects", .severity = .err, .message = "`@cancel` without `ctx` parameter", .summary = "A function declared `@cancel` observes cancellation, so it must take a `ctx: Cancel` parameter. Add `ctx: Cancel` to the signature, or drop `@cancel` if the function doesn't observe `ctx.cancelled()`. See spec/effects.md §\"`@cancel` and `@uncancellable`\"." },
     .{ .code = "EFF140", .subsystem = "Effects", .severity = .err, .message = "user effect shadows a core marker", .summary = "A `pub effect @<name>` reuses the name of a blessed core marker (e.g. `@realtime`, `@io`, `@pure`). Pick a non-colliding name for the user-defined effect. See spec/effects.md §\"User-defined effects\"." },
     .{ .code = "EFF141", .subsystem = "Effects", .severity = .err, .message = "invalid effect name", .summary = "A user-defined effect name must match `^@[a-z][a-z_]*$` — lowercase letters and underscores, leading letter (e.g. `@logging`, `@audit`). See spec/effects.md §\"User-defined effects\"." },
+    .{ .code = "REG050", .subsystem = "Regions", .severity = .err, .message = "unknown transfer verb", .summary = "The only cross-region/cross-heap move is `transfer(to: …)`. `copy_to`, `pin_to`, and `intern` are not in the language — rewrite the call as `value.transfer(to: <region>)`. See spec/memory.md §\"Cross-region transfers\"." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"

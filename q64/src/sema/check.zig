@@ -1187,6 +1187,68 @@ fn checkPureEnv(gpa: std.mem.Allocator, fd: ast.FnDecl, es: ast.EffectSpec, diag
     }
 }
 
+/// Reserved non-verbs the language deliberately omits: the only
+/// cross-region move is `transfer(to: …)`. `copy_to` / `pin_to` /
+/// `intern` are absent (memory.md §"Cross-region transfers"), so a
+/// method call by any of these names is REG050.
+const reserved_nonverbs = [_][]const u8{ "copy_to", "pin_to", "intern" };
+
+fn flagIfReservedVerb(gpa: std.mem.Allocator, tok: cst.Token, diags: *std.ArrayList(Diag)) !void {
+    for (reserved_nonverbs) |v| {
+        if (std.mem.eql(u8, v, tok.text)) {
+            try diags.append(gpa, .{ .code = "REG050", .offset = tok.offset });
+            return;
+        }
+    }
+}
+
+/// The last dotted segment of a `PATH_EXPR` (`a.copy_to` → `copy_to`),
+/// but only when the path actually has a `.` — a bare name is not a verb
+/// call. Used to read the verb out of `recv.verb(...)`.
+fn dottedLastSegment(path: *const cst.Node) ?cst.Token {
+    var last: ?cst.Token = null;
+    var seen_dot = false;
+    for (path.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind == .DOT) seen_dot = true else if (t.kind == .IDENT) last = t;
+        },
+        .node => {},
+    };
+    return if (seen_dot) last else null;
+}
+
+/// **REG050** — a call using an unknown transfer verb. The receiver form
+/// `recv.verb(args)` parses two ways: as a `METHOD_EXPR` (receiver is a
+/// non-path expression, `make().copy_to(r)`) or — the common case — as a
+/// `CALL_EXPR` over a greedy dotted `PATH_EXPR` (`a.copy_to` + args). Both
+/// are scanned; the verb is flagged at its token.
+fn checkTransferVerbs(
+    gpa: std.mem.Allocator,
+    node: *const cst.Node,
+    diags: *std.ArrayList(Diag),
+) std.mem.Allocator.Error!void {
+    switch (node.kind) {
+        .METHOD_EXPR => {
+            const me = ast.MethodExpr{ .cst = node };
+            if (me.method()) |m| try flagIfReservedVerb(gpa, m, diags);
+        },
+        .CALL_EXPR => for (node.children) |c| switch (c) {
+            .node => |n| {
+                if (n.kind == .PATH_EXPR) {
+                    if (dottedLastSegment(n)) |seg| try flagIfReservedVerb(gpa, seg, diags);
+                }
+                break; // the callee is the first child node
+            },
+            .token => {},
+        },
+        else => {},
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try checkTransferVerbs(gpa, n, diags),
+        .token => {},
+    };
+}
+
 /// The auto-prelude typed-string prefixes (modules.md §"Typed-prefix
 /// string literals", types.md §"Typed-prefix form"). v0 ships the one
 /// the prelude blesses: `url"…"`, reachable because `Url` appears in
@@ -1400,6 +1462,8 @@ pub fn checkFile(
 
     // LEX020: unknown typed-string prefixes (`xyz"…"`) anywhere in the file.
     try checkTypedPrefixes(gpa, sf.cst, &diags);
+    // REG050: unknown transfer verbs (`a.copy_to(r)`, …) anywhere in the file.
+    try checkTransferVerbs(gpa, sf.cst, &diags);
 
     var it = sf.items();
     while (it.next()) |item| switch (item) {
@@ -1921,6 +1985,16 @@ test "check: ENV056 — ambient `env` from a `@pure` function" {
     try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
     // A parameter named `env` shadows the ambient binding — not ambient.
     try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
+}
+
+test "check: REG050 — unknown transfer verbs" {
+    try expectCodes("fn main { let b = a.copy_to(arena2) }\n", &.{"REG050"});
+    try expectCodes("fn main { let b = a.pin_to(p) }\n", &.{"REG050"});
+    try expectCodes("fn main { let b = a.intern(pool) }\n", &.{"REG050"});
+    // The real verb is silent.
+    try expectCodes("fn main { let b = a.transfer(to: arena2) }\n", &.{});
+    // An ordinary method call is untouched.
+    try expectCodes("fn main { let n = xs.len() }\n", &.{});
 }
 
 test "check: LEX020 — unknown typed-string prefix" {

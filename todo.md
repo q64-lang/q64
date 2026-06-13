@@ -1117,8 +1117,18 @@ verified, honest diagnostics throughout.
       now trips ENV056, so the EFF120 test's `@pure` cases were made
       env-free. Catalog entries + 2 check cases (8 asserts); conformance
       `effects/cancel-without-ctx` + `env/ambient-env-in-pure` flip →
-      **35/51**) → next: the `From` conversion on `try`, EFF110
-      (assert/operation violations in the body), and the remaining
+      **35/51**) → REG050 wired (landed: the only cross-region move is
+      `transfer(to: …)`; `copy_to`/`pin_to`/`intern` are reserved
+      non-verbs the language omits (memory.md §"Cross-region transfers").
+      `checkTransferVerbs` scans the CST for either call shape — a
+      `METHOD_EXPR` (`make().copy_to(r)`) or the common
+      `CALL_EXPR` over a greedy dotted `PATH_EXPR` (`a.copy_to(r)`, where
+      the verb is the path's last dotted segment) — and flags the verb
+      token. A bare (non-dotted) name isn't treated as a verb. Catalog
+      entry + 1 check case (5 asserts); conformance
+      `memory/unknown-transfer-verb` flips → **36/51**) → next: the
+      `From` conversion on `try`, EFF110 (assert/operation violations in
+      the body), NAM002 (import path escapes qube), and the remaining
       negative-diagnostic gaps.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
