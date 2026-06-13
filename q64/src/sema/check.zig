@@ -1102,6 +1102,91 @@ fn checkEffectContradiction(gpa: std.mem.Allocator, es: ast.EffectSpec, diags: *
     }
 }
 
+/// **EFF160** — a `@cancel` function must carry a `ctx: Cancel`
+/// parameter (effects.md §"`@cancel` and `@uncancellable`": `@cancel`
+/// observes cancellation through the token, so the signature must accept
+/// one). Declaring `@cancel` without a `Cancel`-typed parameter is the
+/// error. The type is the load-bearing part — we match on a parameter
+/// whose declared type is `Cancel`, not on the conventional name `ctx`.
+fn checkCancelCtx(gpa: std.mem.Allocator, fd: ast.FnDecl, es: ast.EffectSpec, diags: *std.ArrayList(Diag)) !void {
+    var cancel_off: ?u32 = null;
+    var it = es.markers();
+    while (it.next()) |m| {
+        const nt = m.name() orelse continue;
+        if (std.mem.eql(u8, nt.text, "cancel")) {
+            cancel_off = nt.offset;
+            break;
+        }
+    }
+    const off = cancel_off orelse return;
+
+    if (fd.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| {
+            const tt = (try p.typeText(gpa)) orelse continue;
+            defer gpa.free(tt);
+            if (std.mem.eql(u8, std.mem.trim(u8, tt, " \t"), "Cancel")) return; // satisfied
+        }
+    }
+    try diags.append(gpa, .{ .code = "EFF160", .offset = off });
+}
+
+/// True when the path node's head segment is the ambient `env` (the
+/// first non-trivia token is `IDENT "env"`), as in `env.out` / `env.fs`.
+fn pathHeadIsEnv(node: *const cst.Node) bool {
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            return t.kind == .IDENT and std.mem.eql(u8, t.text, "env");
+        },
+        .node => return false,
+    };
+    return false;
+}
+
+/// Recursively: does `node` contain a `PATH_EXPR` headed by ambient `env`?
+fn referencesAmbientEnv(node: *const cst.Node) bool {
+    if (node.kind == .PATH_EXPR and pathHeadIsEnv(node)) return true;
+    for (node.children) |c| switch (c) {
+        .node => |n| if (referencesAmbientEnv(n)) return true,
+        .token => {},
+    };
+    return false;
+}
+
+/// **ENV056** — a `@pure` function may not touch the ambient `env`
+/// (env.md §"Diagnostic codes": ambient capability use is incompatible
+/// with purity — the reference would synthesize a capability parameter).
+/// Fires when a `@pure` function's body references `env.X` and `env`
+/// isn't shadowed by a parameter of that name.
+fn checkPureEnv(gpa: std.mem.Allocator, fd: ast.FnDecl, es: ast.EffectSpec, diags: *std.ArrayList(Diag)) !void {
+    var pure_off: ?u32 = null;
+    var it = es.markers();
+    while (it.next()) |m| {
+        const nt = m.name() orelse continue;
+        if (std.mem.eql(u8, nt.text, "pure")) {
+            pure_off = nt.offset;
+            break;
+        }
+    }
+    const off = pure_off orelse return;
+
+    // A parameter named `env` shadows the ambient binding; its uses
+    // aren't ambient, so ENV056 doesn't apply.
+    if (fd.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| {
+            const pn = p.name() orelse continue;
+            if (std.mem.eql(u8, pn.text, "env")) return;
+        }
+    }
+
+    const body = fd.body() orelse return;
+    if (referencesAmbientEnv(body.cst)) {
+        try diags.append(gpa, .{ .code = "ENV056", .offset = off });
+    }
+}
+
 /// The auto-prelude typed-string prefixes (modules.md §"Typed-prefix
 /// string literals", types.md §"Typed-prefix form"). v0 ships the one
 /// the prelude blesses: `url"…"`, reachable because `Url` appears in
@@ -1305,7 +1390,11 @@ pub fn checkFile(
         if (gp) |g| try checkGenericDefaults(gpa, g, &diags);
         if (item == .effect_decl) try checkEffectDecl(gpa, item.effect_decl, &diags);
         if (item == .fn_decl) {
-            if (item.fn_decl.effectSpec()) |es| try checkEffectContradiction(gpa, es, &diags);
+            if (item.fn_decl.effectSpec()) |es| {
+                try checkEffectContradiction(gpa, es, &diags);
+                try checkCancelCtx(gpa, item.fn_decl, es, &diags);
+                try checkPureEnv(gpa, item.fn_decl, es, &diags);
+            }
         }
     }
 
@@ -1802,13 +1891,36 @@ test "check: EFF120 — contradictory effect sets" {
     try expectCodes("fn h() @realtime + @audio { env.out(\"x\") }\n", &.{});
     try expectCodes("fn k() @realtime + @time { env.out(\"x\") }\n", &.{});
     // Two asserts compose; a lone assert or lone capability is fine.
-    try expectCodes("fn a() @realtime + @pure { env.out(\"x\") }\n", &.{});
+    // (`@pure` bodies stay env-free so ENV056 doesn't also fire.)
+    try expectCodes("fn a() -> i64 @realtime + @pure { 0 }\n", &.{});
     try expectCodes("fn b() @realtime { env.out(\"x\") }\n", &.{});
     try expectCodes("fn c() @io { env.out(\"x\") }\n", &.{});
     // A user marker is neither assert nor capability — no contradiction.
     try expectCodes("fn d() @realtime + @logging { env.out(\"x\") }\n", &.{});
     // `@pure` forbids every capability.
-    try expectCodes("fn e() @pure + @audio { env.out(\"x\") }\n", &.{"EFF120"});
+    try expectCodes("fn e() -> i64 @pure + @audio { 0 }\n", &.{"EFF120"});
+}
+
+test "check: EFF160 — `@cancel` requires a `ctx: Cancel` parameter" {
+    // No params at all → EFF160.
+    try expectCodes("pub fn watcher @cancel { env.out(\"x\") }\n", &.{"EFF160"});
+    // A param, but not `Cancel`-typed → still EFF160.
+    try expectCodes("fn w(n: i64) @cancel { env.out(\"x\") }\n", &.{"EFF160"});
+    // A `Cancel`-typed parameter satisfies the requirement.
+    try expectCodes("fn fetch(ctx: Cancel, n: i64) @cancel { env.out(\"x\") }\n", &.{});
+    // `@cancel` not declared → no requirement.
+    try expectCodes("fn plain(n: i64) { env.out(\"x\") }\n", &.{});
+}
+
+test "check: ENV056 — ambient `env` from a `@pure` function" {
+    // A `@pure` body touching `env.X`.
+    try expectCodes("pub fn p(x: i64) -> i64 @pure { env.out(\"c\")\n x }\n", &.{"ENV056"});
+    // `@pure` without any `env` reference is clean.
+    try expectCodes("fn q(x: i64) -> i64 @pure { x * 2 }\n", &.{});
+    // A non-`@pure` function may use `env` freely.
+    try expectCodes("fn r(x: i64) { env.out(\"ok\") }\n", &.{});
+    // A parameter named `env` shadows the ambient binding — not ambient.
+    try expectCodes("fn s(env: Env) -> i64 @pure { env.out(\"x\")\n 0 }\n", &.{});
 }
 
 test "check: LEX020 — unknown typed-string prefix" {

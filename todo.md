@@ -1104,8 +1104,22 @@ verified, honest diagnostics throughout.
       **33/51**; no regression on the `@realtime`-only / `@realtime +
       @stage` functions in golden/streams). The structured effect spec
       also unblocks EFF110 (assert/operation violations in the body) and
-      ENV056. → next: the `From` conversion on `try`, EFF110/ENV056, and
-      the remaining negative-diagnostic gaps.
+      ENV056) → EFF160 + ENV056 wired (landed: two more signature-level
+      checks riding the structured effect spec. **EFF160** —
+      `checkCancelCtx`: a `@cancel` function must take a `Cancel`-typed
+      parameter (the cancellation token; matched on the param *type*, not
+      the conventional name `ctx`), else error (effects.md §"`@cancel`
+      and `@uncancellable`"). **ENV056** — `checkPureEnv`: a `@pure`
+      function may not reference the ambient `env` (`referencesAmbientEnv`
+      recursively finds a `PATH_EXPR` headed by `env` in the body); a
+      parameter named `env` shadows the ambient binding and suppresses it.
+      Found + fixed a real interaction: a `@pure` body using `env.out`
+      now trips ENV056, so the EFF120 test's `@pure` cases were made
+      env-free. Catalog entries + 2 check cases (8 asserts); conformance
+      `effects/cancel-without-ctx` + `env/ambient-env-in-pure` flip →
+      **35/51**) → next: the `From` conversion on `try`, EFF110
+      (assert/operation violations in the body), and the remaining
+      negative-diagnostic gaps.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
