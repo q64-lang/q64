@@ -327,7 +327,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 scope.next_idx = @intCast(b.cur_locals.items.len);
                 const res_idx = try scope.declare("#mres", true, mty);
                 try b.cur_locals.append(b.a, mty);
-                try buildMatchInto(b, init_expr.match, scope, rt, out, res_idx, mty);
+                try buildMatchInto(b, init_expr.match, scope, out, res_idx, mty);
                 scope.next_idx = @intCast(b.cur_locals.items.len);
                 const bidx = try scope.declare(nm.text, ls.isVar(), mty);
                 try b.cur_locals.append(b.a, mty);
@@ -471,7 +471,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 if (!mloc.mutable) return reject(b, .immutable_assign);
                 if (op.kind != .EQ) return error.Unsupported;
                 if ((try matchValueTy(b, rhs_ast.match, scope)) != mloc.ty) return error.Unsupported;
-                try buildMatchInto(b, rhs_ast.match, scope, rt, out, mloc.idx, mloc.ty);
+                try buildMatchInto(b, rhs_ast.match, scope, out, mloc.idx, mloc.ty);
                 return;
             }
             const st = try b.a.create(hir.Stmt);
@@ -978,8 +978,9 @@ fn matchValueTy(b: *Builder, me: ast.MatchExpr, scope: *const Scope) BuildError!
 /// `target_idx` (type `ty`). The same scrutinee/tag/exhaustiveness
 /// rules as the statement form; arms are `->` value expressions (a
 /// payload pattern's bindings are in scope for its arm's value).
-fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt), target_idx: u32, ty: hir.Type) BuildError!void {
-    _ = rt; // arm values are scalar expressions (str arms: later)
+fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.ArrayList(*hir.Stmt), target_idx: u32, ty: hir.Type) BuildError!void {
+    // Arm values are scalar expressions (str arms: later), so no RtMap is
+    // needed — this is shared by `main` and callee bodies alike.
     const scrut = me.scrutinee() orelse return error.Unsupported;
     const info_opt = try enumOfExpr(b, scope, scrut);
     if (info_opt == null and (try exprScalar(b, scrut, scope)) != .i64) return error.Unsupported;
@@ -4378,6 +4379,10 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
             const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            // The bind-the-match form (`let label = match s { … }`) in a callee:
+            // same desugar as `main`'s C2 — a hidden result local assigned per
+            // arm, then the name reads it. The whole thing rides in one block.
+            if (init_expr == .match) return buildIntMatchLet(b, ls, init_expr.match, nm, scope);
             // A `bool` binding (`let even = n % 2 == 0`) gets a bool local; any
             // other value expression is i64. (str lets in a value body aren't
             // reached here — those functions take the str path.)
@@ -4502,6 +4507,29 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
         arm_slice = arm_slice[0 .. arm_slice.len - 1];
     }
     try foldMatchChain(b, s_idx, boxed, arm_slice, dflt, &stmts);
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try stmts.toOwnedSlice(b.a) };
+    return out;
+}
+
+/// `let x = match s { … }` in a callee body — the bind-the-match form.
+/// Mirrors `main`'s C2 path through `buildMatchInto`: a hidden mutable
+/// `#mres` local is assigned the chosen arm's value, then the named binding
+/// reads it (the name is NOT in scope inside the arms — an initializer can't
+/// see itself). The scrutinee set, the assignment chain, and the bind all
+/// ride in one block; the binding stays visible to later statements because
+/// `scope.declare` registers it in the shared body scope.
+fn buildIntMatchLet(b: *Builder, ls: ast.LetStmt, me: ast.MatchExpr, nm: parser.cst.Token, scope: *Scope) BuildError!*hir.Stmt {
+    const mty = try matchValueTy(b, me, scope);
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    const res_idx = try declareBodyLocal(b, scope, "#mres", true, mty);
+    try buildMatchInto(b, me, scope, &stmts, res_idx, mty);
+    const bidx = try declareBodyLocal(b, scope, nm.text, ls.isVar(), mty);
+    const read = try b.a.create(hir.Expr);
+    read.* = .{ .local = .{ .idx = res_idx, .ty = mty } };
+    const bst = try b.a.create(hir.Stmt);
+    bst.* = .{ .let = .{ .idx = bidx, .value = read } };
+    try stmts.append(b.a, bst);
     const out = try b.a.create(hir.Stmt);
     out.* = .{ .block = try stmts.toOwnedSlice(b.a) };
     return out;
@@ -7156,6 +7184,56 @@ test "callee-body match: enum params + value if-chain tails" {
         \\        Some(v) -> v,
         \\        None -> 1.5,
         \\    }
+        \\}
+        \\fn main {
+        \\    env.out(f(Some(7)))
+        \\}
+        \\
+    )) == null);
+}
+
+test "callee-body match: `let x = match …` bind form (enum + literal scrutinees)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn classify(n: i64) -> i64 {
+        \\    let label = match n {
+        \\        0 -> 100,
+        \\        1 -> 200,
+        \\        _ -> 999,
+        \\    }
+        \\    label + 1
+        \\}
+        \\fn unwrap_or(o: Option<i64>, d: i64) -> i64 {
+        \\    let v = match o {
+        \\        Some(x) -> x,
+        \\        None -> d,
+        \\    }
+        \\    v * 10
+        \\}
+        \\fn main {
+        \\    env.out(classify(7))
+        \\    env.out(unwrap_or(Some(5), 0))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The bind reads the hidden result local, then the body uses it — so the
+    // chosen arm's value reaches `label + 1` / `v * 10`.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn classify") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn unwrap_or") != null);
+    // Mixed arm types are still rejected in the bind form, same as the tail.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn f(o: Option<i64>) -> i64 {
+        \\    let v = match o {
+        \\        Some(x) -> x,
+        \\        None -> 1.5,
+        \\    }
+        \\    v
         \\}
         \\fn main {
         \\    env.out(f(Some(7)))

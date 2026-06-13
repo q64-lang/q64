@@ -991,9 +991,21 @@ verified, honest diagnostics throughout.
       field access works; generic instantiation keys grew "r:Name"
       descriptors; rec payloads count as pointer-bearing returns.
       KNOWN ISSUE found: a user `fn start` collides with the MIR
-      entry's internal name — rename pending) → next: the `From`
-      conversion on `try`,
-      statement-position callee matches, `let x = match …` in callees.
+      entry's internal name — rename pending) → the `fn start`
+      collision (fixed: the entry's internal MIR name is now `#start`,
+      a `#`-prefixed sentinel illegal as a q64 identifier — calls
+      resolve by FuncId and the entry always exports `_start`, so the
+      name is a backend handle only; `show mir` shows `fn #start`) →
+      `let x = match …` in callees (landed: the bind-the-match form in
+      a plain callee body desugars exactly like `main`'s C2 — a hidden
+      mutable `#mres` local assigned per arm, then the named binding
+      reads it; `buildIntMatchLet` shares `buildMatchInto`, whose
+      unused `RtMap` param was dropped so it's main/callee-agnostic;
+      enum + literal scrutinees both work, mixed-arm-type still
+      rejected. Verified wasm64+wasm32: `classify`/`unwrap_or` →
+      `101 201 1000 50 30`; 401 unit / 81 CLI / 24-of-51 / roundtrips
+      green) → next: the `From` conversion on `try`,
+      statement-position callee matches.
       - [x] **str enum payloads + generic-enum instantiation.**
             `Result<str, i64>`, `Option<str>`, and declared str slots
             (`Msg.Text(str)`) work end-to-end: construction
@@ -1061,7 +1073,8 @@ verified, honest diagnostics throughout.
             later); no match in *record-returning* callee bodies yet
             (the tail there is expr/if only); `let x = match …` inside
             a callee (bind-the-match form) still unsupported — write
-            it as the tail or restructure.
+            it as the tail or restructure. (SUPERSEDED: the bind form
+            landed later — see the `let x = match …` rung above.)
       - [x] **`try` propagation + TYP300 (v0 floor).** `let x = try
             half(n)` inside a Result-returning fn desugars to: bind
             the operand's boxed value once, `if tag == Err { return
