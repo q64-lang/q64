@@ -247,10 +247,10 @@ const SPEC_DEMOS = {
 A Q64 program compiled to wasm, drawing through the \`qview\` host face below —
 the same artifact runs native (\`qube run\`) or embedded like this.
 
-<iframe src="https://q64.dev/play/" title="Q64 qview live demo" loading="lazy"
+<iframe src="/play/plasma/" title="Q64 qview live demo" loading="lazy"
   style="display:block;width:100%;height:540px;border:0;border-radius:12px;background:#0a0c12;margin:.5rem 0"></iframe>
 
-[Open full screen ↗](https://q64.dev/play/)
+[Open full screen ↗](/play/plasma/)
 :::
 
 `,

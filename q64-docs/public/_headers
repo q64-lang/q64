@@ -4,6 +4,13 @@
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: interest-cohort=()
 
+# Playable examples are embedded same-origin in docs pages (e.g. the
+# reactivity page frames /play/<example>/). Allow same-origin framing here
+# while the site-wide default stays DENY.
+/play/*
+  X-Frame-Options: SAMEORIGIN
+  Content-Security-Policy: frame-ancestors 'self'
+
 /_astro/*
   Cache-Control: public, max-age=31536000, immutable
 
