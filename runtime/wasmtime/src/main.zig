@@ -53,12 +53,27 @@ pub fn main(init: std.process.Init) !void {
     _ = it.next(); // argv0
     var path: ?[]const u8 = null;
     var png_path: ?[]const u8 = null;
+    var contact_path: ?[]const u8 = null;
     var cv_w: u32 = 360;
     var cv_h: u32 = 360;
     var cv_bg: u32 = 0x14161C;
+    var cols: u32 = 4;
+    var cell_w: u32 = 160;
+    var cell_h: u32 = 160;
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--png")) {
             png_path = it.next();
+        } else if (std.mem.eql(u8, arg, "--contact")) {
+            contact_path = it.next();
+        } else if (std.mem.eql(u8, arg, "--cols")) {
+            if (it.next()) |n| cols = std.fmt.parseInt(u32, n, 10) catch cols;
+        } else if (std.mem.eql(u8, arg, "--cell")) {
+            if (it.next()) |dim| {
+                if (std.mem.indexOfScalar(u8, dim, 'x')) |xi| {
+                    cell_w = std.fmt.parseInt(u32, dim[0..xi], 10) catch cell_w;
+                    cell_h = std.fmt.parseInt(u32, dim[xi + 1 ..], 10) catch cell_h;
+                }
+            }
         } else if (std.mem.eql(u8, arg, "--size")) {
             if (it.next()) |dim| {
                 if (std.mem.indexOfScalar(u8, dim, 'x')) |xi| {
@@ -347,6 +362,40 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         try err_w.interface.print("q64-wasmtime-host: rendered {d} ops -> {s} ({d}x{d})\n", .{ g_display.items.len, pp, cv_w, cv_h });
+        try err_w.interface.flush();
+    }
+
+    // Contact sheet: split the display list into frames at each `present` and
+    // tile them — a procedural animation shown as one image (`--contact`).
+    if (contact_path) |cp| {
+        var frames: std.ArrayListUnmanaged([]const render.Op) = .empty;
+        defer frames.deinit(gpa);
+        var start: usize = 0;
+        for (g_display.items, 0..) |op, i| {
+            if (std.mem.eql(u8, op.name, "present")) {
+                try frames.append(gpa, g_display.items[start..i]);
+                start = i + 1;
+            }
+        }
+        if (start < g_display.items.len) try frames.append(gpa, g_display.items[start..]);
+        const cv = render.renderContact(gpa, frames.items, cols, cell_w, cell_h, 8, cv_bg) catch |e| {
+            try err_w.interface.print("q64-wasmtime-host: contact render failed: {s}\n", .{@errorName(e)});
+            try err_w.interface.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(cv.px);
+        const png = render.toPng(gpa, cv) catch |e| {
+            try err_w.interface.print("q64-wasmtime-host: png encode failed: {s}\n", .{@errorName(e)});
+            try err_w.interface.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(png);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cp, .data = png }) catch |e| {
+            try err_w.interface.print("q64-wasmtime-host: cannot write {s}: {s}\n", .{ cp, @errorName(e) });
+            try err_w.interface.flush();
+            std.process.exit(1);
+        };
+        try err_w.interface.print("q64-wasmtime-host: {d} frames -> {s} ({d} cols, {d}x{d} cells)\n", .{ frames.items.len, cp, cols, cell_w, cell_h });
         try err_w.interface.flush();
     }
 }

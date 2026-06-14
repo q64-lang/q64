@@ -93,23 +93,48 @@ fn font(ch: u8) ?[5]u3 {
     };
 }
 
-/// Draw a display list onto a fresh canvas.
-pub fn render(a: std.mem.Allocator, ops: []const Op, w: u32, h: u32, bg: u32) !Canvas {
-    var cv = try Canvas.init(a, w, h, bg);
+/// Draw a display list onto `cv`, offset by (ox, oy) — the offset lets a frame
+/// land in a contact-sheet cell while its ops use 0-based coordinates.
+pub fn drawOps(cv: *Canvas, ops: []const Op, ox: i64, oy: i64) void {
     for (ops) |op| {
         const ar = op.args;
         if (std.mem.eql(u8, op.name, "box") and ar.len >= 5) {
-            cv.rect(ar[0], ar[1], ar[2], ar[3], @intCast(ar[4] & 0xffffff));
+            cv.rect(ox + ar[0], oy + ar[1], ar[2], ar[3], @intCast(ar[4] & 0xffffff));
         } else if (std.mem.eql(u8, op.name, "button") and ar.len >= 5) {
-            cv.rect(ar[1], ar[2], ar[3], ar[4], 0x2D6CDF);
-            cv.rectOutline(ar[1], ar[2], ar[3], ar[4], 0x5B8DEF, 2);
+            cv.rect(ox + ar[1], oy + ar[2], ar[3], ar[4], 0x2D6CDF);
+            cv.rectOutline(ox + ar[1], oy + ar[2], ar[3], ar[4], 0x5B8DEF, 2);
         } else if (std.mem.eql(u8, op.name, "number") and ar.len >= 3) {
             var buf: [24]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, "{d}", .{ar[2]}) catch "?";
-            cv.text(s, ar[0], ar[1], 0xF0F0F0, 4);
+            cv.text(s, ox + ar[0], oy + ar[1], 0xF0F0F0, 4);
         } else if (std.mem.eql(u8, op.name, "text") and ar.len >= 3) {
-            cv.rect(ar[0], ar[1], 120, 4, 0x6A7080);
+            cv.rect(ox + ar[0], oy + ar[1], 120, 4, 0x6A7080);
         }
+    }
+}
+
+/// Draw a single display list onto a fresh canvas.
+pub fn render(a: std.mem.Allocator, ops: []const Op, w: u32, h: u32, bg: u32) !Canvas {
+    var cv = try Canvas.init(a, w, h, bg);
+    drawOps(&cv, ops, 0, 0);
+    return cv;
+}
+
+/// Tile animation frames (each a display list) into a contact-sheet grid —
+/// `cols` columns, each cell `cw`x`ch`, `gap` px between. One static image that
+/// shows a procedural animation's progression.
+pub fn renderContact(a: std.mem.Allocator, frames: []const []const Op, cols: u32, cw: u32, ch: u32, gap: u32, bg: u32) !Canvas {
+    const n: u32 = @intCast(frames.len);
+    const rows = (n + cols - 1) / cols;
+    const w = cols * cw + (cols + 1) * gap;
+    const h = rows * ch + (rows + 1) * gap;
+    var cv = try Canvas.init(a, w, h, bg);
+    for (frames, 0..) |frame, idx| {
+        const col: u32 = @intCast(idx % cols);
+        const row: u32 = @intCast(idx / cols);
+        const ox: i64 = gap + col * (cw + gap);
+        const oy: i64 = gap + row * (ch + gap);
+        drawOps(&cv, frame, ox, oy);
     }
     return cv;
 }
