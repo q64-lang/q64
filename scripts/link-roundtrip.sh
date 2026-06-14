@@ -2056,6 +2056,33 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> first-class tuples: let t = (..), t.N index, let (a, b) = t (value via record ABI)"
+tv_app="$tmp/tuplevals.q"
+cat > "$tv_app" <<'Q64'
+fn main {
+    let t = (3, 4)
+    env.out(t.0)
+    env.out(t.1)
+    env.out(t.0 + t.1)
+    let (a, b) = t
+    env.out(a * b)
+    let trip = (10, 20, 30)
+    let (x, y, z) = trip
+    env.out(x + y + z)
+    var m = 5
+    let pair = (m * 2, m + 1)
+    env.out(pair.0 + pair.1)
+}
+Q64
+tv_expected=$'3\n4\n7\n12\n60\n16'
+"$Q64_BIN" emit "$tv_app" "$tmp/tuplevals.wasm"
+tv_out="$("$HOST_BIN" "$tmp/tuplevals.wasm")"
+[[ "$tv_out" == "$tv_expected" ]] || { echo "FAIL: first-class tuples (got: $tv_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$tv_app" "$tmp/tuplevals32.wasm" --addr wasm32
+tv32_out="$("$HOST_BIN" "$tmp/tuplevals32.wasm")"
+[[ "$tv32_out" == "$tv_expected" ]] || { echo "FAIL: first-class tuples wasm32 (got: $tv32_out)" >&2; exit 1; }
+echo "    ok: first-class tuples -> 3/4/7/12/60/16 (wasm64 + wasm32; binding, index, destructure)"
+
 echo "==> tuple destructuring: let (a, b) = (e1, e2) (parallel binding, main + callee)"
 tup_app="$tmp/tupledes.q"
 cat > "$tup_app" <<'Q64'

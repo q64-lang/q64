@@ -343,29 +343,56 @@ fn buildRecordDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, sc
 /// side's ident sub-patterns. v0: i64/bool/float elements, ident binders,
 /// matching arity. Emits its `let`s into `out`; works in main + callee bodies.
 fn buildTupleDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, scope: *Scope, isVar: bool, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
-    const tup = switch (init_expr) {
-        .tuple => |t| t, // a tuple binding (no literal) needs first-class tuples
-        else => return error.Unsupported,
-    };
+    // Count the left-side ident binders.
+    var names: std.ArrayList([]const u8) = .empty;
     var pit = ast.PatternIter{ .children = pat.cst.children };
-    var eit = tup.elements();
-    var n: usize = 0;
     while (pit.next()) |sp| {
-        const el = eit.next() orelse return error.Unsupported; // too few elements
         if (sp.kind() != .IDENT_PATTERN) return error.Unsupported; // `_`/nested: later
-        const name = (sp.bindingName() orelse return error.Unsupported).text;
-        const sc = try exprScalar(b, el, scope);
-        if (sc == .narrow_int or sc == .str) return error.Unsupported; // widen/str: later
-        const ty = scalarBindTy(sc);
-        // Build before declaring so an element can't see the name it binds.
-        const value = try buildIntExpr(b, el, scope);
-        const idx = try declareBodyLocal(b, scope, name, isVar, ty);
-        const st = try b.a.create(hir.Stmt);
-        st.* = .{ .let = .{ .idx = idx, .value = value } };
-        try out.append(b.a, st);
-        n += 1;
+        try names.append(b.a, (sp.bindingName() orelse return error.Unsupported).text);
     }
-    if (n == 0 or eit.next() != null) return error.Unsupported; // empty, or too many elements
+    if (names.items.len == 0) return error.Unsupported;
+
+    switch (init_expr) {
+        // `let (a, b) = (e1, e2)` — parallel binding straight from the literal
+        // (no tuple value materialized).
+        .tuple => |tup| {
+            var eit = tup.elements();
+            for (names.items) |name| {
+                const el = eit.next() orelse return error.Unsupported; // too few elements
+                const sc = try exprScalar(b, el, scope);
+                if (sc == .narrow_int or sc == .str) return error.Unsupported;
+                const ty = scalarBindTy(sc);
+                const value = try buildIntExpr(b, el, scope); // build before declaring
+                const idx = try declareBodyLocal(b, scope, name, isVar, ty);
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .let = .{ .idx = idx, .value = value } };
+                try out.append(b.a, st);
+            }
+            if (eit.next() != null) return error.Unsupported; // too many elements
+        },
+        // `let (a, b) = t` — read the fields of a tuple *value* (an anonymous
+        // record). Stash the base pointer, then load each slot.
+        else => {
+            const rv = (try buildRecExpr(b, init_expr, scope)) orelse return error.Unsupported;
+            if (rv.si.fields.len != names.items.len) return error.Unsupported; // arity
+            const base_idx = try declareBodyLocal(b, scope, "#tdes", false, .ptr);
+            const set = try b.a.create(hir.Stmt);
+            set.* = .{ .let = .{ .idx = base_idx, .value = rv.e } };
+            try out.append(b.a, set);
+            for (names.items, 0..) |name, i| {
+                const fld = rv.si.fields[i];
+                if (fld.ty != .i64) return error.Unsupported;
+                const idx = try declareBodyLocal(b, scope, name, isVar, .i64);
+                const base = try b.a.create(hir.Expr);
+                base.* = .{ .local = .{ .idx = base_idx, .ty = .ptr } };
+                const ld = try b.a.create(hir.Expr);
+                ld.* = .{ .field_get = .{ .base = base, .offset = fld.offset, .ty = .i64 } };
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .let = .{ .idx = idx, .value = ld } };
+                try out.append(b.a, st);
+            }
+        },
+    }
 }
 
 /// Build one statement of `main`'s body, appending 0+ HIR statements to `out`.
@@ -497,13 +524,14 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // `let d = xs.map|filter(|x| …)` — handled (vec_new + pushes).
             } else if (try tryVecReduce(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let r = xs.reduce(init, |acc, x| …)` — handled (scalar fold).
-            } else if (if (init_expr == .call or isBoxedVariantPath(b, init_expr)) try buildRecExpr(b, init_expr, scope) else null) |rv| {
+            } else if (if (init_expr == .call or init_expr == .tuple or isBoxedVariantPath(b, init_expr)) try buildRecExpr(b, init_expr, scope) else null) |rv| {
                 // `let p = make(3, 4)` / `let c = first([...])` — a
                 // record-returning call (incl. a generic whose `-> T`
                 // inferred to a record): bind the returned base pointer
                 // (the record lives in the scope arena). Gated on `.call`
                 // so a bare `let q = p` stays the documented
                 // whole-record-copy rejection, not a silent alias.
+                // `let t = (3, 4)` — a tuple literal is an anonymous record.
                 try bindMainRecord(b, scope, nm.text, ls.isVar(), rv.e, rv.si, out);
                 // A boxed-enum value: remember the enum for `match`.
                 if (try enumOfExpr(b, scope, init_expr)) |info| {
@@ -4302,9 +4330,56 @@ fn bindMainRecord(b: *Builder, scope: *Scope, name: []const u8, is_var: bool, va
 /// expression isn't record-shaped (the caller picks another path).
 const RecValue = struct { e: *hir.Expr, si: *const StructInfo };
 
+/// Synthesize a `StructInfo` for a tuple value: fields named "0", "1", … laid
+/// out like a struct (declaration order, natural alignment). A tuple is just
+/// an anonymous record, so it reuses the whole record ABI (record_alloc,
+/// field_get/_set, `recs` dispatch). v0: i64 elements.
+fn tupleStructInfo(b: *Builder, tys: []const hir.Type) BuildError!*const StructInfo {
+    const fields = try b.a.alloc(StructField, tys.len);
+    var off: u32 = 0;
+    var max_align: u32 = 1;
+    for (tys, 0..) |ty, i| {
+        const w = fieldWidth(ty) orelse return error.Unsupported;
+        off = std.mem.alignForward(u32, off, w.alignment);
+        fields[i] = .{ .name = try std.fmt.allocPrint(b.a, "{d}", .{i}), .ty = ty, .offset = off };
+        off += w.size;
+        if (w.alignment > max_align) max_align = w.alignment;
+    }
+    const si = try b.a.create(StructInfo);
+    si.* = .{
+        .name = "(tuple)",
+        .fields = fields,
+        .size = std.mem.alignForward(u32, off, max_align),
+        .alignment = max_align,
+    };
+    return si;
+}
+
 fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue {
     switch (expr) {
         .paren => |p| return buildRecExpr(b, p.inner() orelse return error.Unsupported, scope),
+        .tuple => |te| {
+            // `(e1, e2, …)` — an anonymous record allocated in the scope arena.
+            // v0: i64 elements. The synthesized `si` rides in `recs` so `t.0`
+            // and `let (a, b) = t` resolve through the record machinery.
+            var tys: std.ArrayList(hir.Type) = .empty;
+            var eit = te.elements();
+            while (eit.next()) |el| {
+                if ((try exprScalar(b, el, scope)) != .i64) return error.Unsupported; // bool/float/str: later
+                try tys.append(b.a, .i64);
+            }
+            if (tys.items.len < 2) return error.Unsupported; // `()` / `(x)` aren't tuples
+            const si = try tupleStructInfo(b, tys.items);
+            var inits: std.ArrayList(hir.FieldInit) = .empty;
+            var eit2 = te.elements();
+            var i: usize = 0;
+            while (eit2.next()) |el| : (i += 1) {
+                try inits.append(b.a, .{ .offset = si.fields[i].offset, .ty = si.fields[i].ty, .value = try buildIntExpr(b, el, scope) });
+            }
+            const out = try b.a.create(hir.Expr);
+            out.* = .{ .record_alloc = .{ .size = si.size, .alignment = si.alignment, .inits = try inits.toOwnedSlice(b.a) } };
+            return .{ .e = out, .si = si };
+        },
         .record => |re| {
             const pname = try (re.path() orelse return error.Unsupported).text(b.a);
             defer b.a.free(pname);
@@ -6314,6 +6389,18 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             }
             out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc.args(), scope, null) } };
         },
+        .tuple_field => |tf| {
+            // `t.0` — index a tuple value. The tuple is an anonymous record
+            // (fields "0", "1", …), so a field_get at the indexed slot. v0:
+            // i64 elements.
+            const idx_tok = tf.index() orelse return error.Unsupported;
+            const tbase = tf.base() orelse return error.Unsupported;
+            const rv = (try buildRecExpr(b, tbase, scope)) orelse return error.Unsupported;
+            const f = rv.si.field(idx_tok.text) orelse return error.Unsupported; // out of range
+            if (f.ty != .i64) return error.Unsupported;
+            out.* = .{ .field_get = .{ .base = rv.e, .offset = f.offset, .ty = .i64 } };
+            return out;
+        },
         .field => |fe| {
             const fld = (fe.field() orelse return error.Unsupported).text;
             const fbase = fe.base() orelse return error.Unsupported;
@@ -7448,13 +7535,51 @@ test "tuple destructuring: `let (a, b) = (e1, e2)` binds elements (main + callee
         \\}
         \\
     )) == null);
+    // Destructuring a tuple *binding* (a first-class tuple value) builds.
     var tr3 = TestResolver{ .a = testing.allocator };
     defer tr3.deinit();
-    try testing.expect((try buildLocal(testing.allocator, &tr3,
+    var m3 = (try buildLocal(testing.allocator, &tr3,
         \\fn main {
         \\    let pair = (3, 4)
         \\    let (a, b) = pair
-        \\    env.out(a)
+        \\    env.out(a + b)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    m3.deinit();
+}
+
+test "first-class tuples: literal binding, `.N` index, and destructure-from-binding" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn main {
+        \\    let t = (3, 4)
+        \\    env.out(t.0 + t.1)
+        \\    let (a, b) = t
+        \\    env.out(a * b)
+        \\    var m = 5
+        \\    let pair = (m * 2, m + 1)
+        \\    env.out(pair.0 + pair.1)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // A tuple materializes like a 2-cell record; `.N` is a field_get.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc size=16 align=8") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null);
+
+    // An out-of-range index is honestly unsupported.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    let t = (3, 4)
+        \\    env.out(t.2)
         \\}
         \\
     )) == null);

@@ -190,10 +190,21 @@ needs the platform audit, so it's the highest-leverage near-term work.
           Works in `main` and callee bodies; v0: i64/bool/float elements, ident
           binders. A non-literal RHS (`let (a, b) = pair`) and arity mismatch
           reject honestly. Runs wasm64 + wasm32 (roundtrip `7 / 60 / 10 / 105 /
-          35`). **Next (deferred per spec / needs first-class tuples):** nested
-          struct destructuring beyond one level (`P { pos: Point { x } }`),
-          tuple *values* + `let (a, b) = pair`, plain struct-value `match`,
-          bool/str/narrow/record record-fields.
+          35`).
+    - [x] **First-class tuple values** (`let t = (3, 4)`, `t.0`, `let (a,b)=t`):
+          a tuple is an anonymous record — `tupleStructInfo` synthesizes a
+          `StructInfo` (fields "0", "1", … laid out by natural alignment), so
+          the whole record ABI is reused: `buildRecExpr` gains a `.tuple` arm
+          (record_alloc into the scope arena), `buildIntExpr` a `.tuple_field`
+          arm (`t.N` → field_get), the `main` let path binds a tuple literal
+          via `bindMainRecord`, and `buildTupleDestructure` reads a tuple
+          binding's fields (`let (a, b) = t`) as well as the parallel-literal
+          form. v0: i64 elements, main-position bindings. An out-of-range index
+          rejects. Runs wasm64 + wasm32 (roundtrip `3/4/7/12/60/16`).
+          **Next (deferred per spec / bigger):** tuple params + returns
+          (multi-value return), bool/float tuple elements, nested struct
+          destructuring beyond one level, plain struct-value `match`,
+          bool/str/narrow record-fields.
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the
