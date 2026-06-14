@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Q64 — procedural animation</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #0a0c12; color: #c9d1e0;
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; text-align: center;
+  }
+  canvas {
+    width: min(80vmin, 480px); height: min(80vmin, 480px);
+    image-rendering: pixelated; border-radius: 12px;
+    box-shadow: 0 12px 40px #0006, 0 0 0 1px #ffffff14;
+    background: #0a0c12;
+  }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  p  { margin: 0; color: #7e879c; max-width: 42ch; }
+  code { color: #9db4ff; }
+</style>
+</head>
+<body>
+  <h1>Q64 → wasm → qview</h1>
+  <canvas id="c" width="288" height="288"></canvas>
+  <p>A procedural animation written in Q64. The <code>.q</code> program emits
+     <code>qview.box</code> calls and a <code>qview.present()</code> per frame;
+     this page plays the captured frames on a 2D canvas. Same artifact runs
+     native (<code>qube run</code>) or here.</p>
+<script>
+// qview host (canvas-2D). Capture the display list the wasm emits, split into
+// frames at `present`, then play them back on a rAF loop. q64 emits host-face
+// args as i64, so the imports receive BigInt — coerce with Number().
+(async () => {
+  const frames = [];
+  let cur = [];
+  const num = (v) => typeof v === "bigint" ? Number(v) : v;
+  const imports = {
+    qview: {
+      box: (x, y, w, h, color) => cur.push([num(x), num(y), num(w), num(h), num(color) & 0xffffff]),
+      present: () => { frames.push(cur); cur = []; },
+      // other qview ops are no-ops for this demo (open face)
+      text: () => {}, number: () => {}, button: () => {},
+    },
+    env: { out: () => {}, fs_read: () => 0n },
+  };
+  const bytes = await fetch("plasma.wasm").then(r => r.arrayBuffer());
+  const { instance } = await WebAssembly.instantiate(bytes, imports);
+  instance.exports._start();           // runs the frame loop, fills `frames`
+
+  const cv = document.getElementById("c");
+  const ctx = cv.getContext("2d");
+  const hex = (c) => "#" + (c >>> 0 & 0xffffff).toString(16).padStart(6, "0");
+  let f = 0;
+  function draw() {
+    const frame = frames[f % frames.length] || [];
+    ctx.fillStyle = "#0a0c12";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    for (const [x, y, w, h, color] of frame) {
+      ctx.fillStyle = hex(color);
+      ctx.fillRect(x, y, w, h);
+    }
+    f++;
+  }
+  // ~12 fps playback loop.
+  draw();
+  setInterval(() => requestAnimationFrame(draw), 83);
+  window.__qviewFrames = frames.length;  // for the headless screenshot check
+})();
+</script>
+</body>
+</html>
