@@ -374,9 +374,11 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         `-> T` handler is an `ask` (the value method path). `Counter { state n;
         handle bump(); handle add(k); handle get() -> i64 }` with `c.bump();
         c.bump(); c.add(10); c.get()` → 12 (state persists across calls).
-        Runs wasm64 + wasm32. v0: explicit construction `Counter { n: 0 }`
-        (default-fill `Counter {}`, void handlers in callee bodies, and `ask`
-        suspension are follow-ons).
+        Runs wasm64 + wasm32. **Default construction `Counter {}`** fills each
+        unspecified state field with its `state … = <default>` value (in
+        `buildRecExpr`'s record arm, from `b.actor_decls`); partial literals
+        fill the rest. (Void handlers in callee bodies and `ask` suspension are
+        follow-ons.)
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3 — STARTED.**
   - [x] **Structured `graph` declarations** (parsing). `parseGraphDecl`

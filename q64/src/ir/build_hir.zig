@@ -4813,6 +4813,31 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                 try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildIntExpr(b, fval, scope) });
                 seen += 1;
             }
+            // Actor construction (`Counter {}` / partial): fill any state
+            // field not explicitly set with its `state … = <default>` value.
+            if (b.actor_decls.get(pname)) |ad| {
+                var sit = ad.states();
+                while (sit.next()) |s| {
+                    const sname = (s.name() orelse continue).text;
+                    const f = si.field(sname) orelse continue;
+                    var found = false;
+                    for (inits.items) |ini| {
+                        if (ini.offset == f.offset) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) continue;
+                    const dval = s.value() orelse return error.Unsupported; // no default → must be explicit
+                    if (narrowRange(f.ty) != null) {
+                        try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildNarrowValue(b, f.ty, dval) });
+                    } else {
+                        if (scalarBindTy(try exprScalar(b, dval, scope)) != f.ty) return error.Unsupported;
+                        try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildIntExpr(b, dval, scope) });
+                    }
+                    seen += 1;
+                }
+            }
             // Every field must be initialized, each exactly once (the layout
             // has no default values). seen == fields.len with per-name lookup
             // admits a duplicate+omission pair only if a name repeats — which
@@ -8237,7 +8262,7 @@ test "actors v0: handlers lower to self-taking functions; tell/ask dispatch" {
         \\    handle get() -> i64 { n }
         \\}
         \\fn main {
-        \\    var c = Counter { n: 0 }
+        \\    var c = Counter {}
         \\    c.bump()
         \\    env.out(c.get())
         \\}

@@ -2386,7 +2386,7 @@ actor Counter {
     handle get() -> i64 { n }
 }
 fn main {
-    var c = Counter { n: 0 }
+    var c = Counter {}
     c.bump()
     c.bump()
     c.add(10)
@@ -2400,7 +2400,7 @@ act_out="$("$HOST_BIN" "$tmp/actor.wasm")"
 "$Q64_BIN" emit "$act_app" "$tmp/actor32.wasm" --addr wasm32
 act32_out="$("$HOST_BIN" "$tmp/actor32.wasm")"
 [[ "$act32_out" == "$act_expected" ]] || { echo "FAIL: actor wasm32 (got: $act32_out)" >&2; exit 1; }
-echo "    ok: actor -> 12 (wasm64 + wasm32; tell bump/add + ask get, bare-field state, persists)"
+echo "    ok: actor -> 12 (wasm64 + wasm32; Counter {} defaults, tell bump/add + ask get, bare-field state, persists)"
 
 echo "==> pipe operator |>: x |> f(args) ≡ f(x, args) (chains, f64)"
 pip_app="$tmp/pipe.q"
