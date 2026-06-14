@@ -68,9 +68,17 @@ address-space choice** and present in both modes:
 - **Multiple memories** — a core module declares several linear memory
   instances; q64 uses this to segregate region kinds.
 - **WasmGC** — `struct.new`, `array.new`, engine-managed references.
-- **Threads + atomics** — SAB-backed shared linear memory.
-- **Stack-switching** — lightweight coroutine stacks.
+- **Threads + atomics** — SAB-backed shared linear memory (browser: gated
+  on COOP/COEP cross-origin isolation — an opt-in upgrade, not the floor;
+  see [§"Concurrency platform audit"](#concurrency-platform-audit-the-stack-switching-reckoning)).
 - **SIMD** — 128-bit vector ops.
+
+> **Not on the floor: stack-switching.** Earlier drafts assumed
+> lightweight coroutine stacks (the typed-continuations proposal). The
+> [concurrency platform audit](#concurrency-platform-audit-the-stack-switching-reckoning)
+> found **no engine q64 targets exposes it** (wasmtime 45 has no C-API
+> toggle; no browser ships it to stable as of 2026-06). The v0 concurrency
+> floor is a single-threaded cooperative scheduler instead.
 
 These choices compound. The dual-heap model is **what the platform
 gives us**, not a compromise. The address-space split is the one place
@@ -108,6 +116,100 @@ stored in the Continuum (it holds **source** archives — see
 [`continuum-api.md`](./continuum-api.md)); the dual-build store + per-request
 selection live in the deploy host (on qubepods, the artifact store keyed by
 the QubePod manifest's `component.variants`).
+
+### Concurrency platform audit (the stack-switching reckoning)
+
+The address-space split above came from probing one feature (Memory64).
+The same discipline applies to the features the **concurrency** and
+**stream** layers lean on. The headline finding: q64's concurrency design
+was written assuming **stack-switching** (lightweight coroutine stacks /
+the typed-continuations proposal), and *no production engine exposes it on
+the floor q64 targets*. The audit below is the basis for the v0
+concurrency floor.
+
+**Support matrix** — `✓` available, `✗` absent, `⚠` available with a
+caveat. The `wasmtime` column is **probed** against the vendored engine
+(`vendor/wasmtime`, **45.0.0**, via the C-API `wasmtime_config_wasm_*`
+toggles it exposes); the browser and `wasmer` columns are from engine
+release notes / known status **as of 2026-06** and should be re-probed
+with the live `WebAssembly.validate` script (below) before any host is
+declared supported.
+
+| Feature (proposal)            | WebKit — Safari/iPad | Chrome / V8 | Firefox | wasmtime 45 | wasmer |
+|-------------------------------|:--------------------:|:-----------:|:-------:|:-----------:|:------:|
+| Tail calls                    | ✓                    | ✓           | ✓       | ✓           | ✓      |
+| Exception handling            | ✓                    | ✓           | ✓       | ✓           | ✓      |
+| WasmGC                        | ✓ (Safari 18.2+)     | ✓           | ✓       | ✓           | ⚠      |
+| Threads + atomics + SAB       | ⚠ (COOP/COEP)        | ⚠ (COOP/COEP)| ⚠ (COOP/COEP)| ✓     | ✓      |
+| **Stack-switching**           | **✗**                | **✗**       | **✗**   | **✗** (no C-API toggle) | **✗** |
+
+Notes:
+
+- **Stack-switching is the blocker.** wasmtime 45 ships config toggles for
+  tail-calls, exceptions, GC, function-references, and threads, but **no
+  `wasm_stack_switching` toggle** — its only stack mechanism is host-side
+  fibers (`async` / `component_model_async_stackful`), which is *not* the
+  guest-visible `cont`/`resume`/`suspend` instruction set. No browser ships
+  the typed-continuations proposal to stable (Chrome's **JSPI** is a
+  different, JS-Promise–shaped feature, not general guest stack-switching).
+  A concurrency runtime that needs guest stacks to suspend mid-function
+  therefore **cannot run anywhere q64 ships today.**
+- **Threads need cross-origin isolation in the browser.** `SharedArrayBuffer`
+  (hence wasm threads/atomics) is gated on **COOP/COEP** headers. qubepods
+  can serve them, but it is a deployment constraint, and iPad Safari is the
+  weakest link — so threads are an *opt-in upgrade*, never the floor.
+- Everything else q64 needs (tail-calls, EH for the `panic` lowering, GC for
+  `Managed`) is broadly available; `wasmer`'s GC support is the laggard.
+
+**Re-runnable probe.** Mirror the Memory64 probe — `WebAssembly.validate`
+a tiny module per feature, log engine + version + date, in each browser
+and via each native host. (Script lives with the runtime adapters; this
+spec records the *decision*, not the harness.)
+
+### The v0 concurrency floor (normative)
+
+Because stack-switching is unavailable on the floor — and **WebKit/iPad is
+the declared compatibility floor** — q64 v0 does **not** use guest
+stack-switching. The v0 floor is a **single-threaded cooperative
+scheduler**:
+
+- **One scheduler, one thread.** Tasks (`spawn`, graph stages, actor
+  message turns) run on a single wasm instance with no shared-memory
+  parallelism. This preserves the one-scheduler invariant of
+  [`concurrency-model.md`](./concurrency-model.md) on every host.
+- **Suspension only at statically-known boundaries.** A task may yield
+  only where the compiler already sees a suspension point — an `await`, a
+  channel `send`/`recv`, a host-call that returns a future. The front end
+  knows these from the effect system, so the lowering is a **CPS /
+  state-machine transform of the suspendable functions** (only functions
+  whose effect signature can suspend are split), *not* a whole-program
+  asyncify pass.
+- **No mid-function preemption.** A CPU-bound loop with no suspension point
+  runs to completion before the scheduler regains control — the same
+  contract as a JS event loop or a single-threaded async runtime.
+  Acceptable for v0; cooperative by construction.
+
+Why this floor over the alternatives the audit weighed:
+
+1. **(rejected) "require a capable host."** Would exclude iPad/WebKit —
+   violates the compatibility floor.
+2. **(rejected) asyncify the whole program.** Binaryen can, but it taxes
+   *every* function with code-size and call-overhead even where no
+   suspension happens; the effect system lets us transform only the
+   functions that can actually suspend.
+3. **(chosen) cooperative scheduler, selective CPS lowering.** Runs
+   everywhere with no stack-switching and no SAB/COOP-COEP requirement,
+   and the suspension points are exactly the ones the type/effect system
+   already identifies.
+
+**Upgrade path, not a redesign.** True parallelism (threads + atomics,
+where COOP/COEP and host support allow) and guest stack-switching (if/when
+it ships broadly) are *opt-in upgrades behind the same scheduler
+abstraction* — a capable target may lower `spawn` to a real worker thread.
+The surface language and the one-scheduler model do not change; only the
+task-resumption mechanism does. This is the concurrency analogue of the
+`wasm32`/`wasm64` per-build choice: the floor is universal, capability
+unlocks more.
 
 ## Region kinds
 

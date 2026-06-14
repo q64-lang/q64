@@ -254,13 +254,17 @@ needs the platform audit, so it's the highest-leverage near-term work.
     (§"QView…" — parse/AST done; lowering + `runtime/web` reading the i32
     `env.out` args remain).
 
-**Phase 2 — Platform feature audit — THE GATE (do before any scheduler
-code).** §"Wasm 3.0 feature audit". Probe matrix (stack-switching, threads
-+ SAB + atomics, WasmGC, exception handling, tail calls) × hosts (WebKit/
-iPad, Chrome, Firefox, wasmtime, wasmer); record the matrix in the specs;
-**pick the v0 concurrency floor** for hosts without stack-switching
-(restrict / cooperative-scheduler / asyncify). Everything in Phase 3+
-depends on this decision.
+**Phase 2 — Platform feature audit — THE GATE — DECISION RECORDED
+(2026-06-14).** §"Wasm 3.0 feature audit". Matrix recorded in
+`spec/memory.md` §"Concurrency platform audit": **stack-switching ships on
+no host q64 targets** (wasmtime 45 has no C-API toggle; no browser stable);
+tail-call/EH/GC are broadly available; threads need COOP/COEP. **v0
+concurrency floor = single-threaded cooperative scheduler** (suspend only at
+statically-known points, selective CPS lowering — not asyncify); threads +
+stack-switching are capable-host upgrades behind the same scheduler. This
+unblocks Phase 3. Remaining: the live `WebAssembly.validate` browser-probe
+harness (confirm the WebKit/iPad column empirically) + maintainer sign-off on the
+floor. Everything in Phase 3+ now has its target.
 
 **Phase 3 — Concurrency runtime — gated on Phase 2.** Implement the chosen
 floor: the scheduler, `spawn` + structured `scope` execution, `channel`
@@ -2207,22 +2211,32 @@ not been applied to the rest of the platform bet. Everything in
 engine ships; WebKit (the declared iPad baseline) also lacks threads-adjacent
 pieces. Cheap insurance, do it before any scheduler code:
 
-- [ ] **Probe matrix.** Tiny `.wat` + `WebAssembly.validate` probes (mirroring
-      the Memory64 probe) per feature × host: stack-switching, threads + SAB +
-      atomics (incl. COOP/COEP reality on qubepods), WasmGC, exception
-      handling (the `panic` lowering), tail calls. Hosts: WebKit/iPad Safari,
-      Chrome, Firefox, vendored wasmtime, wasmer. Record engine versions +
-      dates; script it so it can re-run.
-- [ ] **Record the decision in the specs.** Extend `spec/memory.md` §"The
-      platform" with the audited matrix; cross-link from `concurrency.md` and
-      `concurrency-model.md`.
-- [ ] **Pick the v0 concurrency floor for hosts without stack-switching**
-      (WebKit will be one). Options, by cost: (a) "v0 concurrency requires a
-      capable host" — spec the restriction, UI-only qubes unaffected; (b) a
-      single-threaded cooperative scheduler floor (suspension only at host-call
-      boundaries — no mid-function yield); (c) an asyncify-style transform
-      (binaryen has it; code-size + perf tax). Decide, spec it, and gate any
-      `spawn`/`channel` codegen work on the decision.
+- [x] **Probe matrix — first pass recorded.** wasmtime column **probed**
+      against vendored `wasmtime 45.0.0` via the C-API `wasmtime_config_wasm_*`
+      toggles it exposes: tail-call ✓, exceptions ✓, gc ✓, function-references
+      ✓, threads ✓ — **no `stack_switching` toggle** (only host-side
+      `async`/`component_model_async_stackful` fibers, not guest `cont`/
+      `resume`). Browser + wasmer columns from release-note knowledge as of
+      2026-06 (NOT live-probed here — no browsers in the build env): tail-call/
+      EH/GC broadly shipped; threads need COOP/COEP; **stack-switching ships
+      nowhere on the floor**. Matrix recorded in `spec/memory.md`. **Still TODO:**
+      the re-runnable `WebAssembly.validate` harness in `runtime/` to confirm
+      the browser columns on real WebKit/iPad before declaring a host supported.
+- [x] **Recorded the decision in the specs.** `spec/memory.md` §"Concurrency
+      platform audit (the stack-switching reckoning)" holds the matrix +
+      decision; the stale "stack-switching" platform bullet is corrected;
+      `concurrency.md` and `concurrency-model.md` carry the v0-floor banner +
+      cross-links.
+- [x] **Picked the v0 concurrency floor: (b) single-threaded cooperative
+      scheduler.** Suspension only at statically-known points (`await`,
+      channel `send`/`recv`, suspending host calls — the effect system already
+      identifies them), lowered as a **selective CPS / state-machine transform**
+      of the suspendable functions (not whole-program asyncify). Rejected (a)
+      "require a capable host" (excludes iPad) and (c) asyncify (taxes every
+      function). Threads + guest stack-switching are opt-in capable-host
+      *upgrades* behind the same one-scheduler abstraction. This **unblocks
+      Phase 3**; `spawn`/`channel`/`select` codegen now targets this floor.
+      (Recommendation pending maintainer sign-off; reversible at the spec level.)
 
 ## C bindings
 

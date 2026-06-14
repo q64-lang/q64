@@ -41,7 +41,9 @@ detailed semantics stay in its owning spec.
         └──────────────────────┴──────────┬───────────┴──────────────────────┘
                                           ▼
                      tasks + channels + ONE scheduler
-              (concurrency.md; Wasm 3.0 stack-switching)
+              (concurrency.md; v0: single-threaded cooperative
+               scheduler — stack-switching is unavailable on the
+               floor, see memory.md §"Concurrency platform audit")
 ```
 
 Every box in the top row is a *surface*: a checked, sugared way of

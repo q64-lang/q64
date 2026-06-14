@@ -1,10 +1,24 @@
 # Concurrency
 
 How work is structured in q64. Scopes own tasks. Tasks are virtual
-threads on Wasm 3.0 stack-switching. Channels move ownership.
+threads. Channels move ownership.
 Shared state is opt-in via the `@shared` regions and `Atomic<T>`
 primitives from [`memory.md`](./memory.md). The stream runtime is
 the task scheduler.
+
+> **v0 runtime floor (normative).** This chapter describes the *surface
+> language and semantics*, which are stable. The original implementation
+> bet — virtual threads on **Wasm stack-switching** — did **not** survive
+> the platform audit: no engine q64 targets exposes guest stack-switching
+> (see [`memory.md` §"Concurrency platform audit"](./memory.md#concurrency-platform-audit-the-stack-switching-reckoning)).
+> The v0 runtime is therefore a **single-threaded cooperative scheduler**
+> that suspends only at statically-known points (`await`, channel
+> `send`/`recv`, suspending host calls), lowered as a selective CPS /
+> state-machine transform. Where this chapter says "stack-switching," read
+> "the scheduler's task-resumption mechanism" — stack-switching becomes one
+> capable-host *upgrade*, alongside threads, behind the same one-scheduler
+> model. The semantics below (structured scopes, ownership-moving channels,
+> cooperative cancellation) are unchanged by the floor.
 
 ## Design goals
 
