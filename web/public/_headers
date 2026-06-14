@@ -4,13 +4,6 @@
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: interest-cohort=()
 
-# Playable examples (/play/<name>/) may be embedded — same-origin here and by
-# the docs site. `frame-ancestors` supersedes the site-wide X-Frame-Options:
-# DENY for these paths; everything else stays DENY.
-/play/*
-  X-Frame-Options: SAMEORIGIN
-  Content-Security-Policy: frame-ancestors 'self' https://docs.q64.dev
-
 /_astro/*
   Cache-Control: public, max-age=31536000, immutable
 
