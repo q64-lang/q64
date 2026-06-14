@@ -329,8 +329,18 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         suspension. **Still genuine CPS work (next):** a *consumer spawned
         before its producer* (true mutual suspension — `recv`-on-empty must
         yield to a later task), `send`-on-full backpressure (v0 channels are
-        unbounded), and `select`. The eager floor covers producer-before-
-        consumer DAGs (the common case).
+        unbounded), and a *suspending* `select`. The eager floor covers
+        producer-before-consumer DAGs (the common case).
+  - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
+        `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
+        arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs
+        its `recv` (binding the value or discarding it with `_`), bumps the
+        cursor, and runs its body (block or `-> expr`). No else — a
+        non-suspending select falls through when nothing is ready (a *parking*
+        select waits for the scheduler). `select { v=a.recv()->…, w=b.recv()->… }`
+        with `b` ready → the b arm; both ready → the first arm. Runs wasm64 +
+        wasm32 (`100 / 7`). **Still needs the scheduler:** parking when no arm
+        is ready, and `send` arms / send-on-full.
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

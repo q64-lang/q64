@@ -1381,6 +1381,19 @@ pub const SelectArm = struct {
     pub fn block(self: SelectArm) ?Block {
         return firstChildNode(self.cst, .BLOCK, Block);
     }
+    /// The arm body when it is an expression (`-> use(v)`): the second
+    /// expression child (the first is the raced `operation()`).
+    pub fn bodyExpr(self: SelectArm) ?Expr {
+        var seen: usize = 0;
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (Expr.cast(n)) |e| {
+                if (seen == 1) return e;
+                seen += 1;
+            },
+            .token => {},
+        };
+        return null;
+    }
 };
 
 pub const SelectArmIter = struct {

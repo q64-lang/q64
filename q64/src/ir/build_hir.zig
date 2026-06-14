@@ -799,8 +799,106 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             try out.append(b.a, st);
         },
         .scope_stmt => |ss| try buildScopeStmt(b, ss, scope, rt, out),
+        .select_stmt => |sel| try buildSelectStmt(b, sel, scope, rt, out),
         else => return error.Unsupported,
     }
+}
+
+/// `select { v = ch.recv() -> body, … }` on the v0 cooperative floor: a
+/// non-suspending first-ready-wins choice. Each arm's channel op is tested for
+/// readiness (`recv`: the buffer has an unread element); the first ready arm
+/// performs its op (binding the result) and runs its body. Lowers to an
+/// if / else-if chain; if no arm is ready it falls through (a real suspending
+/// select — park until one is ready — arrives with the scheduler). v0: `recv`
+/// arms on channel bindings.
+fn buildSelectStmt(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const Arm = struct { cond: *hir.Expr, body: *hir.Stmt };
+    var arms: std.ArrayList(Arm) = .empty;
+    defer arms.deinit(b.a);
+
+    var it = sel.arms();
+    while (it.next()) |arm| {
+        const op = arm.operation() orelse return error.Unsupported;
+        const cc = switch (op) {
+            .call => |x| x,
+            else => return error.Unsupported,
+        };
+        const cname = (callPathName(b, cc)) orelse return error.Unsupported;
+        defer b.a.free(cname);
+        const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return error.Unsupported;
+        if (!std.mem.eql(u8, cname[dot + 1 ..], "recv")) return error.Unsupported; // v0: recv arms
+        const head = cname[0..dot];
+        const cur_idx = scope.chans.get(head) orelse return error.Unsupported;
+        const loc = scope.find(head) orelse return error.Unsupported;
+
+        // Readiness: cursor < vec_len(buffer).
+        const curref = try b.a.create(hir.Expr);
+        curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+        const bufref = try b.a.create(hir.Expr);
+        bufref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+        const lenx = try b.a.create(hir.Expr);
+        lenx.* = .{ .vec_len = .{ .vec = bufref } };
+        const cond = try b.a.create(hir.Expr);
+        cond.* = .{ .bin = .{ .kind = .lt, .lhs = curref, .rhs = lenx } };
+
+        // Arm body: read the value (bind it, or discard), bump the cursor, then
+        // the user body.
+        var items: std.ArrayList(*hir.Stmt) = .empty;
+        const buf2 = try b.a.create(hir.Expr);
+        buf2.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+        const cur2 = try b.a.create(hir.Expr);
+        cur2.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+        const get = try b.a.create(hir.Expr);
+        get.* = .{ .vec_get = .{ .vec = buf2, .idx = cur2 } };
+        if (arm.binding()) |p| {
+            if (p.kind() == .IDENT_PATTERN) {
+                const vn = (p.bindingName() orelse return error.Unsupported).text;
+                const v_idx = try declareBodyLocal(b, scope, vn, false, .i64);
+                const bind = try b.a.create(hir.Stmt);
+                bind.* = .{ .let = .{ .idx = v_idx, .value = get } };
+                try items.append(b.a, bind);
+            }
+            // `_ = ch.recv()` discards the value; the cursor bump consumes it.
+        }
+        // cursor += 1
+        const cur3 = try b.a.create(hir.Expr);
+        cur3.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+        const one = try b.a.create(hir.Expr);
+        one.* = .{ .int_const = 1 };
+        const inc = try b.a.create(hir.Expr);
+        inc.* = .{ .bin = .{ .kind = .add, .lhs = cur3, .rhs = one } };
+        const setc = try b.a.create(hir.Stmt);
+        setc.* = .{ .assign = .{ .idx = cur_idx, .value = inc } };
+        try items.append(b.a, setc);
+        // The user body (block or trailing expression).
+        if (arm.block()) |blk| {
+            var bit = blk.statements();
+            while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, &items);
+        } else if (arm.bodyExpr()) |be| {
+            try buildMainExprStmt(b, be, scope, rt, &items);
+        }
+        const body = try b.a.create(hir.Stmt);
+        body.* = .{ .block = try items.toOwnedSlice(b.a) };
+        try arms.append(b.a, .{ .cond = cond, .body = body });
+    }
+
+    // Fold back-to-front into an if / else-if chain; no else (a non-suspending
+    // select falls through when no arm is ready — the scheduler adds parking).
+    var chain: ?*hir.Stmt = null;
+    var i = arms.items.len;
+    while (i > 0) {
+        i -= 1;
+        var else_part = chain;
+        if (else_part) |ep| if (ep.* == .if_) {
+            const wrap = try b.a.create(hir.Stmt);
+            wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{ep}) };
+            else_part = wrap;
+        };
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .if_ = .{ .cond = arms.items[i].cond, .then_ = arms.items[i].body, .else_ = else_part } };
+        chain = st;
+    }
+    if (chain) |c| try out.append(b.a, c);
 }
 
 /// `let h = spawn { stmts; tail }` — bind a task handle. v0 cooperative floor:
@@ -7893,6 +7991,31 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\}
         \\
     )) == null);
+}
+
+test "select v0: first-ready arm over channel recv lowers to an if/else chain" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let a = channel(capacity: 4)
+        \\        let b = channel(capacity: 4)
+        \\        spawn { b.send(99) }
+        \\        select {
+        \\            v = a.recv() -> env.out(v),
+        \\            w = b.recv() -> env.out(w + 1),
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Each arm's readiness is a `vec_len` test; the choice is an if-chain.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
 }
 
 test "channels v0: channel() + send/recv lower to a Vec buffer + read cursor" {

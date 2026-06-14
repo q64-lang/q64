@@ -2376,6 +2376,38 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/101/parent/102/100/done (wasm64 + wasm32; eager-at-spawn, tasks see scope locals)"
 
+echo "==> select v0: first-ready-wins over channel recv arms"
+sel_app="$tmp/select.q"
+cat > "$sel_app" <<'Q64'
+fn main {
+    scope {
+        let a = channel(capacity: 4)
+        let b = channel(capacity: 4)
+        spawn { b.send(99) }
+        select {
+            v = a.recv() -> env.out(v),
+            w = b.recv() -> env.out(w + 1),
+        }
+    }
+    scope {
+        let a = channel(capacity: 4)
+        spawn { a.send(7) }
+        select {
+            v = a.recv() -> { env.out(v) }
+            _ = a.recv() -> { env.out(0) }
+        }
+    }
+}
+Q64
+sel_expected=$'100\n7'
+"$Q64_BIN" emit "$sel_app" "$tmp/select.wasm"
+sel_out="$("$HOST_BIN" "$tmp/select.wasm")"
+[[ "$sel_out" == "$sel_expected" ]] || { echo "FAIL: select (got: $sel_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$sel_app" "$tmp/select32.wasm" --addr wasm32
+sel32_out="$("$HOST_BIN" "$tmp/select32.wasm")"
+[[ "$sel32_out" == "$sel_expected" ]] || { echo "FAIL: select wasm32 (got: $sel32_out)" >&2; exit 1; }
+echo "    ok: select -> 100 / 7 (wasm64 + wasm32; first-ready arm wins, bind + discard, expr + block body)"
+
 echo "==> channels v0 (FIFO): natural idiom — spawn producer, parent consumes (eager-at-spawn)"
 chn_app="$tmp/channel.q"
 cat > "$chn_app" <<'Q64'
