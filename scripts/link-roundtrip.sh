@@ -2376,6 +2376,30 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/101/parent/102/100/done (wasm64 + wasm32; eager-at-spawn, tasks see scope locals)"
 
+echo "==> graph v0: named pipeline runs eagerly, terminal stage is the output"
+grf_app="$tmp/graph.q"
+cat > "$grf_app" <<'Q64'
+fn src(seed: i64) -> i64 { seed }
+fn dbl(n: i64) -> i64 { n * 2 }
+fn inc(n: i64) -> i64 { n + 1 }
+graph pipeline(seed: i64) -> i64 {
+    let a = src(seed)
+    let b = a |> dbl |> inc
+}
+fn main {
+    env.out(pipeline(20))
+    env.out(pipeline(100))
+}
+Q64
+grf_expected=$'41\n201'
+"$Q64_BIN" emit "$grf_app" "$tmp/graph.wasm"
+grf_out="$("$HOST_BIN" "$tmp/graph.wasm")"
+[[ "$grf_out" == "$grf_expected" ]] || { echo "FAIL: graph (got: $grf_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$grf_app" "$tmp/graph32.wasm" --addr wasm32
+grf32_out="$("$HOST_BIN" "$tmp/graph32.wasm")"
+[[ "$grf32_out" == "$grf_expected" ]] || { echo "FAIL: graph wasm32 (got: $grf32_out)" >&2; exit 1; }
+echo "    ok: graph -> 41 / 201 (wasm64 + wasm32; eager stage pipeline, terminal binding = output)"
+
 echo "==> actors v0: state record + handlers (tell/ask) with bare-field self access"
 act_app="$tmp/actor.q"
 cat > "$act_app" <<'Q64'

@@ -129,6 +129,10 @@ const Builder = struct {
     /// `c.handle(...)` dispatch can build the handler, and construction can
     /// fill `state` defaults.
     actor_decls: std.StringHashMapUnmanaged(ast.ActorDecl) = .empty,
+    /// Graph declarations by name (Phase 4 v0). A `graph` runs eagerly as a
+    /// function: its `let` stage bindings execute in order and the last binding
+    /// is the pipeline's output. Kept so a `pipeline(args)` call can build it.
+    graph_decls: std.StringHashMapUnmanaged(ast.GraphDecl) = .empty,
     /// This file's all-unit enum declarations (C1): a variant value is
     /// its declaration-order tag (an i64 at the compute floor).
     enums: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
@@ -3820,6 +3824,9 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
             try b.structs.put(b.a, nm.text, si);
             try b.actor_decls.put(b.a, nm.text, ad);
         },
+        .graph_decl => |gd| {
+            if (gd.name()) |nm| try b.graph_decls.put(b.a, nm.text, gd);
+        },
         else => {},
     };
 }
@@ -4281,6 +4288,79 @@ fn registerActorHandler(b: *Builder, si: *const StructInfo, mname: []const u8) B
         t.* = if (ty == .str) .ptr else ty;
     }
     b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = ret_ty, .locals = locals, .body = block };
+    return id;
+}
+
+/// Build (once) a `graph` as an eagerly-run function (Phase 4 v0). The body's
+/// `let` stage bindings execute in order; the **last binding is the pipeline's
+/// output** (the terminal stage), returned as the graph's value. Reuses the
+/// callee value-body machinery — eager dataflow is sequential stage calls on
+/// the cooperative floor (continuous streaming is the deep follow-up).
+fn registerGraph(b: *Builder, name: []const u8) BuildError!?hir.FuncId {
+    if (b.ids.get(name)) |id| return id;
+    const gd = b.graph_decls.get(name) orelse return null;
+    const body_blk = gd.body() orelse return error.Unsupported;
+    const rt = gd.returnType() orelse return error.Unsupported; // v0: a graph declares a scalar output
+    const rs = (try semaScalar(b, rt.type_())) orelse return error.Unsupported;
+    const ret_ty: hir.Type = switch (rs) {
+        .bool, .i64, .f64, .f32 => rs,
+        else => return error.Unsupported,
+    };
+
+    const owned = try b.a.dupe(u8, name);
+    var scope = Scope{ .a = b.a, .callee = true };
+    var params: std.ArrayList(hir.Param) = .empty;
+    if (gd.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| {
+            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+            const pty: hir.Type = switch (psc) {
+                .bool, .i64, .f64, .f32 => psc,
+                else => return error.Unsupported,
+            };
+            const pn = (p.name() orelse return error.Unsupported).text;
+            _ = try scope.declare(pn, false, pty);
+            try params.append(b.a, .{ .name = pn, .ty = pty });
+        }
+    }
+    scope.n_params = @intCast(params.items.len);
+    const param_slice = try params.toOwnedSlice(b.a);
+
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, owned, id);
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = ret_ty, .body = dummy });
+
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    var last_name: ?[]const u8 = null;
+    var sit = body_blk.statements();
+    while (sit.next()) |s| {
+        try items.append(b.a, try buildIntStmt(b, s, &scope));
+        if (s == .let_stmt) {
+            if (s.let_stmt.pattern()) |p| {
+                if (p.bindingName()) |tok| last_name = tok.text;
+            }
+        }
+    }
+    // The terminal stage is the graph's output.
+    const ln = last_name orelse return error.Unsupported; // empty graph body
+    const loc = scope.find(ln) orelse return error.Unsupported;
+    const rd = try b.a.create(hir.Expr);
+    rd.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+    const ret = try b.a.create(hir.Stmt);
+    ret.* = .{ .ret = rd };
+    try items.append(b.a, ret);
+    const block = try b.a.create(hir.Stmt);
+    block.* = .{ .block = try items.toOwnedSlice(b.a) };
+
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty;
+    }
+    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = ret_ty, .locals = locals, .body = block };
     return id;
 }
 
@@ -6174,6 +6254,18 @@ const ExprTypeBridge = struct {
 
     fn callRet(ctx: *anyopaque, name: []const u8, call: ast.CallExpr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
         const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
+        // A `graph` call (`pipeline(...)`) types as the graph's declared output.
+        if (self.b.graph_decls.get(name)) |gd| {
+            const rt = gd.returnType() orelse return null;
+            const ht = (semaScalar(self.b, rt.type_()) catch null) orelse return null;
+            return switch (ht) {
+                .i64 => .i64,
+                .f64 => .f64,
+                .f32 => .f32,
+                .bool => .bool,
+                else => null,
+            };
+        }
         // A builtin numeric cast types as its target (`f32(x)` is f32).
         if (castTarget(name)) |ct| {
             return switch (ct) {
@@ -7038,6 +7130,13 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     }
                     return ge;
                 }
+            }
+            // A `graph` called by name (`pipeline(args)`) runs its stages
+            // eagerly and yields the terminal stage's value (Phase 4 v0).
+            if (b.graph_decls.contains(cname)) {
+                const gid = (try registerGraph(b, cname)) orelse return reject(b, .name_not_found);
+                out.* = .{ .call = .{ .func = gid, .args = try buildCallArgs(b, gid, cc.args(), scope, null) } };
+                return out;
             }
             const id = try registerFunc(b, cname);
             // An i64 or bool (i32 0/1) callee produces a value usable here; a
@@ -8250,6 +8349,28 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\}
         \\
     )) == null);
+}
+
+test "graph v0: a named pipeline runs eagerly; terminal stage is the output" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn src(seed: i64) -> i64 { seed }
+        \\fn dbl(n: i64) -> i64 { n * 2 }
+        \\graph pipeline(seed: i64) -> i64 {
+        \\    let a = src(seed)
+        \\    let b = a |> dbl
+        \\}
+        \\fn main {
+        \\    env.out(pipeline(20))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The graph lowers to a function returning its terminal binding.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn pipeline -> i64") != null);
 }
 
 test "actors v0: handlers lower to self-taking functions; tell/ask dispatch" {

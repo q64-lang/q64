@@ -388,9 +388,17 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         `SymbolKind.graph`). The body is `let` stage bindings whose RHS is a
         stage call or a `|>` pipeline (the pipe lowering already exists). Lossless
         round-trip + an AST-structure test; `q64 check` accepts a graph.
-        **Codegen next:** walk the desugared stage call-tree to build the
-        topology; v0 can run a graph eagerly (stages are just function calls via
-        `|>`) on the cooperative floor, like the rest of Phase 3.
+  - [x] **Graph eager codegen.** `registerGraph` lowers a `graph` to an
+        eagerly-run function: its `let` stage bindings execute in order and the
+        **last binding is the pipeline's output** (returned). A `pipeline(args)`
+        call dispatches to it (gated on `b.graph_decls`), typed via the
+        `callRet` bridge so non-i64 outputs format right. `graph pipeline(seed)
+        -> i64 { let a = src(seed); let b = a |> dbl |> inc }` with
+        `pipeline(20)` → 41. Runs wasm64 + wasm32. Eager dataflow = sequential
+        stage calls on the cooperative floor; **continuous streaming**
+        (Signal/Event/Stream sampling, the graph scheduler, `g.start()` →
+        Handle) is the deep Phase-4 follow-up, and the anonymous `graph { … }`
+        expression form is a smaller one.
 
 **Phase 4 (cont.) — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream
