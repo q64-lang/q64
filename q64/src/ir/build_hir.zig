@@ -537,6 +537,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 try out.append(b.a, st);
             } else if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let v = Vec.from([…])` — handled (vec_new + pushes).
+            } else if (try tryChannelNew(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let ch = channel(…)` — a Vec buffer + read cursor.
+            } else if (try tryChannelRecv(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let v = ch.recv()` — buf[cursor]; cursor += 1.
             } else if (try tryVecMap(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let d = xs.map|filter(|x| …)` — handled (vec_new + pushes).
             } else if (try tryVecReduce(b, init_expr, nm.text, ls.isVar(), scope, out)) {
@@ -1517,6 +1521,11 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
             }
             // `v.push(x)` on a vec binding (the v0 Vec floor).
             if (try tryVecPush(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
+            }
+            // `ch.send(x)` on a channel binding — a vec_push onto the buffer.
+            if (try tryChannelSend(b, call, scope)) |st| {
                 try out.append(b.a, st);
                 return;
             }
@@ -4819,6 +4828,94 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
     return true;
 }
 
+/// `let ch = channel(...)` — concurrency v0. A channel is a Vec buffer plus an
+/// i64 read cursor: `send` pushes, `recv` reads `buf[cursor]` then bumps the
+/// cursor (FIFO). v0 has no suspension (producer-before-consumer ordering, and
+/// capacity ≥ messages); suspend-on-empty/full arrives with the scheduler.
+fn tryChannelNew(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cname = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cname);
+    if (!std.mem.eql(u8, cname, "channel")) return false;
+    // The buffer: a Vec under `name`.
+    const v_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
+    try scope.vecs.put(b.a, name, {});
+    const nv = try b.a.create(hir.Expr);
+    nv.* = .vec_new;
+    const bind = try b.a.create(hir.Stmt);
+    bind.* = .{ .let = .{ .idx = v_idx, .value = nv } };
+    try out.append(b.a, bind);
+    // The read cursor: `name#cur` = 0.
+    const cur_name = try std.fmt.allocPrint(b.a, "{s}#cur", .{name});
+    const cur_idx = try declareBodyLocal(b, scope, cur_name, true, .i64);
+    try scope.chans.put(b.a, name, cur_idx);
+    const zero = try b.a.create(hir.Expr);
+    zero.* = .{ .int_const = 0 };
+    const cbind = try b.a.create(hir.Stmt);
+    cbind.* = .{ .let = .{ .idx = cur_idx, .value = zero } };
+    try out.append(b.a, cbind);
+    return true;
+}
+
+/// `ch.send(x)` on a channel binding — a `vec_push` onto the buffer.
+fn tryChannelSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
+    const cname = (callPathName(b, call)) orelse return null;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return null;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "send")) return null;
+    const head = cname[0..dot];
+    if (!scope.chans.contains(head)) return null;
+    const loc = scope.find(head) orelse return null;
+    var ait = call.args();
+    const a0 = ait.next() orelse return error.Unsupported;
+    if (ait.next() != null) return error.Unsupported; // v0: one value per send
+    const vref = try b.a.create(hir.Expr);
+    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .vec_push = .{ .vec = vref, .value = try buildIntExpr(b, a0, scope) } };
+    return st;
+}
+
+/// `let v = ch.recv()` on a channel binding — `v = buf[cursor]; cursor += 1`.
+fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cname = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "recv")) return false;
+    const head = cname[0..dot];
+    const cur_idx = scope.chans.get(head) orelse return false;
+    const loc = scope.find(head) orelse return false;
+    // v = buf[cursor]
+    const vref = try b.a.create(hir.Expr);
+    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    const curref = try b.a.create(hir.Expr);
+    curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+    const get = try b.a.create(hir.Expr);
+    get.* = .{ .vec_get = .{ .vec = vref, .idx = curref } };
+    const v_idx = try declareBodyLocal(b, scope, name, mutable, .i64);
+    const bind = try b.a.create(hir.Stmt);
+    bind.* = .{ .let = .{ .idx = v_idx, .value = get } };
+    try out.append(b.a, bind);
+    // cursor += 1
+    const curref2 = try b.a.create(hir.Expr);
+    curref2.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+    const one = try b.a.create(hir.Expr);
+    one.* = .{ .int_const = 1 };
+    const inc = try b.a.create(hir.Expr);
+    inc.* = .{ .bin = .{ .kind = .add, .lhs = curref2, .rhs = one } };
+    const setc = try b.a.create(hir.Stmt);
+    setc.* = .{ .assign = .{ .idx = cur_idx, .value = inc } };
+    try out.append(b.a, setc);
+    return true;
+}
+
 /// map/filter method name → is-filter (true=filter, false=map), or null.
 fn mapFilterKind(method: []const u8) ?bool {
     if (std.mem.eql(u8, method, "filter")) return true;
@@ -5947,6 +6044,12 @@ const Scope = struct {
     /// present. The header base pointer lives in `locals` under the
     /// same name (a `.ptr`); elements are i64.
     vecs: std.StringHashMapUnmanaged(void) = .empty,
+    /// Channel bindings (concurrency v0): name → the i64 read-cursor local
+    /// index. The buffer is a Vec under the same name (also in `vecs`):
+    /// `send` is a `vec_push`, `recv` reads `buf[cursor]` then bumps the
+    /// cursor. v0 FIFO with no suspension (producer-before-consumer ordering,
+    /// capacity ≥ messages); suspend-on-empty/full arrives with the scheduler.
+    chans: std.StringHashMapUnmanaged(u32) = .empty,
     /// True for a plain callee body (registerFunc), whose locals are
     /// tracked by `declare` alone — entry-style bodies (`main`,
     /// stamped generics) mirror every local into `b.cur_locals` too.
@@ -7798,6 +7901,32 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\}
         \\
     )) == null);
+}
+
+test "channels v0: channel() + send/recv lower to a Vec buffer + read cursor" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel(capacity: 8)
+        \\        ch.send(10)
+        \\        ch.send(20)
+        \\        spawn {
+        \\            let a = ch.recv()
+        \\            let b = ch.recv()
+        \\            env.out(a + b)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // send is a vec_push; recv is a vec_get off the cursor.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

@@ -2376,6 +2376,33 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/parent/101/102/100/done (wasm64 + wasm32; tasks run at join, see scope locals)"
 
+echo "==> channels v0 (FIFO): channel() + ch.send / let v = ch.recv() (parent fills, task drains)"
+chn_app="$tmp/channel.q"
+cat > "$chn_app" <<'Q64'
+fn main {
+    scope {
+        let ch = channel(capacity: 8)
+        ch.send(10)
+        ch.send(20)
+        ch.send(30)
+        spawn {
+            let a = ch.recv()
+            let b = ch.recv()
+            let c = ch.recv()
+            env.out(a + b + c)
+        }
+    }
+}
+Q64
+chn_expected=$'60'
+"$Q64_BIN" emit "$chn_app" "$tmp/channel.wasm"
+chn_out="$("$HOST_BIN" "$tmp/channel.wasm")"
+[[ "$chn_out" == "$chn_expected" ]] || { echo "FAIL: channel FIFO (got: $chn_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$chn_app" "$tmp/channel32.wasm" --addr wasm32
+chn32_out="$("$HOST_BIN" "$tmp/channel32.wasm")"
+[[ "$chn32_out" == "$chn_expected" ]] || { echo "FAIL: channel FIFO wasm32 (got: $chn32_out)" >&2; exit 1; }
+echo "    ok: channel FIFO -> 60 (wasm64 + wasm32; send=push, recv=buf[cursor]++)"
+
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
 cat > "$ssc_app" <<'Q64'

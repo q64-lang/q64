@@ -311,10 +311,23 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         { … }` (run the nested scope, whose own spawns join at its own brace) —
         in both main and callee positions. Nested structured concurrency:
         `spawn scope { spawn { … } … }` → `outer-parent/inner-parent/inner-a`.
-        Runs wasm64 + wasm32. **The genuine CPS/state-machine transform is only
-        needed for task-*internal* suspension** (a task that awaits mid-body) —
-        that's the next slice, along with record/str handle results and
-        `select`/`channel`.
+        Runs wasm64 + wasm32.
+  - [x] **Channels v0 — FIFO buffer (CPS increment 1).** `let ch =
+        channel(...)` lowers to a Vec buffer + an i64 read cursor (`scope.chans`
+        + `scope.vecs`); `ch.send(x)` is a `vec_push`; `let v = ch.recv()` is
+        `v = buf[cursor]; cursor += 1`. i64 elements. **Key finding that frames
+        the rest of the CPS work:** task-internal suspension is only
+        *observably* needed for channels — handle-await DAGs already run
+        topologically under the eager model. And the natural idiom (spawn the
+        producer, consume in the parent) *requires* suspension, because the
+        spawned producer is hoisted to the join and would `send` after the
+        parent's `recv`s (recv-on-empty traps). So v0 FIFO works in the
+        inverted arrangement — **parent fills, a spawned task drains at the
+        join** — proving the buffer mechanism: `ch.send(10/20/30)` then a task
+        `ch.recv()×3` → 60 (wasm64 + wasm32). **CPS increment 2 (next):** the
+        scheduler + state-machine so `recv`-on-empty / `send`-on-full *suspend*
+        and resume — which makes the natural spawn-producer arrangement and
+        `select` work.
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream
