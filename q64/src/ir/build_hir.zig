@@ -831,19 +831,19 @@ fn buildSpawnLet(b: *Builder, sp: ast.SpawnExpr, nm: parser.cst.Token, is_var: b
     try out.append(b.a, st);
 }
 
-/// If `stmt` is a statement-position `spawn { … }`, its body block (the
-/// `spawn scope …` sugar and `let h = spawn …` forms are later slices).
-fn spawnBody(stmt: ast.Stmt) ?ast.Block {
+/// If `stmt` is a statement-position `spawn …`, its spawn expression (the
+/// fire-and-forget task). Covers both `spawn { block }` and the `spawn scope
+/// { … }` sugar.
+fn spawnExprOf(stmt: ast.Stmt) ?ast.SpawnExpr {
     const es = switch (stmt) {
         .expr_stmt => |e| e,
         else => return null,
     };
     const expr = es.expression() orelse return null;
-    const sp = switch (expr) {
+    return switch (expr) {
         .spawn => |s| s,
-        else => return null,
+        else => null,
     };
-    return sp.block();
 }
 
 /// `scope { … }` on the v0 cooperative floor (spec/memory.md §"Concurrency
@@ -859,20 +859,26 @@ fn buildScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, rt: *RtMap, out
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
-    var deferred: std.ArrayList(ast.Block) = .empty;
+    var deferred: std.ArrayList(ast.SpawnExpr) = .empty;
     defer deferred.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
-        if (spawnBody(stmt)) |body| {
-            try deferred.append(b.a, body); // a task — runs at the join
+        if (spawnExprOf(stmt)) |sp| {
+            try deferred.append(b.a, sp); // a task — runs at the join
         } else {
             try buildMainStmt(b, stmt, scope, rt, out); // the parent flow
         }
     }
-    // The structured join: run the spawned tasks in spawn order.
-    for (deferred.items) |body| {
-        var bit = body.statements();
-        while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, out);
+    // The structured join: run the spawned tasks in spawn order. A `spawn {
+    // block }` replays its statements; a `spawn scope { … }` runs the nested
+    // scope (its own spawns join at its own brace).
+    for (deferred.items) |sp| {
+        if (sp.block()) |body| {
+            var bit = body.statements();
+            while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, out);
+        } else if (sp.scopeStmt()) |inner| {
+            try buildScopeStmt(b, inner, scope, rt, out);
+        } else return error.Unsupported;
     }
 }
 
@@ -2147,19 +2153,23 @@ fn buildVoidScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, out: *std.A
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
-    var deferred: std.ArrayList(ast.Block) = .empty;
+    var deferred: std.ArrayList(ast.SpawnExpr) = .empty;
     defer deferred.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
-        if (spawnBody(stmt)) |body| {
-            try deferred.append(b.a, body);
+        if (spawnExprOf(stmt)) |sp| {
+            try deferred.append(b.a, sp);
         } else {
             try buildVoidStmt(b, stmt, scope, out);
         }
     }
-    for (deferred.items) |body| {
-        var bit = body.statements();
-        while (bit.next()) |bstmt| try buildVoidStmt(b, bstmt, scope, out);
+    for (deferred.items) |sp| {
+        if (sp.block()) |body| {
+            var bit = body.statements();
+            while (bit.next()) |bstmt| try buildVoidStmt(b, bstmt, scope, out);
+        } else if (sp.scopeStmt()) |inner| {
+            try buildVoidScopeStmt(b, inner, scope, out);
+        } else return error.Unsupported;
     }
 }
 

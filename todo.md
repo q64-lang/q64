@@ -304,10 +304,17 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         { compute(6) }; … h1.await() + h2.await()` → 85; an f64 handle → 4.5.
         Runs wasm64 + wasm32. Multi-statement task bodies lower as a value
         block (leading statements for effect, tail = handle value): `let h =
-        spawn { let x=10\n let y=20\n x+y }` → 30. **The genuine CPS/state-
-        machine transform is only needed for task-*internal* suspension** (a
-        task that awaits mid-body) — that's the next slice, along with record/
-        str handle results, `spawn scope` sugar, and `select`/`channel`.
+        spawn { let x=10\n let y=20\n x+y }` → 30.
+  - [x] **`spawn scope { … }` sugar.** The deferred-task mechanism
+        (`spawnExprOf`) now carries the whole spawn expression, so a join-time
+        task is either a `spawn { block }` (replay statements) or a `spawn scope
+        { … }` (run the nested scope, whose own spawns join at its own brace) —
+        in both main and callee positions. Nested structured concurrency:
+        `spawn scope { spawn { … } … }` → `outer-parent/inner-parent/inner-a`.
+        Runs wasm64 + wasm32. **The genuine CPS/state-machine transform is only
+        needed for task-*internal* suspension** (a task that awaits mid-body) —
+        that's the next slice, along with record/str handle results and
+        `select`/`channel`.
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

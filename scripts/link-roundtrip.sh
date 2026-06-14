@@ -2376,6 +2376,30 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/parent/101/102/100/done (wasm64 + wasm32; tasks run at join, see scope locals)"
 
+echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
+ssc_app="$tmp/spawnscope.q"
+cat > "$ssc_app" <<'Q64'
+fn main {
+    env.out("start")
+    scope {
+        spawn scope {
+            spawn { env.out("inner-a") }
+            env.out("inner-parent")
+        }
+        env.out("outer-parent")
+    }
+    env.out("done")
+}
+Q64
+ssc_expected=$'start\nouter-parent\ninner-parent\ninner-a\ndone'
+"$Q64_BIN" emit "$ssc_app" "$tmp/spawnscope.wasm"
+ssc_out="$("$HOST_BIN" "$tmp/spawnscope.wasm")"
+[[ "$ssc_out" == "$ssc_expected" ]] || { echo "FAIL: spawn scope (got: $ssc_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$ssc_app" "$tmp/spawnscope32.wasm" --addr wasm32
+ssc32_out="$("$HOST_BIN" "$tmp/spawnscope32.wasm")"
+[[ "$ssc32_out" == "$ssc_expected" ]] || { echo "FAIL: spawn scope wasm32 (got: $ssc32_out)" >&2; exit 1; }
+echo "    ok: spawn scope -> start/outer-parent/inner-parent/inner-a/done (wasm64 + wasm32; nested join)"
+
 echo "==> structured concurrency v0: let h = spawn { … } + h.await() (handle results)"
 awa_app="$tmp/await.q"
 cat > "$awa_app" <<'Q64'
