@@ -279,7 +279,7 @@ const Parser = struct {
 
     fn isItemKeyword(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN, .KW_EFFECT => true,
+            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN, .KW_EFFECT, .KW_ACTOR => true,
             else => false,
         };
     }
@@ -352,6 +352,7 @@ const Parser = struct {
             .KW_FIT => try self.parseFitDecl(),
             .KW_SCREEN => try self.parseScreenDecl(),
             .KW_EFFECT => try self.parseEffectDecl(),
+            .KW_ACTOR => try self.parseActorDecl(),
             else => unreachable,
         };
         if (anns.items.len == 0) return node;
@@ -454,6 +455,61 @@ const Parser = struct {
             try children.append(self.arena, .{ .node = try self.parseBlock() });
         }
         return try cst.makeNode(self.arena, .ON_HANDLER, children.items);
+    }
+
+    /// `ActorDecl := "actor" IDENT GenericParams? "{" (StateDecl|HandleDecl)* "}"`
+    /// (spec/grammar.md §"Concurrency forms"). An actor owns `state` fields and
+    /// `handle` message methods; structurally a `screen` with handlers. Codegen
+    /// lowers it to a state record + handler functions (a follow-up).
+    fn parseActorDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_ACTOR
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) try children.append(self.arena, .{ .token = self.advance() }); // name
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_ANGLE) {
+            try children.append(self.arena, .{ .node = try self.parseGenericParams() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() }); // {
+            while (!self.isEof() and self.peek() != .R_BRACE) {
+                if (self.peek().isTrivia()) {
+                    try children.append(self.arena, .{ .token = self.advance() });
+                    continue;
+                }
+                switch (self.peek()) {
+                    .KW_STATE => try children.append(self.arena, .{ .node = try self.parseStateDecl() }),
+                    .KW_HANDLE => try children.append(self.arena, .{ .node = try self.parseHandleDecl() }),
+                    else => try children.append(self.arena, .{ .token = self.advance() }), // recovery
+                }
+            }
+            if (self.peek() == .R_BRACE) try children.append(self.arena, .{ .token = self.advance() }); // }
+        }
+        return try cst.makeNode(self.arena, .ACTOR_DECL, children.items);
+    }
+
+    /// `HandleDecl := "handle" IDENT ("(" Params? ")")? ("->" TypeExpr)? Block`
+    /// — an actor message handler (`handle inc()`, `handle get() -> i64`).
+    fn parseHandleDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_HANDLE
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) try children.append(self.arena, .{ .token = self.advance() }); // name
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_PAREN) {
+            try children.append(self.arena, .{ .node = try self.parseParams() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .ARROW) {
+            try children.append(self.arena, .{ .node = try self.parseReturnType() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .HANDLE_DECL, children.items);
     }
 
     fn parseFnDecl(self: *Parser) !*const cst.Node {
@@ -2647,6 +2703,7 @@ test "round-trip: serialize(parse(s)) == s" {
         "fn main {\n    scope @io {\n        run()\n    } catch (e: Panic) {\n        log(e)\n    }\n}\n",
         "fn main {\n    let h = spawn scope {\n        run()\n    }\n}\n",
         "fn main {\n    select {\n        v = ch.recv() -> use(v),\n        _ = ctx.cancelled() -> stop(),\n    }\n}\n",
+        "actor Counter {\n    state n: i64 = 0\n\n    handle bump() {\n        n = n + 1\n    }\n\n    handle get() -> i64 {\n        n\n    }\n}\n",
     };
 
     for (sources) |src| {
@@ -2710,6 +2767,37 @@ test "concurrency forms: scope/catch/spawn/select parse structured" {
     const a1 = sarms.next().?;
     try testing.expect(a1.binding() != null); // `_` wildcard pattern
     try testing.expect(sarms.next() == null);
+}
+
+test "actor decl: structures name / state fields / handle methods" {
+    const src =
+        "actor Counter {\n" ++
+        "    state n: i64 = 0\n" ++
+        "    handle bump() {\n" ++
+        "        n = n + 1\n" ++
+        "    }\n" ++
+        "    handle get() -> i64 {\n" ++
+        "        n\n" ++
+        "    }\n" ++
+        "}\n";
+    const r = try parse(testing.allocator, src, "a.q");
+    defer r.deinit(testing.allocator);
+    var items = ast.SourceFile.items(.{ .cst = r.root });
+    const actor = items.next().?.actor_decl;
+    try testing.expectEqualStrings("Counter", actor.name().?.text);
+
+    var states = actor.states();
+    try testing.expect(states.next() != null); // the `n` state field
+    try testing.expect(states.next() == null);
+
+    var handlers = actor.handlers();
+    const h0 = handlers.next().?;
+    try testing.expectEqualStrings("bump", h0.name().?.text);
+    try testing.expect(h0.body() != null);
+    const h1 = handlers.next().?;
+    try testing.expectEqualStrings("get", h1.name().?.text);
+    try testing.expect(h1.returnType() != null); // `-> i64`
+    try testing.expect(handlers.next() == null);
 }
 
 test "screen DSL: a screen decl structures state / draw / on members" {

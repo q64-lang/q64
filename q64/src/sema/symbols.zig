@@ -21,6 +21,7 @@ pub const SymbolKind = enum {
     face,
     fit,
     screen,
+    actor,
     import_binding,
 
     pub fn label(self: SymbolKind) []const u8 {
@@ -34,6 +35,7 @@ pub const SymbolKind = enum {
             .face => "face",
             .fit => "fit",
             .screen => "screen",
+            .actor => "actor",
             .import_binding => "import",
         };
     }
@@ -169,6 +171,7 @@ pub fn build(gpa: std.mem.Allocator, sf: ast.SourceFile) !SymbolTable {
                 .public = d.isPublic(),
             });
         },
+        .actor_decl => |d| try bindNamed(&t, d.name(), .actor, d.visibility() != null),
         // Effect markers live in their own namespace (not value/type symbols);
         // their validity is checked directly (EFF140/EFF141).
         .effect_decl => {},

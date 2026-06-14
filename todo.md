@@ -352,6 +352,17 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         Runs wasm64 + wasm32. (Method-call pipe targets `x |> r.m()` are a
         follow-on; this is the function-pipe used across the corpus and the core
         of the stream `|>` syntax.)
+  - [x] **Structured `actor` declarations** (parsing). `parseActorDecl`
+        (`actor IDENT GenericParams? "{" (StateDecl|HandleDecl)* "}"`) +
+        `parseHandleDecl` (`handle IDENT (Params)? ("->" TypeExpr)? Block`),
+        wired into `itemKeyword`/`isItemKeyword`/`parseItem`. New AST views
+        `ActorDecl{name,states,handlers}` + `HandleDecl{name,params,returnType,
+        body}` (+ `Item.actor_decl`, `SymbolKind.actor` so the name binds and
+        resolves). Structurally a `screen` with `handle` methods. Lossless
+        round-trip + an AST-structure test; `q64 check` accepts an actor.
+        **Codegen next:** lower an actor to a state record + handler functions,
+        with `tell`/`ask` as (eager, cooperative-floor) calls on the instance —
+        reusing the record + fit-method machinery.
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

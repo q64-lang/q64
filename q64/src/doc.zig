@@ -384,6 +384,7 @@ fn itemKind(item: ast.Item) []const u8 {
         .fit_decl => "fit",
         .screen_decl => "screen",
         .effect_decl => "effect",
+        .actor_decl => "actor",
     };
 }
 

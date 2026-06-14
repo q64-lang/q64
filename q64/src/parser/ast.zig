@@ -146,6 +146,7 @@ pub const Item = union(enum) {
     fit_decl: FitDecl,
     screen_decl: ScreenDecl,
     effect_decl: EffectDecl,
+    actor_decl: ActorDecl,
 
     pub fn cast(node: *const cst.Node) ?Item {
         return switch (node.kind) {
@@ -159,6 +160,7 @@ pub const Item = union(enum) {
             .FIT_DECL => .{ .fit_decl = .{ .cst = node } },
             .SCREEN_DECL => .{ .screen_decl = .{ .cst = node } },
             .EFFECT_DECL => .{ .effect_decl = .{ .cst = node } },
+            .ACTOR_DECL => .{ .actor_decl = .{ .cst = node } },
             else => null,
         };
     }
@@ -801,6 +803,46 @@ pub const OnHandler = struct {
         return firstChildNode(self.cst, .PARAMS, Params);
     }
     pub fn body(self: OnHandler) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+/// `ActorDecl := "actor" IDENT GenericParams? "{" (StateDecl|HandleDecl)* "}"`
+/// — owns `state` fields and `handle` message methods. Codegen lowers it to a
+/// state record + handler functions (a follow-up).
+pub const ActorDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: ActorDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn name(self: ActorDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+    /// The `state` declarations (the actor's fields), in order.
+    pub fn states(self: ActorDecl) ChildIter(StateDecl, .STATE_DECL) {
+        return .{ .children = self.cst.children };
+    }
+    /// The `handle <msg>(…) { … }` message handlers, in order.
+    pub fn handlers(self: ActorDecl) ChildIter(HandleDecl, .HANDLE_DECL) {
+        return .{ .children = self.cst.children };
+    }
+};
+
+/// `HandleDecl := "handle" IDENT ("(" Params? ")")? ("->" TypeExpr)? Block`.
+pub const HandleDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn name(self: HandleDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+    pub fn params(self: HandleDecl) ?Params {
+        return firstChildNode(self.cst, .PARAMS, Params);
+    }
+    pub fn returnType(self: HandleDecl) ?ReturnType {
+        return firstChildNode(self.cst, .RETURN_TYPE, ReturnType);
+    }
+    pub fn body(self: HandleDecl) ?Block {
         return firstChildNode(self.cst, .BLOCK, Block);
     }
 };
