@@ -293,6 +293,19 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         worker() { scope { spawn … } }` runs its tasks at the per-call join.
         `worker(1); worker(2)` → `1/10/100/2/20/200`. Runs wasm64 + wasm32.
         (Value-callee `scope` and `spawn scope` sugar remain follow-ons.)
+  - [x] **`let h = spawn { e }` + `h.await()` (handle results).** Key
+        realization: a task that doesn't *itself* suspend needs **no** state
+        machine — `await` is just "run to completion (already done, eagerly) and
+        read the result." `buildSpawnLet` binds the handle to the task's eager
+        result value; `h.await()` (which parses as a call to the dotted path
+        `h.await`, since `await` isn't a keyword) reads it back, in both
+        `buildIntExpr`'s `.call` arm and the `callRet`/`scalarOf` typing bridge
+        (result type = receiver type, so f64 handles stay f64). `let h1 = spawn
+        { compute(6) }; … h1.await() + h2.await()` → 85; an f64 handle → 4.5.
+        Runs wasm64 + wasm32. **The genuine CPS/state-machine transform is only
+        needed for task-*internal* suspension** (a task that awaits mid-body) —
+        that's the next slice, along with multi-statement task bodies (value-
+        block lowering), record/str handle results, and `select`/`channel`.
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

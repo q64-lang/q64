@@ -123,12 +123,15 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
             return .unknown;
         },
         .method => |me| {
+            // `h.await()` yields the awaited task's result type — the type of
+            // the handle's value.
+            const recv = me.receiver() orelse return .unknown;
+            const mname = (me.method() orelse return .unknown).text;
+            if (std.mem.eql(u8, mname, "await")) return scalarOf(gpa, recv, env);
             // The str method floor (spec/types.md §Strings): contains /
             // starts_with → bool, index_of → i64, slice → str. Non-str
             // receivers (fit methods) are typed by the caller's bridge.
-            const recv = me.receiver() orelse return .unknown;
             if ((try scalarOf(gpa, recv, env)) != .str) return .unknown;
-            const mname = (me.method() orelse return .unknown).text;
             return strMethodType(mname) orelse .unknown;
         },
         .field => |fe| {

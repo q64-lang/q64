@@ -424,6 +424,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 return buildTupleDestructure(b, lpat, init_expr, scope, ls.isVar(), out);
             }
             const nm = lpat.bindingName() orelse return error.Unsupported;
+            // `let h = spawn { e }` — a task handle. On the v0 cooperative
+            // floor (non-suspending tasks), the task runs to completion eagerly
+            // and the handle holds its result; `h.await()` reads it.
+            if (init_expr == .spawn) {
+                return buildSpawnLet(b, init_expr.spawn, nm, ls.isVar(), scope, out);
+            }
             // An immutable `let` whose initializer const-folds (incl. a
             // const-bodied call, e.g. `let v = version()`) becomes a
             // compile-time binding. A `var` is mutable, so it must stay a real
@@ -791,6 +797,39 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
         .scope_stmt => |ss| try buildScopeStmt(b, ss, scope, rt, out),
         else => return error.Unsupported,
     }
+}
+
+/// A block that is a single expression statement, that expression. Used for
+/// the v0 `spawn { e }` task body (multi-statement task bodies are a later
+/// slice — they need a value-block lowering).
+fn soleExpr(blk: ast.Block) ?ast.Expr {
+    var it = blk.statements();
+    const first = it.next() orelse return null;
+    if (it.next() != null) return null;
+    return switch (first) {
+        .expr_stmt => |es| es.expression(),
+        else => null,
+    };
+}
+
+/// `let h = spawn { e }` — bind a task handle. v0 cooperative floor: a task
+/// that does not itself suspend runs to completion eagerly, so the handle is
+/// simply its result value (read back by `h.await()`). v0: a single-expression
+/// scalar body. (`spawn scope`, multi-statement bodies, and record/str results
+/// are later slices; true deferral arrives with the CPS transform.)
+fn buildSpawnLet(b: *Builder, sp: ast.SpawnExpr, nm: parser.cst.Token, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const sbody = sp.block() orelse return error.Unsupported; // spawn scope: later
+    const e = soleExpr(sbody) orelse return error.Unsupported;
+    const sc = try exprScalar(b, e, scope);
+    if (sc == .narrow_int or sc == .str) return error.Unsupported; // str/record handles: later
+    const ty = scalarBindTy(sc);
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const value = try buildIntExpr(b, e, scope);
+    const idx = try scope.declare(nm.text, is_var, ty);
+    try b.cur_locals.append(b.a, ty);
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .let = .{ .idx = idx, .value = value } };
+    try out.append(b.a, st);
 }
 
 /// If `stmt` is a statement-position `spawn { … }`, its body block (the
@@ -5753,6 +5792,18 @@ const ExprTypeBridge = struct {
         if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
             const mname = name[dot + 1 ..];
             if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
+            // `h.await()` types as the handle's result — the receiver's type.
+            if (std.mem.eql(u8, mname, "await")) {
+                if (self.scope.find(name[0..dot])) |head| {
+                    return switch (head.ty) {
+                        .bool => .bool,
+                        .f64 => .f64,
+                        .f32 => .f32,
+                        else => .i64,
+                    };
+                }
+                return null;
+            }
             // A native float-math builtin (`x.sqrt()`, `x.min(y)`) types as
             // its float receiver: f64 stays f64, f32 stays f32.
             if (floatBuiltinKind(mname) != null or floatBinBuiltinKind(mname) != null) {
@@ -6390,6 +6441,21 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // `h.await()` — `await` isn't a keyword, so it parses as a call to
+            // the dotted path `h.await`. On the v0 cooperative floor a task
+            // that doesn't itself suspend has already completed (eager handle),
+            // so `await` reads the handle's result. Task-internal suspension
+            // (the CPS transform) is the next slice.
+            if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
+                if (std.mem.eql(u8, cname[dot + 1 ..], "await")) {
+                    const head = cname[0..dot];
+                    if (scope.find(head)) |loc| {
+                        const r = try b.a.create(hir.Expr);
+                        r.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                        return r;
+                    }
+                }
+            }
             // Closure inlining (slice 3b): a call to the enclosing HOF's
             // `fn`-typed parameter inlines the bound lambda's body.
             if (scope.hof_name) |hn| {
@@ -6597,6 +6663,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
         },
         .method => |me| {
             const mname = (me.method() orelse return error.Unsupported).text;
+            // `h.await()` — suspend until the task completes, yield its result.
+            // On the v0 cooperative floor a task that doesn't itself suspend
+            // has already run to completion (eager handle), so the handle *is*
+            // its result: await reads it. (Task-internal suspension — a task
+            // that awaits mid-body — needs the CPS transform; that's the next
+            // slice.) v0: scalar results.
+            if (std.mem.eql(u8, mname, "await")) {
+                return buildIntExpr(b, me.receiver() orelse return error.Unsupported, scope);
+            }
             // B4: a method on a record-valued receiver *expression* —
             // `make(1, 2).area()`, `Point { x: 1, y: 2 }.norm()` — the
             // receiver's base pointer is the self argument directly (the
@@ -7711,6 +7786,38 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\fn main {
         \\    let t = (3, 4)
         \\    env.out(t.2)
+        \\}
+        \\
+    )) == null);
+}
+
+test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn compute(n: i64) -> i64 { n * n }
+        \\fn main {
+        \\    let h1 = spawn { compute(6) }
+        \\    let h2 = spawn { compute(7) }
+        \\    env.out(h1.await() + h2.await())
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The handle is the task's eager result (a `compute` call bound to a
+    // local); `h.await()` reads the local — no separate task funcref.
+    try testing.expect(std.mem.indexOf(u8, dump, "call") != null);
+
+    // A multi-statement task body needs a value-block lowering — later.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    let h = spawn { let x = 1
+        \\        x + 2 }
+        \\    env.out(h.await())
         \\}
         \\
     )) == null);

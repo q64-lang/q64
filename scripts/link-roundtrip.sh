@@ -2376,6 +2376,32 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/parent/101/102/100/done (wasm64 + wasm32; tasks run at join, see scope locals)"
 
+echo "==> structured concurrency v0: let h = spawn { … } + h.await() (handle results)"
+awa_app="$tmp/await.q"
+cat > "$awa_app" <<'Q64'
+fn compute(n: i64) -> i64 { n * n }
+fn half(x: f64) -> f64 { x / 2.0 }
+fn main {
+    scope {
+        let h1 = spawn { compute(6) }
+        let h2 = spawn { compute(7) }
+        let a = h1.await()
+        let b = h2.await()
+        env.out(a + b)
+    }
+    let hf = spawn { half(9.0) }
+    env.out(hf.await())
+}
+Q64
+awa_expected=$'85\n4.5'
+"$Q64_BIN" emit "$awa_app" "$tmp/await.wasm"
+awa_out="$("$HOST_BIN" "$tmp/await.wasm")"
+[[ "$awa_out" == "$awa_expected" ]] || { echo "FAIL: handle/await (got: $awa_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$awa_app" "$tmp/await32.wasm" --addr wasm32
+awa32_out="$("$HOST_BIN" "$tmp/await32.wasm")"
+[[ "$awa32_out" == "$awa_expected" ]] || { echo "FAIL: handle/await wasm32 (got: $awa32_out)" >&2; exit 1; }
+echo "    ok: handle/await -> 85 / 4.5 (wasm64 + wasm32; i64 + f64 results)"
+
 echo "==> structured concurrency v0: scope/spawn inside a callee (void proc)"
 cwk_app="$tmp/calleescope.q"
 cat > "$cwk_app" <<'Q64'
