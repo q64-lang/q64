@@ -266,13 +266,28 @@ unblocks Phase 3. Remaining: the live `WebAssembly.validate` browser-probe
 harness (confirm the WebKit/iPad column empirically) + maintainer sign-off on the
 floor. Everything in Phase 3+ now has its target.
 
-**Phase 3 — Concurrency runtime — gated on Phase 2.** Implement the chosen
-floor: the scheduler, `spawn` + structured `scope` execution, `channel`
-send/recv with the policies already diagnosed (Backpressure/LatestValue/
-RingBuffer/Unbounded), and `actor` `tell`/`ask` dispatch. Then the runtime
-effect checks the front end can't do statically (EFF110 assert/operation
-violations, `@cancel` propagation). Specs: `concurrency.md`,
+**Phase 3 — Concurrency runtime — gated on Phase 2 — STARTED.** Implement
+the chosen floor: the scheduler, `spawn` + structured `scope` execution,
+`channel` send/recv with the policies already diagnosed (Backpressure/
+LatestValue/RingBuffer/Unbounded), and `actor` `tell`/`ask` dispatch. Then
+the runtime effect checks the front end can't do statically (EFF110 assert/
+operation violations, `@cancel` propagation). Specs: `concurrency.md`,
 `concurrency-model.md`.
+  - [x] **`scope` + statement `spawn` execution (cooperative v0).**
+        `buildScopeStmt` lowers `scope { … }` on the cooperative floor: the
+        parent flow lowers first, then each spawned task body at the structured
+        join (the closing brace), in spawn order. Because the floor is
+        single-threaded and same-frame, "defer a task" is **hoisting its body
+        to the join** — no closure box, no task funcref, and the body sees the
+        scope's locals directly. `scope { spawn { env.out(base+1) } env.out("p")
+        spawn { env.out(base+2) } }` → `p / 101 / 102`. Runs wasm64 + wasm32
+        (link-roundtrip `start/parent/101/102/100/done`). **Boundaries / next
+        slices:** suspension + `await` (the CPS transform for genuinely
+        suspending tasks), `let h = spawn` + `Handle`/`await`, `select`
+        execution, `channel` send/recv, `catch` arms (need the EH runtime),
+        `spawn scope` sugar, and scope/spawn in callee/void bodies (v0 is
+        main-position). A spawn referencing a not-yet-declared scope local is
+        caught by `resolve` (lexical order) before the hoist.
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

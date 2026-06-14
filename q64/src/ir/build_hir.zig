@@ -788,7 +788,53 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             st.* = .cont;
             try out.append(b.a, st);
         },
+        .scope_stmt => |ss| try buildScopeStmt(b, ss, scope, rt, out),
         else => return error.Unsupported,
+    }
+}
+
+/// If `stmt` is a statement-position `spawn { … }`, its body block (the
+/// `spawn scope …` sugar and `let h = spawn …` forms are later slices).
+fn spawnBody(stmt: ast.Stmt) ?ast.Block {
+    const es = switch (stmt) {
+        .expr_stmt => |e| e,
+        else => return null,
+    };
+    const expr = es.expression() orelse return null;
+    const sp = switch (expr) {
+        .spawn => |s| s,
+        else => return null,
+    };
+    return sp.block();
+}
+
+/// `scope { … }` on the v0 cooperative floor (spec/memory.md §"Concurrency
+/// platform audit"). A scope is a structured-concurrency arena whose spawned
+/// tasks all complete at the closing brace. With no suspension points and a
+/// single thread, a valid cooperative schedule is: run the scope body, then —
+/// at the join — run each spawned task to completion, in spawn order. Because
+/// it is single-threaded and same-frame, "defer a task" is simply hoisting its
+/// body to the join: the body still sees the scope's locals, no closure box or
+/// task funcref needed. (Suspension/`await`, deferred re-entrancy, `catch`,
+/// and `let h = spawn` are the next slices.)
+fn buildScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    var carms = ss.catchArms();
+    if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
+    const blk = ss.block() orelse return error.Unsupported;
+    var deferred: std.ArrayList(ast.Block) = .empty;
+    defer deferred.deinit(b.a);
+    var it = blk.statements();
+    while (it.next()) |stmt| {
+        if (spawnBody(stmt)) |body| {
+            try deferred.append(b.a, body); // a task — runs at the join
+        } else {
+            try buildMainStmt(b, stmt, scope, rt, out); // the parent flow
+        }
+    }
+    // The structured join: run the spawned tasks in spawn order.
+    for (deferred.items) |body| {
+        var bit = body.statements();
+        while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, out);
     }
 }
 
@@ -7641,6 +7687,46 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\fn main {
         \\    let t = (3, 4)
         \\    env.out(t.2)
+        \\}
+        \\
+    )) == null);
+}
+
+test "structured concurrency v0: scope hoists spawn bodies to the join" {
+    // The cooperative floor: the parent flow lowers first, then each spawned
+    // task body (in spawn order) — tasks see the scope's locals (same frame).
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let base = 100
+        \\        spawn { env.out(base + 1) }
+        \\        env.out("parent")
+        \\        spawn { env.out(base + 2) }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Both spawned task bodies are lowered (`base` const-folds, so the bodies
+    // print 101 and 102); the runtime *ordering* (parent before tasks) is
+    // checked end-to-end by link-roundtrip.
+    try testing.expect(std.mem.indexOf(u8, dump, "101") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "102") != null);
+
+    // `catch` arms need the EH runtime — honestly unsupported on the v0 floor.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    scope {
+        \\        spawn { work() }
+        \\    } catch (e: Panic) {
+        \\        env.out("caught")
+        \\    }
         \\}
         \\
     )) == null);

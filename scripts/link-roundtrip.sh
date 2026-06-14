@@ -2350,4 +2350,30 @@ grd32_out="$("$HOST_BIN" "$tmp/guard32.wasm")"
 [[ "$grd32_out" == "$grd_expected" ]] || { echo "FAIL: match guards wasm32 (got: $grd32_out)" >&2; exit 1; }
 echo "    ok: match guards -> 400/51/0 / one-plain / go-fast (wasm64 + wasm32; binder, literal, enum; fall-through)"
 
+echo "==> structured concurrency v0: scope { spawn … } runs tasks at the join (cooperative floor)"
+sco_app="$tmp/scope.q"
+cat > "$sco_app" <<'Q64'
+fn main {
+    env.out("start")
+    var total = 0
+    scope {
+        let base = 100
+        spawn { env.out(base + 1) }
+        env.out("parent")
+        spawn { env.out(base + 2) }
+        total = base
+    }
+    env.out(total)
+    env.out("done")
+}
+Q64
+sco_expected=$'start\nparent\n101\n102\n100\ndone'
+"$Q64_BIN" emit "$sco_app" "$tmp/scope.wasm"
+sco_out="$("$HOST_BIN" "$tmp/scope.wasm")"
+[[ "$sco_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn (got: $sco_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$sco_app" "$tmp/scope32.wasm" --addr wasm32
+sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
+[[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
+echo "    ok: scope/spawn -> start/parent/101/102/100/done (wasm64 + wasm32; tasks run at join, see scope locals)"
+
 echo "PASS: $qube_out"
