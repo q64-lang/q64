@@ -828,6 +828,134 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .EFFECT_MARKER, children.items);
     }
 
+    /// `ScopeStmt := "scope" EffectAnnot? Block CatchArm*` (spec/grammar.md
+    /// §"Concurrency forms"). The structured-concurrency arena: a block of
+    /// statements whose spawned tasks join at the closing brace, with optional
+    /// `@`-effect annotation and trailing `catch` arms.
+    fn parseScopeStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // scope
+        try self.eatTrivia(&children);
+        if (self.peek() == .AT) {
+            try children.append(self.arena, .{ .node = try self.parseEffectSpec() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        try self.parseCatchArms(&children);
+        return try cst.makeNode(self.arena, .SCOPE_STMT, children.items);
+    }
+
+    /// Zero-or-more trailing `catch` arms after a `scope`/`spawn scope` block.
+    /// Leading trivia is only consumed when a `catch` actually follows.
+    fn parseCatchArms(self: *Parser, children: *std.ArrayList(cst.Element)) std.mem.Allocator.Error!void {
+        while (true) {
+            const save = self.pos;
+            var lead: std.ArrayList(cst.Element) = .empty;
+            try self.eatTrivia(&lead);
+            if (self.peek() != .KW_CATCH) {
+                self.pos = save;
+                break;
+            }
+            try children.appendSlice(self.arena, lead.items);
+            try children.append(self.arena, .{ .node = try self.parseCatchArm() });
+        }
+    }
+
+    /// `CatchArm := "catch" "(" IDENT ":" TypeExpr ")" Block`.
+    fn parseCatchArm(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // catch
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_PAREN) {
+            try children.append(self.arena, .{ .token = self.advance() }); // (
+            try self.eatTrivia(&children);
+            if (self.peek() == .IDENT) try children.append(self.arena, .{ .token = self.advance() }); // binding
+            try self.eatTrivia(&children);
+            if (self.peek() == .COLON) {
+                try children.append(self.arena, .{ .token = self.advance() }); // :
+                try self.eatTrivia(&children);
+                try children.append(self.arena, .{ .node = try self.parseType() });
+                try self.eatTrivia(&children);
+            }
+            if (self.peek() == .R_PAREN) try children.append(self.arena, .{ .token = self.advance() }); // )
+        }
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) try children.append(self.arena, .{ .node = try self.parseBlock() });
+        return try cst.makeNode(self.arena, .CATCH_ARM, children.items);
+    }
+
+    /// `SpawnExpr := "spawn" Block | "spawn" "scope" EffectAnnot? Block
+    /// CatchArm*` (the `spawn scope …` form embeds a `SCOPE_STMT`). An
+    /// expression: `let h = spawn { … }`.
+    fn parseSpawn(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // spawn
+        try self.eatTrivia(&children);
+        if (self.peek() == .KW_SCOPE) {
+            try children.append(self.arena, .{ .node = try self.parseScopeStmt() });
+        } else if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .SPAWN_EXPR, children.items);
+    }
+
+    /// `SelectStmt := "select" "{" SelectArm ("," SelectArm)* ","? "}"`. Races
+    /// a set of channel/await operations; the first ready arm runs.
+    fn parseSelectStmt(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try children.append(self.arena, .{ .token = self.advance() }); // select
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .token = self.advance() }); // {
+            while (!self.isEof()) {
+                try self.eatTrivia(&children);
+                if (self.peek() == .R_BRACE) break;
+                try children.append(self.arena, .{ .node = try self.parseSelectArm() });
+                try self.eatTrivia(&children);
+                if (self.peek() == .COMMA) try children.append(self.arena, .{ .token = self.advance() });
+            }
+            if (self.peek() == .R_BRACE) try children.append(self.arena, .{ .token = self.advance() });
+        }
+        return try cst.makeNode(self.arena, .SELECT_STMT, children.items);
+    }
+
+    /// `SelectArm := (Pattern "=")? Expr "->" (Block | Expr)`. The optional
+    /// `Pattern =` binds the operation's result (`v = ch.recv() -> …`); a bare
+    /// `_ = …` discards it.
+    fn parseSelectArm(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        // Optional `Pattern =` binding — only when a lone `=` (not `==`)
+        // follows the pattern.
+        const save = self.pos;
+        const pat = try self.parsePattern();
+        var lead: std.ArrayList(cst.Element) = .empty;
+        try self.eatTrivia(&lead);
+        if (self.peek() == .EQ) {
+            try children.append(self.arena, .{ .node = pat });
+            try children.appendSlice(self.arena, lead.items);
+            try children.append(self.arena, .{ .token = self.advance() }); // =
+            try self.eatTrivia(&children);
+        } else {
+            self.pos = save; // no binding — the head is a bare expression
+        }
+        self.no_record_depth += 1;
+        try children.append(self.arena, .{ .node = try self.parseExpr() }); // the op
+        self.no_record_depth -= 1;
+        try self.eatTrivia(&children);
+        if (self.peek() == .ARROW) {
+            try children.append(self.arena, .{ .token = self.advance() }); // ->
+            try self.eatTrivia(&children);
+            if (self.peek() == .L_BRACE) {
+                try children.append(self.arena, .{ .node = try self.parseBlock() });
+            } else {
+                try children.append(self.arena, .{ .node = try self.parseExpr() });
+            }
+        }
+        return try cst.makeNode(self.arena, .SELECT_ARM, children.items);
+    }
+
     /// `StateDecl := "state" IDENT (":" TypeExpr)? "=" Expr` — module-level
     /// reactive state (a mutable instance binding). Same shape as a const decl;
     /// the type is optional (inferred from the initializer in v0).
@@ -1506,6 +1634,8 @@ const Parser = struct {
             .KW_LOOP => self.parseLoopStmt(),
             .KW_FOR => self.parseForStmt(),
             .KW_MATCH => self.parseMatchStmt(),
+            .KW_SCOPE => self.parseScopeStmt(),
+            .KW_SELECT => self.parseSelectStmt(),
             else => self.parseExprOrAssignStmt(),
         };
     }
@@ -2273,6 +2403,8 @@ const Parser = struct {
         if (k == .L_PAREN) return self.parseParenOrTuple();
         if (k == .L_BRACK) return self.parseArrayExpr();
         if (k == .KW_MATCH) return self.parseMatch(.MATCH_EXPR);
+        // `spawn { … }` / `spawn scope …` is an expression (yields a handle).
+        if (k == .KW_SPAWN) return self.parseSpawn();
         // A leading `|` / `||` opens a lambda — bitwise-or / logical-or are
         // infix, so they never reach primary position.
         if (k == .PIPE or k == .PIPE_PIPE) return self.parseLambda();
@@ -2510,6 +2642,11 @@ test "round-trip: serialize(parse(s)) == s" {
         "import \"./util.q\".{helper}\n",
         "screen counter {\n    state count: i64 = 0\n\n    draw {\n        number(40, 120, count)\n        button(1, 40, 180, 280, 72, 1)\n    }\n\n    on press(id: i64) {\n        count = count + 1\n    }\n}\n",
         "screen {\n    draw { text(0, 0, 0) }\n}\n",
+        // Structured-concurrency forms (spec/grammar.md §"Concurrency forms").
+        "fn main {\n    scope {\n        let h = spawn { work() }\n    }\n}\n",
+        "fn main {\n    scope @io {\n        run()\n    } catch (e: Panic) {\n        log(e)\n    }\n}\n",
+        "fn main {\n    let h = spawn scope {\n        run()\n    }\n}\n",
+        "fn main {\n    select {\n        v = ch.recv() -> use(v),\n        _ = ctx.cancelled() -> stop(),\n    }\n}\n",
     };
 
     for (sources) |src| {
@@ -2522,6 +2659,57 @@ test "round-trip: serialize(parse(s)) == s" {
 
         try testing.expectEqualStrings(src, out.items);
     }
+}
+
+test "concurrency forms: scope/catch/spawn/select parse structured" {
+    const src =
+        "fn main {\n" ++
+        "    scope @io {\n" ++
+        "        let h = spawn { work() }\n" ++
+        "        select {\n" ++
+        "            v = h.await() -> use(v),\n" ++
+        "            _ = ctx.cancelled() -> stop(),\n" ++
+        "        }\n" ++
+        "    } catch (e: Panic) {\n" ++
+        "        log(e)\n" ++
+        "    }\n" ++
+        "}\n";
+    const r = try parse(testing.allocator, src, "c.q");
+    defer r.deinit(testing.allocator);
+
+    // Drill to main's body and find the scope statement.
+    var items = ast.SourceFile.items(.{ .cst = r.root });
+    const main_fn = items.next().?.fn_decl;
+    const body = main_fn.body().?;
+    var stmts = body.statements();
+    const scope_stmt = switch (stmts.next().?) {
+        .scope_stmt => |ss| ss,
+        else => return error.TestUnexpectedResult,
+    };
+    // The scope has an effect annotation, a body, and one catch arm.
+    try testing.expect(scope_stmt.effectSpec() != null);
+    try testing.expect(scope_stmt.block() != null);
+    var carms = scope_stmt.catchArms();
+    const carm = carms.next().?;
+    try testing.expectEqualStrings("e", carm.binding().?.text);
+    try testing.expect(carm.errorType() != null);
+    try testing.expect(carms.next() == null);
+
+    // Inside the scope: a `let h = spawn { … }` and a `select` with two arms.
+    var inner = scope_stmt.block().?.statements();
+    const let_h = inner.next().?.let_stmt;
+    try testing.expect(let_h.initializer().?.spawn.block() != null);
+    const sel = switch (inner.next().?) {
+        .select_stmt => |s| s,
+        else => return error.TestUnexpectedResult,
+    };
+    var sarms = sel.arms();
+    const a0 = sarms.next().?;
+    try testing.expectEqualStrings("v", a0.binding().?.bindingName().?.text);
+    try testing.expect(a0.operation() != null);
+    const a1 = sarms.next().?;
+    try testing.expect(a1.binding() != null); // `_` wildcard pattern
+    try testing.expect(sarms.next() == null);
 }
 
 test "screen DSL: a screen decl structures state / draw / on members" {

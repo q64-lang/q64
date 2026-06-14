@@ -215,6 +215,26 @@ const Walker = struct {
                     }
                 }
             },
+            .scope_stmt => |ss| {
+                if (ss.block()) |b| try w.walkBlock(b.cst);
+                var arms = ss.catchArms();
+                while (arms.next()) |arm| {
+                    try w.scopes.push();
+                    defer w.scopes.pop();
+                    if (arm.binding()) |tok| try w.scopes.bind(tok.text);
+                    if (arm.block()) |b| try w.walkBlock(b.cst);
+                }
+            },
+            .select_stmt => |sel| {
+                var arms = sel.arms();
+                while (arms.next()) |arm| {
+                    try w.scopes.push();
+                    defer w.scopes.pop();
+                    try w.walkExprOpt(arm.operation());
+                    if (arm.binding()) |p| try w.bindPattern(p);
+                    if (arm.block()) |b| try w.walkBlock(b.cst);
+                }
+            },
         }
     }
 

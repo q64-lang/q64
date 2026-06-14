@@ -1275,6 +1275,8 @@ pub const Stmt = union(enum) {
     break_stmt: BreakStmt,
     continue_stmt: ContinueStmt,
     panic_stmt: PanicStmt,
+    scope_stmt: ScopeStmt,
+    select_stmt: SelectStmt,
 
     pub fn cast(node: *const cst.Node) ?Stmt {
         return switch (node.kind) {
@@ -1290,8 +1292,112 @@ pub const Stmt = union(enum) {
             .BREAK_STMT => .{ .break_stmt = .{ .cst = node } },
             .CONTINUE_STMT => .{ .continue_stmt = .{ .cst = node } },
             .PANIC_STMT => .{ .panic_stmt = .{ .cst = node } },
+            .SCOPE_STMT => .{ .scope_stmt = .{ .cst = node } },
+            .SELECT_STMT => .{ .select_stmt = .{ .cst = node } },
             else => null,
         };
+    }
+};
+
+/// `ScopeStmt := "scope" EffectAnnot? Block CatchArm*` — the structured-
+/// concurrency arena. `block()` is the body; `catchArms()` the handlers.
+pub const ScopeStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn effectSpec(self: ScopeStmt) ?EffectSpec {
+        return firstChildNode(self.cst, .EFFECT_SPEC, EffectSpec);
+    }
+    pub fn block(self: ScopeStmt) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+    pub fn catchArms(self: ScopeStmt) CatchArmIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+/// `CatchArm := "catch" "(" IDENT ":" TypeExpr ")" Block`.
+pub const CatchArm = struct {
+    cst: *const cst.Node,
+
+    /// The bound error name (the IDENT in `catch (e: Panic)`).
+    pub fn binding(self: CatchArm) ?cst.Token {
+        for (self.cst.children) |c| switch (c) {
+            .token => |t| if (t.kind == .IDENT) return t,
+            .node => {},
+        };
+        return null;
+    }
+    pub fn errorType(self: CatchArm) ?TypeExpr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (TypeExpr.cast(n)) |t| return t,
+            .token => {},
+        };
+        return null;
+    }
+    pub fn block(self: CatchArm) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+pub const CatchArmIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *CatchArmIter) ?CatchArm {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .CATCH_ARM) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
+    }
+};
+
+/// `SelectStmt := "select" "{" SelectArm,* "}"` — race a set of ops.
+pub const SelectStmt = struct {
+    cst: *const cst.Node,
+
+    pub fn arms(self: SelectStmt) SelectArmIter {
+        return .{ .children = self.cst.children };
+    }
+};
+
+/// `SelectArm := (Pattern "=")? Expr "->" (Block | Expr)`.
+pub const SelectArm = struct {
+    cst: *const cst.Node,
+
+    /// The optional result binding pattern (`v` in `v = ch.recv() -> …`).
+    pub fn binding(self: SelectArm) ?Pattern {
+        return firstChildPattern(self.cst);
+    }
+    /// The operation being raced (`ch.recv()`).
+    pub fn operation(self: SelectArm) ?Expr {
+        return firstChildExpr(self.cst);
+    }
+    pub fn block(self: SelectArm) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+};
+
+pub const SelectArmIter = struct {
+    children: []const cst.Element,
+    i: usize = 0,
+
+    pub fn next(self: *SelectArmIter) ?SelectArm {
+        while (self.i < self.children.len) : (self.i += 1) {
+            switch (self.children[self.i]) {
+                .node => |n| if (n.kind == .SELECT_ARM) {
+                    self.i += 1;
+                    return .{ .cst = n };
+                },
+                .token => {},
+            }
+        }
+        return null;
     }
 };
 
@@ -1751,10 +1857,12 @@ pub const Expr = union(enum) {
     match: MatchExpr,
     lambda: LambdaExpr,
     range: RangeExpr,
+    spawn: SpawnExpr,
 
     pub fn cast(node: *const cst.Node) ?Expr {
         return switch (node.kind) {
             .CALL_EXPR => .{ .call = .{ .cst = node } },
+            .SPAWN_EXPR => .{ .spawn = .{ .cst = node } },
             .RECORD_EXPR => .{ .record = .{ .cst = node } },
             .MATCH_EXPR => .{ .match = .{ .cst = node } },
             .PATH_EXPR => .{ .path = .{ .cst = node } },
@@ -2123,6 +2231,20 @@ pub const TupleFieldExpr = struct {
     /// The tuple-index token (`0`, `1`, …).
     pub fn index(self: TupleFieldExpr) ?cst.Token {
         return lastNonTriviaToken(self.cst);
+    }
+};
+
+/// `SpawnExpr := "spawn" Block | "spawn" "scope" …` — launches a task,
+/// yielding a handle. `block()` is the spawned body; `scopeStmt()` is the
+/// `spawn scope …` sugar form (which embeds a `SCOPE_STMT`).
+pub const SpawnExpr = struct {
+    cst: *const cst.Node,
+
+    pub fn block(self: SpawnExpr) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
+    }
+    pub fn scopeStmt(self: SpawnExpr) ?ScopeStmt {
+        return firstChildNode(self.cst, .SCOPE_STMT, ScopeStmt);
     }
 };
 

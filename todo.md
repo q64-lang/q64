@@ -235,6 +235,21 @@ needs the platform audit, so it's the highest-leverage near-term work.
           the struct node instead of scanning sibling tokens (lossless
           round-trip held; 51/51 + goldens green). Block bodies
           (`graph`/`scope`/`region`/`actor`) are the next slice.
+    - [x] **Structured concurrency forms** (`scope`/`spawn`/`select`/`catch`):
+          `parseScopeStmt` (`ScopeStmt := "scope" EffectAnnot? Block CatchArm*`),
+          `parseSpawn` (`spawn Block` / `spawn scope …`, an expression in
+          primary position), `parseSelectStmt` + `parseSelectArm`
+          (`(Pattern "=")? Expr "->" (Block|Expr)`), and `parseCatchArm`. Wired
+          into `parseStmt` (scope/select) and `parsePrimary` (spawn). New AST
+          views: `ScopeStmt{effectSpec,block,catchArms}`, `CatchArm{binding,
+          errorType,block}`, `SpawnExpr{block,scopeStmt}`, `SelectStmt{arms}`,
+          `SelectArm{binding,operation,block}` (+ `Stmt.scope_stmt`/`select_stmt`,
+          `Expr.spawn`). `resolve`/`check` walk the new blocks/arms (binding the
+          catch error + select result names). Lossless round-trip (4 forms) +
+          an AST-structure test; `q64 check` accepts a full scope/spawn/select/
+          catch program. Codegen is gated on the Phase-2 audit; this is the
+          host-independent front-end Phase 3/4 will lower. Remaining raw:
+          `graph`/`actor`/`region` bodies, `channel(…)`.
   - `screen`/`draw` → `main` **lowering** + the browser-host glue wiring
     (§"QView…" — parse/AST done; lowering + `runtime/web` reading the i32
     `env.out` args remain).

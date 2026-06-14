@@ -717,6 +717,28 @@ const Checker = struct {
                     }
                 }
             },
+            .scope_stmt => |ss| {
+                if (ss.block()) |b| try c.walkBlock(b);
+                var arms = ss.catchArms();
+                while (arms.next()) |arm| {
+                    try c.scope.push();
+                    defer c.scope.pop();
+                    if (arm.binding()) |tok| try c.scope.bind(tok.text, .unknown);
+                    if (arm.block()) |b| try c.walkBlock(b);
+                }
+            },
+            .select_stmt => |sel| {
+                var arms = sel.arms();
+                while (arms.next()) |arm| {
+                    try c.scope.push();
+                    defer c.scope.pop();
+                    _ = try c.typeOfOpt(arm.operation());
+                    if (arm.binding()) |p| {
+                        if (p.bindingName()) |tok| try c.scope.bind(tok.text, .unknown);
+                    }
+                    if (arm.block()) |b| try c.walkBlock(b);
+                }
+            },
         }
     }
 
