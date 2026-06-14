@@ -2056,6 +2056,34 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> f64/bool tuple slots + record-field destructure (per-slot typing via fieldType)"
+fts_app="$tmp/floattuple.q"
+cat > "$fts_app" <<'Q64'
+struct V { x: f64, y: f64 }
+fn scale(p: (f64, f64), k: f64) -> (f64, f64) {
+    (p.0 * k, p.1 * k)
+}
+fn main {
+    let v = V { x: 1.5, y: 2.5 }
+    let V { x, y } = v
+    env.out(x + y)
+    let mixed = (true, 3.5)
+    env.out(mixed.0)
+    env.out(mixed.1)
+    let (q, r) = scale((1.5, 2.0), 3.0)
+    env.out(q)
+    env.out(r)
+}
+Q64
+fts_expected=$'4.0\ntrue\n3.5\n4.5\n6.0'
+"$Q64_BIN" emit "$fts_app" "$tmp/floattuple.wasm"
+fts_out="$("$HOST_BIN" "$tmp/floattuple.wasm")"
+[[ "$fts_out" == "$fts_expected" ]] || { echo "FAIL: f64/bool tuple+field (got: $fts_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$fts_app" "$tmp/floattuple32.wasm" --addr wasm32
+fts32_out="$("$HOST_BIN" "$tmp/floattuple32.wasm")"
+[[ "$fts32_out" == "$fts_expected" ]] || { echo "FAIL: f64/bool tuple+field wasm32 (got: $fts32_out)" >&2; exit 1; }
+echo "    ok: f64/bool tuple slots + record destructure -> 4.0/true/3.5/4.5/6.0 (wasm64 + wasm32)"
+
 echo "==> tuple params + returns: -> (i64, i64), p.N, let (q, r) = divmod(..) (multi-value return)"
 tpr_app="$tmp/tupleparams.q"
 cat > "$tpr_app" <<'Q64'

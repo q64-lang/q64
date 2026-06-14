@@ -46,6 +46,10 @@ pub const Env = struct {
     /// along so a generic callee (`fn twice<T>(x: T) -> T`) can type
     /// its return from the deciding argument.
     callRet: *const fn (ctx: *anyopaque, name: []const u8, call: ast.CallExpr) std.mem.Allocator.Error!?ScalarType,
+    /// Type of a field/tuple-slot of a record-or-tuple-valued `base`
+    /// expression (`expr.field`, `t.0`). `null` when `base` isn't a record
+    /// the caller can resolve, or the field/slot isn't a scalar.
+    fieldType: *const fn (ctx: *anyopaque, base: ast.Expr, field: []const u8) std.mem.Allocator.Error!?ScalarType,
 };
 
 /// Scalar type of `expr` under `env`. Total: anything outside the floor
@@ -127,6 +131,20 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
             const mname = (me.method() orelse return .unknown).text;
             return strMethodType(mname) orelse .unknown;
         },
+        .field => |fe| {
+            // `expr.field` — a field of a record-valued expression. (`p.x` on a
+            // bare binding parses as a dotted path, typed via `localType`.)
+            const base = fe.base() orelse return .unknown;
+            const f = fe.field() orelse return .unknown;
+            return (try env.fieldType(env.ctx, base, f.text)) orelse .unknown;
+        },
+        .tuple_field => |tf| {
+            // `t.0` — a tuple slot. The tuple is an anonymous record whose
+            // fields are named by their index.
+            const base = tf.base() orelse return .unknown;
+            const idx = tf.index() orelse return .unknown;
+            return (try env.fieldType(env.ctx, base, idx.text)) orelse .unknown;
+        },
         else => return .unknown,
     }
 }
@@ -178,9 +196,12 @@ const TestEnv = struct {
         if (std.mem.eql(u8, name, "greet")) return .str;
         return null;
     }
+    fn fieldType(_: *anyopaque, _: ast.Expr, _: []const u8) std.mem.Allocator.Error!?ScalarType {
+        return null;
+    }
     var dummy: u8 = 0;
     fn env() Env {
-        return .{ .ctx = @ptrCast(&dummy), .localType = localType, .callRet = callRet };
+        return .{ .ctx = @ptrCast(&dummy), .localType = localType, .callRet = callRet, .fieldType = fieldType };
     }
 };
 

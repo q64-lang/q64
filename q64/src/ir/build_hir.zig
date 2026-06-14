@@ -329,12 +329,15 @@ fn buildRecordDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, sc
             break :blk (sp.bindingName() orelse return error.Unsupported).text;
         } else fname;
         const fld = rv.si.field(fname) orelse return reject(b, .name_not_found);
-        if (fld.ty != .i64) return error.Unsupported; // bool/narrow/str/record fields: later
-        const idx = try declareBodyLocal(b, scope, bind_name, false, .i64);
+        const fty: hir.Type = switch (fld.ty) {
+            .i64, .bool, .f64, .f32 => fld.ty,
+            else => return error.Unsupported, // narrow/str/record fields: later
+        };
+        const idx = try declareBodyLocal(b, scope, bind_name, false, fty);
         const base = try b.a.create(hir.Expr);
         base.* = .{ .local = .{ .idx = base_idx, .ty = .ptr } };
         const ld = try b.a.create(hir.Expr);
-        ld.* = .{ .field_get = .{ .base = base, .offset = fld.offset, .ty = .i64 } };
+        ld.* = .{ .field_get = .{ .base = base, .offset = fld.offset, .ty = fty } };
         const st = try b.a.create(hir.Stmt);
         st.* = .{ .let = .{ .idx = idx, .value = ld } };
         try out.append(b.a, st);
@@ -386,12 +389,15 @@ fn buildTupleDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, sco
             try out.append(b.a, set);
             for (names.items, 0..) |name, i| {
                 const fld = rv.si.fields[i];
-                if (fld.ty != .i64) return error.Unsupported;
-                const idx = try declareBodyLocal(b, scope, name, isVar, .i64);
+                const fty: hir.Type = switch (fld.ty) {
+                    .i64, .bool, .f64, .f32 => fld.ty,
+                    else => return error.Unsupported,
+                };
+                const idx = try declareBodyLocal(b, scope, name, isVar, fty);
                 const base = try b.a.create(hir.Expr);
                 base.* = .{ .local = .{ .idx = base_idx, .ty = .ptr } };
                 const ld = try b.a.create(hir.Expr);
-                ld.* = .{ .field_get = .{ .base = base, .offset = fld.offset, .ty = .i64 } };
+                ld.* = .{ .field_get = .{ .base = base, .offset = fld.offset, .ty = fty } };
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = ld } };
                 try out.append(b.a, st);
@@ -3589,8 +3595,11 @@ fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInf
             var it = tt.elements();
             while (it.next()) |et| {
                 const sc = (try semaScalar(b, et)) orelse return null;
-                if (sc != .i64) return null; // bool/float/str tuple slots: later
-                try tys.append(b.a, .i64);
+                switch (sc) {
+                    .i64, .f64, .f32, .bool => {},
+                    else => return null, // str/narrow tuple slots: later
+                }
+                try tys.append(b.a, sc);
             }
             if (tys.items.len < 2) return null;
             return try tupleStructInfo(b, tys.items);
@@ -4394,8 +4403,9 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
             var tys: std.ArrayList(hir.Type) = .empty;
             var eit = te.elements();
             while (eit.next()) |el| {
-                if ((try exprScalar(b, el, scope)) != .i64) return error.Unsupported; // bool/float/str: later
-                try tys.append(b.a, .i64);
+                const sc = try exprScalar(b, el, scope);
+                if (sc == .narrow_int or sc == .str or sc == .unknown) return error.Unsupported; // str/narrow: later
+                try tys.append(b.a, scalarBindTy(sc));
             }
             if (tys.items.len < 2) return error.Unsupported; // `()` / `(x)` aren't tuples
             const si = try tupleStructInfo(b, tys.items);
@@ -5322,6 +5332,7 @@ fn exprScalar(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!sema.e
         .ctx = @ptrCast(&bridge),
         .localType = ExprTypeBridge.localType,
         .callRet = ExprTypeBridge.callRet,
+        .fieldType = ExprTypeBridge.fieldType,
     });
 }
 
@@ -5630,6 +5641,28 @@ const ExprTypeBridge = struct {
             .f64 => .f64,
             .f32 => .f32,
             .str => .str,
+            else => .unknown,
+        };
+    }
+
+    fn fieldType(ctx: *anyopaque, base: ast.Expr, field: []const u8) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
+        // Resolve the base to a record/tuple binding (`t.0`, `p.field`); other
+        // bases (calls, index) type their field on a later slice.
+        const bp = switch (base) {
+            .path => |p| p,
+            else => return null,
+        };
+        const nm = try bp.text(self.b.a);
+        defer self.b.a.free(nm);
+        const si = self.scope.recs.get(nm) orelse return null;
+        const f = si.field(field) orelse return null;
+        return switch (f.ty) {
+            .bool => .bool,
+            .i64 => .i64,
+            .f64 => .f64,
+            .f32 => .f32,
+            .u8, .i8, .u16, .i16, .u32, .i32 => .narrow_int,
             else => .unknown,
         };
     }
@@ -6426,8 +6459,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             const tbase = tf.base() orelse return error.Unsupported;
             const rv = (try buildRecExpr(b, tbase, scope)) orelse return error.Unsupported;
             const f = rv.si.field(idx_tok.text) orelse return error.Unsupported; // out of range
-            if (f.ty != .i64) return error.Unsupported;
-            out.* = .{ .field_get = .{ .base = rv.e, .offset = f.offset, .ty = .i64 } };
+            out.* = .{ .field_get = .{ .base = rv.e, .offset = f.offset, .ty = f.ty } };
             return out;
         },
         .field => |fe| {
@@ -7612,6 +7644,38 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\}
         \\
     )) == null);
+}
+
+test "f64/bool fields + tuple slots: record destructure, tuple elements, params/returns" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\struct V { x: f64, y: f64 }
+        \\fn scale(p: (f64, f64), k: f64) -> (f64, f64) {
+        \\    (p.0 * k, p.1 * k)
+        \\}
+        \\fn main {
+        \\    let v = V { x: 1.5, y: 2.5 }
+        \\    let V { x, y } = v
+        \\    env.out(x + y)
+        \\    let mixed = (true, 3.5)
+        \\    env.out(mixed.0)
+        \\    env.out(mixed.1)
+        \\    let (q, r) = scale((1.5, 2.0), 3.0)
+        \\    env.out(q + r)
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The tuple slot is typed: `mixed.1` (f64) goes to the float host path,
+    // distinct from `mixed.0` (the bool/int path).
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_float") != null);
+    // `scale` takes a tuple param and returns a tuple — both `.ptr` records.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn scale -> ptr") != null);
 }
 
 test "tuple params + returns: -> (i64, i64), p.N, let (q, r) = call, tuple args" {

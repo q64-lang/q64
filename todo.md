@@ -210,9 +210,18 @@ needs the platform audit, so it's the highest-leverage near-term work.
           tuple binding *or* literal passes as a tuple arg (matched by the
           interned layout's pointer identity). True multi-value return. v0: i64
           elements. Runs wasm64 + wasm32 (roundtrip `3/2/2/17/123`).
-          **Next (deferred per spec / bigger):** bool/float tuple elements,
-          nested struct destructuring beyond one level, plain struct-value
-          `match`, bool/str/narrow record-fields.
+    - [x] **f64/bool tuple slots + record-field destructure** (per-slot typing):
+          added a `fieldType` callback to `sema/exprtype.Env` (+ `.field` /
+          `.tuple_field` cases in `scalarOf`), so a tuple slot / field-of-expr
+          types from the record layout (`t.1` → f64) instead of defaulting to
+          the i64 print/compute path. The bridge resolves a path base through
+          `scope.recs`. Lifted the i64-only restriction on tuple elements
+          (construction/index/destructure/params/returns) and record `let`-
+          destructure to **i64/f64/f32/bool**. A mixed tuple `(true, 3.5)`
+          prints `true` then `3.5`. Runs wasm64 + wasm32 (roundtrip
+          `4.0/true/3.5/4.5/6.0`). **Next (deferred):** narrow/str tuple+field
+          slots, field-of-*call* typing (`divmod(..).1` as f64), nested struct
+          destructuring, plain struct-value `match`.
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the
