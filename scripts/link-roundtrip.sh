@@ -2367,31 +2367,33 @@ fn main {
     env.out("done")
 }
 Q64
-sco_expected=$'start\nparent\n101\n102\n100\ndone'
+sco_expected=$'start\n101\nparent\n102\n100\ndone'
 "$Q64_BIN" emit "$sco_app" "$tmp/scope.wasm"
 sco_out="$("$HOST_BIN" "$tmp/scope.wasm")"
 [[ "$sco_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn (got: $sco_out)" >&2; exit 1; }
 "$Q64_BIN" emit "$sco_app" "$tmp/scope32.wasm" --addr wasm32
 sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
-echo "    ok: scope/spawn -> start/parent/101/102/100/done (wasm64 + wasm32; tasks run at join, see scope locals)"
+echo "    ok: scope/spawn -> start/101/parent/102/100/done (wasm64 + wasm32; eager-at-spawn, tasks see scope locals)"
 
-echo "==> channels v0 (FIFO): channel() + ch.send / let v = ch.recv() (parent fills, task drains)"
+echo "==> channels v0 (FIFO): natural idiom — spawn producer, parent consumes (eager-at-spawn)"
 chn_app="$tmp/channel.q"
 cat > "$chn_app" <<'Q64'
 fn main {
+    var sum = 0
     scope {
         let ch = channel(capacity: 8)
-        ch.send(10)
-        ch.send(20)
-        ch.send(30)
         spawn {
-            let a = ch.recv()
-            let b = ch.recv()
-            let c = ch.recv()
-            env.out(a + b + c)
+            ch.send(10)
+            ch.send(20)
+            ch.send(30)
         }
+        let a = ch.recv()
+        let b = ch.recv()
+        let c = ch.recv()
+        sum = a + b + c
     }
+    env.out(sum)
 }
 Q64
 chn_expected=$'60'
@@ -2401,7 +2403,7 @@ chn_out="$("$HOST_BIN" "$tmp/channel.wasm")"
 "$Q64_BIN" emit "$chn_app" "$tmp/channel32.wasm" --addr wasm32
 chn32_out="$("$HOST_BIN" "$tmp/channel32.wasm")"
 [[ "$chn32_out" == "$chn_expected" ]] || { echo "FAIL: channel FIFO wasm32 (got: $chn32_out)" >&2; exit 1; }
-echo "    ok: channel FIFO -> 60 (wasm64 + wasm32; send=push, recv=buf[cursor]++)"
+echo "    ok: channel FIFO -> 60 (wasm64 + wasm32; spawn producer fills, parent drains; send=push, recv=buf[cursor]++)"
 
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
@@ -2418,14 +2420,14 @@ fn main {
     env.out("done")
 }
 Q64
-ssc_expected=$'start\nouter-parent\ninner-parent\ninner-a\ndone'
+ssc_expected=$'start\ninner-a\ninner-parent\nouter-parent\ndone'
 "$Q64_BIN" emit "$ssc_app" "$tmp/spawnscope.wasm"
 ssc_out="$("$HOST_BIN" "$tmp/spawnscope.wasm")"
 [[ "$ssc_out" == "$ssc_expected" ]] || { echo "FAIL: spawn scope (got: $ssc_out)" >&2; exit 1; }
 "$Q64_BIN" emit "$ssc_app" "$tmp/spawnscope32.wasm" --addr wasm32
 ssc32_out="$("$HOST_BIN" "$tmp/spawnscope32.wasm")"
 [[ "$ssc32_out" == "$ssc_expected" ]] || { echo "FAIL: spawn scope wasm32 (got: $ssc32_out)" >&2; exit 1; }
-echo "    ok: spawn scope -> start/outer-parent/inner-parent/inner-a/done (wasm64 + wasm32; nested join)"
+echo "    ok: spawn scope -> start/inner-a/inner-parent/outer-parent/done (wasm64 + wasm32; eager nested)"
 
 echo "==> structured concurrency v0: let h = spawn { … } + h.await() (handle results)"
 awa_app="$tmp/await.q"
@@ -2468,13 +2470,13 @@ fn main {
     worker(2)
 }
 Q64
-cwk_expected=$'1\n10\n100\n2\n20\n200'
+cwk_expected=$'10\n1\n100\n20\n2\n200'
 "$Q64_BIN" emit "$cwk_app" "$tmp/calleescope.wasm"
 cwk_out="$("$HOST_BIN" "$tmp/calleescope.wasm")"
 [[ "$cwk_out" == "$cwk_expected" ]] || { echo "FAIL: callee scope/spawn (got: $cwk_out)" >&2; exit 1; }
 "$Q64_BIN" emit "$cwk_app" "$tmp/calleescope32.wasm" --addr wasm32
 cwk32_out="$("$HOST_BIN" "$tmp/calleescope32.wasm")"
 [[ "$cwk32_out" == "$cwk_expected" ]] || { echo "FAIL: callee scope/spawn wasm32 (got: $cwk32_out)" >&2; exit 1; }
-echo "    ok: callee scope/spawn -> 1/10/100/2/20/200 (wasm64 + wasm32; per-call join)"
+echo "    ok: callee scope/spawn -> 10/1/100/20/2/200 (wasm64 + wasm32; eager-at-spawn per call)"
 
 echo "PASS: $qube_out"

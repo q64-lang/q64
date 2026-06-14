@@ -863,26 +863,23 @@ fn buildScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, rt: *RtMap, out
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
-    var deferred: std.ArrayList(ast.SpawnExpr) = .empty;
-    defer deferred.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
         if (spawnExprOf(stmt)) |sp| {
-            try deferred.append(b.a, sp); // a task — runs at the join
+            // v0 cooperative floor: a task runs to completion at its spawn
+            // point (a valid schedule — no preemption). Eager-at-spawn handles
+            // parent-local dependencies and lets a spawned producer fill a
+            // channel before the parent consumes it. (True mutual suspension —
+            // a consumer spawned *before* its producer — needs the scheduler.)
+            if (sp.block()) |body| {
+                var bit = body.statements();
+                while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, out);
+            } else if (sp.scopeStmt()) |inner| {
+                try buildScopeStmt(b, inner, scope, rt, out);
+            } else return error.Unsupported;
         } else {
-            try buildMainStmt(b, stmt, scope, rt, out); // the parent flow
+            try buildMainStmt(b, stmt, scope, rt, out);
         }
-    }
-    // The structured join: run the spawned tasks in spawn order. A `spawn {
-    // block }` replays its statements; a `spawn scope { … }` runs the nested
-    // scope (its own spawns join at its own brace).
-    for (deferred.items) |sp| {
-        if (sp.block()) |body| {
-            var bit = body.statements();
-            while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, out);
-        } else if (sp.scopeStmt()) |inner| {
-            try buildScopeStmt(b, inner, scope, rt, out);
-        } else return error.Unsupported;
     }
 }
 
@@ -2162,23 +2159,18 @@ fn buildVoidScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, out: *std.A
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
-    var deferred: std.ArrayList(ast.SpawnExpr) = .empty;
-    defer deferred.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
         if (spawnExprOf(stmt)) |sp| {
-            try deferred.append(b.a, sp);
+            if (sp.block()) |body| {
+                var bit = body.statements();
+                while (bit.next()) |bstmt| try buildVoidStmt(b, bstmt, scope, out);
+            } else if (sp.scopeStmt()) |inner| {
+                try buildVoidScopeStmt(b, inner, scope, out);
+            } else return error.Unsupported;
         } else {
             try buildVoidStmt(b, stmt, scope, out);
         }
-    }
-    for (deferred.items) |sp| {
-        if (sp.block()) |body| {
-            var bit = body.statements();
-            while (bit.next()) |bstmt| try buildVoidStmt(b, bstmt, scope, out);
-        } else if (sp.scopeStmt()) |inner| {
-            try buildVoidScopeStmt(b, inner, scope, out);
-        } else return error.Unsupported;
     }
 }
 
@@ -7963,9 +7955,9 @@ test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)"
     m2.deinit();
 }
 
-test "structured concurrency v0: scope hoists spawn bodies to the join" {
-    // The cooperative floor: the parent flow lowers first, then each spawned
-    // task body (in spawn order) — tasks see the scope's locals (same frame).
+test "structured concurrency v0: scope runs spawn bodies eager-at-spawn" {
+    // The cooperative floor: each task runs to completion at its spawn point
+    // (a valid no-preemption schedule) — tasks see the scope's locals.
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
     var mod = (try buildLocal(testing.allocator, &tr,

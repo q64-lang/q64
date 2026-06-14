@@ -274,12 +274,15 @@ the runtime effect checks the front end can't do statically (EFF110 assert/
 operation violations, `@cancel` propagation). Specs: `concurrency.md`,
 `concurrency-model.md`.
   - [x] **`scope` + statement `spawn` execution (cooperative v0).**
-        `buildScopeStmt` lowers `scope { … }` on the cooperative floor: the
-        parent flow lowers first, then each spawned task body at the structured
-        join (the closing brace), in spawn order. Because the floor is
-        single-threaded and same-frame, "defer a task" is **hoisting its body
-        to the join** — no closure box, no task funcref, and the body sees the
-        scope's locals directly. `scope { spawn { env.out(base+1) } env.out("p")
+        `buildScopeStmt` lowers `scope { … }` on the cooperative floor with
+        **eager-at-spawn** scheduling: each task runs to completion at its spawn
+        point (a valid no-preemption schedule). Same-frame, so a task sees the
+        scope's locals directly — no closure box, no task funcref. (Originally
+        hoist-to-join; switched to eager because it handles parent-local
+        dependencies AND lets a spawned producer fill a channel before the
+        parent consumes — see Channels below — and it unifies with the eager
+        `let h = spawn` handle model. Both orderings are valid cooperative
+        schedules.) `scope { spawn { env.out(base+1) } env.out("p")
         spawn { env.out(base+2) } }` → `p / 101 / 102`. Runs wasm64 + wasm32
         (link-roundtrip `start/parent/101/102/100/done`). **Boundaries / next
         slices:** suspension + `await` (the CPS transform for genuinely
@@ -290,9 +293,9 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         caught by `resolve` (lexical order) before the hoist.
   - [x] **`scope`/`spawn` in callee (void) bodies.** `buildVoidScopeStmt`
         mirrors the main-position lowering through `buildVoidStmt`, so a `fn
-        worker() { scope { spawn … } }` runs its tasks at the per-call join.
-        `worker(1); worker(2)` → `1/10/100/2/20/200`. Runs wasm64 + wasm32.
-        (Value-callee `scope` and `spawn scope` sugar remain follow-ons.)
+        worker() { scope { spawn … } }` runs its tasks eager-at-spawn.
+        `worker(1); worker(2)` → `10/1/100/20/2/200`. Runs wasm64 + wasm32.
+        (Value-callee `scope` remains a follow-on.)
   - [x] **`let h = spawn { e }` + `h.await()` (handle results).** Key
         realization: a task that doesn't *itself* suspend needs **no** state
         machine — `await` is just "run to completion (already done, eagerly) and
@@ -305,12 +308,12 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         Runs wasm64 + wasm32. Multi-statement task bodies lower as a value
         block (leading statements for effect, tail = handle value): `let h =
         spawn { let x=10\n let y=20\n x+y }` → 30.
-  - [x] **`spawn scope { … }` sugar.** The deferred-task mechanism
-        (`spawnExprOf`) now carries the whole spawn expression, so a join-time
-        task is either a `spawn { block }` (replay statements) or a `spawn scope
-        { … }` (run the nested scope, whose own spawns join at its own brace) —
-        in both main and callee positions. Nested structured concurrency:
-        `spawn scope { spawn { … } … }` → `outer-parent/inner-parent/inner-a`.
+  - [x] **`spawn scope { … }` sugar.** `spawnExprOf` carries the whole spawn
+        expression, so an eager-at-spawn task is either a `spawn { block }`
+        (inline its statements) or a `spawn scope { … }` (run the nested scope,
+        whose own spawns run eager-at-spawn too) — in both main and callee
+        positions. Nested structured concurrency:
+        `spawn scope { spawn { … } … }` → `inner-a/inner-parent/outer-parent`.
         Runs wasm64 + wasm32.
   - [x] **Channels v0 — FIFO buffer (CPS increment 1).** `let ch =
         channel(...)` lowers to a Vec buffer + an i64 read cursor (`scope.chans`
@@ -318,16 +321,16 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         `v = buf[cursor]; cursor += 1`. i64 elements. **Key finding that frames
         the rest of the CPS work:** task-internal suspension is only
         *observably* needed for channels — handle-await DAGs already run
-        topologically under the eager model. And the natural idiom (spawn the
-        producer, consume in the parent) *requires* suspension, because the
-        spawned producer is hoisted to the join and would `send` after the
-        parent's `recv`s (recv-on-empty traps). So v0 FIFO works in the
-        inverted arrangement — **parent fills, a spawned task drains at the
-        join** — proving the buffer mechanism: `ch.send(10/20/30)` then a task
-        `ch.recv()×3` → 60 (wasm64 + wasm32). **CPS increment 2 (next):** the
-        scheduler + state-machine so `recv`-on-empty / `send`-on-full *suspend*
-        and resume — which makes the natural spawn-producer arrangement and
-        `select` work.
+        topologically under the eager model. **The natural idiom now works via
+        eager-at-spawn** (see `scope` above), not a state machine: the spawned
+        producer runs to completion at its spawn point, filling the buffer
+        before the parent's `recv`s — `scope { let ch = channel(); spawn {
+        ch.send(10/20/30) } let a = ch.recv() … }` → 60 (wasm64 + wasm32), no
+        suspension. **Still genuine CPS work (next):** a *consumer spawned
+        before its producer* (true mutual suspension — `recv`-on-empty must
+        yield to a later task), `send`-on-full backpressure (v0 channels are
+        unbounded), and `select`. The eager floor covers producer-before-
+        consumer DAGs (the common case).
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream
