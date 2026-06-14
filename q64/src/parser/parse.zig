@@ -279,7 +279,7 @@ const Parser = struct {
 
     fn isItemKeyword(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN, .KW_EFFECT, .KW_ACTOR => true,
+            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN, .KW_EFFECT, .KW_ACTOR, .KW_GRAPH => true,
             else => false,
         };
     }
@@ -353,6 +353,7 @@ const Parser = struct {
             .KW_SCREEN => try self.parseScreenDecl(),
             .KW_EFFECT => try self.parseEffectDecl(),
             .KW_ACTOR => try self.parseActorDecl(),
+            .KW_GRAPH => try self.parseGraphDecl(),
             else => unreachable,
         };
         if (anns.items.len == 0) return node;
@@ -512,9 +513,37 @@ const Parser = struct {
         return try cst.makeNode(self.arena, .HANDLE_DECL, children.items);
     }
 
+    /// `GraphDecl := "graph" IDENT GenericParams? "(" Params? ")" ("->" TypeExpr)? Block`
+    /// (spec/grammar.md §"Stream forms"). A named dataflow pipeline; the body is
+    /// a sequence of `let` stage bindings (`let y = x |> stage()`). Codegen
+    /// lowers the desugared call tree to the graph runtime (a follow-up).
+    fn parseGraphDecl(self: *Parser) !*const cst.Node {
+        var children: std.ArrayList(cst.Element) = .empty;
+        try self.consumeVisibility(&children);
+        try children.append(self.arena, .{ .token = self.advance() }); // KW_GRAPH
+        try self.eatTrivia(&children);
+        if (self.peek() == .IDENT) try children.append(self.arena, .{ .token = self.advance() }); // name
+        try self.eatTrivia(&children);
+        if (self.peek() == .L_ANGLE) {
+            try children.append(self.arena, .{ .node = try self.parseGenericParams() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .L_PAREN) {
+            try children.append(self.arena, .{ .node = try self.parseParams() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .ARROW) {
+            try children.append(self.arena, .{ .node = try self.parseReturnType() });
+            try self.eatTrivia(&children);
+        }
+        if (self.peek() == .L_BRACE) {
+            try children.append(self.arena, .{ .node = try self.parseBlock() });
+        }
+        return try cst.makeNode(self.arena, .GRAPH_DECL, children.items);
+    }
+
     fn parseFnDecl(self: *Parser) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
-
         try self.consumeVisibility(&children);
 
         std.debug.assert(self.peek() == .KW_FN);
@@ -2704,6 +2733,7 @@ test "round-trip: serialize(parse(s)) == s" {
         "fn main {\n    let h = spawn scope {\n        run()\n    }\n}\n",
         "fn main {\n    select {\n        v = ch.recv() -> use(v),\n        _ = ctx.cancelled() -> stop(),\n    }\n}\n",
         "actor Counter {\n    state n: i64 = 0\n\n    handle bump() {\n        n = n + 1\n    }\n\n    handle get() -> i64 {\n        n\n    }\n}\n",
+        "graph pipeline() -> i64 {\n    let a = src()\n    let b = a |> dbl\n}\n",
     };
 
     for (sources) |src| {
@@ -2798,6 +2828,25 @@ test "actor decl: structures name / state fields / handle methods" {
     try testing.expectEqualStrings("get", h1.name().?.text);
     try testing.expect(h1.returnType() != null); // `-> i64`
     try testing.expect(handlers.next() == null);
+}
+
+test "graph decl: structures name / params / return / pipeline body" {
+    const src =
+        "graph pipeline(seed: i64) -> i64 {\n" ++
+        "    let a = src(seed)\n" ++
+        "    let b = a |> dbl\n" ++
+        "}\n";
+    const r = try parse(testing.allocator, src, "g.q");
+    defer r.deinit(testing.allocator);
+    var items = ast.SourceFile.items(.{ .cst = r.root });
+    const g = items.next().?.graph_decl;
+    try testing.expectEqualStrings("pipeline", g.name().?.text);
+    try testing.expect(g.params() != null);
+    try testing.expect(g.returnType() != null);
+    const body = g.body().?;
+    var stmts = body.statements();
+    try testing.expect(stmts.next() != null); // let a = …
+    try testing.expect(stmts.next() != null); // let b = a |> dbl
 }
 
 test "screen DSL: a screen decl structures state / draw / on members" {

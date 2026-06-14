@@ -22,6 +22,7 @@ pub const SymbolKind = enum {
     fit,
     screen,
     actor,
+    graph,
     import_binding,
 
     pub fn label(self: SymbolKind) []const u8 {
@@ -36,6 +37,7 @@ pub const SymbolKind = enum {
             .fit => "fit",
             .screen => "screen",
             .actor => "actor",
+            .graph => "graph",
             .import_binding => "import",
         };
     }
@@ -172,6 +174,7 @@ pub fn build(gpa: std.mem.Allocator, sf: ast.SourceFile) !SymbolTable {
             });
         },
         .actor_decl => |d| try bindNamed(&t, d.name(), .actor, d.visibility() != null),
+        .graph_decl => |d| try bindNamed(&t, d.name(), .graph, d.visibility() != null),
         // Effect markers live in their own namespace (not value/type symbols);
         // their validity is checked directly (EFF140/EFF141).
         .effect_decl => {},

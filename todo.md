@@ -378,7 +378,19 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         (default-fill `Counter {}`, void handlers in callee bodies, and `ask`
         suspension are follow-ons).
 
-**Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
+**Phase 4 — Streams / dataflow runtime — builds on Phase 3 — STARTED.**
+  - [x] **Structured `graph` declarations** (parsing). `parseGraphDecl`
+        (`graph IDENT GenericParams? "(" Params? ")" ("->" TypeExpr)? Block`),
+        wired into `itemKeyword`/`isItemKeyword`/`parseItem`. New AST view
+        `GraphDecl{name,params,returnType,body}` (+ `Item.graph_decl`,
+        `SymbolKind.graph`). The body is `let` stage bindings whose RHS is a
+        stage call or a `|>` pipeline (the pipe lowering already exists). Lossless
+        round-trip + an AST-structure test; `q64 check` accepts a graph.
+        **Codegen next:** walk the desugared stage call-tree to build the
+        topology; v0 can run a graph eagerly (stages are just function calls via
+        `|>`) on the cooperative floor, like the rest of Phase 3.
+
+**Phase 4 (cont.) — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream
 sampling semantics. The STR0xx diagnostics already guard the front end;
 this makes graphs *run*. Spec: `streams.md`.

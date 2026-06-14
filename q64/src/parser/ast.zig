@@ -147,6 +147,7 @@ pub const Item = union(enum) {
     screen_decl: ScreenDecl,
     effect_decl: EffectDecl,
     actor_decl: ActorDecl,
+    graph_decl: GraphDecl,
 
     pub fn cast(node: *const cst.Node) ?Item {
         return switch (node.kind) {
@@ -161,6 +162,7 @@ pub const Item = union(enum) {
             .SCREEN_DECL => .{ .screen_decl = .{ .cst = node } },
             .EFFECT_DECL => .{ .effect_decl = .{ .cst = node } },
             .ACTOR_DECL => .{ .actor_decl = .{ .cst = node } },
+            .GRAPH_DECL => .{ .graph_decl = .{ .cst = node } },
             else => null,
         };
     }
@@ -834,6 +836,28 @@ pub const ActorDecl = struct {
     /// The `handle <msg>(…) { … }` message handlers, in order.
     pub fn handlers(self: ActorDecl) ChildIter(HandleDecl, .HANDLE_DECL) {
         return .{ .children = self.cst.children };
+    }
+};
+
+/// `GraphDecl := "graph" IDENT GenericParams? "(" Params? ")" ("->" TypeExpr)?
+/// Block` — a named dataflow pipeline; the body is `let` stage bindings.
+pub const GraphDecl = struct {
+    cst: *const cst.Node,
+
+    pub fn visibility(self: GraphDecl) ?Visibility {
+        return itemVisibility(self.cst);
+    }
+    pub fn name(self: GraphDecl) ?cst.Token {
+        return itemName(self.cst);
+    }
+    pub fn params(self: GraphDecl) ?Params {
+        return firstChildNode(self.cst, .PARAMS, Params);
+    }
+    pub fn returnType(self: GraphDecl) ?ReturnType {
+        return firstChildNode(self.cst, .RETURN_TYPE, ReturnType);
+    }
+    pub fn body(self: GraphDecl) ?Block {
+        return firstChildNode(self.cst, .BLOCK, Block);
     }
 };
 

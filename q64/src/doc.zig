@@ -385,6 +385,7 @@ fn itemKind(item: ast.Item) []const u8 {
         .screen_decl => "screen",
         .effect_decl => "effect",
         .actor_decl => "actor",
+        .graph_decl => "graph",
     };
 }
 
