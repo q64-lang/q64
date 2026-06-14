@@ -22,6 +22,7 @@
 //!   - `_start` — a `() -> ()` function the host invokes.
 
 const std = @import("std");
+const render = @import("render.zig");
 
 const c = @cImport({
     @cInclude("wasm.h");
@@ -29,30 +30,58 @@ const c = @cImport({
     @cInclude("wasmtime/wat.h");
 });
 
+// Accumulated `qview` display list, recorded by the host's qview callbacks and
+// rasterized to a PNG after `_start` when `--png <path>` is given. Globals
+// because the wasmtime callbacks are bare C functions (single-run process).
+var g_display: std.ArrayListUnmanaged(render.Op) = .empty;
+var g_alloc: std.mem.Allocator = undefined;
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    // The qview display list lives for the whole run and is freed at exit; use
+    // the page allocator so the leak-checked gpa doesn't flag it.
+    g_alloc = std.heap.page_allocator;
     const io = init.io;
 
     var err_buf: [4096]u8 = undefined;
     var err_w = std.Io.File.stderr().writer(io, &err_buf);
 
+    // usage: q64-wasmtime-host <file.wasm> [--png out.png] [--size WxH] [--bg RRGGBB]
+    // The `--png` flags render the accumulated qview display list to an image —
+    // the headless render-capture of a GUI qube (the native window is `qube run`).
     var it = init.minimal.args.iterate();
     _ = it.next(); // argv0
-    const path = it.next() orelse {
-        try err_w.interface.writeAll("usage: q64-wasmtime-host <file.wat|file.wasm>\n");
+    var path: ?[]const u8 = null;
+    var png_path: ?[]const u8 = null;
+    var cv_w: u32 = 360;
+    var cv_h: u32 = 360;
+    var cv_bg: u32 = 0x14161C;
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--png")) {
+            png_path = it.next();
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            if (it.next()) |dim| {
+                if (std.mem.indexOfScalar(u8, dim, 'x')) |xi| {
+                    cv_w = std.fmt.parseInt(u32, dim[0..xi], 10) catch cv_w;
+                    cv_h = std.fmt.parseInt(u32, dim[xi + 1 ..], 10) catch cv_h;
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--bg")) {
+            if (it.next()) |hex| cv_bg = std.fmt.parseInt(u32, hex, 16) catch cv_bg;
+        } else if (path == null) {
+            path = arg;
+        }
+    }
+    const wasm_path = path orelse {
+        try err_w.interface.writeAll("usage: q64-wasmtime-host <file.wasm> [--png out.png] [--size WxH] [--bg RRGGBB]\n");
         try err_w.interface.flush();
         std.process.exit(2);
     };
-    if (it.next() != null) {
-        try err_w.interface.writeAll("usage: q64-wasmtime-host <file.wat|file.wasm>\n");
-        try err_w.interface.flush();
-        std.process.exit(2);
-    }
 
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |e| {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, wasm_path, gpa, .limited(16 * 1024 * 1024)) catch |e| {
         try err_w.interface.print(
             "q64-wasmtime-host: cannot read {s}: {s}\n",
-            .{ path, @errorName(e) },
+            .{ wasm_path, @errorName(e) },
         );
         try err_w.interface.flush();
         std.process.exit(2);
@@ -80,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
     // anything else is treated as raw `.wasm`.
     // -------------------------------------------------------------
     var wasm_bytes: c.wasm_byte_vec_t = undefined;
-    if (std.mem.endsWith(u8, path, ".wat")) {
+    if (std.mem.endsWith(u8, wasm_path, ".wat")) {
         const wat_err = c.wasmtime_wat2wasm(@ptrCast(source.ptr), source.len, &wasm_bytes);
         if (wat_err) |e| {
             try printErrorAndDelete(io, e, "wat2wasm");
@@ -190,6 +219,58 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // -------------------------------------------------------------
+    // Headless `qview.*` host face (spec/reactivity.md; the live web POC's
+    // ABI). qview is an *open* face — any `qview.<op>(...)` a program invents
+    // (`box`, `line`, `circle`, …) lowers to a host import. Rather than a fixed
+    // list, enumerate the module's imports and define every `qview` one with a
+    // generic trace callback that prints `@qview <op> <args…>` — a deterministic
+    // display list a test asserts on and `scripts/qview-render.py` draws to PNG.
+    // -------------------------------------------------------------
+    {
+        var imports: c.wasm_importtype_vec_t = undefined;
+        c.wasmtime_module_imports(module, &imports);
+        defer c.wasm_importtype_vec_delete(&imports);
+        var i: usize = 0;
+        while (i < imports.size) : (i += 1) {
+            const imp = imports.data[i] orelse continue;
+            if (!nameEql(c.wasm_importtype_module(imp), "qview")) continue;
+            const nm = c.wasm_importtype_name(imp) orelse continue;
+            const ft = c.wasm_externtype_as_functype(@constCast(c.wasm_importtype_type(imp))) orelse continue;
+            const ps = c.wasm_functype_params(ft);
+            const np = ps.*.size;
+            // A process-lifetime, null-terminated op name for the callback's data.
+            const op_z = std.heap.page_allocator.allocSentinel(u8, nm.*.size, 0) catch return error.OutOfMemory;
+            @memcpy(op_z[0..nm.*.size], nm.*.data[0..nm.*.size]);
+            // Match the import's own param kinds (i64 for ints; i32 for wasm32
+            // str ptr/len). Results are void (drawing ops).
+            const qptypes = try std.heap.page_allocator.alloc(?*c.wasm_valtype_t, np);
+            var k: usize = 0;
+            while (k < np) : (k += 1) qptypes[k] = c.wasm_valtype_new(c.wasm_valtype_kind(ps.*.data[k]));
+            var qparams: c.wasm_valtype_vec_t = undefined;
+            c.wasm_valtype_vec_new(&qparams, np, @ptrCast(qptypes.ptr));
+            var qresults: c.wasm_valtype_vec_t = undefined;
+            c.wasm_valtype_vec_new_empty(&qresults);
+            const qtype = c.wasm_functype_new(&qparams, &qresults) orelse return error.FuncTypeNewFailed;
+            defer c.wasm_functype_delete(qtype);
+            const qerr = c.wasmtime_linker_define_func(
+                linker,
+                "qview",
+                "qview".len,
+                op_z.ptr,
+                op_z.len,
+                qtype,
+                qviewCallback,
+                @ptrCast(op_z.ptr),
+                null,
+            );
+            if (qerr) |e| {
+                try printErrorAndDelete(io, e, "linker_define_func qview");
+                std.process.exit(1);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
     // Instantiate.
     // -------------------------------------------------------------
     var instance: c.wasmtime_instance_t = undefined;
@@ -240,6 +321,33 @@ pub fn main(init: std.process.Init) !void {
             try printTrapAndDelete(io, t, "_start");
             std.process.exit(1);
         }
+    }
+
+    // -------------------------------------------------------------
+    // Render-capture: rasterize the qview display list to a PNG (`--png`).
+    // This is the headless half of `qube run`; the windowed half blits the
+    // same framebuffer to an OS window.
+    // -------------------------------------------------------------
+    if (png_path) |pp| {
+        const cv = render.render(gpa, g_display.items, cv_w, cv_h, cv_bg) catch |e| {
+            try err_w.interface.print("q64-wasmtime-host: render failed: {s}\n", .{@errorName(e)});
+            try err_w.interface.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(cv.px);
+        const png = render.toPng(gpa, cv) catch |e| {
+            try err_w.interface.print("q64-wasmtime-host: png encode failed: {s}\n", .{@errorName(e)});
+            try err_w.interface.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(png);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pp, .data = png }) catch |e| {
+            try err_w.interface.print("q64-wasmtime-host: cannot write {s}: {s}\n", .{ pp, @errorName(e) });
+            try err_w.interface.flush();
+            std.process.exit(1);
+        };
+        try err_w.interface.print("q64-wasmtime-host: rendered {d} ops -> {s} ({d}x{d})\n", .{ g_display.items.len, pp, cv_w, cv_h });
+        try err_w.interface.flush();
     }
 }
 
@@ -376,6 +484,39 @@ fn envFsReadCallback(
     return null;
 }
 
+/// `qview.*` callback: records the op into the global display list (for
+/// PNG/window rendering) and prints a best-effort trace line `@qview <op>
+/// <args…>`. The op name rides in `env_` (the import's data pointer); args are
+/// read width-agnostically. The display list is what `qube run` draws.
+fn qviewCallback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = caller;
+    _ = results;
+    _ = nresults;
+    const op = std.mem.span(@as([*:0]const u8, @ptrCast(env_.?)));
+    // Record (for rendering).
+    const argv = g_alloc.alloc(i64, nargs) catch return trap("qview: oom");
+    var i: usize = 0;
+    while (i < nargs) : (i += 1) argv[i] = argAddr(args[i]);
+    g_display.append(g_alloc, .{ .name = op, .args = argv }) catch return trap("qview: oom");
+    // Best-effort trace (a closed pipe must not abort the run).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    w.interface.print("@qview {s}", .{op}) catch return null;
+    var j: usize = 0;
+    while (j < nargs) : (j += 1) w.interface.print(" {d}", .{argv[j]}) catch return null;
+    w.interface.print("\n", .{}) catch return null;
+    w.interface.flush() catch {};
+    return null;
+}
+
 /// Read a wasm value as an address, accepting either an i32 (wasm32) or i64
 /// (wasm64) pointer/length and widening to i64.
 fn argAddr(v: c.wasmtime_val_t) i64 {
@@ -394,10 +535,10 @@ fn envOutWantsI32(module: ?*c.wasmtime_module_t) bool {
     defer c.wasm_importtype_vec_delete(&imports);
     var i: usize = 0;
     while (i < imports.size) : (i += 1) {
-        const it = imports.data[i] orelse continue;
-        if (!nameEql(c.wasm_importtype_module(it), "env")) continue;
-        if (!nameEql(c.wasm_importtype_name(it), "out")) continue;
-        const ft = c.wasm_externtype_as_functype(@constCast(c.wasm_importtype_type(it))) orelse return false;
+        const imp = imports.data[i] orelse continue;
+        if (!nameEql(c.wasm_importtype_module(imp), "env")) continue;
+        if (!nameEql(c.wasm_importtype_name(imp), "out")) continue;
+        const ft = c.wasm_externtype_as_functype(@constCast(c.wasm_importtype_type(imp))) orelse return false;
         const ps = c.wasm_functype_params(ft);
         if (ps.*.size >= 1) return c.wasm_valtype_kind(ps.*.data[0]) == c.WASM_I32;
         return false;
