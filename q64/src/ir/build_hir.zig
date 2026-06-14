@@ -337,6 +337,37 @@ fn buildRecordDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, sc
     if (!any) return error.Unsupported; // `P {}` binds nothing
 }
 
+/// `let (a, b) = (e1, e2)` — tuple-literal destructuring. q64 has no
+/// first-class tuple value yet, so this is the parallel-binding form: the
+/// right side must be a tuple *literal*, bound element-by-element to the left
+/// side's ident sub-patterns. v0: i64/bool/float elements, ident binders,
+/// matching arity. Emits its `let`s into `out`; works in main + callee bodies.
+fn buildTupleDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, scope: *Scope, isVar: bool, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const tup = switch (init_expr) {
+        .tuple => |t| t, // a tuple binding (no literal) needs first-class tuples
+        else => return error.Unsupported,
+    };
+    var pit = ast.PatternIter{ .children = pat.cst.children };
+    var eit = tup.elements();
+    var n: usize = 0;
+    while (pit.next()) |sp| {
+        const el = eit.next() orelse return error.Unsupported; // too few elements
+        if (sp.kind() != .IDENT_PATTERN) return error.Unsupported; // `_`/nested: later
+        const name = (sp.bindingName() orelse return error.Unsupported).text;
+        const sc = try exprScalar(b, el, scope);
+        if (sc == .narrow_int or sc == .str) return error.Unsupported; // widen/str: later
+        const ty = scalarBindTy(sc);
+        // Build before declaring so an element can't see the name it binds.
+        const value = try buildIntExpr(b, el, scope);
+        const idx = try declareBodyLocal(b, scope, name, isVar, ty);
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .let = .{ .idx = idx, .value = value } };
+        try out.append(b.a, st);
+        n += 1;
+    }
+    if (n == 0 or eit.next() != null) return error.Unsupported; // empty, or too many elements
+}
+
 /// Build one statement of `main`'s body, appending 0+ HIR statements to `out`.
 /// Unlike a function body, `main` statements can write the host (`env.out`,
 /// `qview.*`) and have no value/tail — so this handles the host shapes *and*
@@ -349,6 +380,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             // `let P { x, y } = rec` — single-level record destructuring.
             if (lpat.kind() == .RECORD_STRUCT_PATTERN) {
                 return buildRecordDestructure(b, lpat, init_expr, scope, out);
+            }
+            // `let (a, b) = (e1, e2)` — tuple-literal destructuring.
+            if (lpat.kind() == .TUPLE_PATTERN) {
+                return buildTupleDestructure(b, lpat, init_expr, scope, ls.isVar(), out);
             }
             const nm = lpat.bindingName() orelse return error.Unsupported;
             // An immutable `let` whose initializer const-folds (incl. a
@@ -5734,11 +5769,14 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
             const lpat = ls.pattern() orelse return error.Unsupported;
-            // `let P { x, y } = rec` — single-level record destructuring; the
+            // `let P { x, y } = rec` / `let (a, b) = (…)` — destructuring; the
             // binding statements ride in one block (callee bodies are i64-typed).
-            if (lpat.kind() == .RECORD_STRUCT_PATTERN) {
+            if (lpat.kind() == .RECORD_STRUCT_PATTERN or lpat.kind() == .TUPLE_PATTERN) {
                 var items: std.ArrayList(*hir.Stmt) = .empty;
-                try buildRecordDestructure(b, lpat, init_expr, scope, &items);
+                if (lpat.kind() == .RECORD_STRUCT_PATTERN)
+                    try buildRecordDestructure(b, lpat, init_expr, scope, &items)
+                else
+                    try buildTupleDestructure(b, lpat, init_expr, scope, ls.isVar(), &items);
                 out.* = .{ .block = try items.toOwnedSlice(b.a) };
                 return out;
             }
@@ -7373,6 +7411,50 @@ test "record destructuring: `let P { x, y } = p` binds fields (main + callee, re
         \\    let p = P { x: 1, y: 2 }
         \\    let P { z } = p
         \\    env.out(z)
+        \\}
+        \\
+    )) == null);
+}
+
+test "tuple destructuring: `let (a, b) = (e1, e2)` binds elements (main + callee)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn combine(n: i64) -> i64 {
+        \\    let (lo, hi) = (n - 1, n + 1)
+        \\    lo * hi
+        \\}
+        \\fn main {
+        \\    let (a, b) = (3, 4)
+        \\    env.out(a + b)
+        \\    var m = 5
+        \\    let (p, q) = (m * 2, m + 100)
+        \\    env.out(p + q)
+        \\    env.out(combine(6))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+
+    // Arity mismatch and a non-literal RHS (needs first-class tuples) reject.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    let (a, b) = (1, 2, 3)
+        \\    env.out(a)
+        \\}
+        \\
+    )) == null);
+    var tr3 = TestResolver{ .a = testing.allocator };
+    defer tr3.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr3,
+        \\fn main {
+        \\    let pair = (3, 4)
+        \\    let (a, b) = pair
+        \\    env.out(a)
         \\}
         \\
     )) == null);

@@ -2056,6 +2056,34 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> tuple destructuring: let (a, b) = (e1, e2) (parallel binding, main + callee)"
+tup_app="$tmp/tupledes.q"
+cat > "$tup_app" <<'Q64'
+fn combine(n: i64) -> i64 {
+    let (lo, hi) = (n - 1, n + 1)
+    lo * hi
+}
+fn main {
+    let (a, b) = (3, 4)
+    env.out(a + b)
+    let (x, y, z) = (10, 20, 30)
+    env.out(x + y + z)
+    var m = 5
+    let (p, q) = (m * 2, m + 100)
+    env.out(p)
+    env.out(q)
+    env.out(combine(6))
+}
+Q64
+tup_expected=$'7\n60\n10\n105\n35'
+"$Q64_BIN" emit "$tup_app" "$tmp/tupledes.wasm"
+tup_out="$("$HOST_BIN" "$tmp/tupledes.wasm")"
+[[ "$tup_out" == "$tup_expected" ]] || { echo "FAIL: tuple destructuring (got: $tup_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$tup_app" "$tmp/tupledes32.wasm" --addr wasm32
+tup32_out="$("$HOST_BIN" "$tmp/tupledes32.wasm")"
+[[ "$tup32_out" == "$tup_expected" ]] || { echo "FAIL: tuple destructuring wasm32 (got: $tup32_out)" >&2; exit 1; }
+echo "    ok: tuple destructuring -> 7 / 60 / 10 / 105 / 35 (wasm64 + wasm32; main + callee)"
+
 echo "==> record destructuring: let P { x, y } = p (rename, partial, callee body)"
 des_app="$tmp/destructure.q"
 cat > "$des_app" <<'Q64'

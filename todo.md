@@ -182,10 +182,18 @@ needs the platform audit, so it's the highest-leverage near-term work.
           `FieldPattern{name, subPattern}`). Supports rename (`x: a`) and
           partial (`P { x }`) forms, in `main` and callee bodies. v0: i64
           fields, plain (non-nested) binders. Runs wasm64 + wasm32 (roundtrip
-          `7 / 12 / 25 / 3`). **Next (deferred per spec):** nested struct
-          destructuring beyond one level (`P { pos: Point { x } }`), tuple
-          destructuring (`let (a, b) = pair`), plain struct-value `match`,
-          bool/str/narrow/record fields.
+          `7 / 12 / 25 / 3`).
+    - [x] **Tuple-literal destructuring** (`let (a, b) = (e1, e2)`): q64 has no
+          first-class tuple value yet, so this is the parallel-binding form —
+          `buildTupleDestructure` requires the RHS to be a tuple *literal* and
+          binds each element to the LHS's ident sub-patterns (arity-checked).
+          Works in `main` and callee bodies; v0: i64/bool/float elements, ident
+          binders. A non-literal RHS (`let (a, b) = pair`) and arity mismatch
+          reject honestly. Runs wasm64 + wasm32 (roundtrip `7 / 60 / 10 / 105 /
+          35`). **Next (deferred per spec / needs first-class tuples):** nested
+          struct destructuring beyond one level (`P { pos: Point { x } }`),
+          tuple *values* + `let (a, b) = pair`, plain struct-value `match`,
+          bool/str/narrow/record record-fields.
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the
