@@ -2376,6 +2376,32 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/101/parent/102/100/done (wasm64 + wasm32; eager-at-spawn, tasks see scope locals)"
 
+echo "==> actors v0: state record + handlers (tell/ask) with bare-field self access"
+act_app="$tmp/actor.q"
+cat > "$act_app" <<'Q64'
+actor Counter {
+    state n: i64 = 0
+    handle bump() { n = n + 1 }
+    handle add(k: i64) { n = n + k }
+    handle get() -> i64 { n }
+}
+fn main {
+    var c = Counter { n: 0 }
+    c.bump()
+    c.bump()
+    c.add(10)
+    env.out(c.get())
+}
+Q64
+act_expected=$'12'
+"$Q64_BIN" emit "$act_app" "$tmp/actor.wasm"
+act_out="$("$HOST_BIN" "$tmp/actor.wasm")"
+[[ "$act_out" == "$act_expected" ]] || { echo "FAIL: actor (got: $act_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$act_app" "$tmp/actor32.wasm" --addr wasm32
+act32_out="$("$HOST_BIN" "$tmp/actor32.wasm")"
+[[ "$act32_out" == "$act_expected" ]] || { echo "FAIL: actor wasm32 (got: $act32_out)" >&2; exit 1; }
+echo "    ok: actor -> 12 (wasm64 + wasm32; tell bump/add + ask get, bare-field state, persists)"
+
 echo "==> pipe operator |>: x |> f(args) ≡ f(x, args) (chains, f64)"
 pip_app="$tmp/pipe.q"
 cat > "$pip_app" <<'Q64'

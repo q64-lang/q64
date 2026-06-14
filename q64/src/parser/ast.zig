@@ -742,6 +742,14 @@ pub const StateDecl = struct {
     pub fn name(self: StateDecl) ?cst.Token {
         return itemName(self.cst);
     }
+    /// The declared type after `:`, if present (`state n: i64 = 0`).
+    pub fn type_(self: StateDecl) ?TypeExpr {
+        for (self.cst.children) |c| switch (c) {
+            .node => |n| if (TypeExpr.cast(n)) |t| return t,
+            .token => {},
+        };
+        return null;
+    }
     /// The initializer expression after `=`, if present.
     pub fn value(self: StateDecl) ?Expr {
         for (self.cst.children) |c| switch (c) {

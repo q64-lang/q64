@@ -363,6 +363,20 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         **Codegen next:** lower an actor to a state record + handler functions,
         with `tell`/`ask` as (eager, cooperative-floor) calls on the instance —
         reusing the record + fit-method machinery.
+  - [x] **Actors v0 — state record + handlers (tell/ask).** `registerStructs`
+        registers an actor as a struct of its `state` fields (+ keeps the decl
+        in `b.actor_decls`); `registerActorHandler` builds each `handle` as a
+        callee taking the state record as an implicit `self` (`.ptr`), keyed
+        `Name.handler` like a fit method so the dotted-call dispatch finds it.
+        Inside a handler, a **bare state-field name** resolves to `self.<field>`
+        for read, write, and typing via `scope.self_actor` + `actorStateField`.
+        A void handler is a `tell` (`tryActorTell` — statement dispatch); a
+        `-> T` handler is an `ask` (the value method path). `Counter { state n;
+        handle bump(); handle add(k); handle get() -> i64 }` with `c.bump();
+        c.bump(); c.add(10); c.get()` → 12 (state persists across calls).
+        Runs wasm64 + wasm32. v0: explicit construction `Counter { n: 0 }`
+        (default-fill `Counter {}`, void handlers in callee bodies, and `ask`
+        suspension are follow-ons).
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

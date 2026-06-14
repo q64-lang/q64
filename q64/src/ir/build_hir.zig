@@ -124,6 +124,11 @@ const Builder = struct {
     /// tuple type share one `StructInfo` so a tuple arg matches a tuple param
     /// by pointer (the record-arg ABI compares `si` identity).
     tuple_sis: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
+    /// Actor declarations by name (concurrency v0). An actor is registered as a
+    /// struct (its `state` fields) in `structs`; this map keeps the decl so a
+    /// `c.handle(...)` dispatch can build the handler, and construction can
+    /// fill `state` defaults.
+    actor_decls: std.StringHashMapUnmanaged(ast.ActorDecl) = .empty,
     /// This file's all-unit enum declarations (C1): a variant value is
     /// its declaration-order tag (an i64 at the compute floor).
     enums: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
@@ -1633,6 +1638,11 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 while (ait.next()) |a| try args.append(b.a, try buildHostArg(b, a, scope, rt));
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .host_call = .{ .name = fname, .args = try args.toOwnedSlice(b.a) } };
+                try out.append(b.a, st);
+                return;
+            }
+            // `c.bump()` — an actor void handler (tell) on a record binding.
+            if (try tryActorTell(b, call, scope)) |st| {
                 try out.append(b.a, st);
                 return;
             }
@@ -3772,6 +3782,44 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
             };
             try b.structs.put(b.a, nm.text, si);
         },
+        .actor_decl => |ad| {
+            // An actor is a struct of its `state` fields, plus its decl kept
+            // for handler dispatch + default construction.
+            const nm = ad.name() orelse continue;
+            var fields: std.ArrayList(StructField) = .empty;
+            var off: u32 = 0;
+            var max_align: u32 = 1;
+            var ok = true;
+            var sit = ad.states();
+            while (sit.next()) |s| {
+                const fname = s.name() orelse {
+                    ok = false;
+                    break;
+                };
+                const fty = (try semaScalar(b, s.type_())) orelse {
+                    ok = false;
+                    break;
+                };
+                const w = fieldWidth(fty) orelse {
+                    ok = false;
+                    break;
+                };
+                off = std.mem.alignForward(u32, off, w.alignment);
+                try fields.append(b.a, .{ .name = fname.text, .ty = fty, .offset = off });
+                off += w.size;
+                if (w.alignment > max_align) max_align = w.alignment;
+            }
+            if (!ok or fields.items.len == 0) continue;
+            const si = try b.a.create(StructInfo);
+            si.* = .{
+                .name = nm.text,
+                .fields = try fields.toOwnedSlice(b.a),
+                .size = std.mem.alignForward(u32, off, max_align),
+                .alignment = max_align,
+            };
+            try b.structs.put(b.a, nm.text, si);
+            try b.actor_decls.put(b.a, nm.text, ad);
+        },
         else => {},
     };
 }
@@ -3869,6 +3917,17 @@ fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
 /// bindings (`Scope.recs`). `null` when the head isn't one; an unknown field
 /// on a known record — or nested access — is `Unsupported` (nesting needs
 /// struct-typed fields, a later slice).
+/// A bare actor-state field (`n` inside a handler → `self.n`). Returns null
+/// unless we're in a handler body (`scope.self_actor` set) and `name` is a
+/// single-segment field of the actor's state. State fields are mutable.
+fn actorStateField(scope: *const Scope, name: []const u8) ?RecField {
+    const si = scope.self_actor orelse return null;
+    if (std.mem.indexOfScalar(u8, name, '.') != null) return null;
+    const f = si.field(name) orelse return null;
+    const loc = scope.find("self") orelse return null;
+    return .{ .base_idx = loc.idx, .offset = f.offset, .ty = f.ty, .mutable = true };
+}
+
 fn findRecField(scope: *const Scope, txt: []const u8) BuildError!?RecField {
     const dot = std.mem.indexOfScalar(u8, txt, '.') orelse return null;
     const si = scope.recs.get(txt[0..dot]) orelse return null;
@@ -4153,6 +4212,99 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     }
     b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = ret_ty, .locals = locals, .body = body };
     return id;
+}
+
+/// Build (once) an actor handler `Counter.bump` as a callee function taking
+/// the actor's state record as an implicit `self` (a `.ptr`). Inside the body,
+/// bare state-field names resolve to `self.<field>` (`scope.self_actor`). A
+/// handler with no return type is a void procedure (`tell`); one with `-> T`
+/// returns a scalar (`ask`). Keyed `Name.handler` like a fit method, so the
+/// existing dotted-call dispatch finds it.
+fn registerActorHandler(b: *Builder, si: *const StructInfo, mname: []const u8) BuildError!?hir.FuncId {
+    const key = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ si.name, mname });
+    if (b.ids.get(key)) |id| return id;
+    const ad = b.actor_decls.get(si.name) orelse return null;
+    var hit = ad.handlers();
+    const handle = while (hit.next()) |h| {
+        const hn = h.name() orelse continue;
+        if (std.mem.eql(u8, hn.text, mname)) break h;
+    } else return null;
+    const body_blk = handle.body() orelse return error.Unsupported;
+
+    const ret_ty: hir.Type = if (handle.returnType()) |rt| blk: {
+        const rs = (try semaScalar(b, rt.type_())) orelse return error.Unsupported;
+        break :blk switch (rs) {
+            .bool, .i64, .f64, .f32 => rs,
+            else => return error.Unsupported, // str/record handler returns: later
+        };
+    } else .void;
+
+    var scope = Scope{ .a = b.a, .callee = true, .self_actor = si };
+    var params: std.ArrayList(hir.Param) = .empty;
+    var rec_params: std.ArrayList(?*const StructInfo) = .empty;
+    _ = try scope.declare("self", false, .ptr);
+    try scope.recs.put(b.a, "self", si);
+    try params.append(b.a, .{ .name = "self", .ty = .ptr });
+    try rec_params.append(b.a, si);
+    if (handle.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| {
+            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
+            const pty: hir.Type = switch (psc) {
+                .bool, .i64, .f64, .f32 => psc,
+                else => return error.Unsupported,
+            };
+            const pn = (p.name() orelse return error.Unsupported).text;
+            _ = try scope.declare(pn, false, pty);
+            try params.append(b.a, .{ .name = pn, .ty = pty });
+            try rec_params.append(b.a, null);
+        }
+    }
+    scope.n_params = @intCast(params.items.len);
+    const param_slice = try params.toOwnedSlice(b.a);
+
+    const id: hir.FuncId = @intCast(b.funcs.items.len);
+    try b.ids.put(b.a, key, id);
+    const dummy = try b.a.create(hir.Stmt);
+    dummy.* = .{ .block = &.{} };
+    try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy });
+    try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = null });
+
+    const block = if (ret_ty == .void)
+        try buildVoidBlock(b, body_blk, &scope)
+    else
+        try buildIntBlock(b, body_blk, &scope);
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty;
+    }
+    b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = ret_ty, .locals = locals, .body = block };
+    return id;
+}
+
+/// `c.bump()` — a statement-position call to an actor's *void* handler (a
+/// `tell`). Returns the discard-result statement, or null if `call` isn't a
+/// void-handler dispatch on an actor binding.
+fn tryActorTell(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
+    const cname = (callPathName(b, call)) orelse return null;
+    defer b.a.free(cname);
+    const dot = std.mem.indexOfScalar(u8, cname, '.') orelse return null;
+    const head = cname[0..dot];
+    const mname = cname[dot + 1 ..];
+    if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
+    const si = scope.recs.get(head) orelse return null;
+    const loc = scope.find(head) orelse return null;
+    const fid = (try registerActorHandler(b, si, mname)) orelse return null;
+    if (b.funcs.items[fid].ret != .void) return null; // a value handler isn't a tell
+    const recv = try b.a.create(hir.Expr);
+    recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, call.args(), scope, recv) } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .expr = e };
+    return st;
 }
 
 /// The single tail expression of a one-statement block, or null.
@@ -5930,8 +6082,10 @@ const ExprTypeBridge = struct {
                     }
                 }
             }
-            // `p.x` on a materialized record: the field's declared type.
-            const rf = (findRecField(self.scope, name) catch return null) orelse return null;
+            // `p.x` on a materialized record, or a bare actor-state field
+            // (`n` in a handler → `self.n`): the field's declared type.
+            const rf = (findRecField(self.scope, name) catch return null) orelse
+                actorStateField(self.scope, name) orelse return null;
             return switch (rf.ty) {
                 .bool => .bool,
                 .i64 => .i64,
@@ -6161,6 +6315,10 @@ const Scope = struct {
     /// cursor. v0 FIFO with no suspension (producer-before-consumer ordering,
     /// capacity ≥ messages); suspend-on-empty/full arrives with the scheduler.
     chans: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Inside an actor handler body, the actor's state struct — so a bare field
+    /// name (`n`) resolves to `self.n` (read, write, and type), the implicit-
+    /// self convention. `self` itself is registered in `recs`.
+    self_actor: ?*const StructInfo = null,
     /// True for a plain callee body (registerFunc), whose locals are
     /// tracked by `declare` alone — entry-style bodies (`main`,
     /// stamped generics) mirror every local into `b.cur_locals` too.
@@ -6285,31 +6443,51 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             };
             const tname = try tpath.text(b.a);
             defer b.a.free(tname);
-            const loc = scope.find(tname) orelse return error.Unsupported;
-            if (!loc.mutable) return reject(b, .immutable_assign); // a `let` binding or a parameter
-            const rhs_ast = as.value() orelse return error.Unsupported;
             const op = as.op() orelse return error.Unsupported;
-            // No implicit conversion: a plain `=` must assign a value of the
-            // binding's type; compound ops (`+=` …) are arithmetic and apply
-            // to numeric bindings (no `%=` on f64 — wasm has no float rem).
-            const rhs_sc = try exprScalar(b, rhs_ast, scope);
-            if (op.kind == .EQ) {
-                if (scalarBindTy(rhs_sc) != loc.ty) return error.Unsupported;
-            } else if (loc.ty == .f64) {
-                if (op.kind == .PERCENT_EQ or rhs_sc != .f64) return error.Unsupported;
-            } else if (loc.ty != .i64) {
-                return error.Unsupported; // `bool += …` and the like are not arithmetic
-            }
-            const rhs = try buildIntExpr(b, rhs_ast, scope);
-            const value = if (op.kind == .EQ) rhs else blk: {
-                const k = compoundOp(op) orelse return error.Unsupported;
-                const lhs = try b.a.create(hir.Expr);
-                lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
-                const bx = try b.a.create(hir.Expr);
-                bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
-                break :blk bx;
-            };
-            out.* = .{ .assign = .{ .idx = loc.idx, .value = value } };
+            const rhs_ast = as.value() orelse return error.Unsupported;
+            if (scope.find(tname)) |loc| {
+                if (!loc.mutable) return reject(b, .immutable_assign); // a `let` binding or a parameter
+                // No implicit conversion: a plain `=` must assign a value of the
+                // binding's type; compound ops (`+=` …) are arithmetic and apply
+                // to numeric bindings (no `%=` on f64 — wasm has no float rem).
+                const rhs_sc = try exprScalar(b, rhs_ast, scope);
+                if (op.kind == .EQ) {
+                    if (scalarBindTy(rhs_sc) != loc.ty) return error.Unsupported;
+                } else if (loc.ty == .f64) {
+                    if (op.kind == .PERCENT_EQ or rhs_sc != .f64) return error.Unsupported;
+                } else if (loc.ty != .i64) {
+                    return error.Unsupported; // `bool += …` and the like are not arithmetic
+                }
+                const rhs = try buildIntExpr(b, rhs_ast, scope);
+                const value = if (op.kind == .EQ) rhs else blk: {
+                    const k = compoundOp(op) orelse return error.Unsupported;
+                    const lhs = try b.a.create(hir.Expr);
+                    lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                    const bx = try b.a.create(hir.Expr);
+                    bx.* = .{ .bin = .{ .kind = k, .lhs = lhs, .rhs = rhs } };
+                    break :blk bx;
+                };
+                out.* = .{ .assign = .{ .idx = loc.idx, .value = value } };
+            } else if (actorStateField(scope, tname)) |rf| {
+                // `n = …` on a bare actor-state field → a field_set on self.
+                if (rf.ty != .i64 and rf.ty != .bool and rf.ty != .f64 and rf.ty != .f32) return error.Unsupported;
+                const rhs_sc = try exprScalar(b, rhs_ast, scope);
+                if (op.kind == .EQ) {
+                    if (scalarBindTy(rhs_sc) != rf.ty) return error.Unsupported;
+                } else if (rf.ty != .i64) {
+                    return error.Unsupported;
+                }
+                const rhs = try buildIntExpr(b, rhs_ast, scope);
+                const value = if (op.kind == .EQ) rhs else blk: {
+                    const k = compoundOp(op) orelse return error.Unsupported;
+                    const bx = try b.a.create(hir.Expr);
+                    bx.* = .{ .bin = .{ .kind = k, .lhs = try recFieldExpr(b, rf), .rhs = rhs } };
+                    break :blk bx;
+                };
+                const base = try b.a.create(hir.Expr);
+                base.* = .{ .local = .{ .idx = rf.base_idx, .ty = .ptr } };
+                out.* = .{ .field_set = .{ .base = base, .offset = rf.offset, .ty = rf.ty, .value = value } };
+            } else return error.Unsupported;
         },
         .if_stmt => |is| return buildIfStmtNode(b, is, scope),
         .match_stmt => |ms| return buildIntMatch(b, ms, scope),
@@ -6590,6 +6768,9 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             } else if (try findRecField(scope, txt)) |rf| {
                 // `p.x` on a materialized record: a load at (base ptr, offset).
                 return recFieldExpr(b, rf);
+            } else if (actorStateField(scope, txt)) |rf| {
+                // A bare actor-state field (`n` in a handler → `self.n`).
+                return recFieldExpr(b, rf);
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
             } else if (enumVariantTag(b, txt)) |ev| {
@@ -6775,8 +6956,10 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 if (std.mem.indexOfScalar(u8, mname, '.') == null) {
                     if (scope.recs.get(head)) |si| {
                         const loc = scope.find(head) orelse return error.Unsupported;
+                        // A fit method, or an actor's value handler (`c.get()`).
                         const fid = (try registerFitMethod(b, si, mname)) orelse
-                            return reject(b, .name_not_found); // no fit declares it
+                            (try registerActorHandler(b, si, mname)) orelse
+                            return reject(b, .name_not_found);
                         switch (b.funcs.items[fid].ret) {
                             .i64, .bool, .f64, .f32 => {},
                             else => return reject(b, .unsupported_call),
@@ -8042,6 +8225,31 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\}
         \\
     )) == null);
+}
+
+test "actors v0: handlers lower to self-taking functions; tell/ask dispatch" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor Counter {
+        \\    state n: i64 = 0
+        \\    handle bump() { n = n + 1 }
+        \\    handle get() -> i64 { n }
+        \\}
+        \\fn main {
+        \\    var c = Counter { n: 0 }
+        \\    c.bump()
+        \\    env.out(c.get())
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // bump is a void handler (field_set on self); get returns i64.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.bump -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.get -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_set") != null);
 }
 
 test "pipe operator: x |> f(args) lowers to f(x, args), chains left-assoc" {
