@@ -233,9 +233,28 @@ function renderSpec() {
       return `](/spec/${name === 'README' ? '' : name}${hash || ''})`;
     });
     const out = slug === 'README' ? 'index' : slug;
-    write(join(specOutDir, `${out}.md`), `${frontmatter(title, `q64 spec: ${title}`)}<!-- AUTO-GENERATED from /spec/${f} — do not edit. -->\n\n${body}`);
+    // Embed the live qview demo on the reactivity page (spec prose stays clean;
+    // the embed is injected here and regenerates with the docs).
+    const demo = slug === 'reactivity' ? SPEC_DEMOS.reactivity : '';
+    write(join(specOutDir, `${out}.md`), `${frontmatter(title, `q64 spec: ${title}`)}<!-- AUTO-GENERATED from /spec/${f} — do not edit. -->\n\n${demo}${body}`);
   }
 }
+
+// Interactive embeds injected into specific spec pages. Raw HTML passes through
+// Starlight's markdown renderer. The demo is the deployed qview app on q64.dev.
+const SPEC_DEMOS = {
+  reactivity: `:::tip[Live demo]
+A Q64 program compiled to wasm, drawing through the \`qview\` host face below —
+the same artifact runs native (\`qube run\`) or embedded like this.
+
+<iframe src="https://q64.dev/play/" title="Q64 qview live demo" loading="lazy"
+  style="display:block;width:100%;height:540px;border:0;border-radius:12px;background:#0a0c12;margin:.5rem 0"></iframe>
+
+[Open full screen ↗](https://q64.dev/play/)
+:::
+
+`,
+};
 
 // ---------------------------------------------------------------------------
 // llms.txt + llms-full.txt
