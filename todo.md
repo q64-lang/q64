@@ -377,8 +377,11 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         Runs wasm64 + wasm32. **Default construction `Counter {}`** fills each
         unspecified state field with its `state … = <default>` value (in
         `buildRecExpr`'s record arm, from `b.actor_decls`); partial literals
-        fill the rest. (Void handlers in callee bodies and `ask` suspension are
-        follow-ons.)
+        fill the rest. **Callee-position `tell`/`send`** now work too:
+        `buildVoidExprStmt` routes a dotted void call through `tryChannelSend` /
+        `tryActorTell`, so `fn work(c: C) { c.bump() }` mutates the shared actor
+        (pass-by-reference) — `work(c); c.bump(); c.get()` → 7. (`ask`
+        suspension is the remaining follow-on.)
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3 — STARTED.**
   - [x] **Structured `graph` declarations** (parsing). `parseGraphDecl`

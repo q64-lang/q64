@@ -2302,6 +2302,16 @@ fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.Array
         try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
         return;
     }
+    // `ch.send(x)` on a channel binding (vec_push), and `c.bump()` — an actor
+    // void handler (tell) — both dispatch on a record/channel binding.
+    if (try tryChannelSend(b, call, scope)) |st| {
+        try out.append(b.a, st);
+        return;
+    }
+    if (try tryActorTell(b, call, scope)) |st| {
+        try out.append(b.a, st);
+        return;
+    }
     // A statement-position call to another void procedure; its result (there
     // is none) is discarded. A value-returning call here is rejected — nothing
     // may be left on the stack (lower.zig enforces the same on `.expr`).
@@ -8396,6 +8406,24 @@ test "actors v0: handlers lower to self-taking functions; tell/ask dispatch" {
     try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.bump -> void") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.get -> i64") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "field_set") != null);
+
+    // An actor passed to a callee mutates the shared state (tell in a callee).
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    var m2 = (try buildLocal(testing.allocator, &tr2,
+        \\actor C { state n: i64 = 0
+        \\    handle bump() { n = n + 1 }
+        \\    handle get() -> i64 { n }
+        \\}
+        \\fn work(c: C) { c.bump() }
+        \\fn main {
+        \\    var c = C {}
+        \\    work(c)
+        \\    env.out(c.get())
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    m2.deinit();
 }
 
 test "pipe operator: x |> f(args) lowers to f(x, args), chains left-assoc" {
