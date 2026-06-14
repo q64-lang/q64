@@ -2376,6 +2376,29 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/101/parent/102/100/done (wasm64 + wasm32; eager-at-spawn, tasks see scope locals)"
 
+echo "==> pipe operator |>: x |> f(args) ≡ f(x, args) (chains, f64)"
+pip_app="$tmp/pipe.q"
+cat > "$pip_app" <<'Q64'
+fn dbl(n: i64) -> i64 { n * 2 }
+fn inc(n: i64) -> i64 { n + 1 }
+fn add(a: i64, b: i64) -> i64 { a + b }
+fn half(x: f64) -> f64 { x / 2.0 }
+fn main {
+    env.out(5 |> dbl |> inc)
+    env.out(10 |> add(5))
+    env.out(3 |> dbl |> add(100) |> inc)
+    env.out(9.0 |> half)
+}
+Q64
+pip_expected=$'11\n15\n107\n4.5'
+"$Q64_BIN" emit "$pip_app" "$tmp/pipe.wasm"
+pip_out="$("$HOST_BIN" "$tmp/pipe.wasm")"
+[[ "$pip_out" == "$pip_expected" ]] || { echo "FAIL: pipe (got: $pip_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$pip_app" "$tmp/pipe32.wasm" --addr wasm32
+pip32_out="$("$HOST_BIN" "$tmp/pipe32.wasm")"
+[[ "$pip32_out" == "$pip_expected" ]] || { echo "FAIL: pipe wasm32 (got: $pip32_out)" >&2; exit 1; }
+echo "    ok: pipe |> -> 11/15/107/4.5 (wasm64 + wasm32; chains, prepended args, f64 stage)"
+
 echo "==> select v0: first-ready-wins over channel recv arms"
 sel_app="$tmp/select.q"
 cat > "$sel_app" <<'Q64'

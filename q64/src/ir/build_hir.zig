@@ -5638,6 +5638,7 @@ fn exprScalar(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!sema.e
         .localType = ExprTypeBridge.localType,
         .callRet = ExprTypeBridge.callRet,
         .fieldType = ExprTypeBridge.fieldType,
+        .fnRet = ExprTypeBridge.fnRet,
     });
 }
 
@@ -5969,6 +5970,26 @@ const ExprTypeBridge = struct {
             .f32 => .f32,
             .u8, .i8, .u16, .i16, .u32, .i32 => .narrow_int,
             else => .unknown,
+        };
+    }
+
+    fn fnRet(ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOfScalar(u8, name, '.') != null) return null;
+        if (castTarget(name)) |ct| return switch (ct) {
+            .f32 => .f32,
+            .f64 => .f64,
+            else => .i64,
+        };
+        const fd = self.b.resolver.lookup(name) orelse return null;
+        const rt = (fnRetScalar(self.b, fd) catch return null) orelse return null;
+        return switch (rt) {
+            .i64 => .i64,
+            .f64 => .f64,
+            .f32 => .f32,
+            .bool => .bool,
+            .str => .str,
+            else => null,
         };
     }
 
@@ -6633,6 +6654,36 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             } else {
                 const kind = binKind(op_tok) orelse return error.Unsupported;
                 out.* = .{ .bin = .{ .kind = kind, .lhs = lhs, .rhs = rhs } };
+            }
+        },
+        .pipe => |pe| {
+            // `lhs |> f(args)` ≡ `f(lhs, args)`: the piped value becomes the
+            // first argument. `lhs |> f` (bare path) is `f(lhs)`. Chains are
+            // left-associative, so `x |> a |> b` is `b(a(x))` naturally.
+            const lhs = pe.lhs() orelse return error.Unsupported;
+            const rhs = pe.rhs() orelse return error.Unsupported;
+            const lval = try buildIntExpr(b, lhs, scope);
+            switch (rhs) {
+                .call => |rc| {
+                    const fname = (callPathName(b, rc)) orelse return error.Unsupported;
+                    defer b.a.free(fname);
+                    if (std.mem.indexOfScalar(u8, fname, '.') != null) return error.Unsupported; // method targets: later
+                    if (b.resolver.lookup(fname) == null) return reject(b, .name_not_found);
+                    const id = try registerFunc(b, fname);
+                    out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, rc.args(), scope, lval) } };
+                    return out;
+                },
+                .path => |p| {
+                    const fname = try p.text(b.a);
+                    defer b.a.free(fname);
+                    if (std.mem.indexOfScalar(u8, fname, '.') != null) return error.Unsupported;
+                    if (b.resolver.lookup(fname) == null) return reject(b, .name_not_found);
+                    const id = try registerFunc(b, fname);
+                    const empty = ast.ArgIter{ .children = &.{} };
+                    out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, empty, scope, lval) } };
+                    return out;
+                },
+                else => return error.Unsupported,
             }
         },
         .call => |cc| {
@@ -7988,6 +8039,35 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\fn main {
         \\    let t = (3, 4)
         \\    env.out(t.2)
+        \\}
+        \\
+    )) == null);
+}
+
+test "pipe operator: x |> f(args) lowers to f(x, args), chains left-assoc" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn dbl(n: i64) -> i64 { n * 2 }
+        \\fn add(a: i64, b: i64) -> i64 { a + b }
+        \\fn main {
+        \\    env.out(3 |> dbl |> add(100))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Both stages become ordinary calls; the piped value is the first arg.
+    try testing.expect(std.mem.indexOf(u8, dump, "call") != null);
+
+    // A pipe into a non-function rejects honestly.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try testing.expect((try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    let x = 5
+        \\    env.out(3 |> x)
         \\}
         \\
     )) == null);

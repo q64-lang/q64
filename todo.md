@@ -342,6 +342,17 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         wasm32 (`100 / 7`). **Still needs the scheduler:** parking when no arm
         is ready, and `send` arms / send-on-full.
 
+  - [x] **Pipe operator `|>`** (lowering). `lhs |> f(args)` ≡ `f(lhs, args)` —
+        the piped value becomes the first argument (reusing `buildCallArgs`'s
+        receiver slot); `lhs |> f` (bare path) is `f(lhs)`; chains are
+        left-associative so `x |> a |> b` is `b(a(x))`. Typed via a new
+        `Env.fnRet` callback (return type by function name) so an f64 path stage
+        (`9.0 |> half`) formats correctly. `5 |> dbl |> inc` → 11, `10 |>
+        add(5)` → 15, `3 |> dbl |> add(100) |> inc` → 107, `9.0 |> half` → 4.5.
+        Runs wasm64 + wasm32. (Method-call pipe targets `x |> r.m()` are a
+        follow-on; this is the function-pipe used across the corpus and the core
+        of the stream `|>` syntax.)
+
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream
 sampling semantics. The STR0xx diagnostics already guard the front end;

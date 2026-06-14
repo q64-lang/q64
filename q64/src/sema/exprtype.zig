@@ -50,6 +50,10 @@ pub const Env = struct {
     /// expression (`expr.field`, `t.0`). `null` when `base` isn't a record
     /// the caller can resolve, or the field/slot isn't a scalar.
     fieldType: *const fn (ctx: *anyopaque, base: ast.Expr, field: []const u8) std.mem.Allocator.Error!?ScalarType,
+    /// Scalar return type of a named function (no call expression) — used to
+    /// type a bare-path pipe stage (`x |> f`). `null` when not a known scalar
+    /// function.
+    fnRet: *const fn (ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?ScalarType,
 };
 
 /// Scalar type of `expr` under `env`. Total: anything outside the floor
@@ -71,6 +75,21 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
         },
         .string_lit => return .str,
         .paren => |p| return scalarOf(gpa, p.inner() orelse return .unknown, env),
+        .pipe => |pe| {
+            // `lhs |> f(args)` types as `f`'s return. When the stage is a call
+            // (`add(5)`) that's `callRet`; a bare path stage isn't a local, so
+            // it stays unknown (the i64 default covers the common case).
+            const rhs = pe.rhs() orelse return .unknown;
+            return switch (rhs) {
+                .call => try scalarOf(gpa, rhs, env),
+                .path => |p| blk: {
+                    const name = p.text(gpa) catch break :blk .unknown;
+                    defer gpa.free(name);
+                    break :blk (try env.fnRet(env.ctx, name)) orelse .unknown;
+                },
+                else => .unknown,
+            };
+        },
         .unary => |u| {
             const op = u.op() orelse return .unknown;
             return switch (op.kind) {
@@ -202,9 +221,14 @@ const TestEnv = struct {
     fn fieldType(_: *anyopaque, _: ast.Expr, _: []const u8) std.mem.Allocator.Error!?ScalarType {
         return null;
     }
+    fn fnRet(_: *anyopaque, name: []const u8) std.mem.Allocator.Error!?ScalarType {
+        if (std.mem.eql(u8, name, "count")) return .i64;
+        if (std.mem.eql(u8, name, "greet")) return .str;
+        return null;
+    }
     var dummy: u8 = 0;
     fn env() Env {
-        return .{ .ctx = @ptrCast(&dummy), .localType = localType, .callRet = callRet, .fieldType = fieldType };
+        return .{ .ctx = @ptrCast(&dummy), .localType = localType, .callRet = callRet, .fieldType = fieldType, .fnRet = fnRet };
     }
 };
 
