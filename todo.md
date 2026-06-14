@@ -288,6 +288,11 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         `spawn scope` sugar, and scope/spawn in callee/void bodies (v0 is
         main-position). A spawn referencing a not-yet-declared scope local is
         caught by `resolve` (lexical order) before the hoist.
+  - [x] **`scope`/`spawn` in callee (void) bodies.** `buildVoidScopeStmt`
+        mirrors the main-position lowering through `buildVoidStmt`, so a `fn
+        worker() { scope { spawn … } }` runs its tasks at the per-call join.
+        `worker(1); worker(2)` → `1/10/100/2/20/200`. Runs wasm64 + wasm32.
+        (Value-callee `scope` and `spawn scope` sugar remain follow-ons.)
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

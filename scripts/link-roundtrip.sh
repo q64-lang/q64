@@ -2376,4 +2376,28 @@ sco32_out="$("$HOST_BIN" "$tmp/scope32.wasm")"
 [[ "$sco32_out" == "$sco_expected" ]] || { echo "FAIL: scope/spawn wasm32 (got: $sco32_out)" >&2; exit 1; }
 echo "    ok: scope/spawn -> start/parent/101/102/100/done (wasm64 + wasm32; tasks run at join, see scope locals)"
 
+echo "==> structured concurrency v0: scope/spawn inside a callee (void proc)"
+cwk_app="$tmp/calleescope.q"
+cat > "$cwk_app" <<'Q64'
+fn worker(id: i64) {
+    scope {
+        spawn { env.out(id * 10) }
+        env.out(id)
+        spawn { env.out(id * 100) }
+    }
+}
+fn main {
+    worker(1)
+    worker(2)
+}
+Q64
+cwk_expected=$'1\n10\n100\n2\n20\n200'
+"$Q64_BIN" emit "$cwk_app" "$tmp/calleescope.wasm"
+cwk_out="$("$HOST_BIN" "$tmp/calleescope.wasm")"
+[[ "$cwk_out" == "$cwk_expected" ]] || { echo "FAIL: callee scope/spawn (got: $cwk_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$cwk_app" "$tmp/calleescope32.wasm" --addr wasm32
+cwk32_out="$("$HOST_BIN" "$tmp/calleescope32.wasm")"
+[[ "$cwk32_out" == "$cwk_expected" ]] || { echo "FAIL: callee scope/spawn wasm32 (got: $cwk32_out)" >&2; exit 1; }
+echo "    ok: callee scope/spawn -> 1/10/100/2/20/200 (wasm64 + wasm32; per-call join)"
+
 echo "PASS: $qube_out"

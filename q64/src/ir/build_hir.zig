@@ -2097,7 +2097,31 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
         // `let`/`var` bindings and reassignment carry no side effects of their
         // own — the value-callee statement builder handles them identically.
         .let_stmt, .assign_stmt, .break_stmt, .continue_stmt => try out.append(b.a, try buildIntStmt(b, stmt, scope)),
+        .scope_stmt => |ss| try buildVoidScopeStmt(b, ss, scope, out),
         else => return error.Unsupported,
+    }
+}
+
+/// `scope { … }` in a void procedure — the callee analogue of
+/// `buildScopeStmt`. Same cooperative-floor lowering (parent flow first,
+/// spawned task bodies hoisted to the join), routed through `buildVoidStmt`.
+fn buildVoidScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    var carms = ss.catchArms();
+    if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
+    const blk = ss.block() orelse return error.Unsupported;
+    var deferred: std.ArrayList(ast.Block) = .empty;
+    defer deferred.deinit(b.a);
+    var it = blk.statements();
+    while (it.next()) |stmt| {
+        if (spawnBody(stmt)) |body| {
+            try deferred.append(b.a, body);
+        } else {
+            try buildVoidStmt(b, stmt, scope, out);
+        }
+    }
+    for (deferred.items) |body| {
+        var bit = body.statements();
+        while (bit.next()) |bstmt| try buildVoidStmt(b, bstmt, scope, out);
     }
 }
 
