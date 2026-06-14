@@ -302,10 +302,12 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         `buildIntExpr`'s `.call` arm and the `callRet`/`scalarOf` typing bridge
         (result type = receiver type, so f64 handles stay f64). `let h1 = spawn
         { compute(6) }; … h1.await() + h2.await()` → 85; an f64 handle → 4.5.
-        Runs wasm64 + wasm32. **The genuine CPS/state-machine transform is only
-        needed for task-*internal* suspension** (a task that awaits mid-body) —
-        that's the next slice, along with multi-statement task bodies (value-
-        block lowering), record/str handle results, and `select`/`channel`.
+        Runs wasm64 + wasm32. Multi-statement task bodies lower as a value
+        block (leading statements for effect, tail = handle value): `let h =
+        spawn { let x=10\n let y=20\n x+y }` → 30. **The genuine CPS/state-
+        machine transform is only needed for task-*internal* suspension** (a
+        task that awaits mid-body) — that's the next slice, along with record/
+        str handle results, `spawn scope` sugar, and `select`/`channel`.
 
 **Phase 4 — Streams / dataflow runtime — builds on Phase 3.** The graph
 scheduler (stages as tasks), the `|>` pipe runtime, and Signal/Event/Stream

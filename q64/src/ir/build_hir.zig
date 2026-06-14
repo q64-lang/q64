@@ -428,7 +428,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             // floor (non-suspending tasks), the task runs to completion eagerly
             // and the handle holds its result; `h.await()` reads it.
             if (init_expr == .spawn) {
-                return buildSpawnLet(b, init_expr.spawn, nm, ls.isVar(), scope, out);
+                return buildSpawnLet(b, init_expr.spawn, nm, ls.isVar(), scope, rt, out);
             }
             // An immutable `let` whose initializer const-folds (incl. a
             // const-bodied call, e.g. `let v = version()`) becomes a
@@ -799,27 +799,26 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
     }
 }
 
-/// A block that is a single expression statement, that expression. Used for
-/// the v0 `spawn { e }` task body (multi-statement task bodies are a later
-/// slice — they need a value-block lowering).
-fn soleExpr(blk: ast.Block) ?ast.Expr {
-    var it = blk.statements();
-    const first = it.next() orelse return null;
-    if (it.next() != null) return null;
-    return switch (first) {
-        .expr_stmt => |es| es.expression(),
-        else => null,
-    };
-}
-
-/// `let h = spawn { e }` — bind a task handle. v0 cooperative floor: a task
-/// that does not itself suspend runs to completion eagerly, so the handle is
-/// simply its result value (read back by `h.await()`). v0: a single-expression
-/// scalar body. (`spawn scope`, multi-statement bodies, and record/str results
-/// are later slices; true deferral arrives with the CPS transform.)
-fn buildSpawnLet(b: *Builder, sp: ast.SpawnExpr, nm: parser.cst.Token, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+/// `let h = spawn { stmts; tail }` — bind a task handle. v0 cooperative floor:
+/// a task that does not itself suspend runs to completion eagerly, so the
+/// handle is simply its result value (read back by `h.await()`). The body is
+/// lowered as a value block — leading statements run for effect (they may
+/// declare locals the tail reads), and the tail expression is the handle's
+/// value. (`spawn scope`, str/record results, and true deferral arrive with
+/// the CPS transform.)
+fn buildSpawnLet(b: *Builder, sp: ast.SpawnExpr, nm: parser.cst.Token, is_var: bool, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     const sbody = sp.block() orelse return error.Unsupported; // spawn scope: later
-    const e = soleExpr(sbody) orelse return error.Unsupported;
+    var stmts: std.ArrayList(ast.Stmt) = .empty;
+    defer stmts.deinit(b.a);
+    var it = sbody.statements();
+    while (it.next()) |s| try stmts.append(b.a, s);
+    if (stmts.items.len == 0) return error.Unsupported; // `spawn {}` isn't a value
+    // Leading statements run for effect; the last must be a value expression.
+    for (stmts.items[0 .. stmts.items.len - 1]) |s| try buildMainStmt(b, s, scope, rt, out);
+    const e = switch (stmts.items[stmts.items.len - 1]) {
+        .expr_stmt => |es| es.expression() orelse return error.Unsupported,
+        else => return error.Unsupported,
+    };
     const sc = try exprScalar(b, e, scope);
     if (sc == .narrow_int or sc == .str) return error.Unsupported; // str/record handles: later
     const ty = scalarBindTy(sc);
@@ -7810,17 +7809,19 @@ test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)"
     // local); `h.await()` reads the local — no separate task funcref.
     try testing.expect(std.mem.indexOf(u8, dump, "call") != null);
 
-    // A multi-statement task body needs a value-block lowering — later.
+    // A multi-statement task body is lowered as a value block (leading
+    // statements for effect, the tail expression the handle's value).
     var tr2 = TestResolver{ .a = testing.allocator };
     defer tr2.deinit();
-    try testing.expect((try buildLocal(testing.allocator, &tr2,
+    var m2 = (try buildLocal(testing.allocator, &tr2,
         \\fn main {
         \\    let h = spawn { let x = 1
         \\        x + 2 }
         \\    env.out(h.await())
         \\}
         \\
-    )) == null);
+    )) orelse return error.TestUnexpectedResult;
+    m2.deinit();
 }
 
 test "structured concurrency v0: scope hoists spawn bodies to the join" {
