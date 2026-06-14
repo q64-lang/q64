@@ -2056,6 +2056,34 @@ orp32_out="$("$HOST_BIN" "$tmp/orpat32.wasm")"
 [[ "$orp32_out" == "$orp_expected" ]] || { echo "FAIL: or-patterns wasm32 (got: $orp32_out)" >&2; exit 1; }
 echo "    ok: or-patterns -> caution / 10 / 20 (wasm64 + wasm32; enum + literal alternatives)"
 
+echo "==> tuple params + returns: -> (i64, i64), p.N, let (q, r) = divmod(..) (multi-value return)"
+tpr_app="$tmp/tupleparams.q"
+cat > "$tpr_app" <<'Q64'
+fn divmod(a: i64, b: i64) -> (i64, i64) {
+    (a / b, a % b)
+}
+fn sum2(p: (i64, i64)) -> i64 {
+    p.0 + p.1
+}
+fn main {
+    let (q, r) = divmod(17, 5)
+    env.out(q)
+    env.out(r)
+    env.out(divmod(20, 7).0)
+    let t = (8, 9)
+    env.out(sum2(t))
+    env.out(sum2((100, 23)))
+}
+Q64
+tpr_expected=$'3\n2\n2\n17\n123'
+"$Q64_BIN" emit "$tpr_app" "$tmp/tupleparams.wasm"
+tpr_out="$("$HOST_BIN" "$tmp/tupleparams.wasm")"
+[[ "$tpr_out" == "$tpr_expected" ]] || { echo "FAIL: tuple params/returns (got: $tpr_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$tpr_app" "$tmp/tupleparams32.wasm" --addr wasm32
+tpr32_out="$("$HOST_BIN" "$tmp/tupleparams32.wasm")"
+[[ "$tpr32_out" == "$tpr_expected" ]] || { echo "FAIL: tuple params/returns wasm32 (got: $tpr32_out)" >&2; exit 1; }
+echo "    ok: tuple params/returns -> 3/2/2/17/123 (wasm64 + wasm32; -> (..), p.N, multi-value return, tuple args)"
+
 echo "==> first-class tuples: let t = (..), t.N index, let (a, b) = t (value via record ABI)"
 tv_app="$tmp/tuplevals.q"
 cat > "$tv_app" <<'Q64'

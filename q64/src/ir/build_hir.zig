@@ -119,6 +119,11 @@ const Builder = struct {
     /// spec/memory.md §"Linear struct layout". Struct-typed signatures resolve
     /// against this table (v0: the compiling file's structs only).
     structs: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
+    /// Interned tuple layouts, keyed by element-type signature (e.g.
+    /// "i64,i64"). A tuple is an anonymous record; interning makes the same
+    /// tuple type share one `StructInfo` so a tuple arg matches a tuple param
+    /// by pointer (the record-arg ABI compares `si` identity).
+    tuple_sis: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
     /// This file's all-unit enum declarations (C1): a variant value is
     /// its declaration-order tag (an i64 at the compute floor).
     enums: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
@@ -3576,6 +3581,20 @@ fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInf
             const inst = try instFromOptionalInner(b, info, ot);
             return inst.si;
         },
+        .tuple => |tt| {
+            // `(i64, i64)` — an anonymous record. v0: i64 elements; the
+            // interned layout matches a tuple literal's by element signature.
+            var tys: std.ArrayList(hir.Type) = .empty;
+            defer tys.deinit(b.a);
+            var it = tt.elements();
+            while (it.next()) |et| {
+                const sc = (try semaScalar(b, et)) orelse return null;
+                if (sc != .i64) return null; // bool/float/str tuple slots: later
+                try tys.append(b.a, .i64);
+            }
+            if (tys.items.len < 2) return null;
+            return try tupleStructInfo(b, tys.items);
+        },
         else => return null,
     }
 }
@@ -4335,6 +4354,15 @@ const RecValue = struct { e: *hir.Expr, si: *const StructInfo };
 /// an anonymous record, so it reuses the whole record ABI (record_alloc,
 /// field_get/_set, `recs` dispatch). v0: i64 elements.
 fn tupleStructInfo(b: *Builder, tys: []const hir.Type) BuildError!*const StructInfo {
+    // Key by element-type signature so identical tuple types share one layout.
+    var key: std.ArrayList(u8) = .empty;
+    for (tys, 0..) |ty, i| {
+        if (i != 0) try key.append(b.a, ',');
+        try key.appendSlice(b.a, @tagName(ty));
+    }
+    const sig = try key.toOwnedSlice(b.a);
+    if (b.tuple_sis.get(sig)) |si| return si;
+
     const fields = try b.a.alloc(StructField, tys.len);
     var off: u32 = 0;
     var max_align: u32 = 1;
@@ -4352,6 +4380,7 @@ fn tupleStructInfo(b: *Builder, tys: []const hir.Type) BuildError!*const StructI
         .size = std.mem.alignForward(u32, off, max_align),
         .alignment = max_align,
     };
+    try b.tuple_sis.put(b.a, sig, si);
     return si;
 }
 
@@ -7583,6 +7612,36 @@ test "first-class tuples: literal binding, `.N` index, and destructure-from-bind
         \\}
         \\
     )) == null);
+}
+
+test "tuple params + returns: -> (i64, i64), p.N, let (q, r) = call, tuple args" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    const src =
+        \\fn divmod(a: i64, b: i64) -> (i64, i64) {
+        \\    (a / b, a % b)
+        \\}
+        \\fn sum2(p: (i64, i64)) -> i64 {
+        \\    p.0 + p.1
+        \\}
+        \\fn main {
+        \\    let (q, r) = divmod(17, 5)
+        \\    env.out(q + r)
+        \\    let t = (8, 9)
+        \\    env.out(sum2(t))
+        \\    env.out(sum2((100, 23)))
+        \\}
+        \\
+    ;
+    var mod = (try buildLocal(testing.allocator, &tr, src)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The tuple type interns to one layout, so divmod returns a 16-byte record
+    // and sum2 takes a `.ptr` — a tuple binding and a tuple literal both pass.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn divmod -> ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn sum2 -> i64") != null);
 }
 
 test "B2b: a record-returning call binds the base pointer (`fn make -> ptr`)" {

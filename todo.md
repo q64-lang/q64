@@ -201,10 +201,18 @@ needs the platform audit, so it's the highest-leverage near-term work.
           binding's fields (`let (a, b) = t`) as well as the parallel-literal
           form. v0: i64 elements, main-position bindings. An out-of-range index
           rejects. Runs wasm64 + wasm32 (roundtrip `3/4/7/12/60/16`).
-          **Next (deferred per spec / bigger):** tuple params + returns
-          (multi-value return), bool/float tuple elements, nested struct
-          destructuring beyond one level, plain struct-value `match`,
-          bool/str/narrow record-fields.
+    - [x] **Tuple params + returns** (`fn divmod(..) -> (i64, i64)`, `p: (i64,
+          i64)`): `structOfType` recognizes `TUPLE_TYPE` and synthesizes the
+          (interned) tuple `StructInfo`, so a tuple type flows through the whole
+          record param/return ABI — a `-> (i64, i64)` body whose tail is a tuple
+          literal returns a `.ptr` record, a tuple param is a `.ptr` with `p.N`
+          indexing, `let (q, r) = divmod(..)` reads the returned record, and a
+          tuple binding *or* literal passes as a tuple arg (matched by the
+          interned layout's pointer identity). True multi-value return. v0: i64
+          elements. Runs wasm64 + wasm32 (roundtrip `3/2/2/17/123`).
+          **Next (deferred per spec / bigger):** bool/float tuple elements,
+          nested struct destructuring beyond one level, plain struct-value
+          `match`, bool/str/narrow record-fields.
   - Memory reclamation — Stack discipline on the implicit arena (§"Memory reclamation").
   - **Structured parsing of the currently-raw block constructs**
     (`graph`/`scope`/`region`/`actor` bodies, leading annotations) — lets the
