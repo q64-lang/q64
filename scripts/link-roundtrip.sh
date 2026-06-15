@@ -3210,4 +3210,40 @@ tc32_out="$("$HOST_BIN" "$tmp/typedchan32.wasm")"
 [[ "$tc32_out" == "$tc_expected" ]] || { echo "FAIL: typed channel wasm32 (got: $tc32_out)" >&2; exit 1; }
 echo "    ok: typed channel -> 1/7/false (wasm64 + wasm32; channel<bool>/<i64> explicit element type + policy)"
 
+echo "==> channels: str-payload channel (boxed (ptr,len) through the cell)"
+sc_app="$tmp/strchan.q"
+cat > "$sc_app" <<'Q64'
+fn main {
+    scope {
+        let msgs = channel<str>(policy: Unbounded)
+        let done = channel()
+        spawn {
+            msgs.send("hello")
+            var w = "world"
+            msgs.send(w)
+            let _ = done.recv()
+        }
+        spawn {
+            let a = msgs.recv()
+            env.out(a)
+            let b = msgs.recv()
+            env.out(b)
+            env.out(b.len)
+            done.send(1)
+        }
+    }
+}
+Q64
+# `channel<str>` boxes each string {ptr,len} into the arena and passes the box
+# pointer through the i64 cell; recv reloads it into a real str (printable, .len).
+# A literal and a runtime (var) string. -> hello / world / 5.
+sc_expected=$'hello\nworld\n5'
+"$Q64_BIN" emit "$sc_app" "$tmp/strchan.wasm"
+sc_out="$("$HOST_BIN" "$tmp/strchan.wasm")"
+[[ "$sc_out" == "$sc_expected" ]] || { echo "FAIL: str channel (got: $sc_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$sc_app" "$tmp/strchan32.wasm" --addr wasm32
+sc32_out="$("$HOST_BIN" "$tmp/strchan32.wasm")"
+[[ "$sc32_out" == "$sc_expected" ]] || { echo "FAIL: str channel wasm32 (got: $sc32_out)" >&2; exit 1; }
+echo "    ok: str channel -> hello/world/5 (wasm64 + wasm32; boxed (ptr,len), recv'd str printable + .len)"
+
 echo "PASS: $qube_out"

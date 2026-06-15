@@ -1361,6 +1361,9 @@ const Lowerer = struct {
                 const from = src.ty;
                 const to = n.ty;
                 if (from == to) return x;
+                // An address-width pointer widening to the i64 cell of a str
+                // channel box (identity on wasm64, zero-extend on wasm32).
+                if (to == .i64 and from == .ptr) return self.toI64(x);
                 const op: c.BinaryenOp = switch (to) {
                     .f64 => switch (from) {
                         .f32 => c.BinaryenPromoteFloat32(),

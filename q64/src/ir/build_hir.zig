@@ -1618,7 +1618,8 @@ fn channelElemType(cc: ast.CallExpr) ?hir.Type {
                     if (std.mem.eql(u8, t.text, "f64")) return .f64;
                     if (std.mem.eql(u8, t.text, "f32")) return .f32;
                     if (std.mem.eql(u8, t.text, "i64")) return .i64;
-                    return null; // str/record/other T: later (boxed storage)
+                    if (std.mem.eql(u8, t.text, "str")) return .str;
+                    return null; // record/other T: later (boxed storage)
                 },
                 .node => {},
             };
@@ -6373,11 +6374,28 @@ fn tryChannelSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*h
     if (ait.next() != null) return error.Unsupported; // v0: one value per send
     const vref = try b.a.create(hir.Expr);
     vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-    // Conform the sent value to the i64 buffer cell. A bool (i32) widens with an
+    const elem = scope.chan_elem.get(head);
+    // A str channel boxes the value: the (ptr, len) is stored in a 2-cell
+    // {ptr@0, len@8} arena box (`record_alloc` with a str init) and the box's
+    // pointer is widened to the i64 cell. recv reads the box back into a str.
+    if (elem) |et| {
+        if (et == .str) {
+            const sval = try buildStrExpr(b, a0, scope, null);
+            const sinits = try b.a.dupe(hir.StrFieldInit, &.{.{ .offset = 0, .value = sval }});
+            const box = try b.a.create(hir.Expr);
+            box.* = .{ .record_alloc = .{ .size = 16, .alignment = 8, .inits = &.{}, .str_inits = sinits } };
+            const widened = try b.a.create(hir.Expr);
+            widened.* = .{ .num_cast = .{ .to = .i64, .value = box } };
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .vec_push = .{ .vec = vref, .value = widened } };
+            return st;
+        }
+    }
+    // A scalar value conforms to the i64 buffer cell: a bool (i32) widens with an
     // `i64(...)` cast; an f64 is **bit-reinterpreted** to i64 (raw bits kept), so
     // `__vec_push` (which takes i64) typechecks either way.
     var value = try buildIntExpr(b, a0, scope);
-    if (scope.chan_elem.get(head)) |et| {
+    if (elem) |et| {
         if (et == .bool) {
             const cast = try b.a.create(hir.Expr);
             cast.* = .{ .num_cast = .{ .to = .i64, .value = value } };
@@ -6410,6 +6428,7 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
     // the cursor) without binding. Reading the value has no side effect, so the
     // `vec_get` is simply skipped.
     if (!std.mem.eql(u8, name, "_")) {
+        const elem: hir.Type = scope.chan_elem.get(head) orelse .i64;
         // v = buf[cursor]
         const vref = try b.a.create(hir.Expr);
         vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
@@ -6417,27 +6436,49 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
         curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
         const get = try b.a.create(hir.Expr);
         get.* = .{ .vec_get = .{ .vec = vref, .idx = curref } };
-        // Decode the i64 cell to the channel's element type. A bool binds a
-        // `bool` (truthiness `!= 0` → i32) so `env.out` formats true/false; an
-        // f64 binds an `f64` via a bit reinterpretation (raw bits kept). The i64
-        // default binds the cell directly.
-        const elem: hir.Type = scope.chan_elem.get(head) orelse .i64;
-        var value = get;
-        if (elem == .bool) {
-            const z = try b.a.create(hir.Expr);
-            z.* = .{ .int_const = 0 };
-            const ne = try b.a.create(hir.Expr);
-            ne.* = .{ .bin = .{ .kind = .ne, .lhs = get, .rhs = z } };
-            value = ne;
-        } else if (elem == .f64) {
-            const bc = try b.a.create(hir.Expr);
-            bc.* = .{ .bitcast = .{ .to = .f64, .value = get } };
-            value = bc;
+        if (elem == .str) {
+            // The cell is the str box pointer (widened). Narrow it, stash it in a
+            // temp, then load (ptr, len) from {ptr@0, len@8} into a str binding.
+            const boxp = try b.a.create(hir.Expr);
+            boxp.* = .{ .num_cast = .{ .to = .ptr, .value = get } };
+            const box_name = try std.fmt.allocPrint(b.a, "{s}#box", .{name});
+            const box_idx = try declareBodyLocal(b, scope, box_name, false, .ptr);
+            const boxbind = try b.a.create(hir.Stmt);
+            boxbind.* = .{ .let = .{ .idx = box_idx, .value = boxp } };
+            try out.append(b.a, boxbind);
+            const ptr_idx = try declareStrBodyLocal(b, scope, name); // ptr@idx, len@idx+1
+            for ([_]struct { idx: u32, off: u32 }{ .{ .idx = ptr_idx, .off = 0 }, .{ .idx = ptr_idx + 1, .off = 8 } }) |cell| {
+                const base = try b.a.create(hir.Expr);
+                base.* = .{ .local = .{ .idx = box_idx, .ty = .ptr } };
+                const ld = try b.a.create(hir.Expr);
+                ld.* = .{ .field_get = .{ .base = base, .offset = cell.off, .ty = .i64 } };
+                const cast = try b.a.create(hir.Expr);
+                cast.* = .{ .num_cast = .{ .to = .ptr, .value = ld } };
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .let = .{ .idx = cell.idx, .value = cast } };
+                try out.append(b.a, st);
+            }
+        } else {
+            // Decode the i64 cell to the element type: a bool binds a `bool`
+            // (truthiness `!= 0`), an f64 a bit-reinterpreted `f64`, else the i64
+            // cell directly.
+            var value = get;
+            if (elem == .bool) {
+                const z = try b.a.create(hir.Expr);
+                z.* = .{ .int_const = 0 };
+                const ne = try b.a.create(hir.Expr);
+                ne.* = .{ .bin = .{ .kind = .ne, .lhs = get, .rhs = z } };
+                value = ne;
+            } else if (elem == .f64) {
+                const bc = try b.a.create(hir.Expr);
+                bc.* = .{ .bitcast = .{ .to = .f64, .value = get } };
+                value = bc;
+            }
+            const v_idx = try declareBodyLocal(b, scope, name, mutable, elem);
+            const bind = try b.a.create(hir.Stmt);
+            bind.* = .{ .let = .{ .idx = v_idx, .value = value } };
+            try out.append(b.a, bind);
         }
-        const v_idx = try declareBodyLocal(b, scope, name, mutable, elem);
-        const bind = try b.a.create(hir.Stmt);
-        bind.* = .{ .let = .{ .idx = v_idx, .value = value } };
-        try out.append(b.a, bind);
     }
     // cursor += 1
     const curref2 = try b.a.create(hir.Expr);
@@ -10372,6 +10413,39 @@ test "channels: typed channel<T>(policy) sets the element type explicitly" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "ne 0") != null); // recv binds bool from the explicit type
     try testing.expect(std.mem.indexOf(u8, dump, "i64(") != null); // send widens the bool to the cell
+}
+
+test "channels: a str-payload channel boxes the (ptr,len) through the cell" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `channel<str>(…)` boxes each sent string into a 2-cell {ptr@0,len@8} arena
+    // box (`record_alloc` with a str init); the box pointer is widened into the
+    // i64 cell. recv narrows the cell back to the box pointer and loads the
+    // (ptr,len) into a str binding (so `env.out` prints the string).
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let msgs = channel<str>(policy: Unbounded)
+        \\        let done = channel()
+        \\        spawn {
+        \\            msgs.send("hello")
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            let a = msgs.recv()
+        \\            env.out(a)
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") != null); // the send-side str box
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null); // recv loads (ptr,len) from the box
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null); // env.out(a) prints the string
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
