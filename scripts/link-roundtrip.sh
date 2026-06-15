@@ -3330,4 +3330,39 @@ ec32_out="$("$HOST_BIN" "$tmp/enumchan32.wasm")"
 [[ "$ec32_out" == "$ec_expected" ]] || { echo "FAIL: enum channel wasm32 (got: $ec32_out)" >&2; exit 1; }
 echo "    ok: enum channel -> 42/-1 (wasm64 + wasm32; tag+payload box by pointer, match resolves after recv)"
 
+echo "==> channels: the (tx, rx) sender/receiver split (spec form)"
+tr_app="$tmp/txrx.q"
+cat > "$tr_app" <<'Q64'
+fn main {
+    scope {
+        let (tx, rx) = channel<i64>(policy: Backpressure, capacity: 2)
+        spawn {
+            var i = 1
+            loop {
+                tx.send(i)
+                if i == 4 { break }
+                i = i + 1
+            }
+        }
+        spawn {
+            loop {
+                let v = rx.recv()
+                env.out(v)
+                if v == 4 { break }
+            }
+        }
+    }
+}
+Q64
+# The spec's split form: tx (sender) and rx (receiver) alias one bounded buffer.
+# capacity 2 with 4 items exercises backpressure through the shared cursor. -> 1 2 3 4.
+tr_expected=$'1\n2\n3\n4'
+"$Q64_BIN" emit "$tr_app" "$tmp/txrx.wasm"
+tr_out="$("$HOST_BIN" "$tmp/txrx.wasm")"
+[[ "$tr_out" == "$tr_expected" ]] || { echo "FAIL: (tx, rx) split (got: $tr_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$tr_app" "$tmp/txrx32.wasm" --addr wasm32
+tr32_out="$("$HOST_BIN" "$tmp/txrx32.wasm")"
+[[ "$tr32_out" == "$tr_expected" ]] || { echo "FAIL: (tx, rx) split wasm32 (got: $tr32_out)" >&2; exit 1; }
+echo "    ok: (tx, rx) split -> 1/2/3/4 (wasm64 + wasm32; shared bounded buffer, backpressure across the split)"
+
 echo "PASS: $qube_out"

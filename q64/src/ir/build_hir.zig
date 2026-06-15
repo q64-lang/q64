@@ -369,6 +369,22 @@ fn buildTupleDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, sco
     }
     if (names.items.len == 0) return error.Unsupported;
 
+    // `let (tx, rx) = channel<T>(…)` — the spec's split channel form. Build one
+    // channel under the sender name and alias the receiver onto the same
+    // buffer+cursor (both drive one FIFO; `tx.send` / `rx.recv`).
+    if (names.items.len == 2) {
+        if (init_expr == .call) {
+            if (callPathName(b, init_expr.call)) |cn| {
+                defer b.a.free(cn);
+                if (std.mem.eql(u8, cn, "channel")) {
+                    if (!try tryChannelNew(b, init_expr, names.items[0], isVar, scope, out)) return error.Unsupported;
+                    try aliasChannel(b, scope, names.items[0], names.items[1]);
+                    return;
+                }
+            }
+        }
+    }
+
     switch (init_expr) {
         // `let (a, b) = (e1, e2)` — parallel binding straight from the literal
         // (no tuple value materialized).
@@ -1112,6 +1128,15 @@ const RecvStep = struct { chan: []const u8, name: []const u8, call: ast.Expr };
 
 /// `let x = channel(...)` → the binding name (a stable, source-lived slice).
 fn channelDeclName(b: *Builder, stmt: ast.Stmt) ?[]const u8 {
+    return (channelDeclNames(b, stmt) orelse return null).a;
+}
+
+/// The binding name(s) a `channel(…)` decl introduces: one for `let ch =
+/// channel(…)`, or two for the spec's split form `let (tx, rx) = channel(…)`
+/// (sender + receiver, both aliasing one buffer). Null if `stmt` isn't a
+/// channel decl. v0 tuple form: exactly two ident binders.
+const ChanNames = struct { a: []const u8, b: ?[]const u8 = null };
+fn channelDeclNames(b: *Builder, stmt: ast.Stmt) ?ChanNames {
     const ls = switch (stmt) {
         .let_stmt => |x| x,
         else => return null,
@@ -1125,8 +1150,19 @@ fn channelDeclName(b: *Builder, stmt: ast.Stmt) ?[]const u8 {
     defer b.a.free(cn);
     if (!std.mem.eql(u8, cn, "channel")) return null;
     const pat = ls.pattern() orelse return null;
+    if (pat.kind() == .TUPLE_PATTERN) {
+        var pit = ast.PatternIter{ .children = pat.cst.children };
+        const p0 = pit.next() orelse return null;
+        if (p0.kind() != .IDENT_PATTERN) return null;
+        const n0 = (p0.bindingName() orelse return null).text;
+        const p1 = pit.next() orelse return null;
+        if (p1.kind() != .IDENT_PATTERN) return null;
+        const n1 = (p1.bindingName() orelse return null).text;
+        if (pit.next() != null) return null; // only the 2-tuple (tx, rx) form
+        return .{ .a = n0, .b = n1 };
+    }
     const nm = pat.bindingName() orelse return null;
-    return nm.text;
+    return .{ .a = nm.text, .b = null };
 }
 
 /// A `recv` on a channel in `chans` — `let v = ch.recv()`, the discard form
@@ -1220,7 +1256,10 @@ fn inferChannelTypes(b: *Builder, blk: ast.Block, scope: *Scope) BuildError!void
     defer chans.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
-        if (channelDeclName(b, stmt)) |nm| try chans.put(b.a, nm, {});
+        if (channelDeclNames(b, stmt)) |cn| {
+            try chans.put(b.a, cn.a, {});
+            if (cn.b) |second| try chans.put(b.a, second, {});
+        }
     }
     if (chans.count() == 0) return;
     it = blk.statements();
@@ -1510,9 +1549,14 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
     defer actors.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
-        if (channelDeclName(b, stmt)) |nm| {
-            chans.put(b.a, nm, {}) catch return false;
-            if (channelDeclCap(b, stmt) != null) bounded.put(b.a, nm, {}) catch return false;
+        if (channelDeclNames(b, stmt)) |cn| {
+            const capped = channelDeclCap(b, stmt) != null;
+            chans.put(b.a, cn.a, {}) catch return false;
+            if (capped) bounded.put(b.a, cn.a, {}) catch return false;
+            if (cn.b) |second| {
+                chans.put(b.a, second, {}) catch return false;
+                if (capped) bounded.put(b.a, second, {}) catch return false;
+            }
         } else if (actorBindingOf(b, stmt)) |nm| {
             // Actor instances are built (a state record) only in `main`-position
             // scopes — the callee scheduler can't build records yet (v0).
@@ -1961,7 +2005,10 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
     {
         var it = blk.statements();
         while (it.next()) |stmt| {
-            if (channelDeclName(b, stmt)) |nm| try chans.put(b.a, nm, {});
+            if (channelDeclNames(b, stmt)) |cn| {
+                try chans.put(b.a, cn.a, {});
+                if (cn.b) |second| try chans.put(b.a, second, {});
+            }
         }
     }
     // Emit the setup (channel decls) in order; collect the spawned task bodies.
@@ -1972,14 +2019,11 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
         while (it.next()) |stmt| {
             if (spawnExprOf(stmt)) |sp| {
                 try tasks.append(b.a, sp.block() orelse return error.Unsupported);
-            } else if (channelDeclName(b, stmt)) |_| {
-                // A channel decl: build it directly via `tryChannelNew` so the
-                // scheduler is builder-agnostic — it runs in `main` and in callee
-                // (void) bodies alike (the main/void statement builders differ).
-                const ls = stmt.let_stmt;
-                const init = ls.initializer() orelse return error.Unsupported;
-                const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
-                if (!try tryChannelNew(b, init, nm.text, ls.isVar(), scope, out)) return error.Unsupported;
+            } else if (try buildChannelDecl(b, stmt, scope, out)) {
+                // A channel decl (single `let ch = …` or split `let (tx, rx) = …`),
+                // built directly so the scheduler is builder-agnostic — it runs in
+                // `main` and in callee (void) bodies alike (the main/void statement
+                // builders differ).
             } else {
                 // An actor-instance construct (`let acc = Actor {}`): build the
                 // state record via the full statement builder (records are
@@ -6326,6 +6370,35 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
 /// i64 read cursor: `send` pushes, `recv` reads `buf[cursor]` then bumps the
 /// cursor (FIFO). v0 has no suspension (producer-before-consumer ordering, and
 /// capacity ≥ messages); suspend-on-empty/full arrives with the scheduler.
+/// Alias `to` onto the channel `from` — the `(tx, rx)` split, where the sender
+/// and receiver share one buffer + cursor. Adds a scope entry for `to` at
+/// `from`'s buffer local (no new local is allocated) and copies the channel's
+/// bookkeeping (cursor, capacity, and element/record/enum payload type) under
+/// `to`, so `tx.send` and `rx.recv` drive the same FIFO.
+fn aliasChannel(b: *Builder, scope: *Scope, from: []const u8, to: []const u8) BuildError!void {
+    const buf = scope.find(from) orelse return error.Unsupported;
+    try scope.locals.append(b.a, .{ .name = to, .idx = buf.idx, .mutable = buf.mutable, .ty = .ptr });
+    try scope.vecs.put(b.a, to, {});
+    if (scope.chans.get(from)) |cur| try scope.chans.put(b.a, to, cur);
+    if (scope.chan_caps.get(from)) |c| try scope.chan_caps.put(b.a, to, c);
+    if (scope.chan_elem.get(from)) |e| try scope.chan_elem.put(b.a, to, e);
+    if (scope.chan_rec.get(from)) |r| try scope.chan_rec.put(b.a, to, r);
+    if (scope.chan_enum.get(from)) |en| try scope.chan_enum.put(b.a, to, en);
+}
+
+/// Build a channel decl — single (`let ch = channel(…)`) or split (`let (tx, rx)
+/// = channel(…)`, where `rx` aliases `tx`'s buffer+cursor). Returns false if
+/// `stmt` isn't a channel decl. Shared by the scheduler and static paths so both
+/// see the same construction.
+fn buildChannelDecl(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const names = channelDeclNames(b, stmt) orelse return false;
+    const ls = stmt.let_stmt;
+    const init = ls.initializer() orelse return error.Unsupported;
+    if (!try tryChannelNew(b, init, names.a, ls.isVar(), scope, out)) return error.Unsupported;
+    if (names.b) |second| try aliasChannel(b, scope, names.a, second);
+    return true;
+}
+
 fn tryChannelNew(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
     const cc = switch (init_expr) {
         .call => |x| x,
@@ -10572,6 +10645,44 @@ test "channels: an enum-payload channel passes the box pointer and matches after
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "i64(record_alloc") != null); // sent enum box's base pointer, widened
     try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null); // match reads the tag/payload after recv
+}
+
+test "channels: the (tx, rx) split aliases one buffer (tx sends, rx receives)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `let (tx, rx) = channel<T>(…)` — the spec's split form. Both names alias one
+    // buffer + cursor, so `tx.send` and `rx.recv` drive the same FIFO. Only one
+    // `vec_new` is emitted (the shared buffer); the producer pushes, the consumer
+    // reads through the same local.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let (tx, rx) = channel<i64>(policy: Unbounded)
+        \\        let done = channel()
+        \\        spawn {
+        \\            tx.send(10)
+        \\            tx.send(20)
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            let a = rx.recv()
+        \\            let b = rx.recv()
+        \\            env.out(a + b)
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Exactly two vec_new: the (tx, rx) channel's shared buffer + the `done`
+    // channel — not three (tx and rx do NOT each get their own buffer).
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, dump, i, "vec_new")) |p| : (i = p + 1) n += 1;
+    try testing.expectEqual(@as(usize, 2), n);
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

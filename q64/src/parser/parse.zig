@@ -2815,6 +2815,9 @@ test "round-trip: serialize(parse(s)) == s" {
         // turbofish form q64 parses; spec/concurrency.md §\"Channel construction\").
         "fn main {\n    let ch = channel<bool>(policy: Backpressure, capacity: 4)\n}\n",
         "fn main {\n    let ch = channel<i64>(policy: Unbounded)\n}\n",
+        // The spec's split channel form — a tuple pattern bound to the typed
+        // constructor (spec/concurrency.md §\"Channels\").
+        "fn main {\n    let (tx, rx) = channel<Frame>(policy: Backpressure, capacity: 16)\n}\n",
     };
 
     for (sources) |src| {

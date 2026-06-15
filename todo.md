@@ -408,12 +408,29 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         mutual `while` ping-pong → 10 / 20 / 30; an `if`/`else` server reply
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
-        **v0 boundaries (next):** the `(tx, rx)` sender/receiver split. (Since
-        landed: discard recvs, `break`/`continue` in task loops, statement `match`
-        in a task, nested task loops, bool + f64 + str + record + enum channel
-        payloads, typed `channel<T>(policy:…)` construction, `select` parking,
-        bounded-channel backpressure, cooperative `ask`, and lifting the scheduler
-        into callees.)
+        (Since landed: discard recvs, `break`/`continue` in task loops, statement
+        `match` in a task, nested task loops, bool + f64 + str + record + enum
+        channel payloads, typed `channel<T>(policy:…)` construction, the `(tx, rx)`
+        sender/receiver split, `select` parking, bounded-channel backpressure,
+        cooperative `ask`, and lifting the scheduler into callees.)
+  - [x] **the `(tx, rx)` sender/receiver split (spec channel form).** The spec
+        writes channels as `let (tx, rx) = channel<T>(policy:…)` — a sender +
+        receiver pair, not q64's prior single `let ch = channel(…)` binding. Now
+        supported: a 2-tuple `let` pattern bound to a `channel(…)` call builds the
+        channel **once** and **aliases** both names onto the same buffer + cursor
+        (`aliasChannel` adds a scope entry for the receiver at the sender's buffer
+        local — no second buffer — and copies the cursor / capacity / payload-type
+        bookkeeping), so `tx.send` and `rx.recv` drive one FIFO. Plumbed through
+        every channel-name site: a new tuple-aware `channelDeclNames` (returning 1
+        or 2 names) feeds the inference, scheduler-detection (+ bounded), and
+        scheduler-build `chans` sets; a shared `buildChannelDecl` constructs the
+        decl on both the scheduler and static paths. Verified wasm64 + wasm32:
+        unbounded i64 split → 60, str split → ping, and a **bounded** split
+        (capacity 2, 4 items) exercising backpressure across the shared cursor →
+        1 / 2 / 3 / 4. Adds a build_hir test (asserts one shared buffer, not two),
+        a parser round-trip case, and a link-roundtrip section. **v0 boundary:** tx
+        and rx are functional aliases — the send-only/recv-only role restriction
+        (`tx.recv()` should be rejected) is a later sema refinement.
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
