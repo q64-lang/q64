@@ -412,6 +412,23 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         no `break`/`continue`/`match` in a task; `let _ = ch.recv()` discard
         recvs; `select` parking on the loop; `send`-on-full (bounded channels);
         `ask` suspension; lifting the scheduler into callee bodies.
+  - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
+        A `select` inside a scheduled task now **parks** until an arm is ready
+        instead of falling through. `buildSelectStmt`'s arm-building was factored
+        into `lowerSelectArms`, which returns both the first-ready-wins **chain**
+        and an **`any_ready`** predicate (the OR of every arm's readiness — a
+        recv arm's `cursor < len`, a send arm's `true`). The static path uses
+        only the chain (unchanged fall-through); the scheduler lowers a select to
+        a recv-kind block **gated on `any_ready`** (so it parks when nothing is
+        ready) whose body is the chain (which then fires exactly one arm). The
+        scan reports a select as a suspend point (routes the scope to the
+        scheduler). Verified wasm64 + wasm32: a consumer looping a `select` over
+        two channels drains both producers → 1 / 2; a select parks until a
+        later-spawned producer feeds an arm → 77. Static select tests (100/7,
+        99/42) still pass. Adds a build_hir test (`any_ready` = `or_` of
+        `vec_len` tests inside the scheduler `while`) and a link-roundtrip
+        section. **Next:** `send`-on-full backpressure (bounded channels — the
+        send side suspending), `ask` suspension, and the scheduler in callees.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

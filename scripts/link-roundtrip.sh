@@ -2714,6 +2714,43 @@ ife32_out="$("$HOST_BIN" "$tmp/ifelse32.wasm")"
 [[ "$ife32_out" == "$ife_expected" ]] || { echo "FAIL: if/else task wasm32 (got: $ife32_out)" >&2; exit 1; }
 echo "    ok: if/else in a task -> 1 / 200 / 3 (wasm64 + wasm32; branch into then/else, rejoin)"
 
+echo "==> scheduler: select parking (a select inside a task blocks until an arm is ready)"
+sp_app="$tmp/selectpark.q"
+cat > "$sp_app" <<'Q64'
+fn main {
+    scope {
+        let a = channel()
+        let b = channel()
+        spawn {
+            a.send(1)
+        }
+        spawn {
+            b.send(2)
+        }
+        spawn {
+            var got = 0
+            while got < 2 {
+                select {
+                    v = a.recv() -> env.out(v)
+                    w = b.recv() -> env.out(w)
+                }
+                got = got + 1
+            }
+        }
+    }
+}
+Q64
+# The consumer's select parks until a channel has data (gated on the OR of the
+# arms' readiness), then fires the ready arm. It drains both producers -> 1 / 2.
+sp_expected=$'1\n2'
+"$Q64_BIN" emit "$sp_app" "$tmp/selectpark.wasm"
+sp_out="$("$HOST_BIN" "$tmp/selectpark.wasm")"
+[[ "$sp_out" == "$sp_expected" ]] || { echo "FAIL: select parking (got: $sp_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$sp_app" "$tmp/selectpark32.wasm" --addr wasm32
+sp32_out="$("$HOST_BIN" "$tmp/selectpark32.wasm")"
+[[ "$sp32_out" == "$sp_expected" ]] || { echo "FAIL: select parking wasm32 (got: $sp32_out)" >&2; exit 1; }
+echo "    ok: select parking -> 1 / 2 (wasm64 + wasm32; parks on any_ready, fires the ready arm, drains both)"
+
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
 cat > "$ssc_app" <<'Q64'

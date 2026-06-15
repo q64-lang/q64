@@ -821,7 +821,19 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
 /// select — park until one is ready — arrives with the scheduler). v0: `recv`
 /// arms on channel bindings.
 fn buildSelectStmt(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
-    const Arm = struct { cond: *hir.Expr, body: *hir.Stmt };
+    // A non-suspending select: append the first-ready-wins chain; it falls
+    // through when no arm is ready (the scheduler adds parking via `any_ready`).
+    const lowered = try lowerSelectArms(b, sel, scope, rt);
+    if (lowered.chain) |c| try out.append(b.a, c);
+}
+
+/// Lower a `select`'s arms to a first-ready-wins if/else `chain` plus an
+/// `any_ready` predicate (the OR of every arm's readiness). The static
+/// `buildSelectStmt` uses only the chain (fall-through); the scheduler gates a
+/// select block on `any_ready` so it parks until an arm is ready, then runs the
+/// chain (which fires exactly one arm). recv/send arms on scope channels.
+fn lowerSelectArms(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap) BuildError!struct { chain: ?*hir.Stmt, any_ready: ?*hir.Expr } {
+    const Arm = struct { cond: *hir.Expr, body: *hir.Stmt, head: []const u8, is_recv: bool };
     var arms: std.ArrayList(Arm) = .empty;
     defer arms.deinit(b.a);
 
@@ -836,14 +848,14 @@ fn buildSelectStmt(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap, 
         defer b.a.free(cname);
         const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return error.Unsupported;
         const method = cname[dot + 1 ..];
-        const head = cname[0..dot];
-        if (!scope.chans.contains(head)) return error.Unsupported;
+        const head = scope.chans.getKey(cname[0..dot]) orelse return error.Unsupported; // stable key
         const loc = scope.find(head) orelse return error.Unsupported;
 
         // The arm's readiness test and its channel op (run when the arm wins).
         var cond: *hir.Expr = undefined;
         var items: std.ArrayList(*hir.Stmt) = .empty;
-        if (std.mem.eql(u8, method, "recv")) {
+        const is_recv = std.mem.eql(u8, method, "recv");
+        if (is_recv) {
             const cur_idx = scope.chans.get(head) orelse return error.Unsupported;
             // Readiness: cursor < vec_len(buffer).
             const curref = try b.a.create(hir.Expr);
@@ -908,7 +920,7 @@ fn buildSelectStmt(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap, 
         }
         const body = try b.a.create(hir.Stmt);
         body.* = .{ .block = try items.toOwnedSlice(b.a) };
-        try arms.append(b.a, .{ .cond = cond, .body = body });
+        try arms.append(b.a, .{ .cond = cond, .body = body, .head = head, .is_recv = is_recv });
     }
 
     // Fold back-to-front into an if / else-if chain; no else (a non-suspending
@@ -927,7 +939,18 @@ fn buildSelectStmt(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap, 
         st.* = .{ .if_ = .{ .cond = arms.items[i].cond, .then_ = arms.items[i].body, .else_ = else_part } };
         chain = st;
     }
-    if (chain) |c| try out.append(b.a, c);
+    // `any_ready` = OR of every arm's readiness (built fresh — a recv arm's is
+    // `cursor < len`, a send arm's is `true`), the scheduler's park predicate.
+    var any_ready: ?*hir.Expr = null;
+    for (arms.items) |a| {
+        const r = if (a.is_recv) try chanReadyCond(b, scope, a.head) else blk: {
+            const t = try b.a.create(hir.Expr);
+            t.* = .{ .bool_const = true };
+            break :blk t;
+        };
+        any_ready = if (any_ready) |acc| try mkLogicalE(b, .or_, acc, r) else r;
+    }
+    return .{ .chain = chain, .any_ready = any_ready };
 }
 
 /// `let h = spawn { stmts; tail }` — bind a task handle. v0 cooperative floor:
@@ -1191,10 +1214,40 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
             .if_stmt => |ifs| {
                 if (!ifStmtSchedulable(b, ifs, chans, scan, loop_depth)) return false;
             },
+            .select_stmt => |sel| {
+                if (!selectSchedulable(b, sel, chans, scan)) return false;
+                scan.recv_in_ctrl = true; // a select parks → route to the scheduler
+            },
             else => return false, // other control flow in a task: v0
         }
     }
     return true;
+}
+
+/// A `select` in a task: every arm must be a `recv`/`send` on a scope channel.
+/// Records the send/recv signal; the arm bodies are lowered later (v0: simple).
+fn selectSchedulable(b: *Builder, sel: ast.SelectStmt, chans: *const std.StringHashMapUnmanaged(void), scan: *TaskScan) bool {
+    var it = sel.arms();
+    var n: usize = 0;
+    while (it.next()) |arm| {
+        n += 1;
+        const op = arm.operation() orelse return false;
+        const cc = switch (op) {
+            .call => |x| x,
+            else => return false,
+        };
+        const cn = callPathName(b, cc) orelse return false;
+        defer b.a.free(cn);
+        const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return false;
+        if (!chans.contains(cn[0..dot])) return false;
+        const method = cn[dot + 1 ..];
+        if (std.mem.eql(u8, method, "recv")) {
+            scan.recvs = true;
+        } else if (std.mem.eql(u8, method, "send")) {
+            scan.sends = true;
+        } else return false;
+    }
+    return n > 0;
 }
 
 /// An `if`/`else`/`else if` chain in a task: each branch body must itself be
@@ -1294,9 +1347,9 @@ const SchedBlock = struct {
 };
 
 /// One source item of a task body: a maximal run of straight-line statements,
-/// a single `recv` suspend point, a counted `for` loop, a `while` loop, or an
-/// `if`/`else` chain.
-const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt };
+/// a single `recv` suspend point, a counted `for` loop, a `while` loop, an
+/// `if`/`else` chain, or a `select` (a multi-channel parking suspend point).
+const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt, sel: ast.SelectStmt };
 
 /// Context threaded through the per-task CFG lowering.
 const SchedCtx = struct {
@@ -1425,6 +1478,16 @@ fn lowerSchedItem(ctx: *SchedCtx, item: SchedItem) BuildError!ItemSpan {
             const head = try lowerIfBranch(ctx, ifs, join);
             return .{ .entry = head, .exit_id = join, .exit_alt = false };
         },
+        .sel => |sel| {
+            // A parking select: a recv-kind block gated on `any_ready` (so it
+            // parks until an arm is ready), whose body is the first-ready-wins
+            // dispatch chain (which then fires exactly one arm).
+            const lowered = try lowerSelectArms(b, sel, ctx.scope, ctx.rt);
+            const chain = lowered.chain orelse return error.Unsupported;
+            const ready = lowered.any_ready orelse return error.Unsupported;
+            const id = try addBlock(ctx, .{ .kind = .recv, .stmts = try b.a.dupe(*hir.Stmt, &.{chain}), .ready = ready, .next = 0 });
+            return .{ .entry = id, .exit_id = id, .exit_alt = false };
+        },
     }
 }
 
@@ -1450,6 +1513,9 @@ fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError
         } else if (s == .if_stmt) {
             if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
             try items.append(b.a, .{ .iff = s.if_stmt });
+        } else if (s == .select_stmt) {
+            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
+            try items.append(b.a, .{ .sel = s.select_stmt });
         } else {
             try run.append(b.a, s);
         }
@@ -9428,6 +9494,43 @@ test "scope scheduling: while loops and if/else are schedulable control flow" {
     defer testing.allocator.free(dump2);
     try testing.expect(std.mem.indexOf(u8, dump2, "while") != null); // scheduler loop
     try testing.expect(std.mem.indexOf(u8, dump2, "rem") != null); // the `x % 2` branch test
+}
+
+test "scope scheduling: a select inside a task parks until an arm is ready" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // The consumer loops a `select` over two channels; it routes to the
+    // scheduler (a select is a parking suspend point) and the select block is
+    // gated on `any_ready` (the OR of the arms' readiness) so it parks when
+    // neither channel has data.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let a = channel()
+        \\        let b = channel()
+        \\        spawn { a.send(1) }
+        \\        spawn { b.send(2) }
+        \\        spawn {
+        \\            var got = 0
+        \\            while got < 2 {
+        \\                select {
+        \\                    v = a.recv() -> env.out(v)
+        \\                    w = b.recv() -> env.out(w)
+        \\                }
+        \\                got = got + 1
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
+    // The park predicate ORs the arms' readiness (`vec_len` tests joined by or_).
+    try testing.expect(std.mem.indexOf(u8, dump, "or_") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
