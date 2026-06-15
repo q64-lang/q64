@@ -2481,6 +2481,33 @@ sel32_out="$("$HOST_BIN" "$tmp/select32.wasm")"
 [[ "$sel32_out" == "$sel_expected" ]] || { echo "FAIL: select wasm32 (got: $sel32_out)" >&2; exit 1; }
 echo "    ok: select -> 100 / 7 (wasm64 + wasm32; first-ready arm wins, bind + discard, expr + block body)"
 
+echo "==> select v0: send arms (always-ready on an unbounded channel)"
+selsnd_app="$tmp/select_send.q"
+cat > "$selsnd_app" <<'Q64'
+fn main {
+    scope {
+        let a = channel()
+        let b = channel()
+        select {
+            v = a.recv() -> env.out(v)
+            b.send(42) -> env.out(99)
+        }
+        let got = b.recv()
+        env.out(got)
+    }
+}
+Q64
+# `a` is empty so its recv arm is not ready; the send arm is always ready and
+# wins, pushing 42 into `b` (which the trailing recv then reads). -> 99 / 42.
+selsnd_expected=$'99\n42'
+"$Q64_BIN" emit "$selsnd_app" "$tmp/select_send.wasm"
+selsnd_out="$("$HOST_BIN" "$tmp/select_send.wasm")"
+[[ "$selsnd_out" == "$selsnd_expected" ]] || { echo "FAIL: select send arm (got: $selsnd_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$selsnd_app" "$tmp/select_send32.wasm" --addr wasm32
+selsnd32_out="$("$HOST_BIN" "$tmp/select_send32.wasm")"
+[[ "$selsnd32_out" == "$selsnd_expected" ]] || { echo "FAIL: select send arm wasm32 (got: $selsnd32_out)" >&2; exit 1; }
+echo "    ok: select send arm -> 99 / 42 (wasm64 + wasm32; send always-ready, vec_push, races recv arms)"
+
 echo "==> channels v0 (FIFO): natural idiom — spawn producer, parent consumes (eager-at-spawn)"
 chn_app="$tmp/channel.q"
 cat > "$chn_app" <<'Q64'

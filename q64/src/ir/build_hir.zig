@@ -835,50 +835,70 @@ fn buildSelectStmt(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap, 
         const cname = (callPathName(b, cc)) orelse return error.Unsupported;
         defer b.a.free(cname);
         const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return error.Unsupported;
-        if (!std.mem.eql(u8, cname[dot + 1 ..], "recv")) return error.Unsupported; // v0: recv arms
+        const method = cname[dot + 1 ..];
         const head = cname[0..dot];
-        const cur_idx = scope.chans.get(head) orelse return error.Unsupported;
+        if (!scope.chans.contains(head)) return error.Unsupported;
         const loc = scope.find(head) orelse return error.Unsupported;
 
-        // Readiness: cursor < vec_len(buffer).
-        const curref = try b.a.create(hir.Expr);
-        curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
-        const bufref = try b.a.create(hir.Expr);
-        bufref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-        const lenx = try b.a.create(hir.Expr);
-        lenx.* = .{ .vec_len = .{ .vec = bufref } };
-        const cond = try b.a.create(hir.Expr);
-        cond.* = .{ .bin = .{ .kind = .lt, .lhs = curref, .rhs = lenx } };
-
-        // Arm body: read the value (bind it, or discard), bump the cursor, then
-        // the user body.
+        // The arm's readiness test and its channel op (run when the arm wins).
+        var cond: *hir.Expr = undefined;
         var items: std.ArrayList(*hir.Stmt) = .empty;
-        const buf2 = try b.a.create(hir.Expr);
-        buf2.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-        const cur2 = try b.a.create(hir.Expr);
-        cur2.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
-        const get = try b.a.create(hir.Expr);
-        get.* = .{ .vec_get = .{ .vec = buf2, .idx = cur2 } };
-        if (arm.binding()) |p| {
-            if (p.kind() == .IDENT_PATTERN) {
-                const vn = (p.bindingName() orelse return error.Unsupported).text;
-                const v_idx = try declareBodyLocal(b, scope, vn, false, .i64);
-                const bind = try b.a.create(hir.Stmt);
-                bind.* = .{ .let = .{ .idx = v_idx, .value = get } };
-                try items.append(b.a, bind);
+        if (std.mem.eql(u8, method, "recv")) {
+            const cur_idx = scope.chans.get(head) orelse return error.Unsupported;
+            // Readiness: cursor < vec_len(buffer).
+            const curref = try b.a.create(hir.Expr);
+            curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+            const bufref = try b.a.create(hir.Expr);
+            bufref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+            const lenx = try b.a.create(hir.Expr);
+            lenx.* = .{ .vec_len = .{ .vec = bufref } };
+            cond = try b.a.create(hir.Expr);
+            cond.* = .{ .bin = .{ .kind = .lt, .lhs = curref, .rhs = lenx } };
+
+            // Op: read the value (bind it, or discard), then bump the cursor.
+            const buf2 = try b.a.create(hir.Expr);
+            buf2.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+            const cur2 = try b.a.create(hir.Expr);
+            cur2.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+            const get = try b.a.create(hir.Expr);
+            get.* = .{ .vec_get = .{ .vec = buf2, .idx = cur2 } };
+            if (arm.binding()) |p| {
+                if (p.kind() == .IDENT_PATTERN) {
+                    const vn = (p.bindingName() orelse return error.Unsupported).text;
+                    const v_idx = try declareBodyLocal(b, scope, vn, false, .i64);
+                    const bind = try b.a.create(hir.Stmt);
+                    bind.* = .{ .let = .{ .idx = v_idx, .value = get } };
+                    try items.append(b.a, bind);
+                }
+                // `_ = ch.recv()` discards the value; the cursor bump consumes it.
             }
-            // `_ = ch.recv()` discards the value; the cursor bump consumes it.
-        }
-        // cursor += 1
-        const cur3 = try b.a.create(hir.Expr);
-        cur3.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
-        const one = try b.a.create(hir.Expr);
-        one.* = .{ .int_const = 1 };
-        const inc = try b.a.create(hir.Expr);
-        inc.* = .{ .bin = .{ .kind = .add, .lhs = cur3, .rhs = one } };
-        const setc = try b.a.create(hir.Stmt);
-        setc.* = .{ .assign = .{ .idx = cur_idx, .value = inc } };
-        try items.append(b.a, setc);
+            // cursor += 1
+            const cur3 = try b.a.create(hir.Expr);
+            cur3.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+            const one = try b.a.create(hir.Expr);
+            one.* = .{ .int_const = 1 };
+            const inc = try b.a.create(hir.Expr);
+            inc.* = .{ .bin = .{ .kind = .add, .lhs = cur3, .rhs = one } };
+            const setc = try b.a.create(hir.Stmt);
+            setc.* = .{ .assign = .{ .idx = cur_idx, .value = inc } };
+            try items.append(b.a, setc);
+        } else if (std.mem.eql(u8, method, "send")) {
+            // A `send` arm: `ch.send(x) -> body`. On the v0 unbounded channel a
+            // send always has room, so the arm is **always ready** (no buffer
+            // wait — send-on-full backpressure arrives with the scheduler). The
+            // op is a `vec_push`; a send arm binds nothing.
+            if (arm.binding() != null) return error.Unsupported;
+            var ait = cc.args();
+            const a0 = ait.next() orelse return error.Unsupported;
+            if (ait.next() != null) return error.Unsupported; // v0: one value per send
+            cond = try b.a.create(hir.Expr);
+            cond.* = .{ .bool_const = true };
+            const bufp = try b.a.create(hir.Expr);
+            bufp.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+            const push = try b.a.create(hir.Stmt);
+            push.* = .{ .vec_push = .{ .vec = bufp, .value = try buildIntExpr(b, a0, scope) } };
+            try items.append(b.a, push);
+        } else return error.Unsupported; // v0: recv / send arms
         // The user body (block or trailing expression).
         if (arm.block()) |blk| {
             var bit = blk.statements();
@@ -8575,6 +8595,33 @@ test "select v0: first-ready arm over channel recv lowers to an if/else chain" {
     defer testing.allocator.free(dump);
     // Each arm's readiness is a `vec_len` test; the choice is an if-chain.
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
+}
+
+test "select v0: a send arm is always-ready (vec_push) and races with recv arms" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `a` is empty so its recv arm is not ready; the send arm is always ready
+    // (unbounded channel), so the lowering has both a `vec_len` readiness test
+    // (the recv arm) and a `vec_push` (the send arm's op).
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let a = channel()
+        \\        let b = channel()
+        \\        select {
+        \\            v = a.recv() -> env.out(v),
+        \\            b.send(42) -> env.out(99),
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // recv arm readiness
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null); // send arm op
     try testing.expect(std.mem.indexOf(u8, dump, "if") != null);
 }
 

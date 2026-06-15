@@ -361,8 +361,19 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         non-suspending select falls through when nothing is ready (a *parking*
         select waits for the scheduler). `select { v=a.recv()->…, w=b.recv()->… }`
         with `b` ready → the b arm; both ready → the first arm. Runs wasm64 +
-        wasm32 (`100 / 7`). **Still needs the scheduler:** parking when no arm
-        is ready, and `send` arms / send-on-full.
+        wasm32 (`100 / 7`).
+  - [x] **`select` send arms.** A `ch.send(x) -> body` arm races alongside the
+        recv arms. On the v0 unbounded channel a send always has room, so the
+        arm's readiness is **`bool_const true`** (always ready) and its op is a
+        `vec_push` (a send arm binds nothing); it folds into the same
+        first-ready-wins if-chain. `buildSelectStmt` now branches per arm on the
+        method (`recv` vs `send`). When the recv channel is empty the send arm
+        wins and genuinely pushes — `select { v=a.recv()->…, b.send(42)->… }`
+        on empty `a` → the send arm (99), and a later `b.recv()` reads the 42.
+        A ready recv arm still wins over a later send (first-ready). Runs wasm64
+        + wasm32 (`99 / 42`, `7`) + a build_hir test (`vec_len` recv readiness
+        alongside the send `vec_push`). **Still needs the scheduler:** parking
+        when no arm is ready, and send-on-full backpressure (bounded channels).
 
   - [x] **Pipe operator `|>`** (lowering). `lhs |> f(args)` ≡ `f(lhs, args)` —
         the piped value becomes the first argument (reusing `buildCallArgs`'s
