@@ -2510,6 +2510,38 @@ chn32_out="$("$HOST_BIN" "$tmp/channel32.wasm")"
 [[ "$chn32_out" == "$chn_expected" ]] || { echo "FAIL: channel FIFO wasm32 (got: $chn32_out)" >&2; exit 1; }
 echo "    ok: channel FIFO -> 60 (wasm64 + wasm32; spawn producer fills, parent drains; send=push, recv=buf[cursor]++)"
 
+echo "==> scope scheduling: consumer spawned BEFORE its producer (deferred to the join)"
+cbp_app="$tmp/cbp.q"
+cat > "$cbp_app" <<'Q64'
+fn main {
+    scope {
+        let ch = channel()
+        spawn {
+            let a = ch.recv()
+            let b = ch.recv()
+            env.out(a + b)
+        }
+        env.out(1)
+        spawn {
+            ch.send(10)
+            ch.send(20)
+        }
+    }
+}
+Q64
+# The consumer recv's before any send is emitted, so it is deferred to the
+# scope join; the later producer is emitted first and fills the channel. A
+# parent effect (env.out(1)) between them stays in source position. Without
+# the deferral the eager recv would trap on an empty buffer.
+cbp_expected=$'1\n30'
+"$Q64_BIN" emit "$cbp_app" "$tmp/cbp.wasm"
+cbp_out="$("$HOST_BIN" "$tmp/cbp.wasm")"
+[[ "$cbp_out" == "$cbp_expected" ]] || { echo "FAIL: consumer-before-producer (got: $cbp_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$cbp_app" "$tmp/cbp32.wasm" --addr wasm32
+cbp32_out="$("$HOST_BIN" "$tmp/cbp32.wasm")"
+[[ "$cbp32_out" == "$cbp_expected" ]] || { echo "FAIL: consumer-before-producer wasm32 (got: $cbp32_out)" >&2; exit 1; }
+echo "    ok: consumer-before-producer -> 1 / 30 (wasm64 + wasm32; recv-before-send deferred to join, producer fills first)"
+
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
 cat > "$ssc_app" <<'Q64'

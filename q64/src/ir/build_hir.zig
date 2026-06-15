@@ -957,37 +957,115 @@ fn spawnExprOf(stmt: ast.Stmt) ?ast.SpawnExpr {
     };
 }
 
+/// The scope channel a top-level statement targets with `method`
+/// (`"recv"`/`"send"`) — `let v = ch.recv()`, `_ = ch.recv()`, or
+/// `ch.send(x)` — or null. The returned slice is the stable `scope.chans`
+/// key (the channel binding's name, source-lived), safe to retain in a set.
+/// Only the v0 single-call producer/consumer shapes are recognized; a `recv`
+/// buried in a `select` or a nested block is not (such a task runs
+/// eager-at-spawn, the existing behavior).
+fn stmtChanTarget(b: *Builder, stmt: ast.Stmt, scope: *Scope, method: []const u8) ?[]const u8 {
+    const e: ast.Expr = switch (stmt) {
+        .let_stmt => |ls| ls.initializer() orelse return null,
+        .expr_stmt => |es| es.expression() orelse return null,
+        else => return null,
+    };
+    const cc = switch (e) {
+        .call => |x| x,
+        else => return null,
+    };
+    const cname = callPathName(b, cc) orelse return null;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return null;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], method)) return null;
+    return scope.chans.getKey(cname[0..dot]);
+}
+
+/// True if the spawned task `sp` does a `recv` on a scope channel that has
+/// **no pending sends yet** (`sent`). On the v0 cooperative floor that recv
+/// reads an empty buffer and traps, so such a task must be deferred to the
+/// scope join — where a producer emitted later in the scope has filled the
+/// channel. A recv whose channel is already covered does not block, so its
+/// task still runs eager-at-spawn (unchanged behavior).
+fn taskWouldBlock(b: *Builder, sp: ast.SpawnExpr, scope: *Scope, sent: *const std.StringHashMapUnmanaged(void)) bool {
+    const body = sp.block() orelse return false;
+    var it = body.statements();
+    while (it.next()) |stmt| {
+        if (stmtChanTarget(b, stmt, scope, "recv")) |c| {
+            if (!sent.contains(c)) return true;
+        }
+    }
+    return false;
+}
+
+/// Record (into `sent`) every scope channel the spawned task `sp` sends to,
+/// so a later consumer can tell its producer has already been emitted.
+fn recordTaskSends(b: *Builder, sp: ast.SpawnExpr, scope: *Scope, sent: *std.StringHashMapUnmanaged(void)) BuildError!void {
+    const body = sp.block() orelse return;
+    var it = body.statements();
+    while (it.next()) |stmt| {
+        if (stmtChanTarget(b, stmt, scope, "send")) |c| try sent.put(b.a, c, {});
+    }
+}
+
+/// Emit one spawned task's body inline at the current point (main position):
+/// either a `spawn { block }` (its statements) or `spawn scope { … }` (the
+/// nested scope). Shared by the eager-at-spawn pass and the deferred-join pass.
+fn emitSpawnTaskMain(b: *Builder, sp: ast.SpawnExpr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    if (sp.block()) |body| {
+        var bit = body.statements();
+        while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, out);
+    } else if (sp.scopeStmt()) |inner| {
+        try buildScopeStmt(b, inner, scope, rt, out);
+    } else return error.Unsupported;
+}
+
 /// `scope { … }` on the v0 cooperative floor (spec/memory.md §"Concurrency
 /// platform audit"). A scope is a structured-concurrency arena whose spawned
 /// tasks all complete at the closing brace. With no suspension points and a
-/// single thread, a valid cooperative schedule is: run the scope body, then —
-/// at the join — run each spawned task to completion, in spawn order. Because
-/// it is single-threaded and same-frame, "defer a task" is simply hoisting its
-/// body to the join: the body still sees the scope's locals, no closure box or
-/// task funcref needed. (Suspension/`await`, deferred re-entrancy, `catch`,
-/// and `let h = spawn` are the next slices.)
+/// single thread, a valid cooperative schedule is: run each task to
+/// completion in *some* order. The default is eager-at-spawn (a task runs at
+/// its spawn point) — it handles parent-local dependencies and lets a
+/// spawned producer fill a channel before the parent or a later task
+/// consumes it.
+///
+/// The one ordering eager-at-spawn can't serve is a **consumer spawned
+/// before its producer**: its `recv` would hit an empty buffer and trap.
+/// This is the static slice of the scheduler: a task whose `recv` channel
+/// has no sends emitted yet (`taskWouldBlock`) is deferred to the join and
+/// run after the eager pass, by which point a later producer has filled the
+/// channel — a valid cooperative schedule, no runtime suspension. Tasks
+/// whose channel already has data are untouched, so every currently-running
+/// program is byte-identical. (Genuinely *cyclic* mutual suspension — two
+/// tasks each waiting on the other — still needs the runtime CPS scheduler;
+/// so do `catch` arms, `select` parking, and `ask` suspension.)
 fn buildScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
+    // Channels that have had a send emitted so far (stable scope.chans keys).
+    var sent: std.StringHashMapUnmanaged(void) = .empty;
+    defer sent.deinit(b.a);
+    // Consumer tasks deferred to the join (recv before any producer).
+    var deferred: std.ArrayList(ast.SpawnExpr) = .empty;
+    defer deferred.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
         if (spawnExprOf(stmt)) |sp| {
-            // v0 cooperative floor: a task runs to completion at its spawn
-            // point (a valid schedule — no preemption). Eager-at-spawn handles
-            // parent-local dependencies and lets a spawned producer fill a
-            // channel before the parent consumes it. (True mutual suspension —
-            // a consumer spawned *before* its producer — needs the scheduler.)
-            if (sp.block()) |body| {
-                var bit = body.statements();
-                while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, out);
-            } else if (sp.scopeStmt()) |inner| {
-                try buildScopeStmt(b, inner, scope, rt, out);
-            } else return error.Unsupported;
+            if (taskWouldBlock(b, sp, scope, &sent)) {
+                try deferred.append(b.a, sp);
+                continue;
+            }
+            try recordTaskSends(b, sp, scope, &sent);
+            try emitSpawnTaskMain(b, sp, scope, rt, out);
         } else {
+            if (stmtChanTarget(b, stmt, scope, "send")) |c| try sent.put(b.a, c, {});
             try buildMainStmt(b, stmt, scope, rt, out);
         }
     }
+    // Join: run the deferred consumers, in spawn order, now that their
+    // producers (emitted above) have filled the channels.
+    for (deferred.items) |sp| try emitSpawnTaskMain(b, sp, scope, rt, out);
 }
 
 /// C1/C3: a statement-position `match` on an enum value. The
@@ -2267,23 +2345,43 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
 /// `scope { … }` in a void procedure — the callee analogue of
 /// `buildScopeStmt`. Same cooperative-floor lowering (parent flow first,
 /// spawned task bodies hoisted to the join), routed through `buildVoidStmt`.
+/// Emit one spawned task's body inline at the current point (callee/void
+/// position) — the `buildVoidStmt` mirror of `emitSpawnTaskMain`.
+fn emitSpawnTaskVoid(b: *Builder, sp: ast.SpawnExpr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    if (sp.block()) |body| {
+        var bit = body.statements();
+        while (bit.next()) |bstmt| try buildVoidStmt(b, bstmt, scope, out);
+    } else if (sp.scopeStmt()) |inner| {
+        try buildVoidScopeStmt(b, inner, scope, out);
+    } else return error.Unsupported;
+}
+
 fn buildVoidScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
+    // Same consumer-before-producer deferral as the main-position scope
+    // (see `buildScopeStmt`): a recv on a not-yet-fed channel is deferred to
+    // the join so a later producer fills it first.
+    var sent: std.StringHashMapUnmanaged(void) = .empty;
+    defer sent.deinit(b.a);
+    var deferred: std.ArrayList(ast.SpawnExpr) = .empty;
+    defer deferred.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
         if (spawnExprOf(stmt)) |sp| {
-            if (sp.block()) |body| {
-                var bit = body.statements();
-                while (bit.next()) |bstmt| try buildVoidStmt(b, bstmt, scope, out);
-            } else if (sp.scopeStmt()) |inner| {
-                try buildVoidScopeStmt(b, inner, scope, out);
-            } else return error.Unsupported;
+            if (taskWouldBlock(b, sp, scope, &sent)) {
+                try deferred.append(b.a, sp);
+                continue;
+            }
+            try recordTaskSends(b, sp, scope, &sent);
+            try emitSpawnTaskVoid(b, sp, scope, out);
         } else {
+            if (stmtChanTarget(b, stmt, scope, "send")) |c| try sent.put(b.a, c, {});
             try buildVoidStmt(b, stmt, scope, out);
         }
     }
+    for (deferred.items) |sp| try emitSpawnTaskVoid(b, sp, scope, out);
 }
 
 /// A void expression statement: `env.out(…)`, a host-face call, or a
@@ -8504,6 +8602,69 @@ test "channels v0: channel() + send/recv lower to a Vec buffer + read cursor" {
     // send is a vec_push; recv is a vec_get off the cursor.
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "scope scheduling: a consumer spawned before its producer is deferred to the join" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // The consumer task `recv`s before any `send` has been emitted, so on the
+    // cooperative floor it would trap on an empty buffer. It is deferred to the
+    // scope join; the producer (spawned later) is emitted first and fills the
+    // channel. So in the lowered body the producer's `vec_push` precedes the
+    // consumer's `vec_get`, despite the reverse source order.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        spawn {
+        \\            let a = ch.recv()
+        \\            let b = ch.recv()
+        \\            env.out(a + b)
+        \\        }
+        \\        spawn {
+        \\            ch.send(10)
+        \\            ch.send(20)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    const push_at = std.mem.indexOf(u8, dump, "vec_push") orelse return error.TestUnexpectedResult;
+    const get_at = std.mem.indexOf(u8, dump, "vec_get") orelse return error.TestUnexpectedResult;
+    // Producer emitted before consumer: the buffer is filled before it is read.
+    try testing.expect(push_at < get_at);
+
+    // Control: a producer spawned *before* its consumer is untouched — the
+    // consumer's channel already has data, so it runs eager-at-spawn (no
+    // deferral), preserving source order. Still producer-then-consumer.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    var m2 = (try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        spawn {
+        \\            ch.send(10)
+        \\            ch.send(20)
+        \\        }
+        \\        spawn {
+        \\            let a = ch.recv()
+        \\            let b = ch.recv()
+        \\            env.out(a + b)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer m2.deinit();
+    const dump2 = try print.hirToString(testing.allocator, &m2);
+    defer testing.allocator.free(dump2);
+    const push2 = std.mem.indexOf(u8, dump2, "vec_push") orelse return error.TestUnexpectedResult;
+    const get2 = std.mem.indexOf(u8, dump2, "vec_get") orelse return error.TestUnexpectedResult;
+    try testing.expect(push2 < get2);
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

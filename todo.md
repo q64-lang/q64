@@ -331,6 +331,28 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         yield to a later task), `send`-on-full backpressure (v0 channels are
         unbounded), and a *suspending* `select`. The eager floor covers
         producer-before-consumer DAGs (the common case).
+  - [x] **Consumer spawned before its producer — static scheduling (no CPS).**
+        The acyclic case of "consumer before producer" needs no runtime
+        suspension: it is a *scheduling order*, and any order is a valid
+        cooperative schedule. `buildScopeStmt` / `buildVoidScopeStmt` now do a
+        **conditional two-phase emission** — a spawned task whose `recv`
+        targets a scope channel with **no `send` emitted yet** (`taskWouldBlock`,
+        tracked in a `sent` set of stable `scope.chans` keys via
+        `stmtChanTarget`) would trap on an empty buffer, so it is **deferred to
+        the join** and emitted after the eager pass, by which point a producer
+        spawned later in the scope has filled the channel. Tasks whose channel
+        already has data are untouched (eager-at-spawn), so every
+        currently-running program is **byte-identical** — only the trapping
+        order is fixed. `scope { let ch=channel(); spawn { let a=ch.recv()
+        let b=ch.recv() env.out(a+b) } spawn { ch.send(10) ch.send(20) } }`
+        → 30 (was a trap); a parent `env.out(1)` between them keeps its source
+        position (→ `1 / 30`); two producers feeding one consumer-first task →
+        123. Runs wasm64 + wasm32 (link-roundtrip consumer-before-producer
+        section) + a build_hir test asserting `vec_push` precedes `vec_get`.
+        **Still genuine CPS (next):** *cyclic* mutual suspension (two tasks each
+        waiting on the other), a `recv` buried in a `select`/nested block (only
+        top-level `recv` statements are detected), `send`-on-full backpressure,
+        a *parking* `select`, and `ask` suspension.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs
