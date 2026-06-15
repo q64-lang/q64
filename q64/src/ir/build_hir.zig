@@ -1168,6 +1168,48 @@ fn sendStepChan(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnma
     return chans.getKey(cn[0..dot]);
 }
 
+/// `let x = SomeActor {}` where `SomeActor` is a declared actor → the binding
+/// name, else null. Used to collect a scope's actor instances so handler calls
+/// (`tell`/`ask`) on them are accepted as cooperative steps inside scheduled
+/// tasks (the actor's state is shared; the handler runs synchronously — the
+/// suspension on the cooperative floor comes from the task's channel ops).
+fn actorBindingOf(b: *Builder, stmt: ast.Stmt) ?[]const u8 {
+    const ls = switch (stmt) {
+        .let_stmt => |x| x,
+        else => return null,
+    };
+    const init = ls.initializer() orelse return null;
+    const re = switch (init) {
+        .record => |x| x,
+        else => return null,
+    };
+    const tyname = (re.path() orelse return null).text(b.a) catch return null;
+    defer b.a.free(tyname);
+    if (!b.actor_decls.contains(tyname)) return null;
+    const nm = (ls.pattern() orelse return null).bindingName() orelse return null;
+    return nm.text;
+}
+
+/// True if `stmt` is a handler call on a scope actor — `a.h(args)` (a `tell`) or
+/// `let r = a.h(args)` (an `ask`), with `a` in `actors`.
+fn isActorCall(b: *Builder, stmt: ast.Stmt, actors: *const std.StringHashMapUnmanaged(void)) bool {
+    const cc: ast.CallExpr = switch (stmt) {
+        .expr_stmt => |es| switch (es.expression() orelse return false) {
+            .call => |c| c,
+            else => return false,
+        },
+        .let_stmt => |ls| switch (ls.initializer() orelse return false) {
+            .call => |c| c,
+            else => return false,
+        },
+        else => return false,
+    };
+    const cn = callPathName(b, cc) orelse return false;
+    defer b.a.free(cn);
+    const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return false;
+    return actors.contains(cn[0..dot]);
+}
+
 /// What a task-body scan found: whether it sends / recvs on scope channels, and
 /// whether any `recv` sits **inside control flow** (a loop or `if`). The static
 /// path only detects top-level recvs, so a recv-in-control task must go to the
@@ -1181,7 +1223,7 @@ const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl
 /// loop's counter would need a per-entry reset the pre-init can't give it);
 /// `in_ctrl` marks that we're inside a loop/`if` body. Any other statement →
 /// not schedulable (fall back to the static path).
-fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool) bool {
+fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), actors: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool) bool {
     var it = body.statements();
     while (it.next()) |stmt| {
         if (recvStepOf(b, stmt, chans) != null) {
@@ -1194,6 +1236,12 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
             if (bounded.contains(ch)) scan.send_bounded = true;
             continue;
         }
+        // A `tell`/`ask` on a scope actor is a synchronous cooperative step
+        // (`a.bump()` / `let r = a.get()`): the handler runs to completion at the
+        // call site against the shared state record, so it lowers like any plain
+        // statement. This lets a task that both blocks on channels and talks to
+        // an actor be scheduled (a synchronous ask alone never forces the loop).
+        if (isActorCall(b, stmt, actors)) continue;
         switch (stmt) {
             .expr_stmt => |es| {
                 const e = es.expression() orelse return false;
@@ -1213,16 +1261,16 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
                 const iter = fs.iterable() orelse return false;
                 if (iter != .range) return false; // counted ranges only
                 const fb = fs.body() orelse return false;
-                if (!taskSchedulable(b, fb, chans, bounded, scan, loop_depth + 1, true)) return false;
+                if (!taskSchedulable(b, fb, chans, bounded, actors, scan, loop_depth + 1, true)) return false;
             },
             .while_stmt => |ws| {
                 if (loop_depth != 0) return false; // v0: no nested loops
                 if (ws.ifLet() != null) return false; // `while let`: later
                 const wb = ws.body() orelse return false;
-                if (!taskSchedulable(b, wb, chans, bounded, scan, loop_depth + 1, true)) return false;
+                if (!taskSchedulable(b, wb, chans, bounded, actors, scan, loop_depth + 1, true)) return false;
             },
             .if_stmt => |ifs| {
-                if (!ifStmtSchedulable(b, ifs, chans, bounded, scan, loop_depth)) return false;
+                if (!ifStmtSchedulable(b, ifs, chans, bounded, actors, scan, loop_depth)) return false;
             },
             .select_stmt => |sel| {
                 if (!selectSchedulable(b, sel, chans, bounded, scan)) return false;
@@ -1264,12 +1312,12 @@ fn selectSchedulable(b: *Builder, sel: ast.SelectStmt, chans: *const std.StringH
 
 /// An `if`/`else`/`else if` chain in a task: each branch body must itself be
 /// schedulable (and is `in_ctrl`). `if let` is rejected (a later slice).
-fn ifStmtSchedulable(b: *Builder, ifs: ast.IfStmt, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize) bool {
+fn ifStmtSchedulable(b: *Builder, ifs: ast.IfStmt, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), actors: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize) bool {
     if (ifs.ifLet() != null) return false;
     const tb = ifs.thenBody() orelse return false;
-    if (!taskSchedulable(b, tb, chans, bounded, scan, loop_depth, true)) return false;
-    if (ifs.elseBody()) |eb| return taskSchedulable(b, eb, chans, bounded, scan, loop_depth, true);
-    if (ifs.elseIf()) |ei| return ifStmtSchedulable(b, ei, chans, bounded, scan, loop_depth);
+    if (!taskSchedulable(b, tb, chans, bounded, actors, scan, loop_depth, true)) return false;
+    if (ifs.elseBody()) |eb| return taskSchedulable(b, eb, chans, bounded, actors, scan, loop_depth, true);
+    if (ifs.elseIf()) |ei| return ifStmtSchedulable(b, ei, chans, bounded, actors, scan, loop_depth);
     return true; // no else
 }
 
@@ -1301,16 +1349,22 @@ fn channelDeclCap(b: *Builder, stmt: ast.Stmt) ?i64 {
 /// only holds for programs the static path can't serve, so no currently-static
 /// program is routed here.
 fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
-    _ = scope;
     var chans: std.StringHashMapUnmanaged(void) = .empty;
     defer chans.deinit(b.a);
     var bounded: std.StringHashMapUnmanaged(void) = .empty;
     defer bounded.deinit(b.a);
+    var actors: std.StringHashMapUnmanaged(void) = .empty;
+    defer actors.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
         if (channelDeclName(b, stmt)) |nm| {
             chans.put(b.a, nm, {}) catch return false;
             if (channelDeclCap(b, stmt) != null) bounded.put(b.a, nm, {}) catch return false;
+        } else if (actorBindingOf(b, stmt)) |nm| {
+            // Actor instances are built (a state record) only in `main`-position
+            // scopes — the callee scheduler can't build records yet (v0).
+            if (scope.callee) return false;
+            actors.put(b.a, nm, {}) catch return false;
         }
     }
     var ntasks: usize = 0;
@@ -1321,10 +1375,10 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
             const body = sp.block() orelse return false; // `spawn scope`: not v0-schedulable
             ntasks += 1;
             var scan: TaskScan = .{};
-            if (!taskSchedulable(b, body, &chans, &bounded, &scan, 0, false)) return false;
+            if (!taskSchedulable(b, body, &chans, &bounded, &actors, &scan, 0, false)) return false;
             if ((scan.sends and scan.recvs) or scan.recv_in_ctrl or scan.send_bounded) needs = true;
-        } else if (channelDeclName(b, stmt) == null) {
-            return false; // a non-spawn, non-channel-decl statement: stay static
+        } else if (channelDeclName(b, stmt) == null and actorBindingOf(b, stmt) == null) {
+            return false; // a non-spawn, non-channel-decl, non-actor statement: stay static
         }
     }
     return ntasks >= 2 and needs;
@@ -1688,18 +1742,19 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
         while (it.next()) |stmt| {
             if (spawnExprOf(stmt)) |sp| {
                 try tasks.append(b.a, sp.block() orelse return error.Unsupported);
-            } else {
-                // The only non-spawn statements are channel decls (the gate
-                // guarantees it). Build them directly via `tryChannelNew` so the
+            } else if (channelDeclName(b, stmt)) |_| {
+                // A channel decl: build it directly via `tryChannelNew` so the
                 // scheduler is builder-agnostic — it runs in `main` and in callee
                 // (void) bodies alike (the main/void statement builders differ).
-                const ls = switch (stmt) {
-                    .let_stmt => |x| x,
-                    else => return error.Unsupported,
-                };
+                const ls = stmt.let_stmt;
                 const init = ls.initializer() orelse return error.Unsupported;
                 const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
                 if (!try tryChannelNew(b, init, nm.text, ls.isVar(), scope, out)) return error.Unsupported;
+            } else {
+                // An actor-instance construct (`let acc = Actor {}`): build the
+                // state record via the full statement builder (records are
+                // `main`-only on the v0 floor; the gate keeps callee scopes out).
+                try buildMainStmt(b, stmt, scope, rt, out);
             }
         }
     }
@@ -9750,6 +9805,45 @@ test "scope scheduling: the round-robin scheduler runs inside a callee body" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop, in the callee
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // recv-readiness suspend test
+}
+
+test "scope scheduling: a tell/ask on an actor is a step inside a scheduled task" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // The consumer recvs from a channel (a suspend point → the scope routes to
+    // the scheduler) AND asks an actor. The synchronous handler call must be
+    // accepted as a cooperative step — without it the ask makes the task
+    // unschedulable and the cyclic scope traps. The actor's `call` appears
+    // inside the scheduler `while`.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor Adder {
+        \\    state total: i64 = 0
+        \\    handle add(k: i64) -> i64 { total = total + k; total }
+        \\}
+        \\fn main {
+        \\    scope {
+        \\        let feed = channel()
+        \\        let done = channel()
+        \\        let acc = Adder {}
+        \\        spawn {
+        \\            feed.send(10)
+        \\            let _a = done.recv()
+        \\        }
+        \\        spawn {
+        \\            let x = feed.recv()
+        \\            let r = acc.add(x)
+        \\            env.out(r)
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
+    try testing.expect(std.mem.indexOf(u8, dump, "call") != null); // the synchronous handler call (the ask)
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

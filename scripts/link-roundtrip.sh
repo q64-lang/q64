@@ -2898,4 +2898,47 @@ csc32_out="$("$HOST_BIN" "$tmp/calleesched32.wasm")"
 [[ "$csc32_out" == "$csc_expected" ]] || { echo "FAIL: callee scheduler wasm32 (got: $csc32_out)" >&2; exit 1; }
 echo "    ok: callee scheduler -> 100/11/200 (wasm64 + wasm32; round-robin loop inside a function body)"
 
+echo "==> scheduler: tell/ask on an actor inside a scheduled task (cooperative ask)"
+aia_app="$tmp/actorask.q"
+cat > "$aia_app" <<'Q64'
+actor Adder {
+    state total: i64 = 0
+    handle add(k: i64) -> i64 { total = total + k; total }
+}
+fn main {
+    scope {
+        let feed = channel()
+        let done = channel()
+        let acc = Adder {}
+        spawn {
+            feed.send(10)
+            feed.send(20)
+            let _ack = done.recv()
+            env.out(_ack)
+        }
+        spawn {
+            let x = feed.recv()
+            let r1 = acc.add(x)
+            env.out(r1)
+            let y = feed.recv()
+            let r2 = acc.add(y)
+            env.out(r2)
+            done.send(99)
+        }
+    }
+}
+Q64
+# The consumer blocks on `feed` (a scheduler suspend point) and asks the shared
+# `Adder` actor between recvs. The synchronous handler runs as a cooperative
+# step against the shared state; the task would trap on the static path (the ask
+# made it unschedulable). -> 10 / 30 / 99 (running total persists across asks).
+aia_expected=$'10\n30\n99'
+"$Q64_BIN" emit "$aia_app" "$tmp/actorask.wasm"
+aia_out="$("$HOST_BIN" "$tmp/actorask.wasm")"
+[[ "$aia_out" == "$aia_expected" ]] || { echo "FAIL: actor ask in scheduled task (got: $aia_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$aia_app" "$tmp/actorask32.wasm" --addr wasm32
+aia32_out="$("$HOST_BIN" "$tmp/actorask32.wasm")"
+[[ "$aia32_out" == "$aia_expected" ]] || { echo "FAIL: actor ask in scheduled task wasm32 (got: $aia32_out)" >&2; exit 1; }
+echo "    ok: actor ask in a scheduled task -> 10/30/99 (wasm64 + wasm32; synchronous handler as a cooperative step)"
+
 echo "PASS: $qube_out"

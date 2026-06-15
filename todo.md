@@ -475,6 +475,30 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         build_hir test (the scheduler `while` appears in the callee) and a
         link-roundtrip section; all main-position scheduler cases still pass.
         **Next:** `ask` suspension (actors as scheduled tasks with inbox channels).
+  - [x] **`tell`/`ask` on an actor inside a scheduled task (cooperative ask, v0).**
+        A task that blocks on channels (so it's routed to the round-robin
+        scheduler) can now also `tell`/`ask` a shared actor. Before this, an ask
+        (`let r = acc.add(x)`) made the task **unschedulable** (`taskSchedulable`
+        rejects a `let` with a call init), so a cyclic scope using an actor fell
+        to the static path and **trapped**. The fix recognizes a handler call on
+        a scope actor (`isActorCall`) as a *synchronous cooperative step*: on the
+        v0 floor handlers are synchronous (they run to completion against the
+        shared state record at the call site), so the ask lowers like any plain
+        statement — the task's **suspension comes from its channel ops**, the ask
+        does not itself force or need the loop. `scopeNeedsScheduler` now collects
+        the scope's actor instances (`actorBindingOf`), accepts actor-construct
+        `let`s as valid setup, and threads the actor set through the
+        schedulability scan; `buildScopeScheduled` builds the actor's state record
+        in setup (main-position only — records need the main builder). Verified
+        wasm64 + wasm32: a consumer that recvs from a channel and asks an `Adder`
+        between recvs → 10 / 30 / 99 (the running total persists across asks); a
+        `tell`/`ask` pair driven by a signal channel → 2. Adds a build_hir test
+        (the actor `call` lives inside the scheduler `while`) and a link-roundtrip
+        section; the synchronous-actor and channel-scheduler suites still pass.
+        This is the **cooperative-floor** shape of `ask`; the spec's full
+        inbox/`select`-loop actor model (a *suspending* handler — one that itself
+        `recv`s/`ask`s) remains the capable-host follow-up. **Next:** suspending
+        handler bodies (the handler awaits inside the server loop).
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs
