@@ -1373,6 +1373,8 @@ const Lowerer = struct {
                     .i64 => switch (from) {
                         .f64 => c.BinaryenTruncSFloat64ToInt64(),
                         .f32 => c.BinaryenTruncSFloat32ToInt64(),
+                        // A boolean (i32 0/1) widening to a channel's i64 cell.
+                        .i32 => c.BinaryenExtendUInt32(),
                         else => return Error.UnsupportedCall,
                     },
                     else => return Error.UnsupportedCall,

@@ -1175,6 +1175,72 @@ fn sendStepChan(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnma
     return chans.getKey(cn[0..dot]);
 }
 
+/// Is `e` syntactically a boolean — a `true`/`false` literal, a comparison, or a
+/// `&&`/`||`/`!`? A purely structural test (no scope), used to infer a channel's
+/// element type from its `send`s. A bare identifier (`ch.send(b)`) isn't decided
+/// here (it'd need the sending task's scope), so such a channel stays i64.
+fn exprSyntacticBool(e: ast.Expr) bool {
+    return switch (e) {
+        .literal => |lit| if (lit.token()) |t| (t.kind == .KW_TRUE or t.kind == .KW_FALSE) else false,
+        .paren => |p| if (p.inner()) |inner| exprSyntacticBool(inner) else false,
+        .bin => |bx| if (bx.op()) |op| switch (op.kind) {
+            .EQ_EQ, .BANG_EQ, .L_ANGLE, .LT_EQ, .R_ANGLE, .GT_EQ, .AMP_AMP, .PIPE_PIPE => true,
+            else => false,
+        } else false,
+        .unary => |ux| if (ux.op()) |op| op.kind == .BANG else false,
+        else => false,
+    };
+}
+
+/// Infer the scope's channels' element types from their `send`s and record any
+/// non-default (bool) ones in `scope.chan_elem`. Walks parent statements and
+/// spawned task bodies (recursively through control flow) for `ch.send(arg)`
+/// with a syntactically-boolean `arg`. Called once per scope before recv/send
+/// lowering, so both the static and scheduled paths see consistent types.
+fn inferChannelTypes(b: *Builder, blk: ast.Block, scope: *Scope) BuildError!void {
+    var chans: std.StringHashMapUnmanaged(void) = .empty;
+    defer chans.deinit(b.a);
+    var it = blk.statements();
+    while (it.next()) |stmt| {
+        if (channelDeclName(b, stmt)) |nm| try chans.put(b.a, nm, {});
+    }
+    if (chans.count() == 0) return;
+    it = blk.statements();
+    while (it.next()) |stmt| {
+        if (spawnExprOf(stmt)) |sp| {
+            if (sp.block()) |body| try inferBoolSendsInBlock(b, body, &chans, scope);
+        } else {
+            try inferBoolSendInStmt(b, stmt, &chans, scope);
+        }
+    }
+}
+
+fn inferBoolSendsInBlock(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), scope: *Scope) BuildError!void {
+    var it = body.statements();
+    while (it.next()) |stmt| try inferBoolSendInStmt(b, stmt, chans, scope);
+}
+
+fn inferBoolSendInStmt(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void), scope: *Scope) BuildError!void {
+    // `ch.send(arg)` with a syntactically-boolean arg → mark the channel bool.
+    if (sendStepChan(b, stmt, chans)) |ch| {
+        const cc = stmt.expr_stmt.expression().?.call;
+        var ait = cc.args();
+        if (ait.next()) |a0| {
+            if (exprSyntacticBool(a0)) try scope.chan_elem.put(b.a, ch, .bool);
+        }
+    }
+    // Recurse through control flow that can contain sends.
+    switch (stmt) {
+        .if_stmt => |ifs| {
+            if (ifs.thenBody()) |tb| try inferBoolSendsInBlock(b, tb, chans, scope);
+            if (ifs.elseBody()) |eb| try inferBoolSendsInBlock(b, eb, chans, scope);
+        },
+        .for_stmt => |fs| if (fs.body()) |fb| try inferBoolSendsInBlock(b, fb, chans, scope),
+        .while_stmt => |ws| if (ws.body()) |wb| try inferBoolSendsInBlock(b, wb, chans, scope),
+        else => {},
+    }
+}
+
 /// `let x = SomeActor {}` where `SomeActor` is a declared actor → the binding
 /// name, else null. Used to collect a scope's actor instances so handler calls
 /// (`tell`/`ask`) on them are accepted as cooperative steps inside scheduled
@@ -1947,6 +2013,7 @@ fn buildScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, rt: *RtMap, out
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
+    try inferChannelTypes(b, blk, scope); // bool channels (recv binds bool, send widens)
     // Cyclic tasks — a producer and consumer mutually waiting on each other's
     // channels — can't be served by static ordering (each has effects before
     // its blocking recv that the other depends on). They need the runtime
@@ -3271,6 +3338,7 @@ fn buildVoidScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, out: *std.A
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
+    try inferChannelTypes(b, blk, scope); // bool channels (recv binds bool, send widens)
     // Cyclic / parking / backpressured tasks need the round-robin scheduler,
     // just as in `main` (`buildScopeStmt`). `buildScopeScheduled` is builder-
     // agnostic (it dispatches on `scope.callee`), so the same lowering serves a
@@ -6252,8 +6320,18 @@ fn tryChannelSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*h
     if (ait.next() != null) return error.Unsupported; // v0: one value per send
     const vref = try b.a.create(hir.Expr);
     vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    // On a bool channel the value is an i32 boolean; widen it to the i64 buffer
+    // cell with an `i64(...)` cast so `__vec_push` (which takes i64) typechecks.
+    var value = try buildIntExpr(b, a0, scope);
+    if (scope.chan_elem.get(head)) |et| {
+        if (et == .bool) {
+            const cast = try b.a.create(hir.Expr);
+            cast.* = .{ .num_cast = .{ .to = .i64, .value = value } };
+            value = cast;
+        }
+    }
     const st = try b.a.create(hir.Stmt);
-    st.* = .{ .vec_push = .{ .vec = vref, .value = try buildIntExpr(b, a0, scope) } };
+    st.* = .{ .vec_push = .{ .vec = vref, .value = value } };
     return st;
 }
 
@@ -6281,9 +6359,21 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
         curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
         const get = try b.a.create(hir.Expr);
         get.* = .{ .vec_get = .{ .vec = vref, .idx = curref } };
-        const v_idx = try declareBodyLocal(b, scope, name, mutable, .i64);
+        // A bool channel: the i64 cell holds 0/1; bind a `bool` local (so
+        // `env.out` formats true/false and bool ops typecheck) by truthiness-
+        // testing the cell (`!= 0` → i32 boolean). Otherwise an i64 binding.
+        const elem: hir.Type = scope.chan_elem.get(head) orelse .i64;
+        var value = get;
+        if (elem == .bool) {
+            const z = try b.a.create(hir.Expr);
+            z.* = .{ .int_const = 0 };
+            const ne = try b.a.create(hir.Expr);
+            ne.* = .{ .bin = .{ .kind = .ne, .lhs = get, .rhs = z } };
+            value = ne;
+        }
+        const v_idx = try declareBodyLocal(b, scope, name, mutable, elem);
         const bind = try b.a.create(hir.Stmt);
-        bind.* = .{ .let = .{ .idx = v_idx, .value = get } };
+        bind.* = .{ .let = .{ .idx = v_idx, .value = value } };
         try out.append(b.a, bind);
     }
     // cursor += 1
@@ -7473,6 +7563,12 @@ const Scope = struct {
     /// the scheduler when the buffer holds `capacity` unread elements
     /// (`vec_len - cursor >= capacity`); recv frees a slot by bumping cursor.
     chan_caps: std.StringHashMapUnmanaged(i64) = .empty,
+    /// Channel element type when it isn't the i64 default: a channel inferred to
+    /// carry `bool` (from a syntactically-boolean `send`). A `recv` then binds a
+    /// `bool` local (so `env.out` formats true/false and bool ops typecheck) and
+    /// `send` widens the i32 boolean to the i64 buffer cell. v0: bool only —
+    /// f64/str/record payloads need bitcast / multi-slot storage (later).
+    chan_elem: std.StringHashMapUnmanaged(hir.Type) = .empty,
     /// Inside an actor handler body, the actor's state struct — so a bare field
     /// name (`n`) resolves to `self.n` (read, write, and type), the implicit-
     /// self convention. `self` itself is registered in `recs`.
@@ -10109,6 +10205,40 @@ test "scope scheduling: nested loops in a task reset the inner counter per pass"
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the inner-loop recv gate
+}
+
+test "channels: a bool-payload channel binds a bool recv and widens the send" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A channel whose sends are syntactically boolean (`true` / a comparison) is
+    // inferred to carry `bool`: the `send` widens the i32 boolean to the i64 cell
+    // (`i64(...)`), and the `recv` binds a `bool` (`vec_get != 0`) so `env.out`
+    // formats true/false. A second, i64 channel alongside is unaffected.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let flag = channel()
+        \\        let num = channel()
+        \\        spawn {
+        \\            flag.send(true)
+        \\            num.send(42)
+        \\            flag.send(2 > 1)
+        \\        }
+        \\        let a = flag.recv()
+        \\        env.out(a)
+        \\        let n = num.recv()
+        \\        env.out(n)
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "i64(true)") != null); // the bool send widened to the cell
+    try testing.expect(std.mem.indexOf(u8, dump, "ne 0") != null); // the bool recv (truthiness of the cell)
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null); // env.out(a) formats true/false
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null); // env.out(n) — the i64 channel
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

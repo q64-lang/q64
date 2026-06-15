@@ -408,10 +408,11 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         mutual `while` ping-pong → 10 / 20 / 30; an `if`/`else` server reply
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
-        **v0 boundaries (next):** non-i64 channel payloads. (Since landed: discard
+        **v0 boundaries (next):** f64/str/record channel payloads (bool now
+        lands; the rest need bitcast / multi-slot storage). (Since landed: discard
         recvs, `break`/`continue` in task loops, statement `match` in a task,
-        nested task loops, `select` parking, bounded-channel backpressure,
-        cooperative `ask`, and lifting the scheduler into callees.)
+        nested task loops, bool channel payloads, `select` parking, bounded-channel
+        backpressure, cooperative `ask`, and lifting the scheduler into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -562,8 +563,28 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         nested `2×3` loops → 11/12/13/21/22/23; a **triangular** nest whose inner
         bound is the outer counter (`for j in 1..=i`) → 1 / 1 2 / 1 2 3. Adds a
         build_hir test and a link-roundtrip section; all prior single-loop
-        scheduler cases still pass. **Remaining task-body v0 gap:** non-i64
-        channel payloads (bool/f64/str/record over a channel).
+        scheduler cases still pass.
+  - [x] **Bool channel payloads (first non-i64 channel element type).** A channel
+        whose `send`s are syntactically boolean (`ch.send(true)`,
+        `ch.send(x > 0)`, `&&`/`||`/`!`) is inferred to carry `bool`, so its
+        `recv` binds a real `bool` — usable in `if`/`!`/`&&`, and `env.out` formats
+        true/false — instead of a bare i64 0/1. A scope-level pass
+        (`inferChannelTypes`, run before recv/send lowering in both the static and
+        scheduled paths) walks parent + task bodies for boolean sends and records
+        the element type in `Scope.chan_elem` (absent = the i64 default).
+        Lowering: `send` widens the i32 boolean to the i64 buffer cell via an
+        `i64(...)` `num_cast` (codegen gained the i32→i64 `ExtendUInt32` case it
+        was missing); `recv` truthiness-tests the cell (`vec_get != 0`) into a
+        `bool` local. Channels are per-name typed, so a bool and an i64 channel
+        coexist in one scope. Verified wasm64 + wasm32: a producer sending
+        `true`/`false`/`3>5` with a consumer using the value in `if` and printing
+        it → 1 / 42 / false (mixed with an i64 channel); also on the static
+        eager path. Adds a build_hir test and a link-roundtrip section.
+        **Deliberately scoped to bool:** `f64` payloads need an f64↔i64 bitcast,
+        `str` needs (ptr,len) cells, and records/enums need typed pointers — and a
+        bare-identifier send (`ch.send(b)`) can't be inferred without the sending
+        task's scope, so it stays i64. **Remaining task-body v0 gap:** f64/str/
+        record channel payloads.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

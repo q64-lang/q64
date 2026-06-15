@@ -3090,4 +3090,46 @@ nl32_out="$("$HOST_BIN" "$tmp/nestloop32.wasm")"
 [[ "$nl32_out" == "$nl_expected" ]] || { echo "FAIL: nested loops wasm32 (got: $nl32_out)" >&2; exit 1; }
 echo "    ok: nested loops -> 1/1/2/1/2/3 (wasm64 + wasm32; inner counter resets per outer pass)"
 
+echo "==> channels: bool-payload channel (recv binds bool, send widens to the cell)"
+bp_app="$tmp/boolchan.q"
+cat > "$bp_app" <<'Q64'
+fn main {
+    scope {
+        let flag = channel()
+        let num = channel()
+        let done = channel()
+        spawn {
+            flag.send(true)
+            num.send(42)
+            flag.send(3 > 5)
+            let _ = done.recv()
+        }
+        spawn {
+            let ok = flag.recv()
+            if ok {
+                env.out(1)
+            } else {
+                env.out(0)
+            }
+            let n = num.recv()
+            env.out(n)
+            let ok2 = flag.recv()
+            env.out(ok2)
+            done.send(1)
+        }
+    }
+}
+Q64
+# `flag` is inferred bool (sends true / a comparison): recv binds a bool (usable
+# in `if`, printed true/false); send widens i32->i64 for the cell. The i64 `num`
+# channel alongside is unaffected. -> 1 / 42 / false.
+bp_expected=$'1\n42\nfalse'
+"$Q64_BIN" emit "$bp_app" "$tmp/boolchan.wasm"
+bp_out="$("$HOST_BIN" "$tmp/boolchan.wasm")"
+[[ "$bp_out" == "$bp_expected" ]] || { echo "FAIL: bool channel (got: $bp_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$bp_app" "$tmp/boolchan32.wasm" --addr wasm32
+bp32_out="$("$HOST_BIN" "$tmp/boolchan32.wasm")"
+[[ "$bp32_out" == "$bp_expected" ]] || { echo "FAIL: bool channel wasm32 (got: $bp32_out)" >&2; exit 1; }
+echo "    ok: bool channel -> 1/42/false (wasm64 + wasm32; bool recv in if + true/false, i64 channel intact)"
+
 echo "PASS: $qube_out"
