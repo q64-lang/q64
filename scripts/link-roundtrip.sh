@@ -2569,6 +2569,42 @@ cbp32_out="$("$HOST_BIN" "$tmp/cbp32.wasm")"
 [[ "$cbp32_out" == "$cbp_expected" ]] || { echo "FAIL: consumer-before-producer wasm32 (got: $cbp32_out)" >&2; exit 1; }
 echo "    ok: consumer-before-producer -> 1 / 30 (wasm64 + wasm32; recv-before-send deferred to join, producer fills first)"
 
+echo "==> scheduler: cyclic ping-pong (mutual suspension via the round-robin loop)"
+pp_app="$tmp/pingpong.q"
+cat > "$pp_app" <<'Q64'
+fn main {
+    scope {
+        let a = channel()
+        let b = channel()
+        spawn {
+            a.send(1)
+            let r1 = b.recv()
+            a.send(r1)
+            let r2 = b.recv()
+            env.out(r2)
+        }
+        spawn {
+            let x1 = a.recv()
+            b.send(x1 + 10)
+            let x2 = a.recv()
+            b.send(x2 + 100)
+        }
+    }
+}
+Q64
+# No static order works: each task has effects before its blocking recv that
+# the other depends on. P sends a=1, suspends on b; Q recvs 1, sends b=11; P
+# resumes r1=11, sends a=11, suspends on b; Q recvs 11, sends b=111; P resumes
+# r2=111. The per-task pc state machines + round-robin driver land it.
+pp_expected=$'111'
+"$Q64_BIN" emit "$pp_app" "$tmp/pingpong.wasm"
+pp_out="$("$HOST_BIN" "$tmp/pingpong.wasm")"
+[[ "$pp_out" == "$pp_expected" ]] || { echo "FAIL: ping-pong (got: $pp_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$pp_app" "$tmp/pingpong32.wasm" --addr wasm32
+pp32_out="$("$HOST_BIN" "$tmp/pingpong32.wasm")"
+[[ "$pp32_out" == "$pp_expected" ]] || { echo "FAIL: ping-pong wasm32 (got: $pp32_out)" >&2; exit 1; }
+echo "    ok: cyclic ping-pong -> 111 (wasm64 + wasm32; mutual suspension, pc state machines + round-robin)"
+
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
 cat > "$ssc_app" <<'Q64'

@@ -353,6 +353,33 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         waiting on the other), a `recv` buried in a `select`/nested block (only
         top-level `recv` statements are detected), `send`-on-full backpressure,
         a *parking* `select`, and `ask` suspension.
+  - [x] **Runtime cooperative scheduler — cyclic tasks (the real CPS slice).**
+        A *cyclic* dependency (task P sends `a` then recvs `b`; task Q recvs `a`
+        then sends `b`) has **no** valid static order — P must run to its
+        `b.recv()`, suspend, let Q produce, then resume. On the cooperative
+        floor (no stack switching) `buildScopeScheduled` lowers each task to a
+        **pc state machine** driven by a **round-robin `while` loop**, all in one
+        function frame: a task body is segmented at each `recv`, plain runs are
+        gated `pc == k`, a recv is gated `pc == k and <buffer non-empty>`, and a
+        winning gate advances the pc + sets a `prog` flag. Because the loop is
+        one frame and pc-gating runs each segment exactly once, **task locals
+        persist naturally as ordinary locals** — no closure box, funcref, or
+        hoisting (the key realization that makes this tractable). `prog` is the
+        **deadlock guard**: a full round with no advance ⇒ all tasks blocked
+        forever ⇒ the loop exits. Verified wasm64 + wasm32: ping-pong → 11;
+        two-round exchange → 111; a true cyclic deadlock terminates cleanly
+        (rc 0, no hang). The gate (`scopeNeedsScheduler`) is **deliberately
+        narrow** — ≥2 tasks, ≥1 task that *both* sends and recvs — so no
+        currently-compiling program is ever routed here (none has a mutual
+        task); the static eager/deferred path is byte-identical. Adds a
+        build_hir test (scheduler `while` + pc gates; acyclic pair stays static)
+        and a link-roundtrip section. **v0 boundaries:** main-position scopes;
+        straight-line task bodies (no nested control flow / loops in a task);
+        `let v = ch.recv()` recvs; i64 channels; a `recv` inside a `select` or
+        nested block isn't a detected suspend point. **Next:** loops inside
+        tasks (the streaming/generator shape), `select` parking on the same
+        loop, `send`-on-full (bounded channels), `ask` suspension, and lifting
+        the scheduler into callee bodies.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

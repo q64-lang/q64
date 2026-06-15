@@ -1040,6 +1040,310 @@ fn emitSpawnTaskMain(b: *Builder, sp: ast.SpawnExpr, scope: *Scope, rt: *RtMap, 
     } else return error.Unsupported;
 }
 
+// ─── Runtime cooperative scheduler (cyclic tasks) ───────────────────────────
+//
+// Static ordering (eager-at-spawn + the consumer-before-producer deferral)
+// covers acyclic task graphs. A *cyclic* dependency — task P sends on `a` then
+// recvs on `b`, task Q recvs on `a` then sends on `b` — has no valid static
+// order: P must run up to its `b.recv()`, suspend, let Q produce, then resume.
+// On the cooperative floor (no stack switching) this is a per-task **state
+// machine** driven by a round-robin loop, all in one function frame:
+//
+//   let pc0 = 0; let pc1 = 0; let prog = 1
+//   while ((pc0 < N0 or pc1 < N1) and prog == 1) {
+//       prog = 0
+//       if (pc0 == 0)              { <seg>; pc0 = 1; prog = 1 }   // run a step
+//       if (pc0 == 1 and b_ready)  { r = b.recv(); pc0 = 2; prog = 1 }  // suspend pt
+//       if (pc0 == 2)              { env.out(r); pc0 = 3; prog = 1 }
+//       … task 1 …
+//   }
+//
+// A task's body is segmented at each `recv`: plain runs are gated `pc == k`,
+// a recv is gated `pc == k and <buffer non-empty>`. Because the whole loop is
+// one frame and pc-gating runs each segment exactly once, task locals persist
+// naturally as ordinary locals — no closure box, funcref, or hoisting. `prog`
+// is the **deadlock guard**: a full round with no advance means every task is
+// blocked forever, so the loop exits (v0: incomplete tasks just stop).
+//
+// v0 boundaries: main-position scopes; straight-line task bodies (no nested
+// control flow in a task); `let v = ch.recv()` recvs; i64 channels. The gate
+// (`scopeNeedsScheduler`) is deliberately narrow so only genuinely cyclic
+// programs — which the static path can't compile anyway — are routed here.
+
+const TaskStmtKind = enum { recv, send, plain, unschedulable };
+
+/// A `let v = ch.recv()` step on a scope channel: the channel head, the result
+/// binding name, and the `ch.recv()` call expression (for `tryChannelRecv`).
+const RecvStep = struct { chan: []const u8, name: []const u8, call: ast.Expr };
+
+/// `let x = channel(...)` → the binding name (a stable, source-lived slice).
+fn channelDeclName(b: *Builder, stmt: ast.Stmt) ?[]const u8 {
+    const ls = switch (stmt) {
+        .let_stmt => |x| x,
+        else => return null,
+    };
+    const init = ls.initializer() orelse return null;
+    const cc = switch (init) {
+        .call => |x| x,
+        else => return null,
+    };
+    const cn = callPathName(b, cc) orelse return null;
+    defer b.a.free(cn);
+    if (!std.mem.eql(u8, cn, "channel")) return null;
+    const pat = ls.pattern() orelse return null;
+    const nm = pat.bindingName() orelse return null;
+    return nm.text;
+}
+
+/// `let v = ch.recv()` on a channel in `chans`, or null.
+fn recvStepOf(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void)) ?RecvStep {
+    const ls = switch (stmt) {
+        .let_stmt => |x| x,
+        else => return null,
+    };
+    const init = ls.initializer() orelse return null;
+    const cc = switch (init) {
+        .call => |x| x,
+        else => return null,
+    };
+    const cn = callPathName(b, cc) orelse return null;
+    defer b.a.free(cn);
+    const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return null;
+    if (!std.mem.eql(u8, cn[dot + 1 ..], "recv")) return null;
+    const key = chans.getKey(cn[0..dot]) orelse return null;
+    const pat = ls.pattern() orelse return null;
+    const nm = pat.bindingName() orelse return null;
+    return .{ .chan = key, .name = nm.text, .call = init };
+}
+
+/// `ch.send(x)` statement on a channel in `chans`, or null.
+fn sendStepChan(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void)) ?[]const u8 {
+    const es = switch (stmt) {
+        .expr_stmt => |x| x,
+        else => return null,
+    };
+    const e = es.expression() orelse return null;
+    const cc = switch (e) {
+        .call => |x| x,
+        else => return null,
+    };
+    const cn = callPathName(b, cc) orelse return null;
+    defer b.a.free(cn);
+    const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return null;
+    if (!std.mem.eql(u8, cn[dot + 1 ..], "send")) return null;
+    return chans.getKey(cn[0..dot]);
+}
+
+/// Classify one task-body statement for the scheduler.
+fn classifyTaskStmt(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void)) TaskStmtKind {
+    if (recvStepOf(b, stmt, chans) != null) return .recv;
+    if (sendStepChan(b, stmt, chans) != null) return .send;
+    switch (stmt) {
+        .expr_stmt => |es| {
+            const e = es.expression() orelse return .unschedulable;
+            const cc = switch (e) {
+                .call => |x| x,
+                else => return .unschedulable,
+            };
+            // A plain effect (`env.out(…)`); other calls aren't v0-schedulable.
+            return if (isEnvOut(b.a, cc)) .plain else .unschedulable;
+        },
+        // A non-recv `let` with a non-call initializer (`let r = x + 10`): a
+        // plain step. A call initializer we don't recognize → fall back.
+        .let_stmt => |ls| {
+            const init = ls.initializer() orelse return .unschedulable;
+            return switch (init) {
+                .call => .unschedulable,
+                else => .plain,
+            };
+        },
+        else => return .unschedulable, // control flow in a task: v0 is straight-line
+    }
+}
+
+/// Read-only gate: does this scope hold genuinely cyclic tasks that the static
+/// path can't serve? True iff every non-spawn statement is a channel decl,
+/// every spawned task is straight-line and schedulable, there are ≥2 tasks,
+/// and at least one task **both sends and recvs** (the mutual-wait signature).
+/// That last condition is what keeps every currently-compiling program on the
+/// eager/deferred path — none has such a task.
+fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
+    _ = scope;
+    var chans: std.StringHashMapUnmanaged(void) = .empty;
+    defer chans.deinit(b.a);
+    var it = blk.statements();
+    while (it.next()) |stmt| {
+        if (channelDeclName(b, stmt)) |nm| chans.put(b.a, nm, {}) catch return false;
+    }
+    var ntasks: usize = 0;
+    var mutual = false;
+    it = blk.statements();
+    while (it.next()) |stmt| {
+        if (spawnExprOf(stmt)) |sp| {
+            const body = sp.block() orelse return false; // `spawn scope`: not v0-schedulable
+            ntasks += 1;
+            var sends = false;
+            var recvs = false;
+            var bit = body.statements();
+            while (bit.next()) |bs| switch (classifyTaskStmt(b, bs, &chans)) {
+                .unschedulable => return false,
+                .recv => recvs = true,
+                .send => sends = true,
+                .plain => {},
+            };
+            if (sends and recvs) mutual = true;
+        } else if (channelDeclName(b, stmt) == null) {
+            return false; // a non-spawn, non-channel-decl statement: stay static
+        }
+    }
+    return ntasks >= 2 and mutual;
+}
+
+fn mkLocalE(b: *Builder, idx: u32, ty: hir.Type) BuildError!*hir.Expr {
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .local = .{ .idx = idx, .ty = ty } };
+    return e;
+}
+fn mkIntE(b: *Builder, v: i64) BuildError!*hir.Expr {
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .int_const = v };
+    return e;
+}
+fn mkBinE(b: *Builder, kind: ops.BinKind, lhs: *hir.Expr, rhs: *hir.Expr) BuildError!*hir.Expr {
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .bin = .{ .kind = kind, .lhs = lhs, .rhs = rhs } };
+    return e;
+}
+fn mkLogicalE(b: *Builder, op: ops.LogicalKind, lhs: *hir.Expr, rhs: *hir.Expr) BuildError!*hir.Expr {
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .logical = .{ .op = op, .lhs = lhs, .rhs = rhs } };
+    return e;
+}
+fn mkAssignS(b: *Builder, idx: u32, value: *hir.Expr) BuildError!*hir.Stmt {
+    const s = try b.a.create(hir.Stmt);
+    s.* = .{ .assign = .{ .idx = idx, .value = value } };
+    return s;
+}
+
+/// Channel readiness: `cursor < vec_len(buffer)` (the buffer has an unread
+/// element) — the `recv` suspend test.
+fn chanReadyCond(b: *Builder, scope: *Scope, chan: []const u8) BuildError!*hir.Expr {
+    const cur_idx = scope.chans.get(chan) orelse return error.Unsupported;
+    const loc = scope.find(chan) orelse return error.Unsupported;
+    const cur = try mkLocalE(b, cur_idx, .i64);
+    const buf = try mkLocalE(b, loc.idx, .ptr);
+    const len = try b.a.create(hir.Expr);
+    len.* = .{ .vec_len = .{ .vec = buf } };
+    return mkBinE(b, .lt, cur, len);
+}
+
+/// Emit one pc-gated segment: `if (pc == k [and ready]) { <seg>; pc = k+1;
+/// prog = 1 }`.
+fn emitSchedGate(b: *Builder, body: *std.ArrayList(*hir.Stmt), pc_idx: u32, k: usize, prog_idx: u32, seg: []const *hir.Stmt, ready: ?*hir.Expr) BuildError!void {
+    const pcref = try mkLocalE(b, pc_idx, .i64);
+    const kc = try mkIntE(b, @intCast(k));
+    const eq = try mkBinE(b, .eq, pcref, kc);
+    const cond = if (ready) |r| try mkLogicalE(b, .and_, eq, r) else eq;
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    try items.appendSlice(b.a, seg);
+    try items.append(b.a, try mkAssignS(b, pc_idx, try mkIntE(b, @intCast(k + 1))));
+    try items.append(b.a, try mkAssignS(b, prog_idx, try mkIntE(b, 1)));
+    const then_blk = try b.a.create(hir.Stmt);
+    then_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
+    const ifst = try b.a.create(hir.Stmt);
+    ifst.* = .{ .if_ = .{ .cond = cond, .then_ = then_blk, .else_ = null } };
+    try body.append(b.a, ifst);
+}
+
+/// Lower a scope of cyclic tasks to the round-robin scheduler (see the block
+/// comment above). Gated by `scopeNeedsScheduler`.
+fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    // Channel names (for recv/send classification).
+    var chans: std.StringHashMapUnmanaged(void) = .empty;
+    defer chans.deinit(b.a);
+    {
+        var it = blk.statements();
+        while (it.next()) |stmt| {
+            if (channelDeclName(b, stmt)) |nm| try chans.put(b.a, nm, {});
+        }
+    }
+    // Emit the setup (channel decls) in order; collect the spawned task bodies.
+    var tasks: std.ArrayList(ast.Block) = .empty;
+    defer tasks.deinit(b.a);
+    {
+        var it = blk.statements();
+        while (it.next()) |stmt| {
+            if (spawnExprOf(stmt)) |sp| {
+                try tasks.append(b.a, sp.block() orelse return error.Unsupported);
+            } else {
+                try buildMainStmt(b, stmt, scope, rt, out); // channel() decls
+            }
+        }
+    }
+    const ntasks = tasks.items.len;
+    // Per-task program counters (start 0) + the progress flag (start 1, so the
+    // loop runs at least once).
+    const pc_idx = try b.a.alloc(u32, ntasks);
+    for (0..ntasks) |t| {
+        const nm = try std.fmt.allocPrint(b.a, "#sched_pc{d}", .{t});
+        pc_idx[t] = try declareBodyLocal(b, scope, nm, true, .i64);
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .let = .{ .idx = pc_idx[t], .value = try mkIntE(b, 0) } };
+        try out.append(b.a, st);
+    }
+    const prog_idx = try declareBodyLocal(b, scope, "#sched_prog", true, .i64);
+    {
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .let = .{ .idx = prog_idx, .value = try mkIntE(b, 1) } };
+        try out.append(b.a, st);
+    }
+    // Build the loop body: `prog = 0`, then each task's pc-gated segments.
+    var body: std.ArrayList(*hir.Stmt) = .empty;
+    defer body.deinit(b.a);
+    try body.append(b.a, try mkAssignS(b, prog_idx, try mkIntE(b, 0)));
+    const seg_count = try b.a.alloc(usize, ntasks);
+    for (tasks.items, 0..) |task, t| {
+        var k: usize = 0;
+        var seg: std.ArrayList(*hir.Stmt) = .empty;
+        defer seg.deinit(b.a);
+        var bit = task.statements();
+        while (bit.next()) |bs| {
+            if (recvStepOf(b, bs, &chans)) |rs| {
+                // Flush the accumulated plain run as a gate, then the recv gate.
+                if (seg.items.len > 0) {
+                    try emitSchedGate(b, &body, pc_idx[t], k, prog_idx, try seg.toOwnedSlice(b.a), null);
+                    k += 1;
+                }
+                var ritems: std.ArrayList(*hir.Stmt) = .empty;
+                if (!try tryChannelRecv(b, rs.call, rs.name, false, scope, &ritems)) return error.Unsupported;
+                const ready = try chanReadyCond(b, scope, rs.chan);
+                try emitSchedGate(b, &body, pc_idx[t], k, prog_idx, try ritems.toOwnedSlice(b.a), ready);
+                k += 1;
+            } else {
+                try buildMainStmt(b, bs, scope, rt, &seg);
+            }
+        }
+        if (seg.items.len > 0) {
+            try emitSchedGate(b, &body, pc_idx[t], k, prog_idx, try seg.toOwnedSlice(b.a), null);
+            k += 1;
+        }
+        seg_count[t] = k;
+    }
+    // `while ((pc0 < N0 or pc1 < N1 or …) and prog == 1) { body }`.
+    var any: ?*hir.Expr = null;
+    for (0..ntasks) |t| {
+        const lt = try mkBinE(b, .lt, try mkLocalE(b, pc_idx[t], .i64), try mkIntE(b, @intCast(seg_count[t])));
+        any = if (any) |a| try mkLogicalE(b, .or_, a, lt) else lt;
+    }
+    const prog_eq = try mkBinE(b, .eq, try mkLocalE(b, prog_idx, .i64), try mkIntE(b, 1));
+    const cond = try mkLogicalE(b, .and_, any orelse return error.Unsupported, prog_eq);
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try body.toOwnedSlice(b.a) };
+    const wst = try b.a.create(hir.Stmt);
+    wst.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try out.append(b.a, wst);
+}
+
 /// `scope { … }` on the v0 cooperative floor (spec/memory.md §"Concurrency
 /// platform audit"). A scope is a structured-concurrency arena whose spawned
 /// tasks all complete at the closing brace. With no suspension points and a
@@ -1063,6 +1367,13 @@ fn buildScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, rt: *RtMap, out
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
+    // Cyclic tasks — a producer and consumer mutually waiting on each other's
+    // channels — can't be served by static ordering (each has effects before
+    // its blocking recv that the other depends on). They need the runtime
+    // round-robin scheduler (`buildScopeScheduled`); the gate is conservative
+    // (≥2 tasks, one that both sends and recvs) so no eager/deferred program is
+    // ever routed here.
+    if (scopeNeedsScheduler(b, blk, scope)) return buildScopeScheduled(b, blk, scope, rt, out);
     // Channels that have had a send emitted so far (stable scope.chans keys).
     var sent: std.StringHashMapUnmanaged(void) = .empty;
     defer sent.deinit(b.a);
@@ -8712,6 +9023,65 @@ test "scope scheduling: a consumer spawned before its producer is deferred to th
     const push2 = std.mem.indexOf(u8, dump2, "vec_push") orelse return error.TestUnexpectedResult;
     const get2 = std.mem.indexOf(u8, dump2, "vec_get") orelse return error.TestUnexpectedResult;
     try testing.expect(push2 < get2);
+}
+
+test "scope scheduling: cyclic ping-pong tasks lower to a round-robin scheduler loop" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // P sends `a` then recvs `b`; Q recvs `a` then sends `b` — a mutual wait no
+    // static order can serve. It lowers to a `while` loop (the scheduler) whose
+    // body has pc-gated segments and a `vec_len` recv-readiness test.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let a = channel()
+        \\        let b = channel()
+        \\        spawn {
+        \\            a.send(1)
+        \\            let r = b.recv()
+        \\            env.out(r)
+        \\        }
+        \\        spawn {
+        \\            let x = a.recv()
+        \\            b.send(x + 10)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The scheduler is a while loop; recv suspend points test `vec_len`; both
+    // tasks' ops appear (the producer push, the recv get).
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+
+    // Control: an acyclic producer/consumer pair (no task both sends and recvs)
+    // stays on the static deferral path — no scheduler loop.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    var m2 = (try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        spawn {
+        \\            let p = ch.recv()
+        \\            env.out(p)
+        \\        }
+        \\        spawn {
+        \\            ch.send(5)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer m2.deinit();
+    const dump2 = try print.hirToString(testing.allocator, &m2);
+    defer testing.allocator.free(dump2);
+    try testing.expect(std.mem.indexOf(u8, dump2, "while") == null); // static, not scheduled
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
