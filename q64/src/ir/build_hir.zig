@@ -1129,13 +1129,22 @@ fn channelDeclName(b: *Builder, stmt: ast.Stmt) ?[]const u8 {
     return nm.text;
 }
 
-/// `let v = ch.recv()` on a channel in `chans`, or null.
+/// A `recv` on a channel in `chans` — `let v = ch.recv()`, the discard form
+/// `let _ = ch.recv()`, or a bare statement `ch.recv()` (also a discard). The
+/// discard forms bind the sentinel name `"_"` (which lowering reads as "consume
+/// the value, don't bind it"). Returns null if it isn't a scope-channel recv.
 fn recvStepOf(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void)) ?RecvStep {
-    const ls = switch (stmt) {
-        .let_stmt => |x| x,
+    // The recv call expression + the binding name (or "_" for a discard).
+    const init: ast.Expr, const name: []const u8 = switch (stmt) {
+        .let_stmt => |ls| blk: {
+            const i = ls.initializer() orelse return null;
+            const pat = ls.pattern() orelse return null;
+            const nm: []const u8 = if (pat.kind() == .WILD_PATTERN) "_" else (pat.bindingName() orelse return null).text;
+            break :blk .{ i, nm };
+        },
+        .expr_stmt => |es| .{ es.expression() orelse return null, "_" }, // bare `ch.recv()` — discard
         else => return null,
     };
-    const init = ls.initializer() orelse return null;
     const cc = switch (init) {
         .call => |x| x,
         else => return null,
@@ -1145,9 +1154,7 @@ fn recvStepOf(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmana
     const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return null;
     if (!std.mem.eql(u8, cn[dot + 1 ..], "recv")) return null;
     const key = chans.getKey(cn[0..dot]) orelse return null;
-    const pat = ls.pattern() orelse return null;
-    const nm = pat.bindingName() orelse return null;
-    return .{ .chan = key, .name = nm.text, .call = init };
+    return .{ .chan = key, .name = name, .call = init };
 }
 
 /// `ch.send(x)` statement on a channel in `chans`, or null.
@@ -6160,17 +6167,22 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
     const head = cname[0..dot];
     const cur_idx = scope.chans.get(head) orelse return false;
     const loc = scope.find(head) orelse return false;
-    // v = buf[cursor]
-    const vref = try b.a.create(hir.Expr);
-    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-    const curref = try b.a.create(hir.Expr);
-    curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
-    const get = try b.a.create(hir.Expr);
-    get.* = .{ .vec_get = .{ .vec = vref, .idx = curref } };
-    const v_idx = try declareBodyLocal(b, scope, name, mutable, .i64);
-    const bind = try b.a.create(hir.Stmt);
-    bind.* = .{ .let = .{ .idx = v_idx, .value = get } };
-    try out.append(b.a, bind);
+    // `let _ = ch.recv()` / bare `ch.recv()` — discard: consume the slot (bump
+    // the cursor) without binding. Reading the value has no side effect, so the
+    // `vec_get` is simply skipped.
+    if (!std.mem.eql(u8, name, "_")) {
+        // v = buf[cursor]
+        const vref = try b.a.create(hir.Expr);
+        vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+        const curref = try b.a.create(hir.Expr);
+        curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
+        const get = try b.a.create(hir.Expr);
+        get.* = .{ .vec_get = .{ .vec = vref, .idx = curref } };
+        const v_idx = try declareBodyLocal(b, scope, name, mutable, .i64);
+        const bind = try b.a.create(hir.Stmt);
+        bind.* = .{ .let = .{ .idx = v_idx, .value = get } };
+        try out.append(b.a, bind);
+    }
     // cursor += 1
     const curref2 = try b.a.create(hir.Expr);
     curref2.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
@@ -9844,6 +9856,38 @@ test "scope scheduling: a tell/ask on an actor is a step inside a scheduled task
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
     try testing.expect(std.mem.indexOf(u8, dump, "call") != null); // the synchronous handler call (the ask)
+}
+
+test "scope scheduling: a discard recv (let _ = / bare recv) is a suspend point" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `let _ = b.recv()` consumes a slot without binding — it must still be a
+    // detected suspend point (gated on `vec_len`) so a cyclic task that waits on
+    // a reply it doesn't name schedules instead of trapping. The lowering bumps
+    // the cursor with no `vec_get` (the value is discarded).
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let a = channel()
+        \\        let b = channel()
+        \\        spawn {
+        \\            a.send(1)
+        \\            let _ = b.recv()
+        \\            env.out(42)
+        \\        }
+        \\        spawn {
+        \\            let x = a.recv()
+        \\            b.send(x + 10)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // routed to the scheduler
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the discard recv's readiness gate
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

@@ -2941,4 +2941,35 @@ aia32_out="$("$HOST_BIN" "$tmp/actorask32.wasm")"
 [[ "$aia32_out" == "$aia_expected" ]] || { echo "FAIL: actor ask in scheduled task wasm32 (got: $aia32_out)" >&2; exit 1; }
 echo "    ok: actor ask in a scheduled task -> 10/30/99 (wasm64 + wasm32; synchronous handler as a cooperative step)"
 
+echo "==> scheduler: discard recv (let _ = ch.recv()) as a suspend point"
+dr_app="$tmp/discardrecv.q"
+cat > "$dr_app" <<'Q64'
+fn main {
+    scope {
+        let a = channel()
+        let b = channel()
+        spawn {
+            a.send(1)
+            let _ = b.recv()
+            env.out(42)
+        }
+        spawn {
+            let x = a.recv()
+            b.send(x + 10)
+        }
+    }
+}
+Q64
+# The first task waits for an ack on `b` it doesn't bind (`let _ = b.recv()`).
+# It must still suspend until the reply arrives — a discard recv is a real
+# suspend point (cursor bumped, value not bound). -> 42.
+dr_expected=$'42'
+"$Q64_BIN" emit "$dr_app" "$tmp/discardrecv.wasm"
+dr_out="$("$HOST_BIN" "$tmp/discardrecv.wasm")"
+[[ "$dr_out" == "$dr_expected" ]] || { echo "FAIL: discard recv (got: $dr_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$dr_app" "$tmp/discardrecv32.wasm" --addr wasm32
+dr32_out="$("$HOST_BIN" "$tmp/discardrecv32.wasm")"
+[[ "$dr32_out" == "$dr_expected" ]] || { echo "FAIL: discard recv wasm32 (got: $dr32_out)" >&2; exit 1; }
+echo "    ok: discard recv -> 42 (wasm64 + wasm32; let _ = recv suspends, consumes without binding)"
+
 echo "PASS: $qube_out"

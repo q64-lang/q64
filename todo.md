@@ -409,9 +409,9 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
         **v0 boundaries (next):** one level of loop nesting (no loop-in-loop);
-        no `break`/`continue`/`match` in a task; `let _ = ch.recv()` discard
-        recvs; `select` parking on the loop; `send`-on-full (bounded channels);
-        `ask` suspension; lifting the scheduler into callee bodies.
+        no `break`/`continue`/`match` in a task. (Since landed: discard recvs,
+        `select` parking, bounded-channel backpressure, cooperative `ask`, and
+        lifting the scheduler into callee bodies.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -499,6 +499,20 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         inbox/`select`-loop actor model (a *suspending* handler — one that itself
         `recv`s/`ask`s) remains the capable-host follow-up. **Next:** suspending
         handler bodies (the handler awaits inside the server loop).
+  - [x] **Discard recvs in the scheduler (`let _ = ch.recv()` + bare `ch.recv()`).**
+        A `recv` whose value isn't named is now a real suspend point. Before,
+        `recvStepOf` required a binding name (`pat.bindingName()`, null for the
+        `_` wildcard), so a task waiting on a reply it doesn't bind fell off the
+        schedulable path and the cyclic scope **trapped** (`UnsupportedExpression`).
+        `recvStepOf` now recognizes the discard forms — `let _ = ch.recv()` (a
+        `WILD_PATTERN`) and a bare statement `ch.recv()` — binding the sentinel
+        name `"_"`; `tryChannelRecv` reads `"_"` as "consume the slot, don't bind"
+        and emits only the cursor bump (no `vec_get`), with the readiness gate
+        unchanged so it still parks until data arrives. Verified wasm64 + wasm32:
+        a task that `a.send(1)` then `let _ = b.recv()` (an ack it ignores) → 42;
+        the bare `b.recv()` form → 7. Adds a build_hir test and a link-roundtrip
+        section. **Remaining task-body v0 gaps:** `break`/`continue`/`match` in a
+        task; one level of loop nesting; non-i64 channel payloads.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs
