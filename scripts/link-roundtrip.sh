@@ -3015,4 +3015,42 @@ bc32_out="$("$HOST_BIN" "$tmp/breakcont32.wasm")"
 [[ "$bc32_out" == "$bc_expected" ]] || { echo "FAIL: break/continue wasm32 (got: $bc32_out)" >&2; exit 1; }
 echo "    ok: break/continue -> 5/7 (wasm64 + wasm32; continue skips 0, break exits on 99 sentinel)"
 
+echo "==> scheduler: statement match inside a scheduled task loop"
+mt_app="$tmp/matchtask.q"
+cat > "$mt_app" <<'Q64'
+fn main {
+    scope {
+        let ch = channel()
+        let done = channel()
+        spawn {
+            ch.send(1)
+            ch.send(2)
+            ch.send(5)
+            let _ = done.recv()
+        }
+        spawn {
+            for i in 1..=3 {
+                let v = ch.recv()
+                match v {
+                    1 -> env.out(100),
+                    2 -> env.out(200),
+                    _ -> env.out(900),
+                }
+            }
+            done.send(1)
+        }
+    }
+}
+Q64
+# The consumer recvs (a scheduler suspend point) and matches each value. A
+# match with no channel ops in its arms is a plain cooperative step. -> 100/200/900.
+mt_expected=$'100\n200\n900'
+"$Q64_BIN" emit "$mt_app" "$tmp/matchtask.wasm"
+mt_out="$("$HOST_BIN" "$tmp/matchtask.wasm")"
+[[ "$mt_out" == "$mt_expected" ]] || { echo "FAIL: match in task (got: $mt_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$mt_app" "$tmp/matchtask32.wasm" --addr wasm32
+mt32_out="$("$HOST_BIN" "$tmp/matchtask32.wasm")"
+[[ "$mt32_out" == "$mt_expected" ]] || { echo "FAIL: match in task wasm32 (got: $mt32_out)" >&2; exit 1; }
+echo "    ok: match in task -> 100/200/900 (wasm64 + wasm32; statement match as a cooperative step)"
+
 echo "PASS: $qube_out"

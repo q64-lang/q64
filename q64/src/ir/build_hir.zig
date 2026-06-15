@@ -1217,6 +1217,62 @@ fn isActorCall(b: *Builder, stmt: ast.Stmt, actors: *const std.StringHashMapUnma
     return actors.contains(cn[0..dot]);
 }
 
+/// True if `e` is a `ch.recv()` / `ch.send(…)` call on a scope channel.
+fn exprIsChannelOp(b: *Builder, e: ast.Expr, chans: *const std.StringHashMapUnmanaged(void)) bool {
+    const cc = switch (e) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cn = callPathName(b, cc) orelse return false;
+    defer b.a.free(cn);
+    const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return false;
+    const m = cn[dot + 1 ..];
+    return (std.mem.eql(u8, m, "recv") or std.mem.eql(u8, m, "send")) and chans.contains(cn[0..dot]);
+}
+
+/// Whether a statement (recursively) performs a channel `recv`/`send`/`select`
+/// on a scope channel — used to keep a `match` treated as a plain cooperative
+/// step out of the scheduler when an arm would suspend (CFG-match is a later
+/// slice; such a match must not be lowered as a non-gated plain block).
+fn stmtHasChannelOp(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void)) bool {
+    if (recvStepOf(b, stmt, chans) != null) return true;
+    if (sendStepChan(b, stmt, chans) != null) return true;
+    switch (stmt) {
+        .select_stmt => return true, // a select is a channel suspend point
+        .if_stmt => |ifs| return ifChainHasChannelOp(b, ifs, chans),
+        .for_stmt => |fs| return if (fs.body()) |fb| blockHasChannelOp(b, fb, chans) else false,
+        .while_stmt => |ws| return if (ws.body()) |wb| blockHasChannelOp(b, wb, chans) else false,
+        .match_stmt => |ms| return matchHasChannelOp(b, ms, chans),
+        else => return false,
+    }
+}
+
+fn blockHasChannelOp(b: *Builder, blk: ast.Block, chans: *const std.StringHashMapUnmanaged(void)) bool {
+    var it = blk.statements();
+    while (it.next()) |s| if (stmtHasChannelOp(b, s, chans)) return true;
+    return false;
+}
+
+fn ifChainHasChannelOp(b: *Builder, ifs: ast.IfStmt, chans: *const std.StringHashMapUnmanaged(void)) bool {
+    if (ifs.thenBody()) |tb| if (blockHasChannelOp(b, tb, chans)) return true;
+    if (ifs.elseBody()) |eb| return blockHasChannelOp(b, eb, chans);
+    if (ifs.elseIf()) |ei| return ifChainHasChannelOp(b, ei, chans);
+    return false;
+}
+
+/// True if any `match` arm (body block or `-> expr`) performs a channel op.
+fn matchHasChannelOp(b: *Builder, ms: ast.MatchStmt, chans: *const std.StringHashMapUnmanaged(void)) bool {
+    var it = ms.arms();
+    while (it.next()) |arm| {
+        if (arm.block()) |blk| {
+            if (blockHasChannelOp(b, blk, chans)) return true;
+        } else if (arm.expression()) |e| {
+            if (exprIsChannelOp(b, e, chans)) return true;
+        }
+    }
+    return false;
+}
+
 /// What a task-body scan found: whether it sends / recvs on scope channels, and
 /// whether any `recv` sits **inside control flow** (a loop or `if`). The static
 /// path only detects top-level recvs, so a recv-in-control task must go to the
@@ -1264,6 +1320,7 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
             },
             .assign_stmt => {}, // `x = e` — a plain step (mutates a task local)
             .break_stmt, .continue_stmt => if (loop_depth == 0) return false, // only inside a loop
+            .match_stmt => |ms| if (matchHasChannelOp(b, ms, chans)) return false, // a suspending match arm: CFG-match is later
             .for_stmt => |fs| {
                 if (loop_depth != 0) return false; // v0: no nested loops in a task
                 const iter = fs.iterable() orelse return false;
@@ -9968,6 +10025,44 @@ test "scope scheduling: break / continue inside a scheduled task loop" {
     // The break/continue lower to pc assignments, not a HIR `break` statement
     // (which would escape the scheduler's own loop).
     try testing.expect(std.mem.indexOf(u8, dump, "break") == null);
+}
+
+test "scope scheduling: a statement match (no channel ops in arms) is a step" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A `match` whose arms perform no channel ops is a plain cooperative step
+    // (like an actor call): the task's recv-in-loop routes it to the scheduler,
+    // and the match lowers via the normal builder. `matchHasChannelOp` keeps a
+    // *suspending* match arm out of this path (that's a later CFG-match slice).
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        let done = channel()
+        \\        spawn {
+        \\            ch.send(1)
+        \\            ch.send(2)
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            for i in 1..=2 {
+        \\                let v = ch.recv()
+        \\                match v {
+        \\                    1 -> env.out(100),
+        \\                    _ -> env.out(900),
+        \\                }
+        \\            }
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the recv suspend gate
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

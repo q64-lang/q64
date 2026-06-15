@@ -409,8 +409,8 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
         **v0 boundaries (next):** one level of loop nesting (no loop-in-loop);
-        no `match` in a task; non-i64 channel payloads. (Since landed: discard
-        recvs, `break`/`continue` in task loops, `select` parking, bounded-channel
+        non-i64 channel payloads. (Since landed: discard recvs, `break`/`continue`
+        in task loops, statement `match` in a task, `select` parking, bounded-channel
         backpressure, cooperative `ask`, and lifting the scheduler into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
@@ -529,8 +529,25 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         a `recv` where `continue` skips a 0 and `break` exits on a 99 sentinel →
         5 / 7 (the trailing value never prints). Adds a build_hir test (the loop
         lowers with no HIR `break`) and a link-roundtrip section; all prior
-        scheduler/static loop cases still pass. **Remaining task-body v0 gaps:**
-        `match` in a task; one level of loop nesting; non-i64 channel payloads.
+        scheduler/static loop cases still pass.
+  - [x] **Statement `match` inside a scheduled task.** A `match` statement whose
+        arms perform no channel ops is now a plain cooperative step (the same
+        treatment as an actor call): the task's recv-in-loop routes the scope to
+        the scheduler, and the match lowers through the normal builder
+        (`buildMainMatch`/`buildVoidMatch`) inside a plain block. Before,
+        `taskSchedulable` rejected any `match` (`else => return false`), so a
+        cyclic/looping task that matched a received value **trapped**. A new
+        recursive scan (`matchHasChannelOp`, over arm blocks + `-> expr` arms,
+        through nested `if`/loops/`match`) keeps a *suspending* match arm out of
+        this path — a `recv`/`send`/`select` inside an arm needs the CFG-match
+        slice (later), so such a match stays unschedulable rather than lowering as
+        a non-gated plain block. Verified wasm64 + wasm32: a consumer looping a
+        `recv` and matching each value (`1 -> 100, 2 -> 200, _ -> 900`) → 100 /
+        200 / 900. Adds a build_hir test and a link-roundtrip section. **v0
+        boundaries:** integer/enum *statement* matches with non-suspending arms;
+        a value-match `let c = match …` and enum scrutinees carried over a channel
+        await the non-i64 channel-payload work. **Remaining task-body v0 gaps:**
+        one level of loop nesting; non-i64 channel payloads.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs
