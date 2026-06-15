@@ -408,12 +408,12 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         mutual `while` ping-pong → 10 / 20 / 30; an `if`/`else` server reply
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
-        **v0 boundaries (next):** str/record channel payloads (bool + f64 now
-        land; str needs (ptr,len) cells, records need typed pointers). (Since
-        landed: discard recvs, `break`/`continue` in task loops, statement `match`
-        in a task, nested task loops, bool + f64 channel payloads, `select`
-        parking, bounded-channel backpressure, cooperative `ask`, and lifting the
-        scheduler into callees.)
+        **v0 boundaries (next):** str/record channel payloads (need boxed/multi-
+        slot storage); the `(tx, rx)` sender/receiver split. (Since landed: discard
+        recvs, `break`/`continue` in task loops, statement `match` in a task,
+        nested task loops, bool + f64 channel payloads, typed `channel<T>(policy:…)`
+        construction, `select` parking, bounded-channel backpressure, cooperative
+        `ask`, and lifting the scheduler into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -598,9 +598,27 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         bitcasts the cell→f64. Verified wasm64 + wasm32: `1.5` / `2.25` /
         `0.5+0.5` doubled on recv → 3.0 / 4.5 / 2.0 (real float arithmetic on the
         received value). Adds a build_hir test and a link-roundtrip section; bool
-        and i64 channels (and all prior cases) still pass. **Remaining task-body
-        v0 gap:** str/record channel payloads (str needs (ptr,len) cells, records
-        typed pointers — and a bare-identifier float send still stays i64).
+        and i64 channels (and all prior cases) still pass.
+  - [x] **Typed `channel<T>(policy:…)` construction (groundwork).** The spec's
+        typed channel form now parses and types the element explicitly, the robust
+        alternative to inferring from sends. **Parser:** q64 had no turbofish in
+        expression position (`channel<bool>()` parsed as the comparison
+        `channel < bool > …`). Added a *targeted* turbofish-call form in
+        `parsePostfix` — gated to the `channel` builtin (`isChannelBase`) with a
+        balanced-`<…>`-then-`(` lookahead (`angleThenParen`) so the general
+        `a<b>(c)` ambiguity is untouched — producing `CALL_EXPR[PATH, GENERIC_ARGS,
+        CALL_ARGS]`. **build_hir:** `channelElemType` reads the `<T>` (i64/bool/f64/
+        f32) and sets `chan_elem` explicitly, overriding the syntactic inference;
+        the `policy:` / `capacity:` named args ride the call args (capacity drives
+        backpressure as before; sema's `CONC050` already requires a policy on the
+        typed form, satisfied by writing one). Verified wasm64 + wasm32:
+        `channel<bool>(policy: Backpressure, capacity: 4)` + `channel<i64>(policy:
+        Unbounded)` → 1 / 7 / false, including a **bare-variable** bool send the
+        inference can't see (explicit `<bool>` catches it). Adds two parser
+        round-trip cases, a build_hir test, and a link-roundtrip section. **Next on
+        this groundwork:** `str`/record `T` (boxed/multi-slot cells, reusing the
+        enum-str-payload `record_alloc`), and the `let (tx, rx) = channel<T>(…)`
+        sender/receiver split (spec form).
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

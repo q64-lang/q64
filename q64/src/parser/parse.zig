@@ -203,6 +203,56 @@ const Parser = struct {
         return self.tokens[i].kind;
     }
 
+    /// Is `base` the bare `channel` path (a single IDENT "channel")? The only
+    /// name for which `<…>(` is parsed as a turbofish call rather than a
+    /// comparison (the channel constructor needs its element type).
+    fn isChannelBase(base: *const cst.Node) bool {
+        if (base.kind != .PATH_EXPR) return false;
+        var name: ?[]const u8 = null;
+        var n: usize = 0;
+        for (base.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind.isTrivia()) continue;
+                if (t.kind != .IDENT) return false;
+                name = t.text;
+                n += 1;
+            },
+            .node => return false,
+        };
+        return n == 1 and name != null and std.mem.eql(u8, name.?, "channel");
+    }
+
+    /// At a `<`, is there a balanced `<…>` whose closing `>` is immediately
+    /// followed (past trivia) by `(`? Distinguishes `channel<T>(` (a turbofish
+    /// call) from `channel < x` (a comparison with no following call).
+    fn angleThenParen(self: *const Parser) bool {
+        var i = self.pos;
+        if (i >= self.tokens.len or self.tokens[i].kind != .L_ANGLE) return false;
+        var depth: i32 = 0;
+        while (i < self.tokens.len) : (i += 1) {
+            switch (self.tokens[i].kind) {
+                .L_ANGLE => depth += 1,
+                .R_ANGLE => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        i += 1;
+                        break;
+                    }
+                },
+                .SHR => {
+                    depth -= 2;
+                    if (depth <= 0) {
+                        i += 1;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        } else return false;
+        while (i < self.tokens.len and self.tokens[i].kind.isTrivia()) : (i += 1) {}
+        return i < self.tokens.len and self.tokens[i].kind == .L_PAREN;
+    }
+
     /// Parse an expression with the record-literal restriction lifted —
     /// inside parens/brackets/argument lists the `{` is unambiguous.
     fn parseExprUnrestricted(self: *Parser) std.mem.Allocator.Error!*const cst.Node {
@@ -2347,6 +2397,20 @@ const Parser = struct {
                     try children.append(self.arena, .{ .node = args });
                     base = try cst.makeNode(self.arena, .CALL_EXPR, children.items);
                 },
+                .L_ANGLE => {
+                    // `channel<T>(…)` — the one turbofish call form q64 parses (the
+                    // channel constructor needs its element type; general `a<b>(c)`
+                    // stays a comparison). Fires only when the base is the `channel`
+                    // path and a balanced `<…>` is immediately followed by `(`.
+                    if (base.kind != .PATH_EXPR or !isChannelBase(base) or !self.angleThenParen()) break;
+                    var children: std.ArrayList(cst.Element) = .empty;
+                    try children.append(self.arena, .{ .node = base });
+                    try children.append(self.arena, .{ .node = try self.parseGenericArgs() });
+                    try self.eatTrivia(&children);
+                    const args = try self.parseCallArgs();
+                    try children.append(self.arena, .{ .node = args });
+                    base = try cst.makeNode(self.arena, .CALL_EXPR, children.items);
+                },
                 .L_BRACK => {
                     var children: std.ArrayList(cst.Element) = .empty;
                     try children.append(self.arena, .{ .node = base });
@@ -2747,6 +2811,10 @@ test "round-trip: serialize(parse(s)) == s" {
         // preserved as tokens (spec form `channel(capacity: 4)`).
         "fn main {\n    let ch = channel(capacity: 4)\n}\n",
         "fn main {\n    plot(width: 80, height: 24)\n}\n",
+        // Typed channel construction — the `channel<T>(…)` turbofish call (the one
+        // turbofish form q64 parses; spec/concurrency.md §\"Channel construction\").
+        "fn main {\n    let ch = channel<bool>(policy: Backpressure, capacity: 4)\n}\n",
+        "fn main {\n    let ch = channel<i64>(policy: Unbounded)\n}\n",
     };
 
     for (sources) |src| {

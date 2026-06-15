@@ -3167,4 +3167,47 @@ fc32_out="$("$HOST_BIN" "$tmp/floatchan32.wasm")"
 [[ "$fc32_out" == "$fc_expected" ]] || { echo "FAIL: f64 channel wasm32 (got: $fc32_out)" >&2; exit 1; }
 echo "    ok: f64 channel -> 3.0/4.5/2.0 (wasm64 + wasm32; f64 bit-cast through the i64 cell, real float math)"
 
+echo "==> channels: typed channel<T>(policy, capacity) — explicit element type"
+tc_app="$tmp/typedchan.q"
+cat > "$tc_app" <<'Q64'
+fn main {
+    scope {
+        let flags = channel<bool>(policy: Backpressure, capacity: 4)
+        let nums = channel<i64>(policy: Unbounded)
+        let done = channel()
+        spawn {
+            let v = 2 > 1
+            flags.send(v)
+            nums.send(7)
+            flags.send(false)
+            let _ = done.recv()
+        }
+        spawn {
+            let a = flags.recv()
+            if a {
+                env.out(1)
+            } else {
+                env.out(0)
+            }
+            let n = nums.recv()
+            env.out(n)
+            let b = flags.recv()
+            env.out(b)
+            done.send(1)
+        }
+    }
+}
+Q64
+# The `channel<T>(policy:…)` turbofish gives the element type explicitly: `flags`
+# is bool even though the first send is a bare variable (inference would miss it).
+# a=true -> 1, n=7, b=false. The typed i64 `nums` is unaffected.
+tc_expected=$'1\n7\nfalse'
+"$Q64_BIN" emit "$tc_app" "$tmp/typedchan.wasm"
+tc_out="$("$HOST_BIN" "$tmp/typedchan.wasm")"
+[[ "$tc_out" == "$tc_expected" ]] || { echo "FAIL: typed channel (got: $tc_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$tc_app" "$tmp/typedchan32.wasm" --addr wasm32
+tc32_out="$("$HOST_BIN" "$tmp/typedchan32.wasm")"
+[[ "$tc32_out" == "$tc_expected" ]] || { echo "FAIL: typed channel wasm32 (got: $tc32_out)" >&2; exit 1; }
+echo "    ok: typed channel -> 1/7/false (wasm64 + wasm32; channel<bool>/<i64> explicit element type + policy)"
+
 echo "PASS: $qube_out"

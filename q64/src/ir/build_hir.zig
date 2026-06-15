@@ -1605,6 +1605,29 @@ fn channelCapOf(cc: ast.CallExpr) ?i64 {
     return v;
 }
 
+/// The explicit element type of a typed `channel<T>(…)` constructor, read from
+/// its `GENERIC_ARGS` node — the robust alternative to inferring from sends. v0
+/// scalar cells: `i64` / `bool` / `f64` / `f32`; `str`/record `T` await boxed
+/// storage. Null when there's no type argument (an untyped `channel(…)`).
+fn channelElemType(cc: ast.CallExpr) ?hir.Type {
+    for (cc.cst.children) |c| switch (c) {
+        .node => |n| if (n.kind == .GENERIC_ARGS) {
+            for (n.children) |gc| switch (gc) {
+                .token => |t| if (t.kind == .IDENT) {
+                    if (std.mem.eql(u8, t.text, "bool")) return .bool;
+                    if (std.mem.eql(u8, t.text, "f64")) return .f64;
+                    if (std.mem.eql(u8, t.text, "f32")) return .f32;
+                    if (std.mem.eql(u8, t.text, "i64")) return .i64;
+                    return null; // str/record/other T: later (boxed storage)
+                },
+                .node => {},
+            };
+        },
+        .token => {},
+    };
+    return null;
+}
+
 // A task lowers to a tiny CFG of pc-numbered blocks. A `plain`/`recv` block
 // runs its stmts then jumps to `next`; a `branch` block (a loop head) tests
 // `cond` and jumps to `next` (enter body) or `alt` (exit). The pc is the block
@@ -6305,10 +6328,17 @@ fn tryChannelNew(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bo
     const cname = (callPathName(b, cc)) orelse return false;
     defer b.a.free(cname);
     if (!std.mem.eql(u8, cname, "channel")) return false;
-    // A bounded channel: `channel(capacity: N)` — the (sole, v0) argument is the
-    // capacity. Record it so the scheduler can park a `send` when the buffer is
-    // full. `channel()` (no arg) stays unbounded (no entry in `chan_caps`).
+    // A bounded channel: `channel(capacity: N)` — record the capacity so the
+    // scheduler can park a `send` when the buffer is full. `channel()` (no arg)
+    // stays unbounded (no entry in `chan_caps`).
     if (channelCapOf(cc)) |cap| try scope.chan_caps.put(b.a, name, cap);
+    // A typed `channel<T>(…)`: the element type is explicit (overrides any
+    // syntactic inference from sends). Untyped channels keep the i64 default /
+    // inferred type. (str/record `T` aren't lowerable yet — `channelElemType`
+    // returns null, so they fall back to i64 for now.)
+    if (channelElemType(cc)) |et| {
+        if (et != .i64) try scope.chan_elem.put(b.a, name, et);
+    }
     // The buffer: a Vec under `name`.
     const v_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
     try scope.vecs.put(b.a, name, {});
@@ -10305,6 +10335,43 @@ test "channels: an f64-payload channel bit-casts through the i64 cell" {
     try testing.expect(std.mem.indexOf(u8, dump, "bitcast<i64>") != null); // send: f64 -> i64 cell
     try testing.expect(std.mem.indexOf(u8, dump, "bitcast<f64>") != null); // recv: i64 cell -> f64
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_float") != null); // env.out(x * 2.0) is f64
+}
+
+test "channels: typed channel<T>(policy) sets the element type explicitly" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // The `channel<bool>(…)` turbofish parses as a call and the element type is
+    // read from `<bool>` — robust even when the send is a bare variable that the
+    // syntactic inference can't see. The recv binds a bool (`!= 0`); the send
+    // widens (`i64(...)`). (`channel<i64>` keeps the default — no `chan_elem`.)
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let flags = channel<bool>(policy: Unbounded)
+        \\        let done = channel()
+        \\        spawn {
+        \\            let v = 2 > 1
+        \\            flags.send(v)
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            let ok = flags.recv()
+        \\            if ok {
+        \\                env.out(111)
+        \\            } else {
+        \\                env.out(0)
+        \\            }
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "ne 0") != null); // recv binds bool from the explicit type
+    try testing.expect(std.mem.indexOf(u8, dump, "i64(") != null); // send widens the bool to the cell
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
