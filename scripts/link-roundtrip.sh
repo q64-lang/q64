@@ -3286,4 +3286,48 @@ rc32_out="$("$HOST_BIN" "$tmp/recchan32.wasm")"
 [[ "$rc32_out" == "$rc_expected" ]] || { echo "FAIL: record channel wasm32 (got: $rc32_out)" >&2; exit 1; }
 echo "    ok: record channel -> 1/99/1/2/0 (wasm64 + wasm32; record by base pointer, fields resolve after recv)"
 
+echo "==> channels: enum-payload channel (tag+payload box through the cell)"
+ec_app="$tmp/enumchan.q"
+cat > "$ec_app" <<'Q64'
+enum Status { Done(i64), Fail }
+
+fn main {
+    scope {
+        let events = channel<Status>(policy: Unbounded)
+        let done = channel()
+        spawn {
+            events.send(Status.Done(42))
+            events.send(Status.Fail)
+            let _ = done.recv()
+        }
+        spawn {
+            let a = events.recv()
+            let r1 = match a {
+                Done(n) -> n,
+                Fail -> 0 - 1,
+            }
+            env.out(r1)
+            let b = events.recv()
+            let r2 = match b {
+                Done(n) -> n,
+                Fail -> 0 - 1,
+            }
+            env.out(r2)
+            done.send(1)
+        }
+    }
+}
+Q64
+# channel<Status> carries the boxed tag+payload enum by its base pointer; recv
+# re-registers the binding so a match resolves both variants (incl. the payload
+# binder n). Done(42) -> 42, Fail -> -1.
+ec_expected=$'42\n-1'
+"$Q64_BIN" emit "$ec_app" "$tmp/enumchan.wasm"
+ec_out="$("$HOST_BIN" "$tmp/enumchan.wasm")"
+[[ "$ec_out" == "$ec_expected" ]] || { echo "FAIL: enum channel (got: $ec_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$ec_app" "$tmp/enumchan32.wasm" --addr wasm32
+ec32_out="$("$HOST_BIN" "$tmp/enumchan32.wasm")"
+[[ "$ec32_out" == "$ec_expected" ]] || { echo "FAIL: enum channel wasm32 (got: $ec32_out)" >&2; exit 1; }
+echo "    ok: enum channel -> 42/-1 (wasm64 + wasm32; tag+payload box by pointer, match resolves after recv)"
+
 echo "PASS: $qube_out"

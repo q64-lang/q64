@@ -6345,6 +6345,8 @@ fn tryChannelNew(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bo
     if (channelGenericName(cc)) |tname| {
         if (scalarChanType(tname)) |et| {
             if (et != .i64) try scope.chan_elem.put(b.a, name, et);
+        } else if (b.enums.get(tname)) |info| {
+            try scope.chan_enum.put(b.a, name, info);
         } else if (b.structs.get(tname)) |si| {
             try scope.chan_rec.put(b.a, name, si);
         }
@@ -6384,10 +6386,11 @@ fn tryChannelSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*h
     const vref = try b.a.create(hir.Expr);
     vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
     const elem = scope.chan_elem.get(head);
-    // A record channel passes the payload by pointer: the record already lives in
-    // an arena, so its base pointer (widened to i64) rides the cell; recv narrows
-    // it back and re-registers the binding. (The send arg must be a record value.)
-    if (scope.chan_rec.get(head)) |_| {
+    // A record or enum channel passes the payload by pointer: the value already
+    // lives in an arena (records are boxed, enums are tag+payload boxes), so its
+    // base pointer (widened to i64) rides the cell; recv narrows it back and
+    // re-registers the binding. (The send arg must be that record/enum value.)
+    if (scope.chan_rec.contains(head) or scope.chan_enum.contains(head)) {
         const rv = (try buildRecExpr(b, a0, scope)) orelse return error.Unsupported;
         const widened = try b.a.create(hir.Expr);
         widened.* = .{ .num_cast = .{ .to = .i64, .value = rv.e } };
@@ -6466,6 +6469,19 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
             const rbind = try b.a.create(hir.Stmt);
             rbind.* = .{ .let = .{ .idx = r_idx, .value = recp } };
             try out.append(b.a, rbind);
+        } else if (scope.chan_enum.get(head)) |info| {
+            // The cell holds the enum box's base pointer (widened). Narrow it, bind
+            // a .ptr local, and re-register in both `recs` (boxed struct) and
+            // `enum_binds` so `match` and field access resolve — mirroring how a
+            // `let r = makeEnum()` enum binding is set up.
+            const enp = try b.a.create(hir.Expr);
+            enp.* = .{ .num_cast = .{ .to = .ptr, .value = get } };
+            const e_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
+            try scope.recs.put(b.a, name, info.si.?);
+            try scope.enum_binds.put(b.a, name, info);
+            const ebind = try b.a.create(hir.Stmt);
+            ebind.* = .{ .let = .{ .idx = e_idx, .value = enp } };
+            try out.append(b.a, ebind);
         } else if (elem == .str) {
             // The cell is the str box pointer (widened). Narrow it, stash it in a
             // temp, then load (ptr, len) from {ptr@0, len@8} into a str binding.
@@ -7708,6 +7724,12 @@ const Scope = struct {
     /// re-registers the binding in `recs` (so field access resolves). Mutually
     /// exclusive with a scalar `chan_elem` entry for the same channel.
     chan_rec: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
+    /// An enum-payload channel (`channel<Result>(…)`): name → the payload's
+    /// `EnumInfo`. Enums are boxed (tag + payload), so — like records — `send`
+    /// passes the box's base pointer through the cell and `recv` narrows it back
+    /// and re-registers the binding (in both `recs` and `enum_binds`, so `match`
+    /// and field access resolve). Mutually exclusive with `chan_elem`/`chan_rec`.
+    chan_enum: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
     /// Inside an actor handler body, the actor's state struct — so a bare field
     /// name (`n`) resolves to `self.n` (read, write, and type), the implicit-
     /// self convention. `self` itself is registered in `recs`.
@@ -10514,6 +10536,42 @@ test "channels: a record-payload channel passes the base pointer through the cel
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null); // a.x / a.y read through the recv'd pointer
     try testing.expect(std.mem.indexOf(u8, dump, "i64(record_alloc") != null); // sent record's base pointer, widened
+}
+
+test "channels: an enum-payload channel passes the box pointer and matches after recv" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `channel<Status>(…)` carries a tag+payload enum box by its base pointer (the
+    // record path); recv narrows it back and re-registers in `enum_binds` so a
+    // `match` on the recv'd value resolves both variants (incl. the payload binder).
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\enum Status { Done(i64), Fail }
+        \\fn main {
+        \\    scope {
+        \\        let events = channel<Status>(policy: Unbounded)
+        \\        let done = channel()
+        \\        spawn {
+        \\            events.send(Status.Done(42))
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            let a = events.recv()
+        \\            let r = match a {
+        \\                Done(n) -> n,
+        \\                Fail -> 0 - 1,
+        \\            }
+        \\            env.out(r)
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "i64(record_alloc") != null); // sent enum box's base pointer, widened
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null); // match reads the tag/payload after recv
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

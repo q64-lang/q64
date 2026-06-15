@@ -410,9 +410,10 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         link-roundtrip sections; all prior scheduler + static cases still pass.
         **v0 boundaries (next):** the `(tx, rx)` sender/receiver split. (Since
         landed: discard recvs, `break`/`continue` in task loops, statement `match`
-        in a task, nested task loops, bool + f64 + str + record channel payloads,
-        typed `channel<T>(policy:…)` construction, `select` parking, bounded-channel
-        backpressure, cooperative `ask`, and lifting the scheduler into callees.)
+        in a task, nested task loops, bool + f64 + str + record + enum channel
+        payloads, typed `channel<T>(policy:…)` construction, `select` parking,
+        bounded-channel backpressure, cooperative `ask`, and lifting the scheduler
+        into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -647,9 +648,23 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         split the type-name read from the builtin-scalar mapping). Verified wasm64
         + wasm32: a producer sending a record literal and a record binding (mixed
         i64/bool fields), consumer reading fields after recv → 1 / 99 / 1 / 2 / 0.
-        Adds a build_hir test and a link-roundtrip section. **Channel payloads now
-        cover i64 / bool / f64 / str / record;** only enum `T` remains (a boxed
-        tag+payload, the natural next extension of the str box).
+        Adds a build_hir test and a link-roundtrip section.
+  - [x] **enum channel payloads (tag+payload box through the i64 cell).** A
+        `channel<Status>(…)` now carries enums. An enum value is a boxed tag+payload
+        referred to by a base pointer — exactly the record shape — so the **send is
+        the same code path as records** (`buildRecExpr` gives the box pointer,
+        widened into the cell). recv narrows it back, binds a `.ptr` local, and
+        re-registers the binding in **both** `recs` (boxed struct) and `enum_binds`
+        (the `EnumInfo`), mirroring a `let r = makeEnum()` binding, so a `match` on
+        the recv'd value resolves every variant including payload binders. A new
+        `Scope.chan_enum` map (name → `EnumInfo`) holds the payload type, resolved
+        at construction via `b.enums` (checked before `b.structs`). Verified wasm64
+        + wasm32: producer sending `Status.Done(42)` and `Status.Fail`, consumer
+        matching each after recv → 42 / -1. (Note: a custom enum's variants are
+        constructed qualified — `Status.Done(42)` — since bare `Ok`/`Err`/`Some`
+        are the prelude's; match arms take either form.) Adds a build_hir test and
+        a link-roundtrip section. **Channel payloads now cover i64 / bool / f64 /
+        str / record / enum** — the full value matrix.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs
