@@ -408,12 +408,11 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         mutual `while` ping-pong → 10 / 20 / 30; an `if`/`else` server reply
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
-        **v0 boundaries (next):** record channel payloads; the `(tx, rx)`
-        sender/receiver split. (Since landed: discard recvs, `break`/`continue` in
-        task loops, statement `match` in a task, nested task loops, bool + f64 +
-        str channel payloads, typed `channel<T>(policy:…)` construction, `select`
-        parking, bounded-channel backpressure, cooperative `ask`, and lifting the
-        scheduler into callees.)
+        **v0 boundaries (next):** the `(tx, rx)` sender/receiver split. (Since
+        landed: discard recvs, `break`/`continue` in task loops, statement `match`
+        in a task, nested task loops, bool + f64 + str + record channel payloads,
+        typed `channel<T>(policy:…)` construction, `select` parking, bounded-channel
+        backpressure, cooperative `ask`, and lifting the scheduler into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -635,7 +634,22 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         (`let g = "lit"; ch.send(g)`) can't be sent — folded literals live in the
         const evaluator, not a scope str binding (a pre-existing `buildStrExpr`
         gap, unrelated to channels); use the literal directly or a `var`.
-        **Remaining channel-payload gap:** record/enum `T` (typed-pointer cells).
+        **Remaining channel-payload gap:** enum `T` (boxed tag+payload cells).
+  - [x] **record channel payloads (base pointer through the i64 cell).** A
+        `channel<Point>(…)` now carries records. Unlike str, no boxing is needed —
+        a record already lives in an arena and is referred to by its base pointer,
+        so `send` widens that pointer (`buildRecExpr` gives it; `num_cast .ptr →
+        .i64`) into the cell and `recv` narrows it back (`.i64 → .ptr`), binds a
+        `.ptr` local, and **re-registers** the binding in `scope.recs` so field
+        access (`a.x`, `a.ok`) resolves. A new `Scope.chan_rec` map (name →
+        `StructInfo`) holds the payload type, resolved at construction by looking
+        the `<T>` name up in `b.structs` (`channelGenericName` + `scalarChanType`
+        split the type-name read from the builtin-scalar mapping). Verified wasm64
+        + wasm32: a producer sending a record literal and a record binding (mixed
+        i64/bool fields), consumer reading fields after recv → 1 / 99 / 1 / 2 / 0.
+        Adds a build_hir test and a link-roundtrip section. **Channel payloads now
+        cover i64 / bool / f64 / str / record;** only enum `T` remains (a boxed
+        tag+payload, the natural next extension of the str box).
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

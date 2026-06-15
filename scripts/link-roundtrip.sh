@@ -3246,4 +3246,44 @@ sc32_out="$("$HOST_BIN" "$tmp/strchan32.wasm")"
 [[ "$sc32_out" == "$sc_expected" ]] || { echo "FAIL: str channel wasm32 (got: $sc32_out)" >&2; exit 1; }
 echo "    ok: str channel -> hello/world/5 (wasm64 + wasm32; boxed (ptr,len), recv'd str printable + .len)"
 
+echo "==> channels: record-payload channel (base pointer through the cell)"
+rc_app="$tmp/recchan.q"
+cat > "$rc_app" <<'Q64'
+struct Msg { id: i64, score: i64, ok: bool }
+
+fn main {
+    scope {
+        let q = channel<Msg>(policy: Unbounded)
+        let done = channel()
+        spawn {
+            q.send(Msg { id: 1, score: 99, ok: true })
+            let m = Msg { id: 2, score: 7, ok: false }
+            q.send(m)
+            let _ = done.recv()
+        }
+        spawn {
+            let a = q.recv()
+            env.out(a.id)
+            env.out(a.score)
+            if a.ok { env.out(1) } else { env.out(0) }
+            let b = q.recv()
+            env.out(b.id)
+            if b.ok { env.out(1) } else { env.out(0) }
+            done.send(1)
+        }
+    }
+}
+Q64
+# channel<Msg> carries records by their arena base pointer (widened through the
+# i64 cell); recv re-registers the binding so field access resolves. A literal
+# and a record-binding send, mixed i64/bool fields. -> 1 / 99 / 1 / 2 / 0.
+rc_expected=$'1\n99\n1\n2\n0'
+"$Q64_BIN" emit "$rc_app" "$tmp/recchan.wasm"
+rc_out="$("$HOST_BIN" "$tmp/recchan.wasm")"
+[[ "$rc_out" == "$rc_expected" ]] || { echo "FAIL: record channel (got: $rc_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$rc_app" "$tmp/recchan32.wasm" --addr wasm32
+rc32_out="$("$HOST_BIN" "$tmp/recchan32.wasm")"
+[[ "$rc32_out" == "$rc_expected" ]] || { echo "FAIL: record channel wasm32 (got: $rc32_out)" >&2; exit 1; }
+echo "    ok: record channel -> 1/99/1/2/0 (wasm64 + wasm32; record by base pointer, fields resolve after recv)"
+
 echo "PASS: $qube_out"

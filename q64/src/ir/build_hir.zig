@@ -1605,27 +1605,32 @@ fn channelCapOf(cc: ast.CallExpr) ?i64 {
     return v;
 }
 
-/// The explicit element type of a typed `channel<T>(…)` constructor, read from
-/// its `GENERIC_ARGS` node — the robust alternative to inferring from sends. v0
-/// scalar cells: `i64` / `bool` / `f64` / `f32`; `str`/record `T` await boxed
-/// storage. Null when there's no type argument (an untyped `channel(…)`).
-fn channelElemType(cc: ast.CallExpr) ?hir.Type {
+/// The explicit element type name of a typed `channel<T>(…)` constructor, read
+/// from its `GENERIC_ARGS` node (the first type ident) — the robust alternative
+/// to inferring from sends. Null when there's no type argument (an untyped
+/// `channel(…)`).
+fn channelGenericName(cc: ast.CallExpr) ?[]const u8 {
     for (cc.cst.children) |c| switch (c) {
         .node => |n| if (n.kind == .GENERIC_ARGS) {
             for (n.children) |gc| switch (gc) {
-                .token => |t| if (t.kind == .IDENT) {
-                    if (std.mem.eql(u8, t.text, "bool")) return .bool;
-                    if (std.mem.eql(u8, t.text, "f64")) return .f64;
-                    if (std.mem.eql(u8, t.text, "f32")) return .f32;
-                    if (std.mem.eql(u8, t.text, "i64")) return .i64;
-                    if (std.mem.eql(u8, t.text, "str")) return .str;
-                    return null; // record/other T: later (boxed storage)
-                },
+                .token => |t| if (t.kind == .IDENT) return t.text,
                 .node => {},
             };
         },
         .token => {},
     };
+    return null;
+}
+
+/// A builtin scalar/str type name → its channel cell `hir.Type` (`i64` / `bool`
+/// / `f64` / `f32` / `str`). Null for a record/other name (resolved via
+/// `b.structs` into `chan_rec` instead).
+fn scalarChanType(tname: []const u8) ?hir.Type {
+    if (std.mem.eql(u8, tname, "bool")) return .bool;
+    if (std.mem.eql(u8, tname, "f64")) return .f64;
+    if (std.mem.eql(u8, tname, "f32")) return .f32;
+    if (std.mem.eql(u8, tname, "i64")) return .i64;
+    if (std.mem.eql(u8, tname, "str")) return .str;
     return null;
 }
 
@@ -6334,11 +6339,15 @@ fn tryChannelNew(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bo
     // stays unbounded (no entry in `chan_caps`).
     if (channelCapOf(cc)) |cap| try scope.chan_caps.put(b.a, name, cap);
     // A typed `channel<T>(…)`: the element type is explicit (overrides any
-    // syntactic inference from sends). Untyped channels keep the i64 default /
-    // inferred type. (str/record `T` aren't lowerable yet — `channelElemType`
-    // returns null, so they fall back to i64 for now.)
-    if (channelElemType(cc)) |et| {
-        if (et != .i64) try scope.chan_elem.put(b.a, name, et);
+    // syntactic inference from sends). A builtin scalar/str name sets `chan_elem`;
+    // a record type name resolves through `b.structs` into `chan_rec` (the payload
+    // is passed by arena pointer). Untyped channels keep the i64 default.
+    if (channelGenericName(cc)) |tname| {
+        if (scalarChanType(tname)) |et| {
+            if (et != .i64) try scope.chan_elem.put(b.a, name, et);
+        } else if (b.structs.get(tname)) |si| {
+            try scope.chan_rec.put(b.a, name, si);
+        }
     }
     // The buffer: a Vec under `name`.
     const v_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
@@ -6375,6 +6384,17 @@ fn tryChannelSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*h
     const vref = try b.a.create(hir.Expr);
     vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
     const elem = scope.chan_elem.get(head);
+    // A record channel passes the payload by pointer: the record already lives in
+    // an arena, so its base pointer (widened to i64) rides the cell; recv narrows
+    // it back and re-registers the binding. (The send arg must be a record value.)
+    if (scope.chan_rec.get(head)) |_| {
+        const rv = (try buildRecExpr(b, a0, scope)) orelse return error.Unsupported;
+        const widened = try b.a.create(hir.Expr);
+        widened.* = .{ .num_cast = .{ .to = .i64, .value = rv.e } };
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .vec_push = .{ .vec = vref, .value = widened } };
+        return st;
+    }
     // A str channel boxes the value: the (ptr, len) is stored in a 2-cell
     // {ptr@0, len@8} arena box (`record_alloc` with a str init) and the box's
     // pointer is widened to the i64 cell. recv reads the box back into a str.
@@ -6436,7 +6456,17 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
         curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
         const get = try b.a.create(hir.Expr);
         get.* = .{ .vec_get = .{ .vec = vref, .idx = curref } };
-        if (elem == .str) {
+        if (scope.chan_rec.get(head)) |si| {
+            // The cell holds the record's base pointer (widened). Narrow it, bind
+            // a .ptr local, and re-register the record so field access resolves.
+            const recp = try b.a.create(hir.Expr);
+            recp.* = .{ .num_cast = .{ .to = .ptr, .value = get } };
+            const r_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
+            try scope.recs.put(b.a, name, si);
+            const rbind = try b.a.create(hir.Stmt);
+            rbind.* = .{ .let = .{ .idx = r_idx, .value = recp } };
+            try out.append(b.a, rbind);
+        } else if (elem == .str) {
             // The cell is the str box pointer (widened). Narrow it, stash it in a
             // temp, then load (ptr, len) from {ptr@0, len@8} into a str binding.
             const boxp = try b.a.create(hir.Expr);
@@ -7667,12 +7697,17 @@ const Scope = struct {
     /// the scheduler when the buffer holds `capacity` unread elements
     /// (`vec_len - cursor >= capacity`); recv frees a slot by bumping cursor.
     chan_caps: std.StringHashMapUnmanaged(i64) = .empty,
-    /// Channel element type when it isn't the i64 default: a channel inferred to
-    /// carry `bool` (from a syntactically-boolean `send`). A `recv` then binds a
-    /// `bool` local (so `env.out` formats true/false and bool ops typecheck) and
-    /// `send` widens the i32 boolean to the i64 buffer cell. v0: bool only —
-    /// f64/str/record payloads need bitcast / multi-slot storage (later).
+    /// Channel element type when it isn't the i64 default — `bool` (inferred from
+    /// a syntactically-boolean `send`, or explicit `channel<bool>`), `f64`, or
+    /// `str`. `recv` decodes the cell to the element type (bool `!= 0`, f64 bit-
+    /// cast, str unboxed) and `send` encodes it. Records use `chan_rec` instead.
     chan_elem: std.StringHashMapUnmanaged(hir.Type) = .empty,
+    /// A record-payload channel (`channel<Point>(…)`): name → the payload's
+    /// `StructInfo`. The record already lives in an arena, so `send` passes its
+    /// base pointer through the i64 cell (widened) and `recv` narrows it back and
+    /// re-registers the binding in `recs` (so field access resolves). Mutually
+    /// exclusive with a scalar `chan_elem` entry for the same channel.
+    chan_rec: std.StringHashMapUnmanaged(*const StructInfo) = .empty,
     /// Inside an actor handler body, the actor's state struct — so a bare field
     /// name (`n`) resolves to `self.n` (read, write, and type), the implicit-
     /// self convention. `self` itself is registered in `recs`.
@@ -10446,6 +10481,39 @@ test "channels: a str-payload channel boxes the (ptr,len) through the cell" {
     try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") != null); // the send-side str box
     try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null); // recv loads (ptr,len) from the box
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_str") != null); // env.out(a) prints the string
+}
+
+test "channels: a record-payload channel passes the base pointer through the cell" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `channel<Point>(…)` carries records by arena pointer: send widens the
+    // record's base pointer into the i64 cell, recv narrows it back and
+    // re-registers the binding so `a.x` / `a.y` resolve through `recs`.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\struct Point { x: i64, y: i64 }
+        \\fn main {
+        \\    scope {
+        \\        let pts = channel<Point>(policy: Unbounded)
+        \\        let done = channel()
+        \\        spawn {
+        \\            pts.send(Point { x: 3, y: 4 })
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            let a = pts.recv()
+        \\            env.out(a.x)
+        \\            env.out(a.y)
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "field_get") != null); // a.x / a.y read through the recv'd pointer
+    try testing.expect(std.mem.indexOf(u8, dump, "i64(record_alloc") != null); // sent record's base pointer, widened
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
