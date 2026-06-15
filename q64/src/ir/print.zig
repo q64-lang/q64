@@ -173,6 +173,11 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, nc.value);
             try app(gpa, out, ")", .{});
         },
+        .bitcast => |bc| {
+            try app(gpa, out, "bitcast<{s}>(", .{@tagName(bc.to)});
+            try hirExpr(gpa, out, bc.value);
+            try app(gpa, out, ")", .{});
+        },
         .bool_const => |v| try app(gpa, out, "{s}", .{if (v) "true" else "false"}),
         .local => |l| try app(gpa, out, "local#{d}", .{l.idx}),
         .global_get => |i| try app(gpa, out, "global#{d}", .{i}),
@@ -372,6 +377,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .const_f64 => |v| try app(gpa, out, "const_f64 {d}\n", .{v}),
         .num_cast => |src| {
             try app(gpa, out, "num_cast -> {s}\n", .{@tagName(inst.ty)});
+            try mirInst(gpa, out, src, depth + 1);
+        },
+        .bitcast => |src| {
+            try app(gpa, out, "bitcast -> {s}\n", .{@tagName(inst.ty)});
             try mirInst(gpa, out, src, depth + 1);
         },
         .const_i32 => |v| try app(gpa, out, "const_i32 {d}\n", .{v}),

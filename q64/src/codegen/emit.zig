@@ -932,6 +932,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .host_out_float => |h| bodyHasOut(h.value, want_int), // __fmt_f64 is its own helper
         .fmt_float_to_str => |inner| bodyHasOut(inner, want_int),
         .num_cast => |src| bodyHasOut(src, want_int),
+        .bitcast => |src| bodyHasOut(src, want_int),
         .host_out_str => |h| !want_int or bodyHasOut(h.value, want_int),
         .block => |items| blk: {
             for (items) |child| if (bodyHasOut(child, want_int)) break :blk true;
@@ -1152,6 +1153,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(inner, s);
         },
         .num_cast => |src| scanScratch(src, s),
+        .bitcast => |src| scanScratch(src, s),
         .host_out_float => |h| {
             s.host_out = true; // pair scratch for the (ptr, len) split
             s.has_float_fmt = true;
@@ -1377,6 +1379,18 @@ const Lowerer = struct {
                         .i32 => c.BinaryenExtendUInt32(),
                         else => return Error.UnsupportedCall,
                     },
+                    else => return Error.UnsupportedCall,
+                };
+                return c.BinaryenUnary(module, op, x);
+            },
+            .bitcast => |src| {
+                // f64 ↔ i64 bit reinterpretation (raw bits kept) — an f64 channel
+                // cell. Same width both ways, so only these two directions exist.
+                const x = try self.inst(src);
+                if (src.ty == n.ty) return x;
+                const op: c.BinaryenOp = switch (n.ty) {
+                    .i64 => c.BinaryenReinterpretFloat64(),
+                    .f64 => c.BinaryenReinterpretInt64(),
                     else => return Error.UnsupportedCall,
                 };
                 return c.BinaryenUnary(module, op, x);

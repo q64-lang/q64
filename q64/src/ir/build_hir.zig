@@ -1192,6 +1192,24 @@ fn exprSyntacticBool(e: ast.Expr) bool {
     };
 }
 
+/// Is `e` syntactically an `f64` — a float literal, or arithmetic/parens over
+/// one? Structural (no scope), the float analogue of `exprSyntacticBool`. A bare
+/// identifier or call stays undecided (the channel keeps the i64 default).
+fn exprSyntacticFloat(e: ast.Expr) bool {
+    return switch (e) {
+        .num_lit => |n| if (n.token()) |t| t.kind == .FLOAT_LIT else false,
+        .paren => |p| if (p.inner()) |inner| exprSyntacticFloat(inner) else false,
+        .unary => |ux| if (ux.operand()) |o| exprSyntacticFloat(o) else false,
+        .bin => |bx| if (bx.op()) |op| switch (op.kind) {
+            // Arithmetic over a float operand is f64 (no implicit int↔float mix).
+            .PLUS, .MINUS, .STAR, .SLASH => (if (bx.lhs()) |l| exprSyntacticFloat(l) else false) or
+                (if (bx.rhs()) |r| exprSyntacticFloat(r) else false),
+            else => false,
+        } else false,
+        else => false,
+    };
+}
+
 /// Infer the scope's channels' element types from their `send`s and record any
 /// non-default (bool) ones in `scope.chan_elem`. Walks parent statements and
 /// spawned task bodies (recursively through control flow) for `ch.send(arg)`
@@ -1221,12 +1239,17 @@ fn inferBoolSendsInBlock(b: *Builder, body: ast.Block, chans: *const std.StringH
 }
 
 fn inferBoolSendInStmt(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void), scope: *Scope) BuildError!void {
-    // `ch.send(arg)` with a syntactically-boolean arg → mark the channel bool.
+    // `ch.send(arg)` with a syntactically-typed arg → record the channel's
+    // element type (f64 takes precedence over bool; otherwise the i64 default).
     if (sendStepChan(b, stmt, chans)) |ch| {
         const cc = stmt.expr_stmt.expression().?.call;
         var ait = cc.args();
         if (ait.next()) |a0| {
-            if (exprSyntacticBool(a0)) try scope.chan_elem.put(b.a, ch, .bool);
+            if (exprSyntacticFloat(a0)) {
+                try scope.chan_elem.put(b.a, ch, .f64);
+            } else if (exprSyntacticBool(a0)) {
+                try scope.chan_elem.put(b.a, ch, .bool);
+            }
         }
     }
     // Recurse through control flow that can contain sends.
@@ -6320,14 +6343,19 @@ fn tryChannelSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*h
     if (ait.next() != null) return error.Unsupported; // v0: one value per send
     const vref = try b.a.create(hir.Expr);
     vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-    // On a bool channel the value is an i32 boolean; widen it to the i64 buffer
-    // cell with an `i64(...)` cast so `__vec_push` (which takes i64) typechecks.
+    // Conform the sent value to the i64 buffer cell. A bool (i32) widens with an
+    // `i64(...)` cast; an f64 is **bit-reinterpreted** to i64 (raw bits kept), so
+    // `__vec_push` (which takes i64) typechecks either way.
     var value = try buildIntExpr(b, a0, scope);
     if (scope.chan_elem.get(head)) |et| {
         if (et == .bool) {
             const cast = try b.a.create(hir.Expr);
             cast.* = .{ .num_cast = .{ .to = .i64, .value = value } };
             value = cast;
+        } else if (et == .f64) {
+            const bc = try b.a.create(hir.Expr);
+            bc.* = .{ .bitcast = .{ .to = .i64, .value = value } };
+            value = bc;
         }
     }
     const st = try b.a.create(hir.Stmt);
@@ -6359,9 +6387,10 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
         curref.* = .{ .local = .{ .idx = cur_idx, .ty = .i64 } };
         const get = try b.a.create(hir.Expr);
         get.* = .{ .vec_get = .{ .vec = vref, .idx = curref } };
-        // A bool channel: the i64 cell holds 0/1; bind a `bool` local (so
-        // `env.out` formats true/false and bool ops typecheck) by truthiness-
-        // testing the cell (`!= 0` → i32 boolean). Otherwise an i64 binding.
+        // Decode the i64 cell to the channel's element type. A bool binds a
+        // `bool` (truthiness `!= 0` → i32) so `env.out` formats true/false; an
+        // f64 binds an `f64` via a bit reinterpretation (raw bits kept). The i64
+        // default binds the cell directly.
         const elem: hir.Type = scope.chan_elem.get(head) orelse .i64;
         var value = get;
         if (elem == .bool) {
@@ -6370,6 +6399,10 @@ fn tryChannelRecv(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: b
             const ne = try b.a.create(hir.Expr);
             ne.* = .{ .bin = .{ .kind = .ne, .lhs = get, .rhs = z } };
             value = ne;
+        } else if (elem == .f64) {
+            const bc = try b.a.create(hir.Expr);
+            bc.* = .{ .bitcast = .{ .to = .f64, .value = get } };
+            value = bc;
         }
         const v_idx = try declareBodyLocal(b, scope, name, mutable, elem);
         const bind = try b.a.create(hir.Stmt);
@@ -10239,6 +10272,39 @@ test "channels: a bool-payload channel binds a bool recv and widens the send" {
     try testing.expect(std.mem.indexOf(u8, dump, "ne 0") != null); // the bool recv (truthiness of the cell)
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_bool") != null); // env.out(a) formats true/false
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null); // env.out(n) — the i64 channel
+}
+
+test "channels: an f64-payload channel bit-casts through the i64 cell" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A channel whose sends are syntactically float carries f64: the `send`
+    // bit-reinterprets the f64 to the i64 cell, the `recv` reinterprets back to
+    // an `f64` binding (raw bits kept — not a value-converting cast). The recv'd
+    // value is a real f64 usable in float arithmetic.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        let done = channel()
+        \\        spawn {
+        \\            ch.send(2.5)
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            let x = ch.recv()
+        \\            env.out(x * 2.0)
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "bitcast<i64>") != null); // send: f64 -> i64 cell
+    try testing.expect(std.mem.indexOf(u8, dump, "bitcast<f64>") != null); // recv: i64 cell -> f64
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_float") != null); // env.out(x * 2.0) is f64
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

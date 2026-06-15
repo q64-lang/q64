@@ -3132,4 +3132,39 @@ bp32_out="$("$HOST_BIN" "$tmp/boolchan32.wasm")"
 [[ "$bp32_out" == "$bp_expected" ]] || { echo "FAIL: bool channel wasm32 (got: $bp32_out)" >&2; exit 1; }
 echo "    ok: bool channel -> 1/42/false (wasm64 + wasm32; bool recv in if + true/false, i64 channel intact)"
 
+echo "==> channels: f64-payload channel (bit-cast through the i64 cell)"
+fc_app="$tmp/floatchan.q"
+cat > "$fc_app" <<'Q64'
+fn main {
+    scope {
+        let samples = channel()
+        let done = channel()
+        spawn {
+            samples.send(1.5)
+            samples.send(2.25)
+            samples.send(0.5 + 0.5)
+            let _ = done.recv()
+        }
+        spawn {
+            for i in 1..=3 {
+                let s = samples.recv()
+                env.out(s * 2.0)
+            }
+            done.send(1)
+        }
+    }
+}
+Q64
+# `samples` is inferred f64 (float-literal sends): send bit-reinterprets f64->i64
+# for the cell, recv reinterprets back to a real f64 (usable in float math).
+# 1.5*2 / 2.25*2 / (0.5+0.5)*2 -> 3.0 / 4.5 / 2.0.
+fc_expected=$'3.0\n4.5\n2.0'
+"$Q64_BIN" emit "$fc_app" "$tmp/floatchan.wasm"
+fc_out="$("$HOST_BIN" "$tmp/floatchan.wasm")"
+[[ "$fc_out" == "$fc_expected" ]] || { echo "FAIL: f64 channel (got: $fc_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$fc_app" "$tmp/floatchan32.wasm" --addr wasm32
+fc32_out="$("$HOST_BIN" "$tmp/floatchan32.wasm")"
+[[ "$fc32_out" == "$fc_expected" ]] || { echo "FAIL: f64 channel wasm32 (got: $fc32_out)" >&2; exit 1; }
+echo "    ok: f64 channel -> 3.0/4.5/2.0 (wasm64 + wasm32; f64 bit-cast through the i64 cell, real float math)"
+
 echo "PASS: $qube_out"

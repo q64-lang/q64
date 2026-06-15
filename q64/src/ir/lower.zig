@@ -357,6 +357,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .float_const => |v| return mk(ctx.a, .f64, .{ .const_f64 = v }),
         .num_cast => |nc| return mk(ctx.a, mapType(nc.to), .{ .num_cast = try lowerExpr(ctx, nc.value) }),
+        .bitcast => |bc| return mk(ctx.a, mapType(bc.to), .{ .bitcast = try lowerExpr(ctx, bc.value) }),
         .bool_const => |v| return mk(ctx.a, .i32, .{ .const_i32 = @intFromBool(v) }),
         .local => |l| return mk(ctx.a, mapType(l.ty), .{ .local_get = l.idx }),
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),

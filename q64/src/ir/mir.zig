@@ -153,6 +153,10 @@ pub const Op = union(enum) {
     /// source the operand's type. float→int uses the *trapping* trunc
     /// (spec/types.md §Casts: narrowing traps on overflow/NaN).
     num_cast: *Inst,
+    /// A bit reinterpretation between f64 and i64 (target type = `inst.ty`); the
+    /// raw bits are kept (an f64 channel cell ↔ value). Distinct from `num_cast`,
+    /// which converts the value.
+    bitcast: *Inst,
     /// A boolean (0/1) constant — the branch leaves of a short-circuit
     /// `&&`/`||` `if_`, which yields an i32 to match comparisons and `!`.
     const_i32: i32,

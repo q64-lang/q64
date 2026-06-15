@@ -408,11 +408,12 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         mutual `while` ping-pong → 10 / 20 / 30; an `if`/`else` server reply
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
-        **v0 boundaries (next):** f64/str/record channel payloads (bool now
-        lands; the rest need bitcast / multi-slot storage). (Since landed: discard
-        recvs, `break`/`continue` in task loops, statement `match` in a task,
-        nested task loops, bool channel payloads, `select` parking, bounded-channel
-        backpressure, cooperative `ask`, and lifting the scheduler into callees.)
+        **v0 boundaries (next):** str/record channel payloads (bool + f64 now
+        land; str needs (ptr,len) cells, records need typed pointers). (Since
+        landed: discard recvs, `break`/`continue` in task loops, statement `match`
+        in a task, nested task loops, bool + f64 channel payloads, `select`
+        parking, bounded-channel backpressure, cooperative `ask`, and lifting the
+        scheduler into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -583,8 +584,23 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         **Deliberately scoped to bool:** `f64` payloads need an f64↔i64 bitcast,
         `str` needs (ptr,len) cells, and records/enums need typed pointers — and a
         bare-identifier send (`ch.send(b)`) can't be inferred without the sending
-        task's scope, so it stays i64. **Remaining task-body v0 gap:** f64/str/
-        record channel payloads.
+        task's scope, so it stays i64.
+  - [x] **f64 channel payloads (bit-cast through the i64 cell).** A channel whose
+        sends are syntactically float (`ch.send(1.5)`, float arithmetic) carries
+        `f64`: the `recv` binds a real `f64` usable in float math, formatted by
+        `__fmt_f64`. Storing an f64 in the i64 buffer needs a **bit
+        reinterpretation**, not a value cast (`num_cast` f64→i64 would *truncate*).
+        Added a first-class `bitcast` op through every IR layer — `hir.Expr.bitcast`
+        / `mir.Inst.bitcast` (lower, print, effects) → codegen
+        `BinaryenReinterpretFloat64`/`Int64`. `inferChannelTypes` gained
+        `exprSyntacticFloat` (float literal / arithmetic over one; f64 takes
+        precedence over bool); `send` bitcasts f64→i64 into the cell, `recv`
+        bitcasts the cell→f64. Verified wasm64 + wasm32: `1.5` / `2.25` /
+        `0.5+0.5` doubled on recv → 3.0 / 4.5 / 2.0 (real float arithmetic on the
+        received value). Adds a build_hir test and a link-roundtrip section; bool
+        and i64 channels (and all prior cases) still pass. **Remaining task-body
+        v0 gap:** str/record channel payloads (str needs (ptr,len) cells, records
+        typed pointers — and a bare-identifier float send still stays i64).
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

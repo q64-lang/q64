@@ -166,6 +166,7 @@ fn collectExpr(
         .concat => |pieces| for (pieces) |p| try collectExpr(a, p, d, e),
         .fmt_int, .fmt_float => |inner| try collectExpr(a, inner, d, e),
         .num_cast => |nc| try collectExpr(a, nc.value, d, e),
+        .bitcast => |bc| try collectExpr(a, bc.value, d, e),
         .str_len => |s| try collectExpr(a, s, d, e),
         .str_index => |si| {
             try collectExpr(a, si.str, d, e);

@@ -289,6 +289,10 @@ pub const Expr = union(enum) {
     /// spec/types.md §Casts; the only conversions, nothing implicit).
     /// float→int narrowing traps on overflow/NaN per the spec.
     num_cast: struct { to: Type, value: *Expr },
+    /// A **bit reinterpretation** between `f64` and `i64` (not a value
+    /// conversion): the raw bits are kept. Used to store an `f64` in a channel's
+    /// i64 buffer cell and read it back. (`num_cast` would convert the value.)
+    bitcast: struct { to: Type, value: *Expr },
     /// A `true` / `false` literal. A boolean (i32 0/1), like a comparison or
     /// `!` — usable in conditions and as an operand of `&&`/`||`/`!`.
     bool_const: bool,
