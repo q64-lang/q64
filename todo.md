@@ -408,10 +408,10 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         mutual `while` ping-pong → 10 / 20 / 30; an `if`/`else` server reply
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
-        **v0 boundaries (next):** one level of loop nesting (no loop-in-loop);
-        non-i64 channel payloads. (Since landed: discard recvs, `break`/`continue`
-        in task loops, statement `match` in a task, `select` parking, bounded-channel
-        backpressure, cooperative `ask`, and lifting the scheduler into callees.)
+        **v0 boundaries (next):** non-i64 channel payloads. (Since landed: discard
+        recvs, `break`/`continue` in task loops, statement `match` in a task,
+        nested task loops, `select` parking, bounded-channel backpressure,
+        cooperative `ask`, and lifting the scheduler into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -547,7 +547,23 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         boundaries:** integer/enum *statement* matches with non-suspending arms;
         a value-match `let c = match …` and enum scrutinees carried over a channel
         await the non-i64 channel-payload work. **Remaining task-body v0 gaps:**
-        one level of loop nesting; non-i64 channel payloads.
+        non-i64 channel payloads.
+  - [x] **Nested loops inside a scheduled task.** A task may now nest loops
+        (`for i { for j { … } }`, `while`/`for` in any combination). The blocker
+        was the `for` counter init: it ran **once** before the scheduler loop
+        (`ctx.pre`), so an inner counter never reset on re-entry. Each `for` now
+        carries a per-entry **INIT block** (`hi = <bound>; i = <lo>`) as its loop
+        entry — control reaching the loop (from before it, or an enclosing loop's
+        back-edge) always passes through INIT, so the inner counter resets every
+        outer pass *and* a bound that depends on an outer counter is re-evaluated.
+        The `ctx.pre` mechanism is gone. `taskSchedulable`'s nesting cap
+        (`loop_depth != 0 → reject`) is lifted; `loop_depth` now only gates
+        `break`/`continue`. Verified wasm64 + wasm32: a producer/consumer over
+        nested `2×3` loops → 11/12/13/21/22/23; a **triangular** nest whose inner
+        bound is the outer counter (`for j in 1..=i`) → 1 / 1 2 / 1 2 3. Adds a
+        build_hir test and a link-roundtrip section; all prior single-loop
+        scheduler cases still pass. **Remaining task-body v0 gap:** non-i64
+        channel payloads (bool/f64/str/record over a channel).
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

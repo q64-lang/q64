@@ -1281,11 +1281,12 @@ const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl
 
 /// Recursively check a task body is schedulable, filling `scan`. Schedulable
 /// forms: `let v = ch.recv()`, `ch.send(e)`, `env.out(e)`, a non-call `let`, an
-/// assignment, a counted `for i in lo..hi`, a `while`, and an `if`/`else` chain
-/// (bodies recurse). `loop_depth` caps loop nesting (v0: one level — a nested
-/// loop's counter would need a per-entry reset the pre-init can't give it);
-/// `in_ctrl` marks that we're inside a loop/`if` body. Any other statement →
-/// not schedulable (fall back to the static path).
+/// assignment, a counted `for i in lo..hi`, a `while`, `break`/`continue`, a
+/// `match` (non-suspending arms), and an `if`/`else` chain (bodies recurse).
+/// Loops may nest (each `for` resets its counter in a per-entry INIT block);
+/// `loop_depth` tracks nesting so `break`/`continue` are only accepted inside a
+/// loop. `in_ctrl` marks that we're inside a loop/`if` body. Any other statement
+/// → not schedulable (fall back to the static path).
 fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), actors: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool) bool {
     var it = body.statements();
     while (it.next()) |stmt| {
@@ -1322,14 +1323,12 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
             .break_stmt, .continue_stmt => if (loop_depth == 0) return false, // only inside a loop
             .match_stmt => |ms| if (matchHasChannelOp(b, ms, chans)) return false, // a suspending match arm: CFG-match is later
             .for_stmt => |fs| {
-                if (loop_depth != 0) return false; // v0: no nested loops in a task
                 const iter = fs.iterable() orelse return false;
                 if (iter != .range) return false; // counted ranges only
                 const fb = fs.body() orelse return false;
                 if (!taskSchedulable(b, fb, chans, bounded, actors, scan, loop_depth + 1, true)) return false;
             },
             .while_stmt => |ws| {
-                if (loop_depth != 0) return false; // v0: no nested loops
                 if (ws.ifLet() != null) return false; // `while let`: later
                 const wb = ws.body() orelse return false;
                 if (!taskSchedulable(b, wb, chans, bounded, actors, scan, loop_depth + 1, true)) return false;
@@ -1548,10 +1547,10 @@ const SchedCtx = struct {
     rt: *RtMap,
     chans: *const std.StringHashMapUnmanaged(void),
     blocks: *std.ArrayList(SchedBlock),
-    pre: *std.ArrayList(*hir.Stmt), // loop-var inits, emitted once before the loop
-    // The innermost task loop's pc targets (v0 has no loop nesting, so a single
-    // pair suffices): `continue` jumps to `loop_continue` (a `for`'s back-edge /
-    // a `while`'s head), `break` to `loop_break` (the loop's exit block).
+    // The enclosing task loop's pc targets: `continue` jumps to `loop_continue`
+    // (a `for`'s back-edge / a `while`'s head), `break` to `loop_break` (the
+    // loop's exit block). Saved/restored around each loop body, so a nested
+    // inner loop's break/continue target the inner loop.
     loop_continue: ?usize = null,
     loop_break: ?usize = null,
 };
@@ -1586,7 +1585,11 @@ const ItemSpan = struct { entry: usize, exit_id: usize, exit_alt: bool, fixed: b
 /// Lower a counted `for i in lo..hi { body }` into head/body/back blocks.
 /// HEAD branches `i (<|<=) #hi ? body_entry : <exit>`; the body's tail flows to
 /// BACK (`i += 1; goto HEAD`). The loop-exit (`HEAD.alt`) is patched by the
-/// caller. The counter + bound are pre-initialized once before the loop.
+/// caller. The counter + bound are reset by an **INIT block** that runs on every
+/// entry to the loop — so a *nested* inner loop re-initializes each outer pass
+/// (and a bound that depends on an outer counter is re-evaluated). INIT is the
+/// loop's entry; control reaching the loop (from before it, or from an enclosing
+/// loop's back-edge) always passes through INIT first.
 fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!struct { head: usize, exit: usize } {
     const b = ctx.b;
     const range = (fs.iterable() orelse return error.Unsupported).range;
@@ -1599,22 +1602,27 @@ fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!struct { head: usize
     const hi_name = try std.fmt.allocPrint(b.a, "{s}#schi_hi{d}", .{ iname, ctx.blocks.items.len });
     const hi_idx = try declareBodyLocal(b, ctx.scope, hi_name, false, .i64);
     const i_idx = try declareBodyLocal(b, ctx.scope, iname, true, .i64);
-    try ctx.pre.append(b.a, blk: {
-        const s = try b.a.create(hir.Stmt);
-        s.* = .{ .let = .{ .idx = hi_idx, .value = hi_e } };
-        break :blk s;
+    // INIT block (the loop entry): `hi = <bound>; i = <lo>` — runs each entry.
+    const init_stmts = try b.a.dupe(*hir.Stmt, &.{
+        blk: {
+            const s = try b.a.create(hir.Stmt);
+            s.* = .{ .let = .{ .idx = hi_idx, .value = hi_e } };
+            break :blk s;
+        },
+        blk: {
+            const s = try b.a.create(hir.Stmt);
+            s.* = .{ .let = .{ .idx = i_idx, .value = lo_e } };
+            break :blk s;
+        },
     });
-    try ctx.pre.append(b.a, blk: {
-        const s = try b.a.create(hir.Stmt);
-        s.* = .{ .let = .{ .idx = i_idx, .value = lo_e } };
-        break :blk s;
-    });
+    const init_id = try addBlock(ctx, .{ .kind = .plain, .stmts = init_stmts, .next = 0 });
     // Reserve HEAD + BACK + EXIT; build the body (left-to-right) flowing to BACK.
     // `continue` targets BACK (increment then re-test), `break` targets EXIT (an
     // empty block whose `next` the caller patches to the loop's successor).
     const head_id = try addBlock(ctx, .{ .kind = .branch, .next = 0 });
     const back_id = try addBlock(ctx, .{ .kind = .plain, .next = 0 });
     const exit_id = try addBlock(ctx, .{ .kind = .plain, .next = 0 });
+    ctx.blocks.items[init_id].next = head_id;
     const sc = ctx.loop_continue;
     const sb = ctx.loop_break;
     ctx.loop_continue = back_id;
@@ -1627,7 +1635,7 @@ fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!struct { head: usize
     const inc = try mkBinE(b, .add, try mkLocalE(b, i_idx, .i64), try mkIntE(b, 1));
     const back_stmts = try b.a.dupe(*hir.Stmt, &.{try mkAssignS(b, i_idx, inc)});
     ctx.blocks.items[back_id] = .{ .kind = .plain, .stmts = back_stmts, .next = head_id };
-    return .{ .head = head_id, .exit = exit_id };
+    return .{ .head = init_id, .exit = exit_id };
 }
 
 /// Lower a `while cond { body }` into a head + body. HEAD branches `cond ?
@@ -1868,8 +1876,6 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
     const terminal = try b.a.alloc(usize, ntasks);
     // The progress flag (declared first: the per-task gates reference it).
     const prog_idx = try declareBodyLocal(b, scope, "#sched_prog", true, .i64);
-    var pre: std.ArrayList(*hir.Stmt) = .empty; // loop-var inits (before the loop)
-    defer pre.deinit(b.a);
     var gates: std.ArrayList(*hir.Stmt) = .empty; // per-task block gates (the loop body)
     defer gates.deinit(b.a);
     for (tasks.items, 0..) |task, t| {
@@ -1877,7 +1883,7 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
         pc_idx[t] = try declareBodyLocal(b, scope, nm, true, .i64);
         var blocks: std.ArrayList(SchedBlock) = .empty;
         defer blocks.deinit(b.a);
-        var ctx: SchedCtx = .{ .b = b, .scope = scope, .rt = rt, .chans = &chans, .blocks = &blocks, .pre = &pre };
+        var ctx: SchedCtx = .{ .b = b, .scope = scope, .rt = rt, .chans = &chans, .blocks = &blocks };
         entry[t] = try lowerTaskSeq(&ctx, try collectStmts(b, task), DONE_PC);
         terminal[t] = blocks.items.len; // pc == terminal ⇒ task complete
         for (blocks.items) |*bl| {
@@ -1886,8 +1892,8 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
         }
         for (blocks.items, 0..) |bl, id| try emitBlockGate(b, &gates, pc_idx[t], id, prog_idx, bl);
     }
-    // Setup runs once before the loop: loop-var inits, then pc = entry, prog = 1.
-    try out.appendSlice(b.a, pre.items);
+    // Setup runs once before the loop: pc = entry, prog = 1. (Loop counters now
+    // reset in their per-entry INIT blocks, so nothing rides ahead of the loop.)
     for (0..ntasks) |t| {
         const st = try b.a.create(hir.Stmt);
         st.* = .{ .let = .{ .idx = pc_idx[t], .value = try mkIntE(b, @intCast(entry[t])) } };
@@ -10063,6 +10069,46 @@ test "scope scheduling: a statement match (no channel ops in arms) is a step" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the recv suspend gate
+}
+
+test "scope scheduling: nested loops in a task reset the inner counter per pass" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // Nested `for` loops in a scheduled task. The inner counter resets each outer
+    // pass via a per-entry INIT block (the old once-before-the-loop init couldn't
+    // serve nesting). The producer sends in a nested loop; the consumer recvs in
+    // a nested loop (the inner recv is the suspend point).
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        let done = channel()
+        \\        spawn {
+        \\            for i in 1..=2 {
+        \\                for j in 1..=2 {
+        \\                    ch.send(i * 10 + j)
+        \\                }
+        \\            }
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            for a in 1..=2 {
+        \\                for b in 1..=2 {
+        \\                    let v = ch.recv()
+        \\                    env.out(v)
+        \\                }
+        \\            }
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the inner-loop recv gate
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

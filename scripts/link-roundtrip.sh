@@ -3053,4 +3053,41 @@ mt32_out="$("$HOST_BIN" "$tmp/matchtask32.wasm")"
 [[ "$mt32_out" == "$mt_expected" ]] || { echo "FAIL: match in task wasm32 (got: $mt32_out)" >&2; exit 1; }
 echo "    ok: match in task -> 100/200/900 (wasm64 + wasm32; statement match as a cooperative step)"
 
+echo "==> scheduler: nested loops inside a scheduled task"
+nl_app="$tmp/nestloop.q"
+cat > "$nl_app" <<'Q64'
+fn main {
+    scope {
+        let ch = channel()
+        let done = channel()
+        spawn {
+            for i in 1..=3 {
+                for j in 1..=i {
+                    ch.send(j)
+                }
+            }
+            let _ = done.recv()
+        }
+        spawn {
+            for k in 1..=6 {
+                let v = ch.recv()
+                env.out(v)
+            }
+            done.send(1)
+        }
+    }
+}
+Q64
+# Nested for loops; the inner bound depends on the outer counter (triangular),
+# so the inner counter + bound must reset/re-evaluate each outer pass (INIT
+# block). Producer sends 1 / 1 2 / 1 2 3; consumer drains. -> 1 1 2 1 2 3.
+nl_expected=$'1\n1\n2\n1\n2\n3'
+"$Q64_BIN" emit "$nl_app" "$tmp/nestloop.wasm"
+nl_out="$("$HOST_BIN" "$tmp/nestloop.wasm")"
+[[ "$nl_out" == "$nl_expected" ]] || { echo "FAIL: nested loops (got: $nl_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$nl_app" "$tmp/nestloop32.wasm" --addr wasm32
+nl32_out="$("$HOST_BIN" "$tmp/nestloop32.wasm")"
+[[ "$nl32_out" == "$nl_expected" ]] || { echo "FAIL: nested loops wasm32 (got: $nl32_out)" >&2; exit 1; }
+echo "    ok: nested loops -> 1/1/2/1/2/3 (wasm64 + wasm32; inner counter resets per outer pass)"
+
 echo "PASS: $qube_out"
