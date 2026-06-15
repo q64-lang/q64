@@ -429,6 +429,33 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         `vec_len` tests inside the scheduler `while`) and a link-roundtrip
         section. **Next:** `send`-on-full backpressure (bounded channels — the
         send side suspending), `ask` suspension, and the scheduler in callees.
+  - [x] **Bounded channels — `send`-on-full backpressure.** `channel(capacity:
+        N)` is now a *bounded* channel whose `send` **parks** when the buffer
+        holds `N` unread elements and resumes after a `recv` frees a slot — the
+        symmetric twin of recv-on-empty. The channel model is unchanged (a Vec
+        buffer + read cursor); "unread count" is `vec_len - cursor`, so the room
+        (send-readiness) test is `vec_len - cursor < capacity` (`chanSendReadyCond`),
+        mirroring the recv readiness `cursor < vec_len`. A `Scope.chan_caps` map
+        records each bounded channel's capacity (absent ⇒ unbounded, send never
+        blocks). In the scheduler a bounded `send` becomes its own suspend block
+        (a recv-kind CFG block gated on the room predicate, body = the `vec_push`);
+        unbounded sends stay in the plain run (byte-identical, no backpressure).
+        The schedulability scan gained `send_bounded`, and the gate routes a scope
+        to the scheduler when a task sends on a bounded channel (the static path
+        ignores capacity) — even when no task is a mutual cycle. `select` send
+        arms also use the room predicate (a parking select now waits when every
+        send arm is full), both in the arm chain and the `any_ready` park test.
+        **Parser fix (enabling):** named call arguments (`name: value`) were
+        parsed as three junk args (`path`, a recovery literal for the colon, then
+        the value); `parseCallArg` now recognizes `IDENT COLON expr` and captures
+        the label + colon as tokens (lossless round-trip) so `cc.args()` surfaces
+        the value — `channel(capacity: 4)`'s capacity is finally readable. Verified
+        wasm64 + wasm32: a straight-line producer/consumer over `capacity: 1`
+        interleaves 101/1/102/2/103/3 (unbounded races ahead → 101 102 103 1 2 3);
+        `capacity: 2` → 101 102 1 2 103 3. Adds two build_hir tests (the bounded
+        send routes to the scheduler with a `sub` room test; the unbounded twin
+        stays static), two parser round-trip cases, and a link-roundtrip section.
+        **Next:** `ask` suspension, and lifting the scheduler into callee bodies.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

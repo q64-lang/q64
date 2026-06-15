@@ -2688,6 +2688,15 @@ const Parser = struct {
 
     fn parseCallArg(self: *Parser) !*const cst.Node {
         var children: std.ArrayList(cst.Element) = .empty;
+        // Named argument: `name: value` (e.g. `channel(capacity: 4)`). The label
+        // token and colon are captured as tokens so the node round-trips; the
+        // arg's *expression* is the value, which is what `ArgIter` surfaces.
+        if (self.peek() == .IDENT and self.peekSecond() == .COLON) {
+            try children.append(self.arena, .{ .token = self.advance() }); // name
+            try self.eatTrivia(&children);
+            try children.append(self.arena, .{ .token = self.advance() }); // colon
+            try self.eatTrivia(&children);
+        }
         const expr = try self.parseExprUnrestricted();
         try children.append(self.arena, .{ .node = expr });
         return try cst.makeNode(self.arena, .CALL_ARG, children.items);
@@ -2734,6 +2743,10 @@ test "round-trip: serialize(parse(s)) == s" {
         "fn main {\n    select {\n        v = ch.recv() -> use(v),\n        _ = ctx.cancelled() -> stop(),\n    }\n}\n",
         "actor Counter {\n    state n: i64 = 0\n\n    handle bump() {\n        n = n + 1\n    }\n\n    handle get() -> i64 {\n        n\n    }\n}\n",
         "graph pipeline() -> i64 {\n    let a = src()\n    let b = a |> dbl\n}\n",
+        // Named call arguments (`name: value`) round-trip — the label + colon are
+        // preserved as tokens (spec form `channel(capacity: 4)`).
+        "fn main {\n    let ch = channel(capacity: 4)\n}\n",
+        "fn main {\n    plot(width: 80, height: 24)\n}\n",
     };
 
     for (sources) |src| {

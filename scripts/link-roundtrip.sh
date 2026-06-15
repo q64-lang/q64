@@ -2751,6 +2751,44 @@ sp32_out="$("$HOST_BIN" "$tmp/selectpark32.wasm")"
 [[ "$sp32_out" == "$sp_expected" ]] || { echo "FAIL: select parking wasm32 (got: $sp32_out)" >&2; exit 1; }
 echo "    ok: select parking -> 1 / 2 (wasm64 + wasm32; parks on any_ready, fires the ready arm, drains both)"
 
+echo "==> scheduler: bounded channel send-on-full backpressure (channel(capacity: N))"
+bp_app="$tmp/backpressure.q"
+cat > "$bp_app" <<'Q64'
+fn main {
+    scope {
+        let ch = channel(capacity: 1)
+        spawn {
+            ch.send(1)
+            env.out(101)
+            ch.send(2)
+            env.out(102)
+            ch.send(3)
+            env.out(103)
+        }
+        spawn {
+            let a = ch.recv()
+            env.out(a)
+            let b = ch.recv()
+            env.out(b)
+            let c = ch.recv()
+            env.out(c)
+        }
+    }
+}
+Q64
+# With capacity 1, the producer's `send` parks once the buffer holds one unread
+# element (vec_len - cursor >= capacity) and resumes after the consumer's `recv`
+# frees the slot — so producer and consumer interleave: 101 / 1 / 102 / 2 / 103 / 3.
+# (An unbounded channel of the same shape races the producer ahead: 101 102 103 1 2 3.)
+bp_expected=$'101\n1\n102\n2\n103\n3'
+"$Q64_BIN" emit "$bp_app" "$tmp/backpressure.wasm"
+bp_out="$("$HOST_BIN" "$tmp/backpressure.wasm")"
+[[ "$bp_out" == "$bp_expected" ]] || { echo "FAIL: backpressure (got: $bp_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$bp_app" "$tmp/backpressure32.wasm" --addr wasm32
+bp32_out="$("$HOST_BIN" "$tmp/backpressure32.wasm")"
+[[ "$bp32_out" == "$bp_expected" ]] || { echo "FAIL: backpressure wasm32 (got: $bp32_out)" >&2; exit 1; }
+echo "    ok: backpressure -> 101/1/102/2/103/3 (wasm64 + wasm32; bounded send parks on full, recv frees a slot)"
+
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
 cat > "$ssc_app" <<'Q64'

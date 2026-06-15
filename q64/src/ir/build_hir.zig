@@ -895,16 +895,20 @@ fn lowerSelectArms(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap) 
             setc.* = .{ .assign = .{ .idx = cur_idx, .value = inc } };
             try items.append(b.a, setc);
         } else if (std.mem.eql(u8, method, "send")) {
-            // A `send` arm: `ch.send(x) -> body`. On the v0 unbounded channel a
-            // send always has room, so the arm is **always ready** (no buffer
-            // wait — send-on-full backpressure arrives with the scheduler). The
-            // op is a `vec_push`; a send arm binds nothing.
+            // A `send` arm: `ch.send(x) -> body`. Its readiness is "the buffer
+            // has room": always-ready on an unbounded channel (`true`), or the
+            // backpressure predicate (`vec_len - cursor < capacity`) on a bounded
+            // one — so a parking select waits when every send arm is full. The op
+            // is a `vec_push`; a send arm binds nothing.
             if (arm.binding() != null) return error.Unsupported;
             var ait = cc.args();
             const a0 = ait.next() orelse return error.Unsupported;
             if (ait.next() != null) return error.Unsupported; // v0: one value per send
-            cond = try b.a.create(hir.Expr);
-            cond.* = .{ .bool_const = true };
+            cond = (try chanSendReadyCond(b, scope, head)) orelse blk: {
+                const t = try b.a.create(hir.Expr);
+                t.* = .{ .bool_const = true };
+                break :blk t;
+            };
             const bufp = try b.a.create(hir.Expr);
             bufp.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
             const push = try b.a.create(hir.Stmt);
@@ -940,10 +944,11 @@ fn lowerSelectArms(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap) 
         chain = st;
     }
     // `any_ready` = OR of every arm's readiness (built fresh — a recv arm's is
-    // `cursor < len`, a send arm's is `true`), the scheduler's park predicate.
+    // `cursor < len`, a send arm's is the room test, `true` when unbounded), the
+    // scheduler's park predicate.
     var any_ready: ?*hir.Expr = null;
     for (arms.items) |a| {
-        const r = if (a.is_recv) try chanReadyCond(b, scope, a.head) else blk: {
+        const r = if (a.is_recv) try chanReadyCond(b, scope, a.head) else (try chanSendReadyCond(b, scope, a.head)) orelse blk: {
             const t = try b.a.create(hir.Expr);
             t.* = .{ .bool_const = true };
             break :blk t;
@@ -1163,7 +1168,7 @@ fn sendStepChan(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnma
 /// whether any `recv` sits **inside control flow** (a loop or `if`). The static
 /// path only detects top-level recvs, so a recv-in-control task must go to the
 /// scheduler even when it isn't part of a mutual cycle.
-const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl: bool = false };
+const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl: bool = false, send_bounded: bool = false };
 
 /// Recursively check a task body is schedulable, filling `scan`. Schedulable
 /// forms: `let v = ch.recv()`, `ch.send(e)`, `env.out(e)`, a non-call `let`, an
@@ -1172,7 +1177,7 @@ const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl
 /// loop's counter would need a per-entry reset the pre-init can't give it);
 /// `in_ctrl` marks that we're inside a loop/`if` body. Any other statement →
 /// not schedulable (fall back to the static path).
-fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool) bool {
+fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool) bool {
     var it = body.statements();
     while (it.next()) |stmt| {
         if (recvStepOf(b, stmt, chans) != null) {
@@ -1180,8 +1185,9 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
             if (in_ctrl) scan.recv_in_ctrl = true;
             continue;
         }
-        if (sendStepChan(b, stmt, chans) != null) {
+        if (sendStepChan(b, stmt, chans)) |ch| {
             scan.sends = true;
+            if (bounded.contains(ch)) scan.send_bounded = true;
             continue;
         }
         switch (stmt) {
@@ -1203,19 +1209,19 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
                 const iter = fs.iterable() orelse return false;
                 if (iter != .range) return false; // counted ranges only
                 const fb = fs.body() orelse return false;
-                if (!taskSchedulable(b, fb, chans, scan, loop_depth + 1, true)) return false;
+                if (!taskSchedulable(b, fb, chans, bounded, scan, loop_depth + 1, true)) return false;
             },
             .while_stmt => |ws| {
                 if (loop_depth != 0) return false; // v0: no nested loops
                 if (ws.ifLet() != null) return false; // `while let`: later
                 const wb = ws.body() orelse return false;
-                if (!taskSchedulable(b, wb, chans, scan, loop_depth + 1, true)) return false;
+                if (!taskSchedulable(b, wb, chans, bounded, scan, loop_depth + 1, true)) return false;
             },
             .if_stmt => |ifs| {
-                if (!ifStmtSchedulable(b, ifs, chans, scan, loop_depth)) return false;
+                if (!ifStmtSchedulable(b, ifs, chans, bounded, scan, loop_depth)) return false;
             },
             .select_stmt => |sel| {
-                if (!selectSchedulable(b, sel, chans, scan)) return false;
+                if (!selectSchedulable(b, sel, chans, bounded, scan)) return false;
                 scan.recv_in_ctrl = true; // a select parks → route to the scheduler
             },
             else => return false, // other control flow in a task: v0
@@ -1226,7 +1232,7 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
 
 /// A `select` in a task: every arm must be a `recv`/`send` on a scope channel.
 /// Records the send/recv signal; the arm bodies are lowered later (v0: simple).
-fn selectSchedulable(b: *Builder, sel: ast.SelectStmt, chans: *const std.StringHashMapUnmanaged(void), scan: *TaskScan) bool {
+fn selectSchedulable(b: *Builder, sel: ast.SelectStmt, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), scan: *TaskScan) bool {
     var it = sel.arms();
     var n: usize = 0;
     while (it.next()) |arm| {
@@ -1239,12 +1245,14 @@ fn selectSchedulable(b: *Builder, sel: ast.SelectStmt, chans: *const std.StringH
         const cn = callPathName(b, cc) orelse return false;
         defer b.a.free(cn);
         const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return false;
-        if (!chans.contains(cn[0..dot])) return false;
+        const head = cn[0..dot];
+        if (!chans.contains(head)) return false;
         const method = cn[dot + 1 ..];
         if (std.mem.eql(u8, method, "recv")) {
             scan.recvs = true;
         } else if (std.mem.eql(u8, method, "send")) {
             scan.sends = true;
+            if (bounded.contains(head)) scan.send_bounded = true;
         } else return false;
     }
     return n > 0;
@@ -1252,29 +1260,54 @@ fn selectSchedulable(b: *Builder, sel: ast.SelectStmt, chans: *const std.StringH
 
 /// An `if`/`else`/`else if` chain in a task: each branch body must itself be
 /// schedulable (and is `in_ctrl`). `if let` is rejected (a later slice).
-fn ifStmtSchedulable(b: *Builder, ifs: ast.IfStmt, chans: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize) bool {
+fn ifStmtSchedulable(b: *Builder, ifs: ast.IfStmt, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize) bool {
     if (ifs.ifLet() != null) return false;
     const tb = ifs.thenBody() orelse return false;
-    if (!taskSchedulable(b, tb, chans, scan, loop_depth, true)) return false;
-    if (ifs.elseBody()) |eb| return taskSchedulable(b, eb, chans, scan, loop_depth, true);
-    if (ifs.elseIf()) |ei| return ifStmtSchedulable(b, ei, chans, scan, loop_depth);
+    if (!taskSchedulable(b, tb, chans, bounded, scan, loop_depth, true)) return false;
+    if (ifs.elseBody()) |eb| return taskSchedulable(b, eb, chans, bounded, scan, loop_depth, true);
+    if (ifs.elseIf()) |ei| return ifStmtSchedulable(b, ei, chans, bounded, scan, loop_depth);
     return true; // no else
+}
+
+/// `let x = channel(capacity: N)` → N, or null (not a channel decl, or no
+/// capacity argument — an unbounded channel).
+fn channelDeclCap(b: *Builder, stmt: ast.Stmt) ?i64 {
+    const ls = switch (stmt) {
+        .let_stmt => |x| x,
+        else => return null,
+    };
+    const init = ls.initializer() orelse return null;
+    const cc = switch (init) {
+        .call => |x| x,
+        else => return null,
+    };
+    const cn = callPathName(b, cc) orelse return null;
+    defer b.a.free(cn);
+    if (!std.mem.eql(u8, cn, "channel")) return null;
+    return channelCapOf(cc);
 }
 
 /// Read-only gate: does this scope need the runtime scheduler (rather than the
 /// static eager/deferred path)? True iff every non-spawn statement is a channel
 /// decl, every spawned task is schedulable, there are ≥2 tasks, and at least
-/// one task either **both sends and recvs** (the mutual-wait cycle) **or** has a
+/// one task either **both sends and recvs** (the mutual-wait cycle), has a
 /// `recv` inside control flow (which the static path can't lower — it only sees
-/// top-level recvs). Either condition only ever holds for programs the static
-/// path can't compile anyway, so no currently-compiling program is routed here.
+/// top-level recvs), or **sends on a bounded channel** (whose `send` may need to
+/// park on a full buffer — backpressure the static path ignores). Each condition
+/// only holds for programs the static path can't serve, so no currently-static
+/// program is routed here.
 fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
     _ = scope;
     var chans: std.StringHashMapUnmanaged(void) = .empty;
     defer chans.deinit(b.a);
+    var bounded: std.StringHashMapUnmanaged(void) = .empty;
+    defer bounded.deinit(b.a);
     var it = blk.statements();
     while (it.next()) |stmt| {
-        if (channelDeclName(b, stmt)) |nm| chans.put(b.a, nm, {}) catch return false;
+        if (channelDeclName(b, stmt)) |nm| {
+            chans.put(b.a, nm, {}) catch return false;
+            if (channelDeclCap(b, stmt) != null) bounded.put(b.a, nm, {}) catch return false;
+        }
     }
     var ntasks: usize = 0;
     var needs = false;
@@ -1284,8 +1317,8 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
             const body = sp.block() orelse return false; // `spawn scope`: not v0-schedulable
             ntasks += 1;
             var scan: TaskScan = .{};
-            if (!taskSchedulable(b, body, &chans, &scan, 0, false)) return false;
-            if ((scan.sends and scan.recvs) or scan.recv_in_ctrl) needs = true;
+            if (!taskSchedulable(b, body, &chans, &bounded, &scan, 0, false)) return false;
+            if ((scan.sends and scan.recvs) or scan.recv_in_ctrl or scan.send_bounded) needs = true;
         } else if (channelDeclName(b, stmt) == null) {
             return false; // a non-spawn, non-channel-decl statement: stay static
         }
@@ -1331,6 +1364,36 @@ fn chanReadyCond(b: *Builder, scope: *Scope, chan: []const u8) BuildError!*hir.E
     return mkBinE(b, .lt, cur, len);
 }
 
+/// Send readiness for a channel: `vec_len(buffer) - cursor < capacity` (the
+/// buffer has room for another element) — the `send` suspend test. Returns
+/// `null` for an unbounded channel (a send is then always ready, no gate).
+fn chanSendReadyCond(b: *Builder, scope: *Scope, chan: []const u8) BuildError!?*hir.Expr {
+    const cap = scope.chan_caps.get(chan) orelse return null;
+    const cur_idx = scope.chans.get(chan) orelse return error.Unsupported;
+    const loc = scope.find(chan) orelse return error.Unsupported;
+    const buf = try mkLocalE(b, loc.idx, .ptr);
+    const len = try b.a.create(hir.Expr);
+    len.* = .{ .vec_len = .{ .vec = buf } };
+    const unread = try mkBinE(b, .sub, len, try mkLocalE(b, cur_idx, .i64));
+    return mkBinE(b, .lt, unread, try mkIntE(b, cap));
+}
+
+/// `let x = channel(capacity: N)` → the capacity (the sole v0 argument's
+/// const-evaluated int value), or null if the call has no argument (unbounded).
+fn channelCapOf(cc: ast.CallExpr) ?i64 {
+    var it = cc.args();
+    const a0 = it.next() orelse return null;
+    const n = switch (a0) {
+        .num_lit => |x| x,
+        else => return null,
+    };
+    const tok = n.token() orelse return null;
+    if (tok.kind == .FLOAT_LIT) return null;
+    const v = consteval.parseIntLit(tok.text) catch return null;
+    if (v <= 0) return null; // a non-positive capacity isn't a bound
+    return v;
+}
+
 // A task lowers to a tiny CFG of pc-numbered blocks. A `plain`/`recv` block
 // runs its stmts then jumps to `next`; a `branch` block (a loop head) tests
 // `cond` and jumps to `next` (enter body) or `alt` (exit). The pc is the block
@@ -1347,9 +1410,10 @@ const SchedBlock = struct {
 };
 
 /// One source item of a task body: a maximal run of straight-line statements,
-/// a single `recv` suspend point, a counted `for` loop, a `while` loop, an
-/// `if`/`else` chain, or a `select` (a multi-channel parking suspend point).
-const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt, sel: ast.SelectStmt };
+/// a single `recv` suspend point, a bounded-channel `send` suspend point (parks
+/// on a full buffer), a counted `for` loop, a `while` loop, an `if`/`else`
+/// chain, or a `select` (a multi-channel parking suspend point).
+const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, send: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt, sel: ast.SelectStmt };
 
 /// Context threaded through the per-task CFG lowering.
 const SchedCtx = struct {
@@ -1464,6 +1528,27 @@ fn lowerSchedItem(ctx: *SchedCtx, item: SchedItem) BuildError!ItemSpan {
             const id = try addBlock(ctx, .{ .kind = .recv, .stmts = try list.toOwnedSlice(b.a), .ready = ready, .next = 0 });
             return .{ .entry = id, .exit_id = id, .exit_alt = false };
         },
+        .send => |s| {
+            // A bounded-channel `send`: a suspend block gated on the buffer
+            // having room (`vec_len - cursor < capacity`), so it parks when full
+            // and resumes after a `recv` frees a slot. The op is the `vec_push`.
+            const es = switch (s) {
+                .expr_stmt => |x| x,
+                else => return error.Unsupported,
+            };
+            const cc = switch (es.expression() orelse return error.Unsupported) {
+                .call => |x| x,
+                else => return error.Unsupported,
+            };
+            const cn = callPathName(b, cc) orelse return error.Unsupported;
+            defer b.a.free(cn);
+            const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return error.Unsupported;
+            const head = ctx.chans.getKey(cn[0..dot]) orelse return error.Unsupported;
+            const push = (try tryChannelSend(b, cc, ctx.scope)) orelse return error.Unsupported;
+            const ready = (try chanSendReadyCond(b, ctx.scope, head)) orelse return error.Unsupported;
+            const id = try addBlock(ctx, .{ .kind = .recv, .stmts = try b.a.dupe(*hir.Stmt, &.{push}), .ready = ready, .next = 0 });
+            return .{ .entry = id, .exit_id = id, .exit_alt = false };
+        },
         .forl => |fs| {
             const head = try lowerForLoop(ctx, fs);
             return .{ .entry = head, .exit_id = head, .exit_alt = true }; // exit = HEAD.alt
@@ -1501,21 +1586,25 @@ fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError
     var run: std.ArrayList(ast.Stmt) = .empty;
     defer run.deinit(b.a);
     for (stmts) |s| {
-        if (recvStepOf(b, s, ctx.chans) != null) {
+        // The non-plain item for this statement (a suspend point or control
+        // flow), or null for a straight-line statement that joins the run. A
+        // send only suspends on a *bounded* channel; unbounded sends stay plain.
+        const item: ?SchedItem = blk: {
+            if (recvStepOf(b, s, ctx.chans) != null) break :blk .{ .recv = s };
+            if (sendStepChan(b, s, ctx.chans)) |ch| {
+                if (ctx.scope.chan_caps.contains(ch)) break :blk .{ .send = s };
+            }
+            break :blk switch (s) {
+                .for_stmt => |x| .{ .forl = x },
+                .while_stmt => |x| .{ .whilel = x },
+                .if_stmt => |x| .{ .iff = x },
+                .select_stmt => |x| .{ .sel = x },
+                else => null,
+            };
+        };
+        if (item) |it| {
             if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
-            try items.append(b.a, .{ .recv = s });
-        } else if (s == .for_stmt) {
-            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
-            try items.append(b.a, .{ .forl = s.for_stmt });
-        } else if (s == .while_stmt) {
-            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
-            try items.append(b.a, .{ .whilel = s.while_stmt });
-        } else if (s == .if_stmt) {
-            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
-            try items.append(b.a, .{ .iff = s.if_stmt });
-        } else if (s == .select_stmt) {
-            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
-            try items.append(b.a, .{ .sel = s.select_stmt });
+            try items.append(b.a, it);
         } else {
             try run.append(b.a, s);
         }
@@ -5929,6 +6018,10 @@ fn tryChannelNew(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bo
     const cname = (callPathName(b, cc)) orelse return false;
     defer b.a.free(cname);
     if (!std.mem.eql(u8, cname, "channel")) return false;
+    // A bounded channel: `channel(capacity: N)` — the (sole, v0) argument is the
+    // capacity. Record it so the scheduler can park a `send` when the buffer is
+    // full. `channel()` (no arg) stays unbounded (no entry in `chan_caps`).
+    if (channelCapOf(cc)) |cap| try scope.chan_caps.put(b.a, name, cap);
     // The buffer: a Vec under `name`.
     const v_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
     try scope.vecs.put(b.a, name, {});
@@ -7171,9 +7264,14 @@ const Scope = struct {
     /// Channel bindings (concurrency v0): name → the i64 read-cursor local
     /// index. The buffer is a Vec under the same name (also in `vecs`):
     /// `send` is a `vec_push`, `recv` reads `buf[cursor]` then bumps the
-    /// cursor. v0 FIFO with no suspension (producer-before-consumer ordering,
-    /// capacity ≥ messages); suspend-on-empty/full arrives with the scheduler.
+    /// cursor. v0 FIFO. recv suspends on empty; a *bounded* channel (below)
+    /// suspends `send` on full — both in the round-robin scheduler.
     chans: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Bounded channels: name → capacity (a positive count). Absent ⇒
+    /// unbounded (`send` never blocks). A bounded channel's `send` parks in
+    /// the scheduler when the buffer holds `capacity` unread elements
+    /// (`vec_len - cursor >= capacity`); recv frees a slot by bumping cursor.
+    chan_caps: std.StringHashMapUnmanaged(i64) = .empty,
     /// Inside an actor handler body, the actor's state struct — so a bare field
     /// name (`n`) resolves to `self.n` (read, write, and type), the implicit-
     /// self convention. `self` itself is registered in `recs`.
@@ -9531,6 +9629,64 @@ test "scope scheduling: a select inside a task parks until an arm is ready" {
     // The park predicate ORs the arms' readiness (`vec_len` tests joined by or_).
     try testing.expect(std.mem.indexOf(u8, dump, "or_") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+}
+
+test "scope scheduling: a send on a bounded channel parks on a full buffer" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A bounded `channel(capacity: 1)`: the producer's `send` is a suspend point
+    // gated on the buffer having room (`vec_len - cursor < capacity`), so a
+    // straight-line producer/consumer pair routes to the scheduler — even though
+    // neither task both sends and recvs — and the producer parks when the buffer
+    // is full. The room test prints as `(vec_len(buf) sub cursor) lt 1`.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel(capacity: 1)
+        \\        spawn {
+        \\            ch.send(1)
+        \\            ch.send(2)
+        \\        }
+        \\        spawn {
+        \\            let a = ch.recv()
+        \\            let b = ch.recv()
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
+    try testing.expect(std.mem.indexOf(u8, dump, "sub") != null); // the room (unread-count) test
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null); // the gated send op
+
+    // Control: the *unbounded* `channel()` variant of the same shape has no
+    // backpressure — the producer (send-only) and consumer (top-level recvs)
+    // stay on the static eager/deferred path, no scheduler loop.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    var m2 = (try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        spawn {
+        \\            ch.send(1)
+        \\            ch.send(2)
+        \\        }
+        \\        spawn {
+        \\            let a = ch.recv()
+        \\            let b = ch.recv()
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer m2.deinit();
+    const dump2 = try print.hirToString(testing.allocator, &m2);
+    defer testing.allocator.free(dump2);
+    try testing.expect(std.mem.indexOf(u8, dump2, "while") == null); // static, not scheduled
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
