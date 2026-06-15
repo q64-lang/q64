@@ -1058,19 +1058,21 @@ fn emitSpawnTaskMain(b: *Builder, sp: ast.SpawnExpr, scope: *Scope, rt: *RtMap, 
 //       … task 1 …
 //   }
 //
-// A task's body is segmented at each `recv`: plain runs are gated `pc == k`,
-// a recv is gated `pc == k and <buffer non-empty>`. Because the whole loop is
-// one frame and pc-gating runs each segment exactly once, task locals persist
+// Each task lowers to a tiny CFG of pc-numbered blocks (`SchedBlock`): a plain
+// run, a `recv` suspend point (gated `pc == id and <buffer non-empty>`), or a
+// counted `for` loop (a branch head + a back-edge that increments the counter
+// and jumps back — so a `recv` *inside* a loop is a real suspend point, which
+// is the request/reply streaming shape). Because the whole loop is one frame
+// and pc-gating runs each block at the right time, task locals persist
 // naturally as ordinary locals — no closure box, funcref, or hoisting. `prog`
 // is the **deadlock guard**: a full round with no advance means every task is
 // blocked forever, so the loop exits (v0: incomplete tasks just stop).
 //
-// v0 boundaries: main-position scopes; straight-line task bodies (no nested
-// control flow in a task); `let v = ch.recv()` recvs; i64 channels. The gate
-// (`scopeNeedsScheduler`) is deliberately narrow so only genuinely cyclic
-// programs — which the static path can't compile anyway — are routed here.
-
-const TaskStmtKind = enum { recv, send, plain, unschedulable };
+// v0 boundaries: main-position scopes; task bodies of straight-line statements
+// + one level of counted `for i in lo..hi` loops (no nested loops, no `if`);
+// `let v = ch.recv()` recvs; i64 channels. The gate (`scopeNeedsScheduler`) is
+// deliberately narrow so only genuinely cyclic programs — which the static path
+// can't compile anyway — are routed here.
 
 /// A `let v = ch.recv()` step on a scope channel: the channel head, the result
 /// binding name, and the `ch.recv()` call expression (for `tryChannelRecv`).
@@ -1134,31 +1136,48 @@ fn sendStepChan(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnma
     return chans.getKey(cn[0..dot]);
 }
 
-/// Classify one task-body statement for the scheduler.
-fn classifyTaskStmt(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnmanaged(void)) TaskStmtKind {
-    if (recvStepOf(b, stmt, chans) != null) return .recv;
-    if (sendStepChan(b, stmt, chans) != null) return .send;
-    switch (stmt) {
-        .expr_stmt => |es| {
-            const e = es.expression() orelse return .unschedulable;
-            const cc = switch (e) {
-                .call => |x| x,
-                else => return .unschedulable,
-            };
-            // A plain effect (`env.out(…)`); other calls aren't v0-schedulable.
-            return if (isEnvOut(b.a, cc)) .plain else .unschedulable;
-        },
-        // A non-recv `let` with a non-call initializer (`let r = x + 10`): a
-        // plain step. A call initializer we don't recognize → fall back.
-        .let_stmt => |ls| {
-            const init = ls.initializer() orelse return .unschedulable;
-            return switch (init) {
-                .call => .unschedulable,
-                else => .plain,
-            };
-        },
-        else => return .unschedulable, // control flow in a task: v0 is straight-line
+/// Recursively check a task body is schedulable, recording whether it sends
+/// and/or recvs on scope channels (the `mutual` signal). Schedulable forms:
+/// `let v = ch.recv()`, `ch.send(e)`, `env.out(e)`, a non-call `let`, and a
+/// counted `for i in lo..hi { … }` loop (whose body recurses). `loop_depth`
+/// caps nesting: a `for` is only allowed at the task's top level (v0 — a nested
+/// loop's counter would need a per-entry reset the pre-init can't give it).
+/// Any other statement → not schedulable (fall back to the static path).
+fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), sends: *bool, recvs: *bool, loop_depth: usize) bool {
+    var it = body.statements();
+    while (it.next()) |stmt| {
+        if (recvStepOf(b, stmt, chans) != null) {
+            recvs.* = true;
+            continue;
+        }
+        if (sendStepChan(b, stmt, chans) != null) {
+            sends.* = true;
+            continue;
+        }
+        switch (stmt) {
+            .expr_stmt => |es| {
+                const e = es.expression() orelse return false;
+                const cc = switch (e) {
+                    .call => |x| x,
+                    else => return false,
+                };
+                if (!isEnvOut(b.a, cc)) return false; // other calls aren't v0
+            },
+            .let_stmt => |ls| {
+                const init = ls.initializer() orelse return false;
+                if (init == .call) return false; // a non-recv call init: not v0
+            },
+            .for_stmt => |fs| {
+                if (loop_depth != 0) return false; // v0: no nested loops in a task
+                const iter = fs.iterable() orelse return false;
+                if (iter != .range) return false; // counted ranges only
+                const fb = fs.body() orelse return false;
+                if (!taskSchedulable(b, fb, chans, sends, recvs, loop_depth + 1)) return false;
+            },
+            else => return false, // other control flow in a task: v0
+        }
     }
+    return true;
 }
 
 /// Read-only gate: does this scope hold genuinely cyclic tasks that the static
@@ -1184,13 +1203,7 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
             ntasks += 1;
             var sends = false;
             var recvs = false;
-            var bit = body.statements();
-            while (bit.next()) |bs| switch (classifyTaskStmt(b, bs, &chans)) {
-                .unschedulable => return false,
-                .recv => recvs = true,
-                .send => sends = true,
-                .plain => {},
-            };
+            if (!taskSchedulable(b, body, &chans, &sends, &recvs, 0)) return false;
             if (sends and recvs) mutual = true;
         } else if (channelDeclName(b, stmt) == null) {
             return false; // a non-spawn, non-channel-decl statement: stay static
@@ -1237,17 +1250,175 @@ fn chanReadyCond(b: *Builder, scope: *Scope, chan: []const u8) BuildError!*hir.E
     return mkBinE(b, .lt, cur, len);
 }
 
-/// Emit one pc-gated segment: `if (pc == k [and ready]) { <seg>; pc = k+1;
-/// prog = 1 }`.
-fn emitSchedGate(b: *Builder, body: *std.ArrayList(*hir.Stmt), pc_idx: u32, k: usize, prog_idx: u32, seg: []const *hir.Stmt, ready: ?*hir.Expr) BuildError!void {
-    const pcref = try mkLocalE(b, pc_idx, .i64);
-    const kc = try mkIntE(b, @intCast(k));
-    const eq = try mkBinE(b, .eq, pcref, kc);
-    const cond = if (ready) |r| try mkLogicalE(b, .and_, eq, r) else eq;
+// A task lowers to a tiny CFG of pc-numbered blocks. A `plain`/`recv` block
+// runs its stmts then jumps to `next`; a `branch` block (a loop head) tests
+// `cond` and jumps to `next` (enter body) or `alt` (exit). The pc is the block
+// id; `next`/`alt` are block ids. `DONE_PC` is a sentinel for "task complete",
+// patched to the terminal id (one past the last block) after all blocks exist.
+const DONE_PC: usize = std.math.maxInt(usize);
+const SchedBlock = struct {
+    kind: enum { plain, recv, branch },
+    stmts: []const *hir.Stmt = &.{},
+    ready: ?*hir.Expr = null, // recv readiness test
+    cond: ?*hir.Expr = null, // branch (loop-head) test
+    next: usize, // plain/recv successor, or branch then-target
+    alt: usize = 0, // branch else-target
+};
+
+/// One source item of a task body: a maximal run of straight-line statements,
+/// a single `recv` suspend point, or a counted `for` loop.
+const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, forl: ast.ForStmt };
+
+/// Context threaded through the per-task CFG lowering.
+const SchedCtx = struct {
+    b: *Builder,
+    scope: *Scope,
+    rt: *RtMap,
+    chans: *const std.StringHashMapUnmanaged(void),
+    blocks: *std.ArrayList(SchedBlock),
+    pre: *std.ArrayList(*hir.Stmt), // loop-var inits, emitted once before the loop
+};
+
+fn collectStmts(b: *Builder, body: ast.Block) BuildError![]const ast.Stmt {
+    var list: std.ArrayList(ast.Stmt) = .empty;
+    var it = body.statements();
+    while (it.next()) |s| try list.append(b.a, s);
+    return list.toOwnedSlice(b.a);
+}
+
+fn addBlock(ctx: *SchedCtx, blk: SchedBlock) BuildError!usize {
+    try ctx.blocks.append(ctx.b.a, blk);
+    return ctx.blocks.items.len - 1;
+}
+
+/// Where an item's control flow leaves it (patched to the successor's entry):
+/// either a block's `.next` or, for a loop head, its `.alt` (loop-exit) field.
+const ItemSpan = struct { entry: usize, exit_id: usize, exit_alt: bool };
+
+/// Lower a counted `for i in lo..hi { body }` into head/body/back blocks.
+/// HEAD branches `i (<|<=) #hi ? body_entry : <exit>`; the body's tail flows to
+/// BACK (`i += 1; goto HEAD`). The loop-exit (`HEAD.alt`) is patched by the
+/// caller. The counter + bound are pre-initialized once before the loop.
+fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!usize {
+    const b = ctx.b;
+    const range = (fs.iterable() orelse return error.Unsupported).range;
+    const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+    const lo_e = try buildIntExpr(b, range.lo() orelse return error.Unsupported, ctx.scope);
+    const hi_e = try buildIntExpr(b, range.hi() orelse return error.Unsupported, ctx.scope);
+    // The counter binds the source name (so the body's uses resolve); a `_`
+    // loop gets a fresh hidden name.
+    const iname = if (std.mem.eql(u8, pat.text, "_")) try std.fmt.allocPrint(b.a, "#schi{d}", .{ctx.blocks.items.len}) else pat.text;
+    const hi_name = try std.fmt.allocPrint(b.a, "{s}#schi_hi{d}", .{ iname, ctx.blocks.items.len });
+    const hi_idx = try declareBodyLocal(b, ctx.scope, hi_name, false, .i64);
+    const i_idx = try declareBodyLocal(b, ctx.scope, iname, true, .i64);
+    try ctx.pre.append(b.a, blk: {
+        const s = try b.a.create(hir.Stmt);
+        s.* = .{ .let = .{ .idx = hi_idx, .value = hi_e } };
+        break :blk s;
+    });
+    try ctx.pre.append(b.a, blk: {
+        const s = try b.a.create(hir.Stmt);
+        s.* = .{ .let = .{ .idx = i_idx, .value = lo_e } };
+        break :blk s;
+    });
+    // Reserve HEAD + BACK; build the body (left-to-right) flowing to BACK.
+    const head_id = try addBlock(ctx, .{ .kind = .branch, .next = 0 });
+    const back_id = try addBlock(ctx, .{ .kind = .plain, .next = 0 });
+    const body_entry = try lowerTaskSeq(ctx, try collectStmts(b, fs.body() orelse return error.Unsupported), back_id);
+    const cond = try mkBinE(b, if (range.inclusive()) .le else .lt, try mkLocalE(b, i_idx, .i64), try mkLocalE(b, hi_idx, .i64));
+    ctx.blocks.items[head_id] = .{ .kind = .branch, .cond = cond, .next = body_entry, .alt = 0 };
+    const inc = try mkBinE(b, .add, try mkLocalE(b, i_idx, .i64), try mkIntE(b, 1));
+    const back_stmts = try b.a.dupe(*hir.Stmt, &.{try mkAssignS(b, i_idx, inc)});
+    ctx.blocks.items[back_id] = .{ .kind = .plain, .stmts = back_stmts, .next = head_id };
+    return head_id;
+}
+
+/// Materialize one item's HIR + block(s), returning its entry pc and the block
+/// field that carries control onward. Built **in source order** so a binding
+/// (e.g. a recv result) is declared before a later statement reads it.
+fn lowerSchedItem(ctx: *SchedCtx, item: SchedItem) BuildError!ItemSpan {
+    const b = ctx.b;
+    switch (item) {
+        .plain => |ss| {
+            var list: std.ArrayList(*hir.Stmt) = .empty;
+            for (ss) |s| try buildMainStmt(b, s, ctx.scope, ctx.rt, &list);
+            const id = try addBlock(ctx, .{ .kind = .plain, .stmts = try list.toOwnedSlice(b.a), .next = 0 });
+            return .{ .entry = id, .exit_id = id, .exit_alt = false };
+        },
+        .recv => |s| {
+            const rs = recvStepOf(b, s, ctx.chans) orelse return error.Unsupported;
+            var list: std.ArrayList(*hir.Stmt) = .empty;
+            if (!try tryChannelRecv(b, rs.call, rs.name, false, ctx.scope, &list)) return error.Unsupported;
+            const ready = try chanReadyCond(b, ctx.scope, rs.chan);
+            const id = try addBlock(ctx, .{ .kind = .recv, .stmts = try list.toOwnedSlice(b.a), .ready = ready, .next = 0 });
+            return .{ .entry = id, .exit_id = id, .exit_alt = false };
+        },
+        .forl => |fs| {
+            const head = try lowerForLoop(ctx, fs);
+            return .{ .entry = head, .exit_id = head, .exit_alt = true }; // exit = HEAD.alt
+        },
+    }
+}
+
+/// Lower a statement sequence to CFG blocks, returning the entry pc. Items are
+/// built **left-to-right** (so local declarations precede their uses); then
+/// each item's exit is patched to the next item's entry (last → `succ`).
+fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError!usize {
+    const b = ctx.b;
+    var items: std.ArrayList(SchedItem) = .empty;
+    defer items.deinit(b.a);
+    var run: std.ArrayList(ast.Stmt) = .empty;
+    defer run.deinit(b.a);
+    for (stmts) |s| {
+        if (recvStepOf(b, s, ctx.chans) != null) {
+            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
+            try items.append(b.a, .{ .recv = s });
+        } else if (s == .for_stmt) {
+            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
+            try items.append(b.a, .{ .forl = s.for_stmt });
+        } else {
+            try run.append(b.a, s);
+        }
+    }
+    if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
+    if (items.items.len == 0) return succ;
+    var spans: std.ArrayList(ItemSpan) = .empty;
+    defer spans.deinit(b.a);
+    for (items.items) |item| try spans.append(b.a, try lowerSchedItem(ctx, item));
+    for (spans.items, 0..) |span, i| {
+        const target = if (i + 1 < spans.items.len) spans.items[i + 1].entry else succ;
+        if (span.exit_alt) {
+            ctx.blocks.items[span.exit_id].alt = target;
+        } else {
+            ctx.blocks.items[span.exit_id].next = target;
+        }
+    }
+    return spans.items[0].entry;
+}
+
+/// Emit one block as a pc-gated `if`. plain/recv: `if (pc == id [and ready]) {
+/// stmts; pc = next; prog = 1 }`. branch: `if (pc == id) { if (cond) pc = next
+/// else pc = alt; prog = 1 }`.
+fn emitBlockGate(b: *Builder, body: *std.ArrayList(*hir.Stmt), pc_idx: u32, id: usize, prog_idx: u32, blk: SchedBlock) BuildError!void {
+    const at = try mkBinE(b, .eq, try mkLocalE(b, pc_idx, .i64), try mkIntE(b, @intCast(id)));
     var items: std.ArrayList(*hir.Stmt) = .empty;
-    try items.appendSlice(b.a, seg);
-    try items.append(b.a, try mkAssignS(b, pc_idx, try mkIntE(b, @intCast(k + 1))));
+    switch (blk.kind) {
+        .plain, .recv => {
+            try items.appendSlice(b.a, blk.stmts);
+            try items.append(b.a, try mkAssignS(b, pc_idx, try mkIntE(b, @intCast(blk.next))));
+        },
+        .branch => {
+            const then_s = try b.a.create(hir.Stmt);
+            then_s.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{try mkAssignS(b, pc_idx, try mkIntE(b, @intCast(blk.next)))}) };
+            const else_s = try b.a.create(hir.Stmt);
+            else_s.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{try mkAssignS(b, pc_idx, try mkIntE(b, @intCast(blk.alt)))}) };
+            const brif = try b.a.create(hir.Stmt);
+            brif.* = .{ .if_ = .{ .cond = blk.cond.?, .then_ = then_s, .else_ = else_s } };
+            try items.append(b.a, brif);
+        },
+    }
     try items.append(b.a, try mkAssignS(b, prog_idx, try mkIntE(b, 1)));
+    const cond = if (blk.ready) |r| try mkLogicalE(b, .and_, at, r) else at;
     const then_blk = try b.a.create(hir.Stmt);
     then_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
     const ifst = try b.a.create(hir.Stmt);
@@ -1281,58 +1452,50 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
         }
     }
     const ntasks = tasks.items.len;
-    // Per-task program counters (start 0) + the progress flag (start 1, so the
-    // loop runs at least once).
     const pc_idx = try b.a.alloc(u32, ntasks);
-    for (0..ntasks) |t| {
+    const entry = try b.a.alloc(usize, ntasks);
+    const terminal = try b.a.alloc(usize, ntasks);
+    // The progress flag (declared first: the per-task gates reference it).
+    const prog_idx = try declareBodyLocal(b, scope, "#sched_prog", true, .i64);
+    var pre: std.ArrayList(*hir.Stmt) = .empty; // loop-var inits (before the loop)
+    defer pre.deinit(b.a);
+    var gates: std.ArrayList(*hir.Stmt) = .empty; // per-task block gates (the loop body)
+    defer gates.deinit(b.a);
+    for (tasks.items, 0..) |task, t| {
         const nm = try std.fmt.allocPrint(b.a, "#sched_pc{d}", .{t});
         pc_idx[t] = try declareBodyLocal(b, scope, nm, true, .i64);
+        var blocks: std.ArrayList(SchedBlock) = .empty;
+        defer blocks.deinit(b.a);
+        var ctx: SchedCtx = .{ .b = b, .scope = scope, .rt = rt, .chans = &chans, .blocks = &blocks, .pre = &pre };
+        entry[t] = try lowerTaskSeq(&ctx, try collectStmts(b, task), DONE_PC);
+        terminal[t] = blocks.items.len; // pc == terminal ⇒ task complete
+        for (blocks.items) |*bl| {
+            if (bl.next == DONE_PC) bl.next = terminal[t];
+            if (bl.alt == DONE_PC) bl.alt = terminal[t];
+        }
+        for (blocks.items, 0..) |bl, id| try emitBlockGate(b, &gates, pc_idx[t], id, prog_idx, bl);
+    }
+    // Setup runs once before the loop: loop-var inits, then pc = entry, prog = 1.
+    try out.appendSlice(b.a, pre.items);
+    for (0..ntasks) |t| {
         const st = try b.a.create(hir.Stmt);
-        st.* = .{ .let = .{ .idx = pc_idx[t], .value = try mkIntE(b, 0) } };
+        st.* = .{ .let = .{ .idx = pc_idx[t], .value = try mkIntE(b, @intCast(entry[t])) } };
         try out.append(b.a, st);
     }
-    const prog_idx = try declareBodyLocal(b, scope, "#sched_prog", true, .i64);
     {
         const st = try b.a.create(hir.Stmt);
         st.* = .{ .let = .{ .idx = prog_idx, .value = try mkIntE(b, 1) } };
         try out.append(b.a, st);
     }
-    // Build the loop body: `prog = 0`, then each task's pc-gated segments.
+    // Loop body: `prog = 0`, then every task's block gates.
     var body: std.ArrayList(*hir.Stmt) = .empty;
     defer body.deinit(b.a);
     try body.append(b.a, try mkAssignS(b, prog_idx, try mkIntE(b, 0)));
-    const seg_count = try b.a.alloc(usize, ntasks);
-    for (tasks.items, 0..) |task, t| {
-        var k: usize = 0;
-        var seg: std.ArrayList(*hir.Stmt) = .empty;
-        defer seg.deinit(b.a);
-        var bit = task.statements();
-        while (bit.next()) |bs| {
-            if (recvStepOf(b, bs, &chans)) |rs| {
-                // Flush the accumulated plain run as a gate, then the recv gate.
-                if (seg.items.len > 0) {
-                    try emitSchedGate(b, &body, pc_idx[t], k, prog_idx, try seg.toOwnedSlice(b.a), null);
-                    k += 1;
-                }
-                var ritems: std.ArrayList(*hir.Stmt) = .empty;
-                if (!try tryChannelRecv(b, rs.call, rs.name, false, scope, &ritems)) return error.Unsupported;
-                const ready = try chanReadyCond(b, scope, rs.chan);
-                try emitSchedGate(b, &body, pc_idx[t], k, prog_idx, try ritems.toOwnedSlice(b.a), ready);
-                k += 1;
-            } else {
-                try buildMainStmt(b, bs, scope, rt, &seg);
-            }
-        }
-        if (seg.items.len > 0) {
-            try emitSchedGate(b, &body, pc_idx[t], k, prog_idx, try seg.toOwnedSlice(b.a), null);
-            k += 1;
-        }
-        seg_count[t] = k;
-    }
+    try body.appendSlice(b.a, gates.items);
     // `while ((pc0 < N0 or pc1 < N1 or …) and prog == 1) { body }`.
     var any: ?*hir.Expr = null;
     for (0..ntasks) |t| {
-        const lt = try mkBinE(b, .lt, try mkLocalE(b, pc_idx[t], .i64), try mkIntE(b, @intCast(seg_count[t])));
+        const lt = try mkBinE(b, .lt, try mkLocalE(b, pc_idx[t], .i64), try mkIntE(b, @intCast(terminal[t])));
         any = if (any) |a| try mkLogicalE(b, .or_, a, lt) else lt;
     }
     const prog_eq = try mkBinE(b, .eq, try mkLocalE(b, prog_idx, .i64), try mkIntE(b, 1));
@@ -9082,6 +9245,47 @@ test "scope scheduling: cyclic ping-pong tasks lower to a round-robin scheduler 
     const dump2 = try print.hirToString(testing.allocator, &m2);
     defer testing.allocator.free(dump2);
     try testing.expect(std.mem.indexOf(u8, dump2, "while") == null); // static, not scheduled
+}
+
+test "scope scheduling: a recv inside a for-loop is a suspend point (request/reply)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // Client loops { send req; recv resp; emit }, server loops { recv req; send
+    // resp } — the recv inside each loop is a real suspend point, so the loop
+    // lowers to a branch head + a back-edge (`i += 1` then re-test) around the
+    // recv gate, all inside the one scheduler `while`.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let req = channel()
+        \\        let resp = channel()
+        \\        spawn {
+        \\            for i in 1..=3 {
+        \\                req.send(i)
+        \\                let r = resp.recv()
+        \\                env.out(r)
+        \\            }
+        \\        }
+        \\        spawn {
+        \\            for j in 1..=3 {
+        \\                let x = req.recv()
+        \\                resp.send(x * 10)
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The scheduler while, the loop counters (`le` head test = inclusive range),
+    // the recv readiness (`vec_len`), and both channel ops are present.
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "le") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

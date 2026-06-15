@@ -374,12 +374,28 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         task); the static eager/deferred path is byte-identical. Adds a
         build_hir test (scheduler `while` + pc gates; acyclic pair stays static)
         and a link-roundtrip section. **v0 boundaries:** main-position scopes;
-        straight-line task bodies (no nested control flow / loops in a task);
-        `let v = ch.recv()` recvs; i64 channels; a `recv` inside a `select` or
-        nested block isn't a detected suspend point. **Next:** loops inside
-        tasks (the streaming/generator shape), `select` parking on the same
-        loop, `send`-on-full (bounded channels), `ask` suspension, and lifting
-        the scheduler into callee bodies.
+        straight-line task bodies; `let v = ch.recv()` recvs; i64 channels; a
+        `recv` inside a `select` isn't a detected suspend point.
+  - [x] **Loops inside scheduled tasks — the request/reply streaming shape.**
+        Generalized the scheduler from a linear segment list to a tiny **per-task
+        CFG** (`SchedBlock`: plain / recv / branch, each with explicit successor
+        pcs). A counted `for i in lo..hi { … }` lowers to a **branch head**
+        (`i (<|<=) #hi ? body : exit`) + a **back-edge** block (`i += 1; goto
+        head`), so a `recv` *inside* the loop is a real suspend point with the
+        loop counter carried across scheduler rounds. Blocks are materialized
+        **left-to-right** (a binding is declared before a later block reads it —
+        the ordering bug a naive right-to-left chaining hit) and their
+        successors patched forward; the counter + bound are pre-initialized
+        once before the loop. The marquee case — client `for i { req.send(i);
+        let r = resp.recv(); emit(r) }` plus server `for j { let x = req.recv();
+        resp.send(x*10) }` — interleaves correctly: 10 / 20 / 30 (wasm64 +
+        wasm32). Straight-line ping-pong (11) and the two-round exchange (111)
+        still pass; a cyclic deadlock still exits clean. Adds a build_hir test
+        (loop head `le` + recv `vec_len` inside the scheduler `while`) and a
+        link-roundtrip section. **v0 boundaries (next):** one level of counted
+        `for` only (no nested loops, no `while`/`if` in a task); `select`
+        parking on the same loop; `send`-on-full (bounded channels); `ask`
+        suspension; lifting the scheduler into callee bodies.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

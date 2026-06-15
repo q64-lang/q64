@@ -2605,6 +2605,42 @@ pp32_out="$("$HOST_BIN" "$tmp/pingpong32.wasm")"
 [[ "$pp32_out" == "$pp_expected" ]] || { echo "FAIL: ping-pong wasm32 (got: $pp32_out)" >&2; exit 1; }
 echo "    ok: cyclic ping-pong -> 111 (wasm64 + wasm32; mutual suspension, pc state machines + round-robin)"
 
+echo "==> scheduler: request/reply with a recv suspend point INSIDE a loop"
+rr_app="$tmp/reqrep.q"
+cat > "$rr_app" <<'Q64'
+fn main {
+    scope {
+        let req = channel()
+        let resp = channel()
+        spawn {
+            for i in 1..=3 {
+                req.send(i)
+                let r = resp.recv()
+                env.out(r)
+            }
+        }
+        spawn {
+            for j in 1..=3 {
+                let x = req.recv()
+                resp.send(x * 10)
+            }
+        }
+    }
+}
+Q64
+# Each iteration interleaves: client sends req[i], suspends on resp; server
+# recvs req[i], sends resp; client resumes and emits. The recv inside the loop
+# is a real suspend point — the loop lowers to a branch head + back-edge around
+# the recv gate. -> 10 / 20 / 30.
+rr_expected=$'10\n20\n30'
+"$Q64_BIN" emit "$rr_app" "$tmp/reqrep.wasm"
+rr_out="$("$HOST_BIN" "$tmp/reqrep.wasm")"
+[[ "$rr_out" == "$rr_expected" ]] || { echo "FAIL: request/reply loop (got: $rr_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$rr_app" "$tmp/reqrep32.wasm" --addr wasm32
+rr32_out="$("$HOST_BIN" "$tmp/reqrep32.wasm")"
+[[ "$rr32_out" == "$rr_expected" ]] || { echo "FAIL: request/reply loop wasm32 (got: $rr32_out)" >&2; exit 1; }
+echo "    ok: request/reply loop -> 10 / 20 / 30 (wasm64 + wasm32; recv suspends inside a for-loop, back-edge resumes)"
+
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
 cat > "$ssc_app" <<'Q64'
