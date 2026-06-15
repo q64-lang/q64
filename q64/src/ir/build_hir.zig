@@ -1136,22 +1136,29 @@ fn sendStepChan(b: *Builder, stmt: ast.Stmt, chans: *const std.StringHashMapUnma
     return chans.getKey(cn[0..dot]);
 }
 
-/// Recursively check a task body is schedulable, recording whether it sends
-/// and/or recvs on scope channels (the `mutual` signal). Schedulable forms:
-/// `let v = ch.recv()`, `ch.send(e)`, `env.out(e)`, a non-call `let`, and a
-/// counted `for i in lo..hi { … }` loop (whose body recurses). `loop_depth`
-/// caps nesting: a `for` is only allowed at the task's top level (v0 — a nested
-/// loop's counter would need a per-entry reset the pre-init can't give it).
-/// Any other statement → not schedulable (fall back to the static path).
-fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), sends: *bool, recvs: *bool, loop_depth: usize) bool {
+/// What a task-body scan found: whether it sends / recvs on scope channels, and
+/// whether any `recv` sits **inside control flow** (a loop or `if`). The static
+/// path only detects top-level recvs, so a recv-in-control task must go to the
+/// scheduler even when it isn't part of a mutual cycle.
+const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl: bool = false };
+
+/// Recursively check a task body is schedulable, filling `scan`. Schedulable
+/// forms: `let v = ch.recv()`, `ch.send(e)`, `env.out(e)`, a non-call `let`, an
+/// assignment, a counted `for i in lo..hi`, a `while`, and an `if`/`else` chain
+/// (bodies recurse). `loop_depth` caps loop nesting (v0: one level — a nested
+/// loop's counter would need a per-entry reset the pre-init can't give it);
+/// `in_ctrl` marks that we're inside a loop/`if` body. Any other statement →
+/// not schedulable (fall back to the static path).
+fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool) bool {
     var it = body.statements();
     while (it.next()) |stmt| {
         if (recvStepOf(b, stmt, chans) != null) {
-            recvs.* = true;
+            scan.recvs = true;
+            if (in_ctrl) scan.recv_in_ctrl = true;
             continue;
         }
         if (sendStepChan(b, stmt, chans) != null) {
-            sends.* = true;
+            scan.sends = true;
             continue;
         }
         switch (stmt) {
@@ -1167,12 +1174,22 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
                 const init = ls.initializer() orelse return false;
                 if (init == .call) return false; // a non-recv call init: not v0
             },
+            .assign_stmt => {}, // `x = e` — a plain step (mutates a task local)
             .for_stmt => |fs| {
                 if (loop_depth != 0) return false; // v0: no nested loops in a task
                 const iter = fs.iterable() orelse return false;
                 if (iter != .range) return false; // counted ranges only
                 const fb = fs.body() orelse return false;
-                if (!taskSchedulable(b, fb, chans, sends, recvs, loop_depth + 1)) return false;
+                if (!taskSchedulable(b, fb, chans, scan, loop_depth + 1, true)) return false;
+            },
+            .while_stmt => |ws| {
+                if (loop_depth != 0) return false; // v0: no nested loops
+                if (ws.ifLet() != null) return false; // `while let`: later
+                const wb = ws.body() orelse return false;
+                if (!taskSchedulable(b, wb, chans, scan, loop_depth + 1, true)) return false;
+            },
+            .if_stmt => |ifs| {
+                if (!ifStmtSchedulable(b, ifs, chans, scan, loop_depth)) return false;
             },
             else => return false, // other control flow in a task: v0
         }
@@ -1180,12 +1197,24 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
     return true;
 }
 
-/// Read-only gate: does this scope hold genuinely cyclic tasks that the static
-/// path can't serve? True iff every non-spawn statement is a channel decl,
-/// every spawned task is straight-line and schedulable, there are ≥2 tasks,
-/// and at least one task **both sends and recvs** (the mutual-wait signature).
-/// That last condition is what keeps every currently-compiling program on the
-/// eager/deferred path — none has such a task.
+/// An `if`/`else`/`else if` chain in a task: each branch body must itself be
+/// schedulable (and is `in_ctrl`). `if let` is rejected (a later slice).
+fn ifStmtSchedulable(b: *Builder, ifs: ast.IfStmt, chans: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize) bool {
+    if (ifs.ifLet() != null) return false;
+    const tb = ifs.thenBody() orelse return false;
+    if (!taskSchedulable(b, tb, chans, scan, loop_depth, true)) return false;
+    if (ifs.elseBody()) |eb| return taskSchedulable(b, eb, chans, scan, loop_depth, true);
+    if (ifs.elseIf()) |ei| return ifStmtSchedulable(b, ei, chans, scan, loop_depth);
+    return true; // no else
+}
+
+/// Read-only gate: does this scope need the runtime scheduler (rather than the
+/// static eager/deferred path)? True iff every non-spawn statement is a channel
+/// decl, every spawned task is schedulable, there are ≥2 tasks, and at least
+/// one task either **both sends and recvs** (the mutual-wait cycle) **or** has a
+/// `recv` inside control flow (which the static path can't lower — it only sees
+/// top-level recvs). Either condition only ever holds for programs the static
+/// path can't compile anyway, so no currently-compiling program is routed here.
 fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
     _ = scope;
     var chans: std.StringHashMapUnmanaged(void) = .empty;
@@ -1195,21 +1224,20 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
         if (channelDeclName(b, stmt)) |nm| chans.put(b.a, nm, {}) catch return false;
     }
     var ntasks: usize = 0;
-    var mutual = false;
+    var needs = false;
     it = blk.statements();
     while (it.next()) |stmt| {
         if (spawnExprOf(stmt)) |sp| {
             const body = sp.block() orelse return false; // `spawn scope`: not v0-schedulable
             ntasks += 1;
-            var sends = false;
-            var recvs = false;
-            if (!taskSchedulable(b, body, &chans, &sends, &recvs, 0)) return false;
-            if (sends and recvs) mutual = true;
+            var scan: TaskScan = .{};
+            if (!taskSchedulable(b, body, &chans, &scan, 0, false)) return false;
+            if ((scan.sends and scan.recvs) or scan.recv_in_ctrl) needs = true;
         } else if (channelDeclName(b, stmt) == null) {
             return false; // a non-spawn, non-channel-decl statement: stay static
         }
     }
-    return ntasks >= 2 and mutual;
+    return ntasks >= 2 and needs;
 }
 
 fn mkLocalE(b: *Builder, idx: u32, ty: hir.Type) BuildError!*hir.Expr {
@@ -1266,8 +1294,9 @@ const SchedBlock = struct {
 };
 
 /// One source item of a task body: a maximal run of straight-line statements,
-/// a single `recv` suspend point, or a counted `for` loop.
-const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, forl: ast.ForStmt };
+/// a single `recv` suspend point, a counted `for` loop, a `while` loop, or an
+/// `if`/`else` chain.
+const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt };
 
 /// Context threaded through the per-task CFG lowering.
 const SchedCtx = struct {
@@ -1333,6 +1362,35 @@ fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!usize {
     return head_id;
 }
 
+/// Lower a `while cond { body }` into a head + body. HEAD branches `cond ?
+/// body_entry : <exit>`; the body's tail flows back to HEAD (the body must
+/// mutate `cond` to terminate). No counter — unlike `for`, nothing is
+/// pre-initialized. The loop-exit (`HEAD.alt`) is patched by the caller.
+fn lowerWhileLoop(ctx: *SchedCtx, ws: ast.WhileStmt) BuildError!usize {
+    const b = ctx.b;
+    const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, ctx.scope);
+    const head_id = try addBlock(ctx, .{ .kind = .branch, .next = 0 });
+    const body_entry = try lowerTaskSeq(ctx, try collectStmts(b, ws.body() orelse return error.Unsupported), head_id);
+    ctx.blocks.items[head_id] = .{ .kind = .branch, .cond = cond, .next = body_entry, .alt = 0 };
+    return head_id;
+}
+
+/// Lower an `if`/`else`/`else if` chain whose branches all flow to `join`.
+/// Returns the head (branch) block id. `cond ? then_entry : else_entry`, where
+/// the else target is the else body, the nested `else if`, or `join` directly.
+fn lowerIfBranch(ctx: *SchedCtx, ifs: ast.IfStmt, join: usize) BuildError!usize {
+    const b = ctx.b;
+    const cond = try buildIntExpr(b, ifs.condition() orelse return error.Unsupported, ctx.scope);
+    const then_entry = try lowerTaskSeq(ctx, try collectStmts(b, ifs.thenBody() orelse return error.Unsupported), join);
+    var else_entry: usize = join;
+    if (ifs.elseBody()) |eb| {
+        else_entry = try lowerTaskSeq(ctx, try collectStmts(b, eb), join);
+    } else if (ifs.elseIf()) |ei| {
+        else_entry = try lowerIfBranch(ctx, ei, join);
+    }
+    return addBlock(ctx, .{ .kind = .branch, .cond = cond, .next = then_entry, .alt = else_entry });
+}
+
 /// Materialize one item's HIR + block(s), returning its entry pc and the block
 /// field that carries control onward. Built **in source order** so a binding
 /// (e.g. a recv result) is declared before a later statement reads it.
@@ -1357,6 +1415,16 @@ fn lowerSchedItem(ctx: *SchedCtx, item: SchedItem) BuildError!ItemSpan {
             const head = try lowerForLoop(ctx, fs);
             return .{ .entry = head, .exit_id = head, .exit_alt = true }; // exit = HEAD.alt
         },
+        .whilel => |ws| {
+            const head = try lowerWhileLoop(ctx, ws);
+            return .{ .entry = head, .exit_id = head, .exit_alt = true }; // exit = HEAD.alt
+        },
+        .iff => |ifs| {
+            // An empty JOIN block reunites the branches; its `next` is the exit.
+            const join = try addBlock(ctx, .{ .kind = .plain, .next = 0 });
+            const head = try lowerIfBranch(ctx, ifs, join);
+            return .{ .entry = head, .exit_id = join, .exit_alt = false };
+        },
     }
 }
 
@@ -1376,6 +1444,12 @@ fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError
         } else if (s == .for_stmt) {
             if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
             try items.append(b.a, .{ .forl = s.for_stmt });
+        } else if (s == .while_stmt) {
+            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
+            try items.append(b.a, .{ .whilel = s.while_stmt });
+        } else if (s == .if_stmt) {
+            if (run.items.len > 0) try items.append(b.a, .{ .plain = try run.toOwnedSlice(b.a) });
+            try items.append(b.a, .{ .iff = s.if_stmt });
         } else {
             try run.append(b.a, s);
         }
@@ -9286,6 +9360,74 @@ test "scope scheduling: a recv inside a for-loop is a suspend point (request/rep
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "scope scheduling: while loops and if/else are schedulable control flow" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A `recv` inside a `while` (the consumer) routes the scope to the scheduler
+    // even though it isn't a mutual cycle (the static path can't lower a recv
+    // inside control flow). The producer's `while` is a recv-free loop.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        spawn {
+        \\            var n = 1
+        \\            while n <= 3 {
+        \\                ch.send(n)
+        \\                n = n + 1
+        \\            }
+        \\        }
+        \\        spawn {
+        \\            var got = 0
+        \\            while got < 3 {
+        \\                let x = ch.recv()
+        \\                env.out(x)
+        \\                got = got + 1
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null); // the recv-in-while
+
+    // An `if`/`else` inside a task body is schedulable (a branch into then/else
+    // that rejoins) — here choosing which value the server replies with.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    var m2 = (try buildLocal(testing.allocator, &tr2,
+        \\fn main {
+        \\    scope {
+        \\        let req = channel()
+        \\        let resp = channel()
+        \\        spawn {
+        \\            req.send(2)
+        \\            let r = resp.recv()
+        \\            env.out(r)
+        \\        }
+        \\        spawn {
+        \\            let x = req.recv()
+        \\            if x % 2 == 0 {
+        \\                resp.send(x * 100)
+        \\            } else {
+        \\                resp.send(x)
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer m2.deinit();
+    const dump2 = try print.hirToString(testing.allocator, &m2);
+    defer testing.allocator.free(dump2);
+    try testing.expect(std.mem.indexOf(u8, dump2, "while") != null); // scheduler loop
+    try testing.expect(std.mem.indexOf(u8, dump2, "rem") != null); // the `x % 2` branch test
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

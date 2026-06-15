@@ -392,10 +392,26 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         wasm32). Straight-line ping-pong (11) and the two-round exchange (111)
         still pass; a cyclic deadlock still exits clean. Adds a build_hir test
         (loop head `le` + recv `vec_len` inside the scheduler `while`) and a
-        link-roundtrip section. **v0 boundaries (next):** one level of counted
-        `for` only (no nested loops, no `while`/`if` in a task); `select`
-        parking on the same loop; `send`-on-full (bounded channels); `ask`
-        suspension; lifting the scheduler into callee bodies.
+        link-roundtrip section.
+  - [x] **`while` loops + `if`/`else` in scheduled tasks (general control flow).**
+        Extended the per-task CFG with two more block shapes. A `while cond { … }`
+        is a branch head (`cond ? body : exit`) whose body flows **back to the
+        head** (no counter — the body mutates `cond`). An `if`/`else`/`else if`
+        is a branch into then/else entries that reunite at an empty **JOIN**
+        block (`else if` recurses; a missing `else` targets JOIN directly).
+        Assignments (`n = n + 1`) are plain steps. The schedulability scan now
+        also reports **`recv_in_ctrl`** (a recv inside a loop/`if`), and the gate
+        routes such a scope to the scheduler **even when it isn't a mutual
+        cycle** — the static path only sees top-level recvs, so a recv inside
+        control flow can't be lowered there. Verified wasm64 + wasm32: a
+        non-mutual `while` producer/consumer (recv-in-while) → 1 / 2 / 3; a
+        mutual `while` ping-pong → 10 / 20 / 30; an `if`/`else` server reply
+        (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
+        link-roundtrip sections; all prior scheduler + static cases still pass.
+        **v0 boundaries (next):** one level of loop nesting (no loop-in-loop);
+        no `break`/`continue`/`match` in a task; `let _ = ch.recv()` discard
+        recvs; `select` parking on the loop; `send`-on-full (bounded channels);
+        `ask` suspension; lifting the scheduler into callee bodies.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

@@ -2641,6 +2641,79 @@ rr32_out="$("$HOST_BIN" "$tmp/reqrep32.wasm")"
 [[ "$rr32_out" == "$rr_expected" ]] || { echo "FAIL: request/reply loop wasm32 (got: $rr32_out)" >&2; exit 1; }
 echo "    ok: request/reply loop -> 10 / 20 / 30 (wasm64 + wasm32; recv suspends inside a for-loop, back-edge resumes)"
 
+echo "==> scheduler: while-loop producer/consumer (recv inside a while, non-mutual)"
+wl_app="$tmp/whileloop.q"
+cat > "$wl_app" <<'Q64'
+fn main {
+    scope {
+        let ch = channel()
+        spawn {
+            var n = 1
+            while n <= 3 {
+                ch.send(n)
+                n = n + 1
+            }
+        }
+        spawn {
+            var got = 0
+            while got < 3 {
+                let x = ch.recv()
+                env.out(x)
+                got = got + 1
+            }
+        }
+    }
+}
+Q64
+# The consumer's recv sits inside a `while`, which the static path can't lower,
+# so the scope routes to the scheduler even though it isn't a mutual cycle. The
+# producer's while is a recv-free loop. -> 1 / 2 / 3.
+wl_expected=$'1\n2\n3'
+"$Q64_BIN" emit "$wl_app" "$tmp/whileloop.wasm"
+wl_out="$("$HOST_BIN" "$tmp/whileloop.wasm")"
+[[ "$wl_out" == "$wl_expected" ]] || { echo "FAIL: while loop (got: $wl_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$wl_app" "$tmp/whileloop32.wasm" --addr wasm32
+wl32_out="$("$HOST_BIN" "$tmp/whileloop32.wasm")"
+[[ "$wl32_out" == "$wl_expected" ]] || { echo "FAIL: while loop wasm32 (got: $wl32_out)" >&2; exit 1; }
+echo "    ok: while producer/consumer -> 1 / 2 / 3 (wasm64 + wasm32; recv-in-while, branch head + back-edge)"
+
+echo "==> scheduler: if/else inside a task (conditional reply)"
+ife_app="$tmp/ifelse.q"
+cat > "$ife_app" <<'Q64'
+fn main {
+    scope {
+        let req = channel()
+        let resp = channel()
+        spawn {
+            for i in 1..=3 {
+                req.send(i)
+                let r = resp.recv()
+                env.out(r)
+            }
+        }
+        spawn {
+            for j in 1..=3 {
+                let x = req.recv()
+                if x % 2 == 0 {
+                    resp.send(x * 100)
+                } else {
+                    resp.send(x)
+                }
+            }
+        }
+    }
+}
+Q64
+# The server branches on the request: even -> x*100, odd -> x. -> 1 / 200 / 3.
+ife_expected=$'1\n200\n3'
+"$Q64_BIN" emit "$ife_app" "$tmp/ifelse.wasm"
+ife_out="$("$HOST_BIN" "$tmp/ifelse.wasm")"
+[[ "$ife_out" == "$ife_expected" ]] || { echo "FAIL: if/else task (got: $ife_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$ife_app" "$tmp/ifelse32.wasm" --addr wasm32
+ife32_out="$("$HOST_BIN" "$tmp/ifelse32.wasm")"
+[[ "$ife32_out" == "$ife_expected" ]] || { echo "FAIL: if/else task wasm32 (got: $ife32_out)" >&2; exit 1; }
+echo "    ok: if/else in a task -> 1 / 200 / 3 (wasm64 + wasm32; branch into then/else, rejoin)"
+
 echo "==> structured concurrency v0: spawn scope { … } sugar (nested join)"
 ssc_app="$tmp/spawnscope.q"
 cat > "$ssc_app" <<'Q64'
