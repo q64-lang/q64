@@ -915,12 +915,16 @@ fn lowerSelectArms(b: *Builder, sel: ast.SelectStmt, scope: *Scope, rt: *RtMap) 
             push.* = .{ .vec_push = .{ .vec = bufp, .value = try buildIntExpr(b, a0, scope) } };
             try items.append(b.a, push);
         } else return error.Unsupported; // v0: recv / send arms
-        // The user body (block or trailing expression).
+        // The user body (block or trailing expression). Built with the callee
+        // (void) or main statement builder per the scope context, so a select in
+        // a scheduled task works in a function body as well as in `main`.
         if (arm.block()) |blk| {
             var bit = blk.statements();
-            while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, &items);
+            while (bit.next()) |bstmt| {
+                if (scope.callee) try buildVoidStmt(b, bstmt, scope, &items) else try buildMainStmt(b, bstmt, scope, rt, &items);
+            }
         } else if (arm.bodyExpr()) |be| {
-            try buildMainExprStmt(b, be, scope, rt, &items);
+            if (scope.callee) try buildVoidExprStmt(b, be, scope, &items) else try buildMainExprStmt(b, be, scope, rt, &items);
         }
         const body = try b.a.create(hir.Stmt);
         body.* = .{ .block = try items.toOwnedSlice(b.a) };
@@ -1437,6 +1441,15 @@ fn addBlock(ctx: *SchedCtx, blk: SchedBlock) BuildError!usize {
     return ctx.blocks.items.len - 1;
 }
 
+/// Build one straight-line task-body statement with the right builder for the
+/// scope context: the callee (void) builder inside a function body, the main
+/// builder in `main`. (The scheduler's own locals always go through the
+/// scope-aware `declareBodyLocal`, so only the user statements need this split.)
+fn buildSchedStmt(ctx: *SchedCtx, s: ast.Stmt, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    if (ctx.scope.callee) return buildVoidStmt(ctx.b, s, ctx.scope, out);
+    return buildMainStmt(ctx.b, s, ctx.scope, ctx.rt, out);
+}
+
 /// Where an item's control flow leaves it (patched to the successor's entry):
 /// either a block's `.next` or, for a loop head, its `.alt` (loop-exit) field.
 const ItemSpan = struct { entry: usize, exit_id: usize, exit_alt: bool };
@@ -1516,7 +1529,7 @@ fn lowerSchedItem(ctx: *SchedCtx, item: SchedItem) BuildError!ItemSpan {
     switch (item) {
         .plain => |ss| {
             var list: std.ArrayList(*hir.Stmt) = .empty;
-            for (ss) |s| try buildMainStmt(b, s, ctx.scope, ctx.rt, &list);
+            for (ss) |s| try buildSchedStmt(ctx, s, &list);
             const id = try addBlock(ctx, .{ .kind = .plain, .stmts = try list.toOwnedSlice(b.a), .next = 0 });
             return .{ .entry = id, .exit_id = id, .exit_alt = false };
         },
@@ -1676,7 +1689,17 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
             if (spawnExprOf(stmt)) |sp| {
                 try tasks.append(b.a, sp.block() orelse return error.Unsupported);
             } else {
-                try buildMainStmt(b, stmt, scope, rt, out); // channel() decls
+                // The only non-spawn statements are channel decls (the gate
+                // guarantees it). Build them directly via `tryChannelNew` so the
+                // scheduler is builder-agnostic — it runs in `main` and in callee
+                // (void) bodies alike (the main/void statement builders differ).
+                const ls = switch (stmt) {
+                    .let_stmt => |x| x,
+                    else => return error.Unsupported,
+                };
+                const init = ls.initializer() orelse return error.Unsupported;
+                const nm = (ls.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+                if (!try tryChannelNew(b, init, nm.text, ls.isVar(), scope, out)) return error.Unsupported;
             }
         }
     }
@@ -3083,6 +3106,14 @@ fn buildVoidScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, out: *std.A
     var carms = ss.catchArms();
     if (carms.next() != null) return error.Unsupported; // panic-catch needs the EH runtime
     const blk = ss.block() orelse return error.Unsupported;
+    // Cyclic / parking / backpressured tasks need the round-robin scheduler,
+    // just as in `main` (`buildScopeStmt`). `buildScopeScheduled` is builder-
+    // agnostic (it dispatches on `scope.callee`), so the same lowering serves a
+    // scope inside a function body. The gate is conservative — no static
+    // eager/deferred program is ever routed here.
+    var rt: RtMap = .empty;
+    defer rt.deinit(b.a);
+    if (scopeNeedsScheduler(b, blk, scope)) return buildScopeScheduled(b, blk, scope, &rt, out);
     // Same consumer-before-producer deferral as the main-position scope
     // (see `buildScopeStmt`): a recv on a not-yet-fed channel is deferred to
     // the join so a later producer fills it first.
@@ -9687,6 +9718,38 @@ test "scope scheduling: a send on a bounded channel parks on a full buffer" {
     const dump2 = try print.hirToString(testing.allocator, &m2);
     defer testing.allocator.free(dump2);
     try testing.expect(std.mem.indexOf(u8, dump2, "while") == null); // static, not scheduled
+}
+
+test "scope scheduling: the round-robin scheduler runs inside a callee body" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A cyclic ping-pong inside a *function* body (not `main`) must route to the
+    // scheduler too. `buildScopeScheduled` is builder-agnostic (it dispatches on
+    // `scope.callee`), so the scheduler `while` loop appears in the callee.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn run() {
+        \\    scope {
+        \\        let a = channel()
+        \\        let b = channel()
+        \\        spawn {
+        \\            a.send(1)
+        \\            let r = b.recv()
+        \\            env.out(r)
+        \\        }
+        \\        spawn {
+        \\            let x = a.recv()
+        \\            b.send(x + 10)
+        \\        }
+        \\    }
+        \\}
+        \\fn main { run() }
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop, in the callee
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // recv-readiness suspend test
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {

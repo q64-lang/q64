@@ -2863,4 +2863,39 @@ cwk32_out="$("$HOST_BIN" "$tmp/calleescope32.wasm")"
 [[ "$cwk32_out" == "$cwk_expected" ]] || { echo "FAIL: callee scope/spawn wasm32 (got: $cwk32_out)" >&2; exit 1; }
 echo "    ok: callee scope/spawn -> 10/1/100/20/2/200 (wasm64 + wasm32; eager-at-spawn per call)"
 
+echo "==> scheduler in a callee: cyclic ping-pong inside a function body"
+csc_app="$tmp/calleesched.q"
+cat > "$csc_app" <<'Q64'
+fn run() {
+    scope {
+        let a = channel()
+        let b = channel()
+        spawn {
+            a.send(1)
+            let r = b.recv()
+            env.out(r)
+        }
+        spawn {
+            let x = a.recv()
+            b.send(x + 10)
+        }
+    }
+}
+fn main {
+    env.out(100)
+    run()
+    env.out(200)
+}
+Q64
+# The round-robin scheduler (mutual suspension) runs inside `run()`, not just
+# `main` — buildScopeScheduled dispatches on scope.callee. -> 100 / 11 / 200.
+csc_expected=$'100\n11\n200'
+"$Q64_BIN" emit "$csc_app" "$tmp/calleesched.wasm"
+csc_out="$("$HOST_BIN" "$tmp/calleesched.wasm")"
+[[ "$csc_out" == "$csc_expected" ]] || { echo "FAIL: callee scheduler (got: $csc_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$csc_app" "$tmp/calleesched32.wasm" --addr wasm32
+csc32_out="$("$HOST_BIN" "$tmp/calleesched32.wasm")"
+[[ "$csc32_out" == "$csc_expected" ]] || { echo "FAIL: callee scheduler wasm32 (got: $csc32_out)" >&2; exit 1; }
+echo "    ok: callee scheduler -> 100/11/200 (wasm64 + wasm32; round-robin loop inside a function body)"
+
 echo "PASS: $qube_out"

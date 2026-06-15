@@ -456,6 +456,25 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         send routes to the scheduler with a `sub` room test; the unbounded twin
         stays static), two parser round-trip cases, and a link-roundtrip section.
         **Next:** `ask` suspension, and lifting the scheduler into callee bodies.
+  - [x] **Scheduler in callee bodies (lifting the round-robin loop out of `main`).**
+        The cooperative round-robin scheduler (`buildScopeScheduled`) now runs
+        inside a *function* body, not just `main` — so a cyclic / parking /
+        backpressured `scope` works wherever it appears. `buildVoidScopeStmt` (the
+        callee analogue of `buildScopeStmt`) gained the same `scopeNeedsScheduler`
+        gate. The key realization: the scheduler's own bookkeeping locals (pc,
+        prog, channels, recv bindings) already go through the scope-aware
+        `declareBodyLocal`, so only the **user statements** in task bodies need the
+        right builder — `buildMainStmt` in `main` (which mirrors locals into
+        `b.cur_locals`) vs `buildVoidStmt` in a callee (scope-tracked locals). A
+        new `buildSchedStmt` dispatches on `scope.callee` for plain runs;
+        `lowerSelectArms` dispatches its arm bodies the same way; and channel
+        decls are now built directly via `tryChannelNew` (builder-agnostic)
+        instead of through `buildMainStmt`. Verified wasm64 + wasm32: cyclic
+        ping-pong inside `run()` → 100 / 11 / 200; backpressure inside a callee →
+        101/1/102/2; a request/reply `for`-loop inside a callee → 10/20/30. Adds a
+        build_hir test (the scheduler `while` appears in the callee) and a
+        link-roundtrip section; all main-position scheduler cases still pass.
+        **Next:** `ask` suspension (actors as scheduled tasks with inbox channels).
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs
