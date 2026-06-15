@@ -2972,4 +2972,47 @@ dr32_out="$("$HOST_BIN" "$tmp/discardrecv32.wasm")"
 [[ "$dr32_out" == "$dr_expected" ]] || { echo "FAIL: discard recv wasm32 (got: $dr32_out)" >&2; exit 1; }
 echo "    ok: discard recv -> 42 (wasm64 + wasm32; let _ = recv suspends, consumes without binding)"
 
+echo "==> scheduler: break / continue inside a scheduled task loop"
+bc_app="$tmp/breakcont.q"
+cat > "$bc_app" <<'Q64'
+fn main {
+    scope {
+        let ch = channel()
+        let done = channel()
+        spawn {
+            ch.send(5)
+            ch.send(0)
+            ch.send(7)
+            ch.send(99)
+            ch.send(3)
+            let _ = done.recv()
+        }
+        spawn {
+            while true {
+                let v = ch.recv()
+                if v == 99 {
+                    break
+                }
+                if v == 0 {
+                    continue
+                }
+                env.out(v)
+            }
+            done.send(1)
+        }
+    }
+}
+Q64
+# The consumer loops a recv: `continue` skips the 0, `break` exits on the 99
+# sentinel (so the trailing 3 is never printed). break/continue lower to pc
+# jumps (to the loop exit / back-edge), not HIR break. -> 5 / 7.
+bc_expected=$'5\n7'
+"$Q64_BIN" emit "$bc_app" "$tmp/breakcont.wasm"
+bc_out="$("$HOST_BIN" "$tmp/breakcont.wasm")"
+[[ "$bc_out" == "$bc_expected" ]] || { echo "FAIL: break/continue (got: $bc_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$bc_app" "$tmp/breakcont32.wasm" --addr wasm32
+bc32_out="$("$HOST_BIN" "$tmp/breakcont32.wasm")"
+[[ "$bc32_out" == "$bc_expected" ]] || { echo "FAIL: break/continue wasm32 (got: $bc32_out)" >&2; exit 1; }
+echo "    ok: break/continue -> 5/7 (wasm64 + wasm32; continue skips 0, break exits on 99 sentinel)"
+
 echo "PASS: $qube_out"

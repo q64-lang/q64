@@ -409,9 +409,9 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         (even → x*100, odd → x) → 1 / 200 / 3. Adds two build_hir tests and two
         link-roundtrip sections; all prior scheduler + static cases still pass.
         **v0 boundaries (next):** one level of loop nesting (no loop-in-loop);
-        no `break`/`continue`/`match` in a task. (Since landed: discard recvs,
-        `select` parking, bounded-channel backpressure, cooperative `ask`, and
-        lifting the scheduler into callee bodies.)
+        no `match` in a task; non-i64 channel payloads. (Since landed: discard
+        recvs, `break`/`continue` in task loops, `select` parking, bounded-channel
+        backpressure, cooperative `ask`, and lifting the scheduler into callees.)
   - [x] **`select` parking in scheduled tasks (the last suspend primitive).**
         A `select` inside a scheduled task now **parks** until an arm is ready
         instead of falling through. `buildSelectStmt`'s arm-building was factored
@@ -511,8 +511,26 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
         unchanged so it still parks until data arrives. Verified wasm64 + wasm32:
         a task that `a.send(1)` then `let _ = b.recv()` (an ack it ignores) → 42;
         the bare `b.recv()` form → 7. Adds a build_hir test and a link-roundtrip
-        section. **Remaining task-body v0 gaps:** `break`/`continue`/`match` in a
-        task; one level of loop nesting; non-i64 channel payloads.
+        section.
+  - [x] **`break` / `continue` in scheduled task loops.** A task loop can now
+        exit early or skip an iteration. The challenge: the scheduler is a flat
+        pc state machine, so a HIR `break`/`continue` would break the *scheduler's*
+        own `while` — they must lower to **pc jumps** instead. Each loop now
+        reserves an explicit **EXIT block** (an empty pc step the caller patches
+        to the loop's successor), so `break` has a concrete target despite the
+        exit being a forward reference; `continue` targets the `for` back-edge
+        (increment + re-test) or the `while` head (re-test). The targets ride on
+        `SchedCtx` (`loop_continue`/`loop_break`); since v0 forbids loop nesting a
+        single pair suffices, saved/restored around each loop body. A `break`/
+        `continue` span is marked **`fixed`** so the sequential wiring doesn't
+        re-patch its (already-final) exit to the next statement. `taskSchedulable`
+        accepts `break`/`continue` only inside a loop (`loop_depth > 0`), incl.
+        inside an `if` in the loop. Verified wasm64 + wasm32: a consumer looping
+        a `recv` where `continue` skips a 0 and `break` exits on a 99 sentinel →
+        5 / 7 (the trailing value never prints). Adds a build_hir test (the loop
+        lowers with no HIR `break`) and a link-roundtrip section; all prior
+        scheduler/static loop cases still pass. **Remaining task-body v0 gaps:**
+        `match` in a task; one level of loop nesting; non-i64 channel payloads.
   - [x] **`select` v0 — first-ready-wins.** `buildSelectStmt` lowers
         `select { v = ch.recv() -> body, … }` to an if / else-if chain: each
         arm's readiness is `cursor < vec_len(buf)`, the first ready arm performs

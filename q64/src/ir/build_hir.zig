@@ -1263,6 +1263,7 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
                 if (init == .call) return false; // a non-recv call init: not v0
             },
             .assign_stmt => {}, // `x = e` — a plain step (mutates a task local)
+            .break_stmt, .continue_stmt => if (loop_depth == 0) return false, // only inside a loop
             .for_stmt => |fs| {
                 if (loop_depth != 0) return false; // v0: no nested loops in a task
                 const iter = fs.iterable() orelse return false;
@@ -1477,8 +1478,11 @@ const SchedBlock = struct {
 /// One source item of a task body: a maximal run of straight-line statements,
 /// a single `recv` suspend point, a bounded-channel `send` suspend point (parks
 /// on a full buffer), a counted `for` loop, a `while` loop, an `if`/`else`
-/// chain, or a `select` (a multi-channel parking suspend point).
-const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, send: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt, sel: ast.SelectStmt };
+/// chain, or a `select` (a multi-channel parking suspend point). `brk`/`cont`
+/// are `break`/`continue` inside a task loop — they jump to the loop's exit /
+/// continue target as pc assignments (not HIR `break`, which would break the
+/// scheduler's own `while`).
+const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, send: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt, sel: ast.SelectStmt, brk: void, cont: void };
 
 /// Context threaded through the per-task CFG lowering.
 const SchedCtx = struct {
@@ -1488,6 +1492,11 @@ const SchedCtx = struct {
     chans: *const std.StringHashMapUnmanaged(void),
     blocks: *std.ArrayList(SchedBlock),
     pre: *std.ArrayList(*hir.Stmt), // loop-var inits, emitted once before the loop
+    // The innermost task loop's pc targets (v0 has no loop nesting, so a single
+    // pair suffices): `continue` jumps to `loop_continue` (a `for`'s back-edge /
+    // a `while`'s head), `break` to `loop_break` (the loop's exit block).
+    loop_continue: ?usize = null,
+    loop_break: ?usize = null,
 };
 
 fn collectStmts(b: *Builder, body: ast.Block) BuildError![]const ast.Stmt {
@@ -1513,13 +1522,15 @@ fn buildSchedStmt(ctx: *SchedCtx, s: ast.Stmt, out: *std.ArrayList(*hir.Stmt)) B
 
 /// Where an item's control flow leaves it (patched to the successor's entry):
 /// either a block's `.next` or, for a loop head, its `.alt` (loop-exit) field.
-const ItemSpan = struct { entry: usize, exit_id: usize, exit_alt: bool };
+/// `fixed` marks an item whose exit is already final (a `break`/`continue` that
+/// jumps to a loop target) — the sequence wiring must not re-patch it.
+const ItemSpan = struct { entry: usize, exit_id: usize, exit_alt: bool, fixed: bool = false };
 
 /// Lower a counted `for i in lo..hi { body }` into head/body/back blocks.
 /// HEAD branches `i (<|<=) #hi ? body_entry : <exit>`; the body's tail flows to
 /// BACK (`i += 1; goto HEAD`). The loop-exit (`HEAD.alt`) is patched by the
 /// caller. The counter + bound are pre-initialized once before the loop.
-fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!usize {
+fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!struct { head: usize, exit: usize } {
     const b = ctx.b;
     const range = (fs.iterable() orelse return error.Unsupported).range;
     const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
@@ -1541,29 +1552,45 @@ fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!usize {
         s.* = .{ .let = .{ .idx = i_idx, .value = lo_e } };
         break :blk s;
     });
-    // Reserve HEAD + BACK; build the body (left-to-right) flowing to BACK.
+    // Reserve HEAD + BACK + EXIT; build the body (left-to-right) flowing to BACK.
+    // `continue` targets BACK (increment then re-test), `break` targets EXIT (an
+    // empty block whose `next` the caller patches to the loop's successor).
     const head_id = try addBlock(ctx, .{ .kind = .branch, .next = 0 });
     const back_id = try addBlock(ctx, .{ .kind = .plain, .next = 0 });
+    const exit_id = try addBlock(ctx, .{ .kind = .plain, .next = 0 });
+    const sc = ctx.loop_continue;
+    const sb = ctx.loop_break;
+    ctx.loop_continue = back_id;
+    ctx.loop_break = exit_id;
     const body_entry = try lowerTaskSeq(ctx, try collectStmts(b, fs.body() orelse return error.Unsupported), back_id);
+    ctx.loop_continue = sc;
+    ctx.loop_break = sb;
     const cond = try mkBinE(b, if (range.inclusive()) .le else .lt, try mkLocalE(b, i_idx, .i64), try mkLocalE(b, hi_idx, .i64));
-    ctx.blocks.items[head_id] = .{ .kind = .branch, .cond = cond, .next = body_entry, .alt = 0 };
+    ctx.blocks.items[head_id] = .{ .kind = .branch, .cond = cond, .next = body_entry, .alt = exit_id };
     const inc = try mkBinE(b, .add, try mkLocalE(b, i_idx, .i64), try mkIntE(b, 1));
     const back_stmts = try b.a.dupe(*hir.Stmt, &.{try mkAssignS(b, i_idx, inc)});
     ctx.blocks.items[back_id] = .{ .kind = .plain, .stmts = back_stmts, .next = head_id };
-    return head_id;
+    return .{ .head = head_id, .exit = exit_id };
 }
 
 /// Lower a `while cond { body }` into a head + body. HEAD branches `cond ?
 /// body_entry : <exit>`; the body's tail flows back to HEAD (the body must
 /// mutate `cond` to terminate). No counter — unlike `for`, nothing is
 /// pre-initialized. The loop-exit (`HEAD.alt`) is patched by the caller.
-fn lowerWhileLoop(ctx: *SchedCtx, ws: ast.WhileStmt) BuildError!usize {
+fn lowerWhileLoop(ctx: *SchedCtx, ws: ast.WhileStmt) BuildError!struct { head: usize, exit: usize } {
     const b = ctx.b;
     const cond = try buildIntExpr(b, ws.condition() orelse return error.Unsupported, ctx.scope);
     const head_id = try addBlock(ctx, .{ .kind = .branch, .next = 0 });
+    const exit_id = try addBlock(ctx, .{ .kind = .plain, .next = 0 });
+    const sc = ctx.loop_continue;
+    const sb = ctx.loop_break;
+    ctx.loop_continue = head_id; // `continue` re-tests the condition
+    ctx.loop_break = exit_id;
     const body_entry = try lowerTaskSeq(ctx, try collectStmts(b, ws.body() orelse return error.Unsupported), head_id);
-    ctx.blocks.items[head_id] = .{ .kind = .branch, .cond = cond, .next = body_entry, .alt = 0 };
-    return head_id;
+    ctx.loop_continue = sc;
+    ctx.loop_break = sb;
+    ctx.blocks.items[head_id] = .{ .kind = .branch, .cond = cond, .next = body_entry, .alt = exit_id };
+    return .{ .head = head_id, .exit = exit_id };
 }
 
 /// Lower an `if`/`else`/`else if` chain whose branches all flow to `join`.
@@ -1624,12 +1651,22 @@ fn lowerSchedItem(ctx: *SchedCtx, item: SchedItem) BuildError!ItemSpan {
             return .{ .entry = id, .exit_id = id, .exit_alt = false };
         },
         .forl => |fs| {
-            const head = try lowerForLoop(ctx, fs);
-            return .{ .entry = head, .exit_id = head, .exit_alt = true }; // exit = HEAD.alt
+            const r = try lowerForLoop(ctx, fs);
+            return .{ .entry = r.head, .exit_id = r.exit, .exit_alt = false }; // fall-through via the EXIT block
         },
         .whilel => |ws| {
-            const head = try lowerWhileLoop(ctx, ws);
-            return .{ .entry = head, .exit_id = head, .exit_alt = true }; // exit = HEAD.alt
+            const r = try lowerWhileLoop(ctx, ws);
+            return .{ .entry = r.head, .exit_id = r.exit, .exit_alt = false }; // fall-through via the EXIT block
+        },
+        .brk => {
+            // `break` → jump to the loop's exit block; the exit is final (the
+            // sequence wiring must not re-patch it to the next statement).
+            const id = try addBlock(ctx, .{ .kind = .plain, .next = ctx.loop_break orelse return error.Unsupported });
+            return .{ .entry = id, .exit_id = id, .exit_alt = false, .fixed = true };
+        },
+        .cont => {
+            const id = try addBlock(ctx, .{ .kind = .plain, .next = ctx.loop_continue orelse return error.Unsupported });
+            return .{ .entry = id, .exit_id = id, .exit_alt = false, .fixed = true };
         },
         .iff => |ifs| {
             // An empty JOIN block reunites the branches; its `next` is the exit.
@@ -1673,6 +1710,8 @@ fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError
                 .while_stmt => |x| .{ .whilel = x },
                 .if_stmt => |x| .{ .iff = x },
                 .select_stmt => |x| .{ .sel = x },
+                .break_stmt => .brk,
+                .continue_stmt => .cont,
                 else => null,
             };
         };
@@ -1689,6 +1728,7 @@ fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError
     defer spans.deinit(b.a);
     for (items.items) |item| try spans.append(b.a, try lowerSchedItem(ctx, item));
     for (spans.items, 0..) |span, i| {
+        if (span.fixed) continue; // `break`/`continue`: exit already targets a loop pc
         const target = if (i + 1 < spans.items.len) spans.items[i + 1].entry else succ;
         if (span.exit_alt) {
             ctx.blocks.items[span.exit_id].alt = target;
@@ -9888,6 +9928,46 @@ test "scope scheduling: a discard recv (let _ = / bare recv) is a suspend point"
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // routed to the scheduler
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the discard recv's readiness gate
+}
+
+test "scope scheduling: break / continue inside a scheduled task loop" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A `while` loop with a `recv` (so the scope routes to the scheduler) that
+    // `break`s on a sentinel. `break`/`continue` lower to pc jumps to the loop's
+    // exit / back-edge — not HIR `break`, which would break the scheduler's own
+    // `while`. The body's `if v == 99 { break }` is accepted and lowered.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        let done = channel()
+        \\        spawn {
+        \\            ch.send(1)
+        \\            ch.send(99)
+        \\            let _ = done.recv()
+        \\        }
+        \\        spawn {
+        \\            while true {
+        \\                let v = ch.recv()
+        \\                if v == 99 {
+        \\                    break
+        \\                }
+        \\                env.out(v)
+        \\            }
+        \\            done.send(1)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler loop
+    // The break/continue lower to pc assignments, not a HIR `break` statement
+    // (which would escape the scheduler's own loop).
+    try testing.expect(std.mem.indexOf(u8, dump, "break") == null);
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
