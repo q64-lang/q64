@@ -6,9 +6,8 @@
 > ([`agent-ui.md`](./agent-ui.md)), and the planned renderer-agnostic view
 > vocabulary ([`../stdlib/view/README.md`](../stdlib/view/README.md)). It
 > proposes an ecosystem layer, not a language change: a registry of
-> hand-verified UI compositions distributed through the Continuum, modeled on
-> the "copy the source into your project and own it" pattern popularized by
-> [shadcn/ui](https://ui.shadcn.com).
+> hand-verified UI compositions distributed through the Continuum, following the
+> "copy the source into your project and own it" component-registry pattern.
 
 ## The problem
 
@@ -42,13 +41,12 @@ addresses the first two with a typed view vocabulary and a host-implemented
 `Renderer` face. This note addresses the **third**: where verified, named,
 themeable compositions come from, and how they reach a project.
 
-## Prior art: shadcn's distribution model, not its components
+## The distribution model: copy-and-own, not a runtime dependency
 
-shadcn/ui's durable idea is not its component set — it is the **distribution
-model**: a registry of source you install *into* your project with a CLI, then
-own and edit, rather than a versioned runtime dependency you import opaquely.
-That model is a strong fit for QView for reasons that are sharper here than on
-the web:
+The model this note adopts is a **component registry**: source you install
+*into* your project with a CLI, then own and edit, rather than a versioned
+runtime dependency you import opaquely. It is a strong fit for QView for reasons
+that are sharper here than on the web:
 
 - **The producer must read and edit the component.** A vendored
   `src/ui/card.q` is in-source: a human (or an agent, per `agent-ui.md`) can
@@ -70,13 +68,13 @@ the web:
 
 ## Two layers: `q64.view` (linked) vs. the registry (copied)
 
-The split mirrors shadcn's own split between its `lib`/primitives and its
-copy-in components:
+The split separates the linked foundation from the copied-in content built on
+it:
 
-| Layer | Form | Home | Analogue |
-|---|---|---|---|
-| **`q64.view`** — the `Renderer` face, named protocol constants, an id-allocating context, `Style`/theme tokens, base views (`Container`, `Text`, `Button`, …) | linked stdlib qube | shipped with the toolchain (`q64.*`) | shadcn's `lib/` + primitives |
-| **QView component registry** — verified *compositions* and *blocks* (`card`, `field`, a `variant`-driven `button`, a whole `join_form`) | source copied into `src/ui/`, owned by the consumer | the Continuum (+ optional doc mirror) | shadcn's copy-in components/blocks |
+| Layer | Form | Home |
+|---|---|---|
+| **`q64.view`** — the `Renderer` face, named protocol constants, an id-allocating context, `Style`/theme tokens, base views (`Container`, `Text`, `Button`, …) | linked stdlib qube | shipped with the toolchain (`q64.*`) |
+| **QView component registry** — verified *compositions* and *blocks* (`card`, `field`, a `variant`-driven `button`, a whole `join_form`) | source copied into `src/ui/`, owned by the consumer | the Continuum (+ optional doc mirror) |
 
 `q64.view` is the foundation the unimplemented `stdlib/view` already describes;
 the registry is content *on top of it*.
@@ -147,8 +145,8 @@ The contract, stated:
   contributes `@ui` and no other capability.
 - **`Ctx` owns id allocation and a theme handle.** `c.next()` is the monotonic
   id cursor; `c.theme` is the token table (§"Theme tokens").
-- **Variants are parameters, not forks.** One `button.q`; `variant` selects
-  tokens — the role shadcn's class-variance utility plays.
+- **Variants are parameters, not forks.** One `button.q`; `variant` selects a
+  token set, rather than a separate file per look.
 - **Returns the node id**, so composition is passing `parent` downward, and
   handlers can `set_attr` the node later — the surgical, node-addressed update
   the retained model is built for ([`agent-ui.md`](./agent-ui.md) §"Server-driven,
@@ -169,10 +167,10 @@ my-app/
       ui.lock.json5    # installed components + the PROTOCOL_VERSION they target
 ```
 
-`ui.lock.json5` is the analogue of shadcn's `components.json`: it records each
-vendored component, the registry source it came from, and the
-`PROTOCOL_VERSION` (`'1.10'`) it was generated against — so a protocol append
-can flag a stale copy rather than break silently.
+`ui.lock.json5` is the registry lockfile: it records each vendored component,
+the registry source it came from, and the `PROTOCOL_VERSION` (`'1.10'`) it was
+generated against — so a protocol append can flag a stale copy rather than break
+silently.
 
 ## CLI surface — mirror `qube add`
 
@@ -201,13 +199,13 @@ component, its files, and its `q64.view` requirements:
     card:      { files: ["card.q"],                        requires: ["proto", "ctx"] },
     button:    { files: ["button.q"],                      requires: ["proto", "ctx", "theme"] },
     field:     { files: ["field.q", "field_handlers.q"],   requires: ["proto", "ctx", "theme"] },
-    // a "block" — a whole composed section, shadcn's blocks analogue
+    // a "block" — a whole composed section, not just a single widget
     join_form: { files: ["join_form.q"],                   requires: ["card", "field", "button"] },
   }
 }
 ```
 
-**Blocks** (whole composed sections, like shadcn's blocks) are where the
+**Blocks** — whole composed sections rather than single widgets — are where the
 registry earns its keep: a verified `join_form` is a drop-in section, not a pile
 of primitives a producer must re-assemble correctly each time.
 

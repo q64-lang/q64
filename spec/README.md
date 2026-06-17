@@ -36,7 +36,7 @@ suite.
 | [`grammar.md`](./grammar.md)                             | Lexical structure and the consolidated syntactic grammar                          |
 | [`rpc.md`](./rpc.md)                                     | Qube-to-qube RPC over the synthesized WIT world: wRPC + component-value wire, the `@wire` effect, transports, addressing |
 | [`qview-protocol.md`](./qview-protocol.md)               | QView retained mutation protocol (Stage 1): `create_node`/`set_attr`/`remove`/`on`/`present`, node-kind/attr/event enums, the versioned Renderer contract |
-| [`qview-ui-registry.md`](./qview-ui-registry.md)         | QView component registry (design note): shadcn-style copy-and-own UI compositions distributed through the Continuum, `q64.view` vs. the registry, `qube ui add`, theme tokens |
+| [`qview-ui-registry.md`](./qview-ui-registry.md)         | QView component registry (design note): copy-and-own UI compositions distributed through the Continuum, `q64.view` vs. the registry, `qube ui add`, theme tokens |
 | [`tests/`](./tests)                                      | Conformance test corpus — `.q` source files paired with expected diagnostic envelopes. See [`tests/README.md`](./tests/README.md) for conventions and [`tests/INDEX.md`](./tests/INDEX.md) for code coverage. |
 
 ## Wasm 3.0 is the platform; the Component Model is an optional wrapper
