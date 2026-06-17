@@ -21,3 +21,8 @@ set. Input is delivered through [`q64.event`](../event); state-driven
 updates ride [`q64.reactive`](../reactive). The view tree itself never
 touches a screen — it is consumed by a `Renderer` running in the host
 (browser DOM, native shell, terminal, headless test surface).
+
+Verified *compositions* on top of these base views (a themeable `card`,
+`button`, `field`, or a whole `join_form` block) are distributed separately as
+a copy-and-own registry — see
+[`spec/qview-ui-registry.md`](../../spec/qview-ui-registry.md).
