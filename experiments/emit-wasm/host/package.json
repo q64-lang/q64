@@ -1,0 +1,14 @@
+{
+  "name": "q64-emit-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "JS host shim: drives q64-emit.wasm with binaryen.js (Option B).",
+  "scripts": {
+    "compile": "node compile.mjs",
+    "difftest": "node difftest.mjs ../../../q64/zig-out/bin/q64 ../../../examples/hello/hello.q"
+  },
+  "dependencies": {
+    "binaryen": "129.0.0"
+  }
+}

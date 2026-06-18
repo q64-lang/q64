@@ -48,6 +48,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_mod.addImport("emit", codegen_mod);
+    // The ABI layer also needs the parser's diagnostics machinery (parse +
+    // diag) and the sema passes (the same analysis `q64 check` runs) to produce
+    // the spec/diagnostics.md envelope on the diagnostics path.
+    wasm_mod.addImport("parser", parser_mod);
+    wasm_mod.addImport("sema", sema_mod);
 
     const wasm = b.addExecutable(.{ .name = "q64-emit", .root_module = wasm_mod });
     wasm.entry = .disabled;

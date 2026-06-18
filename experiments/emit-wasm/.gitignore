@@ -1,2 +1,5 @@
 zig-out/
 .zig-cache/
+host/node_modules/
+host/package-lock.json
+host/*.wasm

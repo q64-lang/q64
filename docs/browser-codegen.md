@@ -81,15 +81,23 @@ later doesn't touch `emit.zig`'s logic.
   arrays / strings out of q64-wasm linear memory).
 - Plus `qube build --in-process` (below).
 
-#### ✅ Spike done — q64 side proven ([`experiments/emit-wasm`](../experiments/emit-wasm))
+#### ✅ Implemented and verified ([`experiments/emit-wasm`](../experiments/emit-wasm))
 
-Built `q64-emit.wasm` (`wasm32-wasi`, Binaryen header included, archive **not**
-linked). The full pipeline (parse → sema → ir → emit) compiles, and the entire
-Binaryen surface comes out as **132 clean `env` imports** (full list:
-`experiments/emit-wasm/binaryen-imports.txt`) plus `wasi_snapshot_preview1` —
-nothing else. So the JS shim's contract is now concrete: implement those 132
-functions over binaryen.js. Remaining: real `compile()` C ABI entry, the shim,
-WASI stubs, and `qube build --in-process`.
+`q64-emit.wasm` (`wasm32-wasi`, Binaryen header included, archive **not** linked)
+is the full pipeline (parse → sema → ir → emit) behind a C ABI — `q64_alloc` /
+`q64_compile` / `q64_diagnostics` / `q64_free` — and the entire Binaryen surface
+comes out as **132 clean `env` imports** (`experiments/emit-wasm/binaryen-imports.txt`)
+plus three `wasi_snapshot_preview1` stubs, nothing else. The JS host
+(`experiments/emit-wasm/host/`) fills those 132 imports over **binaryen.js@129**
+(pinned to the vendored Binaryen): it captures binaryen's `WebAssembly.Memory`
+(by hooking `WebAssembly.instantiate`), forwards the pure-integer majority of the
+calls straight to the `_Binaryen*` exports, and marshals the ~20 pointer/string/
+array/literal calls between the two heaps.
+
+**Differential test passes**: every `.q` in `examples/` + `spec/tests/` that
+compiles emits a core module **byte-identical** to native `q64 emit`, on both
+`wasm32` and `wasm64`. The in-process `compile()` entry is exactly what
+`qube build` calls on device (no subprocess).
 
 ## Required regardless of option: subprocess → in-process
 
@@ -101,14 +109,21 @@ in-browser build.
 
 ## Checklist
 
-- [ ] Spike: Binaryen builds for `wasm32-wasi` (single-threaded, `-fwasm-exceptions`)
-- [ ] `libbinaryen.a` (wasm) reproducible from `init.sh` (pinned artifact or Zig-built)
-- [ ] `q64-emit.wasm` target exporting `compile()` C ABI + diagnostics envelope
-- [ ] Differential test: in-wasm `emit` vs native `q64 emit` over the test corpus
-- [ ] `qube build --in-process` (no subprocess)
-- [ ] On device, skip `--component` (it shells out to `wasm-tools`) — emit a bare
-      core module; the pure-Zig `component.zig` covers the simple cases
-- [ ] Size budget: `ReleaseSmall`, lazy-load the compiler wasm
+Option B (chosen path) — done:
+
+- [x] `q64-emit.wasm` target exporting `compile()` C ABI + diagnostics envelope
+- [x] JS shim: 132 `env.Binaryen*` imports over binaryen.js + WASI stubs
+- [x] Differential test: in-wasm `emit` vs native `q64 emit` over the test corpus
+      (byte-identical, wasm32 + wasm64)
+- [x] In-process `compile()` (no subprocess) — what `qube build` calls on device
+- [x] On device, skip `--component` (it shells out to `wasm-tools`) — emit a bare
+      core module
+- [x] Size budget: `ReleaseSmall`, lazy-load the compiler wasm
+
+Deferred (Option A perf path / later):
+
+- [ ] Binaryen builds for `wasm32-wasi` static lib (single-threaded, `-fwasm-exceptions`)
+      — removes the JS hop; a perf optimization, not new capability
 - [ ] Threads: single-threaded v1; revisit SharedArrayBuffer + workers later
 
 ## Downstream: hosting the wasm on iPad / Android

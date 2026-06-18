@@ -1,41 +1,67 @@
-# experiments/emit-wasm — q64 codegen → wasm (Option B spike)
+# experiments/emit-wasm — q64 codegen → wasm, on device (Option B)
 
-Proves the **q64 half** of Option B (see [`../../docs/browser-codegen.md`](../../docs/browser-codegen.md)):
-q64's codegen compiles to `wasm32-wasi` with **Binaryen unlinked**, so every
-Binaryen C-API call becomes a wasm import that a JS host fills via `binaryen.js`.
+The on-device q64 compiler: `q64-emit.wasm` is the **full** q64 codegen pipeline
+(parse → sema → ir → emit) compiled to `wasm32-wasi` with **Binaryen unlinked**,
+plus a JS host (`host/`) that fills Binaryen's C API from the maintained
+[`binaryen.js`](https://www.npmjs.com/package/binaryen). Together they compile
+`.q` → wasm **entirely client-side — no server, no subprocess** (the missing half
+of edit→compile→run on iPad). See [`../../docs/browser-codegen.md`](../../docs/browser-codegen.md).
 
 ## Result ✅
 
-- Builds clean (`zig build`) → `zig-out/bin/q64-emit.wasm`.
-- **Imports: 132 Binaryen functions** under `env` (full list in
-  [`binaryen-imports.txt`](./binaryen-imports.txt)) + `wasi_snapshot_preview1`.
-  Nothing else in `env`.
-- Exports: `memory`, `q64_emit_len` (runs the full pipeline — parse → sema → ir →
-  emit — on a tiny program, so the complete Binaryen surface is reachable).
+- **`q64-emit.wasm`** (`zig build -Doptimize=ReleaseSmall`) exports a C ABI —
+  `q64_alloc` / `q64_free` / `q64_compile` / `q64_diagnostics` (+ `q64_libc_malloc`
+  for the result hand-off) — and imports exactly **132 `env.Binaryen*`** functions
+  (full list in [`binaryen-imports.txt`](./binaryen-imports.txt)) plus three WASI
+  stubs (`args_get`, `args_sizes_get`, `proc_exit`). Nothing else.
+- **`host/`** implements those 132 imports over `binaryen.js@129` (pinned to the
+  vendored Binaryen version) and drives the whole thing.
+- **Differential test passes**: every `.q` in `examples/` + `spec/tests/` that
+  compiles produces a core module **byte-identical** to native `q64 emit`, on both
+  `wasm32` and `wasm64` (46 programs; the rest need `--module` or are
+  negative-type fixtures both paths reject identically).
 
-The whole codegen pipeline (`emit.zig` + `parser`/`sema`/`ir`) compiles to wasm;
-Binaryen is the only external dependency, and it's a clean, enumerable import set.
+## ABI (mirrors `q64-lsp/packages/core-wasm`)
+
+```
+q64_alloc(len)                     -> ptr      ; host writes `len` source bytes
+q64_compile(ptr, len, wasm64)      -> u64      ; (out_ptr<<32)|out_len of core .wasm, 0 on failure
+q64_diagnostics(ptr, len, wasm64)  -> u64      ; (out_ptr<<32)|out_len of a spec/diagnostics.md JSON envelope
+q64_free(ptr, len)                              ; release any buffer received
+```
+
+A bare **core module** is emitted (what the run / qview lanes consume) — never a
+component (`--component` shells out to `wasm-tools`, impossible on device).
+
+## How the shim works
+
+`binaryen.js` is Binaryen compiled to wasm; it exposes the raw `_Binaryen*` C
+functions and `_malloc`/`_free`, but not its HEAP views — so the shim captures
+its `WebAssembly.Memory` by hooking `WebAssembly.instantiate` during load. Then:
+
+- **Handles** (module / expression / type refs) are plain integers in both
+  worlds → forwarded straight through (the pure-integer majority of the 132).
+- **Pointers** (strings, type/operand arrays, the data segment, the literal
+  struct, the emitted bytes) are marshalled between q64's heap and binaryen's
+  heap by the ~20 special handlers in [`host/binaryen-shim.mjs`](./host/binaryen-shim.mjs).
+
+It is isomorphic: the same `host/compiler.mjs` runs under Node (these tests) and
+in a WebView (Qubonaut's `CompilerService`).
 
 ## Run
 
 ```sh
-(cd ../.. && ./init.sh)          # once: vendors zig + builds vendor/binaryen
-../../vendor/zig/zig build       # → zig-out/bin/q64-emit.wasm
-# size: add -Doptimize=ReleaseSmall
+(cd ../.. && ./init.sh)                       # vendors zig + binaryen header/lib
+zig build -Doptimize=ReleaseSmall             # → zig-out/bin/q64-emit.wasm
+(cd host && npm install)                      # binaryen.js@129
+
+# compile a .q with the in-wasm compiler
+node host/compile.mjs path/to/foo.q -o foo.wasm
+
+# prove it matches native q64 emit
+node host/difftest.mjs ../../q64/zig-out/bin/q64 ../../examples/**/*.q
 ```
 
-Uses `vendor/binaryen/include` for the **header only** — it never links
-`libbinaryen.a` (that's the whole point).
-
-## What's left for in-browser compile
-
-1. **Real C ABI entry** — `compile(srcPtr, len) -> (outPtr<<32)|outLen` + a
-   diagnostics envelope (replace the throwaway `q64_emit_len`).
-2. **JS shim** — implement the 132 `env.Binaryen*` imports over `binaryen.js`:
-   handle mapping (wasm i32 handles ↔ binaryen.js objects) + marshalling (read
-   child arrays / strings out of wasm linear memory). Plus minimal
-   `wasi_snapshot_preview1` stubs (the module is a reactor).
-3. **`qube build --in-process`** — drive the compiler without a subprocess.
-
-Then load `q64-emit.wasm` + `binaryen.js` in a WebView (WKWebView / Android
-WebView) → compile `.q` on device, no server.
+`zig build` uses `vendor/binaryen/include` for the **header only** — it never
+links `libbinaryen.a`. That's the whole point: Binaryen stays an import set the
+JS host fills.
