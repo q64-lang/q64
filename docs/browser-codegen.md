@@ -73,13 +73,23 @@ later doesn't touch `emit.zig`'s logic.
 ### B — scope (the real work is q64-side, not binaryen.js)
 
 - The binaryen.js host side is **done/available**.
-- q64 side: compile `emit.zig` to wasm with its **137 distinct `Binaryen*` C-API
-  symbols left as wasm imports** (`@cImport` the header for signatures, don't
-  link the lib, target wasm32 → the calls become imports).
-- JS shim: implement those 137 imports over binaryen.js — **handle mapping**
+- q64 side: compile `emit.zig` to wasm with its `Binaryen*` C-API calls left as
+  wasm imports (`@cImport` the header for signatures, don't link the lib, target
+  wasm32-wasi → the calls become imports).
+- JS shim: implement those imports over binaryen.js — **handle mapping**
   (q64-wasm i32 handles ↔ binaryen.js objects) and **marshalling** (read child
   arrays / strings out of q64-wasm linear memory).
 - Plus `qube build --in-process` (below).
+
+#### ✅ Spike done — q64 side proven ([`experiments/emit-wasm`](../experiments/emit-wasm))
+
+Built `q64-emit.wasm` (`wasm32-wasi`, Binaryen header included, archive **not**
+linked). The full pipeline (parse → sema → ir → emit) compiles, and the entire
+Binaryen surface comes out as **132 clean `env` imports** (full list:
+`experiments/emit-wasm/binaryen-imports.txt`) plus `wasi_snapshot_preview1` —
+nothing else. So the JS shim's contract is now concrete: implement those 132
+functions over binaryen.js. Remaining: real `compile()` C ABI entry, the shim,
+WASI stubs, and `qube build --in-process`.
 
 ## Required regardless of option: subprocess → in-process
 
