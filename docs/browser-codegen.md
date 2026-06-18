@@ -49,15 +49,37 @@ encoding), non-optimizing v1.
 - **Cons:** large reimplementation; lose Binaryen's optimization + validation;
   long correctness tail.
 
-## Recommendation
+## Decision (2026-06): start with B
 
-1. **Spike Option A first** (timeboxed): *can Binaryen build for `wasm32-wasi`
-   at all* (single-threaded, exceptions)? That answers feasibility fastest and
-   reuses the existing link path.
-2. If A's size/threads/exceptions prove painful, fall back to **B**
-   (`binaryen.js` host import) for the browser specifically.
-3. Hold **C** (pure-Zig emitter) as the strategic north star for zero-C++
-   portability if/when we want to drop the Binaryen dependency entirely.
+**Chosen near-term path: B (`binaryen.js` host import).** Rationale:
+
+- **Binaryen-in-wasm already exists and is maintained — it *is* `binaryen.js`**
+  (Binaryen built to wasm via Emscripten). Verified: `binaryen@130` builds a
+  module, validates, and `emitBinary()` produces a valid wasm that instantiates
+  and runs. So the hard "get Binaryen into wasm" problem is already solved by the
+  ecosystem; we consume it.
+- **A is the same wasm Binaryen, just statically linked** to remove the JS
+  boundary — a *performance* optimization, not a different capability. Its cost
+  is a `wasm32-wasi` static-lib build (wasi-sdk, wasm exceptions, threads-off,
+  libc++, Zig↔C++-wasm link) — hours of uncertain work — so defer it.
+- **C** (pure-Zig emitter) stays the long-term north star for zero-C++.
+
+Perf note: B pays one wasm→JS→wasm hop per Binaryen API call; negligible for
+small/medium modules, measurable for large ones. Mitigate with **batching**
+(emit a compact IR description consumed in fewer binaryen.js calls) before
+reaching for A. The q64 codegen interface is identical across A/B/C, so switching
+later doesn't touch `emit.zig`'s logic.
+
+### B — scope (the real work is q64-side, not binaryen.js)
+
+- The binaryen.js host side is **done/available**.
+- q64 side: compile `emit.zig` to wasm with its **137 distinct `Binaryen*` C-API
+  symbols left as wasm imports** (`@cImport` the header for signatures, don't
+  link the lib, target wasm32 → the calls become imports).
+- JS shim: implement those 137 imports over binaryen.js — **handle mapping**
+  (q64-wasm i32 handles ↔ binaryen.js objects) and **marshalling** (read child
+  arrays / strings out of q64-wasm linear memory).
+- Plus `qube build --in-process` (below).
 
 ## Required regardless of option: subprocess → in-process
 
