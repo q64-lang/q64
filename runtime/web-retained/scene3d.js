@@ -24,6 +24,13 @@ const ENGINE_BASE = 'https://cdn.qubeworlds.com/engine';
 const DPR = Math.max(1, Math.min(3, (typeof window !== 'undefined' && window.devicePixelRatio) || 1));
 const log = (m) => console.log('[qview scene3d]', m);
 
+// A human-readable boot status, drawn ON the QView canvas by the scene widget
+// while the 3D isn't live — so a Snap (which only captures #gpu) reveals the
+// actual failure (no content / engine abort / CDN load / context) on-device.
+let statusLine = 'scene: idle';
+function note(s) { statusLine = s; log(s); }
+export function status() { return statusLine; }
+
 // The project's 3D content, injected by the host (or null for a plain 2D qube).
 function game() { return (typeof window !== 'undefined' && window.__qubonautGame) || null; }
 
@@ -82,32 +89,38 @@ function provideAssets() {
 // Feed the project's scene into the running engine (assets first, then the scene).
 function enqueueScene() {
   const g = game();
-  if (!g || !g.scene) { log('no project scene to render (window.__qubonautGame is empty)'); return; }
+  if (!g || !g.scene) { note('scene: no 3D content injected (run `qube run`)'); return; }
   try {
     provideAssets();
     window.Module.ccall('quine_enqueue', null, ['string'], [JSON.stringify({ type: 'scene', json: g.scene })]);
     window.Module.ccall('quine_set_autoplay', null, ['number'], [1]);
     try { window.Module.ccall('quine_set_hud', null, ['number'], [0]); } catch {}
     active = true;
-  } catch (e) { log('enqueue failed: ' + (e && e.message)); }
+    note('scene: engine ready — ' + (g.assets ? g.assets.length : 0) + ' asset(s)');
+  } catch (e) { note('scene: enqueue failed — ' + (e && e.message)); }
 }
 
 async function boot() {
   if (booting || ready || failed) return;
-  if (!game()) { log('no project 3D content injected — nothing to render'); return; }
+  if (!game()) { note('scene: no 3D content injected (run `qube run`)'); return; }
   booting = true;
   const canvas = ensureCanvas();
   if (!canvas) { booting = false; return; }
   // Backend: prefer a real WebGPU adapter; fall back to the WebGL2 floor.
   let backend = 'webgl2';
   try { if (navigator.gpu && (await navigator.gpu.requestAdapter())) backend = 'webgpu'; } catch {}
+  // The engine needs SharedArrayBuffer (cross-origin isolation). Surface that
+  // precondition up front so a Snap shows it even if the engine aborts opaquely.
+  const coi = (typeof crossOriginIsolated !== 'undefined') ? crossOriginIsolated : false;
+  const hasSab = typeof SharedArrayBuffer !== 'undefined';
+  note('scene: booting engine (' + backend + ') · isolated=' + coi + ' SAB=' + hasSab);
   const bust = '?v=' + Date.now();
   window.Module = {
     canvas,
     locateFile: (p) => ENGINE_BASE + '/' + p + bust,
     print: (t) => log('engine: ' + t),
-    printErr: (t) => log('engine[err]: ' + t),
-    onAbort: (w) => { log('engine ABORT: ' + w); failed = true; },
+    printErr: (t) => { log('engine[err]: ' + t); note('scene: engine err — ' + t); },
+    onAbort: (w) => { failed = true; note('scene: engine ABORT — ' + w); },
     onRuntimeInitialized: () => {
       ready = true; booting = false;
       if (want) { enqueueScene(); if (active) canvas.style.display = ''; }
@@ -116,15 +129,15 @@ async function boot() {
   const s = document.createElement('script');
   s.async = true; s.crossOrigin = 'anonymous';
   s.src = ENGINE_BASE + '/quine-' + backend + '.js' + bust;
-  s.onerror = () => { log('engine script failed to load: ' + s.src); failed = true; booting = false; };
+  s.onerror = () => { failed = true; booting = false; note('scene: engine bundle failed to load (CDN/CORS)'); };
   document.head.appendChild(s);
-  log('booting engine (' + backend + ')');
 }
 
 /** Activate the project's scene (boot lazily on first call). Returns true if a 3D
  *  layer is (or is becoming) live — app.js uses this to make #gpu transparent. */
 export function activate() {
-  if (failed || !game()) return false;
+  if (failed) return false;
+  if (!game()) { note('scene: no 3D content injected (run `qube run`)'); return false; }
   want = true;
   if (!ready) { void boot(); return true; }
   if (!active) enqueueScene();
