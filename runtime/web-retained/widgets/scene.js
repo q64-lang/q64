@@ -24,8 +24,8 @@ register(KIND.scene, {
     if (w <= 0 || h <= 0) return;
     r.drawPrim(r.pass, 0, 0, w, h, [0.03, 0.04, 0.06, 1], {});
     if (r.glyphForStr) {
-      const g = r.glyphForStr(status(), 16);
-      if (g) r.drawPrim(r.pass, Math.max(8, (w - g.w) / 2), 72, g.w, g.h, [0.55, 0.85, 1, 1], { texView: g.view });
+      const g = r.glyphForStr(status(), 13);   // small + left-aligned so the full trace line fits
+      if (g) r.drawPrim(r.pass, 8, 64, g.w, g.h, [0.55, 0.85, 1, 1], { texView: g.view });
     }
   },
   measure() { return { w: 0, h: 0 }; },

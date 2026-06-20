@@ -34,6 +34,13 @@ export function status() { return statusLine; }
 // The project's 3D content, injected by the host (or null for a plain 2D qube).
 function game() { return (typeof window !== 'undefined' && window.__qubonautGame) || null; }
 
+// Full injection-pipeline trace (each hop writes a sessionStorage flag): so one
+// Snap shows exactly where the project's `game` payload was lost on the way to
+// the iframe.  recv=tab onPreview · show=showPreview · set=qnGame bytes written ·
+// shim=iframe parse · win=window.__qubonautGame present.
+function ss(k) { try { return sessionStorage.getItem(k) || '-'; } catch { return '?'; } }
+function traceStr() { return `recv=${ss('qnT_recv')} show=${ss('qnT_show')} set=${ss('qnT_set')} shim=${ss('qnT_shim')} win=${game() ? 'Y' : 'N'}`; }
+
 let backCanvas = null;     // the engine's own <canvas>, behind #gpu
 let booting = false;       // engine bundle requested, runtime not yet ready
 let ready = false;         // onRuntimeInitialized fired
@@ -89,7 +96,7 @@ function provideAssets() {
 // Feed the project's scene into the running engine (assets first, then the scene).
 function enqueueScene() {
   const g = game();
-  if (!g || !g.scene) { note('scene: no 3D content injected (run `qube run`)'); return; }
+  if (!g || !g.scene) { note('no 3D content · ' + traceStr()); return; }
   try {
     provideAssets();
     window.Module.ccall('quine_enqueue', null, ['string'], [JSON.stringify({ type: 'scene', json: g.scene })]);
@@ -102,7 +109,7 @@ function enqueueScene() {
 
 async function boot() {
   if (booting || ready || failed) return;
-  if (!game()) { note('scene: no 3D content injected (run `qube run`)'); return; }
+  if (!game()) { note('no 3D content · ' + traceStr()); return; }
   booting = true;
   const canvas = ensureCanvas();
   if (!canvas) { booting = false; return; }
@@ -137,7 +144,7 @@ async function boot() {
  *  layer is (or is becoming) live — app.js uses this to make #gpu transparent. */
 export function activate() {
   if (failed) return false;
-  if (!game()) { note('scene: no 3D content injected (run `qube run`)'); return false; }
+  if (!game()) { note('no 3D content · ' + traceStr()); return false; }
   want = true;
   if (!ready) { void boot(); return true; }
   if (!active) enqueueScene();

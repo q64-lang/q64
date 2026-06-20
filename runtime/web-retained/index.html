@@ -62,7 +62,61 @@
   /* Bring-up status line (host/wasm/WebGPU). Commented out — not user-facing.
      Re-enable with the #log div below to see load diagnostics on-screen. */
   /* #log { padding: 0.5rem 1rem calc(env(safe-area-inset-bottom) + 0.5rem); font: 0.8rem ui-monospace, monospace; color: #6b7484; } */
+  /* Logs: an on-page console (button + scrollable panel) so the engine/scene/
+     injection trace is readable on-device without a desktop debugger. Above the
+     canvases (which own gestures) with pointer-events:auto so taps reach it. */
+  #logsbtn { position: fixed; right: 10px; bottom: calc(env(safe-area-inset-bottom) + 10px); z-index: 100;
+    -webkit-appearance: none; appearance: none; cursor: pointer; border: 1px solid #2a4a63;
+    background: rgba(10,16,24,.82); color: #cfe8ff; border-radius: 8px; padding: 8px 14px;
+    font: 600 0.78rem ui-monospace, monospace; pointer-events: auto; }
+  #logspanel { position: fixed; inset: 8px 8px 60px 8px; z-index: 99; display: none; overflow: auto;
+    margin: 0; padding: 10px; background: rgba(6,9,14,.96); color: #d7e6f5; border: 1px solid #1c2330;
+    border-radius: 10px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, monospace;
+    pointer-events: auto; -webkit-user-select: text; user-select: text; }
 </style>
+<script>
+  // Capture EVERYTHING from the very first line (before app.js / the inject shim)
+  // into a ring buffer the Logs panel renders. Mirrors console + window errors +
+  // the per-hop injection trace flags written to sessionStorage.
+  (function () {
+    var BUF = (window.__qnLogs = []);
+    function fmt(a) { try { return typeof a === 'object' ? JSON.stringify(a) : String(a); } catch (e) { return '[?]'; } }
+    function push(tag, args) {
+      var t = new Date().toISOString().slice(11, 23);
+      BUF.push(t + ' ' + tag + Array.prototype.map.call(args, fmt).join(' '));
+      if (BUF.length > 800) BUF.shift();
+      render();
+    }
+    ['log', 'warn', 'error'].forEach(function (k) {
+      var o = console[k].bind(console);
+      console[k] = function () { push(k === 'log' ? '' : '[' + k + '] ', arguments); o.apply(console, arguments); };
+    });
+    window.addEventListener('error', function (e) { push('[window error] ', [e.message, (e.filename || '') + ':' + (e.lineno || ''), e.error && e.error.stack]); });
+    window.addEventListener('unhandledrejection', function (e) { var r = e.reason; push('[reject] ', [r && r.stack ? r.stack : String(r)]); });
+    function traceFlags() {
+      try {
+        var ks = ['qnT_recv', 'qnT_show', 'qnT_set', 'qnT_shim'], out = [];
+        for (var i = 0; i < ks.length; i++) out.push(ks[i].slice(4) + '=' + (sessionStorage.getItem(ks[i]) || '-'));
+        out.push('win=' + (window.__qubonautGame ? 'Y' : 'N'));
+        return 'inject trace · ' + out.join(' ');
+      } catch (e) { return 'inject trace · (no sessionStorage)'; }
+    }
+    function render() {
+      var p = document.getElementById('logspanel');
+      if (p && p.style.display !== 'none') { p.textContent = traceFlags() + '\n────────\n' + BUF.join('\n'); p.scrollTop = p.scrollHeight; }
+    }
+    window.__qnRenderLogs = render;
+    window.addEventListener('DOMContentLoaded', function () {
+      var b = document.getElementById('logsbtn'), p = document.getElementById('logspanel');
+      if (b && p) b.addEventListener('click', function () {
+        var show = p.style.display === 'none' || !p.style.display;
+        p.style.display = show ? 'block' : 'none';
+        b.textContent = show ? 'Hide' : 'Logs';
+        if (show) render();
+      });
+    });
+  })();
+</script>
 </head>
 <body>
   <header><span class="ttl">QView · retained</span><button id="snap">Snap</button><button id="copy" disabled>Copy</button></header>
@@ -70,6 +124,8 @@
   <input id="kbd" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
   <textarea id="kbdm" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
   <!-- <div id="log">loading…</div> --> <!-- bring-up status line; status still goes to console.log -->
+  <button id="logsbtn">Logs</button>
+  <pre id="logspanel"></pre>
 
   <script type="module" src="./app.js"></script>
 </body>
