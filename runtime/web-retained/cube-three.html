@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>three.js cube</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07090d; overflow: hidden; }
+  canvas { display: block; }
+  #log { position: fixed; left: 8px; right: 8px; bottom: 8px; z-index: 10; max-height: 30%; overflow: auto;
+    margin: 0; padding: 8px; color: #d7e6f5; background: rgba(6,9,14,.9); border: 1px solid #1c2330; border-radius: 8px;
+    font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; -webkit-user-select: text; user-select: text; }
+  .err { color: #ff9b9b; } .ok { color: #8be38b; }
+</style>
+</head>
+<body>
+  <pre id="log">three.js cube test…</pre>
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
+  <script type="module">
+    const log = (c, m) => { const e = document.getElementById('log'); const s = document.createElement('span'); s.className = c; s.textContent = '\n' + m; e.appendChild(s); e.scrollTop = e.scrollHeight; };
+    window.addEventListener('error', e => log('err', '[error] ' + e.message + ' ' + (e.filename||'') + ':' + (e.lineno||'')));
+    window.addEventListener('unhandledrejection', e => log('err', '[reject] ' + (e.reason && e.reason.message || e.reason)));
+    try {
+      const THREE = await import('three');
+      log('ok', 'three r' + THREE.REVISION + ' loaded');
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setClearColor(0x0a0f18, 1);
+      document.body.appendChild(renderer.domElement);
+      log('ok', 'WebGL context: ' + (renderer.getContext() ? 'OK' : 'NULL'));
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+      camera.position.set(3, 2.2, 4.5);
+      camera.lookAt(0, 0, 0);
+
+      const cube = new THREE.Mesh(
+        new THREE.BoxGeometry(2, 2, 2),
+        new THREE.MeshStandardMaterial({ color: 0x4d9eff, metalness: 0.1, roughness: 0.5 })
+      );
+      scene.add(cube);
+      scene.add(new THREE.HemisphereLight(0xbcd6ff, 0x202830, 1.1));
+      const key = new THREE.DirectionalLight(0xffffff, 1.6); key.position.set(-3, 5, 4); scene.add(key);
+
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      let n = 0;
+      renderer.setAnimationLoop(() => {
+        cube.rotation.x += 0.006; cube.rotation.y += 0.011;
+        renderer.render(scene, camera);
+        if (n++ === 0) log('ok', 'first frame rendered — you should see a turning cube');
+      });
+    } catch (e) {
+      log('err', 'FAILED: ' + (e && (e.stack || e.message || e)));
+    }
+  </script>
+</body>
+</html>
