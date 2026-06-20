@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>cube engine test</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #07090d; color: #d7e6f5; overflow: hidden;
+    font: 13px/1.45 ui-monospace, Menlo, monospace; }
+  #canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; background: #07090d; }
+  #log { position: fixed; left: 8px; right: 8px; bottom: 8px; max-height: 38%; overflow: auto; z-index: 10;
+    margin: 0; padding: 8px; background: rgba(6,9,14,.92); border: 1px solid #1c2330; border-radius: 8px;
+    white-space: pre-wrap; word-break: break-word; -webkit-user-select: text; user-select: text; }
+  .err { color: #ff9b9b; } .ok { color: #8be38b; } .dim { color: #6b7484; }
+</style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <pre id="log"></pre>
+<script>
+  // ISOLATION TEST — the quine engine ONLY: a turning cube, opaque, full screen,
+  // no QView/overlay/compositing. Cube scene + mesh are embedded inline because
+  // this is a diagnostic page (NOT the product path — there content lives in the
+  // project). If the cube shows here, the engine renders on this device and any
+  // remaining failure is compositing; if not, it's the engine/glb/WebGPU itself.
+  var CDN = "https://cdn.qubeworlds.com/engine";
+  var CUBE_B64 = "Z2xURgIAAAC8BQAAGAMAAEpTT057ImFzc2V0Ijp7InZlcnNpb24iOiIyLjAiLCJnZW5lcmF0b3IiOiJxdmlldy1jdWJlIn0sInNjZW5lIjowLCJzY2VuZXMiOlt7Im5vZGVzIjpbMF19XSwibm9kZXMiOlt7Im1lc2giOjB9XSwibWVzaGVzIjpbeyJwcmltaXRpdmVzIjpbeyJhdHRyaWJ1dGVzIjp7IlBPU0lUSU9OIjowLCJOT1JNQUwiOjF9LCJpbmRpY2VzIjoyLCJtYXRlcmlhbCI6MH1dfV0sIm1hdGVyaWFscyI6W3sicGJyTWV0YWxsaWNSb3VnaG5lc3MiOnsiYmFzZUNvbG9yRmFjdG9yIjpbMC4zLDAuNjIsMS4wLDEuMF0sIm1ldGFsbGljRmFjdG9yIjowLjAsInJvdWdobmVzc0ZhY3RvciI6MC41NX19XSwiYnVmZmVycyI6W3siYnl0ZUxlbmd0aCI6NjQ4fV0sImJ1ZmZlclZpZXdzIjpbeyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjAsImJ5dGVMZW5ndGgiOjI4OCwidGFyZ2V0IjozNDk2Mn0seyJidWZmZXIiOjAsImJ5dGVPZmZzZXQiOjI4OCwiYnl0ZUxlbmd0aCI6Mjg4LCJ0YXJnZXQiOjM0OTYyfSx7ImJ1ZmZlciI6MCwiYnl0ZU9mZnNldCI6NTc2LCJieXRlTGVuZ3RoIjo3MiwidGFyZ2V0IjozNDk2M31dLCJhY2Nlc3NvcnMiOlt7ImJ1ZmZlclZpZXciOjAsImNvbXBvbmVudFR5cGUiOjUxMjYsImNvdW50IjoyNCwidHlwZSI6IlZFQzMiLCJtaW4iOlstMSwtMSwtMV0sIm1heCI6WzEsMSwxXX0seyJidWZmZXJWaWV3IjoxLCJjb21wb25lbnRUeXBlIjo1MTI2LCJjb3VudCI6MjQsInR5cGUiOiJWRUMzIn0seyJidWZmZXJWaWV3IjoyLCJjb21wb25lbnRUeXBlIjo1MTIzLCJjb3VudCI6MzYsInR5cGUiOiJTQ0FMQVIifV19ICCIAgAAQklOAAAAgL8AAIC/AACAPwAAgD8AAIC/AACAPwAAgD8AAIA/AACAPwAAgL8AAIA/AACAPwAAgD8AAIC/AACAvwAAgL8AAIC/AACAvwAAgL8AAIA/AACAvwAAgD8AAIA/AACAvwAAgD8AAIC/AACAPwAAgD8AAIC/AACAvwAAgD8AAIA/AACAvwAAgD8AAIA/AACAPwAAgL8AAIC/AACAvwAAgL8AAIC/AACAPwAAgL8AAIA/AACAPwAAgL8AAIA/AACAvwAAgL8AAIA/AACAPwAAgD8AAIA/AACAPwAAgD8AAIA/AACAvwAAgL8AAIA/AACAvwAAgL8AAIC/AACAvwAAgD8AAIC/AACAvwAAgD8AAIC/AACAPwAAgL8AAIC/AACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAQACAAAAAgADAAQABQAGAAQABgAHAAgACQAKAAgACgALAAwADQAOAAwADgAPABAAEQASABAAEgATABQAFQAWABQAFgAXAA==";
+  var SCENE = JSON.stringify({
+    schemaVersion: 1, name: "cube",
+    entities: [
+      { name: "cube", geometry: { kind: "gltf", source: "cube" },
+        material: { color: [0.30,0.62,1.0,1.0], metallic: 0.0, roughness: 0.55 },
+        spin: { velocity: [0.35,0.7,0.0] } },
+      { name: "key", light: { kind: "directional", direction: [-0.4,-0.8,-0.5], color: [1,1,1], intensity: 1.3 } },
+      { name: "sky", environment: { sky: { zenith: [0.03,0.05,0.09], horizon: [0.08,0.11,0.18] }, ambient: { color: [0.40,0.50,0.70], intensity: 0.5 } } },
+      { name: "camera", transform: { position: [3,2,5] }, camera: { controller: { kind: "orbit", target: [0,0,0], distance: 5, yaw: 0.6, pitch: 0.25 } } }
+    ]
+  });
+  var logEl = document.getElementById("log");
+  function log(cls, m) { var s = document.createElement("span"); s.className = cls || ""; s.textContent = m + "\n"; logEl.appendChild(s); logEl.scrollTop = logEl.scrollHeight; }
+  window.addEventListener("error", function (e) { log("err", "[window error] " + (e.message||"") + " " + (e.filename||"") + ":" + (e.lineno||"") + (e.error&&e.error.stack ? "\n"+e.error.stack : "")); });
+  window.addEventListener("unhandledrejection", function (e) { var r = e.reason; log("err", "[reject] " + (r&&r.stack ? r.stack : String(r))); });
+  function bytes() { var bin = atob(CUBE_B64), a = new Uint8Array(bin.length); for (var i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i); return a; }
+  log("dim", "ua: " + navigator.userAgent);
+  (async function () {
+    var backend = "webgl2";
+    try { if (navigator.gpu && await navigator.gpu.requestAdapter()) backend = "webgpu"; } catch (e) {}
+    log("dim", "backend: " + backend + " · SAB=" + (typeof SharedArrayBuffer!=="undefined") + " isolated=" + (typeof crossOriginIsolated!=="undefined"?crossOriginIsolated:"?"));
+    var bust = "?v=" + Date.now();
+    window.Module = {
+      canvas: document.getElementById("canvas"),
+      locateFile: function (p) { return CDN + "/" + p + bust; },
+      print: function (t) { log("", "[out] " + t); },
+      printErr: function (t) { log("err", "[err] " + t); },
+      onAbort: function (w) { log("err", "[ABORT] " + w); },
+      onRuntimeInitialized: function () {
+        try {
+          var b = bytes(), p = Module._malloc(b.length); Module.HEAPU8.set(b, p);
+          Module.ccall("quine_provide_asset", null, ["string","number","number"], ["cube", p, b.length]); Module._free(p);
+          log("ok", "provided cube mesh (" + b.length + " B)");
+          Module.ccall("quine_enqueue", null, ["string"], [JSON.stringify({ type: "scene", json: SCENE })]);
+          Module.ccall("quine_set_autoplay", null, ["number"], [1]);
+          try { Module.ccall("quine_set_hud", null, ["number"], [0]); } catch (e) {}
+          log("ok", "[runtime ready] scene enqueued — you should see a turning cube");
+        } catch (e) { log("err", "inject failed: " + (e && (e.stack||e.message))); }
+      }
+    };
+    log("dim", "loading engine: " + CDN + "/quine-" + backend + ".js");
+    var s = document.createElement("script"); s.async = true; s.crossOrigin = "anonymous";
+    s.src = CDN + "/quine-" + backend + ".js" + bust;
+    s.onerror = function () { log("err", "[engine script failed to load] " + s.src); };
+    document.head.appendChild(s);
+  })();
+</script>
+</body>
+</html>
