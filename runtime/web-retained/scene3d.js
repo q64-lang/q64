@@ -171,8 +171,10 @@ export function place(rect) {
   backCanvas.style.top = y + 'px';
   backCanvas.style.width = w + 'px';
   backCanvas.style.height = h + 'px';
-  const bw = Math.max(1, Math.round(w * DPR)), bh = Math.max(1, Math.round(h * DPR));
-  if (backCanvas.width !== bw || backCanvas.height !== bh) { backCanvas.width = bw; backCanvas.height = bh; }
+  // Set ONLY the CSS size + position. The engine (sokol) OWNS the canvas backing
+  // store — it tracks the CSS size and sizes its framebuffer/GL viewport to match.
+  // Setting backCanvas.width/height here fights it (viewport ≠ buffer) and squashes
+  // the render into a corner — which was the wrong-size bug.
 }
 
 export function isLive() { return ready && active; }
