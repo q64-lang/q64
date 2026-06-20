@@ -15,7 +15,8 @@ try { ({ BUILD } = await import('./version.js')); } catch {}
 // Snap upload config (api origin + snap:create token), filled by the deploy.
 let SNAP = { api: '', token: '' };
 try { ({ SNAP } = await import('./snap-config.js')); } catch {}
-import { initGPU, drawPrim, sdfTexture, iconSdf, beginFrame, endFrame, setScissor, DPR } from './gpu.js';
+import { initGPU, drawPrim, sdfTexture, iconSdf, beginFrame, endFrame, setScissor, setTransparent, DPR } from './gpu.js';
+import { deactivate as deactivateScene } from './scene3d.js';
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
 import { Scene } from './scene.js';
@@ -86,6 +87,7 @@ const CATALOG = [
   'Notes',           // 31  text_area section label
   'Icons',           // 32  icon section label
   'Search',          // 33  icon button label
+  'Turning cube',    // 34  scene_overlay demo title (a 3D scene + a form on top)
 ];
 
 // Vector-icon catalog (Lucide path data, ISC). Referenced by integer id via
@@ -216,6 +218,11 @@ function readUtf8(ptr, len) {
 let spinRAF = 0;
 function hasSpinner() {
   for (const n of nodes.values()) if (n.kind === KIND.spinner) return true;
+  return false;
+}
+// Is a 3D `scene` viewport in the tree? (drives surface transparency — see render).
+function hasScene() {
+  for (const n of nodes.values()) if (n.kind === KIND.scene) return true;
   return false;
 }
 function spinTick() {
@@ -541,6 +548,12 @@ function render() {
   // NB: scrollY is NOT hard-clamped here — it may sit slightly past the edges
   // during an iOS-style rubber-band overscroll; the drag applies resistance and
   // release springs it back (see settleScroll). maxBound() is the true limit.
+
+  // A `scene` node turns on the 3D back layer: make the QView surface transparent
+  // so the engine canvas shows through, and tear it down when none remain.
+  const sceneLive = hasScene();
+  setTransparent(sceneLive);
+  if (!sceneLive) deactivateScene();
 
   const frame = beginFrame(THEME.bg);
   renderCtx.pass = frame.pass;

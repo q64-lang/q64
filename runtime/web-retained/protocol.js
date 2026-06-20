@@ -4,7 +4,7 @@
 // tag here and a draw entry in widgets.js; it never edits the op set.
 //
 // PROTOCOL_VERSION bumps minor on append, major on any meaning/encoding change.
-export const PROTOCOL_VERSION = '1.10';
+export const PROTOCOL_VERSION = '1.11';
 
 // Node kinds (spec §"Node kinds").
 export const KIND = {
@@ -18,6 +18,15 @@ export const KIND = {
   text_area: 18,  // multi-line text field (wraps; Enter inserts a newline)
   icon: 19,       // a vector icon (Lucide) rendered as an SDF, tinted by fg
   spinner: 20,    // round animated wait cursor (dot-ring; host drives the RAF)
+  // scene (21): a content-AGNOSTIC 3D scene viewport. The host fills the node's
+  // rect with the 3D scene named by ATTR.scene_id (a host scene catalog, like
+  // text_id is a host glyph catalog — no strings cross the wasm boundary). The
+  // viewport is a back layer; QView widgets drawn after it (e.g. a card placed
+  // over it in a `stack`) composite ON TOP — this is how a form overlays 3D.
+  // Renderer-agnostic: the web host renders it with the quine game engine; a
+  // native host renders the same scene id through its own 3D backend (sokol /
+  // render.zig). The cube is just one scene's DATA, never baked into this kind.
+  scene: 21,
 };
 export const KIND_NAME = Object.fromEntries(Object.entries(KIND).map(([k, v]) => [v, k]));
 
@@ -46,6 +55,11 @@ export const ATTR = {
   // container" (fill small screens, cap + center on wide ones). They also clamp
   // a node's intrinsic/explicit width anywhere. See arrange.js.
   max_w: 27, min_w: 28,
+  // scene_id (29): on a `scene` node, the host scene-catalog id of the 3D scene
+  // to render in the viewport (mirrors text_id's host-catalog pattern — an
+  // integer, no strings cross wasm). Catalog id 0 is the host's default scene
+  // (a slowly turning cube). Unknown ids fall back to the default.
+  scene_id: 29,
 };
 export const ATTR_NAME = Object.fromEntries(Object.entries(ATTR).map(([k, v]) => [v, k]));
 

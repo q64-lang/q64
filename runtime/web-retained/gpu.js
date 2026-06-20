@@ -12,6 +12,25 @@
 export const DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
 
 let device, ctx, format, primPipe, sampler, uniformBuf, whiteTex, bgLayout;
+// When a `scene` viewport is live, the QView surface must be SEE-THROUGH so the
+// engine canvas behind it shows through where there's no widget. setTransparent
+// reconfigures the canvas alpha + flips beginFrame to a transparent clear.
+let transparent = false;
+let configuredDevice, configuredFormat;
+
+// Toggle whether the QView surface composites over content behind it (a `scene`
+// engine canvas). Reconfigures the canvas: 'premultiplied' alpha so a transparent
+// clear lets the 3D show through; 'opaque' for the normal solid-background path.
+export function setTransparent(on) {
+  on = !!on;
+  if (on === transparent || !ctx || !configuredDevice) return;
+  transparent = on;
+  ctx.configure({
+    device: configuredDevice, format: configuredFormat,
+    alphaMode: on ? 'premultiplied' : 'opaque',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+  });
+}
 
 export async function initGPU(canvas) {
   if (!navigator.gpu) throw new Error('WebGPU not available in this browser');
@@ -27,6 +46,7 @@ export async function initGPU(canvas) {
     device, format, alphaMode: 'opaque',
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
+  configuredDevice = device; configuredFormat = format;
 
   uniformBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
@@ -127,7 +147,9 @@ export function beginFrame(bg = [0.027, 0.035, 0.05, 1]) {
   const canvas = ctx.canvas;
   device.queue.writeBuffer(uniformBuf, 0, new Float32Array([canvas.width, canvas.height, 0, 0]));
   const enc = device.createCommandEncoder();
-  const clearValue = { r: bg[0], g: bg[1], b: bg[2], a: bg[3] ?? 1 };
+  // Transparent clear when compositing over a scene engine canvas (premultiplied
+  // alpha → rgb must be 0 at a=0), else the solid platform background.
+  const clearValue = transparent ? { r: 0, g: 0, b: 0, a: 0 } : { r: bg[0], g: bg[1], b: bg[2], a: bg[3] ?? 1 };
   const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue, loadOp: 'clear', storeOp: 'store' }] });
   return { enc, pass };
 }

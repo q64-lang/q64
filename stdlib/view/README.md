@@ -11,6 +11,12 @@ actual drawing is the host's job.
   face.
 - **Built-in views** — `Container`, `Text`, `Image`, `Scroll`, `Stack`,
   `Grid`, `Input`, `Button`, each generic over its child type.
+- **`Scene`** — a content-agnostic 3D viewport view (the `scene` protocol kind):
+  it names a host scene by id and the host renders it (web → the quine engine,
+  native → the sokol/3D backend) as a back layer. The view tree never touches a
+  GPU; the 3D is the host's job, exactly like the other views. The reusable
+  `scene_overlay` composite (a `Scene` with a form on top) ships through the
+  component registry — see [`spec/qview-ui-registry.md`](../../spec/qview-ui-registry.md).
 - **`Style`** — typography, color, spacing, border, shadow as typed values
   (not strings). Composes; does not inherit CSS semantics.
 - **`Renderer`** face — the host-implemented contract: `create_node`,

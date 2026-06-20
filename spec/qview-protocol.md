@@ -144,6 +144,7 @@ encoding** column.
 | `26` | `icon` | icon, button | host `ICONS` catalog index of the vector icon to draw |
 | `27` | `max_w` | all | maximum width px. Clamps intrinsic/explicit width; on a `column` child with `align: stretch` it caps the stretched width and re-centers the child (responsive content container). |
 | `28` | `min_w` | all | minimum width px. Floors the resolved width by the same rules as `max_w`. |
+| `29` | `scene_id` | scene | host scene-catalog id of the 3D scene to render in a `scene` viewport (Stage 1, like `text_id`). `0` = the host default scene (a turning cube). Unknown ids fall back to the default. |
 
 **`SURFACE` roles** (the `surface` attr value) — theme-resolved translucent
 fills, so a producer asks for "a frosted bar" and the host paints the platform's
@@ -208,6 +209,43 @@ label without first solving the string ABI. **Producer-owned strings** (a wasm32
 `(ptr,len)` read by the host, per the wasm32 string-ABI work) land alongside
 `text_input`, since both need it. Until then, dynamic text uses `number` semantics
 (the host renders an integer) as the POC does.
+
+## 3D scene viewport (kind `21` `scene`)
+
+QView is a 2D retained widget tree, but a screen often wants a **3D backdrop a
+form sits over** (a product turntable behind a buy card, a world behind its HUD).
+The `scene` kind adds that **without** turning QView into a 3D drawing API and
+**without** baking any content into the protocol:
+
+- A `scene` node is a **content-agnostic 3D viewport**. It carries one attribute,
+  `scene_id` (attr `29`) — a **host scene-catalog** id, the exact mirror of the
+  `text_id` glyph-catalog pattern: an integer names host-owned content, so **no
+  geometry, no strings, and no GPU calls cross the wasm boundary**. The producer
+  says *"render scene 0 here,"* not *"draw these triangles."*
+- It is a **back layer**. The host renders the named scene into the node's
+  laid-out rect; QView widgets emitted **after** it (e.g. a `box` card placed over
+  it in a `stack`) composite **on top**. That layering is the whole overlay model
+  — the same one [`world`/`quine`](https://qubeworlds.com/scene) use (3D canvas +
+  a UI overlay the engine ignores), expressed inside QView.
+- It is **renderer-agnostic**, like every other op. The decided web substrate
+  renders the scene with the **quine** game engine (the cross-platform wasm 3D
+  engine, loaded from the CDN) on a canvas behind the QView surface; a **native**
+  host renders the *same `scene_id`* through its own 3D backend (the sokol/Zig
+  path, alongside [`runtime/wasmtime/src/render.zig`](../runtime/wasmtime/src/render.zig)).
+  The producer never knows which renders it — exactly as it never knows which
+  renderer applies a `set_attr`.
+
+**Why a viewport id and not a cube/mesh/material op set.** A 3D scene is *data*
+(entities, transforms, lights — see the scene-description contract the engine
+consumes), authored and versioned separately and rendered by a real engine. Per
+`q64.gfx`/`q64.math` (both "not yet implemented"), the language has no float/SIMD
+math surface yet, so a producer **cannot** do its own rotation/projection; making
+the host own the scene keeps the cube turning today on an integer-only ABI, and
+leaves a clean seam for a future imperative `gfx` face once the math lands.
+
+The reusable **composite** that pairs a `scene` viewport with an overlaid QView
+form — the `scene_overlay` block — lives in the QView component registry, not in
+this contract; see [`qview-ui-registry.md`](./qview-ui-registry.md).
 
 ## Per-platform look & themes
 

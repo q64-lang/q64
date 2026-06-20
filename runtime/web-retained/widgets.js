@@ -21,3 +21,4 @@ import './widgets/text_input.js';
 import './widgets/text_area.js';
 import './widgets/icon.js';
 import './widgets/spinner.js';
+import './widgets/scene.js';      // 3D scene viewport (kind 21) — engine behind #gpu

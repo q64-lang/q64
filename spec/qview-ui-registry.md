@@ -201,6 +201,8 @@ component, its files, and its `q64.view` requirements:
     field:     { files: ["field.q", "field_handlers.q"],   requires: ["proto", "ctx", "theme"] },
     // a "block" — a whole composed section, not just a single widget
     join_form: { files: ["join_form.q"],                   requires: ["card", "field", "button"] },
+    // a block that pairs a 3D scene viewport with an overlaid form
+    scene_overlay: { files: ["scene_overlay.q"],           requires: ["proto", "ctx", "card"] },
   }
 }
 ```
@@ -208,6 +210,45 @@ component, its files, and its `q64.view` requirements:
 **Blocks** — whole composed sections rather than single widgets — are where the
 registry earns its keep: a verified `join_form` is a drop-in section, not a pile
 of primitives a producer must re-assemble correctly each time.
+
+### `scene_overlay` — a 3D scene with a form on top
+
+The reusable **composite View** for "render a 3D scene, float a QView form over
+it." It is the canonical consumer of the `scene` viewport kind
+([`qview-protocol.md` §"3D scene viewport"](./qview-protocol.md)): a `stack`
+whose **back** child is a `scene` node (the 3D, rendered host-side by the engine)
+and whose **front** child is a `card` the caller fills with controls. The block
+owns the layering and id bookkeeping; the caller owns what goes in the card.
+
+```q64
+// src/ui/scene_overlay.q  — vendored; the consumer owns this file
+use q64.view.proto.{ KIND, ATTR }
+use ui.card.{ card }
+
+// A 3D `scene_id` viewport with a frosted card overlaid. Returns the CARD's node
+// id, so the caller parents its controls under the returned id and the scene
+// stays untouched behind them.
+//   c        — id-allocating context + theme (q64.view)
+//   parent   — where to mount (0 = root)
+//   scene_id — host scene-catalog id (0 = the default turning cube)
+pub fn scene_overlay(c: Ctx, parent: i64, scene_id: i64) -> i64 {
+  let root = c.next()
+  qview.create(root, KIND.stack, parent)            // z-stack: children share the rect
+
+  let view = c.next()
+  qview.create(view, KIND.scene, root)              // BACK layer — the 3D viewport
+  qview.set_attr(view, ATTR.scene_id, scene_id)
+
+  let panel = card(c, root)                          // FRONT layer — the form, on top
+  return panel
+}
+```
+
+Because it lowers to nothing but `qview.*`, the block carries only `@ui` — the 3D
+render is a *host* capability behind the `scene` kind, not a new effect the
+producer takes on. Swapping the renderer (web quine ↔ native sokol) changes
+nothing in this source. This is the "reusable composite View, in the registry"
+home for the scene+form pattern; `q64.view` supplies the `Ctx`/proto it builds on.
 
 ## Theme tokens map onto QView's semantic roles
 

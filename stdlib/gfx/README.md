@@ -17,6 +17,18 @@ Graphics primitives and GPU bridging.
 - **Shaders** — q64-source compute and render shaders compiled to WGSL /
   SPIR-V via the compiler, not embedded as strings.
 
+## Today: scenes render through an engine, not this surface
+
+Until the typed surface above lands, 3D reaches the screen as **data, not draw
+calls**: a QView `scene` viewport names a host scene by id and the host renders
+it with a real cross-platform engine (web → the **quine** wasm engine; native →
+its sokol backend). That keeps a turning cube + an overlaid form working on the
+integer-only QView ABI with no `q64.gfx`/`q64.math` yet. See
+[`spec/qview-protocol.md` §"3D scene viewport"](../../spec/qview-protocol.md) and
+the `scene_overlay` registry composite. An imperative `gfx` draw face is a later
+addition once the color/math types here exist; it does not replace the
+scene-as-data path.
+
 The type system catches the standard graphics bugs: blending in sRGB instead
 of linear, mixing color spaces on the same canvas, swapping straight and
 premultiplied alpha.
