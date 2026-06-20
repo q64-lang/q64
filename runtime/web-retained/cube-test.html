@@ -44,8 +44,7 @@
   function bytes() { var bin = atob(CUBE_B64), a = new Uint8Array(bin.length); for (var i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i); return a; }
   log("dim", "ua: " + navigator.userAgent);
   (async function () {
-    var backend = "webgl2";
-    try { if (navigator.gpu && await navigator.gpu.requestAdapter()) backend = "webgpu"; } catch (e) {}
+    var backend = "webgl2"; // WebGL2 renders on iPad Safari; the WebGPU bundle boots but draws blank
     log("dim", "backend: " + backend + " · SAB=" + (typeof SharedArrayBuffer!=="undefined") + " isolated=" + (typeof crossOriginIsolated!=="undefined"?crossOriginIsolated:"?"));
     var bust = "?v=" + Date.now();
     window.Module = {

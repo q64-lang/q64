@@ -113,14 +113,12 @@ async function boot() {
   booting = true;
   const canvas = ensureCanvas();
   if (!canvas) { booting = false; return; }
-  // Backend: prefer a real WebGPU adapter; fall back to the WebGL2 floor.
-  let backend = 'webgl2';
-  try { if (navigator.gpu && (await navigator.gpu.requestAdapter())) backend = 'webgpu'; } catch {}
-  // The engine needs SharedArrayBuffer (cross-origin isolation). Surface that
-  // precondition up front so a Snap shows it even if the engine aborts opaquely.
-  const coi = (typeof crossOriginIsolated !== 'undefined') ? crossOriginIsolated : false;
-  const hasSab = typeof SharedArrayBuffer !== 'undefined';
-  note('scene: booting engine (' + backend + ') · isolated=' + coi + ' SAB=' + hasSab);
+  // Backend: WebGL2 (NOT WebGPU). On iPad Safari the WebGPU bundle boots "ready"
+  // but renders nothing; WebGL2 is the proven path (it rendered this exact scene
+  // in headless GL, and three.js/WebGL renders on the device). qubeworlds renders
+  // on webgl2 too. Pin it rather than probing for a WebGPU adapter that draws blank.
+  const backend = 'webgl2';
+  note('scene: booting engine (' + backend + ')');
   const bust = '?v=' + Date.now();
   window.Module = {
     canvas,
