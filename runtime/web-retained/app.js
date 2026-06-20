@@ -16,7 +16,7 @@ try { ({ BUILD } = await import('./version.js')); } catch {}
 let SNAP = { api: '', token: '' };
 try { ({ SNAP } = await import('./snap-config.js')); } catch {}
 import { initGPU, drawPrim, sdfTexture, iconSdf, beginFrame, endFrame, setScissor, setTransparent, DPR } from './gpu.js';
-import { deactivate as deactivateScene } from './scene3d.js';
+import { deactivate as deactivateScene, isLive as sceneIsLive } from './scene3d.js';
 import { drawPopup as drawMenu, hitPopup as hitMenu } from './popup.js';
 import { widgetFor } from './widgets.js';
 import { Scene } from './scene.js';
@@ -225,6 +225,12 @@ function hasScene() {
   for (const n of nodes.values()) if (n.kind === KIND.scene) return true;
   return false;
 }
+// A scene whose engine hasn't produced a frame yet needs continuous re-renders:
+// the engine boots ASYNC after present(), and #gpu is event-driven — without this
+// the dim placeholder drawn pre-boot stays on #gpu and OCCLUDES the engine canvas
+// once it's live. Re-render until live, so the frame where it goes live repaints
+// #gpu transparent and the 3D shows through. Then it idles (engine self-animates).
+function sceneBooting() { return hasScene() && !sceneIsLive(); }
 function spinTick() {
   spinRAF = 0;
   // Pause the whole loop while a text field is focused: the continuous re-render
@@ -232,10 +238,10 @@ function spinTick() {
   // freezes during typing — resumed by ensureSpin() on blur.
   if (focusedId !== null) return;
   render();
-  if (hasSpinner()) spinRAF = requestAnimationFrame(spinTick);
+  if (hasSpinner() || sceneBooting()) spinRAF = requestAnimationFrame(spinTick);
 }
 function ensureSpin() {
-  if (!spinRAF && hasSpinner() && focusedId === null) spinRAF = requestAnimationFrame(spinTick);
+  if (!spinRAF && (hasSpinner() || sceneBooting()) && focusedId === null) spinRAF = requestAnimationFrame(spinTick);
 }
 
 // ATTR.surface role tag -> theme token key (the translucent material fills).
