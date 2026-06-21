@@ -775,15 +775,31 @@ Phase 3/4.** `@state(scope)` as first-class syntax + AST partitioning, the
 typed twin `face`/RPC API beyond `inc`, MSDF text, and the full retained
 `Renderer` face. Specs: `reactivity.md`, `agent-ui.md`.
 
+**Phase 6 — WIT as the first-class contract layer — NEAR-TERM, *no gate*
+(do before the SDK).** Promote WIT from an emit-only *view* of a qube to the
+**authored-where-needed, stored, and consumed** contract that makes the
+Continuum a polyglot component registry. WIT is the Component Model's standard
+IDL, the key to cross-language qubes, and must be first-class in the library
+manifest (`qube.json5`), the Continuum, the `qube`/`q64` CLIs, and the
+qubepods host. Detailed rungs in §"WIT — first-class contract layer". The
+foundational rungs (emit `.wit` + embed the component-type, manifest world,
+Continuum storage/serve, CLI commands) extend already-live systems and need
+no gate; **WIT ingestion** (binding imports to foreign `.wit`) is the larger
+follow-on that unlocks true any-language interop. Sequence this **before** the
+SDK — the SDK generates bindings *against* WIT, so the contract layer must
+exist first.
+
 **Cross-cutting / later (independent of the critical path).** RPC + `@wire`
 (`rpc.md`); the full memory model — `Managed`/WasmGC heap, named regions,
 `transfer` runtime (`memory.md`); C bindings / vendoring Binaryen
 (§"C bindings"); the host ABI for non-trivial faces (§"Host ABI…"); `spec/
 ffi.md` (unwritten); and the native **LLVM** backend (explicitly "Later").
 
-**Critical path:** Phase 2 → 3 → 4, with 5 depending on 3/4. Phase 1 and
-the cross-cutting bucket run in parallel and need no gate. The single
-hard ordering constraint in the whole plan is **audit-before-scheduler**.
+**Critical path:** Phase 2 → 3 → 4, with 5 depending on 3/4. Phase 1, Phase 6
+(WIT contract layer), and the cross-cutting bucket run in parallel and need no
+gate. The single hard ordering constraint in the whole plan is
+**audit-before-scheduler**; the single hard *product* constraint is
+**WIT-before-SDK** (Phase 6 lands the contract the SDK generates against).
 
 ## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
 
@@ -1396,6 +1412,78 @@ spec/q64-cli.md `--component`).
       building. Revisit MLIR only if Q64 grows multi-target (GPU) or its own
       mid-level optimization passes — and then as HIR/MIR *as dialects*, not
       a layer on top.
+
+## WIT — first-class contract layer
+
+The Component Model's IDL is **WIT**, and it's the contract that lets qubes
+written in any language interoperate, the unit the Continuum should store and
+serve, and the thing the `qube`/`q64` CLIs and the qubepods host must treat as
+first-class. Today WIT is **emit-only** — `q64 show world` *synthesizes* a
+world from a qube's surface (see §"Component emission" and `spec/modules.md`
+§"The qube as a component"), and we never read foreign WIT. This section makes
+WIT a real artifact: **emitted to disk, embedded in the component, declared in
+the library manifest, stored/served by the Continuum, surfaced in the CLIs,
+and — the big one — consumed.**
+
+**Design rule (don't regress the existing decision).** A qube's *own* world
+stays **synthesized, not authored** — q64's type + effect system is the single
+source of truth, no hand-written `.wit` duplicating the source (`spec/modules.md`
+§"The world is also the RPC contract"). What's new is the **consume**
+direction: binding a qube's *imports* to an external, authored/foreign `.wit`
+(a Rust/JS/Go component, or a shared interface package). Faces are **not**
+widened to cover WIT `resource`s — foreign resources get an opaque handle type
+*outside* the face system (see §"Host ABI for non-trivial faces" and the gap
+notes below).
+
+### Rung order (do in order; the first four extend live systems, no gate)
+
+- [ ] **1. Emit `.wit` to disk + embed the component-type.** Extend
+      `q64 emit --component` / `qube build --component` (§"Component emission")
+      to (a) write the synthesized world as a `<name>.wit` artifact next to the
+      component, and (b) embed the `component-type` custom section in the
+      emitted component so `wasm-tools component wit <c>.wasm` round-trips it.
+      Add `q64 show world --out <file.wit>` (today the world only prints to
+      stdout, `spec/q64-cli.md:51`). Cheapest rung; unblocks the rest.
+- [ ] **2. Library manifest carries the world.** `qube.json5` for a **library
+      qube** (`type: "library"`) gains a `wit` block — package name + world +
+      the `.wit` path (or `"synthesized"`). Spec in `spec/qube.json5.md` +
+      `.schema.json`. A library's published surface *is* its world; this is
+      what consumers resolve and link against. (Apps emit a world too, but the
+      contract that matters for linking is a library's.)
+- [ ] **3. Continuum stores + serves + displays WIT.** A published qube
+      version carries its `.wit` (the component-type is also in the archive).
+      `continuum-api` stores it alongside the `.zip` archive
+      (`spec/continuum-api.md` §"Archive format"), serves it over the qubes
+      API, and the Continuum UI renders the world (exports/imports) on the qube
+      page — the registry becomes a browsable **interface catalog**, not just a
+      blob store. This is the "key to the Continuum" piece.
+- [ ] **4. `qube`/`q64` CLI — first-class WIT.** `qube wit show` (resolved
+      world of the current/named qube), `qube wit extract <c>.wasm` (pull the
+      embedded world from any component, any language), `qube wit check` (the
+      qube's surface matches its declared world), `qube wit diff <a> <b>`
+      (breaking-change check across versions — pairs with Continuum semver).
+      Spec in `spec/qube-cli.md` / `spec/q64-cli.md`.
+- [ ] **5. WIT ingestion — consume foreign `.wit` (the big one).** Parse an
+      authored/foreign `.wit` package and bind a qube's `import`s to its
+      interfaces — the path that lets a q64 qube call a Rust/JS/Go component.
+      Needs: a WIT parser; a WIT-type → q64-type mapping (the inverse of the
+      `spec/modules.md` lowering table); and an **opaque resource-handle type**
+      that lives *outside* the face system (q64 user code can hold/pass a
+      foreign `resource` handle but not introspect it — keeps the `faces.md`
+      boundary intact, `spec/modules.md:381`). This is the missing **input**
+      direction that makes "any language over WIT" real.
+- [ ] **6. Host-side composition (qubepods).** Tracked in `qubepods/TODO.md`
+      §"WIT in the host" — the host validates a deployed component against its
+      declared world and composes heterogeneous components over shared WIT.
+
+### Known type-system gaps to close as ingestion lands
+
+WIT primitives q64 has no representation for yet — surface honestly, don't
+silently coerce: **`flags`** (no flags type, `spec/types.md`), **`char`** (no
+Unicode-scalar type), and **anonymous `tuple<…>`** in *foreign* signatures
+(q64 tuples are nominal, `spec/types.md` §"Tuple structs"). Each is additive.
+Resources, own/borrow, and type-only interfaces are handled by the
+opaque-handle approach in rung 5, **not** by widening faces.
 
 ## Semantic pass + struct values → static fits — NEXT (the slope-changing ladder)
 
