@@ -36,6 +36,7 @@ qube --help    | -h
 | `qube lock`                      | Regenerate `qube.lock` from the manifest                           |
 | `qube publish`                   | Publish this qube to the registry                                  |
 | `qube wit <show\|extract\|check\|diff>` | First-class WIT contracts — this qube's world, a component's embedded world, surface↔manifest agreement, version diffs |
+| `qube wac <plug\|compose>`       | Link components — satisfy a socket's imports with a plug's exports (link at build) |
 | `qube outdated`                  | List dependencies with newer compatible versions                   |
 | `qube audit`                     | Show effects and capabilities each dependency declares             |
 | `qube clean`                     | Remove build outputs (`target/`)                                   |
@@ -268,6 +269,26 @@ package tool — see [`q64-cli.md`](./q64-cli.md) §"`q64 wit` vs `qube wit`".)
 `PATH` (the same resolution `q64 emit --component` uses). `extract` and the
 component side of `diff` need it; `show`/`check` and a `.wit`↔`.wit` `diff` do
 not.
+
+## `qube wac` — link components at build
+
+`wac` (the WebAssembly Composition tool) is the **linker**: it satisfies one
+component's imports with another's exports, producing a single runnable
+component. `qube wac` is the step between `qube build` (q64 → a component that
+*declares* its foreign imports — WIT rung 5) and `qube run`.
+
+| Form | Meaning |
+|------|---------|
+| `qube wac plug <socket.wasm> --plug <dep.wasm>… -o <out.wasm>` | Satisfy `socket`'s imports with the `plug`s' exports; write one composed component. Repeatable `--plug`. |
+| `qube wac compose <file.wac> [-o <out.wasm>]` | Run a `.wac` composition graph (the wac graph language — wac-only). |
+
+**Engine.** `qube wac` prefers the real **`wac`** (`Q64_WAC`, else
+`vendor/wac/wac`, else `PATH`); for `plug` it falls back to the vendored
+**`wasm-tools compose`** when no `wac` is present (the documented fallback). The
+`.wac` graph language has no `wasm-tools` equivalent, so `compose` requires
+`wac`. Composition wires by **matching interface id**: a plug must *export* the
+interface id the socket *imports* (e.g. `test:shared/math`). Verified by
+`scripts/wac-roundtrip.sh` against both engines.
 
 ## How `qube` invokes `q64`
 

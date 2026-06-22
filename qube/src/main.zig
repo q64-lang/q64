@@ -169,6 +169,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "wac")) {
+        cmdWac(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: wac failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     // Documented subcommands that are not implemented yet. Listed
     // explicitly so unknown names still hit the usage fallback.
     const stub_subs = [_][]const u8{
@@ -212,6 +220,9 @@ fn usage(io: std.Io) !void {
         \\                          Inspect WIT worlds: this qube's contract, a component's
         \\                          embedded world, surface↔manifest agreement, version diffs,
         \\                          and a foreign .wit's q64 bindings.
+        \\  wac plug <socket> --plug <dep> -o <out>
+        \\                          Link components — satisfy a socket's imports with a plug's
+        \\                          exports (link at build). `wac compose <file.wac>` for graphs.
         \\  login                   Authenticate against the Continuum registry.
         \\  --version, -v           Print the version and exit.
         \\  --help, -h              Print this help and exit.
@@ -1280,6 +1291,195 @@ fn resolveBinary(
     }
     // Fall back to argv[0] name; the OS resolves via PATH at spawn time.
     return try gpa.dupe(u8, path_name);
+}
+
+// ---------------------------------------------------------------------------
+// qube wac — on-device component linker (link at build)
+// ---------------------------------------------------------------------------
+//
+// `wac` is the WebAssembly Composition tool — the linker that satisfies one
+// component's imports with another's exports, producing a single runnable
+// component. `qube wac plug <socket> --plug <dep>` composes an application qube
+// with the library qubes it imports; `qube wac compose <file.wac>` runs a `.wac`
+// composition graph. It is the missing step between `qube build` (q64 →
+// component, which now *declares* its foreign imports — WIT rung 5) and
+// `qube run`.
+//
+// Engine: prefer the real `wac` (env `Q64_WAC`, else `vendor/wac/wac`, else
+// `PATH`); fall back to the vendored `wasm-tools compose` (the documented
+// fallback) for `plug`. The `.wac` graph language is wac-only.
+
+/// Locate the `wac` binary if one is explicitly available (env or vendored). A
+/// `null` result means: fall back to `wasm-tools compose`. Caller frees.
+fn resolveWac(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, repo_root: ?[]const u8) !?[]u8 {
+    if (env.get("Q64_WAC")) |v| {
+        if (v.len > 0) return try gpa.dupe(u8, v);
+    }
+    if (repo_root) |root| {
+        const candidate = try std.fs.path.join(gpa, &.{ root, "vendor/wac/wac" });
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch {
+            gpa.free(candidate);
+            return null;
+        };
+        return candidate;
+    }
+    return null;
+}
+
+fn cmdWac(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    const verb = args_it.next() orelse {
+        try writeStderr(io, "usage: qube wac <plug|compose> [args]\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+    if (std.mem.eql(u8, verb, "plug")) return wacPlug(gpa, io, env, args_it);
+    if (std.mem.eql(u8, verb, "compose")) return wacCompose(gpa, io, env, args_it);
+    try printStderr(io, "qube wac: unknown verb '{s}' (plug|compose)\n", .{verb});
+    std.process.exit(@intFromEnum(ExitCode.usage));
+}
+
+/// `qube wac plug <socket.wasm> --plug <p.wasm>… -o <out.wasm>` — satisfy the
+/// socket's imports with the plugs' exports, writing one composed component.
+fn wacPlug(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var socket: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    var plugs: std.ArrayList([]const u8) = .empty;
+    defer plugs.deinit(gpa);
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--plug")) {
+            try plugs.append(gpa, args_it.next() orelse {
+                try writeStderr(io, "qube wac plug: --plug needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            });
+        } else if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--out")) {
+            out_path = args_it.next() orelse {
+                try writeStderr(io, "qube wac plug: -o needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube wac plug: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (socket == null) {
+            socket = a;
+        } else {
+            try writeStderr(io, "qube wac plug: unexpected extra arg\n");
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    const sock = socket orelse {
+        try writeStderr(io, "usage: qube wac plug <socket.wasm> --plug <p.wasm>… -o <out.wasm>\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+    const out = out_path orelse {
+        try writeStderr(io, "qube wac plug: -o <out.wasm> is required\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+    if (plugs.items.len == 0) {
+        try writeStderr(io, "qube wac plug: at least one --plug is required\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const repo_root_opt = findRepoRoot(gpa, io, cwd_path) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+
+    const wac = try resolveWac(gpa, io, env, repo_root_opt);
+    defer if (wac) |w| gpa.free(w);
+    if (wac) |w| {
+        // wac plug <socket> --plug <p>… -o <out>
+        try argv.appendSlice(gpa, &.{ w, "plug", sock });
+        for (plugs.items) |p| try argv.appendSlice(gpa, &.{ "--plug", p });
+        try argv.appendSlice(gpa, &.{ "-o", out });
+    } else {
+        // Fallback: wasm-tools compose <socket> -d <plug>… -o <out>.
+        const tools = try resolveBinary(gpa, io, env, "Q64_WASM_TOOLS", repo_root_opt, "vendor/wasm-tools/wasm-tools", "wasm-tools");
+        defer gpa.free(tools);
+        try argv.appendSlice(gpa, &.{ tools, "compose", sock });
+        for (plugs.items) |p| try argv.appendSlice(gpa, &.{ "-d", p });
+        try argv.appendSlice(gpa, &.{ "-o", out });
+        const term = spawnInherit(io, argv.items) catch {
+            try writeStderr(io, "qube wac plug: no composer found (set Q64_WAC or Q64_WASM_TOOLS, or run ./init.sh)\n");
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        const code = termCode(term) orelse 255;
+        if (code != 0) std.process.exit(@intFromEnum(ExitCode.compile));
+        try printStdout(io, "qube wac: linked {s} (wasm-tools compose)\n", .{out});
+        return;
+    }
+    const term = spawnInherit(io, argv.items) catch {
+        try writeStderr(io, "qube wac plug: failed to run wac\n");
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    };
+    const code = termCode(term) orelse 255;
+    if (code != 0) std.process.exit(@intFromEnum(ExitCode.compile));
+    try printStdout(io, "qube wac: linked {s} (wac plug)\n", .{out});
+}
+
+/// `qube wac compose <file.wac> [-o <out.wasm>]` — run a `.wac` composition
+/// graph. wac-only (the `.wac` language has no wasm-tools equivalent).
+fn wacCompose(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var file: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--out")) {
+            out_path = args_it.next() orelse {
+                try writeStderr(io, "qube wac compose: -o needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube wac compose: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (file == null) {
+            file = a;
+        } else {
+            try writeStderr(io, "qube wac compose: unexpected extra arg\n");
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    const f = file orelse {
+        try writeStderr(io, "usage: qube wac compose <file.wac> [-o <out.wasm>]\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const repo_root_opt = findRepoRoot(gpa, io, cwd_path) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const wac = (try resolveWac(gpa, io, env, repo_root_opt)) orelse {
+        try writeStderr(io, "qube wac compose: the .wac graph language needs `wac` (set Q64_WAC or vendor it); `plug` works without it via wasm-tools compose\n");
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    };
+    defer gpa.free(wac);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ wac, "compose", f });
+    if (out_path) |op| try argv.appendSlice(gpa, &.{ "-o", op });
+    const term = spawnInherit(io, argv.items) catch {
+        try writeStderr(io, "qube wac compose: failed to run wac\n");
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    };
+    const code = termCode(term) orelse 255;
+    if (code != 0) std.process.exit(@intFromEnum(ExitCode.compile));
+    if (out_path) |op| try printStdout(io, "qube wac: composed {s}\n", .{op});
 }
 
 // ---------------------------------------------------------------------------

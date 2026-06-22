@@ -156,6 +156,13 @@ pub fn build(b: *std.Build) void {
     const component_step = b.step("component-roundtrip", "Emit a component and validate it with wasmtime");
     component_step.dependOn(&component_script.step);
 
+    // End-to-end: link two components with `qube wac` (link at build) and verify
+    // the import is satisfied. Uses the real `wac` when available, else the
+    // vendored `wasm-tools compose` fallback.
+    const wac_script = b.addSystemCommand(&.{ "bash", "../scripts/wac-roundtrip.sh" });
+    const wac_step = b.step("wac-roundtrip", "Link components with qube wac and validate");
+    wac_step.dependOn(&wac_script.step);
+
     // Black-box CLI suite (Bun). Builds the binary, then runs `bun test`
     // in the sibling ../q64-test against zig-out/bin/q64. Only runs when
     // invoked explicitly; needs `bun` on PATH.
