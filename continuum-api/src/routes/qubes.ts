@@ -27,6 +27,24 @@ qubes.post("/:name", async (c) => {
   if (!manifestText || !(archiveBlob instanceof Blob)) {
     return c.json({ code: "PUB400", message: "fields 'manifest' (text) and 'archive' (file) required" }, 400);
   }
+  // Optional `wit` field: the toolchain-synthesized WIT world (WIT rung 3).
+  // `qube publish` runs `q64 show world` and uploads the result, the same way
+  // it syncs `capabilities`. Accepted as a text field or a small file; rejected
+  // if it doesn't look like a WIT document (must declare a `world`).
+  let witText: string | null = null;
+  if (typeof body.wit === "string") {
+    witText = body.wit;
+  } else if (body.wit instanceof Blob) {
+    witText = await body.wit.text();
+  }
+  if (witText !== null) {
+    if (witText.length > 256 * 1024) {
+      return c.json({ code: "PUB413", message: "wit world exceeds 256 KiB limit" }, 413);
+    }
+    if (!/(^|\n)\s*world\s+[A-Za-z]/.test(witText)) {
+      return c.json({ code: "PUB422", message: "'wit' field is not a WIT document (no `world` declaration)" }, 422);
+    }
+  }
 
   let manifest: Record<string, unknown>;
   try {
@@ -121,9 +139,9 @@ qubes.post("/:name", async (c) => {
   }
 
   await c.env.DB.prepare(
-    `INSERT INTO versions (qube_name, version, manifest, archive_sha, archive_size, effects, published_at, yanked, scan_status, published_via)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending', 'manual')`,
-  ).bind(urlName, version, manifestText, sha, archiveBytes.byteLength, JSON.stringify(effects), now).run();
+    `INSERT INTO versions (qube_name, version, manifest, archive_sha, archive_size, effects, published_at, yanked, scan_status, published_via, wit)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending', 'manual', ?)`,
+  ).bind(urlName, version, manifestText, sha, archiveBytes.byteLength, JSON.stringify(effects), now, witText).run();
 
   return c.json(
     {
@@ -158,6 +176,7 @@ type VersionRow = {
   yanked: number;
   published_via: string | null;
   provenance: string | null;
+  wit: string | null;
 };
 
 const QUBE_COLS = `q.name, q.description, q.repository, q.license, q.latest,
@@ -173,6 +192,18 @@ function parseManifestOrNull(text: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+// Pull the `world <name>` declaration out of a WIT document for a UI summary.
+// Lightweight on purpose — the registry never parses WIT, it stores + serves
+// the toolchain-synthesized document verbatim.
+function witWorldName(wit: string): string | null {
+  return /(?:^|\n)\s*world\s+([A-Za-z][A-Za-z0-9_-]*)/.exec(wit)?.[1] ?? null;
+}
+
+// Pull the `package ns:name[@ver];` id out of a WIT document.
+function witPackageId(wit: string): string | null {
+  return /(?:^|\n)\s*package\s+([^\s;]+)\s*;/.exec(wit)?.[1] ?? null;
 }
 
 function orderClause(sort: string | undefined, hasQuery: boolean): string {
@@ -242,7 +273,7 @@ qubes.get("/:name/:version", async (c) => {
   const version = c.req.param("version");
   const row = await c.env.DB.prepare(
     `SELECT version, manifest, archive_sha, archive_size, effects, published_at,
-            yanked, published_via, provenance
+            yanked, published_via, provenance, wit
      FROM versions WHERE qube_name = ? AND version = ?`,
   ).bind(name, version).first<VersionRow>();
   if (!row) return c.json({ code: "QUB404", message: "version not found" }, 404);
@@ -262,6 +293,49 @@ qubes.get("/:name/:version", async (c) => {
     manifest: parseManifestOrNull(row.manifest),
     published_via: row.published_via,
     provenance: row.provenance ? JSON.parse(row.provenance) : null,
+    // WIT world (rung 3): present when the publishing toolchain attached one.
+    // `world`/`package` are parsed out of the document for a quick UI summary;
+    // the full document is served at `/:name/:version/world`.
+    has_wit: row.wit !== null,
+    world: row.wit ? witWorldName(row.wit) : null,
+    package: row.wit ? witPackageId(row.wit) : null,
+  });
+});
+
+// GET /v1/qubes/:name/:version/world — the qube's synthesized WIT world (rung
+// 3). Default response is JSON metadata + the document; `Accept: text/plain`
+// (or `?format=wit`) returns the raw `.wit` for tooling (`wac`, `jco`,
+// `wasm-tools`). For an RPC-serving qube this is also where the served-world +
+// endpoint resolution lives (spec/continuum-api.md §"RPC endpoint resolution");
+// endpoints are empty until rpc.export wiring lands.
+qubes.get("/:name/:version/world", async (c) => {
+  const name = decodeURIComponent(c.req.param("name"));
+  const version = c.req.param("version");
+  const row = await c.env.DB.prepare(
+    `SELECT wit FROM versions WHERE qube_name = ? AND version = ?`,
+  ).bind(name, version).first<{ wit: string | null }>();
+  if (!row) return c.json({ code: "QUB404", message: "version not found" }, 404);
+  if (row.wit === null) {
+    return c.json({ code: "QUB404", message: `${name}@${version} has no published WIT world` }, 404);
+  }
+
+  const wantsRaw =
+    c.req.query("format") === "wit" || (c.req.header("accept") ?? "").includes("text/plain");
+  if (wantsRaw) {
+    return new Response(row.wit, {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "immutable, max-age=31536000",
+      },
+    });
+  }
+  return c.json({
+    qube: name,
+    version,
+    world: witWorldName(row.wit),
+    package: witPackageId(row.wit),
+    wit: row.wit,
+    endpoints: [],
   });
 });
 

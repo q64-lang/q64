@@ -2055,6 +2055,61 @@ fn syncManifestCapabilities(
     try printStdout(io, "qube publish: capabilities synced to {s} (compiler-derived)\n", .{rendered});
 }
 
+/// Synthesize the qube's WIT world to a file under `target/publish/` and return
+/// its path (caller frees), or null when no world can be produced (q64 absent,
+/// or the qube doesn't compile). The world name + package come from the
+/// manifest `wit` block (WIT rung 2), so the published contract matches the
+/// `.wit` `qube build --component` emits. Best-effort: a synthesis failure must
+/// not block publish — the registry treats the world as optional metadata.
+fn synthesizeWitWorld(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    m: *const LoadedManifest,
+    name: []const u8,
+) !?[]u8 {
+    const project_dir = m.projectDir();
+    const repo_root_opt = findRepoRoot(gpa, io, project_dir) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const q64_bin = resolveBinary(gpa, io, env, "Q64_BIN", repo_root_opt, "q64/zig-out/bin/q64", "q64") catch return null;
+    defer gpa.free(q64_bin);
+
+    const type_str = manifestString(m.root, "type") orelse "library";
+    const entry_rel = manifestString(m.root, "entry") orelse
+        (if (std.mem.eql(u8, type_str, "application")) "src/main.q" else "src/lib.q");
+    const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
+    defer gpa.free(entry_path);
+
+    const world_name = resolveWorldName(m.root, name);
+    const wit_package = try resolveWitPackage(gpa, m.root, name);
+    defer gpa.free(wit_package);
+
+    const out_dir = try std.fs.path.join(gpa, &.{ project_dir, "target", "publish" });
+    defer gpa.free(out_dir);
+    std.Io.Dir.cwd().createDirPath(io, out_dir) catch {};
+    const wit_file = try std.fmt.allocPrint(gpa, "{s}.wit", .{name});
+    defer gpa.free(wit_file);
+    const wit_path = try std.fs.path.join(gpa, &.{ out_dir, wit_file });
+    errdefer gpa.free(wit_path);
+
+    var module_specs = resolveModuleSpecs(gpa, io, env, project_dir, m.root) catch return null;
+    defer {
+        for (module_specs.items) |s| gpa.free(s);
+        module_specs.deinit(gpa);
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ q64_bin, "show", "world", "--qube", entry_path, "--world", world_name, "--wit-package", wit_package, "--out", wit_path });
+    for (module_specs.items) |spec| try argv.appendSlice(gpa, &.{ "--module", spec });
+
+    const res = runCapture(gpa, io, argv.items) catch return null;
+    defer gpa.free(res.stdout);
+    if ((res.code orelse 255) != 0) return null;
+    try printStdout(io, "qube publish: attached WIT world '{s}' ({s})\n", .{ world_name, wit_package });
+    return wit_path;
+}
+
 fn cmdPublish(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -2125,6 +2180,13 @@ fn cmdPublish(
     }
     try printStdout(io, "qube publish: packed {s}\n", .{out_zip_full});
 
+    // Synthesize the WIT world and attach it (WIT rung 3): the Continuum stores
+    // SOURCE, not wasm, so the world can't be derived registry-side — the
+    // toolchain attaches it here (like `capabilities`). Best-effort: if q64 is
+    // absent or the qube doesn't compile a world, publish proceeds without it.
+    const wit_path = synthesizeWitWorld(gpa, io, env, &m, name) catch null;
+    defer if (wit_path) |p| gpa.free(p);
+
     // Token.
     const home = try qubeHome(gpa, env);
     defer gpa.free(home);
@@ -2144,13 +2206,20 @@ fn cmdPublish(
     const archive_field = try std.fmt.allocPrint(gpa, "archive=@{s};type=application/zip", .{out_zip_full});
     defer gpa.free(archive_field);
 
-    const argv = [_][]const u8{
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{
         "curl",          "-sS",  "-w", "\n%{http_code}",
         "-X",            "POST", url,  "-H",
         auth,            "-F",   manifest_field,
         "-F",            archive_field,
-    };
-    const cap = try runCapture(gpa, io, &argv);
+    });
+    // Attach the synthesized world when one was produced (WIT rung 3).
+    const wit_field = if (wit_path) |p| try std.fmt.allocPrint(gpa, "wit=<{s}", .{p}) else null;
+    defer if (wit_field) |f| gpa.free(f);
+    if (wit_field) |f| try argv.appendSlice(gpa, &.{ "-F", f });
+
+    const cap = try runCapture(gpa, io, argv.items);
     defer gpa.free(cap.stdout);
     const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse cap.stdout.len;
     const body = cap.stdout[0..nl];

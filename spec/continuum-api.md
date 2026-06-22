@@ -73,7 +73,9 @@ GET /v1/qubes/{name}/{version}
 ```
 
 Returns the full manifest for a specific version plus its effect index,
-declared targets, and dependency graph.
+declared targets, and dependency graph. When the version attached a WIT world
+(WIT rung 3), it also carries `has_wit: true` with the parsed `world` and
+`package` names (the full document is at `…/{version}/world`).
 
 ```
 GET /v1/qubes/{name}/{version}/archive
@@ -120,7 +122,18 @@ Content-Type: multipart/form-data
 
   manifest=<qube.json5 body>
   archive=<binary zip>
+  wit=<synthesized WIT world>   # optional
 ```
+
+The optional **`wit`** field carries the qube's synthesized WIT world (WIT
+rung 3). Because the Continuum stores **source**, not compiled wasm (see
+"Address space and compiled artifacts"), the world cannot be derived
+registry-side — `qube publish` synthesizes it (`q64 show world`) and attaches
+it here, the same way it syncs the generated `capabilities` field. It is
+stored verbatim and served at `GET /v1/qubes/{name}/{version}/world`. The
+server validates only that it declares a `world` (it does not parse WIT); max
+256 KiB. A version published without it simply has no world
+(`has_wit: false`).
 
 Server validates, in order:
 
@@ -270,8 +283,18 @@ dependency version:
 GET /v1/qubes/{name}/{version}/world
 ```
 
-returns the synthesized WIT world the qube serves and its endpoint
-address(es). Because importing a remote qube adds `@wire` to the consumer's
+returns the qube's synthesized WIT world (WIT rung 3) — for **any** published
+qube that attached one, not only RPC-serving qubes. A library's surface *is*
+its world: this is the contract a consumer resolves and `wac` links against.
+The default response is JSON `{ qube, version, world, package, wit, endpoints }`
+(`wit` is the full document; `world`/`package` are parsed out of it for a
+summary; `endpoints` is populated for an RPC-serving qube, empty otherwise).
+`Accept: text/plain` (or `?format=wit`) returns the raw `.wit` for tooling
+(`wac`, `jco`, `wasm-tools`). A version with no attached world returns `404`.
+
+For an RPC-serving qube (`rpc.export: true`), this is also where the **served
+world + endpoint resolution** lives. Because importing a remote qube adds
+`@wire` to the consumer's
 effect set (per [`effects.md`](./effects.md) and [`rpc.md`](./rpc.md)), the
 remote dependency is disclosed in `qube audit` like any capability — the
 `@wire` reach and the served world appear at `qube add` time. The endpoint

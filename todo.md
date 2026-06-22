@@ -1494,13 +1494,29 @@ notes below).
         `component-roundtrip.sh` (asserts `package dev-q64:math` + `world math`).
         Spec: `spec/qube.json5.md`, `spec/qube.json5.schema.json`,
         `spec/q64-cli.md`.
-- [ ] **3. Continuum stores + serves + displays WIT.** A published qube
-      version carries its `.wit` (the component-type is also in the archive).
-      `continuum-api` stores it alongside the `.zip` archive
-      (`spec/continuum-api.md` §"Archive format"), serves it over the qubes
-      API, and the Continuum UI renders the world (exports/imports) on the qube
-      page — the registry becomes a browsable **interface catalog**, not just a
-      blob store. This is the "key to the Continuum" piece.
+- [x] **3. Continuum stores + serves + displays WIT.** Done. The registry is
+      now a browsable interface catalogue.
+      - **Stores.** `continuum-api` migration `0003_wit.sql` adds a nullable
+        `versions.wit` column. Because the Continuum stores **source**, not
+        wasm, the world can't be derived registry-side — `qube publish`
+        synthesizes it (`q64 show world`, naming it from the manifest `wit`
+        block) and uploads it as an optional `wit` multipart field, the same
+        way it syncs `capabilities` (`synthesizeWitWorld` in `qube/src/main.zig`,
+        best-effort: a synthesis failure doesn't block publish). The publish
+        handler validates it declares a `world` (≤256 KiB) and stores it.
+      - **Serves.** New `GET /v1/qubes/:name/:version/world` returns the world —
+        JSON `{ world, package, wit, endpoints }` by default, raw `.wit` under
+        `Accept: text/plain` / `?format=wit` (for `wac`/`jco`/`wasm-tools`).
+        `GET /:name/:version` gained `has_wit` + parsed `world`/`package`. The
+        spec'd RPC `/world` endpoint is generalized to **any** qube with a
+        world, not just `rpc.export` ones.
+      - **Displays.** The Continuum UI (`continuum/src/index.tsx`) renders a
+        "WIT World" section on the qube page (package + world + a "view .wit"
+        link) when a version attached one.
+      - Verified: `tsc` clean (both Workers), the WIT-parsing regexes checked
+        against real `q64 show world` output, migration well-formed. Spec:
+        `spec/continuum-api.md` (publish `wit` field, `/world`, version detail).
+        (No registry test harness exists — typecheck is the repo's bar.)
 - [ ] **4. `qube`/`q64` CLI — first-class WIT.** `qube wit show` (resolved
       world of the current/named qube), `qube wit extract <c>.wasm` (pull the
       embedded world from any component, any language), `qube wit check` (the

@@ -172,6 +172,10 @@ type VersionDetail = {
   manifest: Record<string, unknown>;
   published_via: string | null;
   provenance: unknown;
+  // WIT world (rung 3): present when the publishing toolchain attached one.
+  has_wit?: boolean;
+  world?: string | null;
+  package?: string | null;
 };
 
 const REGISTRY_HOST = "https://qubes.q64.dev";
@@ -299,6 +303,21 @@ app.get("/qubes/:name", async (c) => {
         <>
           <h2>Capabilities</h2>
           <div class="meta">{capabilities.map((cap) => <span><code>{cap}</code></span>)}</div>
+        </>
+      )}
+
+      {detail?.has_wit && qube.latest && (
+        <>
+          <h2>WIT World</h2>
+          <div class="meta">
+            {detail.package && <span><code>{detail.package}</code></span>}
+            {detail.world && <span>world <code>{detail.world}</code></span>}
+            <span>
+              <a href={`${REGISTRY_HOST}${apiPath}/${encodeURIComponent(qube.latest)}/world?format=wit`}>
+                view .wit
+              </a>
+            </span>
+          </div>
         </>
       )}
 
