@@ -401,15 +401,17 @@ wit: {
   world:   "math",          // world name; default = last segment of `name`
   path:    "synthesized",   // "synthesized" (q64 generates) | relative .wit path
   imports: [],              // foreign .wit packages this qube imports (rung 5)
+  interface: "math",        // export the surface as <package>/<interface>
 }
 ```
 
-| Field     | Type     | Default                | Notes                                                                                          |
-|-----------|----------|------------------------|------------------------------------------------------------------------------------------------|
-| `package` | string   | derived from `name`    | WIT package id `namespace:name`. Default maps the dotted qube `name` — namespace = the prefix with `.`→`-`, package = the last segment (`dev.q64.math` → `dev-q64:math`). |
-| `world`   | string   | last segment of `name` | The synthesized world's name (`dev.q64.math` → `math`). `qube build --component` passes it to `q64 emit --world`, so the emitted `<name>.wit` matches the manifest rather than the entry filename. |
-| `path`    | string   | `"synthesized"`        | `"synthesized"` — q64 generates the world from source at build (the design rule: a qube's **own** world is synthesized, not authored, see [`modules.md`](./modules.md)). A relative path names a checked-in `.wit` to publish instead — **reserved**, not yet consumed. |
-| `imports` | string[] | `[]`                   | Foreign `.wit` packages this qube **imports** (WIT rung 5, the consume direction). Each relative path is parsed and its scalar-signature interfaces are declared in the emitted component's world (what `wac` links at build); `qube build --component` passes them to `q64 emit --wit-import`. |
+| Field       | Type     | Default                | Notes                                                                                          |
+|-------------|----------|------------------------|------------------------------------------------------------------------------------------------|
+| `package`   | string   | derived from `name`    | WIT package id `namespace:name`. Default maps the dotted qube `name` — namespace = the prefix with `.`→`-`, package = the last segment (`dev.q64.math` → `dev-q64:math`). |
+| `world`     | string   | last segment of `name` | The synthesized world's name (`dev.q64.math` → `math`). `qube build --component` passes it to `q64 emit --world`, so the emitted `<name>.wit` matches the manifest rather than the entry filename. |
+| `path`      | string   | `"synthesized"`        | `"synthesized"` — q64 generates the world from source at build (the design rule: a qube's **own** world is synthesized, not authored, see [`modules.md`](./modules.md)). A relative path names a checked-in `.wit` to publish instead — **reserved**, not yet consumed. |
+| `imports`   | string[] | `[]`                   | Foreign `.wit` packages this qube **imports** (WIT rung 5, the consume direction). Each relative path is parsed and its scalar-signature interfaces are declared in the emitted component's world (what `wac` links at build); `qube build --component` passes them to `q64 emit --wit-import`. |
+| `interface` | string   | *(none)*               | Export this **library**'s surface as the named WIT interface `<package>/<interface>` (e.g. `acme:mathlib/math`) instead of bare top-level functions. `qube build --component` passes it to `q64 emit --export-interface`. So a consumer qube that lists this interface in its `imports` can be `wac`-linked against this provider — the q64↔q64 link. Omit for bare-function exports. |
 
 The world name resolves `wit.world` → `component.world` → last segment of
 `name`; the package resolves `wit.package` → derived from `name`. `wit.world`

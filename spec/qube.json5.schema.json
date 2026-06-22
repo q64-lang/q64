@@ -181,6 +181,10 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Foreign .wit packages this qube imports (WIT rung 5). Relative paths; their scalar interfaces are declared in the emitted component's world so wac can link them at build. Passed to q64 emit --wit-import."
+        },
+        "interface": {
+          "type": "string",
+          "description": "Export this library's surface as the named WIT interface <package>/<interface> (instead of bare functions), so a consumer importing it can be wac-linked. Passed to q64 emit --export-interface."
         }
       }
     },

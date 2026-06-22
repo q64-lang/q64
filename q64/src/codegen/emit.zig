@@ -218,7 +218,7 @@ pub fn emitFromSource(
     // The raw core module keeps q64's `env.out` host face (the contract with
     // `runtime/wasmtime/` and `runtime/browser/`). The component path emits the
     // preview1 variant separately.
-    return lowerToWasm(allocator, &mmod, addr, .env_out);
+    return lowerToWasm(allocator, &mmod, addr, .env_out, null);
 }
 
 /// The product of `emitComponent`. Either a finished component (the import-free
@@ -240,6 +240,13 @@ pub const ComponentArtifact = union(enum) {
     /// A WASI preview1 core module (imports `wasi_snapshot_preview1.fd_write`,
     /// exports `_start`) to be wrapped by the WASI adapter. Caller owns it.
     preview1_app: []u8,
+    /// A library whose scalar surface is exported under a **named WIT
+    /// interface** (`<pkg>/<iface>`): the core (exports `<iface>#<fn>`) plus the
+    /// world `.wit` to lift it with `wasm-tools component embed`+`new`. This is
+    /// the export-mirror of the rung-5 instance import, so a q64 consumer that
+    /// imports the interface can be `wac`-linked against this provider. Both
+    /// slices owned by the caller.
+    interface_lib: struct { core: []u8, world: []u8 },
 };
 
 /// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
@@ -252,7 +259,7 @@ pub const ComponentArtifact = union(enum) {
 /// capability the lift can't satisfy (e.g. a `qview.*` face) is likewise
 /// `ComponentNeedsImportLowering`; a surface with no liftable export is
 /// `ComponentNoExports`.
-pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace, foreign: []const component.ImportIface) !ComponentArtifact {
+pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace, foreign: []const component.ImportIface, export_interface: ?[]const u8) !ComponentArtifact {
     var hmod = try buildHir(allocator, source, file, modules);
     defer hmod.deinit();
     var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
@@ -267,10 +274,25 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     // preview1 ABI is 32-bit (i32 iovec/fd_write); a wasm64 app isn't lowerable.
     if (usesEnvOut(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
-        return .{ .preview1_app = try lowerToWasm(allocator, &mmod, addr, .wasi_preview1) };
+        return .{ .preview1_app = try lowerToWasm(allocator, &mmod, addr, .wasi_preview1, null) };
     }
 
-    const core = try lowerToWasm(allocator, &mmod, addr, .env_out);
+    // Interface-export library: emit the core with `<iface>#<fn>` export names
+    // and the world `.wit` declaring the interface, for the caller to lift with
+    // `wasm-tools component embed`+`new`. (The hand-rolled scalar encoder below
+    // exports bare functions; this path exports a named interface instead.)
+    if (export_interface) |iface| {
+        const core = try lowerToWasm(allocator, &mmod, addr, .env_out, iface);
+        errdefer allocator.free(core);
+        if (coreHasImports(core)) {
+            allocator.free(core);
+            return Error.ComponentNeedsImportLowering;
+        }
+        const world = try synthInterfaceWorld(allocator, &hmod, iface);
+        return .{ .interface_lib = .{ .core = core, .world = world } };
+    }
+
+    const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null);
     defer allocator.free(core);
 
     // A library core that still imports something (e.g. a `qview.*` host face)
@@ -504,6 +526,51 @@ pub fn showWorld(
     return out.toOwnedSlice(allocator);
 }
 
+/// Synthesize the `.wit` for an **interface-export** library: the qube's scalar
+/// `pub` surface wrapped in a named WIT `interface`, and a world exporting it —
+/// for `wasm-tools component embed`+`new` to lift the core (whose exports are
+/// `<iface>#<fn>`). `iface_id` is `<package>/<interface>` (e.g.
+/// `acme:mathlib/math`); the world is named after the interface. Only scalar
+/// funcs are listed (the same canonical-ABI boundary as the bare-export path).
+fn synthInterfaceWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, iface_id: []const u8) ![]u8 {
+    const slash = std.mem.indexOfScalar(u8, iface_id, '/') orelse return Error.UnsupportedExpression;
+    const pkg = iface_id[0..slash];
+    const iface = iface_id[slash + 1 ..];
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "// synthesized WIT (q64 interface export)\npackage {s};\n\n", .{pkg});
+    try out.print(allocator, "interface {s} {{\n", .{iface});
+    for (hmod.funcs) |f| {
+        if (f.visibility != .public) continue;
+        var scalar = true;
+        for (f.params) |p| {
+            if (component.Scalar.fromHir(p.ty) == null) {
+                scalar = false;
+                break;
+            }
+        }
+        if (f.ret != .void and component.Scalar.fromHir(f.ret) == null) scalar = false;
+        if (!scalar) continue;
+        try out.appendSlice(allocator, "  ");
+        try appendKebab(allocator, &out, f.name);
+        try out.appendSlice(allocator, ": func(");
+        for (f.params, 0..) |p, i| {
+            if (i > 0) try out.appendSlice(allocator, ", ");
+            try appendKebab(allocator, &out, p.name);
+            try out.appendSlice(allocator, ": ");
+            try out.appendSlice(allocator, witType(p.ty));
+        }
+        try out.appendSlice(allocator, ")");
+        if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
+        try out.appendSlice(allocator, ";\n");
+    }
+    try out.appendSlice(allocator, "}\n\n");
+    // The world name must differ from the interface name within the package.
+    try out.print(allocator, "world {s}-world {{\n  export {s};\n}}\n", .{ iface, iface });
+    return out.toOwnedSlice(allocator);
+}
+
 /// Union the effect sets of the qube's public surface (entry + `pub` funcs).
 /// Each function's `effects` is already the transitive closure, so a private
 /// helper's capabilities are folded into its public callers — unioning the
@@ -624,7 +691,7 @@ fn mapReject(r: ir.hir.Reject) Error {
     };
 }
 
-fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace, stdout_abi: StdoutAbi) ![]u8 {
+fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace, stdout_abi: StdoutAbi, export_interface: ?[]const u8) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
@@ -952,7 +1019,18 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (is_entry) {
             _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
         } else if (f.exported) {
-            _ = c.BinaryenAddFunctionExport(module, f.name.ptr, f.name.ptr);
+            // Interface-export mode: a library's funcs are exported under the
+            // WIT interface id (`<pkg>/<iface>#<fn>`), the core-export naming
+            // `wasm-tools component embed` maps into the named interface. Plain
+            // mode exports them by name (the hand-rolled scalar encoder lifts
+            // those directly).
+            if (export_interface) |iface| {
+                const qualified = try std.fmt.allocPrintSentinel(allocator, "{s}#{s}", .{ iface, f.name }, 0);
+                defer allocator.free(qualified);
+                _ = c.BinaryenAddFunctionExport(module, f.name.ptr, qualified.ptr);
+            } else {
+                _ = c.BinaryenAddFunctionExport(module, f.name.ptr, f.name.ptr);
+            }
         }
     }
 

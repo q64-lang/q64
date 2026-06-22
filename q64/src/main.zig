@@ -104,6 +104,7 @@ fn usage(io: std.Io) !void {
         \\                                     --component also writes <out>.component.wasm + <out>.wit.
         \\                                     --world <name> / --wit-package <id> name the synthesized world.
         \\                                     --wit-import <file.wit> declares a foreign import (repeatable).
+        \\                                     --export-interface <pkg>/<iface> exports the surface as a named interface.
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
         \\  show <hir|mir|symbols> <file.q> [--module name=dir ...]
         \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
@@ -289,12 +290,20 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // emitted component's world (what `wac` links at build). Repeatable.
     var wit_import_paths: std.ArrayList([]const u8) = .empty;
     defer wit_import_paths.deinit(gpa);
+    // Export this library's surface as a named WIT interface `<pkg>/<iface>`
+    // (so a q64 consumer that imports it can be `wac`-linked); null = bare funcs.
+    var export_interface: ?[]const u8 = null;
 
     while (args_it.next()) |a| {
         if (std.mem.eql(u8, a, "--component")) {
             // Also wrap the core module in a component (spec/q64-cli.md). The
             // core module is still written to `out`.
             want_component = true;
+        } else if (std.mem.eql(u8, a, "--export-interface")) {
+            export_interface = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, a, "--wit-import")) {
             try wit_import_paths.append(gpa, args_it.next() orelse {
                 try usage(io);
@@ -408,7 +417,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             std.process.exit(1);
         };
 
-        const artifact = emit.emitComponent(gpa, source, src, module_sources.items, addr, foreign) catch |err| {
+        const artifact = emit.emitComponent(gpa, source, src, module_sources.items, addr, foreign, export_interface) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
             try w.interface.print("q64: component emit failed: {s}\n", .{@errorName(err)});
@@ -428,6 +437,11 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             .preview1_app => |core| {
                 defer gpa.free(core);
                 try adaptPreview1Component(gpa, io, env, core, comp_path);
+            },
+            .interface_lib => |lib| {
+                defer gpa.free(lib.core);
+                defer gpa.free(lib.world);
+                try embedAndNewComponent(gpa, io, env, lib.core, lib.world, export_interface.?, comp_path);
             },
         }
 
@@ -496,6 +510,70 @@ fn adaptPreview1Component(
         try w.interface.print("q64: wasm-tools component new failed (the WASI adapter could not lift the preview1 core)\n", .{});
         try w.interface.flush();
         std.process.exit(1);
+    }
+}
+
+/// Lift an **interface-export** library core into a component that exports the
+/// named WIT interface: write the core + the synthesized `world.wit` to temp
+/// files, run `wasm-tools component embed <world.wit> <core> --world <iface>`
+/// then `wasm-tools component new` → the component at `comp_path`. `iface_id` is
+/// `<pkg>/<iface>`; the embed world is named after the interface. So a q64
+/// consumer that imports `<pkg>/<iface>` can be `wac`-linked against this.
+fn embedAndNewComponent(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    core: []const u8,
+    world_wit: []const u8,
+    iface_id: []const u8,
+    comp_path: []const u8,
+) !void {
+    const repo_root = findRepoRoot(gpa, io, ".") catch null;
+    defer if (repo_root) |r| gpa.free(r);
+    const wasm_tools = try resolveBinary(gpa, io, env, "Q64_WASM_TOOLS", repo_root, "vendor/wasm-tools/wasm-tools", "wasm-tools");
+    defer gpa.free(wasm_tools);
+
+    const slash = std.mem.indexOfScalar(u8, iface_id, '/') orelse iface_id.len;
+    const iface_name = if (slash < iface_id.len) iface_id[slash + 1 ..] else iface_id;
+    // Matches `synthInterfaceWorld`: the world is named `<iface>-world` (it
+    // can't share the interface's name within the package).
+    const world_name = try std.fmt.allocPrint(gpa, "{s}-world", .{iface_name});
+    defer gpa.free(world_name);
+
+    const tmp_core = try std.fmt.allocPrint(gpa, "{s}.ifcore.wasm", .{comp_path});
+    defer gpa.free(tmp_core);
+    const tmp_wit = try std.fmt.allocPrint(gpa, "{s}.iface.wit", .{comp_path});
+    defer gpa.free(tmp_wit);
+    const tmp_embed = try std.fmt.allocPrint(gpa, "{s}.embed.wasm", .{comp_path});
+    defer gpa.free(tmp_embed);
+    try writeFile(io, tmp_core, core);
+    try writeFile(io, tmp_wit, world_wit);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_core) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_wit) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_embed) catch {};
+
+    const fail = struct {
+        fn f(io2: std.Io, comptime msg: []const u8) noreturn {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io2, &buf);
+            w.interface.print("q64: {s}\n", .{msg}) catch {};
+            w.interface.print("q64: set Q64_WASM_TOOLS or run ./init.sh to vendor wasm-tools\n", .{}) catch {};
+            w.interface.flush() catch {};
+            std.process.exit(1);
+        }
+    }.f;
+
+    // 1. embed the component type into the core.
+    {
+        const argv = [_][]const u8{ wasm_tools, "component", "embed", tmp_wit, tmp_core, "--world", world_name, "-o", tmp_embed };
+        const term = spawnInherit(io, &argv) catch fail(io, "could not run wasm-tools component embed");
+        if (termCode(term) != @as(u8, 0)) fail(io, "wasm-tools component embed failed (interface export)");
+    }
+    // 2. lift the embedded core into a component exporting the interface.
+    {
+        const argv = [_][]const u8{ wasm_tools, "component", "new", tmp_embed, "-o", comp_path };
+        const term = spawnInherit(io, &argv) catch fail(io, "could not run wasm-tools component new");
+        if (termCode(term) != @as(u8, 0)) fail(io, "wasm-tools component new failed (interface export)");
     }
 }
 

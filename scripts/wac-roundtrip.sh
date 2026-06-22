@@ -77,6 +77,16 @@ assert_composed() {
     echo "    ok ($label): composed validates, export compute kept, test:shared/math import satisfied"
 }
 
+# Assert a q64↔q64 link: valid, exports `compute`, no `import` line survives.
+assert_composed_iface() {
+    local out="$1" label="$2"
+    "$WASMTOOLS_BIN" validate "$out" >/dev/null || { echo "FAIL ($label): composed component invalid" >&2; exit 1; }
+    local wit; wit="$("$WASMTOOLS_BIN" component wit "$out")"
+    echo "$wit" | grep -qE "export compute:" || { echo "FAIL ($label): composed missing export compute" >&2; echo "$wit" >&2; exit 1; }
+    echo "$wit" | grep -qE "^\s*import " && { echo "FAIL ($label): an import is unsatisfied" >&2; echo "$wit" >&2; exit 1; }
+    echo "    ok ($label): two q64 components linked — exports compute, acme:mathlib/math import satisfied"
+}
+
 # --- fallback engine: wasm-tools compose (always available) ------------------
 # Clear Q64_WAC so the fallback is genuinely exercised even if a wac is on hand.
 echo "==> qube wac plug (wasm-tools compose fallback)"
@@ -92,6 +102,29 @@ if [[ -x "$WAC_BIN" ]]; then
     assert_composed "$tmp/out-wac.wasm" "wac plug"
 else
     echo "==> SKIP real wac (set Q64_WAC or vendor vendor/wac/wac to exercise it)"
+fi
+
+# --- q64 ↔ q64: two q64 qubes link (interface export + foreign import) --------
+Q64_BIN="${Q64_BIN:-$REPO_ROOT/q64/zig-out/bin/q64}"
+if [[ -x "$Q64_BIN" ]]; then
+    echo "==> q64 ↔ q64: provider exports an interface, consumer imports it, qube wac links"
+    export Q64_WASM_TOOLS="$WASMTOOLS_BIN"
+    # Provider: a q64 library exporting the named interface acme:mathlib/math.
+    printf 'pub fn add(a: i64, b: i64) -> i64 { a + b }\n' > "$tmp/qprov.q"
+    "$Q64_BIN" emit "$tmp/qprov.q" "$tmp/qprov.wasm" --addr wasm32 --component --export-interface "acme:mathlib/math"
+    "$WASMTOOLS_BIN" component wit "$tmp/qprov.component.wasm" | grep -q "export acme:mathlib/math" \
+        || { echo "FAIL: q64 provider does not export the interface" >&2; exit 1; }
+    # Consumer: a q64 library importing acme:mathlib/math.
+    printf 'package acme:mathlib;\ninterface math { add: func(a: s64, b: s64) -> s64; }\n' > "$tmp/math.wit"
+    printf 'pub fn compute(x: i64) -> i64 { x + 1 }\n' > "$tmp/qcons.q"
+    "$Q64_BIN" emit "$tmp/qcons.q" "$tmp/qcons.wasm" --addr wasm32 --component --wit-import "$tmp/math.wit"
+    "$WASMTOOLS_BIN" component wit "$tmp/qcons.component.wasm" | grep -q "import acme:mathlib/math" \
+        || { echo "FAIL: q64 consumer does not import the interface" >&2; exit 1; }
+    "$QUBE_BIN" wac plug "$tmp/qcons.component.wasm" --plug "$tmp/qprov.component.wasm" -o "$tmp/qlinked.wasm" \
+        2>&1 | grep -v "deprecated\|wac instead\|information about" || true
+    assert_composed_iface "$tmp/qlinked.wasm" "q64↔q64"
+else
+    echo "==> SKIP q64↔q64 (set Q64_BIN or build q64 to exercise it)"
 fi
 
 echo "PASS: qube wac links a consumer + provider into one component (import satisfied)"

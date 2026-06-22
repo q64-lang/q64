@@ -1576,14 +1576,25 @@ notes below).
         component wit` shows the import), `component-roundtrip.sh`. Spec:
         `q64-cli.md` (`--wit-import`), `qube.json5.md`/`.schema.json`
         (`wit.imports`).
-      - **Remaining — the source-level call.** The component now *declares* its
-        foreign imports, but q64 **source** doesn't yet *call* them: that wants a
-        foreign-symbol kind in name resolution (NAM), a foreign-call node through
-        HIR/MIR, and a returning core-module import emitted at the call site
-        (the `host_call` seam is the template). Rich-type calls share the
-        non-scalar canonical-ABI memory glue still outstanding on the export
-        side. The declaration + the rung-5 parser are the inputs that work
-        consumes.
+      - **Done — interface export + q64↔q64 linking.** The export-mirror of the
+        import declaration: `q64 emit --component --export-interface <pkg>/<iface>`
+        exports a library's scalar surface as a **named WIT interface** (e.g.
+        `acme:mathlib/math`) instead of bare functions — the core is emitted with
+        `<iface>#<fn>` export names (`lowerToWasm` + `synthInterfaceWorld`) and
+        lifted via `wasm-tools component embed`+`new` (`embedAndNewComponent`).
+        Manifest `wit.interface` → `qube build` passes it. So a q64 **provider**
+        (exports the interface) and a q64 **consumer** (`--wit-import`s it) now
+        **link via `qube wac`** into one component, import satisfied — verified
+        end-to-end in `scripts/wac-roundtrip.sh` (q64↔q64 case) + the
+        manifest-driven flow. This closes the q64↔q64 link-at-build loop.
+      - **Remaining — the source-level call.** The component now declares its
+        imports *and* a provider can export a matching interface, so they link;
+        the last piece is q64 **source** *calling* a foreign import (`iface.fn(x)`
+        in a q64 body): a foreign-symbol kind in name resolution (NAM), a
+        foreign-call node through HIR/MIR, and a returning core-module import at
+        the call site (the `host_call` seam is the template). Rich-type calls
+        share the non-scalar canonical-ABI memory glue still outstanding on the
+        export side.
 - [ ] **6. Host-side composition (qubepods).** Tracked in `qubepods/TODO.md`
       §"WIT in the host" — the host validates a deployed component against its
       declared world and composes heterogeneous components over shared WIT.

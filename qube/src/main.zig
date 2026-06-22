@@ -1182,7 +1182,16 @@ fn cmdBuild(
         wit_imports.deinit(gpa);
     }
 
-    // q64 emit <entry> <wasm> --addr <addr> [--module …] [--component --world … --wit-package … --wit-import …]
+    // `wit.interface`: export this library's surface as the named interface
+    // `<wit.package>/<wit.interface>` (so a q64 consumer that imports it can be
+    // `wac`-linked). Owned; null = bare-function exports.
+    const export_interface: ?[]u8 = if (manifestNestedString(root, "wit", "interface")) |iface|
+        try std.fmt.allocPrint(gpa, "{s}/{s}", .{ wit_package, iface })
+    else
+        null;
+    defer if (export_interface) |e| gpa.free(e);
+
+    // q64 emit <entry> <wasm> --addr <addr> [--module …] [--component --world … --wit-package … --wit-import … --export-interface …]
     {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
@@ -1191,6 +1200,7 @@ fn cmdBuild(
         if (want_component) {
             try argv.appendSlice(gpa, &.{ "--component", "--world", world_name, "--wit-package", wit_package });
             for (wit_imports.items) |w| try argv.appendSlice(gpa, &.{ "--wit-import", w });
+            if (export_interface) |e| try argv.appendSlice(gpa, &.{ "--export-interface", e });
         }
         const term = try spawnInherit(io, argv.items);
         const code = termCode(term) orelse std.process.exit(@intFromEnum(ExitCode.compile));
