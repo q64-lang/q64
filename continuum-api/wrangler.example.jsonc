@@ -1,43 +1,86 @@
-// Copy to `wrangler.jsonc` and fill in the placeholders.
-// `wrangler.jsonc` is gitignored.
+// Copy to `wrangler.jsonc` and fill in the placeholders. `wrangler.jsonc` is
+// gitignored (it holds account ids + resource ids — never commit those; this
+// repo is public). Worker names + route hostnames are NOT secret, so they stay
+// here verbatim.
+//
+// STAGE IS THE DEFAULT, PROD NEEDS MORE. A bare `wrangler deploy` (and CI) goes
+// to STAGE — so an accidental deploy can't hit prod. PROD requires an explicit
+// `wrangler deploy --env prod` with the prod account's CLOUDFLARE_API_TOKEN +
+// CLOUDFLARE_ACCOUNT_ID, and the prod D1/KV ids filled in below.
+//
+//   pnpm run deploy        →  wrangler deploy             (stage, the default)
+//   pnpm run deploy:prod   →  wrangler deploy --env prod  (prod account)
+//
+// Naming scheme: worker `name` is `q64-continuum-api-stage` (stage, top level) /
+// `q64-continuum-api` (prod, env.prod). DNS scheme: stage binds
+// `qubes-q64.taluvi.dev` (the `<host>-<project>.taluvi.dev` stage pattern, stage
+// account); prod binds `qubes.q64.dev` (prod q64.dev zone). Each env declares its
+// own account_id + bindings — named envs don't inherit bindings — so nothing
+// crosses accounts.
+//
+// Provision each env's resources on its own account first, then migrate:
+//   wrangler d1 create q64-continuum-stage
+//   wrangler r2 bucket create q64-continuum-archives-stage
+//   wrangler kv namespace create CACHE
+//   wrangler d1 migrations apply q64-continuum-stage --remote        # stage (default)
+//   wrangler d1 migrations apply q64-continuum --remote --env prod   # prod
 {
   "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
-  "name": "q64-continuum-api",
+  "name": "q64-continuum-api-stage",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
+  // ---- stage (the default deploy target) ----
+  "account_id": "REPLACE_WITH_STAGE_ACCOUNT_ID",
   "routes": [
-    { "pattern": "qubes.q64.dev", "custom_domain": true }
+    { "pattern": "qubes-q64.taluvi.dev", "custom_domain": true }
   ],
-
   "r2_buckets": [
-    {
-      "binding": "ARCHIVES",
-      "bucket_name": "q64-continuum-archives"
-    }
+    { "binding": "ARCHIVES", "bucket_name": "q64-continuum-archives-stage" }
   ],
-
   "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "q64-continuum",
-      "database_id": "REPLACE_WITH_D1_ID",
-      "migrations_dir": "migrations"
-    }
+    { "binding": "DB", "database_name": "q64-continuum-stage", "database_id": "REPLACE_WITH_STAGE_D1_ID", "migrations_dir": "migrations" }
   ],
-
   "kv_namespaces": [
-    {
-      "binding": "CACHE",
-      "id": "REPLACE_WITH_KV_ID"
-    }
+    { "binding": "CACHE", "id": "REPLACE_WITH_STAGE_KV_ID" }
   ],
-
   "vars": {
     "ENV": "dev",
-    // Comma-separated allowlist; set per-deploy in your own wrangler.jsonc.
-    "ADMIN_EMAILS": ""
+    "ADMIN_EMAILS": "",
+    // Taluvi tracing: endpoint + tenant are config; TRACING_INGEST_TOKEN is a
+    // SECRET — mint a trc_ingest_ token (tracing/scripts/mint-token.mjs) and
+    //   wrangler secret put TRACING_INGEST_TOKEN
+    "SERVICE_NAME": "q64-continuum-api-stage",
+    "TRACING_OTLP_ENDPOINT": "https://otel.taluvi.dev",
+    "TRACING_TENANT_ID": "taluvi"
+  },
+
+  // ---- prod (needs `--env prod`) ----
+  "env": {
+    "prod": {
+      "name": "q64-continuum-api",
+      "account_id": "REPLACE_WITH_PROD_ACCOUNT_ID",
+      "routes": [
+        { "pattern": "qubes.q64.dev", "custom_domain": true }
+      ],
+      "r2_buckets": [
+        { "binding": "ARCHIVES", "bucket_name": "q64-continuum-archives" }
+      ],
+      "d1_databases": [
+        { "binding": "DB", "database_name": "q64-continuum", "database_id": "REPLACE_WITH_PROD_D1_ID", "migrations_dir": "migrations" }
+      ],
+      "kv_namespaces": [
+        { "binding": "CACHE", "id": "REPLACE_WITH_PROD_KV_ID" }
+      ],
+      "vars": {
+        "ENV": "prod",
+        "ADMIN_EMAILS": "",
+        "SERVICE_NAME": "q64-continuum-api",
+        "TRACING_OTLP_ENDPOINT": "https://otel.taluvi.com",
+        "TRACING_TENANT_ID": "taluvi"
+      }
+    }
   }
 }

@@ -374,6 +374,58 @@ client engine and requests the matching build (see
 > `/v1/qubes/{name}/{version}/artifact?addr=wasm32|wasm64` endpoint — it does
 > not change the source-archive contract above. Tracked as future work.
 
+## OCI distribution
+
+The Continuum also speaks a subset of the **OCI Distribution Spec** at `/v2/`,
+so a published qube is pullable with the standard ecosystem (`oras pull`,
+`wkg`, `crane`, any cloud-registry mirror). This is a **second protocol facade
+over the same content-addressed store** — the JSON API above and
+`qube publish` / `qube add` stay the opinionated front door; OCI is an interop
+escape hatch, not a migration. Publishing once is visible to both.
+
+**Mapping.** A qube name is the OCI **repository**, a version is a **tag**, and
+the archive's SHA-256 is the blob **digest** (`sha256:<hex>`) — the R2 keys are
+already digest-addressed, so blobs map 1:1:
+
+| Continuum | OCI |
+|---|---|
+| qube name `dev.q64.math` | repository `<name>` |
+| version `0.1.0` | tag `<reference>` |
+| archive SHA-256 | layer blob digest `sha256:<hex>`, `application/zip` |
+| `qube.json5` (canonical JSON) | config blob `application/vnd.q64.qube.config.v1+json` |
+| synthesized `.wit` world (if any) | layer blob `application/vnd.q64.qube.wit.v1+text` |
+
+The image manifest is `application/vnd.oci.image.manifest.v1+json` with
+`artifactType: application/vnd.q64.qube.v1+json`. It is **synthesized on read**
+from the existing version row and is byte-stable (canonical, key-sorted JSON),
+so its digest is deterministic; the small derived blobs (config, wit, manifest)
+are materialized into the store under their digest on first read, while the
+`.zip` is served in place from the archive store (never duplicated).
+
+**Endpoints (read path).**
+
+| Method | Path | Returns |
+|---|---|---|
+| `GET`/`HEAD` | `/v2/` | `200 {}` + `Docker-Distribution-API-Version: registry/2.0` (public, anonymous) |
+| `GET`/`HEAD` | `/v2/{name}/manifests/{reference}` | synthesized manifest for a tag or `sha256:` digest; `Docker-Content-Digest` set |
+| `GET`/`HEAD` | `/v2/{name}/blobs/{digest}` | config / wit / archive blob by digest |
+| `GET` | `/v2/{name}/tags/list` | `{ name, tags }` (supports `n` / `last` pagination) |
+
+Errors use the distribution-spec envelope `{ errors: [{ code, message, detail }] }`
+with codes `NAME_UNKNOWN`, `MANIFEST_UNKNOWN`, `BLOB_UNKNOWN`, `DIGEST_INVALID`,
+`UNSUPPORTED`.
+
+**Write path (push) — not yet.** `POST .../blobs/uploads/` and
+`PUT .../manifests/{ref}` return `405 UNSUPPORTED`; publish through the JSON API
+(`qube publish`). OCI **Bearer auth** (the `WWW-Authenticate` → token-endpoint
+flow) lands with push — public **pull** needs no auth.
+
+> This makes the **engine-as-component** work (the `qubeworlds:engine` WIT
+> contract) distributable the standard way: once the engine bundle is published
+> as a qube carrying its `.wit` world, that world is just another OCI **layer**
+> here, `oras pull`-able by a qubepods host. See the qubepods
+> `docs/engine-as-component.md` plan, Phase 4.
+
 ## Notes on hosting
 
 The reference deployment runs on Cloudflare Workers (handlers), R2

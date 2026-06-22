@@ -178,7 +178,11 @@ type VersionDetail = {
   package?: string | null;
 };
 
-const REGISTRY_HOST = "https://qubes.q64.dev";
+// Default registry API host (prod). The browser-facing archive / .wit links must
+// point at the SAME env the UI is serving, else they 404 — so each handler reads
+// the per-env override from `c.env.REGISTRY_HOST` (wrangler vars) and falls back
+// to this prod default.
+const REGISTRY_HOST_DEFAULT = "https://qubes.q64.dev";
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -244,8 +248,9 @@ app.get("/qubes/:name", async (c) => {
     ? (manifest as { entry: string }).entry
     : null;
 
+  const registryHost = c.env.REGISTRY_HOST ?? REGISTRY_HOST_DEFAULT;
   const latestArchiveUrl = qube.latest
-    ? `${REGISTRY_HOST}${apiPath}/${encodeURIComponent(qube.latest)}/archive`
+    ? `${registryHost}${apiPath}/${encodeURIComponent(qube.latest)}/archive`
     : null;
 
   return c.html(
@@ -313,7 +318,7 @@ app.get("/qubes/:name", async (c) => {
             {detail.package && <span><code>{detail.package}</code></span>}
             {detail.world && <span>world <code>{detail.world}</code></span>}
             <span>
-              <a href={`${REGISTRY_HOST}${apiPath}/${encodeURIComponent(qube.latest)}/world?format=wit`}>
+              <a href={`${registryHost}${apiPath}/${encodeURIComponent(qube.latest)}/world?format=wit`}>
                 view .wit
               </a>
             </span>
@@ -335,7 +340,7 @@ app.get("/qubes/:name", async (c) => {
               {v.yanked && <span style="color: #b91c1c;">yanked</span>}
               {v.published_via && <span>via {v.published_via}</span>}
               <span>
-                <a href={`${REGISTRY_HOST}${apiPath}/${encodeURIComponent(v.version)}/archive`}>
+                <a href={`${registryHost}${apiPath}/${encodeURIComponent(v.version)}/archive`}>
                   download .zip
                 </a>
               </span>
