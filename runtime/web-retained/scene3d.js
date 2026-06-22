@@ -10,11 +10,19 @@
 // CONTENT LIVES IN THE PROJECT, NEVER HERE. This framework module carries no
 // scene and no meshes. The project (a qube) declares its 3D scene + assets in its
 // qube.json5 `game` block; the host loads them from the project and injects them
-// as `window.__qubonautGame = { scene: <json>, assets: [{ name, b64 }] }` (see
-// scripts/build-qview.sh + the Qubonaut shell). The engine takes meshes by name
-// via `quine_provide_asset`. A `.glb` is user data — it is never baked into the
-// engine or this host (quine/world CLAUDE.md: distribution is the CDN/project's
+// as `window.__qubonautGame = { scene: <json>, assets: [{ name, b64 }], engine? }`
+// (see scripts/build-qview.sh + the Qubonaut shell). The engine takes meshes by
+// name via `quine_provide_asset`. A `.glb` is user data — it is never baked into
+// the engine or this host (quine/world CLAUDE.md: distribution is the CDN/project's
 // job, the engine is content-agnostic).
+//
+// DEPENDENCY-DRIVEN MOUNT + VERSION PIN. Whether a qube gets 3D falls out of its
+// qube.json5 `qubeworlds:engine` DEPENDENCY (host-side; see qubepods'
+// docs/engine-as-component.md). When declared, the shell sets `game.engine =
+// { version: "<semver range>" }` on the injected payload. The engine itself is
+// host-mounted from the frozen, unversioned CDN bundle below, so the pin is
+// VERIFIED here against the live `quine_version()` — a mismatch is logged, not
+// fatal (fetching a *specific* build from the pin is a later registry/OCI phase).
 //
 // Heavily guarded: if WebGL/WebGPU, the engine bundle, or the project content is
 // unavailable, it logs and no-ops, and the QView form still renders.
@@ -103,6 +111,47 @@ export function setTint(packed) {
   }
 }
 
+// Minimal semver-range check for the engine version pin: supports `^`, `~`,
+// exact `x.y.z`, and `*`/`latest`/empty (any). Enough for qube.json5 pins; a
+// non-semver engine build (a dev/git version string) returns true (can't verify,
+// so don't warn). Not a full semver implementation — pre-release/build metadata
+// is ignored, which is correct for "does the served engine satisfy the pin".
+function parseSemver(s) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(s || '').trim());
+  return m ? [+m[1], +m[2], +m[3]] : null;
+}
+function satisfies(have, range) {
+  range = String(range || '').trim();
+  if (!range || range === '*' || range === 'latest') return true;
+  const h = parseSemver(have);
+  if (!h) return true; // non-semver engine build — can't verify, stay quiet
+  const op = range[0] === '^' || range[0] === '~' ? range[0] : '';
+  const r = parseSemver(op ? range.slice(1) : range);
+  if (!r) return true;
+  const ge = h[0] > r[0] || (h[0] === r[0] && (h[1] > r[1] || (h[1] === r[1] && h[2] >= r[2])));
+  if (op === '^') {
+    if (r[0] > 0) return h[0] === r[0] && ge;               // ^1.2.3 → >=1.2.3 <2.0.0
+    if (r[1] > 0) return h[0] === 0 && h[1] === r[1] && ge;  // ^0.1.2 → >=0.1.2 <0.2.0
+    return h[0] === 0 && h[1] === 0 && h[2] === r[2];        // ^0.0.3 → =0.0.3
+  }
+  if (op === '~') return h[0] === r[0] && h[1] === r[1] && ge; // ~1.2.3 → >=1.2.3 <1.3.0
+  return h[0] === r[0] && h[1] === r[1] && h[2] === r[2];      // exact
+}
+
+// Verify the CDN-served engine satisfies the version the project PINNED via its
+// qube.json5 `qubeworlds:engine` dependency. Advisory this phase (the CDN path is
+// frozen + unversioned, so it serves latest); a mismatch is surfaced in the boot
+// status so a Snap shows it on-device. No pin / no engine block ⇒ nothing to do.
+function verifyEngineVersion() {
+  const g = game();
+  const want = g && g.engine && g.engine.version;
+  if (!want) return;
+  let have = '';
+  try { have = window.Module.ccall('quine_version', 'string', [], []) || ''; } catch { return; }
+  if (satisfies(have, want)) { log('engine ' + (have || '?') + ' satisfies pin ' + want); return; }
+  note('scene: engine ' + (have || '?') + ' does NOT satisfy pin ' + want + ' (CDN serves latest; pin advisory)');
+}
+
 function b64ToBytes(b64) {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -182,6 +231,7 @@ async function boot() {
     onAbort: (w) => { failed = true; note('scene: engine ABORT — ' + w); },
     onRuntimeInitialized: () => {
       ready = true; booting = false;
+      verifyEngineVersion(); // check the CDN engine against the qube's qubeworlds:engine pin
       if (want) { enqueueScene(); if (active) canvas.style.display = ''; }
     },
   };
