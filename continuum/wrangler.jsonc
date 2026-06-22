@@ -22,5 +22,26 @@
 
   "vars": {
     "ENV": "dev"
+  },
+
+  // Stage env: deploy with `wrangler deploy --env stage` (CLOUDFLARE_ACCOUNT_ID +
+  // token = the stage account). Same DNS scheme as the API — prod
+  // `continuum.q64.dev` → stage `continuum-q64.taluvi.dev` — and the API service
+  // binding points at the STAGE API so the stage UI reads the stage registry.
+  // Account id is supplied by the deploy env var, never committed (public repo).
+  // Top-level config stays the prod default (`wrangler deploy`), unchanged.
+  "env": {
+    "stage": {
+      "name": "q64-continuum-stage",
+      "routes": [
+        { "pattern": "continuum-q64.taluvi.dev", "custom_domain": true }
+      ],
+      "services": [
+        { "binding": "API", "service": "q64-continuum-api-stage" }
+      ],
+      "vars": {
+        "ENV": "dev"
+      }
+    }
   }
 }
