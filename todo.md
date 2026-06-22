@@ -1645,21 +1645,35 @@ protocol facade, not new storage.
   world. The `.wit` we already store/serve (WIT rung 3) becomes a typed layer.
 
 **Rungs (do in order; all additive, no gate):**
-- [ ] **1. `GET /v2/` version check** + OCI **Bearer auth** flow
+- [~] **1. `GET /v2/` version check** + OCI **Bearer auth** flow
       (`WWW-Authenticate` → token), reusing the current auth backend
-      (`continuum-api/src/routes/auth.ts`).
-- [ ] **2. Blob endpoints** — `HEAD/GET /v2/<name>/blobs/<digest>` (serve from
+      (`continuum-api/src/routes/auth.ts`). **`GET /v2/` done** (200 anonymous +
+      `Docker-Distribution-API-Version`); the Bearer/token flow lands with the
+      write path (public pull needs no auth).
+- [~] **2. Blob endpoints** — `HEAD/GET /v2/<name>/blobs/<digest>` (serve from
       R2 by digest; we already verify SHA-256) and the upload flow
       `POST .../blobs/uploads/` → `PUT` (monolithic first; chunked later).
-- [ ] **3. Manifest endpoints** — `PUT/GET/HEAD /v2/<name>/manifests/<ref>`
+      **Read half done** (GET/HEAD blobs: config/wit from `blobs/sha256/<h>`,
+      `.zip` in place from `archives/<h>`); upload returns `405 UNSUPPORTED`.
+- [~] **3. Manifest endpoints** — `PUT/GET/HEAD /v2/<name>/manifests/<ref>`
       (ref = tag or digest). Synthesize the OCI manifest from existing version
       metadata on read; on write, record it alongside the D1 version row.
-- [ ] **4. `GET /v2/<name>/tags/list`** from the existing versions table.
-- [ ] **5. Media types + spec** — define `application/vnd.q64.qube.v1+json`,
+      **Read half done** (synthesized on read, byte-stable canonical JSON →
+      deterministic digest; derived blobs materialized lazily); `PUT` is `405`.
+- [x] **4. `GET /v2/<name>/tags/list`** from the existing versions table.
+      Done (with `n`/`last` pagination).
+- [x] **5. Media types + spec** — define `application/vnd.q64.qube.v1+json`,
       the `.wit`/component layer types; document the OCI surface in
-      `spec/continuum-api.md` §"OCI distribution".
+      `spec/continuum-api.md` §"OCI distribution". Done — `oci.ts` defines the
+      media types; spec section added.
 - [ ] **6. Interop check** — `wkg`/`oras pull dev.q64.math:0.1.0` round-trips a
       published qube; `oras push` of a component is consumable by `qube add`.
+      (Pull path is unit + route tested in `continuum-api/test/oci*.test.ts`;
+      live `oras pull` against a deployed worker is the remaining check.)
+
+Implementation: `continuum-api/src/routes/oci.ts` (mounted at `/v2`). Read path
+(rungs 1,3,4 + the GET/HEAD half of 2) + rung 5 are done; the write path (the
+rest of 2 + `PUT` manifest in 3) is the next increment, gated on OCI Bearer auth.
 
 **Coexistence:** both surfaces read/write the **same R2 blobs by digest** and the
 **same D1 metadata** — publishing once is visible to both `qube add` and `wkg`.
