@@ -159,6 +159,27 @@
       }
     },
 
+    "wit": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The qube's published WIT contract — a library's surface is its world (what the Continuum stores/serves and `wac` links against). See spec/qube.json5.md §WIT and spec/modules.md.",
+      "properties": {
+        "package": {
+          "type": "string",
+          "description": "WIT package id `namespace:name`. Defaults to the dotted qube name mapped to `<prefix-with-dashes>:<last-segment>` (dev.q64.math -> dev-q64:math)."
+        },
+        "world": {
+          "type": "string",
+          "description": "The synthesized world's name. Defaults to the last dotted segment of `name`; preferred over the legacy component.world. Passed to `q64 emit --world` so the emitted .wit matches the manifest."
+        },
+        "path": {
+          "type": "string",
+          "default": "synthesized",
+          "description": "\"synthesized\" (q64 generates the world from source at build) or a relative path to a checked-in .wit (reserved, not yet consumed)."
+        }
+      }
+    },
+
     "rpc": {
       "type": "object",
       "additionalProperties": false,

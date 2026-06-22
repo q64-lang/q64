@@ -731,6 +731,46 @@ fn manifestString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+/// Read a string field from a nested object field (`obj.outer.key`). Used for
+/// the `wit` / `component` manifest blocks.
+fn manifestNestedString(obj: std.json.ObjectMap, outer: []const u8, key: []const u8) ?[]const u8 {
+    const o = obj.get(outer) orelse return null;
+    return switch (o) {
+        .object => |inner| manifestString(inner, key),
+        else => null,
+    };
+}
+
+/// The qube's WIT world name (WIT rung 2): `wit.world`, else `component.world`,
+/// else the last dotted segment of the qube name (`dev.q64.math` → `math`).
+fn resolveWorldName(root: std.json.ObjectMap, name: []const u8) []const u8 {
+    if (manifestNestedString(root, "wit", "world")) |w| return w;
+    if (manifestNestedString(root, "component", "world")) |w| return w;
+    return lastDottedSegment(name);
+}
+
+/// The qube's WIT package id: `wit.package`, else derived from the qube name —
+/// namespace = the dotted prefix with `.`→`-`, package = the last segment
+/// (`dev.q64.math` → `dev-q64:math`). A single-segment name has no namespace,
+/// so it falls back to `q64:<name>` (workspace roots aren't publishable). The
+/// returned slice is allocated from `gpa` (caller frees) unless it aliases the
+/// manifest (`wit.package`), so callers should treat it as borrowed-or-owned —
+/// here we always allocate a copy for a uniform free.
+fn resolveWitPackage(gpa: std.mem.Allocator, root: std.json.ObjectMap, name: []const u8) ![]u8 {
+    if (manifestNestedString(root, "wit", "package")) |p| return gpa.dupe(u8, p);
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return std.fmt.allocPrint(gpa, "q64:{s}", .{name});
+    const ns = try gpa.alloc(u8, dot);
+    for (name[0..dot], 0..) |ch, i| ns[i] = if (ch == '.') '-' else ch;
+    defer gpa.free(ns);
+    return std.fmt.allocPrint(gpa, "{s}:{s}", .{ ns, name[dot + 1 ..] });
+}
+
+/// The last `.`-separated segment of a dotted qube name.
+fn lastDottedSegment(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
+    return name;
+}
+
 /// Resolve the manifest's `dependencies` map into `name=dir` strings for
 /// `q64 emit --module`. A local-path dependency resolves to
 /// `<dep-path>/src`, made absolute. A registry dependency (a version-range
@@ -1074,13 +1114,23 @@ fn cmdBuild(
     const wasm_path = try std.fs.path.join(gpa, &.{ out_dir, wasm_name });
     defer gpa.free(wasm_path);
 
-    // q64 emit <entry> <wasm> --addr <addr> [--module …] [--component]
+    // WIT rung 2: name the synthesized world + WIT package from the manifest
+    // (`wit.world`/`wit.package`, defaulting from the qube name), so the
+    // emitted `.wit` carries the qube's contract identity rather than the entry
+    // filename (`src/lib.q` → `lib`). Only meaningful with `--component`.
+    const world_name = resolveWorldName(root, name);
+    const wit_package = try resolveWitPackage(gpa, root, name);
+    defer gpa.free(wit_package);
+
+    // q64 emit <entry> <wasm> --addr <addr> [--module …] [--component --world … --wit-package …]
     {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         try argv.appendSlice(gpa, &.{ q64_bin, "emit", entry_path, wasm_path, "--addr", addr });
         for (module_specs.items) |spec| try argv.appendSlice(gpa, &.{ "--module", spec });
-        if (want_component) try argv.append(gpa, "--component");
+        if (want_component) {
+            try argv.appendSlice(gpa, &.{ "--component", "--world", world_name, "--wit-package", wit_package });
+        }
         const term = try spawnInherit(io, argv.items);
         const code = termCode(term) orelse std.process.exit(@intFromEnum(ExitCode.compile));
         if (code != 0) std.process.exit(if (code == 1) @intFromEnum(ExitCode.compile) else code);

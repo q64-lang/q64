@@ -1471,12 +1471,29 @@ notes below).
         `world root`, matching the reference tool) — would need an embedded
         component-type that wasm-tools actually reflects, not worth it until a
         consumer needs the name; the `.wit` artifact carries `world <name>`.
-- [ ] **2. Library manifest carries the world.** `qube.json5` for a **library
-      qube** (`type: "library"`) gains a `wit` block — package name + world +
-      the `.wit` path (or `"synthesized"`). Spec in `spec/qube.json5.md` +
-      `.schema.json`. A library's published surface *is* its world; this is
-      what consumers resolve and link against. (Apps emit a world too, but the
-      contract that matters for linking is a library's.)
+- [x] **2. Library manifest carries the world.** Done. `qube.json5` gains a
+      `wit` block — `{ package, world, path }` — the qube's published contract
+      (a library's surface *is* its world). Specced in `spec/qube.json5.md`
+      §WIT + `.schema.json`.
+      - **The world name is now real.** Before this, `q64 emit --component`
+        named the world from the *entry filename* (`src/lib.q` → `world lib`)
+        and the manifest's `component.world` was ignored. Added `q64 emit` /
+        `q64 show world` flags **`--world <name>`** + **`--wit-package <id>`**
+        (default: filename / `q64:<world>`), and `qube build --component` now
+        resolves them from the manifest (`resolveWorldName`/`resolveWitPackage`
+        in `qube/src/main.zig`): world = `wit.world` → `component.world` → last
+        dotted segment of `name`; package = `wit.package` → derived from `name`
+        (`dev.q64.math` → `dev-q64:math`). So `examples/math-lib` now emits
+        `package dev-q64:math; world math { … }` instead of `world lib`.
+      - `path` defaults to `"synthesized"` (the design rule: a qube's own world
+        is synthesized, not authored); a checked-in `.wit` path is reserved,
+        not yet consumed.
+      - Tests: `q64-test` `show/capabilities-world.test.ts` (`--world` /
+        `--wit-package` override), `qube-test` `build.test.ts` (manifest `wit`
+        block + default-from-name drive the emitted `.wit`),
+        `component-roundtrip.sh` (asserts `package dev-q64:math` + `world math`).
+        Spec: `spec/qube.json5.md`, `spec/qube.json5.schema.json`,
+        `spec/q64-cli.md`.
 - [ ] **3. Continuum stores + serves + displays WIT.** A published qube
       version carries its `.wit` (the component-type is also in the archive).
       `continuum-api` stores it alongside the `.zip` archive

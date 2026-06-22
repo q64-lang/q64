@@ -10,7 +10,7 @@
  * (wasmtime instantiating + calling the lifted exports) lives in
  * scripts/component-roundtrip.sh.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { Q64_BIN, WASI_ADAPTER, WASM_TOOLS, appManifest, binaryAvailable, componentToolsAvailable, makeProject, q64Available, runCli } from "../src/harness";
@@ -58,6 +58,34 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
     expect(r.exitCode).toBe(0);
     expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.math.wasm"))).toBe(true);
     expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.math.component.wasm"))).toBe(true);
+  });
+
+  test("--component also writes <name>.wit, world named from the manifest wit block (WIT rung 2)", () => {
+    // With no wit block, the world defaults to the last segment of `name`
+    // (`math`) and the package derives from it — NOT the entry filename (`lib`).
+    const proj = scalarLibProject();
+    const r = runCli(["build", "--component"], { cwd: proj, env });
+    expect(r.exitCode).toBe(0);
+    const witPath = join(proj, "target/debug/wasm64/dev.q64.math.wit");
+    expect(existsSync(witPath)).toBe(true);
+    const wit = readFileSync(witPath, "utf8");
+    expect(wit).toContain("package dev-q64:math;");
+    expect(wit).toContain("world math {");
+    // Never the entry-filename-derived default.
+    expect(wit).not.toContain("world lib {");
+  });
+
+  test("--component honors an explicit wit block (package + world)", () => {
+    const proj = makeProject({
+      "qube.json5":
+        '{ "name": "dev.q64.math", "version": "0.1.0", "license": "MIT", "type": "library", "entry": "src/lib.q", "wit": { "package": "acme:calc", "world": "calculator" } }',
+      "src/lib.q": "pub fn add(a: i64, b: i64) -> i64 { a + b }\n",
+    });
+    const r = runCli(["build", "--component"], { cwd: proj, env });
+    expect(r.exitCode).toBe(0);
+    const wit = readFileSync(join(proj, "target/debug/wasm64/dev.q64.math.wit"), "utf8");
+    expect(wit).toContain("package acme:calc;");
+    expect(wit).toContain("world calculator {");
   });
 
   test("a compile error from q64 propagates as exit 64", () => {

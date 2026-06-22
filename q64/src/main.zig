@@ -96,12 +96,13 @@ fn usage(io: std.Io) !void {
         \\                                     --addr selects the linear-memory address space
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
         \\                                     --component also writes <out>.component.wasm + <out>.wit.
+        \\                                     --world <name> / --wit-package <id> name the synthesized world.
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
         \\  show <hir|mir|symbols> <file.q> [--module name=dir ...]
         \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
         \\  show effects <fn> --qube <file.q>  Print a function's inferred capability effect set.
         \\  show capabilities --qube <file.q>  Print the qube's compiler-derived capability set.
-        \\  show world --qube <file.q> [--out <file.wit>]
+        \\  show world --qube <file.q> [--out <file.wit>] [--world <name>] [--wit-package <id>]
         \\                                     Print (or write) the synthesized WIT world.
         \\  doc --json [--qube <file.q>]       Emit the language documentation index as JSON.
         \\  explain <code> [--diagnostics json]  Print documentation for a diagnostic code.
@@ -269,6 +270,11 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // 32-bit module (the WebKit/iPad baseline) for the integer/import subset.
     var addr: emit.AddressSpace = .wasm64;
     var want_component = false;
+    // WIT rung 2: the world name + WIT package id for the synthesized `.wit`,
+    // set by `qube build` from the manifest (`wit.world` / `wit.package`).
+    // Null = derive from the source filename / `q64:<world>`.
+    var world_name: ?[]const u8 = null;
+    var wit_package: ?[]const u8 = null;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
 
@@ -277,6 +283,16 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             // Also wrap the core module in a component (spec/q64-cli.md). The
             // core module is still written to `out`.
             want_component = true;
+        } else if (std.mem.eql(u8, a, "--world")) {
+            world_name = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, a, "--wit-package")) {
+            wit_package = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, a, "--addr")) {
             const v = args_it.next() orelse {
                 try usage(io);
@@ -390,7 +406,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
         // and `wac`/`wasm-tools` consume. The component embeds its own type
         // (round-trips via `wasm-tools component wit`); this is its source-level
         // companion. Same synthesis as `q64 show world`.
-        const wit = emit.showWorld(gpa, source, src, module_sources.items) catch |err| {
+        const wit = emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
             try w.interface.print("q64: WIT emit failed: {s}\n", .{@errorName(err)});
@@ -643,6 +659,10 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     // `--out <file>` redirects the dump to a file instead of stdout (spec
     // §"show"); the on-disk WIT companion to `q64 show world` (WIT rung 1).
     var out_path: ?[]const u8 = null;
+    // `--world` / `--wit-package` (WIT rung 2) name the world / WIT package for
+    // `show world`; null = derive from the filename / `q64:<world>`.
+    var world_name: ?[]const u8 = null;
+    var wit_package: ?[]const u8 = null;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
 
@@ -667,6 +687,16 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
             };
         } else if (std.mem.eql(u8, a, "--out")) {
             out_path = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, a, "--world")) {
+            world_name = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, a, "--wit-package")) {
+            wit_package = args_it.next() orelse {
                 try usage(io);
                 std.process.exit(2);
             };
@@ -743,7 +773,7 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         .symbols => sema.showSymbols(gpa, source, src),
         .effects => emit.showEffects(gpa, source, src, module_sources.items, arg2.?),
         .capabilities => emit.showCapabilities(gpa, source, src, module_sources.items),
-        .world => emit.showWorld(gpa, source, src, module_sources.items),
+        .world => emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package),
     }) catch |err| {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writerStreaming(io, &buf);

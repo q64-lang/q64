@@ -411,14 +411,27 @@ pub fn showCapabilities(allocator: std.mem.Allocator, source: []const u8, file: 
 /// exports = the public surface, imports = the derived capability set mapped
 /// through the effect→WIT-import table (spec/effects.md). The format is
 /// human/test-facing, not a stable serialization.
-pub fn showWorld(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
+///
+/// `world_override` / `package_override` (WIT rung 2) set the world name and
+/// WIT package id from the qube manifest (`wit.world` / `wit.package`); when
+/// null they default to the source-file basename and `q64:<world>`. `qube
+/// build` passes them so the emitted world matches the manifest contract,
+/// rather than the entry filename (`src/lib.q` → `lib`).
+pub fn showWorld(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    file: []const u8,
+    modules: []const ModuleSource,
+    world_override: ?[]const u8,
+    package_override: ?[]const u8,
+) ![]u8 {
     var hmod = try buildHir(allocator, source, file, modules);
     defer hmod.deinit();
     const caps = qubeCapabilities(&hmod);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    const world = worldName(file);
+    const world = world_override orelse worldName(file);
     // Emit a valid, standalone WIT document: a `package` declaration plus the
     // synthesized `world`. This is also the on-disk `<name>.wit` artifact
     // `q64 emit --component` writes and `q64 show world --out` saves (WIT rung
@@ -426,8 +439,15 @@ pub fn showWorld(allocator: std.mem.Allocator, source: []const u8, file: []const
     // library this parses standalone; an app's world references external
     // packages (wasi:cli), whose authoritative form is the adapted component.
     try out.appendSlice(allocator, "// synthesized WIT world (q64 show world)\n");
-    try out.appendSlice(allocator, "package q64:");
-    try appendKebab(allocator, &out, world);
+    try out.appendSlice(allocator, "package ");
+    if (package_override) |pkg| {
+        // Manifest-provided package id (e.g. `dev-q64:math`); kebab-normalize
+        // any snake_case the author left in (the `:` separator is preserved).
+        try appendKebab(allocator, &out, pkg);
+    } else {
+        try out.appendSlice(allocator, "q64:");
+        try appendKebab(allocator, &out, world);
+    }
     try out.appendSlice(allocator, ";\n\n");
     try out.appendSlice(allocator, "world ");
     try appendKebab(allocator, &out, world);

@@ -388,6 +388,33 @@ component: { emit: true, world: "my-api", worlds: ["wasi:http/proxy"] }
 This makes the qube a drop-in **qubepods** endpoint runnable under generic
 Component Model HTTP lifting, with no qubepods-specific ABI.
 
+### WIT (the published contract)
+
+A **library qube**'s published surface *is* its WIT world — the contract
+consumers resolve and link against (per [`modules.md` §"The qube as a
+component"](./modules.md)). The `wit` block names that contract; it is what
+the Continuum stores/serves and what `wac` links against.
+
+```json5
+wit: {
+  package: "dev-q64:math",  // WIT package id; default derived from `name`
+  world:   "math",          // world name; default = last segment of `name`
+  path:    "synthesized",   // "synthesized" (q64 generates) | relative .wit path
+}
+```
+
+| Field     | Type   | Default                | Notes                                                                                          |
+|-----------|--------|------------------------|------------------------------------------------------------------------------------------------|
+| `package` | string | derived from `name`    | WIT package id `namespace:name`. Default maps the dotted qube `name` — namespace = the prefix with `.`→`-`, package = the last segment (`dev.q64.math` → `dev-q64:math`). |
+| `world`   | string | last segment of `name` | The synthesized world's name (`dev.q64.math` → `math`). `qube build --component` passes it to `q64 emit --world`, so the emitted `<name>.wit` matches the manifest rather than the entry filename. |
+| `path`    | string | `"synthesized"`        | `"synthesized"` — q64 generates the world from source at build (the design rule: a qube's **own** world is synthesized, not authored, see [`modules.md`](./modules.md)). A relative path names a checked-in `.wit` to publish instead — **reserved**, not yet consumed. |
+
+The world name resolves `wit.world` → `component.world` → last segment of
+`name`; the package resolves `wit.package` → derived from `name`. `wit.world`
+is preferred over the legacy `component.world` for a library's contract.
+Component-model labels are kebab-case, so q64 kebab-cases the world name and
+every export/parameter when it synthesizes the `.wit`.
+
 ### RPC
 
 Qube-to-qube remote calls over the synthesized world (full semantics in

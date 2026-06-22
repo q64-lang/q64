@@ -155,8 +155,14 @@ rm -rf "$mathlib_dir/target"
 ( cd "$mathlib_dir" && Q64_BIN="$Q64_BIN" "$QUBE_BIN" build --component )
 mathlib_comp="$mathlib_dir/target/debug/wasm64/dev.q64.math.component.wasm"
 test -f "$mathlib_comp" || { echo "FAIL: qube build produced no component" >&2; exit 1; }
-test -f "$mathlib_dir/target/debug/wasm64/dev.q64.math.wit" || { echo "FAIL: qube build --component produced no .wit world artifact" >&2; exit 1; }
+mathlib_wit="$mathlib_dir/target/debug/wasm64/dev.q64.math.wit"
+test -f "$mathlib_wit" || { echo "FAIL: qube build --component produced no .wit world artifact" >&2; exit 1; }
 echo "    ok: qube build --component also emitted dev.q64.math.wit"
+# WIT rung 2: the manifest `wit` block names the world/package — not the entry
+# filename (src/lib.q would otherwise yield `world lib`).
+grep -q "^package dev-q64:math;" "$mathlib_wit" || { echo "FAIL: .wit package not driven by manifest wit.package" >&2; cat "$mathlib_wit" >&2; exit 1; }
+grep -q "^world math {" "$mathlib_wit" || { echo "FAIL: .wit world not driven by manifest wit.world (got the entry filename?)" >&2; cat "$mathlib_wit" >&2; exit 1; }
+echo "    ok: manifest wit block drives 'package dev-q64:math' + 'world math'"
 echo "==> wasmtime: call dev.q64.math add(40,2) == 42"
 "$CHECK_BIN" "$mathlib_comp" add 40 2 42
 rm -rf "$mathlib_dir/target"

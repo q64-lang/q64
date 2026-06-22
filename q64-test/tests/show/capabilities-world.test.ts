@@ -74,4 +74,26 @@ describe.skipIf(!binaryAvailable())("q64 show world", () => {
     expect(wit).toContain("world library {");
     expect(wit).toContain("export add: func(a: s64, b: s64) -> s64");
   });
+
+  test("--world / --wit-package override the filename-derived names (WIT rung 2)", () => {
+    // The world/package default from the source filename (`library` here);
+    // `qube build` overrides them from the manifest so the world matches the
+    // qube's identity, not the entry file.
+    const r = runCli([
+      "show",
+      "world",
+      "--qube",
+      fixture("library.q"),
+      "--world",
+      "math",
+      "--wit-package",
+      "dev-q64:math",
+    ]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("package dev-q64:math;");
+    expect(r.stdout).toContain("world math {");
+    // Not the filename-derived defaults.
+    expect(r.stdout).not.toContain("package q64:library;");
+    expect(r.stdout).not.toContain("world library {");
+  });
 });

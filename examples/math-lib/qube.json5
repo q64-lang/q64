@@ -13,6 +13,14 @@
   // See spec/modules.md §"The qube as a component".
   "component": {
     "emit": true,
-    "world": "dev-q64-math",
+  },
+
+  // The published WIT contract (WIT rung 2). A library's surface is its world;
+  // `qube build --component` names the synthesized world/package from here so
+  // the emitted .wit carries the qube's identity, not the entry filename.
+  "wit": {
+    "package": "dev-q64:math",
+    "world": "math",
+    "path": "synthesized",
   },
 }
