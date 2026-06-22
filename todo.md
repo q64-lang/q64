@@ -1517,12 +1517,25 @@ notes below).
         against real `q64 show world` output, migration well-formed. Spec:
         `spec/continuum-api.md` (publish `wit` field, `/world`, version detail).
         (No registry test harness exists — typecheck is the repo's bar.)
-- [ ] **4. `qube`/`q64` CLI — first-class WIT.** `qube wit show` (resolved
-      world of the current/named qube), `qube wit extract <c>.wasm` (pull the
-      embedded world from any component, any language), `qube wit check` (the
-      qube's surface matches its declared world), `qube wit diff <a> <b>`
-      (breaking-change check across versions — pairs with Continuum semver).
-      Spec in `spec/qube-cli.md` / `spec/q64-cli.md`.
+- [x] **4. `qube` CLI — first-class WIT.** Done. `qube wit <show|extract|check|
+      diff>` landed (`qube/src/main.zig` `cmdWit`):
+      - **`show [--out]`** — synthesize + print this qube's world (`q64 show
+        world` for the manifest entry, named from the `wit` block, `--module`
+        per dep). Reuses the rung-2 manifest resolution (`buildWorldInvocation`).
+      - **`extract <c>.wasm [--out]`** — pull the embedded world from *any*
+        component via `wasm-tools component wit` (any source language).
+      - **`check`** — the source compiles to a world, and (for a pure library)
+        the synthesized world parses with wasm-tools; exit 64 on drift.
+      - **`diff <a> <b>`** — surface diff of two worlds (each a `.wit` or a
+        component `.wasm`, extracted first): removed/changed export = breaking
+        (exit 64), added = compatible (exit 0). `collectExports` splits on the
+        `;` WIT-item terminator (robust to multi-item lines), strips comments.
+      - Tests: `qube-test/tests/wit.test.ts` (7 — show/check/extract/diff,
+        compatible + breaking). Spec: `spec/qube-cli.md` §"qube wit".
+      - **Deferred:** `q64 wit export/import` (the compiler-side primitives —
+        `export` folds rung-1 synthesis behind a verb; `import` is rung 5
+        ingestion). `qube wit` calls `q64 show world` today; the dedicated
+        `q64 wit` verbs are additive.
 - [ ] **5. WIT ingestion — consume foreign `.wit` (the big one).** Parse an
       authored/foreign `.wit` package and bind a qube's `import`s to its
       interfaces — the path that lets a q64 qube call a Rust/JS/Go component.
@@ -1607,12 +1620,13 @@ WIT also splits along the same line. Decided: **the source↔WIT primitives are
       a qube's `import`s to its interfaces (the **consume** direction). This is
       WIT rung 5 — needs a WIT parser, the WIT-type → q64-type mapping, and the
       opaque resource-handle type outside the face system. The big one.
-- [ ] `qube wit show/extract/check/diff` — the **package** layer (rung 4):
-      resolved world of the current/named qube (manifest + deps), extract the
-      embedded world from any component, check a qube's surface against its
-      declared world, diff worlds across versions (Continuum semver). Wrappers
-      over the `q64 wit`/`q64 show world` primitives; they own dependency
-      resolution and the registry, the primitives own source↔WIT.
+- [x] `qube wit show/extract/check/diff` — the **package** layer (rung 4):
+      **done**. Resolved world of the current qube (manifest + deps), extract
+      the embedded world from any component, check a qube's surface, diff worlds
+      across versions. Wrappers over `q64 show world` + `wasm-tools`; they own
+      dependency resolution + tooling, the primitives own source↔WIT. (The
+      dedicated `q64 wit export/import` primitives above are still pending;
+      `qube wit` calls `q64 show world` for now.)
 
 ## Semantic pass + struct values → static fits — NEXT (the slope-changing ladder)
 

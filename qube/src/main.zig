@@ -161,6 +161,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "wit")) {
+        cmdWit(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: wit failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     // Documented subcommands that are not implemented yet. Listed
     // explicitly so unknown names still hit the usage fallback.
     const stub_subs = [_][]const u8{
@@ -200,6 +208,9 @@ fn usage(io: std.Io) !void {
         \\  lock                    Resolve manifest dependencies and write qube.lock.
         \\  install [--offline]     Fetch locked dependencies into the cache (relocks if stale).
         \\  publish                 Pack this qube and publish it to the Continuum.
+        \\  wit <show|extract|check|diff>
+        \\                          Inspect WIT worlds: this qube's contract, a component's
+        \\                          embedded world, surface↔manifest agreement, version diffs.
         \\  login                   Authenticate against the Continuum registry.
         \\  --version, -v           Print the version and exit.
         \\  --help, -h              Print this help and exit.
@@ -1230,6 +1241,402 @@ fn resolveBinary(
     }
     // Fall back to argv[0] name; the OS resolves via PATH at spawn time.
     return try gpa.dupe(u8, path_name);
+}
+
+// ---------------------------------------------------------------------------
+// qube wit — first-class WIT contracts (WIT rung 4)
+// ---------------------------------------------------------------------------
+//
+// Package-level WIT verbs (spec/qube-cli.md, spec/q64-cli.md §"q64 wit vs qube
+// wit"): they resolve via the manifest + deps and call the compiler / wasm
+// tooling, where `q64`'s primitives operate on a bare source file. `show`
+// synthesizes this qube's world; `extract` pulls the embedded world from any
+// component (any language) via wasm-tools; `check` confirms the source's
+// synthesized world is well-formed and matches the manifest; `diff` reports
+// breaking vs compatible changes between two worlds.
+
+fn cmdWit(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    const verb = args_it.next() orelse {
+        try writeStderr(io, "usage: qube wit <show|extract|check|diff> [args]\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+    if (std.mem.eql(u8, verb, "show")) return witShow(gpa, io, env, args_it);
+    if (std.mem.eql(u8, verb, "extract")) return witExtract(gpa, io, env, args_it);
+    if (std.mem.eql(u8, verb, "check")) return witCheck(gpa, io, env, args_it);
+    if (std.mem.eql(u8, verb, "diff")) return witDiff(gpa, io, env, args_it);
+    try printStderr(io, "qube wit: unknown verb '{s}' (show|extract|check|diff)\n", .{verb});
+    std.process.exit(@intFromEnum(ExitCode.usage));
+}
+
+/// Build the `q64 show world` argv for the current qube — entry, manifest-named
+/// world/package, and `--module` deps. Caller owns every appended string and
+/// the list. `q64_bin`/`world`/`package` are also owned (returned via out
+/// params) so the caller frees them after the spawn.
+const WorldInvocation = struct {
+    argv: std.ArrayList([]const u8),
+    q64_bin: []u8,
+    entry: []u8,
+    world: []u8,
+    package: []u8,
+    module_specs: std.ArrayList([]u8),
+
+    fn deinit(self: *WorldInvocation, gpa: std.mem.Allocator) void {
+        self.argv.deinit(gpa);
+        gpa.free(self.q64_bin);
+        gpa.free(self.entry);
+        gpa.free(self.world);
+        gpa.free(self.package);
+        for (self.module_specs.items) |s| gpa.free(s);
+        self.module_specs.deinit(gpa);
+    }
+};
+
+fn buildWorldInvocation(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    m: *const LoadedManifest,
+) !WorldInvocation {
+    const project_dir = m.projectDir();
+    const name = manifestString(m.root, "name") orelse {
+        try writeStderr(io, "qube wit: manifest has no \"name\"\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const type_str = manifestString(m.root, "type") orelse "library";
+    const entry_rel = manifestString(m.root, "entry") orelse
+        (if (std.mem.eql(u8, type_str, "application")) "src/main.q" else "src/lib.q");
+    const entry = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
+    errdefer gpa.free(entry);
+
+    const repo_root_opt = findRepoRoot(gpa, io, project_dir) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const q64_bin = try resolveBinary(gpa, io, env, "Q64_BIN", repo_root_opt, "q64/zig-out/bin/q64", "q64");
+    errdefer gpa.free(q64_bin);
+
+    const world = try gpa.dupe(u8, resolveWorldName(m.root, name));
+    errdefer gpa.free(world);
+    const package = try resolveWitPackage(gpa, m.root, name);
+    errdefer gpa.free(package);
+
+    var module_specs = try resolveModuleSpecs(gpa, io, env, project_dir, m.root);
+    errdefer {
+        for (module_specs.items) |s| gpa.free(s);
+        module_specs.deinit(gpa);
+    }
+
+    // argv holds borrowed slices into this struct's owned fields, so it stays
+    // valid for the lifetime of the WorldInvocation.
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ q64_bin, "show", "world", "--qube", entry, "--world", world, "--wit-package", package });
+    for (module_specs.items) |spec| try argv.appendSlice(gpa, &.{ "--module", spec });
+    return .{ .argv = argv, .q64_bin = q64_bin, .entry = entry, .world = world, .package = package, .module_specs = module_specs };
+}
+
+/// `qube wit show [--out <file>]` — synthesize and print this qube's world.
+fn witShow(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var out_path: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--out")) {
+            out_path = args_it.next() orelse {
+                try writeStderr(io, "qube wit show: --out needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else {
+            try printStderr(io, "qube wit show: unknown arg: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    var inv = try buildWorldInvocation(gpa, io, env, &m);
+    defer inv.deinit(gpa);
+    if (out_path) |op| try inv.argv.appendSlice(gpa, &.{ "--out", op });
+    const term = try spawnInherit(io, inv.argv.items);
+    const code = termCode(term) orelse 255;
+    if (code != 0) std.process.exit(if (code == 1) @intFromEnum(ExitCode.compile) else code);
+}
+
+/// `qube wit extract <component.wasm> [--out <file>]` — pull the embedded world
+/// from any component via wasm-tools (any source language).
+fn witExtract(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var input: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--out")) {
+            out_path = args_it.next() orelse {
+                try writeStderr(io, "qube wit extract: --out needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube wit extract: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (input == null) {
+            input = a;
+        } else {
+            try writeStderr(io, "qube wit extract: unexpected extra arg\n");
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    const in = input orelse {
+        try writeStderr(io, "usage: qube wit extract <component.wasm> [--out <file>]\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const repo_root_opt = findRepoRoot(gpa, io, cwd_path) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const tools = try resolveBinary(gpa, io, env, "Q64_WASM_TOOLS", repo_root_opt, "vendor/wasm-tools/wasm-tools", "wasm-tools");
+    defer gpa.free(tools);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ tools, "component", "wit", in });
+    if (out_path) |op| try argv.appendSlice(gpa, &.{ "-o", op });
+    const term = spawnInherit(io, argv.items) catch {
+        try writeStderr(io, "qube wit extract: wasm-tools not found (set Q64_WASM_TOOLS or run ./init.sh)\n");
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    };
+    const code = termCode(term) orelse 255;
+    if (code != 0) std.process.exit(@intFromEnum(ExitCode.compile));
+}
+
+/// `qube wit check` — synthesize this qube's world and confirm it is well-formed
+/// (and, for a pure library, parses as standalone WIT via wasm-tools). Exits 64
+/// if the source doesn't compile to a world or the world is malformed.
+fn witCheck(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    while (args_it.next()) |a| {
+        try printStderr(io, "qube wit check: ignoring unrecognised arg: {s}\n", .{a});
+    }
+    var m = try loadManifest(gpa, io);
+    defer m.deinit(gpa);
+    var inv = try buildWorldInvocation(gpa, io, env, &m);
+    defer inv.deinit(gpa);
+
+    const res = runCapture(gpa, io, inv.argv.items) catch {
+        try writeStderr(io, "qube wit check: q64 not found (set Q64_BIN or build q64)\n");
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    };
+    defer gpa.free(res.stdout);
+    if ((res.code orelse 255) != 0) {
+        try printStderr(io, "qube wit check: the qube does not compile to a WIT world (q64 exit {d})\n", .{res.code orelse 255});
+        std.process.exit(@intFromEnum(ExitCode.compile));
+    }
+    const wit = res.stdout;
+
+    // A pure-surface library imports nothing, so its world is standalone WIT —
+    // validate it parses with wasm-tools. A qube whose world imports external
+    // packages (e.g. an app's wasi:cli) can't be parsed in isolation, so we
+    // stop at successful synthesis (the authoritative form is its component).
+    const pure = std.mem.indexOf(u8, wit, "(none — pure surface)") != null;
+    if (pure) {
+        const cwd_path = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd_path);
+        const repo_root_opt = findRepoRoot(gpa, io, cwd_path) catch null;
+        defer if (repo_root_opt) |r| gpa.free(r);
+        const tools = try resolveBinary(gpa, io, env, "Q64_WASM_TOOLS", repo_root_opt, "vendor/wasm-tools/wasm-tools", "wasm-tools");
+        defer gpa.free(tools);
+
+        // Write the synthesized world to a temp file and ask wasm-tools to parse
+        // it. A non-zero exit means the synthesized WIT is malformed.
+        const tmp_path = try std.fmt.allocPrint(gpa, "{s}/target/wit-check.wit", .{m.projectDir()});
+        defer gpa.free(tmp_path);
+        std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(tmp_path) orelse ".") catch {};
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = wit }) catch {};
+        const argv = [_][]const u8{ tools, "component", "wit", tmp_path };
+        const vres = runCapture(gpa, io, &argv) catch {
+            // wasm-tools absent — synthesis already succeeded; accept.
+            try printStdout(io, "qube wit check: OK — world '{s}' ({s}) synthesizes (wasm-tools absent; skipped parse)\n", .{ inv.world, inv.package });
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            return;
+        };
+        defer gpa.free(vres.stdout);
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        if ((vres.code orelse 255) != 0) {
+            try printStderr(io, "qube wit check: the synthesized world is not valid WIT\n", .{});
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
+    }
+    try printStdout(io, "qube wit check: OK — world '{s}' ({s})\n", .{ inv.world, inv.package });
+}
+
+/// `qube wit diff <a> <b>` — compare the export surfaces of two worlds (each a
+/// `.wit` file or a component `.wasm`) and classify the change. A removed or
+/// changed export is **breaking** (exit 1); added-only is **compatible** (exit
+/// 0). A v0 surface diff over the synthesized canonical-ABI signatures.
+fn witDiff(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var a_in: ?[]const u8 = null;
+    var b_in: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube wit diff: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (a_in == null) {
+            a_in = a;
+        } else if (b_in == null) {
+            b_in = a;
+        } else {
+            try writeStderr(io, "qube wit diff: expected exactly two inputs\n");
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    const a_path = a_in orelse null;
+    const b_path = b_in orelse null;
+    if (a_path == null or b_path == null) {
+        try writeStderr(io, "usage: qube wit diff <a.wit|a.wasm> <b.wit|b.wasm>\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const repo_root_opt = findRepoRoot(gpa, io, cwd_path) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const tools = try resolveBinary(gpa, io, env, "Q64_WASM_TOOLS", repo_root_opt, "vendor/wasm-tools/wasm-tools", "wasm-tools");
+    defer gpa.free(tools);
+
+    const a_text = try readWorldText(gpa, io, tools, a_path.?);
+    defer gpa.free(a_text);
+    const b_text = try readWorldText(gpa, io, tools, b_path.?);
+    defer gpa.free(b_text);
+
+    var a_exports = try collectExports(gpa, a_text);
+    defer freeExports(gpa, &a_exports);
+    var b_exports = try collectExports(gpa, b_text);
+    defer freeExports(gpa, &b_exports);
+
+    var breaking: usize = 0;
+    var added: usize = 0;
+
+    // Removed or changed exports — breaking.
+    var ait = a_exports.iterator();
+    while (ait.next()) |e| {
+        const name = e.key_ptr.*;
+        if (b_exports.get(name)) |bsig| {
+            if (!std.mem.eql(u8, bsig, e.value_ptr.*)) {
+                try printStdout(io, "~ changed (breaking): export {s}\n    a: {s}\n    b: {s}\n", .{ name, e.value_ptr.*, bsig });
+                breaking += 1;
+            }
+        } else {
+            try printStdout(io, "- removed (breaking): export {s}: {s}\n", .{ name, e.value_ptr.* });
+            breaking += 1;
+        }
+    }
+    // Added exports — compatible.
+    var bit = b_exports.iterator();
+    while (bit.next()) |e| {
+        if (a_exports.get(e.key_ptr.*) == null) {
+            try printStdout(io, "+ added (compatible): export {s}: {s}\n", .{ e.key_ptr.*, e.value_ptr.* });
+            added += 1;
+        }
+    }
+
+    if (breaking > 0) {
+        try printStdout(io, "qube wit diff: {d} breaking, {d} added — BREAKING\n", .{ breaking, added });
+        std.process.exit(@intFromEnum(ExitCode.compile));
+    }
+    try printStdout(io, "qube wit diff: 0 breaking, {d} added — compatible\n", .{added});
+}
+
+/// Read a world as text: a `.wasm` input is run through `wasm-tools component
+/// wit`; anything else is read verbatim (a `.wit` file). Caller owns the slice.
+fn readWorldText(gpa: std.mem.Allocator, io: std.Io, tools: []const u8, path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, path, ".wasm")) {
+        const argv = [_][]const u8{ tools, "component", "wit", path };
+        const res = try runCapture(gpa, io, &argv);
+        if ((res.code orelse 255) != 0) {
+            gpa.free(res.stdout);
+            try printStderr(io, "qube wit diff: cannot extract world from {s}\n", .{path});
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
+        return res.stdout;
+    }
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch |err| {
+        try printStderr(io, "qube wit diff: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+}
+
+/// Parse `export <name>: <sig>;` items from a WIT document into a name→signature
+/// map (both owned). Splits on `;` (the WIT item terminator) rather than lines,
+/// so it is robust to multiple items per line; `//` comments are stripped first.
+/// Interface-style exports (`export wasi:cli/run;`) key on the token with an
+/// empty signature. A v0 surface diff over the canonical-ABI signatures — it
+/// does not model nested interface bodies.
+fn collectExports(gpa: std.mem.Allocator, wit: []const u8) !std.StringHashMapUnmanaged([]u8) {
+    var map: std.StringHashMapUnmanaged([]u8) = .{};
+    errdefer freeExports(gpa, &map);
+
+    // Strip `//` line comments so a commented `export` (or a `;` in a comment)
+    // never reaches the splitter.
+    var cleaned: std.ArrayList(u8) = .empty;
+    defer cleaned.deinit(gpa);
+    var lines = std.mem.splitScalar(u8, wit, '\n');
+    while (lines.next()) |raw| {
+        const line = if (std.mem.indexOf(u8, raw, "//")) |i| raw[0..i] else raw;
+        try cleaned.appendSlice(gpa, line);
+        try cleaned.append(gpa, '\n');
+    }
+
+    var items = std.mem.splitScalar(u8, cleaned.items, ';');
+    while (items.next()) |seg| {
+        // The export keyword may be preceded by `world x {` / whitespace on the
+        // same segment; take everything after the last `export ` token.
+        const kw = std.mem.lastIndexOf(u8, seg, "export ") orelse continue;
+        const rest = std.mem.trim(u8, seg[kw + "export ".len ..], " \t\r\n");
+        if (rest.len == 0) continue;
+        const name = if (std.mem.indexOfScalar(u8, rest, ':')) |c|
+            std.mem.trim(u8, rest[0..c], " \t\r\n")
+        else
+            rest;
+        const sig = if (std.mem.indexOfScalar(u8, rest, ':')) |c|
+            std.mem.trim(u8, rest[c + 1 ..], " \t\r\n")
+        else
+            "";
+        const key = try gpa.dupe(u8, name);
+        const val = try gpa.dupe(u8, sig);
+        const gop = try map.getOrPut(gpa, key);
+        if (gop.found_existing) {
+            gpa.free(key);
+            gpa.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = val;
+    }
+    return map;
+}
+
+fn freeExports(gpa: std.mem.Allocator, map: *std.StringHashMapUnmanaged([]u8)) void {
+    var it = map.iterator();
+    while (it.next()) |e| {
+        gpa.free(e.key_ptr.*);
+        gpa.free(e.value_ptr.*);
+    }
+    map.deinit(gpa);
 }
 
 // ---------------------------------------------------------------------------

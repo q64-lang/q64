@@ -35,6 +35,7 @@ qube --help    | -h
 | `qube install`                   | Fetch all dependencies into the local cache                        |
 | `qube lock`                      | Regenerate `qube.lock` from the manifest                           |
 | `qube publish`                   | Publish this qube to the registry                                  |
+| `qube wit <show\|extract\|check\|diff>` | First-class WIT contracts — this qube's world, a component's embedded world, surface↔manifest agreement, version diffs |
 | `qube outdated`                  | List dependencies with newer compatible versions                   |
 | `qube audit`                     | Show effects and capabilities each dependency declares             |
 | `qube clean`                     | Remove build outputs (`target/`)                                   |
@@ -245,6 +246,27 @@ Resolved dependencies are extracted to a user-global cache:
 ```
 
 `QUBE_HOME` overrides `~/.qube`. CI systems pin caches via this variable.
+
+## `qube wit` — first-class WIT contracts
+
+The package-level WIT verbs (WIT rung 4). They are the **package** layer over
+the `q64` source↔WIT primitives: `qube wit` resolves the manifest + dependency
+graph and shells out to the compiler / `wasm-tools`, where
+[`q64 show world`](./q64-cli.md) / `q64 wit` operate on a bare source file with
+no manifest. (The split: `q64` is the compiler over source; `qube` is the
+package tool — see [`q64-cli.md`](./q64-cli.md) §"`q64 wit` vs `qube wit`".)
+
+| Form | Meaning |
+|------|---------|
+| `qube wit show [--out <file>]` | Synthesize and print **this** qube's world — `q64 show world` for the manifest's entry, named from the `wit` block (`wit.world`/`wit.package`), with `--module` for each dependency. `--out` writes it to a file. |
+| `qube wit extract <component.wasm> [--out <file>]` | Pull the embedded world out of **any** component (any source language) via `wasm-tools component wit`. The inverse of emission: read a contract from a binary. |
+| `qube wit check` | Confirm the qube's source compiles to a world **and** (for a pure-surface library, whose world is standalone WIT) that the synthesized world parses with `wasm-tools`. Exit `64` on drift — source that doesn't compile to a world, or a malformed synthesized world. An app whose world imports external packages (e.g. `wasi:cli`) is validated at the synthesis step only (its standalone world isn't self-contained; the authoritative form is its component). |
+| `qube wit diff <a> <b>` | Compare the **export surfaces** of two worlds — each a `.wit` file or a component `.wasm` (extracted via `wasm-tools` first). A **removed** or **changed** export is breaking (exit `64`); an **added** export is compatible (exit `0`). A v0 surface diff over the canonical-ABI signatures; pairs with Continuum semver. |
+
+`wasm-tools` is located via `Q64_WASM_TOOLS`, else the repo `vendor/`, else
+`PATH` (the same resolution `q64 emit --component` uses). `extract` and the
+component side of `diff` need it; `show`/`check` and a `.wit`↔`.wit` `diff` do
+not.
 
 ## How `qube` invokes `q64`
 
