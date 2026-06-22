@@ -132,5 +132,18 @@ export async function createCompiler(opts) {
         }
     }
 
-    return { compile, compileProject, diagnostics, binaryen };
+    /// Project-aware diagnostics envelope (links `modules`, so an `import` they
+    /// satisfy isn't flagged). `modules: []` ≡ `diagnostics`.
+    function diagnosticsProject(main, modules = [], { wasm64 = false } = {}) {
+        const image = encodeProject(main, modules);
+        const ptr = x.q64_alloc(image.length) >>> 0;
+        new Uint8Array(x.memory.buffer).set(image, ptr);
+        try {
+            return readJson(x.q64_diagnostics_project(ptr, image.length, wasm64 ? 1 : 0));
+        } finally {
+            x.q64_free(ptr, image.length);
+        }
+    }
+
+    return { compile, compileProject, diagnostics, diagnosticsProject, binaryen };
 }

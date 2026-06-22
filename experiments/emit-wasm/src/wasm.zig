@@ -141,10 +141,30 @@ export fn q64_compile_project(buf_ptr: [*]const u8, buf_len: usize, addr_is_wasm
 /// `(ptr << 32) | len` of the UTF-8 JSON (host frees via `q64_free`), or `0` on
 /// allocation failure.
 export fn q64_diagnostics(src_ptr: [*]const u8, src_len: usize, addr_is_wasm64: u32) u64 {
-    return diagnosticsInner(src_ptr[0..src_len], addr_is_wasm64 != 0) catch 0;
+    return diagnosticsInner(src_ptr[0..src_len], &.{}, addr_is_wasm64 != 0) catch 0;
 }
 
-fn diagnosticsInner(source: []const u8, wasm64: bool) !u64 {
+/// Project-aware diagnostics: the same `q64_compile_project` wire image, so a
+/// qube that links a library sees the link resolved (no spurious "unknown
+/// module" for an `import` the modules actually satisfy).
+export fn q64_diagnostics_project(buf_ptr: [*]const u8, buf_len: usize, addr_is_wasm64: u32) u64 {
+    var r = Reader{ .buf = buf_ptr[0..buf_len] };
+    const main_len = r.u32le() orelse return 0;
+    const main_src = r.slice(main_len) orelse return 0;
+    const mod_count = r.u32le() orelse return 0;
+    const mods = host_allocator.alloc(emit.ModuleSource, mod_count) catch return 0;
+    defer host_allocator.free(mods);
+    for (mods) |*m| {
+        const name_len = r.u32le() orelse return 0;
+        const name = r.slice(name_len) orelse return 0;
+        const src_len = r.u32le() orelse return 0;
+        const src = r.slice(src_len) orelse return 0;
+        m.* = .{ .name = name, .source = src };
+    }
+    return diagnosticsInner(main_src, mods, addr_is_wasm64 != 0) catch 0;
+}
+
+fn diagnosticsInner(source: []const u8, modules: []const emit.ModuleSource, wasm64: bool) !u64 {
     // Everything transient — the parse tree, the symbol/type tables, the
     // diagnostics, the JSON builder's scratch — lives in a per-call arena freed
     // on return. Caller buffers are copied out below.
@@ -201,7 +221,7 @@ fn diagnosticsInner(source: []const u8, wasm64: bool) !u64 {
     };
     if (!has_error) {
         const addr: emit.AddressSpace = if (wasm64) .wasm64 else .wasm32;
-        if (emit.emitFromSource(arena, source, "main.q", &.{}, addr)) |bytes| {
+        if (emit.emitFromSource(arena, source, "main.q", modules, addr)) |bytes| {
             arena.free(bytes);
         } else |err| {
             try diags.append(arena, codegenDiagnostic(err));
