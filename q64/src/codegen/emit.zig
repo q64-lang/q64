@@ -754,9 +754,10 @@ fn worldName(file: []const u8) []const u8 {
 /// Adapts the sema `Linker` to the IR builder's `ModuleResolver` so
 /// `build_hir` can resolve call targets to their AST without `ir/` depending
 /// on `codegen/`.
-fn linkerLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
+fn linkerLookupShim(ctx: *anyopaque, scope: u32, name: []const u8) ?ir.hir.Resolved {
     const l: *sema.link.Linker = @ptrCast(@alignCast(ctx));
-    return l.lookup(name);
+    const r = l.lookup(scope, name) orelse return null;
+    return .{ .fd = r.fd, .scope = r.scope };
 }
 
 /// Parse `source`, resolve its imports against `modules`, and build the HIR —
@@ -778,8 +779,7 @@ fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, 
     // the stable emit codes.
     var linker = sema.link.Linker.init(allocator, modules);
     defer linker.deinit();
-    try linker.indexLocalFunctions(sf);
-    linker.resolveImports(sf) catch |e| return switch (e) {
+    linker.build(sf) catch |e| return switch (e) {
         error.UnknownModule => Error.UnknownModule,
         error.NameNotFound => Error.NameNotFound,
         error.UnsupportedImport => Error.UnsupportedImport,

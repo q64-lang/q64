@@ -23,17 +23,26 @@ pub const ops = @import("ops.zig");
 
 pub const FuncId = u32;
 
-/// Resolves a function name (imported or file-local) to its AST declaration.
+/// A resolved function: its AST declaration plus the **scope** (module) its body
+/// resolves against. Resolution is module-scoped — a name is looked up in the
+/// caller's scope, but the callee's body resolves in *its own* scope (its module's
+/// locals + imports), so a library can call its own helpers and its own imports.
+pub const Resolved = struct {
+    fd: ast.FnDecl,
+    /// The scope index the callee's body resolves in (the module that defines it).
+    scope: u32,
+};
+
+/// Resolves a function name to its AST declaration, **within a given scope**.
 /// The AST→HIR builder calls this to turn a call site into a `FuncId`; the
-/// codegen router backs it with the existing `Resolver.lookup`, so HIR
-/// construction reuses import resolution without `ir/` depending on codegen.
-/// (Name resolution will move fully into the builder in a later phase.)
+/// codegen router backs it with the sema `Linker`. Scope 0 is the root file;
+/// each imported module gets its own scope (see `sema.link`).
 pub const ModuleResolver = struct {
     ctx: *anyopaque,
-    lookupFn: *const fn (*anyopaque, name: []const u8) ?ast.FnDecl,
+    lookupFn: *const fn (*anyopaque, scope: u32, name: []const u8) ?Resolved,
 
-    pub fn lookup(self: ModuleResolver, name: []const u8) ?ast.FnDecl {
-        return self.lookupFn(self.ctx, name);
+    pub fn lookup(self: ModuleResolver, scope: u32, name: []const u8) ?Resolved {
+        return self.lookupFn(self.ctx, scope, name);
     }
 };
 

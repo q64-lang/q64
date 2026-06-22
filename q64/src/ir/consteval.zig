@@ -27,6 +27,10 @@ pub const Error = error{ NotConst, ConstArith } || std.mem.Allocator.Error;
 pub const Evaluator = struct {
     a: std.mem.Allocator, // arena
     resolver: hir.ModuleResolver,
+    /// The module scope const-folding currently resolves names in (mirrors the
+    /// builder's `cur_scope`). 0 is the root file; a folded cross-module call
+    /// switches to the callee's scope while evaluating its body.
+    scope: u32 = 0,
     /// `let`/`var` bindings that hold a compile-time value (name → bytes).
     bindings: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Whether a (nullary, const-bodied) function call may be folded. Only a
@@ -115,11 +119,15 @@ pub const Evaluator = struct {
         var args = call.args();
         if (args.next() != null) return error.NotConst;
 
-        const fd = self.resolver.lookup(name) orelse return error.NotConst;
-        return self.evalFn(fd);
+        const resolved = self.resolver.lookup(self.scope, name) orelse return error.NotConst;
+        return self.evalFn(resolved.fd, resolved.scope);
     }
 
-    fn evalFn(self: *Evaluator, fd: ast.FnDecl) Error![]const u8 {
+    fn evalFn(self: *Evaluator, fd: ast.FnDecl, scope: u32) Error![]const u8 {
+        // The callee's body resolves in its OWN module scope.
+        const saved = self.scope;
+        self.scope = scope;
+        defer self.scope = saved;
         const body = fd.body() orelse return error.NotConst;
         var stmts = body.statements();
         var last: ?ast.Expr = null;

@@ -93,6 +93,11 @@ const RecField = struct { base_idx: u32, offset: u32, ty: hir.Type, mutable: boo
 const Builder = struct {
     a: std.mem.Allocator,
     resolver: ModuleResolver,
+    /// The module scope name resolution currently runs in (module-scoped
+    /// linking). 0 is the root file; compiling a callee's body switches to the
+    /// callee's own scope so its calls resolve against *its* module (its locals
+    /// + its imports). Set/restored around each function body in `registerFunc`.
+    cur_scope: u32 = 0,
     /// Foreign WIT interfaces this qube imports (WIT rung 5). A source call
     /// `<iface>.<fn>(…)` whose head names one of these lowers to a `foreign_call`
     /// (a wasm import + call). Empty for a qube with no `--wit-import`, so the
@@ -2774,7 +2779,7 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
             if (callPathName(b, call)) |gn| {
                 defer b.a.free(gn);
                 if (std.mem.indexOfScalar(u8, gn, '.') == null) {
-                    if (b.resolver.lookup(gn)) |fd| {
+                    if (resolveFn(b, gn)) |fd| {
                         if (fd.isGeneric()) {
                             try out.append(b.a, try buildGenericCallStmt(b, gn, fd, call, scope));
                             return;
@@ -2816,7 +2821,7 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 const cname = callPathName(b, call) orelse return reject(b, .unsupported_call);
                 defer b.a.free(cname);
                 if (std.mem.indexOfScalar(u8, cname, '.') != null) return reject(b, .unsupported_call);
-                if (b.resolver.lookup(cname) == null) return reject(b, .name_not_found);
+                if (resolveFn(b, cname) == null) return reject(b, .name_not_found);
                 const id = try registerFunc(b, cname);
                 if (b.funcs.items[id].ret != .void) return reject(b, .unsupported_call);
                 const e = try b.a.create(hir.Expr);
@@ -3259,17 +3264,50 @@ fn collectCalleeParams(
 /// calls) the first time. Returns its FuncId. The id and the parameter list
 /// are reserved *before* the body is built, so a recursive call inside the
 /// body sees the correct arity (not the placeholder's).
-fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
-    if (b.ids.get(name)) |id| return id;
+/// Resolve `name` (a function) in the builder's current module scope.
+fn resolveScoped(b: *Builder, name: []const u8) ?hir.Resolved {
+    return b.resolver.lookup(b.cur_scope, name);
+}
 
-    const fd = b.resolver.lookup(name) orelse return reject(b, .name_not_found);
+/// As `resolveScoped` but yields just the declaration — most call sites only
+/// need to know "does this name resolve, and to what `FnDecl`".
+fn resolveFn(b: *Builder, name: []const u8) ?ast.FnDecl {
+    return if (b.resolver.lookup(b.cur_scope, name)) |r| r.fd else null;
+}
+
+/// A cache key (and the emitted Binaryen function name) unique per (scope,
+/// name). Scope 0 (the root file) keeps the plain name, so single-module output
+/// is byte-for-byte unchanged; a dependency scope appends a `\x01<idx>` tag so a
+/// `helper` in two different modules are distinct functions. q64 emits no name
+/// section, so the tag never reaches the output wasm.
+fn scopedKey(b: *Builder, scope: u32, name: []const u8) std.mem.Allocator.Error![]u8 {
+    if (scope == 0) return b.a.dupe(u8, name);
+    return std.fmt.allocPrint(b.a, "{s}\x01{d}", .{ name, scope });
+}
+
+fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
+    const resolved = resolveScoped(b, name) orelse return reject(b, .name_not_found);
+    const fd = resolved.fd;
+    // Compile the callee's body in ITS module scope (so its calls resolve
+    // against its own module). Restored on return.
+    const saved_scope = b.cur_scope;
+    b.cur_scope = resolved.scope;
+    b.eval.scope = resolved.scope;
+    defer {
+        b.cur_scope = saved_scope;
+        b.eval.scope = saved_scope;
+    }
+
+    const owned = try scopedKey(b, resolved.scope, name);
+    if (b.ids.get(owned)) |id| return id;
+
     const rec_ret = try structOfRet(b, fd);
     // No return type and no record return: a void-returning procedure (a
     // helper run for its side effects — `env.out`, calls, host faces).
-    if (rec_ret == null and fd.returnType() == null) return registerVoidFunc(b, name, fd);
+    if (rec_ret == null and fd.returnType() == null) return registerVoidFunc(b, owned, fd);
     const ret_ty: hir.Type = if (rec_ret != null) .ptr else blk: {
         const rs = (try fnRetScalar(b, fd)) orelse return error.Unsupported;
-        if (rs == .str) return registerStrFunc(b, name, fd);
+        if (rs == .str) return registerStrFunc(b, owned, fd);
         // An i64, f64, or `-> bool` (i32 0/1) value function; the value
         // body builds through `buildIntBlock` whatever the scalar.
         break :blk switch (rs) {
@@ -3277,8 +3315,6 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
             else => return error.Unsupported,
         };
     };
-
-    const owned = try b.a.dupe(u8, name);
 
     // Parameters occupy local indices 0..n; seed the body scope. Callee
     // bookkeeping: locals are tracked by `scope.declare` alone (no cur_locals
@@ -3349,8 +3385,10 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
 /// `lowerEntryStmt`, routed by `hf.ret == .void`). v0 boundary: no `match`,
 /// records, arrays, or `for` in the body, and no runtime str bindings
 /// (`let s = shout(x)`) — str *arguments* to `env.out` are fine.
-fn registerVoidFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
-    const owned = try b.a.dupe(u8, name);
+// `owned` is the scoped cache key / emitted name, already allocated by the
+// caller (`registerFunc`), which has also set `b.cur_scope` to this function's
+// module scope.
+fn registerVoidFunc(b: *Builder, owned: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
     var scope = Scope{ .a = b.a, .callee = true };
     var params: std.ArrayList(hir.Param) = .empty;
     var rec_params: std.ArrayList(?*const StructInfo) = .empty;
@@ -3945,7 +3983,8 @@ fn tailIsValueIfNoElse(body: *const hir.Stmt) bool {
 /// function whose body is a single tail str expression (a constant string, a
 /// passthrough parameter ref, or a call to another str function). Concat
 /// bodies and runtime bindings land in a later slice.
-fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
+// `owned` is the scoped cache key / emitted name (see `registerVoidFunc`).
+fn registerStrFunc(b: *Builder, owned: []const u8, fd: ast.FnDecl) BuildError!hir.FuncId {
     var scope = Scope{ .a = b.a, .callee = true };
     var params: std.ArrayList(hir.Param) = .empty;
     if (fd.params()) |ps| {
@@ -3966,7 +4005,6 @@ fn registerStrFunc(b: *Builder, name: []const u8, fd: ast.FnDecl) BuildError!hir
     scope.n_params = scope.next_idx;
     const param_slice = try params.toOwnedSlice(b.a);
 
-    const owned = try b.a.dupe(u8, name);
     const id: hir.FuncId = @intCast(b.funcs.items.len);
     try b.ids.put(b.a, owned, id);
     const dummy = try b.a.create(hir.Stmt);
@@ -4243,7 +4281,7 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                     };
                     const cname = try cpath.text(b.a);
                     defer b.a.free(cname);
-                    const fd = b.resolver.lookup(cname) orelse return reject(b, .name_not_found);
+                    const fd = resolveFn(b, cname) orelse return reject(b, .name_not_found);
                     // An untyped value function (`fn version { "9.9.9" }`, no
                     // `-> str`) can't be emitted as a runtime str function, so
                     // fold its const body — legacy-compatible. A typed `-> str`
@@ -4412,7 +4450,7 @@ fn isStrCall(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
         const rs = (try semaScalar(b, rt.type_())) orelse return false;
         return rs == .str;
     }
-    const fd = b.resolver.lookup(cname) orelse return false;
+    const fd = resolveFn(b, cname) orelse return false;
     const rs = try fnRetScalar(b, fd);
     return rs != null and rs.? == .str;
 }
@@ -4917,7 +4955,7 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
                 return try instantiateEnum(b, base_info, &.{ "s", "i", "i", "i" });
             }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
-                if (b.resolver.lookup(txt)) |fd| return enumOfRet(b, fd);
+                if (resolveFn(b, txt)) |fd| return enumOfRet(b, fd);
             }
             return null;
         },
@@ -5114,7 +5152,7 @@ fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
     if (std.mem.indexOfScalar(u8, cname, '.') != null) return null; // host/method calls aren't record-valued
-    const fd = b.resolver.lookup(cname) orelse return null;
+    const fd = resolveFn(b, cname) orelse return null;
     return structOfRet(b, fd);
 }
 
@@ -5271,7 +5309,7 @@ fn genericRetStruct(b: *Builder, scope: *const Scope, cc: ast.CallExpr) BuildErr
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
     if (std.mem.indexOfScalar(u8, cname, '.') != null) return null;
-    const fd = b.resolver.lookup(cname) orelse return null;
+    const fd = resolveFn(b, cname) orelse return null;
     if (!fd.isGeneric()) return null;
     const sig = parseGenericSig(fd.genericParams().?) orelse return null;
     const rt = fd.returnType() orelse return null;
@@ -6320,7 +6358,7 @@ fn genericRecCall(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecV
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
     if (std.mem.indexOfScalar(u8, cname, '.') != null) return null;
-    const fd = b.resolver.lookup(cname) orelse return null;
+    const fd = resolveFn(b, cname) orelse return null;
     if (!fd.isGeneric()) return null;
     // Cheap syntactic pre-check: only a `-> T` return can be a record here.
     const sig = parseGenericSig(fd.genericParams().?) orelse return null;
@@ -7596,7 +7634,7 @@ const ExprTypeBridge = struct {
             .f64 => .f64,
             else => .i64,
         };
-        const fd = self.b.resolver.lookup(name) orelse return null;
+        const fd = resolveFn(self.b, name) orelse return null;
         const rt = (fnRetScalar(self.b, fd) catch return null) orelse return null;
         return switch (rt) {
             .i64 => .i64,
@@ -7672,7 +7710,7 @@ const ExprTypeBridge = struct {
                 else => null,
             };
         }
-        const fd = self.b.resolver.lookup(name) orelse return null;
+        const fd = resolveFn(self.b, name) orelse return null;
         if (fd.isGeneric()) {
             if (try self.genericRet(fd, call)) |t| return t;
             // A concrete return on a generic still types below.
@@ -8344,7 +8382,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     const fname = (callPathName(b, rc)) orelse return error.Unsupported;
                     defer b.a.free(fname);
                     if (std.mem.indexOfScalar(u8, fname, '.') != null) return error.Unsupported; // method targets: later
-                    if (b.resolver.lookup(fname) == null) return reject(b, .name_not_found);
+                    if (resolveFn(b, fname) == null) return reject(b, .name_not_found);
                     const id = try registerFunc(b, fname);
                     out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, rc.args(), scope, lval) } };
                     return out;
@@ -8353,7 +8391,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     const fname = try p.text(b.a);
                     defer b.a.free(fname);
                     if (std.mem.indexOfScalar(u8, fname, '.') != null) return error.Unsupported;
-                    if (b.resolver.lookup(fname) == null) return reject(b, .name_not_found);
+                    if (resolveFn(b, fname) == null) return reject(b, .name_not_found);
                     const id = try registerFunc(b, fname);
                     const empty = ast.ArgIter{ .children = &.{} };
                     out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, empty, scope, lval) } };
@@ -8523,7 +8561,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             // monomorphize per the inferred element type, like the
             // statement form (B5). The stamped instance must produce a
             // scalar value here.
-            if (b.resolver.lookup(cname)) |gfd| {
+            if (resolveFn(b, cname)) |gfd| {
                 // Higher-order call (`apply(|n| …, x)`): specialize per lambda.
                 if (hasFnParam(gfd)) {
                     const he = try buildHofCall(b, cname, gfd, cc, scope);
@@ -8792,7 +8830,10 @@ const TestResolver = struct {
         try self.results.append(self.a, try parser.parse.parse(self.a, src, "<lib>"));
     }
 
-    fn lookup(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
+    // Flat test resolver: every function lives in scope 0 (the tests here don't
+    // exercise cross-module scoping — that's covered in sema/link.zig).
+    fn lookup(ctx: *anyopaque, scope: u32, name: []const u8) ?hir.Resolved {
+        _ = scope;
         const self: *TestResolver = @ptrCast(@alignCast(ctx));
         for (self.results.items) |r| {
             const sf = ast.SourceFile.cast(r.root) orelse continue;
@@ -8800,7 +8841,7 @@ const TestResolver = struct {
             while (it.next()) |item| switch (item) {
                 .fn_decl => |fd| {
                     const nm = fd.name() orelse continue;
-                    if (std.mem.eql(u8, nm.text, name)) return fd;
+                    if (std.mem.eql(u8, nm.text, name)) return .{ .fd = fd, .scope = 0 };
                 },
                 else => {},
             };
@@ -8841,7 +8882,7 @@ fn rejectFromSource(gpa: std.mem.Allocator, source: []const u8, res: ModuleResol
 }
 
 const noLib: ModuleResolver = .{ .ctx = undefined, .lookupFn = struct {
-    fn f(_: *anyopaque, _: []const u8) ?ast.FnDecl {
+    fn f(_: *anyopaque, _: u32, _: []const u8) ?hir.Resolved {
         return null;
     }
 }.f };

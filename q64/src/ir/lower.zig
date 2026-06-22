@@ -518,7 +518,7 @@ const print = @import("print.zig");
 
 test "lower: literals fold into the memory image with newlines" {
     const noLib: hir.ModuleResolver = .{ .ctx = undefined, .lookupFn = struct {
-        fn f(_: *anyopaque, _: []const u8) ?parser.ast.FnDecl {
+        fn f(_: *anyopaque, _: u32, _: []const u8) ?hir.Resolved {
             return null;
         }
     }.f };
@@ -551,7 +551,8 @@ const TestResolver = struct {
     fn addLib(self: *TestResolver, src: []const u8) !void {
         try self.results.append(self.a, try parser.parse.parse(self.a, src, "<lib>"));
     }
-    fn lookup(ctx: *anyopaque, name: []const u8) ?parser.ast.FnDecl {
+    fn lookup(ctx: *anyopaque, scope: u32, name: []const u8) ?hir.Resolved {
+        _ = scope;
         const self: *TestResolver = @ptrCast(@alignCast(ctx));
         for (self.results.items) |r| {
             const sf = parser.ast.SourceFile.cast(r.root) orelse continue;
@@ -559,7 +560,7 @@ const TestResolver = struct {
             while (it.next()) |item| switch (item) {
                 .fn_decl => |fd| {
                     const nm = fd.name() orelse continue;
-                    if (std.mem.eql(u8, nm.text, name)) return fd;
+                    if (std.mem.eql(u8, nm.text, name)) return .{ .fd = fd, .scope = 0 };
                 },
                 else => {},
             };
