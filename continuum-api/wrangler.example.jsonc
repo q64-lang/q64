@@ -46,7 +46,16 @@
   "kv_namespaces": [
     { "binding": "CACHE", "id": "REPLACE_WITH_STAGE_KV_ID" }
   ],
-  "vars": { "ENV": "dev", "ADMIN_EMAILS": "" },
+  "vars": {
+    "ENV": "dev",
+    "ADMIN_EMAILS": "",
+    // Taluvi tracing: endpoint + tenant are config; TRACING_INGEST_TOKEN is a
+    // SECRET — mint a trc_ingest_ token (tracing/scripts/mint-token.mjs) and
+    //   wrangler secret put TRACING_INGEST_TOKEN
+    "SERVICE_NAME": "q64-continuum-api-stage",
+    "TRACING_OTLP_ENDPOINT": "https://otel.taluvi.dev",
+    "TRACING_TENANT_ID": "taluvi"
+  },
 
   // ---- prod (needs `--env prod`) ----
   "env": {
@@ -65,7 +74,13 @@
       "kv_namespaces": [
         { "binding": "CACHE", "id": "REPLACE_WITH_PROD_KV_ID" }
       ],
-      "vars": { "ENV": "prod", "ADMIN_EMAILS": "" }
+      "vars": {
+        "ENV": "prod",
+        "ADMIN_EMAILS": "",
+        "SERVICE_NAME": "q64-continuum-api",
+        "TRACING_OTLP_ENDPOINT": "https://otel.taluvi.com",
+        "TRACING_TENANT_ID": "taluvi"
+      }
     }
   }
 }

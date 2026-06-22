@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { honoTracing, tracingConfigFromEnv } from "./lib/tracing/hono.ts";
 import type { Env } from "./env.ts";
 import { qubes } from "./routes/qubes.ts";
 import { categories } from "./routes/categories.ts";
@@ -15,6 +16,13 @@ const app = new Hono<{ Bindings: Env }>({ strict: false });
 // tooling) can fetch metadata + archives + manifests. Reads are public, so a
 // wildcard origin is correct; the publish path stays Bearer-gated regardless.
 app.use("*", cors({ origin: "*", allowMethods: ["GET", "HEAD", "POST", "OPTIONS"] }));
+
+// Taluvi tracing: one OTLP SERVER span per request under app `q64-continuum`,
+// flushed via waitUntil. Inert until TRACING_OTLP_ENDPOINT + TRACING_INGEST_TOKEN
+// are set, so it never affects a request and stays off where unprovisioned. This
+// is how the registry's resolution traffic (e.g. the qubepods shell resolving an
+// engine dependency: GET /v1/qubes/<name>) becomes visible in observe.taluvi.
+app.use("*", honoTracing<Env>((env) => tracingConfigFromEnv(env, "q64-continuum")));
 
 // Root: humans who accidentally hit qubes.q64.dev get a pointer.
 app.get("/", (c) =>
