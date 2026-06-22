@@ -2513,7 +2513,7 @@ const pack_script =
     \\STAGE="$(mktemp -d)"
     \\mkdir -p "$STAGE/$ROOT" "$(dirname "$OUT")"
     \\cd "$PROJECT"
-    \\for item in qube.json5 README.md src tests examples example; do
+    \\for item in qube.json5 README.md src tests examples example wit; do
     \\  [ -e "$item" ] && cp -R "$item" "$STAGE/$ROOT/" || true
     \\done
     \\for lic in LICENSE LICENSE-MIT LICENSE-APACHE; do

@@ -23,7 +23,8 @@
   ],
 
   "vars": {
-    "ENV": "dev"
+    "ENV": "dev",
+    "REGISTRY_HOST": "https://qubes-q64.taluvi.dev"
   },
 
   "env": {
@@ -35,7 +36,7 @@
       "services": [
         { "binding": "API", "service": "q64-continuum-api" }
       ],
-      "vars": { "ENV": "prod" }
+      "vars": { "ENV": "prod", "REGISTRY_HOST": "https://qubes.q64.dev" }
     }
   }
 }
