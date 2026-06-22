@@ -10,11 +10,14 @@
 // canvas) reveals the actual reason on-device instead of a blank black layer.
 import { KIND, ATTR } from '../protocol.js';
 import { register } from '../registry.js';
-import { activate, place, isLive, status } from '../scene3d.js';
+import { activate, place, isLive, status, setTint } from '../scene3d.js';
 
 register(KIND.scene, {
   draw(node, r) {
     void r.attr(node, ATTR.scene_id, 0);  // reserved: select among a project's scenes
+    // `fill` (a packed AARRGGBB) tints the scene's mesh — the producer's one
+    // scalar channel into the host-rendered 3D (0 = the scene's authored color).
+    setTint(r.attr(node, ATTR.fill, 0));
     activate();          // boots the engine + loads the project's scene; idempotent
     place(null);         // Stage 1: full-bleed backdrop (whole #gpu rect)
     if (isLive()) return;

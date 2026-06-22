@@ -19,6 +19,8 @@
 // Heavily guarded: if WebGL/WebGPU, the engine bundle, or the project content is
 // unavailable, it logs and no-ops, and the QView form still renders.
 
+import { unpackColor } from './protocol.js';
+
 const ENGINE_BASE = 'https://cdn.qubeworlds.com/engine';
 
 const DPR = Math.max(1, Math.min(3, (typeof window !== 'undefined' && window.devicePixelRatio) || 1));
@@ -48,6 +50,52 @@ let failed = false;        // boot failed — stop retrying, stay degraded
 let active = false;        // a scene is currently shown
 let want = false;          // a scene was requested before the runtime was ready
 let provided = false;      // the project's assets have been handed to the engine
+let sceneObj = null;       // the project's scene, parsed ONCE and kept in memory
+let tintPacked = 0;        // producer tint (packed AARRGGBB on the scene node's `fill`); 0 = the scene's own colors
+
+// The scene object, parsed once from the injected content and cached — so a tint
+// update is a cheap in-memory mutate + re-stringify, not a re-parse (fast scene
+// changes, per the design). The host edits the scene it hands over; the ENGINE
+// stays content-agnostic (the only producer→3D channel is `quine_enqueue`).
+function sceneObject() {
+  if (sceneObj) return sceneObj;
+  const g = game();
+  if (!g || !g.scene) return null;
+  try { sceneObj = JSON.parse(g.scene); } catch { sceneObj = null; }
+  return sceneObj;
+}
+
+// The current scene JSON, with the active tint applied to each rendered entity's
+// material (the cube). `tintPacked === 0` leaves the scene's authored colors.
+function currentSceneJson() {
+  const obj = sceneObject();
+  if (!obj) return null;
+  if (tintPacked) {
+    const [r, g, b, a] = unpackColor(tintPacked);
+    for (const e of obj.entities || []) {
+      if (e && e.geometry && e.material) e.material.color = [r, g, b, a];
+    }
+  }
+  return JSON.stringify(obj);
+}
+
+/** Tint the scene's mesh(es) to a packed AARRGGBB color (0 = the scene's own
+ *  colors). Called by the `scene` widget from the node's `fill` attr. On a
+ *  change it re-pushes the in-memory scene, which the engine hot-reloads with
+ *  the new material — so tapping recolors the live cube. No-ops when unchanged
+ *  (the widget calls it every frame) and when the color hasn't actually moved. */
+export function setTint(packed) {
+  packed = (packed >>> 0);
+  if (packed === tintPacked) return;
+  tintPacked = packed;
+  if (!ready || !active) return; // applied when the scene next enqueues (boot)
+  const json = currentSceneJson();
+  if (!json) return;
+  try {
+    window.Module.ccall('quine_enqueue', null, ['string'], [JSON.stringify({ type: 'scene', json })]);
+    window.Module.ccall('quine_set_autoplay', null, ['number'], [1]);
+  } catch (e) { log('setTint enqueue failed: ' + (e && e.message)); }
+}
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -99,7 +147,7 @@ function enqueueScene() {
   if (!g || !g.scene) { note('no 3D content · ' + traceStr()); return; }
   try {
     provideAssets();
-    window.Module.ccall('quine_enqueue', null, ['string'], [JSON.stringify({ type: 'scene', json: g.scene })]);
+    window.Module.ccall('quine_enqueue', null, ['string'], [JSON.stringify({ type: 'scene', json: currentSceneJson() ?? g.scene })]);
     window.Module.ccall('quine_set_autoplay', null, ['number'], [1]);
     try { window.Module.ccall('quine_set_hud', null, ['number'], [0]); } catch {}
     active = true;
