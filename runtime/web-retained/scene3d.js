@@ -81,20 +81,26 @@ function currentSceneJson() {
 
 /** Tint the scene's mesh(es) to a packed AARRGGBB color (0 = the scene's own
  *  colors). Called by the `scene` widget from the node's `fill` attr. On a
- *  change it re-pushes the in-memory scene, which the engine hot-reloads with
- *  the new material — so tapping recolors the live cube. No-ops when unchanged
- *  (the widget calls it every frame) and when the color hasn't actually moved. */
+ *  change it pushes an **in-place material edit** per rendered entity — the
+ *  engine updates the Material uniform without rebuilding the world, so the
+ *  running simulation (spin/animation) keeps going (no reset to t=0). The boot
+ *  enqueue applies the initial tint via `currentSceneJson`. No-ops when
+ *  unchanged (the widget calls it every frame). */
 export function setTint(packed) {
   packed = (packed >>> 0);
   if (packed === tintPacked) return;
   tintPacked = packed;
-  if (!ready || !active) return; // applied when the scene next enqueues (boot)
-  const json = currentSceneJson();
-  if (!json) return;
-  try {
-    window.Module.ccall('quine_enqueue', null, ['string'], [JSON.stringify({ type: 'scene', json })]);
-    window.Module.ccall('quine_set_autoplay', null, ['number'], [1]);
-  } catch (e) { log('setTint enqueue failed: ' + (e && e.message)); }
+  if (!ready || !active || !tintPacked) return; // pre-boot: enqueueScene carries it; 0 = authored colors
+  const obj = sceneObject();
+  if (!obj) return;
+  const color = unpackColor(tintPacked);
+  for (const e of obj.entities || []) {
+    if (!(e && e.geometry && e.material && e.name)) continue;
+    try {
+      window.Module.ccall('quine_enqueue', null, ['string'],
+        [JSON.stringify({ type: 'material', entity: e.name, color })]);
+    } catch (err) { log('setTint material edit failed: ' + (err && err.message)); }
+  }
 }
 
 function b64ToBytes(b64) {
