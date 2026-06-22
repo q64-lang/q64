@@ -48,11 +48,14 @@ pub const Scalar = enum {
 };
 
 /// One lifted export: the component export name, the core module's export name
-/// to alias, its parameter scalars, and its optional scalar result.
+/// to alias, its parameter scalars + names, and its optional scalar result.
+/// `name` and `param_names` are the q64 source identifiers (snake_case); the
+/// encoder maps them to the kebab-case the component model requires.
 pub const Export = struct {
     name: []const u8,
     core_name: []const u8,
     params: []const Scalar,
+    param_names: []const []const u8,
     ret: ?Scalar,
 };
 
@@ -84,6 +87,14 @@ const W = struct {
     fn name(self: *W, s: []const u8) Error!void {
         try self.uleb(s.len);
         try self.bytes(s);
+    }
+    /// A length-prefixed component-model **label**, mapping the snake_case `_`
+    /// q64 uses to the kebab-case `-` the component model requires (a
+    /// component name/label with `_` fails validation). The map is
+    /// length-preserving, so the ULEB length is the source length.
+    fn label(self: *W, s: []const u8) Error!void {
+        try self.uleb(s.len);
+        for (s) |ch| try self.byte(if (ch == '_') '-' else ch);
     }
 };
 
@@ -142,9 +153,8 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export)
         for (exports) |e| {
             try s.byte(0x40); // functype
             try s.uleb(e.params.len); // params: vec(name, valtype)
-            for (e.params, 0..) |p, i| {
-                var nbuf: [8]u8 = undefined;
-                try s.name(std.fmt.bufPrint(&nbuf, "p{d}", .{i}) catch "p");
+            for (e.params, e.param_names) |p, pname| {
+                try s.label(pname); // the real q64 param name (→ kebab-case)
                 try s.byte(p.byte());
             }
             if (e.ret) |r| {
@@ -182,8 +192,10 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export)
         for (exports, 0..) |e, i| {
             // A component export name carries a leading 0x00 tag (the plain-name
             // form) before the length-prefixed string — unlike a core name.
+            // The label is kebab-cased (the core alias above keeps the raw
+            // snake_case core export name).
             try s.byte(0x00);
-            try s.name(e.name);
+            try s.label(e.name);
             try s.byte(0x01); // sort: component func
             try s.uleb(i); // component func index i
             try s.byte(0x00); // no extern-desc ascription
@@ -208,7 +220,8 @@ test "encode: component preamble + section ids for a scalar export" {
     // A throwaway "core" payload — encode embeds it verbatim; structural test.
     const core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
     const params = [_]Scalar{ .s64, .s64 };
-    const exports = [_]Export{.{ .name = "add", .core_name = "add", .params = &params, .ret = .s64 }};
+    const param_names = [_][]const u8{ "a", "b" };
+    const exports = [_]Export{.{ .name = "add", .core_name = "add", .params = &params, .param_names = &param_names, .ret = .s64 }};
     const bytes = try encode(testing.allocator, &core, &exports);
     defer testing.allocator.free(bytes);
 
@@ -219,8 +232,30 @@ test "encode: component preamble + section ids for a scalar export" {
     for ([_]u8{ 1, 2, 6, 7, 8, 11 }) |id| {
         try testing.expect(std.mem.indexOfScalar(u8, bytes, id) != null);
     }
-    // The export name is present, with its leading 0x00 plain-name tag.
+    // The export name is present, with its leading 0x00 plain-name tag, and the
+    // real param names are encoded (so `wasm-tools component wit` round-trips
+    // `func(a: s64, b: s64)`, not `p0/p1`).
     try testing.expect(std.mem.indexOf(u8, bytes, "add") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "a") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "b") != null);
+}
+
+test "encode: component-model labels are kebab-cased from snake_case" {
+    // q64 identifiers are snake_case; component-model labels must be kebab-case
+    // (a `_` fails component validation). `encode` maps `get_version` →
+    // `get-version` and the param `min_value` → `min-value`.
+    const core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const params = [_]Scalar{.s64};
+    const param_names = [_][]const u8{"min_value"};
+    const exports = [_]Export{.{ .name = "get_version", .core_name = "get_version", .params = &params, .param_names = &param_names, .ret = .s64 }};
+    const bytes = try encode(testing.allocator, &core, &exports);
+    defer testing.allocator.free(bytes);
+
+    // The kebab forms are present; the snake forms are not (except as the
+    // core-alias name, which intentionally keeps the raw core export name).
+    try testing.expect(std.mem.indexOf(u8, bytes, "get-version") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "min-value") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "min_value") == null);
 }
 
 test "Scalar.fromHir maps the canonical-ABI scalar surface" {

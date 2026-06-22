@@ -280,6 +280,12 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
         const is_entry = (hmod.entry != null and hmod.entry.? == i);
         if (f.visibility != .public and !is_entry) continue;
         const params = try allocator.alloc(component.Scalar, f.params.len);
+        // The parallel param-name vector: the q64 source identifiers, lifted
+        // into the component's WIT type so the world round-trips real names
+        // (the encoder kebab-cases them). The slices alias the HIR, which
+        // outlives this call (freed at function exit, after `encode`).
+        const param_names = try allocator.alloc([]const u8, f.params.len);
+        for (f.params, 0..) |p, j| param_names[j] = p.name;
         var ok = true;
         for (f.params, 0..) |p, j| {
             params[j] = component.Scalar.fromHir(p.ty) orelse {
@@ -289,20 +295,26 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
         }
         const ret: ?component.Scalar = if (f.ret == .void) null else component.Scalar.fromHir(f.ret) orelse {
             allocator.free(params);
+            allocator.free(param_names);
             continue;
         };
         if (!ok) {
             allocator.free(params);
+            allocator.free(param_names);
             continue;
         }
         try exports.append(allocator, .{
             .name = f.name,
             .core_name = if (is_entry) "_start" else f.name,
             .params = params,
+            .param_names = param_names,
             .ret = ret,
         });
     }
-    defer for (exports.items) |e| allocator.free(e.params);
+    defer for (exports.items) |e| {
+        allocator.free(e.params);
+        allocator.free(e.param_names);
+    };
 
     if (exports.items.len == 0) return Error.ComponentNoExports;
     return .{ .component = try component.encode(allocator, core, exports.items) };
@@ -407,8 +419,19 @@ pub fn showWorld(allocator: std.mem.Allocator, source: []const u8, file: []const
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     const world = worldName(file);
-    try out.print(allocator, "// synthesized WIT world for {s} (q64 show world)\n", .{file});
-    try out.print(allocator, "world {s} {{\n", .{world});
+    // Emit a valid, standalone WIT document: a `package` declaration plus the
+    // synthesized `world`. This is also the on-disk `<name>.wit` artifact
+    // `q64 emit --component` writes and `q64 show world --out` saves (WIT rung
+    // 1) — the contract the Continuum stores and `wac` consumes. For a pure
+    // library this parses standalone; an app's world references external
+    // packages (wasi:cli), whose authoritative form is the adapted component.
+    try out.appendSlice(allocator, "// synthesized WIT world (q64 show world)\n");
+    try out.appendSlice(allocator, "package q64:");
+    try appendKebab(allocator, &out, world);
+    try out.appendSlice(allocator, ";\n\n");
+    try out.appendSlice(allocator, "world ");
+    try appendKebab(allocator, &out, world);
+    try out.appendSlice(allocator, " {\n");
 
     // Imports — the derived capability set, mapped to WIT interfaces. `@io`
     // (the umbrella) and `@wire` carry no fixed interface, so they're noted but
@@ -436,10 +459,14 @@ pub fn showWorld(allocator: std.mem.Allocator, source: []const u8, file: []const
         for (hmod.funcs, 0..) |f, i| {
             const is_entry = (hmod.entry != null and hmod.entry.? == i);
             if (f.visibility != .public and !is_entry) continue;
-            try out.print(allocator, "  export {s}: func(", .{f.name});
+            try out.appendSlice(allocator, "  export ");
+            try appendKebab(allocator, &out, f.name);
+            try out.appendSlice(allocator, ": func(");
             for (f.params, 0..) |p, pi| {
                 if (pi > 0) try out.appendSlice(allocator, ", ");
-                try out.print(allocator, "{s}: {s}", .{ p.name, witType(p.ty) });
+                try appendKebab(allocator, &out, p.name);
+                try out.appendSlice(allocator, ": ");
+                try out.appendSlice(allocator, witType(p.ty));
             }
             try out.appendSlice(allocator, ")");
             if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
@@ -497,6 +524,12 @@ fn witType(t: ir.hir.Type) []const u8 {
         .ptr => "u64", // internal pointer width; not a canonical-ABI export type
         .void => "_",
     };
+}
+
+/// Append `s` mapping the snake_case `_` q64 uses to the kebab-case `-` WIT
+/// requires (component-model labels reject `_`). Length-preserving.
+fn appendKebab(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |ch| try out.append(allocator, if (ch == '_') '-' else ch);
 }
 
 /// Derive a WIT world name from the source file: its basename without the

@@ -91,16 +91,18 @@ fn usage(io: std.Io) !void {
         \\
         \\Commands:
         \\  check <file> [--diagnostics json]  Parse a single file and emit diagnostics.
-        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--module name=dir ...]
+        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--component] [--module name=dir ...]
         \\                                     Compile a q64 source file to wasm via codegen.
         \\                                     --addr selects the linear-memory address space
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
+        \\                                     --component also writes <out>.component.wasm + <out>.wit.
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
         \\  show <hir|mir|symbols> <file.q> [--module name=dir ...]
         \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
         \\  show effects <fn> --qube <file.q>  Print a function's inferred capability effect set.
         \\  show capabilities --qube <file.q>  Print the qube's compiler-derived capability set.
-        \\  show world --qube <file.q>         Print the synthesized WIT world (exports + imports).
+        \\  show world --qube <file.q> [--out <file.wit>]
+        \\                                     Print (or write) the synthesized WIT world.
         \\  doc --json [--qube <file.q>]       Emit the language documentation index as JSON.
         \\  explain <code> [--diagnostics json]  Print documentation for a diagnostic code.
         \\  --version                          Print the version and exit.
@@ -382,6 +384,23 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
                 try adaptPreview1Component(gpa, io, env, core, comp_path);
             },
         }
+
+        // WIT rung 1: also write the synthesized world to `<base>.wit` next to
+        // the component — the on-disk contract artifact the Continuum stores
+        // and `wac`/`wasm-tools` consume. The component embeds its own type
+        // (round-trips via `wasm-tools component wit`); this is its source-level
+        // companion. Same synthesis as `q64 show world`.
+        const wit = emit.showWorld(gpa, source, src, module_sources.items) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("q64: WIT emit failed: {s}\n", .{@errorName(err)});
+            try w.interface.flush();
+            std.process.exit(1);
+        };
+        defer gpa.free(wit);
+        const wit_path = try std.fmt.allocPrint(gpa, "{s}.wit", .{base});
+        defer gpa.free(wit_path);
+        try writeFile(io, wit_path, wit);
     }
 }
 
@@ -621,6 +640,9 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     // function name) for `effects`. The qube-level kinds take `--qube` instead.
     var arg2: ?[]const u8 = null;
     var qube_file: ?[]const u8 = null;
+    // `--out <file>` redirects the dump to a file instead of stdout (spec
+    // §"show"); the on-disk WIT companion to `q64 show world` (WIT rung 1).
+    var out_path: ?[]const u8 = null;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
 
@@ -640,6 +662,11 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
             try module_args.append(gpa, .{ .name = spec[0..eq], .dir = spec[eq + 1 ..] });
         } else if (std.mem.eql(u8, a, "--qube")) {
             qube_file = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, a, "--out")) {
+            out_path = args_it.next() orelse {
                 try usage(io);
                 std.process.exit(2);
             };
@@ -725,6 +752,13 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         std.process.exit(1);
     };
     defer gpa.free(dump);
+
+    // `--out <file>` writes the dump to disk (e.g. `show world --out app.wit`);
+    // otherwise it goes to stdout.
+    if (out_path) |op| {
+        try writeFile(io, op, dump);
+        return;
+    }
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(io, &buf);

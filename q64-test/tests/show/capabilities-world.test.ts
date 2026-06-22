@@ -7,6 +7,9 @@
  * the WIT-world synthesis). `show denials` needs the `with_capabilities(deny:)`
  * language feature, which isn't parsed yet — it stays `test.failing`.
  */
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { binaryAvailable, fixture, runCli } from "../../src/harness";
 
@@ -48,5 +51,27 @@ describe.skipIf(!binaryAvailable())("q64 show world", () => {
     expect(r.stdout).toContain("export version: func() -> string");
     expect(r.stdout).toContain("export add: func(a: s64, b: s64) -> s64");
     expect(r.stdout).toContain("(none — pure surface)");
+  });
+
+  test("emits a valid standalone WIT document — a `package` declaration", () => {
+    // WIT rung 1: the synthesized world is a real .wit document (the artifact
+    // `emit --component` writes and the Continuum stores), so it carries a
+    // package declaration, not just a bare `world` block.
+    const r = runCli(["show", "world", "--qube", fixture("library.q")]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("package q64:library;");
+  });
+
+  test("--out writes the world to a file (the .wit artifact), exit 0", () => {
+    const dir = mkdtempSync(join(tmpdir(), "q64-wit-"));
+    const out = join(dir, "library.wit");
+    const r = runCli(["show", "world", "--qube", fixture("library.q"), "--out", out]);
+    expect(r.exitCode).toBe(0);
+    // Nothing on stdout — the dump went to the file.
+    expect(r.stdout.trim()).toBe("");
+    const wit = readFileSync(out, "utf8");
+    expect(wit).toContain("package q64:library;");
+    expect(wit).toContain("world library {");
+    expect(wit).toContain("export add: func(a: s64, b: s64) -> s64");
   });
 });

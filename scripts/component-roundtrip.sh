@@ -52,11 +52,33 @@ trap 'rm -rf "$tmp"' EXIT
 cat > "$tmp/mathlib.q" <<'EOF'
 pub fn add(a: i64, b: i64) -> i64 { a + b }
 pub fn mul(a: i64, b: i64) -> i64 { a * b }
+pub fn min_of(first: i64, second: i64) -> i64 { if first < second { first } else { second } }
 EOF
 
 echo "==> q64 emit --component (scalar library)"
 "$Q64_BIN" emit "$tmp/mathlib.q" "$tmp/mathlib.wasm" --addr wasm32 --component
 test -f "$tmp/mathlib.component.wasm" || { echo "FAIL: no component artifact" >&2; exit 1; }
+
+# WIT rung 1: --component also writes the synthesized world to <base>.wit.
+echo "==> q64 emit --component also writes the <base>.wit world artifact"
+test -f "$tmp/mathlib.wit" || { echo "FAIL: no .wit artifact next to the component" >&2; exit 1; }
+grep -q "world mathlib" "$tmp/mathlib.wit" || { echo "FAIL: .wit missing the named world" >&2; cat "$tmp/mathlib.wit" >&2; exit 1; }
+grep -q "export add: func(a: s64, b: s64) -> s64" "$tmp/mathlib.wit" || { echo "FAIL: .wit missing the real-named export signature" >&2; cat "$tmp/mathlib.wit" >&2; exit 1; }
+echo "    ok: mathlib.wit carries 'world mathlib' + 'export add: func(a: s64, b: s64) -> s64'"
+
+# The .wit is valid standalone WIT (a pure library imports nothing).
+if [ -x "$WASMTOOLS_BIN" ]; then
+    "$WASMTOOLS_BIN" component wit "$tmp/mathlib.wit" >/dev/null || { echo "FAIL: emitted .wit does not parse" >&2; exit 1; }
+    # The component binary embeds its own type → wasm-tools round-trips the world
+    # with the REAL param names (a/b), not the placeholder p0/p1.
+    rt="$("$WASMTOOLS_BIN" component wit "$tmp/mathlib.component.wasm")"
+    echo "$rt" | grep -q "export add: func(a: s64, b: s64) -> s64" || { echo "FAIL: component does not round-trip real param names" >&2; echo "$rt" >&2; exit 1; }
+    echo "    ok: wasm-tools component wit round-trips 'func(a: s64, b: s64)' from the component binary"
+    # Component-model labels are kebab-case: q64's snake_case `min_of` lifts as
+    # `min-of` (a `_` would fail component validation).
+    echo "$rt" | grep -q "export min-of:" || { echo "FAIL: snake_case export not kebab-cased to 'min-of'" >&2; echo "$rt" >&2; exit 1; }
+    echo "    ok: snake_case 'min_of' lifts as the kebab-case label 'min-of'"
+fi
 
 echo "==> wasmtime: validate component"
 "$CHECK_BIN" "$tmp/mathlib.component.wasm"
@@ -133,6 +155,8 @@ rm -rf "$mathlib_dir/target"
 ( cd "$mathlib_dir" && Q64_BIN="$Q64_BIN" "$QUBE_BIN" build --component )
 mathlib_comp="$mathlib_dir/target/debug/wasm64/dev.q64.math.component.wasm"
 test -f "$mathlib_comp" || { echo "FAIL: qube build produced no component" >&2; exit 1; }
+test -f "$mathlib_dir/target/debug/wasm64/dev.q64.math.wit" || { echo "FAIL: qube build --component produced no .wit world artifact" >&2; exit 1; }
+echo "    ok: qube build --component also emitted dev.q64.math.wit"
 echo "==> wasmtime: call dev.q64.math add(40,2) == 42"
 "$CHECK_BIN" "$mathlib_comp" add 40 2 42
 rm -rf "$mathlib_dir/target"
