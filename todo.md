@@ -1587,14 +1587,23 @@ notes below).
         **link via `qube wac`** into one component, import satisfied — verified
         end-to-end in `scripts/wac-roundtrip.sh` (q64↔q64 case) + the
         manifest-driven flow. This closes the q64↔q64 link-at-build loop.
-      - **Remaining — the source-level call.** The component now declares its
-        imports *and* a provider can export a matching interface, so they link;
-        the last piece is q64 **source** *calling* a foreign import (`iface.fn(x)`
-        in a q64 body): a foreign-symbol kind in name resolution (NAM), a
-        foreign-call node through HIR/MIR, and a returning core-module import at
-        the call site (the `host_call` seam is the template). Rich-type calls
-        share the non-scalar canonical-ABI memory glue still outstanding on the
-        export side.
+      - **Source-level call — LANDED (scalar path).** q64 **source** now *calls*
+        a foreign import: `<iface>.<fn>(args)` in a q64 body lowers to a
+        `foreign_call` HIR/MIR node (gated on the `--wit-import` table, so
+        import-free qubes are unaffected) and a **returning** core-module import
+        at the call site (the `host_call` seam was the template, extended to
+        carry a result + scalar args via `slideCall`). The component encoder
+        (`component.zig`) wires each such core import — alias the imported
+        instance's export, `canon lower` it to a core func, feed it back as the
+        main module's instantiation import — so the consumer is a *valid*
+        component whose core genuinely imports (not a phantom forward-decl). A
+        qube **imports what it calls**, not what it declares (`emitComponent`
+        filters the table to the funcs actually used). Verified end-to-end:
+        `scripts/wac-roundtrip.sh` builds a q64 provider + a q64 consumer that
+        calls `math.add(x, 100)`, links them with `qube wac`, and **runs** the
+        result under wasmtime (`compute(5) == 105` — the call reached the linked
+        provider). Rich-type (non-scalar) foreign calls share the canonical-ABI
+        memory glue still outstanding on the export side.
 - [ ] **6. Host-side composition (qubepods).** Tracked in `qubepods/TODO.md`
       §"WIT in the host" — the host validates a deployed component against its
       declared world and composes heterogeneous components over shared WIT.

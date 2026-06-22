@@ -13,9 +13,11 @@
 # Engine: the real `wac` when available (env Q64_WAC or vendor/wac/wac), else
 # the vendored `wasm-tools compose` fallback. Both are exercised when present.
 #
-# The provider/consumer are built with wasm-tools (q64 doesn't yet emit
-# matching-interface-id exports — the source-level foreign-call work); this
-# proves the `qube wac` plumbing + the composition engine.
+# Two layers: (1) a wasm-tools-built provider/consumer pair proves the `qube wac`
+# plumbing + composition engine; (2) a q64↔q64 pair proves the real path — a q64
+# provider exports a named interface, a q64 consumer makes a source-level foreign
+# CALL (`math.add(x, 100)`) that lowers to a wired core import, they're linked,
+# and the linked component is RUN to confirm the call reached the provider.
 
 set -euo pipefail
 
@@ -114,15 +116,34 @@ if [[ -x "$Q64_BIN" ]]; then
     "$Q64_BIN" emit "$tmp/qprov.q" "$tmp/qprov.wasm" --addr wasm32 --component --export-interface "acme:mathlib/math"
     "$WASMTOOLS_BIN" component wit "$tmp/qprov.component.wasm" | grep -q "export acme:mathlib/math" \
         || { echo "FAIL: q64 provider does not export the interface" >&2; exit 1; }
-    # Consumer: a q64 library importing acme:mathlib/math.
+    # Consumer: a q64 library that imports acme:mathlib/math AND calls it —
+    # `compute(x)` is `math.add(x, 100)`, a real source-level foreign call that
+    # lowers to a core import the component wires to the imported interface.
     printf 'package acme:mathlib;\ninterface math { add: func(a: s64, b: s64) -> s64; }\n' > "$tmp/math.wit"
-    printf 'pub fn compute(x: i64) -> i64 { x + 1 }\n' > "$tmp/qcons.q"
+    printf 'pub fn compute(x: i64) -> i64 { math.add(x, 100) }\n' > "$tmp/qcons.q"
     "$Q64_BIN" emit "$tmp/qcons.q" "$tmp/qcons.wasm" --addr wasm32 --component --wit-import "$tmp/math.wit"
     "$WASMTOOLS_BIN" component wit "$tmp/qcons.component.wasm" | grep -q "import acme:mathlib/math" \
         || { echo "FAIL: q64 consumer does not import the interface" >&2; exit 1; }
+    # The consumer alone is a valid component whose core genuinely imports the
+    # foreign func (not a phantom forward-declaration).
+    "$WASMTOOLS_BIN" validate "$tmp/qcons.component.wasm" \
+        || { echo "FAIL: q64 consumer component invalid" >&2; exit 1; }
     "$QUBE_BIN" wac plug "$tmp/qcons.component.wasm" --plug "$tmp/qprov.component.wasm" -o "$tmp/qlinked.wasm" \
         2>&1 | grep -v "deprecated\|wac instead\|information about" || true
     assert_composed_iface "$tmp/qlinked.wasm" "q64↔q64"
+
+    # Run the linked component: `compute(x)` must invoke the provider's `add`
+    # across the component boundary, so `compute(5)` == add(5, 100) == 105. This
+    # is the end-to-end proof the foreign CALL works, not just the wiring.
+    WASMTIME_BIN="${Q64_WASMTIME:-$REPO_ROOT/vendor/wasmtime/bin/wasmtime}"
+    if [[ -x "$WASMTIME_BIN" ]]; then
+        got="$("$WASMTIME_BIN" run --invoke 'compute(5)' "$tmp/qlinked.wasm" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$got" == "105" ]] \
+            && echo "    ok (q64↔q64 run): compute(5) = 105 — the foreign call reached the linked provider" \
+            || { echo "FAIL: linked compute(5) = '$got', expected 105" >&2; exit 1; }
+    else
+        echo "    SKIP run (set Q64_WASMTIME or vendor vendor/wasmtime/bin/wasmtime to execute the link)"
+    fi
 else
     echo "==> SKIP q64↔q64 (set Q64_BIN or build q64 to exercise it)"
 fi

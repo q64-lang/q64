@@ -207,7 +207,28 @@ pub fn emitFromSource(
     modules: []const ModuleSource,
     addr: AddressSpace,
 ) ![]u8 {
-    var hmod = try buildHir(allocator, source, file, modules);
+    return emitFromSourceWithImports(allocator, source, file, modules, addr, &.{});
+}
+
+/// As `emitFromSource`, but with a foreign WIT import table (`--wit-import`,
+/// WIT rung 5). A `<iface>.<fn>(…)` source call against one of these lowers to a
+/// real core import + call, so the emitted core module imports
+/// `(import "<wit-id>" "<fn>" …)`. With an empty table this is `emitFromSource`.
+pub fn emitFromSourceWithImports(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    file: []const u8,
+    modules: []const ModuleSource,
+    addr: AddressSpace,
+    foreign: []const component.ImportIface,
+) ![]u8 {
+    // The derived foreign table is only consulted while building the HIR (the
+    // HIR's `foreign_call` nodes alias the original import data, not this table),
+    // so a scratch arena freed at return covers it.
+    var fa = std.heap.ArenaAllocator.init(allocator);
+    defer fa.deinit();
+    const foreign_table = try deriveForeignTable(fa.allocator(), foreign);
+    var hmod = try buildHir(allocator, source, file, modules, foreign_table);
     defer hmod.deinit();
     var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
         // A shape the lowerer doesn't handle yet → honest UnsupportedExpression.
@@ -259,8 +280,80 @@ pub const ComponentArtifact = union(enum) {
 /// capability the lift can't satisfy (e.g. a `qview.*` face) is likewise
 /// `ComponentNeedsImportLowering`; a surface with no liftable export is
 /// `ComponentNoExports`.
+/// Map a component-ABI scalar to the HIR value type the call binding uses.
+fn scalarToHirType(s: component.Scalar) ir.hir.Type {
+    return switch (s) {
+        .s64 => .i64,
+        .bool_ => .bool,
+        .f64 => .f64,
+    };
+}
+
+/// The q64-source name for an imported interface: the last id segment of its
+/// component-model id (`acme:mathlib/math@1.0.0` → `math`). Strips the version
+/// suffix and the `package:` / `path/` prefixes so source can write `math.add`.
+fn ifaceLocalName(wit_name: []const u8) []const u8 {
+    var s = wit_name;
+    if (std.mem.indexOfScalar(u8, s, '@')) |at| s = s[0..at];
+    if (std.mem.lastIndexOfScalar(u8, s, '/')) |slash| s = s[slash + 1 ..];
+    return s;
+}
+
+/// Lower the codegen import descriptors (`component.ImportIface`, the same data
+/// the component encoder consumes) to the HIR foreign table the builder matches
+/// `<iface>.<fn>(…)` calls against. Arena-allocated from `a` (outlives the HIR).
+fn deriveForeignTable(a: std.mem.Allocator, foreign: []const component.ImportIface) ![]const ir.hir.ForeignIface {
+    if (foreign.len == 0) return &.{};
+    const ifaces = try a.alloc(ir.hir.ForeignIface, foreign.len);
+    for (foreign, ifaces) |src, *dst| {
+        const funcs = try a.alloc(ir.hir.ForeignFn, src.funcs.len);
+        for (src.funcs, funcs) |sf, *df| {
+            const params = try a.alloc(ir.hir.Type, sf.params.len);
+            for (sf.params, params) |sp, *dp| dp.* = scalarToHirType(sp);
+            df.* = .{
+                .name = sf.name,
+                .params = params,
+                .ret = if (sf.ret) |r| scalarToHirType(r) else .void,
+            };
+        }
+        dst.* = .{ .local = ifaceLocalName(src.wit_name), .wit_id = src.wit_name, .funcs = funcs };
+    }
+    return ifaces;
+}
+
+/// Filter the declared foreign import table down to exactly the interfaces and
+/// functions the lowered core actually calls (its `foreign_call` sites). The
+/// component encoder wires the core module's instantiation imports to these, so
+/// the set must match the core's real imports — a declared-but-unused interface
+/// would otherwise leave the instantiate args mismatched. Arena-allocated.
+fn filterUsedImports(a: std.mem.Allocator, foreign: []const component.ImportIface, mmod: *const ir.mir.Module) ![]const component.ImportIface {
+    if (foreign.len == 0) return &.{};
+    var used = std.StringHashMapUnmanaged(*const ir.mir.Inst){};
+    defer used.deinit(a);
+    for (mmod.funcs) |f| switch (f.body) {
+        .structured => |root| try scanForeignCalls(root, &used, a),
+        .cfg => {},
+    };
+    var out: std.ArrayList(component.ImportIface) = .empty;
+    for (foreign) |iface| {
+        var funcs: std.ArrayList(component.ImportFunc) = .empty;
+        for (iface.funcs) |f| {
+            const key = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ iface.wit_name, f.name });
+            if (used.contains(key)) try funcs.append(a, f);
+        }
+        if (funcs.items.len > 0) try out.append(a, .{ .wit_name = iface.wit_name, .funcs = try funcs.toOwnedSlice(a) });
+    }
+    return out.toOwnedSlice(a);
+}
+
 pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace, foreign: []const component.ImportIface, export_interface: ?[]const u8) !ComponentArtifact {
-    var hmod = try buildHir(allocator, source, file, modules);
+    // Scratch arena for the derived foreign table + the used-import filter; both
+    // are consumed within this call (HIR build and `component.encode`), so freeing
+    // at return is safe — the returned artifact owns its own (gpa) bytes.
+    var fa = std.heap.ArenaAllocator.init(allocator);
+    defer fa.deinit();
+    const foreign_table = try deriveForeignTable(fa.allocator(), foreign);
+    var hmod = try buildHir(allocator, source, file, modules, foreign_table);
     defer hmod.deinit();
     var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
         error.Unsupported => return Error.UnsupportedExpression,
@@ -295,10 +388,13 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null);
     defer allocator.free(core);
 
-    // A library core that still imports something (e.g. a `qview.*` host face)
-    // can't be lifted by the scalar encoder — report it honestly rather than
-    // emitting an invalid component.
-    if (coreHasImports(core)) return Error.ComponentNeedsImportLowering;
+    // The only core imports the scalar encoder can wire are foreign WIT imports
+    // (the `foreign_call` binding): it aliases + canon-lowers each into the core
+    // module's instantiation imports. Anything else (a `qview.*` host face) can't
+    // be lifted here — report it honestly. The wired set is exactly the foreign
+    // funcs the source actually calls.
+    const used_imports = try filterUsedImports(fa.allocator(), foreign, &mmod);
+    if (coreHasImports(core) and used_imports.len == 0) return Error.ComponentNeedsImportLowering;
 
     // Gather the scalar public exports. A non-scalar (`str`/list) export needs
     // memory/realloc canon options not in this slice — skip it for now.
@@ -345,7 +441,7 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     };
 
     if (exports.items.len == 0) return Error.ComponentNoExports;
-    return .{ .component = try component.encode(allocator, core, exports.items, foreign) };
+    return .{ .component = try component.encode(allocator, core, exports.items, used_imports) };
 }
 
 /// Scan a core module for an import section (id 2). Used to gate component
@@ -370,16 +466,24 @@ fn coreHasImports(core: []const u8) bool {
     return false;
 }
 
-/// Build the HIR for `source` and return its text dump (`q64 show hir`).
-pub fn showHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
-    var hmod = try buildHir(allocator, source, file, modules);
+/// Build the HIR for `source` and return its text dump (`q64 show hir`). The
+/// foreign WIT import table (`--wit-import`) lets `<iface>.<fn>(…)` calls resolve
+/// to `foreign_call` nodes; empty when the qube imports nothing.
+pub fn showHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, foreign: []const component.ImportIface) ![]u8 {
+    var fa = std.heap.ArenaAllocator.init(allocator);
+    defer fa.deinit();
+    const foreign_table = try deriveForeignTable(fa.allocator(), foreign);
+    var hmod = try buildHir(allocator, source, file, modules, foreign_table);
     defer hmod.deinit();
     return ir.print.hirToString(allocator, &hmod);
 }
 
 /// Lower `source` to MIR and return its text dump (`q64 show mir`).
-pub fn showMir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
-    var hmod = try buildHir(allocator, source, file, modules);
+pub fn showMir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, foreign: []const component.ImportIface) ![]u8 {
+    var fa = std.heap.ArenaAllocator.init(allocator);
+    defer fa.deinit();
+    const foreign_table = try deriveForeignTable(fa.allocator(), foreign);
+    var hmod = try buildHir(allocator, source, file, modules, foreign_table);
     defer hmod.deinit();
     var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
         error.Unsupported => return Error.UnsupportedExpression,
@@ -395,7 +499,7 @@ pub fn showMir(allocator: std.mem.Allocator, source: []const u8, file: []const u
 /// function that reaches no capability). An unknown function name is
 /// `NameNotFound`, matching `emit`/`show hir`.
 pub fn showEffects(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, fn_name: []const u8) ![]u8 {
-    var hmod = try buildHir(allocator, source, file, modules);
+    var hmod = try buildHir(allocator, source, file, modules, &.{});
     defer hmod.deinit();
     for (hmod.funcs) |f| {
         if (std.mem.eql(u8, f.name, fn_name)) {
@@ -416,7 +520,7 @@ pub fn showEffects(allocator: std.mem.Allocator, source: []const u8, file: []con
 /// (spec/q64-cli.md §"show", spec/modules.md §"The qube as a component"). One
 /// marker per line, finest-grained first; `(none)` when the surface is pure.
 pub fn showCapabilities(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) ![]u8 {
-    var hmod = try buildHir(allocator, source, file, modules);
+    var hmod = try buildHir(allocator, source, file, modules, &.{});
     defer hmod.deinit();
     const caps = qubeCapabilities(&hmod);
 
@@ -452,8 +556,12 @@ pub fn showWorld(
     modules: []const ModuleSource,
     world_override: ?[]const u8,
     package_override: ?[]const u8,
+    foreign: []const component.ImportIface,
 ) ![]u8 {
-    var hmod = try buildHir(allocator, source, file, modules);
+    var fa = std.heap.ArenaAllocator.init(allocator);
+    defer fa.deinit();
+    const foreign_table = try deriveForeignTable(fa.allocator(), foreign);
+    var hmod = try buildHir(allocator, source, file, modules, foreign_table);
     defer hmod.deinit();
     const caps = qubeCapabilities(&hmod);
 
@@ -492,6 +600,13 @@ pub fn showWorld(
             try out.print(allocator, "  import {s};\n", .{wit});
             any_import = true;
         }
+    }
+    // Foreign WIT imports (`--wit-import`, WIT rung 5): each interface the qube
+    // links against is a named `import <interface-id>;`. Emitted whether or not
+    // the source already calls it — the contract is what the qube declares.
+    for (foreign) |iface| {
+        try out.print(allocator, "  import {s};\n", .{iface.wit_name});
+        any_import = true;
     }
     if (!any_import) try out.appendSlice(allocator, "  // (none — pure surface)\n");
 
@@ -651,7 +766,7 @@ fn linkerLookupShim(ctx: *anyopaque, name: []const u8) ?ast.FnDecl {
 /// surfaces as its diagnostic code (`build_hir.Reject` → `mapReject`). The
 /// parse result and linker are scoped to HIR construction (the HIR retains
 /// no AST or linker pointers), so both are freed before returning.
-fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource) !ir.hir.Module {
+fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, foreign: []const ir.hir.ForeignIface) !ir.hir.Module {
     const parse_result = try parse.parse(allocator, source, file);
     defer parse_result.deinit(allocator);
     const sf = ast.SourceFile.cast(parse_result.root) orelse return Error.NoMainFunction;
@@ -672,7 +787,7 @@ fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, 
     };
 
     const mres = ir.hir.ModuleResolver{ .ctx = &linker, .lookupFn = linkerLookupShim };
-    return switch (try ir.build_hir.tryBuild(allocator, sf, mres)) {
+    return switch (try ir.build_hir.tryBuild(allocator, sf, mres, foreign)) {
         .unsupported => Error.UnsupportedExpression,
         .rejected => |r| mapReject(r),
         .module => |m| m,
@@ -897,6 +1012,42 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         }
     }
 
+    // Foreign WIT imports (`<iface>.<fn>(…)` from `--wit-import`). Unlike host
+    // faces these return a value: declare `(import "<wit-id>" "<fn>" (param …)
+    // (result …))` with scalar param/result types read off a representative call
+    // inst, and map "<module>\x00<field>" → the internal import name for the
+    // `.foreign_call` lowering.
+    var foreign_imports = std.StringHashMapUnmanaged([*:0]const u8){};
+    {
+        var sites = std.StringHashMapUnmanaged(*const ir.mir.Inst){};
+        for (m.funcs) |f| {
+            const inst = switch (f.body) {
+                .structured => |x| x,
+                .cfg => return Error.CfgUnsupported,
+            };
+            try scanForeignCalls(inst, &sites, na);
+        }
+        var it = sites.iterator();
+        var fidx: u32 = 0;
+        while (it.next()) |e| : (fidx += 1) {
+            const key = e.key_ptr.*; // "<module>\x00<field>"
+            const site = e.value_ptr.*;
+            const fc = site.op.foreign_call;
+            const mod_z = try na.dupeZ(u8, fc.module);
+            const field_z = try na.dupeZ(u8, fc.field);
+            const internal_z = try na.dupeZ(u8, try std.fmt.allocPrint(na, "wit_import_{d}", .{fidx}));
+            // Scalar params only (the canonical-ABI boundary): one wasm value per
+            // arg, typed by the arg's MIR type. The result is the call inst's type.
+            var ptypes: std.ArrayList(c.BinaryenType) = .empty;
+            defer ptypes.deinit(na);
+            for (fc.args) |arg| try ptypes.append(na, wasmType(arg.ty, i64_type, i32_type, none_type, pair_type, ptr_type));
+            const ptype = if (ptypes.items.len > 0) c.BinaryenTypeCreate(ptypes.items.ptr, @intCast(ptypes.items.len)) else none_type;
+            const rtype = wasmType(site.ty, i64_type, i32_type, none_type, pair_type, ptr_type);
+            c.BinaryenAddFunctionImport(module, internal_z.ptr, mod_z.ptr, field_z.ptr, ptype, rtype);
+            try foreign_imports.put(na, key, internal_z.ptr);
+        }
+    }
+
     // Module-level mutable i64 globals (reactive `state`). One `(global (mut i64))`
     // per entry, initialized to its `state` value; names `g0`, `g1`, … (arena-held).
     const global_names = try na.alloc([*:0]const u8, m.globals.len);
@@ -952,6 +1103,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .fs_dest_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7,
             .fs_len_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + 1,
             .host_imports = &host_imports,
+            .foreign_imports = &foreign_imports,
             .global_names = global_names,
             .stdout_abi = stdout_abi,
             .iovec_base = iovec_base,
@@ -1094,6 +1246,10 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .fmt_int_to_str => |inner| want_int or bodyHasOut(inner, want_int),
         .host_call => |hc| blk: {
             for (hc.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
+            break :blk false;
+        },
+        .foreign_call => |fc| blk: {
+            for (fc.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
             break :blk false;
         },
         .global_set => |gs| bodyHasOut(gs.value, want_int),
@@ -1339,6 +1495,13 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             mergeScratch(s, &sub);
             if (1 + sub.region_depth > s.region_depth) s.region_depth = 1 + sub.region_depth;
         },
+        .foreign_call => |fc| {
+            // Like a call: wraps its args in a reclamation region.
+            var sub = Scratch{};
+            for (fc.args) |a| scanScratch(a, &sub);
+            mergeScratch(s, &sub);
+            if (1 + sub.region_depth > s.region_depth) s.region_depth = 1 + sub.region_depth;
+        },
         .global_set => |gs| scanScratch(gs.value, s),
         .str_len => |inner| scanScratch(inner, s),
         .str_index => |si| {
@@ -1415,6 +1578,44 @@ fn scanHostCalls(inst: *const ir.mir.Inst, out: *std.StringHashMapUnmanaged([]co
     }
 }
 
+/// Collect distinct foreign WIT imports (`<module>.<field>`) keyed by
+/// `"<module>\x00<field>"`, each mapped to a representative call inst (so the
+/// import can be declared with the right scalar param types and result type).
+/// A foreign call's args may themselves contain nested foreign calls, so recurse
+/// into them. Two sites of the same import are assumed to share a signature.
+fn scanForeignCalls(inst: *const ir.mir.Inst, out: *std.StringHashMapUnmanaged(*const ir.mir.Inst), a: std.mem.Allocator) Error!void {
+    switch (inst.op) {
+        .block => |items| for (items) |ch| try scanForeignCalls(ch, out, a),
+        .if_ => |iff| {
+            try scanForeignCalls(iff.cond, out, a);
+            try scanForeignCalls(iff.then_, out, a);
+            if (iff.else_) |e| try scanForeignCalls(e, out, a);
+        },
+        .while_ => |w| {
+            try scanForeignCalls(w.cond, out, a);
+            try scanForeignCalls(w.body, out, a);
+        },
+        .loop => |body| try scanForeignCalls(body, out, a),
+        .local_set => |ls| try scanForeignCalls(ls.value, out, a),
+        .global_set => |gs| try scanForeignCalls(gs.value, out, a),
+        .ret => |v| if (v) |val| try scanForeignCalls(val, out, a),
+        .bin => |b| {
+            try scanForeignCalls(b.lhs, out, a);
+            try scanForeignCalls(b.rhs, out, a);
+        },
+        .un => |u| try scanForeignCalls(u.operand, out, a),
+        .num_cast, .bitcast => |src| try scanForeignCalls(src, out, a),
+        .call => |cl| for (cl.args) |arg| try scanForeignCalls(arg, out, a),
+        .host_call => |hc| for (hc.args) |arg| try scanForeignCalls(arg, out, a),
+        .foreign_call => |fc| {
+            const key = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ fc.module, fc.field });
+            try out.put(a, key, inst);
+            for (fc.args) |arg| try scanForeignCalls(arg, out, a);
+        },
+        else => {},
+    }
+}
+
 /// Lowers MIR instructions to Binaryen expressions. Carries the per-function
 /// context (the funcs table for call resolution, the pair scratch local).
 const Lowerer = struct {
@@ -1458,6 +1659,9 @@ const Lowerer = struct {
     /// Dotted host-face name (`qview.text`) → the declared wasm import's internal
     /// name (`qview_text`, null-terminated), for lowering `host_call`.
     host_imports: *const std.StringHashMapUnmanaged([*:0]const u8) = undefined,
+    /// `"<module>\x00<field>"` → the declared wasm import's internal name, for
+    /// lowering `foreign_call` (a `--wit-import` interface function).
+    foreign_imports: *const std.StringHashMapUnmanaged([*:0]const u8) = undefined,
     /// Wasm global names by index (`g0`, `g1`, …), for `global_get`/`global_set`.
     global_names: []const [*:0]const u8 = &.{},
     /// How a stdout write (`env.out`) lowers: q64's `env.out` host face, or a
@@ -1676,6 +1880,25 @@ const Lowerer = struct {
                 }
                 const name = self.host_imports.get(hc.name) orelse return Error.UnsupportedCall;
                 return self.resetAfter(d, c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.none_type));
+            },
+            .foreign_call => |fc| {
+                // A foreign WIT import: scalar args (one operand each), a scalar
+                // result. Wraps in a reclamation region like a call, then slides
+                // the (scalar) result down onto the watermark.
+                const d = self.region_lvl;
+                self.region_lvl += 1;
+                defer self.region_lvl -= 1;
+                var operands: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+                defer operands.deinit(self.allocator);
+                for (fc.args) |a| try operands.append(self.allocator, try self.inst(a));
+                var key_buf: std.ArrayList(u8) = .empty;
+                defer key_buf.deinit(self.allocator);
+                try key_buf.appendSlice(self.allocator, fc.module);
+                try key_buf.append(self.allocator, 0);
+                try key_buf.appendSlice(self.allocator, fc.field);
+                const name = self.foreign_imports.get(key_buf.items) orelse return Error.UnsupportedCall;
+                const callex = c.BinaryenCall(module, name, if (operands.items.len > 0) operands.items.ptr else null, @intCast(operands.items.len), self.wty(n.ty));
+                return self.slideCall(d, n.ty, 0, callex);
             },
             .global_get => |idx| return c.BinaryenGlobalGet(module, self.global_names[idx], self.i64_type),
             .fs_read => |fr| {
@@ -3523,6 +3746,81 @@ test "emitFromSource: continue outside a loop is rejected" {
         Error.BreakOutsideLoop,
         emitFromSource(testing.allocator, app, "main.q", &modules, .wasm64),
     );
+}
+
+// --- foreign WIT imports (`--wit-import`, WIT rung 5: the source-level call) ---
+
+const test_math_iface = blk: {
+    const iparams = [_]component.Scalar{ .s64, .s64 };
+    const inames = [_][]const u8{ "a", "b" };
+    const ifuncs = [_]component.ImportFunc{.{ .name = "add", .params = &iparams, .param_names = &inames, .ret = .s64 }};
+    break :blk [_]component.ImportIface{.{ .wit_name = "acme:mathlib/math", .funcs = &ifuncs }};
+};
+
+test "emitFromSourceWithImports: a foreign call emits a core import + a call" {
+    // `math.add(x, 100)` lowers to `(import "acme:mathlib/math" "add" …)` + a
+    // call to it — the core module genuinely imports the foreign func.
+    const src = "pub fn compute(x: i64) -> i64 { math.add(x, 100) }\n";
+    const core = try emitFromSourceWithImports(testing.allocator, src, "c.q", &.{}, .wasm32, &test_math_iface);
+    defer testing.allocator.free(core);
+    // The core has an import section (id 2) — i.e. it really imports something.
+    try testing.expect(coreHasImports(core));
+    // The import module id + field survive verbatim in the import section.
+    try testing.expect(std.mem.indexOf(u8, core, "acme:mathlib/math") != null);
+    try testing.expect(std.mem.indexOf(u8, core, "add") != null);
+}
+
+test "emitFromSourceWithImports: an unknown foreign func is NameNotFound" {
+    // The interface is imported but `mul` isn't one of its funcs.
+    const src = "pub fn compute(x: i64) -> i64 { math.mul(x, 100) }\n";
+    try testing.expectError(
+        Error.NameNotFound,
+        emitFromSourceWithImports(testing.allocator, src, "c.q", &.{}, .wasm32, &test_math_iface),
+    );
+}
+
+test "emitFromSource: a foreign-looking call without the import table is unresolved" {
+    // With no `--wit-import`, `math.add` is just an unknown name — the
+    // recognition is inert, so existing programs are unaffected.
+    const src = "pub fn compute(x: i64) -> i64 { math.add(x, 100) }\n";
+    try testing.expectError(
+        Error.NameNotFound,
+        emitFromSource(testing.allocator, src, "c.q", &.{}, .wasm32),
+    );
+}
+
+test "emitComponent: a foreign call wires the import into a valid component" {
+    const src = "pub fn compute(x: i64) -> i64 { math.add(x, 100) }\n";
+    const artifact = try emitComponent(testing.allocator, src, "c.q", &.{}, .wasm32, &test_math_iface, null);
+    switch (artifact) {
+        .component => |bytes| {
+            defer testing.allocator.free(bytes);
+            // Component layer (0x01) preamble, the import section (id 0x0a), the
+            // instance-type tag (0x42), and the interface id + names all present.
+            try testing.expectEqualSlices(u8, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 }, bytes[0..8]);
+            try testing.expect(std.mem.indexOfScalar(u8, bytes, 0x0a) != null);
+            try testing.expect(std.mem.indexOfScalar(u8, bytes, 0x42) != null);
+            try testing.expect(std.mem.indexOf(u8, bytes, "acme:mathlib/math") != null);
+            try testing.expect(std.mem.indexOf(u8, bytes, "compute") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: a declared-but-uncalled import is not wired (import what you use)" {
+    // The qube declares the import but never calls it — the core has no import,
+    // and the encoder wires nothing, so the result is the import-free lift.
+    const src = "pub fn compute(x: i64) -> i64 { x + 1 }\n";
+    const artifact = try emitComponent(testing.allocator, src, "c.q", &.{}, .wasm32, &test_math_iface, null);
+    switch (artifact) {
+        .component => |bytes| {
+            defer testing.allocator.free(bytes);
+            // No interface id baked in — the unused import was dropped.
+            try testing.expect(std.mem.indexOf(u8, bytes, "acme:mathlib/math") == null);
+            try testing.expect(std.mem.indexOf(u8, bytes, "compute") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 /// The `Vec` v0 floor's runtime (spec/types.md §Growable, "v0 floor"):

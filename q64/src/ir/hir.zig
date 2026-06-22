@@ -37,6 +37,32 @@ pub const ModuleResolver = struct {
     }
 };
 
+/// One function of a foreign WIT interface a qube imports (WIT rung 5, the
+/// codegen call binding). `name` is the q64-callable function name (`add`); the
+/// param/result types are the scalar lowering of the WIT signature.
+pub const ForeignFn = struct {
+    name: []const u8,
+    params: []const Type,
+    ret: Type, // `.void` for a no-result import.
+};
+
+/// A foreign interface a qube imports by its WIT id. A source call
+/// `<local>.<fn>(args)` where `<local>` names this interface lowers to a wasm
+/// import `(import "<wit_id>" "<fn>" …)` and a call to it. `local` is the name
+/// q64 source uses to refer to the interface (its last id segment, e.g. `math`
+/// for `acme:mathlib/math`).
+pub const ForeignIface = struct {
+    local: []const u8,
+    wit_id: []const u8,
+    funcs: []const ForeignFn,
+
+    /// The function `name` in this interface, if present.
+    pub fn find(self: ForeignIface, name: []const u8) ?ForeignFn {
+        for (self.funcs) |f| if (std.mem.eql(u8, f.name, name)) return f;
+        return null;
+    }
+};
+
 /// Source-level value types. `str` is abstract here (it only becomes a
 /// `(ptr, len)` pair in MIR).
 /// `ptr` is an address-space-width pointer/length (i32 on wasm32, i64 on
@@ -310,6 +336,12 @@ pub const Expr = union(enum) {
     logical: struct { op: ops.LogicalKind, lhs: *Expr, rhs: *Expr },
     /// A call to another function, resolved to its `FuncId`.
     call: struct { func: FuncId, args: []const *Expr },
+    /// A call to a **foreign WIT interface** function (WIT rung 5, the call
+    /// binding): `<iface>.<fn>(args)` where `<iface>` is a `--wit-import`
+    /// interface. Lowers to a wasm import `(import "<module>" "<field>" …)` and
+    /// a call. `module` is the interface's WIT id, `field` the function name.
+    /// Scalar args/result only (the canonical-ABI boundary). Carries `@wire`.
+    foreign_call: struct { module: []const u8, field: []const u8, ret: Type, args: []const *Expr },
     /// A runtime string concatenation (interpolation with dynamic pieces).
     /// Each piece is a `str` value: a `str_const` run, a `local` parameter, a
     /// `call`, an `fmt_int` of an i64, or a `str_binding`.

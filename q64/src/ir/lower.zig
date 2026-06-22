@@ -412,6 +412,14 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             // i32 for a `-> bool`), so it validates against the callee sig.
             return mk(ctx.a, mapType(ctx.funcs[cl.func].ret), .{ .call = .{ .func = cl.func, .args = args } });
         },
+        .foreign_call => |fc| {
+            // A foreign import takes/returns scalars only (the canonical-ABI
+            // boundary the WIT lift enforces): every arg lowers on the scalar
+            // path, and the inst's value type is the import's WIT result type.
+            const args = try ctx.a.alloc(*mir.Inst, fc.args.len);
+            for (fc.args, 0..) |arg, i| args[i] = try lowerExpr(ctx, arg);
+            return mk(ctx.a, mapType(fc.ret), .{ .foreign_call = .{ .module = fc.module, .field = fc.field, .args = args } });
+        },
         // A materialized record: alloc in the scope arena, store the fields,
         // yield the base pointer. The store width rides on each value's type.
         .record_alloc => |ra| {
@@ -517,7 +525,7 @@ test "lower: literals fold into the memory image with newlines" {
     const pr = try parser.parse.parse(testing.allocator, "fn main {\n env.out(\"one\")\n env.out(\"two\")\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = switch (try build_hir.tryBuild(testing.allocator, sf, noLib)) {
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, noLib, &.{})) {
         .module => |m| m,
         else => return error.TestUnexpectedResult,
     };
@@ -572,7 +580,7 @@ test "lower: an i64 binding in main becomes a local_set in _start" {
         "fn main {\n let a = double(21)\n env.out(a)\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver(), &.{})) {
         .module => |m| m,
         else => return error.TestUnexpectedResult,
     };
@@ -596,7 +604,7 @@ test "lower: i64 binding interpolation lowers to fmt_int_to_str inside str_conca
         "fn main {\n let a = double(21)\n env.out(\"a={a}\")\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver(), &.{})) {
         .module => |m| m,
         else => return error.TestUnexpectedResult,
     };
@@ -621,7 +629,7 @@ test "lower: `!` in an if-condition lowers to a `un not` over the comparison" {
         "fn main {\n env.out(nonzero(7))\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver(), &.{})) {
         .module => |m| m,
         else => return error.TestUnexpectedResult,
     };
@@ -647,7 +655,7 @@ test "lower: `&&` lowers to a short-circuit `if_` with a const_i32 false leaf" {
         "fn main {\n env.out(both(1, 1))\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver(), &.{})) {
         .module => |m| m,
         else => return error.TestUnexpectedResult,
     };
@@ -672,7 +680,7 @@ test "lower: env.out(<bool>) interns true/false and lowers to a void if" {
         "fn main {\n env.out(is_even(4))\n}\n", "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver(), &.{})) {
         .module => |m| m,
         else => return error.TestUnexpectedResult,
     };
@@ -709,7 +717,7 @@ test "lower: a materialized record lowers to record_make + field_get loads" {
     const pr = try parser.parse.parse(testing.allocator, src, "<t>");
     defer pr.deinit(testing.allocator);
     const sf = parser.ast.SourceFile.cast(pr.root).?;
-    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver())) {
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, tr.resolver(), &.{})) {
         .module => |m| m,
         else => return error.TestUnexpectedResult,
     };

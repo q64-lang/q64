@@ -150,10 +150,15 @@ fn encodeFuncType(s: *W, params: []const Scalar, param_names: []const []const u8
 
 /// Encode the component. `core` is the emitted core module; `exports` the
 /// scalar public surface to lift; `imports` the foreign WIT interfaces the
-/// component declares it imports (WIT rung 5 — what `wac` links at build).
-/// Caller guarantees the core module has no *core* imports (a pure library); the
-/// component-level imports declared here are forward declarations the v0 core
-/// doesn't yet call (the source-level call binding is the next slice).
+/// component imports (WIT rung 5 — what `wac` links at build). The core's
+/// foreign call binding lowers each `<iface>.<fn>` to a core import
+/// `(import "<wit-id>" "<fn>" …)`; this encoder aliases each imported-instance
+/// export, canon-lowers it to a core func, and feeds those back as the core
+/// module's instantiation imports. **Caller guarantees the core module imports
+/// exactly the `(wit_name, fn)` pairs named here** — no more (a host face like
+/// `qview.*` needs a different lift), no fewer (the instantiate args must match
+/// the module's imports). `emitComponent` enforces this by passing only the
+/// interfaces/funcs the source actually calls.
 pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export, imports: []const ImportIface) Error![]u8 {
     var out = W{ .a = gpa };
     errdefer out.buf.deinit(gpa);
@@ -205,19 +210,82 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
     // §1 core module: the embedded core wasm, verbatim.
     try section(&out, 1, core);
 
-    // §2 core instance: instantiate module 0 with no imports → core instance 0.
+    // Total imported funcs K (across all M interfaces). The core module imports
+    // each foreign func by `(<wit-id>, <fn>)`; the component must supply them by
+    // aliasing each imported-instance export, lowering it to a core func, and
+    // feeding those back in as the core module's instantiation imports.
+    var total_imports: usize = 0;
+    for (imports) |iface| total_imports += iface.funcs.len;
+    const k = total_imports;
+
+    // §6 alias (component func): bring each imported interface function out of
+    // its imported instance into the component-func index space (0..K, in
+    // interface-then-func order).
+    if (k > 0) {
+        var s = W{ .a = gpa };
+        defer s.buf.deinit(gpa);
+        try s.uleb(k);
+        for (imports, 0..) |iface, j| {
+            for (iface.funcs) |f| {
+                try s.byte(0x01); // sort: component func
+                try s.byte(0x00); // target: instance export
+                try s.uleb(j); // component instance index j (the imported instance)
+                try s.label(f.name);
+            }
+        }
+        try section(&out, 6, s.buf.items);
+    }
+
+    // §8 canon lower: lower each aliased import (component func 0..K) into a core
+    // func (core-func index 0..K). Scalars need no canon options.
+    if (k > 0) {
+        var s = W{ .a = gpa };
+        defer s.buf.deinit(gpa);
+        try s.uleb(k);
+        for (0..k) |i| {
+            try s.byte(0x01); // canon …
+            try s.byte(0x00); // … lower
+            try s.uleb(i); // component func index i
+            try s.uleb(0); // 0 canon options
+        }
+        try section(&out, 8, s.buf.items);
+    }
+
+    // §2 core instances: one synthetic from-exports instance per imported
+    // interface (exporting that interface's lowered core funcs under their field
+    // names, core-func indices grouped by interface), then the main module
+    // instantiated with each interface id wired to its synthetic instance.
     {
         var s = W{ .a = gpa };
         defer s.buf.deinit(gpa);
-        try s.uleb(1); // one instance
+        try s.uleb(m + 1); // M synthetic instances + the main module instance
+        var base: usize = 0; // running core-func index for the lowered imports
+        for (imports) |iface| {
+            try s.byte(0x01); // instance form: from exports
+            try s.uleb(iface.funcs.len);
+            for (iface.funcs, 0..) |f, fi| {
+                try s.name(f.name); // core export name (raw field name, no kebab)
+                try s.byte(0x00); // core sort: func
+                try s.uleb(base + fi); // the lowered core func for this import
+            }
+            base += iface.funcs.len;
+        }
+        // The main module instance: instantiate module 0, wiring each foreign
+        // interface id to its synthetic core instance (index j).
         try s.byte(0x00); // instantiate
         try s.uleb(0); // module index 0
-        try s.uleb(0); // 0 instantiation args (no imports)
+        try s.uleb(m); // M instantiation args (one per imported interface)
+        for (imports, 0..) |iface, j| {
+            try s.name(iface.wit_name); // raw core import module id (carries `:`/`/`/`@`)
+            try s.byte(0x12); // core sort: instance
+            try s.uleb(j); // the synthetic core instance index j
+        }
         try section(&out, 2, s.buf.items);
     }
+    const main_inst = m; // the main module's core instance index
 
-    // §6 alias: bring each exported core func out of instance 0 into the
-    // component's core-func index space (indices 0..exports.len in order).
+    // §6 alias (core func): bring each exported core func out of the main
+    // instance into the core-func index space (indices K..K+N in order).
     {
         var s = W{ .a = gpa };
         defer s.buf.deinit(gpa);
@@ -226,13 +294,14 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
             try s.byte(0x00); // sort: core
             try s.byte(0x00); // core sort: func
             try s.byte(0x01); // target: core instance export
-            try s.uleb(0); // core instance 0
+            try s.uleb(main_inst); // the main module's core instance
             try s.name(e.core_name);
         }
         try section(&out, 6, s.buf.items);
     }
 
-    // §7 type: a component func type per export (component type index 0..N).
+    // §7 type: a component func type per export (component type indices M..M+N,
+    // past the M import instance-types).
     {
         var s = W{ .a = gpa };
         defer s.buf.deinit(gpa);
@@ -243,8 +312,8 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
         try section(&out, 7, s.buf.items);
     }
 
-    // §8 canon: lift each aliased core func with its component type → component
-    // func (index 0..N). Scalars need no canon options.
+    // §8 canon lift: lift each aliased export core func (index K+i) with its
+    // component type (M+i) → component func (index K+i). Scalars need no options.
     {
         var s = W{ .a = gpa };
         defer s.buf.deinit(gpa);
@@ -252,14 +321,14 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
         for (exports, 0..) |_, i| {
             try s.byte(0x00); // canon …
             try s.byte(0x00); // … lift
-            try s.uleb(i); // core func index i
+            try s.uleb(k + i); // core func index (past the K lowered imports)
             try s.uleb(0); // 0 canon options
-            try s.uleb(m + i); // component type index (offset past the M import instance-types)
+            try s.uleb(m + i); // component type index (past the M import instance-types)
         }
         try section(&out, 8, s.buf.items);
     }
 
-    // §11 export: surface each lifted component func by its public name.
+    // §11 export: surface each lifted component func (index K+i) by its public name.
     {
         var s = W{ .a = gpa };
         defer s.buf.deinit(gpa);
@@ -272,7 +341,7 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
             try s.byte(0x00);
             try s.label(e.name);
             try s.byte(0x01); // sort: component func
-            try s.uleb(i); // component func index i
+            try s.uleb(k + i); // component func index (past the K aliased imports)
             try s.byte(0x00); // no extern-desc ascription
         }
         try section(&out, 11, s.buf.items);

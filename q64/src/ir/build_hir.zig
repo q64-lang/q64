@@ -93,6 +93,11 @@ const RecField = struct { base_idx: u32, offset: u32, ty: hir.Type, mutable: boo
 const Builder = struct {
     a: std.mem.Allocator,
     resolver: ModuleResolver,
+    /// Foreign WIT interfaces this qube imports (WIT rung 5). A source call
+    /// `<iface>.<fn>(…)` whose head names one of these lowers to a `foreign_call`
+    /// (a wasm import + call). Empty for a qube with no `--wit-import`, so the
+    /// recognition below is inert and existing programs are unaffected.
+    foreign: []const hir.ForeignIface = &.{},
     eval: consteval.Evaluator,
     /// Sema type store (A3): signature annotations lower through sema's
     /// `types.lower` instead of ad-hoc name matching. Arena-backed, so no
@@ -201,12 +206,14 @@ pub fn tryBuild(
     gpa: std.mem.Allocator,
     sf: ast.SourceFile,
     resolver: ModuleResolver,
+    foreign: []const hir.ForeignIface,
 ) std.mem.Allocator.Error!Result {
     var mod = hir.Module.init(gpa);
     const a = mod.alloc();
     var b = Builder{
         .a = a,
         .resolver = resolver,
+        .foreign = foreign,
         .eval = .{ .a = a, .resolver = resolver },
         .tstore = try sema.types.TypeStore.init(a),
     };
@@ -8378,6 +8385,39 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     }
                 }
             }
+            // A foreign WIT import call (`<iface>.<fn>(args)`, WIT rung 5 — the
+            // call binding): when the dotted head names a `--wit-import`
+            // interface and the field one of its functions, lower to a
+            // `foreign_call` (a wasm import + call). Gated on `b.foreign`, so a
+            // qube that imports no interfaces is wholly unaffected; the head
+            // can't collide with a record/float-builtin receiver (those are
+            // scope locals, an imported interface name is not).
+            if (b.foreign.len > 0) {
+                if (std.mem.indexOfScalar(u8, cname, '.')) |dot| {
+                    const head = cname[0..dot];
+                    const field = cname[dot + 1 ..];
+                    if (std.mem.indexOfScalar(u8, field, '.') == null and scope.find(head) == null) {
+                        for (b.foreign) |fi| {
+                            if (!std.mem.eql(u8, fi.local, head)) continue;
+                            const ff = fi.find(field) orelse return reject(b, .name_not_found);
+                            // A void import has no value to use here (i64/bool/f64
+                            // position) — that's a statement-only form.
+                            if (ff.ret == .void) return reject(b, .unsupported_call);
+                            var arg_list: std.ArrayListUnmanaged(*hir.Expr) = .empty;
+                            var ait = cc.args();
+                            while (ait.next()) |an| try arg_list.append(b.a, try buildIntExpr(b, an, scope));
+                            if (arg_list.items.len != ff.params.len) return reject(b, .unsupported_call);
+                            out.* = .{ .foreign_call = .{
+                                .module = fi.wit_id,
+                                .field = ff.name,
+                                .ret = ff.ret,
+                                .args = try arg_list.toOwnedSlice(b.a),
+                            } };
+                            return out;
+                        }
+                    }
+                }
+            }
             // Closure inlining (slice 3b): a call to the enclosing HOF's
             // `fn`-typed parameter inlines the bound lambda's body.
             if (scope.hof_name) |hn| {
@@ -8777,7 +8817,7 @@ fn buildFromSource(gpa: std.mem.Allocator, source: []const u8, res: ModuleResolv
     const pr = try parser.parse.parse(gpa, source, "<test>");
     defer pr.deinit(gpa);
     const sf = ast.SourceFile.cast(pr.root) orelse return null;
-    return switch (try tryBuild(gpa, sf, res)) {
+    return switch (try tryBuild(gpa, sf, res, &.{})) {
         .module => |m| m,
         else => null,
     };
@@ -8789,7 +8829,7 @@ fn rejectFromSource(gpa: std.mem.Allocator, source: []const u8, res: ModuleResol
     const pr = try parser.parse.parse(gpa, source, "<test>");
     defer pr.deinit(gpa);
     const sf = ast.SourceFile.cast(pr.root) orelse return null;
-    var r = try tryBuild(gpa, sf, res);
+    var r = try tryBuild(gpa, sf, res, &.{});
     switch (r) {
         .module => |*m| {
             m.deinit();

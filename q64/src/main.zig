@@ -387,7 +387,21 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
         module_sources.deinit(gpa);
     }
 
-    const bytes = emit.emitFromSource(gpa, source, src, module_sources.items, addr) catch |err| {
+    // Foreign WIT imports (`--wit-import <file.wit>`, WIT rung 5). Parsed once
+    // here and shared by the core emit (so a `<iface>.<fn>(…)` call lowers to a
+    // real core import) and the `--component` wrap below. The arena holds the
+    // parsed WIT + import model for the whole emit.
+    var wit_arena = std.heap.ArenaAllocator.init(gpa);
+    defer wit_arena.deinit();
+    const foreign = buildForeignImports(wit_arena.allocator(), io, wit_import_paths.items) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("q64: --wit-import failed: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        std.process.exit(1);
+    };
+
+    const bytes = emit.emitFromSourceWithImports(gpa, source, src, module_sources.items, addr, foreign) catch |err| {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writerStreaming(io, &buf);
         try w.interface.print("q64: emit failed: {s}\n", .{@errorName(err)});
@@ -404,19 +418,6 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // we run through `wasm-tools component new --adapt` (vendor/wasi/) to get a
     // real `wasi:cli/run` command importing `wasi:cli/stdout`.
     if (want_component) {
-        // Build the foreign-import model from each `--wit-import <file.wit>`
-        // (WIT rung 5). The arena holds the parsed WIT + the import model for
-        // the duration of the component emit.
-        var wit_arena = std.heap.ArenaAllocator.init(gpa);
-        defer wit_arena.deinit();
-        const foreign = buildForeignImports(wit_arena.allocator(), io, wit_import_paths.items) catch |err| {
-            var buf: [4096]u8 = undefined;
-            var w = std.Io.File.stderr().writerStreaming(io, &buf);
-            try w.interface.print("q64: --wit-import failed: {s}\n", .{@errorName(err)});
-            try w.interface.flush();
-            std.process.exit(1);
-        };
-
         const artifact = emit.emitComponent(gpa, source, src, module_sources.items, addr, foreign, export_interface) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
@@ -450,7 +451,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
         // and `wac`/`wasm-tools` consume. The component embeds its own type
         // (round-trips via `wasm-tools component wit`); this is its source-level
         // companion. Same synthesis as `q64 show world`.
-        const wit_text = emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package) catch |err| {
+        const wit_text = emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package, foreign) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
             try w.interface.print("q64: WIT emit failed: {s}\n", .{@errorName(err)});
@@ -773,6 +774,11 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     var wit_package: ?[]const u8 = null;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
+    // `--wit-import <file.wit>` (WIT rung 5): foreign interfaces the qube links
+    // against. `show world` lists them as `import`s; `show hir|mir` resolve
+    // `<iface>.<fn>(…)` calls against them.
+    var wit_import_paths: std.ArrayList([]const u8) = .empty;
+    defer wit_import_paths.deinit(gpa);
 
     while (args_it.next()) |a| {
         if (std.mem.eql(u8, a, "--module")) {
@@ -788,6 +794,11 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
                 std.process.exit(2);
             };
             try module_args.append(gpa, .{ .name = spec[0..eq], .dir = spec[eq + 1 ..] });
+        } else if (std.mem.eql(u8, a, "--wit-import")) {
+            try wit_import_paths.append(gpa, args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            });
         } else if (std.mem.eql(u8, a, "--qube")) {
             qube_file = args_it.next() orelse {
                 try usage(io);
@@ -875,13 +886,23 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
         module_sources.deinit(gpa);
     }
 
+    var wit_arena = std.heap.ArenaAllocator.init(gpa);
+    defer wit_arena.deinit();
+    const foreign = buildForeignImports(wit_arena.allocator(), io, wit_import_paths.items) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("q64: --wit-import failed: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        std.process.exit(1);
+    };
+
     const dump = (switch (which) {
-        .hir => emit.showHir(gpa, source, src, module_sources.items),
-        .mir => emit.showMir(gpa, source, src, module_sources.items),
+        .hir => emit.showHir(gpa, source, src, module_sources.items, foreign),
+        .mir => emit.showMir(gpa, source, src, module_sources.items, foreign),
         .symbols => sema.showSymbols(gpa, source, src),
         .effects => emit.showEffects(gpa, source, src, module_sources.items, arg2.?),
         .capabilities => emit.showCapabilities(gpa, source, src, module_sources.items),
-        .world => emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package),
+        .world => emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package, foreign),
     }) catch |err| {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writerStreaming(io, &buf);

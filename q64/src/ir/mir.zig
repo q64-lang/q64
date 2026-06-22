@@ -192,6 +192,13 @@ pub const Op = union(enum) {
     /// (`(import "qview" "text" …)`) and emits the call. Args are i64 values
     /// (valid on wasm32 — only memory *addresses* are width-sensitive). Void.
     host_call: struct { name: []const u8, args: []const *Inst },
+    /// A call to a **foreign WIT import** function (`<iface>.<fn>(…)` from a
+    /// `--wit-import` interface). `module` is the interface's WIT id, `field`
+    /// the function name; the backend declares the matching wasm import
+    /// (`(import "<module>" "<field>" (params …) <ret>)`) and emits the call.
+    /// Unlike `host_call` this yields a value — the inst's `.ty` is the import's
+    /// result type. Args are scalar i64/f64 values (the canonical-ABI boundary).
+    foreign_call: struct { module: []const u8, field: []const u8, args: []const *Inst },
     /// Read / write a module-level mutable i64 global (reactive `state`), by index.
     global_get: u32,
     global_set: struct { idx: u32, value: *Inst },

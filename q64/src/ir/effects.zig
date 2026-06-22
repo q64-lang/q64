@@ -154,6 +154,13 @@ fn collectExpr(
             try e.append(a, call.func);
             for (call.args) |arg| try collectExpr(a, arg, d, e);
         },
+        // A foreign WIT import reaches across the component boundary; we can't
+        // see what it does, so disclose the honest `@io` umbrella (same rule as
+        // an unrecognized host face).
+        .foreign_call => |fc| {
+            d.insert(.io);
+            for (fc.args) |arg| try collectExpr(a, arg, d, e);
+        },
         .bin => |b| {
             try collectExpr(a, b.lhs, d, e);
             try collectExpr(a, b.rhs, d, e);

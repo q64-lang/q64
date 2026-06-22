@@ -208,6 +208,14 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             }
             try app(gpa, out, ")", .{});
         },
+        .foreign_call => |fc| {
+            try app(gpa, out, "foreign_call \"{s}\".\"{s}\"(", .{ fc.module, fc.field });
+            for (fc.args, 0..) |arg, i| {
+                if (i != 0) try app(gpa, out, ", ", .{});
+                try hirExpr(gpa, out, arg);
+            }
+            try app(gpa, out, ")", .{});
+        },
         .concat => |pieces| {
             try app(gpa, out, "concat[", .{});
             for (pieces, 0..) |p, i| {
@@ -372,6 +380,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .host_call => |hc| {
             try app(gpa, out, "host_call {s} ({d} args)\n", .{ hc.name, hc.args.len });
             for (hc.args) |a| try mirInst(gpa, out, a, depth + 1);
+        },
+        .foreign_call => |fc| {
+            try app(gpa, out, "foreign_call {s}.{s} : {s} ({d} args)\n", .{ fc.module, fc.field, @tagName(inst.ty), fc.args.len });
+            for (fc.args) |a| try mirInst(gpa, out, a, depth + 1);
         },
         .const_i64 => |v| try app(gpa, out, "const_i64 {d}\n", .{v}),
         .const_f64 => |v| try app(gpa, out, "const_f64 {d}\n", .{v}),
