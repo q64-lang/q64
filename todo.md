@@ -1617,6 +1617,56 @@ Unicode-scalar type), and **anonymous `tuple<…>`** in *foreign* signatures
 Resources, own/borrow, and type-only interfaces are handled by the
 opaque-handle approach in rung 5, **not** by widening faces.
 
+## Continuum — OCI compliance (make the registry an OCI registry)
+
+**Goal:** make the Continuum speak the **OCI Distribution Spec** so qubes (and
+emitted components) are pushable/pullable with the whole existing OCI ecosystem —
+`wkg` (`wasm-pkg-tools`), `oras`, `docker`/`crane`, every cloud registry's auth +
+mirroring + CDN. Additive: the JSON API (`spec/continuum-api.md`) and the
+`qube publish`/`add` UX stay the **opinionated front door**; OCI is a **second
+protocol surface over the same content-addressed R2 store**, not a rewrite.
+
+**Why.** The Bytecode Alliance retired the bespoke **Warg** protocol and moved
+component distribution to **OCI** (the `bytecodealliance/wasm-pkg-tools`/`wkg`
+line). A WIT-component world — incl. `qubeworlds:engine/scene` if the game engine
+becomes an imported library — wants ecosystem-standard distribution. The
+Continuum is *already* a content-addressed artifact store (canonical SHA-256 of
+the `.zip` over R2 + D1 metadata), which is exactly OCI's model — so this is a
+protocol facade, not new storage.
+
+**The mapping (we already have the pieces):**
+- qube name `dev.q64.math` + version → OCI **repository:tag** (`dev.q64.math:0.1.0`).
+- canonical archive **SHA-256** → OCI blob **digest** (`sha256:<hex>`) — our
+  R2 keys are already digest-addressed, so blobs map 1:1.
+- An **OCI manifest** (`application/vnd.oci.image.manifest.v1+json`,
+  `artifactType: application/vnd.q64.qube.v1+json`) referencing: a **config**
+  blob = the `qube.json5` manifest JSON; **layer** blobs = the `.zip` archive
+  (and/or the `.component.wasm` with `application/wasm`) + the synthesized `.wit`
+  world. The `.wit` we already store/serve (WIT rung 3) becomes a typed layer.
+
+**Rungs (do in order; all additive, no gate):**
+- [ ] **1. `GET /v2/` version check** + OCI **Bearer auth** flow
+      (`WWW-Authenticate` → token), reusing the current auth backend
+      (`continuum-api/src/routes/auth.ts`).
+- [ ] **2. Blob endpoints** — `HEAD/GET /v2/<name>/blobs/<digest>` (serve from
+      R2 by digest; we already verify SHA-256) and the upload flow
+      `POST .../blobs/uploads/` → `PUT` (monolithic first; chunked later).
+- [ ] **3. Manifest endpoints** — `PUT/GET/HEAD /v2/<name>/manifests/<ref>`
+      (ref = tag or digest). Synthesize the OCI manifest from existing version
+      metadata on read; on write, record it alongside the D1 version row.
+- [ ] **4. `GET /v2/<name>/tags/list`** from the existing versions table.
+- [ ] **5. Media types + spec** — define `application/vnd.q64.qube.v1+json`,
+      the `.wit`/component layer types; document the OCI surface in
+      `spec/continuum-api.md` §"OCI distribution".
+- [ ] **6. Interop check** — `wkg`/`oras pull dev.q64.math:0.1.0` round-trips a
+      published qube; `oras push` of a component is consumable by `qube add`.
+
+**Coexistence:** both surfaces read/write the **same R2 blobs by digest** and the
+**same D1 metadata** — publishing once is visible to both `qube add` and `wkg`.
+Keep `qubes.q64.dev` (JSON API) and add the `/v2/` OCI routes on the same
+`continuum-api` worker (or a sibling route). **Interop escape hatch, not a
+migration** — the Continuum stays the primary, opinionated registry.
+
 ## `q64 show` — full introspection surface (+ `q64 wit` vs `qube wit`)
 
 The compiler's introspection family. **These are `q64` commands, not `qube`
