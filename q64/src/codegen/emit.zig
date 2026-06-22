@@ -228,6 +228,12 @@ pub fn emitFromSource(
 /// `wasm-tools component new --adapt` with the `vendor/wasi/` adapter). Keeping
 /// the adapter shell-out in the CLI layer leaves this codegen module free of
 /// subprocess/filesystem concerns.
+// Re-exports so the CLI can build the foreign-import model without importing
+// `codegen/component.zig` directly (WIT rung 5 — the codegen import binding).
+pub const Scalar = component.Scalar;
+pub const ImportFunc = component.ImportFunc;
+pub const ImportIface = component.ImportIface;
+
 pub const ComponentArtifact = union(enum) {
     /// A finished WebAssembly component, ready to write. Caller owns the slice.
     component: []u8,
@@ -246,7 +252,7 @@ pub const ComponentArtifact = union(enum) {
 /// capability the lift can't satisfy (e.g. a `qview.*` face) is likewise
 /// `ComponentNeedsImportLowering`; a surface with no liftable export is
 /// `ComponentNoExports`.
-pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace) !ComponentArtifact {
+pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []const u8, modules: []const ModuleSource, addr: AddressSpace, foreign: []const component.ImportIface) !ComponentArtifact {
     var hmod = try buildHir(allocator, source, file, modules);
     defer hmod.deinit();
     var mmod = ir.lower.lower(allocator, &hmod) catch |e| switch (e) {
@@ -317,7 +323,7 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     };
 
     if (exports.items.len == 0) return Error.ComponentNoExports;
-    return .{ .component = try component.encode(allocator, core, exports.items) };
+    return .{ .component = try component.encode(allocator, core, exports.items, foreign) };
 }
 
 /// Scan a core module for an import section (id 2). Used to gate component

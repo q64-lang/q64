@@ -777,6 +777,35 @@ fn resolveWitPackage(gpa: std.mem.Allocator, root: std.json.ObjectMap, name: []c
     return std.fmt.allocPrint(gpa, "{s}:{s}", .{ ns, name[dot + 1 ..] });
 }
 
+/// The qube's foreign WIT imports (WIT rung 5): the `wit.imports` array of
+/// relative `.wit` paths, each resolved to an absolute path under the project
+/// dir. Returns an owned list of owned strings.
+fn resolveWitImports(gpa: std.mem.Allocator, root: std.json.ObjectMap, project_dir: []const u8) !std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |w| gpa.free(w);
+        out.deinit(gpa);
+    }
+    const wit = root.get("wit") orelse return out;
+    const wobj = switch (wit) {
+        .object => |o| o,
+        else => return out,
+    };
+    const imports = wobj.get("imports") orelse return out;
+    const arr = switch (imports) {
+        .array => |a| a,
+        else => return out,
+    };
+    for (arr.items) |item| {
+        const rel = switch (item) {
+            .string => |s| s,
+            else => continue,
+        };
+        try out.append(gpa, try std.fs.path.join(gpa, &.{ project_dir, rel }));
+    }
+    return out;
+}
+
 /// The last `.`-separated segment of a dotted qube name.
 fn lastDottedSegment(name: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
@@ -1134,7 +1163,15 @@ fn cmdBuild(
     const wit_package = try resolveWitPackage(gpa, root, name);
     defer gpa.free(wit_package);
 
-    // q64 emit <entry> <wasm> --addr <addr> [--module …] [--component --world … --wit-package …]
+    // WIT rung 5: foreign `.wit` packages this qube imports (`wit.imports` —
+    // relative paths), declared in the emitted component so `wac` can link them.
+    var wit_imports = try resolveWitImports(gpa, root, project_dir);
+    defer {
+        for (wit_imports.items) |w| gpa.free(w);
+        wit_imports.deinit(gpa);
+    }
+
+    // q64 emit <entry> <wasm> --addr <addr> [--module …] [--component --world … --wit-package … --wit-import …]
     {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
@@ -1142,6 +1179,7 @@ fn cmdBuild(
         for (module_specs.items) |spec| try argv.appendSlice(gpa, &.{ "--module", spec });
         if (want_component) {
             try argv.appendSlice(gpa, &.{ "--component", "--world", world_name, "--wit-package", wit_package });
+            for (wit_imports.items) |w| try argv.appendSlice(gpa, &.{ "--wit-import", w });
         }
         const term = try spawnInherit(io, argv.items);
         const code = termCode(term) orelse std.process.exit(@intFromEnum(ExitCode.compile));

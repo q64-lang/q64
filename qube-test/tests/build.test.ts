@@ -88,6 +88,27 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
     expect(wit).toContain("world calculator {");
   });
 
+  test.skipIf(!componentToolsAvailable())(
+    "--component declares the manifest's wit.imports as a component import (WIT rung 5)",
+    () => {
+      const proj = makeProject({
+        "qube.json5":
+          '{ "name": "dev.q64.consumer", "version": "0.1.0", "license": "MIT", "type": "library", "entry": "src/lib.q", "component": { "emit": true }, "wit": { "package": "dev-q64:consumer", "world": "consumer", "imports": ["wit/math.wit"] } }',
+        "wit/math.wit": "package acme:mathlib@1.0.0;\ninterface math { add: func(a: s64, b: s64) -> s64; }\n",
+        "src/lib.q": "pub fn compute(x: i64) -> i64 { x + 1 }\n",
+      });
+      const r = runCli(["build", "--component"], { cwd: proj, env });
+      expect(r.exitCode).toBe(0);
+      const comp = join(proj, "target/debug/wasm64/dev.q64.consumer.component.wasm");
+      expect(existsSync(comp)).toBe(true);
+      // wasm-tools agrees: the component imports the foreign interface and
+      // exports the q64 function.
+      const wit = Bun.spawnSync({ cmd: [WASM_TOOLS, "component", "wit", comp] }).stdout.toString();
+      expect(wit).toContain("import acme:mathlib/math@1.0.0");
+      expect(wit).toContain("export compute: func(x: s64) -> s64");
+    },
+  );
+
   test("a compile error from q64 propagates as exit 64", () => {
     const proj = makeProject({
       "qube.json5": appManifest(),

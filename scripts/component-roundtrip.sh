@@ -148,6 +148,25 @@ echo "==> q64 emit --component (mixed str + scalar) lifts the scalar export"
 "$Q64_BIN" emit "$tmp/mixed.q" "$tmp/mixed.wasm" --addr wasm32 --component
 "$CHECK_BIN" "$tmp/mixed.component.wasm" sub 50 8 42
 
+# --- foreign import: --wit-import declares a component import (WIT rung 5) -----
+if [ -x "$WASMTOOLS_BIN" ]; then
+    cat > "$tmp/consumer.q" <<'EOF'
+pub fn compute(x: i64) -> i64 { x + 1 }
+EOF
+    cat > "$tmp/math.wit" <<'EOF'
+package acme:mathlib@1.0.0;
+interface math { add: func(a: s64, b: s64) -> s64; neg: func(x: s64) -> s64; }
+EOF
+    echo "==> q64 emit --component --wit-import declares the foreign interface"
+    "$Q64_BIN" emit "$tmp/consumer.q" "$tmp/consumer.wasm" --addr wasm32 --component \
+        --world consumer --wit-package acme:consumer --wit-import "$tmp/math.wit"
+    "$WASMTOOLS_BIN" validate --features all "$tmp/consumer.component.wasm" || { echo "FAIL: foreign-import component invalid" >&2; exit 1; }
+    cwit="$("$WASMTOOLS_BIN" component wit "$tmp/consumer.component.wasm")"
+    echo "$cwit" | grep -q "import acme:mathlib/math@1.0.0" || { echo "FAIL: component missing the foreign import" >&2; echo "$cwit" >&2; exit 1; }
+    echo "$cwit" | grep -q "export compute: func(x: s64) -> s64" || { echo "FAIL: component missing the q64 export" >&2; echo "$cwit" >&2; exit 1; }
+    echo "    ok: component imports acme:mathlib/math@1.0.0 and exports compute (validated by wasm-tools)"
+fi
+
 # --- qube build --component drives the same lift through the package tool -----
 echo "==> qube build --component (examples/math-lib library)"
 mathlib_dir="$REPO_ROOT/examples/math-lib"

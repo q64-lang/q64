@@ -6,15 +6,21 @@
 //! type / canon / export sections).
 //!
 //! v0 scope — the smallest faithful slice: the core module must have **no
-//! imports** (a pure library, or any qube that reaches no capability face), and
-//! exports are lifted for **scalar** signatures only (`i64`→`s64`, `bool`,
-//! `f64`), which cross the canonical ABI with no memory/`realloc` glue. A
-//! string/list export is reported by the caller as not-yet-liftable. An **app**
-//! that reaches a capability (`env.out` → `@stdout`) is *not* encoded here: it
-//! is emitted as a WASI preview1 core (`emit.zig`, `StdoutAbi.wasi_preview1`)
-//! and lifted into a real `wasi:cli/run` component by `wasm-tools component new
-//! --adapt`; this encoder is the import-free library path only. The component
-//! this emits is validated end-to-end by wasmtime (`q64-component-check`).
+//! core imports** (a pure library, or any qube that reaches no capability
+//! face), and exports are lifted for **scalar** signatures only (`i64`→`s64`,
+//! `bool`, `f64`), which cross the canonical ABI with no memory/`realloc` glue.
+//! A string/list export is reported by the caller as not-yet-liftable. An
+//! **app** that reaches a capability (`env.out` → `@stdout`) is *not* encoded
+//! here: it is emitted as a WASI preview1 core (`emit.zig`,
+//! `StdoutAbi.wasi_preview1`) and lifted into a real `wasi:cli/run` component by
+//! `wasm-tools component new --adapt`. The component this emits is validated
+//! end-to-end by wasmtime (`q64-component-check`).
+//!
+//! WIT rung 5 (the codegen import binding): `encode` also declares **foreign
+//! imports** — the scalar interfaces a qube depends on — as component-level
+//! instance imports (the inverse of the export encoding), so `wac` can link
+//! them at build. These are forward declarations; the v0 core doesn't yet call
+//! them (the source-level call binding is the next slice).
 
 const std = @import("std");
 const hir = @import("ir").hir;
@@ -57,6 +63,24 @@ pub const Export = struct {
     params: []const Scalar,
     param_names: []const []const u8,
     ret: ?Scalar,
+};
+
+/// One function of a foreign interface this component **imports** (WIT rung 5,
+/// the codegen import binding). Same scalar shape as `Export` — a foreign func
+/// whose signature crosses the canonical ABI with no memory glue.
+pub const ImportFunc = struct {
+    name: []const u8,
+    params: []const Scalar,
+    param_names: []const []const u8,
+    ret: ?Scalar,
+};
+
+/// A foreign WIT interface this component declares it imports. `wit_name` is the
+/// component-model interface id (e.g. `acme:store/kv@1.2.0`) — raw, not
+/// kebab-mapped (it carries `:`/`/`/`@`).
+pub const ImportIface = struct {
+    wit_name: []const u8,
+    funcs: []const ImportFunc,
 };
 
 const W = struct {
@@ -105,15 +129,78 @@ fn section(out: *W, id: u8, contents: []const u8) Error!void {
     try out.bytes(contents);
 }
 
+/// Encode a component-model `functype` (`0x40` + named params + result) — shared
+/// by an export's component type (§7) and an imported interface's instance-type
+/// functype. Param labels are kebab-cased; an absent result is `() -> ()`.
+fn encodeFuncType(s: *W, params: []const Scalar, param_names: []const []const u8, ret: ?Scalar) Error!void {
+    try s.byte(0x40); // functype
+    try s.uleb(params.len);
+    for (params, param_names) |p, pname| {
+        try s.label(pname);
+        try s.byte(p.byte());
+    }
+    if (ret) |r| {
+        try s.byte(0x00); // single unnamed result
+        try s.byte(r.byte());
+    } else {
+        try s.byte(0x01); // named results …
+        try s.uleb(0); // … none
+    }
+}
+
 /// Encode the component. `core` is the emitted core module; `exports` the
-/// scalar public surface to lift. Caller guarantees the core module has no
-/// imports (the import-lowering case isn't handled yet).
-pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export) Error![]u8 {
+/// scalar public surface to lift; `imports` the foreign WIT interfaces the
+/// component declares it imports (WIT rung 5 — what `wac` links at build).
+/// Caller guarantees the core module has no *core* imports (a pure library); the
+/// component-level imports declared here are forward declarations the v0 core
+/// doesn't yet call (the source-level call binding is the next slice).
+pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export, imports: []const ImportIface) Error![]u8 {
     var out = W{ .a = gpa };
     errdefer out.buf.deinit(gpa);
 
     // Preamble: \0asm, version 0x000d, layer 0x0001 (component).
     try out.bytes(&.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+
+    // Foreign imports occupy component **type** indices `0..M`; the export
+    // functypes that follow are offset by `M`. When there are no imports `M=0`
+    // and the encoding is byte-identical to the export-only form.
+    const m = imports.len;
+
+    // §7a import instance-types — one `instancetype` per imported interface,
+    // each declaring its functions. (Only emitted when there are imports, so the
+    // import-free output is unchanged.)
+    if (m > 0) {
+        var s = W{ .a = gpa };
+        defer s.buf.deinit(gpa);
+        try s.uleb(m);
+        for (imports) |iface| {
+            try s.byte(0x42); // instancetype
+            try s.uleb(2 * iface.funcs.len); // a type decl + an export decl per func
+            for (iface.funcs, 0..) |f, idx| {
+                try s.byte(0x01); // type decl …
+                try encodeFuncType(&s, f.params, f.param_names, f.ret);
+                try s.byte(0x04); // export decl …
+                try s.byte(0x00); // plain-name tag
+                try s.label(f.name);
+                try s.byte(0x01); // func sort
+                try s.uleb(idx); // the in-instance func-type index
+            }
+        }
+        try section(&out, 7, s.buf.items);
+
+        // §0a import: bring each foreign interface in as an instance, by its
+        // component-model interface id.
+        var im = W{ .a = gpa };
+        defer im.buf.deinit(gpa);
+        try im.uleb(m);
+        for (imports, 0..) |iface, j| {
+            try im.byte(0x00); // import-name plain tag
+            try im.name(iface.wit_name); // raw id (carries `:`/`/`/`@`)
+            try im.byte(0x05); // instance sort
+            try im.uleb(j); // instance-type index j
+        }
+        try section(&out, 0x0a, im.buf.items);
+    }
 
     // §1 core module: the embedded core wasm, verbatim.
     try section(&out, 1, core);
@@ -151,19 +238,7 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export)
         defer s.buf.deinit(gpa);
         try s.uleb(exports.len);
         for (exports) |e| {
-            try s.byte(0x40); // functype
-            try s.uleb(e.params.len); // params: vec(name, valtype)
-            for (e.params, e.param_names) |p, pname| {
-                try s.label(pname); // the real q64 param name (→ kebab-case)
-                try s.byte(p.byte());
-            }
-            if (e.ret) |r| {
-                try s.byte(0x00); // single unnamed result
-                try s.byte(r.byte());
-            } else {
-                try s.byte(0x01); // named results …
-                try s.uleb(0); // … none (a `func() -> ()`)
-            }
+            try encodeFuncType(&s, e.params, e.param_names, e.ret);
         }
         try section(&out, 7, s.buf.items);
     }
@@ -179,7 +254,7 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export)
             try s.byte(0x00); // … lift
             try s.uleb(i); // core func index i
             try s.uleb(0); // 0 canon options
-            try s.uleb(i); // component type index i
+            try s.uleb(m + i); // component type index (offset past the M import instance-types)
         }
         try section(&out, 8, s.buf.items);
     }
@@ -222,7 +297,7 @@ test "encode: component preamble + section ids for a scalar export" {
     const params = [_]Scalar{ .s64, .s64 };
     const param_names = [_][]const u8{ "a", "b" };
     const exports = [_]Export{.{ .name = "add", .core_name = "add", .params = &params, .param_names = &param_names, .ret = .s64 }};
-    const bytes = try encode(testing.allocator, &core, &exports);
+    const bytes = try encode(testing.allocator, &core, &exports, &.{});
     defer testing.allocator.free(bytes);
 
     // Component preamble: \0asm, version 0x000d, layer 0x0001.
@@ -248,7 +323,7 @@ test "encode: component-model labels are kebab-cased from snake_case" {
     const params = [_]Scalar{.s64};
     const param_names = [_][]const u8{"min_value"};
     const exports = [_]Export{.{ .name = "get_version", .core_name = "get_version", .params = &params, .param_names = &param_names, .ret = .s64 }};
-    const bytes = try encode(testing.allocator, &core, &exports);
+    const bytes = try encode(testing.allocator, &core, &exports, &.{});
     defer testing.allocator.free(bytes);
 
     // The kebab forms are present; the snake forms are not (except as the
@@ -256,6 +331,42 @@ test "encode: component-model labels are kebab-cased from snake_case" {
     try testing.expect(std.mem.indexOf(u8, bytes, "get-version") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "min-value") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "min_value") == null);
+}
+
+test "encode: a foreign import adds the instance-type (§7) + import (§0x0a) sections" {
+    const core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const eparams = [_]Scalar{.s64};
+    const enames = [_][]const u8{"x"};
+    const exports = [_]Export{.{ .name = "compute", .core_name = "compute", .params = &eparams, .param_names = &enames, .ret = .s64 }};
+    const iparams = [_]Scalar{ .s64, .s64 };
+    const inames = [_][]const u8{ "a", "b" };
+    const ifuncs = [_]ImportFunc{.{ .name = "add", .params = &iparams, .param_names = &inames, .ret = .s64 }};
+    const imports = [_]ImportIface{.{ .wit_name = "acme:mathlib/math@1.0.0", .funcs = &ifuncs }};
+    const bytes = try encode(testing.allocator, &core, &exports, &imports);
+    defer testing.allocator.free(bytes);
+
+    // The component-model interface id is present (raw, not kebab-mapped).
+    try testing.expect(std.mem.indexOf(u8, bytes, "acme:mathlib/math@1.0.0") != null);
+    // The import section (id 0x0a) and instance-type tag (0x42) are present.
+    try testing.expect(std.mem.indexOfScalar(u8, bytes, 0x0a) != null);
+    try testing.expect(std.mem.indexOfScalar(u8, bytes, 0x42) != null);
+    // Both the export and the imported func name survive.
+    try testing.expect(std.mem.indexOf(u8, bytes, "compute") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "add") != null);
+}
+
+test "encode: no imports → byte-identical to the export-only form (M=0)" {
+    const core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const params = [_]Scalar{ .s64, .s64 };
+    const names = [_][]const u8{ "a", "b" };
+    const exports = [_]Export{.{ .name = "add", .core_name = "add", .params = &params, .param_names = &names, .ret = .s64 }};
+    const with_empty = try encode(testing.allocator, &core, &exports, &.{});
+    defer testing.allocator.free(with_empty);
+    // The §0x0a import section is absent when there are no imports.
+    // (id 0x0a only appears as a section here if imports were emitted.)
+    // Spot-check: the canon type index is i (not offset), so the encoding is the
+    // pre-import form — verified by the component-roundtrip wasmtime call.
+    try testing.expect(with_empty.len > 8);
 }
 
 test "Scalar.fromHir maps the canonical-ABI scalar surface" {

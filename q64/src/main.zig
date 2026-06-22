@@ -103,6 +103,7 @@ fn usage(io: std.Io) !void {
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
         \\                                     --component also writes <out>.component.wasm + <out>.wit.
         \\                                     --world <name> / --wit-package <id> name the synthesized world.
+        \\                                     --wit-import <file.wit> declares a foreign import (repeatable).
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
         \\  show <hir|mir|symbols> <file.q> [--module name=dir ...]
         \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
@@ -284,12 +285,21 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     var wit_package: ?[]const u8 = null;
     var module_args: std.ArrayList(ModuleArg) = .empty;
     defer module_args.deinit(gpa);
+    // WIT rung 5: foreign `.wit` packages this qube imports — declared in the
+    // emitted component's world (what `wac` links at build). Repeatable.
+    var wit_import_paths: std.ArrayList([]const u8) = .empty;
+    defer wit_import_paths.deinit(gpa);
 
     while (args_it.next()) |a| {
         if (std.mem.eql(u8, a, "--component")) {
             // Also wrap the core module in a component (spec/q64-cli.md). The
             // core module is still written to `out`.
             want_component = true;
+        } else if (std.mem.eql(u8, a, "--wit-import")) {
+            try wit_import_paths.append(gpa, args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            });
         } else if (std.mem.eql(u8, a, "--world")) {
             world_name = args_it.next() orelse {
                 try usage(io);
@@ -385,7 +395,20 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // we run through `wasm-tools component new --adapt` (vendor/wasi/) to get a
     // real `wasi:cli/run` command importing `wasi:cli/stdout`.
     if (want_component) {
-        const artifact = emit.emitComponent(gpa, source, src, module_sources.items, addr) catch |err| {
+        // Build the foreign-import model from each `--wit-import <file.wit>`
+        // (WIT rung 5). The arena holds the parsed WIT + the import model for
+        // the duration of the component emit.
+        var wit_arena = std.heap.ArenaAllocator.init(gpa);
+        defer wit_arena.deinit();
+        const foreign = buildForeignImports(wit_arena.allocator(), io, wit_import_paths.items) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("q64: --wit-import failed: {s}\n", .{@errorName(err)});
+            try w.interface.flush();
+            std.process.exit(1);
+        };
+
+        const artifact = emit.emitComponent(gpa, source, src, module_sources.items, addr, foreign) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
             try w.interface.print("q64: component emit failed: {s}\n", .{@errorName(err)});
@@ -801,6 +824,82 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.writeAll(dump);
     try w.interface.flush();
+}
+
+/// Map a WIT primitive to the canonical-ABI scalar the component encoder
+/// handles (`s64`/`bool`/`f64`), or null for a type that needs memory glue —
+/// mirrors the export slice's scalar-only scope.
+fn witPrimToScalar(p: wit.Prim) ?emit.Scalar {
+    return switch (p) {
+        .s64 => .s64,
+        .bool_ => .bool_,
+        .f64 => .f64,
+        else => null,
+    };
+}
+
+/// Build the component-import model from each `--wit-import <file.wit>` (WIT
+/// rung 5). Each foreign interface becomes an `ImportIface`; only its
+/// **scalar-signature** functions are declared (a non-scalar param/result is
+/// skipped — the same boundary as scalar exports). Everything is arena-owned.
+fn buildForeignImports(arena: std.mem.Allocator, io: std.Io, paths: []const []const u8) ![]const emit.ImportIface {
+    var ifaces: std.ArrayList(emit.ImportIface) = .empty;
+    for (paths) |path| {
+        const src = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024));
+        var p: wit.Parser = undefined;
+        const document = wit.parse(arena, src, &p) catch |err| switch (err) {
+            wit.Error.ParseError => {
+                var buf: [4096]u8 = undefined;
+                var w = std.Io.File.stderr().writerStreaming(io, &buf);
+                try w.interface.print("q64: WIT001: {s}: {s} (byte {d})\n", .{ path, p.err_msg, p.err_pos });
+                try w.interface.flush();
+                return error.ParseError;
+            },
+            else => return err,
+        };
+
+        // The component-model interface id: `<package-base>/<iface>[@version]`.
+        var base: []const u8 = "root:imports";
+        var version: ?[]const u8 = null;
+        if (document.package_id) |pid| {
+            if (std.mem.indexOfScalar(u8, pid, '@')) |at| {
+                base = pid[0..at];
+                version = pid[at + 1 ..];
+            } else base = pid;
+        }
+
+        for (document.interfaces) |iface| {
+            var funcs: std.ArrayList(emit.ImportFunc) = .empty;
+            for (iface.funcs) |f| {
+                var ok = true;
+                const params = try arena.alloc(emit.Scalar, f.params.len);
+                const names = try arena.alloc([]const u8, f.params.len);
+                for (f.params, 0..) |param, i| {
+                    const sc = if (param.ty.* == .prim) witPrimToScalar(param.ty.*.prim) else null;
+                    params[i] = sc orelse {
+                        ok = false;
+                        break;
+                    };
+                    names[i] = param.name;
+                }
+                if (!ok) continue; // non-scalar param — skip this func
+                const ret: ?emit.Scalar = if (f.result) |r|
+                    (if (r.* == .prim) (witPrimToScalar(r.*.prim) orelse {
+                        continue; // non-scalar result — skip
+                    }) else continue)
+                else
+                    null;
+                try funcs.append(arena, .{ .name = f.name, .params = params, .param_names = names, .ret = ret });
+            }
+            if (funcs.items.len == 0) continue; // no liftable scalar funcs
+            const wit_name = if (version) |v|
+                try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ base, iface.name, v })
+            else
+                try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, iface.name });
+            try ifaces.append(arena, .{ .wit_name = wit_name, .funcs = try funcs.toOwnedSlice(arena) });
+        }
+    }
+    return ifaces.toOwnedSlice(arena);
 }
 
 /// `q64 wit import <file.wit> [--out <f>]` — parse a foreign/authored WIT

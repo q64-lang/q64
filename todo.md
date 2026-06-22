@@ -1558,12 +1558,32 @@ notes below).
         error), `q64-test/tests/wit-import.test.ts` (4), `qube-test`
         `wit.test.ts` (1 delegation). Spec: `q64-cli.md` §"q64 wit import",
         `qube-cli.md`, `diagnostics.md`.
-      - **Remaining (the codegen binding).** Actually *generating* the wasm
-        component imports + canonical-ABI call glue so q64 **source** can call a
-        foreign component — wiring the parsed interface into name resolution
-        (NAM), the HIR/MIR, and the import side of `codegen/component.zig`. Plus
-        binding a qube's `import`s to a dependency's `.wit` via the manifest.
-        The parser + mapping this slice landed are the inputs that work feeds on.
+      - **Done — the codegen import *declaration* + manifest binding.** The
+        import side of `codegen/component.zig` now exists: `encode` declares
+        **foreign imports** — a scalar interface's functions — as component-level
+        instance imports (the inverse of the export encoding: a §7 `instancetype`
+        per interface + a §0x0a import section, with the export type indices
+        offset past them). Surfaced via **`q64 emit --component --wit-import
+        <file.wit>`** (repeatable; builds the import model from the rung-5
+        parser, scalar funcs only) and the manifest **`wit.imports`** array
+        (`qube build` passes each as `--wit-import`). The emitted q64 component
+        *validates* and its world declares e.g. `import acme:mathlib/math@1.0.0`
+        alongside `export compute` — exactly what `wac` links at build.
+        Verified byte-correct against a wasm-tools reference; the no-import path
+        is byte-identical (M=0). Tests: `component.zig` (2 unit — import
+        sections + M=0), `q64-test` `wit-import.test.ts` (emit succeeds),
+        `qube-test` `build.test.ts` (manifest `wit.imports` → `wasm-tools
+        component wit` shows the import), `component-roundtrip.sh`. Spec:
+        `q64-cli.md` (`--wit-import`), `qube.json5.md`/`.schema.json`
+        (`wit.imports`).
+      - **Remaining — the source-level call.** The component now *declares* its
+        foreign imports, but q64 **source** doesn't yet *call* them: that wants a
+        foreign-symbol kind in name resolution (NAM), a foreign-call node through
+        HIR/MIR, and a returning core-module import emitted at the call site
+        (the `host_call` seam is the template). Rich-type calls share the
+        non-scalar canonical-ABI memory glue still outstanding on the export
+        side. The declaration + the rung-5 parser are the inputs that work
+        consumes.
 - [ ] **6. Host-side composition (qubepods).** Tracked in `qubepods/TODO.md`
       §"WIT in the host" — the host validates a deployed component against its
       declared world and composes heterogeneous components over shared WIT.

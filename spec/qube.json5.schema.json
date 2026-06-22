@@ -176,6 +176,11 @@
           "type": "string",
           "default": "synthesized",
           "description": "\"synthesized\" (q64 generates the world from source at build) or a relative path to a checked-in .wit (reserved, not yet consumed)."
+        },
+        "imports": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Foreign .wit packages this qube imports (WIT rung 5). Relative paths; their scalar interfaces are declared in the emitted component's world so wac can link them at build. Passed to q64 emit --wit-import."
         }
       }
     },
