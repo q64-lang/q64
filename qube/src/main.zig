@@ -208,9 +208,10 @@ fn usage(io: std.Io) !void {
         \\  lock                    Resolve manifest dependencies and write qube.lock.
         \\  install [--offline]     Fetch locked dependencies into the cache (relocks if stale).
         \\  publish                 Pack this qube and publish it to the Continuum.
-        \\  wit <show|extract|check|diff>
+        \\  wit <show|extract|check|diff|import>
         \\                          Inspect WIT worlds: this qube's contract, a component's
-        \\                          embedded world, surface↔manifest agreement, version diffs.
+        \\                          embedded world, surface↔manifest agreement, version diffs,
+        \\                          and a foreign .wit's q64 bindings.
         \\  login                   Authenticate against the Continuum registry.
         \\  --version, -v           Print the version and exit.
         \\  --help, -h              Print this help and exit.
@@ -1269,7 +1270,8 @@ fn cmdWit(
     if (std.mem.eql(u8, verb, "extract")) return witExtract(gpa, io, env, args_it);
     if (std.mem.eql(u8, verb, "check")) return witCheck(gpa, io, env, args_it);
     if (std.mem.eql(u8, verb, "diff")) return witDiff(gpa, io, env, args_it);
-    try printStderr(io, "qube wit: unknown verb '{s}' (show|extract|check|diff)\n", .{verb});
+    if (std.mem.eql(u8, verb, "import")) return witImport(gpa, io, env, args_it);
+    try printStderr(io, "qube wit: unknown verb '{s}' (show|extract|check|diff|import)\n", .{verb});
     std.process.exit(@intFromEnum(ExitCode.usage));
 }
 
@@ -1363,6 +1365,58 @@ fn witShow(
     defer inv.deinit(gpa);
     if (out_path) |op| try inv.argv.appendSlice(gpa, &.{ "--out", op });
     const term = try spawnInherit(io, inv.argv.items);
+    const code = termCode(term) orelse 255;
+    if (code != 0) std.process.exit(if (code == 1) @intFromEnum(ExitCode.compile) else code);
+}
+
+/// `qube wit import <file.wit> [--out <file>]` — parse a foreign WIT package and
+/// print its q64 binding preview (WIT rung 5, the consume direction). The
+/// package-level wrapper over `q64 wit import` (the compiler owns the parser +
+/// the WIT→q64 type mapping).
+fn witImport(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var input: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--out")) {
+            out_path = args_it.next() orelse {
+                try writeStderr(io, "qube wit import: --out needs a value\n");
+                std.process.exit(@intFromEnum(ExitCode.usage));
+            };
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube wit import: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (input == null) {
+            input = a;
+        } else {
+            try writeStderr(io, "qube wit import: unexpected extra arg\n");
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    const in = input orelse {
+        try writeStderr(io, "usage: qube wit import <file.wit> [--out <file>]\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+
+    const cwd_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_path);
+    const repo_root_opt = findRepoRoot(gpa, io, cwd_path) catch null;
+    defer if (repo_root_opt) |r| gpa.free(r);
+    const q64_bin = try resolveBinary(gpa, io, env, "Q64_BIN", repo_root_opt, "q64/zig-out/bin/q64", "q64");
+    defer gpa.free(q64_bin);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ q64_bin, "wit", "import", in });
+    if (out_path) |op| try argv.appendSlice(gpa, &.{ "--out", op });
+    const term = spawnInherit(io, argv.items) catch {
+        try writeStderr(io, "qube wit import: q64 not found (set Q64_BIN or build q64)\n");
+        std.process.exit(@intFromEnum(ExitCode.internal));
+    };
     const code = termCode(term) orelse 255;
     if (code != 0) std.process.exit(if (code == 1) @intFromEnum(ExitCode.compile) else code);
 }

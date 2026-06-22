@@ -1536,15 +1536,34 @@ notes below).
         `export` folds rung-1 synthesis behind a verb; `import` is rung 5
         ingestion). `qube wit` calls `q64 show world` today; the dedicated
         `q64 wit` verbs are additive.
-- [ ] **5. WIT ingestion — consume foreign `.wit` (the big one).** Parse an
-      authored/foreign `.wit` package and bind a qube's `import`s to its
-      interfaces — the path that lets a q64 qube call a Rust/JS/Go component.
-      Needs: a WIT parser; a WIT-type → q64-type mapping (the inverse of the
-      `spec/modules.md` lowering table); and an **opaque resource-handle type**
-      that lives *outside* the face system (q64 user code can hold/pass a
-      foreign `resource` handle but not introspect it — keeps the `faces.md`
-      boundary intact, `spec/modules.md:381`). This is the missing **input**
-      direction that makes "any language over WIT" real.
+- [~] **5. WIT ingestion — consume foreign `.wit` (the big one).** Foundation
+      **landed**; the codegen binding is the remaining slice.
+      - **Done — parser + type mapping + CLI.** A self-contained WIT parser
+        (`q64/src/wit/wit.zig`: lexer + recursive-descent parser → typed model)
+        covering package/interface/world, `type`/`record`/`enum`/`variant`/
+        `flags`/`resource`/`func`, and the type grammar (primitives, `list`/
+        `option`/`result`/`tuple`, `own`/`borrow` handles, named refs, comments,
+        `%`-escapes). The **WIT→q64 type map** inverts the `spec/modules.md`
+        table (`sN`→`iN`, `string`→`str`, `list<u8>`→`Bytes`, `list<T>`→`[T]`,
+        `option`/`result`, `record`→`struct`, `variant`→`enum`-with-payloads).
+        Surfaced via **`q64 wit import <file.wit>`** + **`qube wit import`** (the
+        package wrapper) — the binding preview, the inverse of `q64 show world`.
+        New `WIT` diagnostic band (`spec/diagnostics.md`).
+      - **Type-system honesty.** `flags` (WIT020), `char` (WIT021), and
+        anonymous `tuple<…>` (WIT022) are surfaced as gaps, never coerced; a
+        foreign `resource` is an **opaque handle** outside the face system
+        (`own<R>`→`handle<R>`, `borrow<R>`→`&handle<R>` — q64 holds, never
+        introspects). Parse errors are WIT001.
+      - Tests: `q64/src/wit/wit.zig` (7 unit — parse/map/gaps/resource/world/
+        error), `q64-test/tests/wit-import.test.ts` (4), `qube-test`
+        `wit.test.ts` (1 delegation). Spec: `q64-cli.md` §"q64 wit import",
+        `qube-cli.md`, `diagnostics.md`.
+      - **Remaining (the codegen binding).** Actually *generating* the wasm
+        component imports + canonical-ABI call glue so q64 **source** can call a
+        foreign component — wiring the parsed interface into name resolution
+        (NAM), the HIR/MIR, and the import side of `codegen/component.zig`. Plus
+        binding a qube's `import`s to a dependency's `.wit` via the manifest.
+        The parser + mapping this slice landed are the inputs that work feeds on.
 - [ ] **6. Host-side composition (qubepods).** Tracked in `qubepods/TODO.md`
       §"WIT in the host" — the host validates a deployed component against its
       declared world and composes heterogeneous components over shared WIT.
@@ -1616,10 +1635,11 @@ WIT also splits along the same line. Decided: **the source↔WIT primitives are
       verb for "give me the world of this source tree" without a full
       `--component` build. Folds WIT rung 1's synthesis behind a first-class
       name.
-- [ ] `q64 wit import <world.wit>` — ingest a foreign/authored `.wit` and bind
-      a qube's `import`s to its interfaces (the **consume** direction). This is
-      WIT rung 5 — needs a WIT parser, the WIT-type → q64-type mapping, and the
-      opaque resource-handle type outside the face system. The big one.
+- [~] `q64 wit import <world.wit>` — ingest a foreign/authored `.wit` (the
+      **consume** direction). **Parser + WIT→q64 type mapping + binding preview
+      landed** (WIT rung 5 above); the remaining slice is *binding* a qube's
+      `import`s to the parsed interfaces in name resolution + codegen so q64
+      source actually calls across. The big one's foundation is in.
 - [x] `qube wit show/extract/check/diff` — the **package** layer (rung 4):
       **done**. Resolved world of the current qube (manifest + deps), extract
       the embedded world from any component, check a qube's surface, diff worlds

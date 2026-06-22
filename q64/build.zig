@@ -53,9 +53,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // WIT ingestion (src/wit/wit.zig) — a self-contained WIT parser + WIT→q64
+    // type mapping (WIT rung 5). Pure Zig, no cross-module imports.
+    const wit_mod = b.createModule(.{
+        .root_source_file = b.path("src/wit/wit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     exe_mod.addImport("parser", parser_mod);
     exe_mod.addImport("ir", ir_mod);
     exe_mod.addImport("sema", sema_mod);
+    exe_mod.addImport("wit", wit_mod);
     linkBinaryen(exe_mod, target, binaryen_include, binaryen_lib);
 
     const exe = b.addExecutable(.{
@@ -80,6 +89,7 @@ pub fn build(b: *std.Build) void {
     addPlainTest(b, test_step, target, optimize, "src/parser/diag.zig");
     addPlainTest(b, test_step, target, optimize, "src/parser/parse.zig");
     addPlainTest(b, test_step, target, optimize, "src/parser/ast.zig");
+    addPlainTest(b, test_step, target, optimize, "src/wit/wit.zig");
 
     // IR tests are pure Zig (no Binaryen link), but need the `parser`
     // import, so they can't use addPlainTest. A fresh module rooted at the

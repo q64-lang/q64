@@ -12,6 +12,7 @@ const diag = parser.diag;
 const emit = @import("codegen/emit.zig");
 const sema = @import("sema");
 const doc = @import("doc.zig");
+const wit = @import("wit");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -61,6 +62,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "wit")) {
+        try cmdWit(gpa, io, &args_it);
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "doc")) {
         try cmdDoc(gpa, io, &args_it);
         return;
@@ -104,6 +110,7 @@ fn usage(io: std.Io) !void {
         \\  show capabilities --qube <file.q>  Print the qube's compiler-derived capability set.
         \\  show world --qube <file.q> [--out <file.wit>] [--world <name>] [--wit-package <id>]
         \\                                     Print (or write) the synthesized WIT world.
+        \\  wit import <file.wit> [--out <f>]  Parse a foreign WIT package and print its q64 bindings.
         \\  doc --json [--qube <file.q>]       Emit the language documentation index as JSON.
         \\  explain <code> [--diagnostics json]  Print documentation for a diagnostic code.
         \\  --version                          Print the version and exit.
@@ -406,17 +413,17 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
         // and `wac`/`wasm-tools` consume. The component embeds its own type
         // (round-trips via `wasm-tools component wit`); this is its source-level
         // companion. Same synthesis as `q64 show world`.
-        const wit = emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package) catch |err| {
+        const wit_text = emit.showWorld(gpa, source, src, module_sources.items, world_name, wit_package) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
             try w.interface.print("q64: WIT emit failed: {s}\n", .{@errorName(err)});
             try w.interface.flush();
             std.process.exit(1);
         };
-        defer gpa.free(wit);
+        defer gpa.free(wit_text);
         const wit_path = try std.fmt.allocPrint(gpa, "{s}.wit", .{base});
         defer gpa.free(wit_path);
-        try writeFile(io, wit_path, wit);
+        try writeFile(io, wit_path, wit_text);
     }
 }
 
@@ -794,6 +801,87 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
     var w = std.Io.File.stdout().writerStreaming(io, &buf);
     try w.interface.writeAll(dump);
     try w.interface.flush();
+}
+
+/// `q64 wit import <file.wit> [--out <f>]` — parse a foreign/authored WIT
+/// package and print its q64 **binding preview** (WIT rung 5, the consume
+/// direction): each interface's type defs + functions rendered as q64
+/// declarations, with honest gaps for the WIT primitives q64 can't represent
+/// (`flags`/`char`/anonymous `tuple`) and opaque handles for `resource`s. A
+/// parse error is reported on stderr (WIT001) with a non-zero exit; a document
+/// that maps with gaps still prints (the gaps are notes), exiting 0.
+fn cmdWit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    const verb = args_it.next() orelse {
+        try usage(io);
+        std.process.exit(2);
+    };
+    if (!std.mem.eql(u8, verb, "import")) {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("q64: wit: unknown verb '{s}' (expected 'import')\n", .{verb});
+        try w.interface.flush();
+        std.process.exit(2);
+    }
+
+    var src_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--out")) {
+            out_path = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // Tolerate unknown flags.
+        } else if (src_path == null) {
+            src_path = a;
+        } else {
+            try usage(io);
+            std.process.exit(2);
+        }
+    }
+    const src = src_path orelse {
+        try usage(io);
+        std.process.exit(2);
+    };
+
+    const source = std.Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("q64: cannot read {s}: {s}\n", .{ src, @errorName(err) });
+        try w.interface.flush();
+        std.process.exit(2);
+    };
+    defer gpa.free(source);
+
+    // The parser arena owns the model + rendered output for this invocation.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var p: wit.Parser = undefined;
+    const document = wit.parse(a, source, &p) catch |err| switch (err) {
+        wit.Error.ParseError => {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("q64: WIT001: {s}: {s} (byte {d})\n", .{ src, p.err_msg, p.err_pos });
+            try w.interface.flush();
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+
+    var gaps = wit.Gaps{};
+    const rendered = try wit.renderBindings(a, &document, &gaps);
+
+    if (out_path) |op| {
+        try writeFile(io, op, rendered);
+    } else {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stdout().writerStreaming(io, &buf);
+        try w.interface.writeAll(rendered);
+        try w.interface.flush();
+    }
 }
 
 /// `q64 doc --json [--qube <file.q>] [--module name=dir ...]` — emit the

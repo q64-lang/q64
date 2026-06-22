@@ -28,6 +28,7 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 fmt [path]`        | Format source in-place (file or directory); add `--stdout` to print to stdout instead and read from stdin when `path` is omitted |
 | `q64 lsp`               | Run the language server (stdin/stdout LSP)                    |
 | `q64 show <kind> <arg>` | Introspection (see below)                                     |
+| `q64 wit import <file.wit>` | Parse a foreign WIT package and print its q64 bindings (see below) |
 | `q64 doc --json [--qube <file.q>]` | Emit the language documentation index as JSON (see below) |
 | `q64 explain <code>`    | Print structured documentation for a diagnostic code          |
 | `q64 repl`              | Interactive REPL (eventual; not in v0)                        |
@@ -74,6 +75,37 @@ stdout; a malformed program surfaces the same honest diagnostic `emit` would
 
 Each form takes additional `--qube <path>` or `--module <name>=<path>`
 flags as needed (see "Global options").
+
+### `q64 wit import` — consume a foreign WIT package
+
+```
+q64 wit import <file.wit> [--out <file>]
+```
+
+The **consume** direction of WIT (rung 5) — the inverse of
+[`q64 show world`](#q64-show-kinds), which *emits* q64 → WIT. `import` parses a
+foreign/authored `.wit` (a component written in any language) and prints its
+**q64 binding preview**: each interface's type definitions and functions
+rendered as q64 declarations, so a q64 qube can see what it would call. The
+WIT→q64 type map inverts the table in
+[`modules.md` §"Lowering q64 types to the canonical ABI"](./modules.md):
+`sN`→`iN`, `uN`→`uN`, `string`→`str`, `list<u8>`→`Bytes`, `list<T>`→`[T]`,
+`option`→`Option`, `result`→`Result`, `record`→`struct`, `enum`→`enum`,
+`variant`→`enum` with payloads.
+
+WIT primitives q64 has no representation for are **surfaced as gaps, never
+silently coerced**: `flags` (`WIT020`), `char` (`WIT021`), and an anonymous
+`tuple<…>` in a foreign signature (`WIT022`). A foreign `resource` becomes an
+**opaque handle** that lives *outside* the face system — q64 can hold and pass
+the handle (`own<R>`→`handle<R>`, `borrow<R>`→`&handle<R>`) but not introspect
+it, keeping the [`faces.md`](./faces.md) boundary intact. A parse error is
+`WIT001` (non-zero exit); a document that maps with gaps still prints (the gaps
+are notes) and exits `0`. `--out` writes the preview to a file.
+
+This slice lands the WIT parser + the type mapping the rest of rung 5 builds
+on; *generating* the wasm imports + canonical-ABI call glue (so q64 source
+actually calls across the boundary) is the next slice. `qube wit import` is the
+package-level wrapper.
 
 ### `q64 fmt` options
 

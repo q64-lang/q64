@@ -1,0 +1,21 @@
+// A foreign component's WIT — the kind a Rust/JS/Go qube publishes — used to
+// exercise `q64 wit import` (WIT rung 5, the consume direction).
+package acme:store@1.2.0;
+
+interface kv {
+  record entry { key: string, value: list<u8> }
+  enum status { ok, missing, denied }
+  variant event { created(string), deleted, renamed(entry) }
+  resource handle {
+    get: func(k: string) -> option<list<u8>>;
+  }
+
+  open: func(name: string) -> own<handle>;
+  put: func(h: borrow<handle>, e: entry) -> result<status, string>;
+  count: func(prefix: string) -> u64;
+  flags perms { read, write }
+}
+
+world store {
+  export kv;
+}

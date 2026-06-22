@@ -93,6 +93,20 @@ describe.skipIf(!binaryAvailable() || !q64Available() || !componentToolsAvailabl
   },
 );
 
+describe.skipIf(!binaryAvailable() || !q64Available())("qube wit import", () => {
+  test("delegates to q64 to map a foreign .wit to q64 bindings", () => {
+    const proj = makeProject({
+      "foreign.wit":
+        "package acme:store@1.0.0;\ninterface kv {\n  record entry { key: string, value: list<u8> }\n  open: func(name: string) -> result<entry, string>;\n}\n",
+    });
+    const r = runCli(["wit", "import", join(proj, "foreign.wit")], { cwd: proj, env });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("WIT package acme:store@1.0.0");
+    expect(r.stdout).toContain("struct entry { key: str, value: Bytes }");
+    expect(r.stdout).toContain("-> Result<entry, str>");
+  });
+});
+
 describe.skipIf(!binaryAvailable())("qube wit diff", () => {
   // Two .wit files — no compiler/wasm-tools needed.
   test("an added export is compatible, exit 0", () => {

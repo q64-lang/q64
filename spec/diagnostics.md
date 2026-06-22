@@ -139,6 +139,7 @@ reader which subsystem raised it:
 | `CGN`   | Codegen                                         |
 | `LNK`   | Linker / wasm assembly                          |
 | `CMP`   | Component emission (WIT world synthesis, canonical-ABI lowering) |
+| `WIT`   | WIT ingestion (foreign `.wit` parsing, WIT→q64 type mapping)     |
 | `RPC`   | Remote procedure call (`@wire`, wRPC wire, transports)          |
 | `FMT`   | Formatter                                       |
 | `LSP`   | Language server                                 |
