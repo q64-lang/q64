@@ -91,5 +91,46 @@ export async function createCompiler(opts) {
         }
     }
 
-    return { compile, diagnostics, binaryen };
+    /// Encode the `q64_compile_project` wire image (see src/wasm.zig): the main
+    /// source, then a count, then each module's `(name, source)` — all u32-LE
+    /// length-prefixed.
+    function encodeProject(main, modules) {
+        const enc = new TextEncoder();
+        const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true); return b; };
+        const parts = [];
+        const mainB = enc.encode(main);
+        parts.push(u32(mainB.length), mainB, u32(modules.length));
+        for (const m of modules) {
+            const nameB = enc.encode(m.name), srcB = enc.encode(m.source);
+            parts.push(u32(nameB.length), nameB, u32(srcB.length), srcB);
+        }
+        const total = parts.reduce((s, p) => s + p.length, 0);
+        const buf = new Uint8Array(total);
+        let off = 0;
+        for (const p of parts) { buf.set(p, off); off += p.length; }
+        return buf;
+    }
+
+    /// Compile a **multi-module project** (the manifest `dependencies` link):
+    /// `main` source plus `modules` = `[{ name, source }]` (e.g.
+    /// `{ name: "test.color", source: "<color/src/lib.q>" }`). Returns
+    /// `{ wasm }` — a core module with the libraries linked in, or `null` wasm on
+    /// failure (call `diagnostics(main)` for the reason). `modules: []` ≡ `compile`.
+    function compileProject(main, modules = [], { wasm64 = false } = {}) {
+        const image = encodeProject(main, modules);
+        const ptr = x.q64_alloc(image.length) >>> 0;
+        new Uint8Array(x.memory.buffer).set(image, ptr);
+        try {
+            const packed = x.q64_compile_project(ptr, image.length, wasm64 ? 1 : 0);
+            if (packed === 0n) return { wasm: null };
+            const out = readPacked(packed);
+            const wasm = new Uint8Array(x.memory.buffer.slice(out.ptr, out.ptr + out.len));
+            x.q64_free(out.ptr, out.len);
+            return { wasm };
+        } finally {
+            x.q64_free(ptr, image.length);
+        }
+    }
+
+    return { compile, compileProject, diagnostics, binaryen };
 }

@@ -78,6 +78,65 @@ export fn q64_compile(src_ptr: [*]const u8, src_len: usize, addr_is_wasm64: u32)
     return pack(bytes);
 }
 
+/// A length-prefixed reader over the host-written project buffer. All lengths
+/// are little-endian `u32` (lossless on wasm32). Every read is bounds-checked;
+/// a short/garbled buffer yields `null` and the caller fails the compile (→ 0).
+const Reader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn u32le(self: *Reader) ?u32 {
+        if (self.pos + 4 > self.buf.len) return null;
+        const v = std.mem.readInt(u32, self.buf[self.pos..][0..4], .little);
+        self.pos += 4;
+        return v;
+    }
+    fn slice(self: *Reader, n: usize) ?[]const u8 {
+        if (self.pos + n > self.buf.len) return null;
+        const s = self.buf[self.pos .. self.pos + n];
+        self.pos += n;
+        return s;
+    }
+};
+
+/// Compile a **multi-module project** to a core `.wasm` module — the on-device
+/// equivalent of `q64 emit --module name=dir …` (manifest `dependencies`). The
+/// codegen already links modules (`emitFromSource(…, modules, …)`); this entry
+/// just lets the host hand them across the wasm boundary, so a qube that
+/// `import`s a sibling **library** qube builds in the browser.
+///
+/// `buf` (written via `q64_alloc`) is a self-describing wire image:
+///
+///   u32 main_len, main_bytes,
+///   u32 module_count,
+///   repeat module_count times: u32 name_len, name_bytes, u32 src_len, src_bytes
+///
+/// Names/sources are zero-copy slices into `buf` (it outlives the call). With
+/// `module_count == 0` this is exactly `q64_compile`. Returns packed
+/// `(ptr << 32) | len` of the emitted bytes (host frees via `q64_free`), or `0`
+/// on a malformed buffer or any compile failure (call `q64_diagnostics` on the
+/// main source for the reason).
+export fn q64_compile_project(buf_ptr: [*]const u8, buf_len: usize, addr_is_wasm64: u32) u64 {
+    var r = Reader{ .buf = buf_ptr[0..buf_len] };
+    const main_len = r.u32le() orelse return 0;
+    const main_src = r.slice(main_len) orelse return 0;
+    const mod_count = r.u32le() orelse return 0;
+
+    const mods = host_allocator.alloc(emit.ModuleSource, mod_count) catch return 0;
+    defer host_allocator.free(mods);
+    for (mods) |*m| {
+        const name_len = r.u32le() orelse return 0;
+        const name = r.slice(name_len) orelse return 0;
+        const src_len = r.u32le() orelse return 0;
+        const src = r.slice(src_len) orelse return 0;
+        m.* = .{ .name = name, .source = src };
+    }
+
+    const addr: emit.AddressSpace = if (addr_is_wasm64 != 0) .wasm64 else .wasm32;
+    const bytes = emit.emitFromSource(host_allocator, main_src, "main.q", mods, addr) catch return 0;
+    return pack(bytes);
+}
+
 /// Produce the spec/diagnostics.md JSON envelope for `source`. Returns packed
 /// `(ptr << 32) | len` of the UTF-8 JSON (host frees via `q64_free`), or `0` on
 /// allocation failure.
