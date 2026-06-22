@@ -2889,11 +2889,27 @@ fn cmdPublish(
     }
     try printStdout(io, "qube publish: packed {s}\n", .{out_zip_full});
 
-    // Synthesize the WIT world and attach it (WIT rung 3): the Continuum stores
-    // SOURCE, not wasm, so the world can't be derived registry-side — the
-    // toolchain attaches it here (like `capabilities`). Best-effort: if q64 is
-    // absent or the qube doesn't compile a world, publish proceeds without it.
-    const wit_path = synthesizeWitWorld(gpa, io, env, &m, name) catch null;
+    // Attach the WIT world (rung 3): the Continuum stores SOURCE, not wasm, so the
+    // world can't be derived registry-side — the toolchain attaches it here (like
+    // `capabilities`). Two sources, in order:
+    //   1. A hand-authored `.wit` named by `wit.file` in the manifest — for a
+    //      FOREIGN component (e.g. a Zig library like quine) whose world the q64
+    //      compiler can't synthesize. Published verbatim.
+    //   2. Otherwise synthesize from q64 source (`q64 show world`).
+    // Best-effort: publish proceeds without a world if neither is available.
+    const wit_path: ?[]u8 = blk: {
+        if (manifestNestedString(m.root, "wit", "file")) |rel| {
+            const p = try std.fs.path.join(gpa, &.{ project_dir, rel });
+            std.Io.Dir.cwd().access(io, p, .{}) catch {
+                try printStderr(io, "qube publish: wit.file '{s}' not found\n", .{rel});
+                gpa.free(p);
+                std.process.exit(@intFromEnum(ExitCode.input));
+            };
+            try printStdout(io, "qube publish: attaching hand-authored WIT '{s}'\n", .{rel});
+            break :blk p;
+        }
+        break :blk synthesizeWitWorld(gpa, io, env, &m, name) catch null;
+    };
     defer if (wit_path) |p| gpa.free(p);
 
     // Token.
