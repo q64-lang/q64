@@ -7,7 +7,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply q64-continuum --local",
-    "db:migrate:remote": "wrangler d1 migrations apply q64-continuum --remote",
+    "db:migrate:stage": "wrangler d1 migrations apply q64-continuum-stage --remote --env stage",
+    "db:migrate:prod": "wrangler d1 migrations apply q64-continuum --remote --env prod",
+    "deploy:stage": "wrangler deploy --env stage",
+    "deploy:prod": "wrangler deploy --env prod",
     "typecheck": "tsc --noEmit",
     "test": "bun test test/"
   },
