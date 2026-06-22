@@ -3,51 +3,53 @@
 // repo is public). Worker names + route hostnames are NOT secret, so they stay
 // here verbatim.
 //
-// Org convention: every Worker ships a `stage` and a `prod` env, deployed
-// explicitly (no top-level deployable default), on a SEPARATE Cloudflare account
-// each — see the qubepods apps for the same shape:
+// STAGE IS THE DEFAULT, PROD NEEDS MORE. A bare `wrangler deploy` (and CI) goes
+// to STAGE — so an accidental deploy can't hit prod. PROD requires an explicit
+// `wrangler deploy --env prod` with the prod account's CLOUDFLARE_API_TOKEN +
+// CLOUDFLARE_ACCOUNT_ID, and the prod D1/KV ids filled in below.
 //
-//   pnpm run deploy:stage   →  wrangler deploy --env stage   (stage account)
-//   pnpm run deploy:prod    →  wrangler deploy --env prod    (prod account)
+//   pnpm run deploy        →  wrangler deploy             (stage, the default)
+//   pnpm run deploy:prod   →  wrangler deploy --env prod  (prod account)
 //
-// Naming scheme: worker `name` is `q64-continuum-api` for prod, `-stage` suffix
-// for stage. DNS scheme: stage binds the custom domain `qubes-q64.taluvi.dev`
-// (the `<host>-<project>.taluvi.dev` stage pattern, on the stage account); prod
-// binds `qubes.q64.dev` (the prod q64.dev zone). Shared keys sit at the top
-// level; `account_id`, routes, and all bindings are per-env so nothing crosses
-// accounts.
+// Naming scheme: worker `name` is `q64-continuum-api-stage` (stage, top level) /
+// `q64-continuum-api` (prod, env.prod). DNS scheme: stage binds
+// `qubes-q64.taluvi.dev` (the `<host>-<project>.taluvi.dev` stage pattern, stage
+// account); prod binds `qubes.q64.dev` (prod q64.dev zone). Each env declares its
+// own account_id + bindings — named envs don't inherit bindings — so nothing
+// crosses accounts.
 //
 // Provision each env's resources on its own account first, then migrate:
-//   wrangler d1 create q64-continuum-<env>
-//   wrangler r2 bucket create q64-continuum-archives-<env>
+//   wrangler d1 create q64-continuum-stage
+//   wrangler r2 bucket create q64-continuum-archives-stage
 //   wrangler kv namespace create CACHE
-//   wrangler d1 migrations apply q64-continuum-<env> --remote --env <env>
+//   wrangler d1 migrations apply q64-continuum-stage --remote        # stage (default)
+//   wrangler d1 migrations apply q64-continuum --remote --env prod   # prod
 {
   "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
+  "name": "q64-continuum-api-stage",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
-  "env": {
-    "stage": {
-      "name": "q64-continuum-api-stage",
-      "account_id": "REPLACE_WITH_STAGE_ACCOUNT_ID",
-      "routes": [
-        { "pattern": "qubes-q64.taluvi.dev", "custom_domain": true }
-      ],
-      "r2_buckets": [
-        { "binding": "ARCHIVES", "bucket_name": "q64-continuum-archives-stage" }
-      ],
-      "d1_databases": [
-        { "binding": "DB", "database_name": "q64-continuum-stage", "database_id": "REPLACE_WITH_STAGE_D1_ID", "migrations_dir": "migrations" }
-      ],
-      "kv_namespaces": [
-        { "binding": "CACHE", "id": "REPLACE_WITH_STAGE_KV_ID" }
-      ],
-      "vars": { "ENV": "dev", "ADMIN_EMAILS": "" }
-    },
+  // ---- stage (the default deploy target) ----
+  "account_id": "REPLACE_WITH_STAGE_ACCOUNT_ID",
+  "routes": [
+    { "pattern": "qubes-q64.taluvi.dev", "custom_domain": true }
+  ],
+  "r2_buckets": [
+    { "binding": "ARCHIVES", "bucket_name": "q64-continuum-archives-stage" }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "q64-continuum-stage", "database_id": "REPLACE_WITH_STAGE_D1_ID", "migrations_dir": "migrations" }
+  ],
+  "kv_namespaces": [
+    { "binding": "CACHE", "id": "REPLACE_WITH_STAGE_KV_ID" }
+  ],
+  "vars": { "ENV": "dev", "ADMIN_EMAILS": "" },
 
+  // ---- prod (needs `--env prod`) ----
+  "env": {
     "prod": {
       "name": "q64-continuum-api",
       "account_id": "REPLACE_WITH_PROD_ACCOUNT_ID",

@@ -1,47 +1,41 @@
 {
+  // STAGE is the default — a bare `wrangler deploy` (and CI) goes to stage, so an
+  // accidental deploy can't hit prod. PROD needs more: an explicit
+  // `wrangler deploy --env prod` with the prod account's CLOUDFLARE_ACCOUNT_ID +
+  // token. DNS scheme: stage `continuum-q64.taluvi.dev`, prod `continuum.q64.dev`;
+  // the API service binding points at the matching env's API worker. Account id
+  // comes from the deploy env var, never committed (public repo).
   "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
-  "name": "q64-continuum",
+  "name": "q64-continuum-stage",
   "main": "src/index.tsx",
   "compatibility_date": "2026-05-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
   "routes": [
-    { "pattern": "continuum.q64.dev", "custom_domain": true }
+    { "pattern": "continuum-q64.taluvi.dev", "custom_domain": true }
   ],
 
-  // Service binding into the API Worker. UI Worker calls the API directly
-  // via env.API.fetch(...) — no public-internet hop, no token needed for
-  // server-rendered reads.
+  // Service binding into the API Worker (stage). The UI calls the API directly
+  // via env.API.fetch(...) — no public-internet hop, no token for server reads.
   "services": [
-    {
-      "binding": "API",
-      "service": "q64-continuum-api"
-    }
+    { "binding": "API", "service": "q64-continuum-api-stage" }
   ],
 
   "vars": {
     "ENV": "dev"
   },
 
-  // Stage env: deploy with `wrangler deploy --env stage` (CLOUDFLARE_ACCOUNT_ID +
-  // token = the stage account). Same DNS scheme as the API — prod
-  // `continuum.q64.dev` → stage `continuum-q64.taluvi.dev` — and the API service
-  // binding points at the STAGE API so the stage UI reads the stage registry.
-  // Account id is supplied by the deploy env var, never committed (public repo).
-  // Top-level config stays the prod default (`wrangler deploy`), unchanged.
   "env": {
-    "stage": {
-      "name": "q64-continuum-stage",
+    "prod": {
+      "name": "q64-continuum",
       "routes": [
-        { "pattern": "continuum-q64.taluvi.dev", "custom_domain": true }
+        { "pattern": "continuum.q64.dev", "custom_domain": true }
       ],
       "services": [
-        { "binding": "API", "service": "q64-continuum-api-stage" }
+        { "binding": "API", "service": "q64-continuum-api" }
       ],
-      "vars": {
-        "ENV": "dev"
-      }
+      "vars": { "ENV": "prod" }
     }
   }
 }
