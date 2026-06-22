@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import type { Env } from "./env.ts";
 import { qubes } from "./routes/qubes.ts";
 import { categories } from "./routes/categories.ts";
@@ -8,6 +9,12 @@ import { oci } from "./routes/oci.ts";
 // `strict: false` so a trailing slash is accepted — the OCI spec mandates
 // `GET /v2/` (with slash), and it's harmless leniency for the v1 JSON API.
 const app = new Hono<{ Bindings: Env }>({ strict: false });
+
+// Public registry: allow cross-origin reads so browser clients (the qubepods
+// shell resolving an engine dependency, the Continuum UI on another host, OCI
+// tooling) can fetch metadata + archives + manifests. Reads are public, so a
+// wildcard origin is correct; the publish path stays Bearer-gated regardless.
+app.use("*", cors({ origin: "*", allowMethods: ["GET", "HEAD", "POST", "OPTIONS"] }));
 
 // Root: humans who accidentally hit qubes.q64.dev get a pointer.
 app.get("/", (c) =>
