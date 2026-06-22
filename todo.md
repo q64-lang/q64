@@ -1670,10 +1670,22 @@ protocol facade, not new storage.
       published qube; `oras push` of a component is consumable by `qube add`.
       (Pull path is unit + route tested in `continuum-api/test/oci*.test.ts`;
       live `oras pull` against a deployed worker is the remaining check.)
+- [ ] **7. Docker Registry v2 Bearer-token protocol** — the
+      `WWW-Authenticate: Bearer realm=…,service=…,scope=…` → token-endpoint
+      (`GET /v2/token`) → `Authorization: Bearer <token>` handshake the OCI
+      clients (`oras`, `docker`, `wkg`) perform, exchanging a `qube_pat_` PAT
+      (HTTP Basic) for a short-lived registry token, reusing the existing auth
+      backend (`routes/auth.ts` + `lib/tokens.ts`). **Gates the write/push path**
+      (rung 2 upload + rung 3 `PUT` manifest) and any future private repos.
+      **NOT needed for download:** public **pull** stays anonymous (no token,
+      `GET /v2/` already answers 200) — so this is push-auth only, not a gate on
+      the read surface that's already shipped.
 
 Implementation: `continuum-api/src/routes/oci.ts` (mounted at `/v2`). Read path
 (rungs 1,3,4 + the GET/HEAD half of 2) + rung 5 are done; the write path (the
-rest of 2 + `PUT` manifest in 3) is the next increment, gated on OCI Bearer auth.
+rest of 2 + `PUT` manifest in 3) is the next increment, gated on the OCI Bearer
+auth handshake (rung 7). Public pull is anonymous, so the read surface ships
+without it.
 
 **Coexistence:** both surfaces read/write the **same R2 blobs by digest** and the
 **same D1 metadata** — publishing once is visible to both `qube add` and `wkg`.
