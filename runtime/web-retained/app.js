@@ -875,11 +875,21 @@ async function main() {
   catch (e) { log('WebGPU unavailable: ' + e.message + ' — open in a WebGPU-capable browser (iPad Safari 18+).'); return; }
   resize();
 
-  const resp = await fetch('./screen.wasm');
-  const bytes = await resp.arrayBuffer();
+  // The program to run: a host-INJECTED one when present (an embedding host —
+  // e.g. the Qubonaut Preview — hands a compiled `qube run` program in via
+  // `window.__qubonautWasm`, base64), else the bundled q64View demo screen.
+  const injected = (typeof window !== 'undefined' && window.__qubonautWasm) || null;
+  let bytes;
+  if (injected) {
+    const bin = atob(injected);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } else {
+    bytes = new Uint8Array(await (await fetch('./screen.wasm')).arrayBuffer());
+  }
   const { instance: inst } = await WebAssembly.instantiate(bytes, ops());
   instance = inst;
-  log(`retained host v${PROTOCOL_VERSION} · wasm32 (${bytes.byteLength} B) · WebGPU`);
+  log(`retained host v${PROTOCOL_VERSION} · wasm32 (${bytes.byteLength} B${injected ? ', injected program' : ' demo'}) · WebGPU`);
 
   instance.exports._start();   // builds the retained tree + first present()
 
