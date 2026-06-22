@@ -1437,13 +1437,40 @@ notes below).
 
 ### Rung order (do in order; the first four extend live systems, no gate)
 
-- [ ] **1. Emit `.wit` to disk + embed the component-type.** Extend
-      `q64 emit --component` / `qube build --component` (§"Component emission")
-      to (a) write the synthesized world as a `<name>.wit` artifact next to the
-      component, and (b) embed the `component-type` custom section in the
-      emitted component so `wasm-tools component wit <c>.wasm` round-trips it.
-      Add `q64 show world --out <file.wit>` (today the world only prints to
-      stdout, `spec/q64-cli.md:51`). Cheapest rung; unblocks the rest.
+- [x] **1. Emit `.wit` to disk + embed the component-type.** Done.
+      - **(a) `.wit` artifact.** `q64 emit --component` now writes `<base>.wit`
+        (the synthesized world) next to `<base>.component.wasm`, and
+        `qube build --component` inherits it (it delegates to `q64 emit`, so the
+        `.wit` lands in `target/<profile>/<addr>/<name>.wit`). The world is now
+        a **valid standalone WIT document** — a `package q64:<world>;`
+        declaration plus the `world` block — so a pure library's `.wit` parses
+        with `wasm-tools component wit <f>.wit`. `showWorld` (`emit.zig`) is the
+        single synthesis; `emit --component` and `show world --out` are two
+        sinks for it.
+      - **(b) round-trips via `wasm-tools component wit`.** The hand-rolled
+        library component (`component.zig`) already carries its own component
+        type, so `wasm-tools component wit <c>.wasm` extracts the world
+        structurally — **no separate `component-type` custom section is
+        needed** (even `wasm-tools component new` output renders the implicit
+        top-level world as `world root`; the custom section would not change
+        that). The real fidelity fix landed instead: the encoder now emits the
+        **real parameter names** (was `p0/p1`) and **kebab-cases** every
+        component-model label from q64's snake_case (`min_of` → `min-of`,
+        `get_version` → `get-version`) — a snake `_` in a label fails component
+        validation, so this was also a latent correctness bug. Verified:
+        `component-roundtrip.sh` asserts `wasm-tools component wit` round-trips
+        `export add: func(a: s64, b: s64) -> s64` and `export min-of:` from the
+        binary, and that the `.wit` artifact exists + parses.
+      - **(c) `q64 show world --out <file.wit>`** writes the world to a file
+        instead of stdout (`main.zig` `cmdShow`).
+      - Tests: `component.zig` unit tests (param names + kebab labels),
+        `q64-test` `show/capabilities-world.test.ts` (`package` decl + `--out`),
+        `scripts/component-roundtrip.sh` (`.wit` + round-trip + kebab + qube
+        build). Spec: `spec/q64-cli.md` (`--component`, `show world --out`).
+      - **Deferred to a later rung:** *naming* the world (it renders as
+        `world root`, matching the reference tool) — would need an embedded
+        component-type that wasm-tools actually reflects, not worth it until a
+        consumer needs the name; the `.wit` artifact carries `world <name>`.
 - [ ] **2. Library manifest carries the world.** `qube.json5` for a **library
       qube** (`type: "library"`) gains a `wit` block — package name + world +
       the `.wit` path (or `"synthesized"`). Spec in `spec/qube.json5.md` +
@@ -1484,6 +1511,75 @@ Unicode-scalar type), and **anonymous `tuple<…>`** in *foreign* signatures
 (q64 tuples are nominal, `spec/types.md` §"Tuple structs"). Each is additive.
 Resources, own/borrow, and type-only interfaces are handled by the
 opaque-handle approach in rung 5, **not** by widening faces.
+
+## `q64 show` — full introspection surface (+ `q64 wit` vs `qube wit`)
+
+The compiler's introspection family. **These are `q64` commands, not `qube`
+commands** — they introspect the *compiler's view of source* (IR, types,
+effects, regions, layout, call graph, capabilities, world) over a single
+`<file.q>` (+ `--module name=dir`), with **no manifest, no dependency
+resolution, no registry**. That's the `q64`/`qube` split the repo already
+draws: `q64` is the compiler over source; `qube` is the package tool over a
+`qube.json5` (resolves deps, hits the Continuum, builds/publishes/runs). The
+package-level WIT verbs (`qube wit show/extract/check/diff`) live in §"WIT —
+first-class contract layer" rung 4 and are thin wrappers that resolve via the
+manifest and call into these `q64` primitives — they don't duplicate them.
+
+`show` dumps are **compiler-introspection: human/test-facing, not a stable
+serialization** (same disclaimer as `show hir|mir|symbols`).
+
+The surface (status against `spec/q64-cli.md` §"show"):
+
+- [x] `q64 show symbols <file.q>` — file-level symbol table (landed).
+- [x] `q64 show hir|mir <file.q>` — IR dumps (landed).
+- [x] `q64 show effects <fn> --qube <file.q>` — a function's inferred
+      capability effect set (landed).
+- [x] `q64 show capabilities --qube <file.q>` — the qube's derived capability
+      set (landed).
+- [x] `q64 show world --qube <file.q> [--out <file.wit>]` — synthesized WIT
+      world (landed; `--out` + `package` decl shipped with WIT rung 1).
+- [ ] `q64 show references <Type.method> --qube <file.q>` — find-usages /
+      cross-references for a symbol (the inverse of the call graph). Needs the
+      name-resolution pass (§"Semantic pass" Ladder A) to record use sites.
+- [ ] `q64 show type <expr> --qube <file.q>` — the inferred type of an
+      expression (the spec already reserves the "expression" subject form,
+      `spec/q64-cli.md`). Gated on the type checker (Ladder A) — today typing is
+      ad-hoc in `build_hir`.
+- [ ] `q64 show regions <fn> --qube <file.q>` — the region/lifetime analysis
+      for a function (which allocations land in which region — scope arena vs
+      stack vs static; `spec/memory.md`). Surfaces the reclamation discipline.
+- [ ] `q64 show layout <Type> --qube <file.q>` — the memory layout of a type
+      (field offsets, size, alignment, canonical-ABI lowering). Pairs with
+      struct-value support (§"Semantic pass" Ladder B) + `spec/memory.md`.
+- [ ] `q64 show graph --qube <file.q>` — the call graph (and/or module import
+      graph) of the qube; useful for effect propagation, dead-code, and the
+      `references` inverse. Emit text + a `--json`/DOT form for tools.
+- [ ] `q64 show denials <fn> --qube <file.q>` — reachability into
+      `with_capabilities(deny:)` blocks (already specced; needs the
+      `with_capabilities` syntax, tracked as `test.failing`).
+
+### `q64 wit` (compiler primitives) vs `qube wit` (package wrappers)
+
+WIT also splits along the same line. Decided: **the source↔WIT primitives are
+`q64 wit`; the manifest/registry-aware verbs are `qube wit`.**
+
+- [ ] `q64 wit export <src>` — synthesize the WIT world from source (a file or
+      a `src/` dir) and write it out. This is the **export/emit** direction the
+      compiler already does internally (`emit --component` writes `<base>.wit`,
+      `show world --out` writes one file); `q64 wit export src/` is the explicit
+      verb for "give me the world of this source tree" without a full
+      `--component` build. Folds WIT rung 1's synthesis behind a first-class
+      name.
+- [ ] `q64 wit import <world.wit>` — ingest a foreign/authored `.wit` and bind
+      a qube's `import`s to its interfaces (the **consume** direction). This is
+      WIT rung 5 — needs a WIT parser, the WIT-type → q64-type mapping, and the
+      opaque resource-handle type outside the face system. The big one.
+- [ ] `qube wit show/extract/check/diff` — the **package** layer (rung 4):
+      resolved world of the current/named qube (manifest + deps), extract the
+      embedded world from any component, check a qube's surface against its
+      declared world, diff worlds across versions (Continuum semver). Wrappers
+      over the `q64 wit`/`q64 show world` primitives; they own dependency
+      resolution and the registry, the primitives own source↔WIT.
 
 ## Semantic pass + struct values → static fits — NEXT (the slope-changing ladder)
 
