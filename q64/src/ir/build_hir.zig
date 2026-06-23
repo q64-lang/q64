@@ -8485,7 +8485,14 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             } else |_| return error.Unsupported;
         },
         .unary => |u| {
-            const kind = unKind(u.op() orelse return error.Unsupported) orelse return error.Unsupported;
+            const op = u.op() orelse return error.Unsupported;
+            // `move x` / `ref x` are ownership qualifiers — identity in v0 (no
+            // borrow tracking yet): build the operand. `move tx` yields the
+            // sender value, so `subs.push(move tx)` / `tell(Join(move tx))` work.
+            if (op.kind == .KW_MOVE or op.kind == .KW_REF) {
+                return buildIntExpr(b, u.operand() orelse return error.Unsupported, scope);
+            }
+            const kind = unKind(op) orelse return error.Unsupported;
             out.* = .{ .un = .{ .kind = kind, .operand = try buildIntExpr(b, u.operand() orelse return error.Unsupported, scope) } };
         },
         .bin => |bx| {
