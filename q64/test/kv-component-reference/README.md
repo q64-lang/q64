@@ -14,9 +14,17 @@ supply them. This directory pins the exact lowering, proven end-to-end through
 - **`wasi-keyvalue.wit`** — the vendored `wasi:keyvalue@0.2.0-draft2` dep package
   (copy of `src/codegen/wit/wasi-keyvalue.wit`, kept local so `run.sh` is
   self-contained).
-- **`run.sh`** — assembles the core, embeds the world + dep, lifts to a
-  component, validates it, and asserts the component WIT imports real
+- **`run.sh`** — assembles the *reference* core, embeds the world + dep, lifts to
+  a component, validates it, and asserts the component WIT imports real
   `wasi:keyvalue` and exports `bump`.
+- **`verify-q64.sh`** — the same, but on the **real** `q64 emit --component`
+  output for `examples/kv-counter` (build q64 first). When `node` + `jco` are
+  available it also transpiles the component and runs `bump`/`read` against a
+  generic `wasi:keyvalue` host (`host.mjs`) — proving the canonical-ABI glue at
+  runtime, not just structurally.
+- **`host.mjs`** — a stock `wasi:keyvalue` JS host (an in-memory store) that
+  drives the transpiled component. Its imports are the plain WASI interfaces (no
+  q64-specific ABI) — the same role the qubepods Dynamic Worker host plays.
 
 ## The lowering, in one breath
 
