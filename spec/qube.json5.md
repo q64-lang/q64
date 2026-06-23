@@ -35,6 +35,30 @@ Every manifest should begin with a `$schema` reference for editor tooling
 That is a complete, publishable library qube. The default `entry` is
 `src/lib.q`; the default `type` is `library`; everything else is optional.
 
+## Project layout
+
+The canonical layout keeps source under **`src/`**, separated from the manifest
+and build output:
+
+```
+my-qube/
+├── qube.json5        # the manifest
+├── qube.lock         # resolved dependencies (generated)
+├── src/
+│   ├── main.q        # an application's entry  (type: "application")
+│   └── lib.q         # a library's entry        (type: "library")
+└── target/           # build output (generated; gitignore it)
+```
+
+**`entry` is the one knob** that says where the entry source lives — every
+`qube` front-end (the native CLI and the on-device wasm shell) builds exactly
+what it names. It defaults to `src/main.q` (applications) / `src/lib.q`
+(libraries), so a qube using the standard layout may omit it; a qube that puts
+its entry elsewhere (e.g. a one-file demo with `entry: "hello.q"`) states it
+explicitly. There is no second rule — `src/` is the default value of `entry`,
+not a separate convention, so the layout can never disagree with what builds.
+A dependency's source is read from `<dep>/src/` the same way.
+
 ## Full example (application qube)
 
 ```json5
