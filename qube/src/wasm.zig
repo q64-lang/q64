@@ -28,6 +28,7 @@
 const std = @import("std");
 const json5 = @import("json5.zig");
 const resolve = @import("resolve.zig");
+const dispatch = @import("dispatch.zig");
 
 const gpa = std.heap.wasm_allocator;
 
@@ -86,6 +87,68 @@ fn manifestEntry(manifest: []const u8) ?[]const u8 {
 export fn qube_resolve_entry(ptr: [*]const u8, len: usize) u64 {
     const entry = manifestEntry(ptr[0..len]) orelse return 0;
     return pack(entry);
+}
+
+/// Route a `qube` invocation. `args_json` (ptr,len) is a JSON array of the arg
+/// strings AFTER `qube` (e.g. `["build","main.q"]`). Returns packed JSON the
+/// front-end acts on — the routing/usage/version/unknown logic lives ONCE here
+/// (shared with the native CLI via dispatch.zig), so the browser shell no longer
+/// re-codes the command switch. `(ptr<<32|len)`; 0 = malformed input.
+///
+///   { "kind":"terminal", "exit":N, "stream":"stdout"|"stderr", "text":"…" }
+///   { "kind":"command",  "cmd":"build|run|wac|webgpu|pod", "rest":[ … ] }
+///
+/// A `terminal` is printed verbatim and exits; a `command` is the one thing the
+/// host must do with a capability (compile/run/link/probe-gpu) it supplies.
+export fn qube_dispatch(args_ptr: [*]const u8, args_len: usize) u64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, args_ptr[0..args_len], .{}) catch return 0;
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return 0,
+    };
+    const args = gpa.alloc([]const u8, arr.items.len) catch return 0;
+    defer gpa.free(args);
+    for (arr.items, 0..) |v, i| args[i] = switch (v) {
+        .string => |s| s,
+        else => return 0,
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    switch (dispatch.route(args)) {
+        .terminal => |t| {
+            out.appendSlice(gpa, "{\"kind\":\"terminal\",\"exit\":") catch return 0;
+            out.print(gpa, "{d}", .{t.code}) catch return 0;
+            out.appendSlice(gpa, ",\"stream\":\"") catch return 0;
+            out.appendSlice(gpa, if (t.stream == .stdout) "stdout" else "stderr") catch return 0;
+            out.appendSlice(gpa, "\",\"text\":") catch return 0;
+            appendJsonString(&out, t.text) catch return 0;
+            out.append(gpa, '}') catch return 0;
+        },
+        .unknown => |nm| {
+            // Build the final text the host prints verbatim: the error + usage.
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(gpa);
+            text.appendSlice(gpa, "qube: unknown subcommand '") catch return 0;
+            text.appendSlice(gpa, nm) catch return 0;
+            text.appendSlice(gpa, "'\n\n") catch return 0;
+            text.appendSlice(gpa, dispatch.usage_text) catch return 0;
+            out.appendSlice(gpa, "{\"kind\":\"terminal\",\"exit\":2,\"stream\":\"stderr\",\"text\":") catch return 0;
+            appendJsonString(&out, text.items) catch return 0;
+            out.append(gpa, '}') catch return 0;
+        },
+        .command => |c| {
+            out.appendSlice(gpa, "{\"kind\":\"command\",\"cmd\":\"") catch return 0;
+            out.appendSlice(gpa, dispatch.name(c.cmd)) catch return 0;
+            out.appendSlice(gpa, "\",\"rest\":[") catch return 0;
+            for (c.rest, 0..) |a, i| {
+                if (i > 0) out.append(gpa, ',') catch return 0;
+                appendJsonString(&out, a) catch return 0;
+            }
+            out.appendSlice(gpa, "]}") catch return 0;
+        },
+    }
+    return pack(out.toOwnedSlice(gpa) catch return 0);
 }
 
 /// Join `base` + `/` + `rel` and collapse `.`/`..` segments (paths are POSIX,

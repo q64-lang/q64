@@ -1,0 +1,69 @@
+// The WIT world for `qube` as a component — the contract the on-device shell
+// (and, ultimately, the native CLI) fulfils. `qube` decides; the host performs.
+//
+// STATUS: design contract. The shipping wasm (`src/wasm.zig`) realises the
+// ROUTING half of this world today over a raw linear-memory ABI that mirrors
+// these signatures 1:1 — `export run` is `qube_dispatch` (routing + usage +
+// version, shared with the native CLI via `dispatch.zig`), and `host.read` is
+// the `env.read` import the resolver uses. The heavy capabilities (`compile`,
+// `run-module`, `link`, `gpu-probe`) are still host-driven in `qube.ts`; lowering
+// them through this `host` interface is what lets `qube.ts` shrink to a thin
+// capability provider and finally disappear. Graduating the raw ABI to a real
+// component (jco / wasm-tools, like the twin backend) does not change this
+// contract — only its encoding.
+
+package q64:qube@0.1.0;
+
+interface host {
+  // --- data the capabilities exchange -------------------------------------
+  record module { name: string, source: string }
+
+  record diag {
+    severity: string,   // "error" | "warning" | "note"
+    code: string,
+    message: string,
+    file: string,
+    line: u32,
+    col: u32,
+  }
+
+  // wasm bytes + diagnostics; `wasm` is empty when compilation failed.
+  record compiled { wasm: list<u8>, diagnostics: list<diag> }
+
+  // the answer to `qube webgpu`: a browser-only capability the wasm can't have.
+  record gpu-report {
+    available: bool,       // navigator.gpu present
+    adapter: string,       // "vendor / architecture (description)" or ""
+    device: bool,          // a GPUDevice was acquired
+    render-ok: bool,       // a 1x1 clear rendered + read back correctly
+    detail: string,        // human note (failure reason, limits, …)
+  }
+
+  // --- capabilities the host supplies -------------------------------------
+  // file + io (today: only `read`, as the raw `env.read` import)
+  read:      func(path: string) -> option<list<u8>>;
+  write:     func(path: string, bytes: list<u8>);
+  print:     func(text: string);
+  print-err: func(text: string);
+
+  // the q64 compiler (itself wasm) — qube drives it, never reimplements it
+  compile:    func(main: string, modules: list<module>) -> compiled;
+  // run a compiled core/component: headless (stdout to the terminal) OR, for a
+  // `qview` face, hand it to the Preview pane. Returns the program's exit code.
+  run-module: func(wasm: list<u8>, title: string) -> u8;
+  // on-device component linking (`qube wac plug`).
+  link:       func(socket: list<u8>, plugs: list<list<u8>>) -> result<list<u8>, string>;
+
+  // probe the browser's WebGPU end to end (adapter -> device -> render+readback).
+  gpu-probe:  func() -> gpu-report;
+}
+
+world qube {
+  import host;
+
+  // The whole CLI as one entrypoint: `args` is everything after `qube`
+  // (e.g. ["build","main.q"]); returns the process exit code. All routing,
+  // usage, version, entry resolution and dependency expansion happen inside —
+  // see dispatch.zig + resolve.zig.
+  export run: func(args: list<string>) -> u8;
+}

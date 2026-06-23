@@ -15,11 +15,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const resolve = @import("resolve.zig");
 const json5 = @import("json5.zig");
+const dispatch = @import("dispatch.zig");
 
 test {
     // Pull the shared wasm-safe cores into `zig build test`.
     _ = resolve;
     _ = json5;
+    _ = dispatch;
 }
 
 const version_string = "qube 0.0.1 (pre-alpha)";
@@ -182,6 +184,14 @@ pub fn main(init: std.process.Init) !void {
             try printStderr(io, "qube: wac failed: {s}\n", .{@errorName(err)});
             std.process.exit(@intFromEnum(ExitCode.internal));
         };
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "webgpu") or std.mem.eql(u8, sub, "gpu")) {
+        // WebGPU is a browser capability (navigator.gpu) — the native CLI has no
+        // GPU surface, so the probe lives on-device. Same command name, so the
+        // surface matches the shell (dispatch.zig owns the on-device routing).
+        try writeStdout(io, "qube webgpu: WebGPU is a browser capability — run `qube webgpu` in the Qubonaut web shell.\n");
         return;
     }
 
