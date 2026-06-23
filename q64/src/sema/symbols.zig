@@ -178,6 +178,9 @@ pub fn build(gpa: std.mem.Allocator, sf: ast.SourceFile) !SymbolTable {
         // Effect markers live in their own namespace (not value/type symbols);
         // their validity is checked directly (EFF140/EFF141).
         .effect_decl => {},
+        // A module-level binding (`let twin = Counter.spawn()`) — a
+        // module-lifetime singleton. Bound like a constant (immutable, private).
+        .let_decl => |d| try bindNamed(&t, (d.pattern() orelse continue).bindingName(), .constant, false),
     };
 
     return t;

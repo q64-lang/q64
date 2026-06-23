@@ -362,12 +362,15 @@ fn itemNode(item: ast.Item) *const cst.Node {
 
 fn itemName(item: ast.Item) ?cst.Token {
     return switch (item) {
+        // A module-level binding names itself through its pattern, not a `name()`.
+        .let_decl => |d| (d.pattern() orelse return null).bindingName(),
         inline else => |v| v.name(),
     };
 }
 
 fn itemIsPublic(item: ast.Item) bool {
     return switch (item) {
+        .let_decl => false, // module-level singletons are private (v0)
         inline else => |v| v.visibility() != null,
     };
 }
@@ -386,6 +389,7 @@ fn itemKind(item: ast.Item) []const u8 {
         .effect_decl => "effect",
         .actor_decl => "actor",
         .graph_decl => "graph",
+        .let_decl => "let",
     };
 }
 

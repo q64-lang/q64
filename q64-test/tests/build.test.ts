@@ -27,6 +27,21 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
     expect(readFileSync(out).subarray(0, 4)).toEqual(WASM_MAGIC);
   });
 
+  test("a module-level actor singleton emits valid wasm and shares state across calls", async () => {
+    // `let twin = Counter.spawn()` is a module-lifetime instance: its state is
+    // allocated once by the wasm `start` and kept in a global, so the shared
+    // count advances across calls (1, 2, 3) — the heap singleton, end to end.
+    const out = join(work, "singleton.wasm");
+    const r = runCli(["emit", fixture("singleton.q"), out, "--addr", "wasm32"]);
+    expect(r.exitCode).toBe(0);
+    expect(readFileSync(out).subarray(0, 4)).toEqual(WASM_MAGIC);
+    const { instance } = await WebAssembly.instantiate(readFileSync(out), {});
+    const ping = instance.exports.ping as () => bigint;
+    expect(ping()).toBe(1n);
+    expect(ping()).toBe(2n);
+    expect(ping()).toBe(3n);
+  });
+
   test("missing source file: non-zero exit", () => {
     const r = runCli(["emit", fixture("nope.q"), join(work, "x.wasm")]);
     expect(r.exitCode).not.toBe(0);

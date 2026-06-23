@@ -148,6 +148,10 @@ pub const Item = union(enum) {
     effect_decl: EffectDecl,
     actor_decl: ActorDecl,
     graph_decl: GraphDecl,
+    /// A module-level binding (`let twin = Counter.spawn()`) — a module-lifetime
+    /// singleton. Reuses the `LetStmt` shape (the parser emits a top-level
+    /// LET_STMT for it); distinct from reactive `state`.
+    let_decl: LetStmt,
 
     pub fn cast(node: *const cst.Node) ?Item {
         return switch (node.kind) {
@@ -163,6 +167,7 @@ pub const Item = union(enum) {
             .EFFECT_DECL => .{ .effect_decl = .{ .cst = node } },
             .ACTOR_DECL => .{ .actor_decl = .{ .cst = node } },
             .GRAPH_DECL => .{ .graph_decl = .{ .cst = node } },
+            .LET_STMT => .{ .let_decl = .{ .cst = node } },
             else => null,
         };
     }

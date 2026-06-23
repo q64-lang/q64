@@ -329,7 +329,11 @@ const Parser = struct {
 
     fn isItemKeyword(k: cst.SyntaxKind) bool {
         return switch (k) {
-            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN, .KW_EFFECT, .KW_ACTOR, .KW_GRAPH => true,
+            // `KW_LET` admits a module-level binding (`let twin = Counter.spawn()`):
+            // a module-lifetime singleton, distinct from reactive `state`. It reuses
+            // the LET_STMT node shape (see `parseItem`), so the AST sees it as an
+            // `Item.let_decl`.
+            .KW_FN, .KW_STRUCT, .KW_ENUM, .KW_TYPE, .KW_CONST, .KW_STATE, .KW_FACE, .KW_FIT, .KW_SCREEN, .KW_EFFECT, .KW_ACTOR, .KW_GRAPH, .KW_LET => true,
             else => false,
         };
     }
@@ -404,6 +408,9 @@ const Parser = struct {
             .KW_EFFECT => try self.parseEffectDecl(),
             .KW_ACTOR => try self.parseActorDecl(),
             .KW_GRAPH => try self.parseGraphDecl(),
+            // A module-level `let` (a singleton binding) reuses the statement
+            // shape; the AST maps a top-level LET_STMT to `Item.let_decl`.
+            .KW_LET => try self.parseLetOrVarStmt(.LET_STMT),
             else => unreachable,
         };
         if (anns.items.len == 0) return node;

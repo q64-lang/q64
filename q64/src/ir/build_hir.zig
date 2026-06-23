@@ -63,6 +63,13 @@ const StructInfo = struct {
 /// Present in `Builder.fn_recs` only for functions with any record surface.
 const FnRec = struct { params: []const ?*const StructInfo, ret: ?*const StructInfo };
 
+/// A module-level actor singleton (`let twin = Counter.spawn()`): its heap
+/// self-pointer lives in module global `gidx` (an i64 cell holding the widened
+/// record address), and `si` is the actor's state struct. The module-init
+/// function allocates the record once and stores it; every `twin.tell/ask`
+/// reads the pointer back from the global.
+const Singleton = struct { gidx: u32, si: *const StructInfo };
+
 /// What an array's elements are: a scalar (loaded/stored at its width)
 /// or an inline record (the element address IS the value — B2b's ABI).
 const ElemKind = union(enum) { scalar: hir.Type, rec: *const StructInfo };
@@ -139,6 +146,18 @@ const Builder = struct {
     /// `c.handle(...)` dispatch can build the handler, and construction can
     /// fill `state` defaults.
     actor_decls: std.StringHashMapUnmanaged(ast.ActorDecl) = .empty,
+    /// Module-level actor singletons (`let twin = Counter.spawn()`): binding name
+    /// → the global holding its heap self-pointer + its state struct. A
+    /// `twin.tell/ask` in any function body resolves the receiver to
+    /// `num_cast(.ptr, global_get(gidx))` — module-lifetime heap state, allocated
+    /// once by the module-init function (`b.module_init`).
+    singletons: std.StringHashMapUnmanaged(Singleton) = .empty,
+    /// The module-init (wasm `start`) statements: one `global_set(gidx,
+    /// num_cast(.i64, record_alloc))` per singleton. Drained into a synthesized
+    /// void `Func` at the end of `build` (`b.init_fid`).
+    module_init: std.ArrayList(*hir.Stmt) = .empty,
+    /// The FuncId of the synthesized module-init function, once appended.
+    init_fid: ?hir.FuncId = null,
     /// Graph declarations by name (Phase 4 v0). A `graph` runs eagerly as a
     /// function: its `let` stage bindings execute in order and the last binding
     /// is the pipeline's output. Kept so a `pipeline(args)` call can build it.
@@ -237,8 +256,19 @@ pub fn tryBuild(
             return error.OutOfMemory;
         },
     };
+    // Synthesize the module-init (wasm `start`) function from any singleton
+    // allocations collected in `buildModule`. A private void func appended last,
+    // wired by the backend via `BinaryenSetStart` — it runs once at
+    // instantiation, before any export call, populating the singleton globals.
+    if (b.module_init.items.len > 0) {
+        const blk = try b.a.create(hir.Stmt);
+        blk.* = .{ .block = try b.module_init.toOwnedSlice(b.a) };
+        b.init_fid = @intCast(b.funcs.items.len);
+        try b.funcs.append(b.a, .{ .name = "#module_init", .ret = .void, .body = blk, .visibility = .private });
+    }
     mod.funcs = try b.funcs.toOwnedSlice(b.a);
     mod.entry = b.entry;
+    mod.init_fn = b.init_fid;
     mod.globals = try b.global_inits.toOwnedSlice(b.a);
     mod.global_names = try b.global_names.toOwnedSlice(b.a);
     // Effect pass: infer each function's capability set over the built graph,
@@ -281,6 +311,10 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // Pass 0.6: the fit registry (B4) — `p.area()` dispatches through it.
     // Its form diagnostics (TYP201/202) belong to `q64 check`, not emit.
     b.fitreg = try sema.fits.build(b.a, sf);
+    // Pass 0.7: module-level actor singletons (`let twin = Counter.spawn()`).
+    // Each reserves a global for its heap self-pointer and contributes one
+    // allocation to the module-init function; `twin.tell/ask` resolve against it.
+    try registerSingletons(b, sf);
 
     // A module may have no `fn main` (a backend twin: just `state` + exported
     // commands). Then there's no entry — build only the screen functions.
@@ -324,6 +358,57 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     b.entry = 0;
 
     try buildScreenFuncs(b, sf);
+}
+
+/// Pass 0.7 — register module-level actor singletons. A top-level
+/// `let twin = Counter.spawn()` is a module-lifetime instance: its heap state
+/// record is allocated once at instantiation (by the module-init function) and
+/// its self-pointer kept in a reserved global. Each `twin.tell/ask` in a body
+/// reads the pointer back from that global, so all functions share one instance.
+///
+/// v0 module-level lets are actor spawns only — any other initializer is an
+/// honest `Unsupported` (rather than a silently-dropped binding).
+fn registerSingletons(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    var scratch = Scope{ .a = b.a };
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .let_decl => |ls| {
+            if (ls.isVar()) return error.Unsupported; // a singleton is an immutable binding
+            const pat = ls.pattern() orelse return error.Unsupported;
+            const nm = pat.bindingName() orelse return error.Unsupported; // v0: plain binding
+            const init_expr = ls.initializer() orelse return error.Unsupported;
+            const cc = switch (init_expr) {
+                .call => |x| x,
+                else => return error.Unsupported, // v0: module-level let = an actor spawn
+            };
+            const cname = (callPathName(b, cc)) orelse return error.Unsupported;
+            defer b.a.free(cname);
+            const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return error.Unsupported;
+            if (!std.mem.eql(u8, cname[dot + 1 ..], "spawn")) return error.Unsupported;
+            const ad = b.actor_decls.get(cname[0..dot]) orelse return error.Unsupported;
+            const si = b.structs.get(cname[0..dot]) orelse return error.Unsupported;
+            {
+                var a0 = cc.args();
+                if (a0.next() != null) return error.Unsupported; // spawn() takes no args
+            }
+            // Reserve the global that holds the heap self-pointer (init 0; the
+            // module-init function fills it). Exported by name like a `state`
+            // global — harmless, and a debugging handle on the instance address.
+            const gidx: u32 = @intCast(b.global_inits.items.len);
+            try b.global_inits.append(b.a, 0);
+            try b.global_names.append(b.a, nm.text);
+            try b.singletons.put(b.a, nm.text, .{ .gidx = gidx, .si = si });
+            // module-init: global_set(gidx, num_cast(.i64, record_alloc)) — the
+            // ptr widens to the i64 global cell (toI64); the read narrows back.
+            const rec = try buildActorDefaultRecord(b, ad, si, &scratch);
+            const widened = try b.a.create(hir.Expr);
+            widened.* = .{ .num_cast = .{ .to = .i64, .value = rec } };
+            const st = try b.a.create(hir.Stmt);
+            st.* = .{ .global_set = .{ .idx = gidx, .value = widened } };
+            try b.module_init.append(b.a, st);
+        },
+        else => {},
+    };
 }
 
 /// `let P { x, y } = rec` — single-level record destructuring. Stashes the
@@ -3099,6 +3184,21 @@ fn buildScreenStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayLi
                 .call => |cc| cc,
                 else => return error.Unsupported,
             };
+            // A void statement call in a screen / void `pub fn` body: an actor
+            // `tell` (incl. module-level singletons), a `vec.push`, or a channel
+            // `send` — before the host-face path, since none is a host call.
+            if (try tryActorTell(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
+            }
+            if (try tryVecPush(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
+            }
+            if (try tryChannelSend(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
+            }
             const fname = (try hostFaceName(b, call)) orelse return error.Unsupported;
             try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
         },
@@ -5685,13 +5785,13 @@ fn tryActorTell(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir
     const head = cname[0..dot];
     const mname = cname[dot + 1 ..];
     if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
-    const si = scope.recs.get(head) orelse return null;
-    const loc = scope.find(head) orelse return null;
+    const rcv = (try actorReceiver(b, scope, head)) orelse return null;
+    const si = rcv.si;
     // Message-style: `c.tell(Bump)` / `c.tell(Add(x))` — the message argument
     // names the handler. A `tell` carries a void handler (a reply-bearing one
     // is an `ask`, CONC020); a value handler here falls through.
     if (std.mem.eql(u8, mname, "tell")) {
-        const m = (try actorMessageCall(b, call, si, loc.idx, scope)) orelse return null;
+        const m = (try actorMessageCall(b, call, si, rcv.recv, scope)) orelse return null;
         if (m.ret != .void) return null;
         const stt = try b.a.create(hir.Stmt);
         stt.* = .{ .expr = m.e };
@@ -5699,8 +5799,7 @@ fn tryActorTell(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir
     }
     const fid = (try registerActorHandler(b, si, mname)) orelse return null;
     if (b.funcs.items[fid].ret != .void) return null; // a value handler isn't a tell
-    const recv = try b.a.create(hir.Expr);
-    recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    const recv = rcv.recv;
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, call.args(), scope, recv) } };
     const st = try b.a.create(hir.Stmt);
@@ -5714,7 +5813,7 @@ fn tryActorTell(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir
 /// handler call (self + payload args) plus its return type; null if the arg
 /// isn't a message form or names no handler. Shared by `tell` (void) and
 /// `ask` (value).
-fn actorMessageCall(b: *Builder, call: ast.CallExpr, si: *const StructInfo, loc_idx: u32, scope: *Scope) BuildError!?struct { e: *hir.Expr, ret: hir.Type } {
+fn actorMessageCall(b: *Builder, call: ast.CallExpr, si: *const StructInfo, recv: *hir.Expr, scope: *Scope) BuildError!?struct { e: *hir.Expr, ret: hir.Type } {
     var ait = call.args();
     const marg = ait.next() orelse return null;
     if (ait.next() != null) return null; // tell/ask take exactly one message
@@ -5730,11 +5829,30 @@ fn actorMessageCall(b: *Builder, call: ast.CallExpr, si: *const StructInfo, loc_
     }
     defer b.a.free(name_buf);
     const fid = (try registerActorHandler(b, si, name_buf)) orelse return null;
-    const recv = try b.a.create(hir.Expr);
-    recv.* = .{ .local = .{ .idx = loc_idx, .ty = .ptr } };
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, payload, scope, recv) } };
     return .{ .e = e, .ret = b.funcs.items[fid].ret };
+}
+
+/// Resolve an actor receiver `head` — a scope binding (`let c = C.spawn()`) or a
+/// module-level singleton (`let twin = C.spawn()`) — to its state struct and a
+/// `.ptr` receiver expression. A scope binding reads its local; a singleton
+/// narrows the heap self-pointer back from its global. Null if `head` is neither.
+fn actorReceiver(b: *Builder, scope: *Scope, head: []const u8) BuildError!?struct { si: *const StructInfo, recv: *hir.Expr } {
+    if (scope.recs.get(head)) |si| {
+        const loc = scope.find(head) orelse return null;
+        const recv = try b.a.create(hir.Expr);
+        recv.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+        return .{ .si = si, .recv = recv };
+    }
+    if (b.singletons.get(head)) |sg| {
+        const g = try b.a.create(hir.Expr);
+        g.* = .{ .global_get = sg.gidx };
+        const recv = try b.a.create(hir.Expr);
+        recv.* = .{ .num_cast = .{ .to = .ptr, .value = g } };
+        return .{ .si = sg.si, .recv = recv };
+    }
+    return null;
 }
 
 /// `c.ask(Msg)` in value position — dispatch a value-returning handler and
@@ -5746,9 +5864,8 @@ fn tryActorAsk(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.
     const dot = std.mem.indexOfScalar(u8, cname, '.') orelse return null;
     if (!std.mem.eql(u8, cname[dot + 1 ..], "ask")) return null;
     const head = cname[0..dot];
-    const si = scope.recs.get(head) orelse return null;
-    const loc = scope.find(head) orelse return null;
-    const m = (try actorMessageCall(b, call, si, loc.idx, scope)) orelse return null;
+    const rcv = (try actorReceiver(b, scope, head)) orelse return null;
+    const m = (try actorMessageCall(b, call, rcv.si, rcv.recv, scope)) orelse return null;
     if (m.ret == .void) return null; // a void handler isn't an ask
     return m.e;
 }
@@ -6565,7 +6682,15 @@ fn tryActorSpawn(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: boo
         var a0 = cc.args();
         if (a0.next() != null) return error.Unsupported; // v0: spawn() takes no args
     }
-    // Build the default state record (every `state … = <default>`), like `C {}`.
+    const rec = try buildActorDefaultRecord(b, ad, si, scope);
+    try bindMainRecord(b, scope, name, is_var, rec, si, out);
+    return true;
+}
+
+/// Build an actor's default state record (`record_alloc` of every `state … =
+/// <default>`, like `C {}`). Shared by `Actor.spawn()` as a scope binding and as
+/// a module-level singleton — both need the same heap record.
+fn buildActorDefaultRecord(b: *Builder, ad: ast.ActorDecl, si: *const StructInfo, scope: *Scope) BuildError!*hir.Expr {
     var inits: std.ArrayList(hir.FieldInit) = .empty;
     var sit = ad.states();
     while (sit.next()) |s| {
@@ -6584,8 +6709,7 @@ fn tryActorSpawn(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: boo
     }
     const rec = try b.a.create(hir.Expr);
     rec.* = .{ .record_alloc = .{ .size = si.size, .alignment = si.alignment, .inits = try inits.toOwnedSlice(b.a) } };
-    try bindMainRecord(b, scope, name, is_var, rec, si, out);
-    return true;
+    return rec;
 }
 
 /// `Vec.from([…])` / `Vec.new()` as a `let`/`var` initializer (the v0 Vec
@@ -8219,7 +8343,19 @@ fn buildIntBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.S
 fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt {
     const out = try b.a.create(hir.Stmt);
     switch (stmt) {
-        .expr_stmt => |es| out.* = .{ .expr = try buildIntExpr(b, es.expression() orelse return error.Unsupported, scope) },
+        .expr_stmt => |es| {
+            const e = es.expression() orelse return error.Unsupported;
+            // A statement-position call may be a void actor `tell`, a `vec.push`,
+            // or a channel `send` — none yields a value, so dispatch them before
+            // the i64-expr path (which would try to resolve `c.tell` as a
+            // function and reject `name_not_found`).
+            if (e == .call) {
+                if (try tryActorTell(b, e.call, scope)) |st| return st;
+                if (try tryVecPush(b, e.call, scope)) |st| return st;
+                if (try tryChannelSend(b, e.call, scope)) |st| return st;
+            }
+            out.* = .{ .expr = try buildIntExpr(b, e, scope) };
+        },
         .return_stmt => |rs| {
             const v: ?*hir.Expr = if (rs.value()) |e| try buildIntExpr(b, e, scope) else null;
             out.* = .{ .ret = v };
@@ -10212,6 +10348,42 @@ test "actors v0: Actor.spawn() instantiates the default state record" {
     // spawn() lowers to the default-state record_alloc + handler dispatch.
     try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.Bump -> void") != null);
+}
+
+test "actors v0: module-level singleton (let twin = C.spawn()) — module-lifetime heap state" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A top-level `let twin = Counter.spawn()` is a module-lifetime instance:
+    // its heap state record is allocated ONCE by the synthesized module-init
+    // function (the wasm `start`) and its self-pointer kept in a module global.
+    // Every `twin.tell/ask` in any function body reads that global — so the
+    // state is shared across calls (a singleton). No `fn main` needed.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor Counter {
+        \\    state n: i64 = 0
+        \\    handle Bump { n = n + 1 }
+        \\    handle Get -> i64 { n }
+        \\}
+        \\let twin = Counter.spawn()
+        \\pub fn ping() -> i64 {
+        \\    twin.tell(Bump)
+        \\    twin.ask(Get)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The module-init function allocates the singleton's record into the global
+    // (the ptr widens to the i64 global cell).
+    try testing.expect(std.mem.indexOf(u8, dump, "fn #module_init -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "global_set #0 = i64(record_alloc") != null);
+    try testing.expect(mod.init_fn != null);
+    // The handlers dispatch with the heap self-pointer read back from the global
+    // (not a scope local) — so all `ping()` calls share one instance.
+    try testing.expect(std.mem.indexOf(u8, dump, "call#1(ptr(global#0))") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.Bump -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.Get -> i64") != null);
 }
 
 test "actors v0: message-style tell/ask dispatch (c.tell(Msg) / c.ask(Msg))" {

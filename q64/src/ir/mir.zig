@@ -54,6 +54,10 @@ pub const Module = struct {
     globals: []const i64 = &.{},
     /// Global names parallel to `globals` (exported by name so a host can read them).
     global_names: []const []const u8 = &.{},
+    /// The module-init function id (the wasm `start`), if any — runs once at
+    /// instantiation to populate module-lifetime singleton globals. The backend
+    /// wires it via `BinaryenSetStart`; it is never exported.
+    init_fn: ?FuncId = null,
 
     pub fn init(gpa: std.mem.Allocator) Module {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };

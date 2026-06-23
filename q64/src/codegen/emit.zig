@@ -1074,12 +1074,16 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         }
     }
 
-    for (m.funcs) |f| {
+    // The wasm `start` function (module-init for singleton globals), captured in
+    // the loop below so `BinaryenSetStart` can wire it after all functions exist.
+    var start_ref: c.BinaryenFunctionRef = null;
+    for (m.funcs, 0..) |f, fi| {
         const structured = switch (f.body) {
             .structured => |inst| inst,
             .cfg => return Error.CfgUnsupported,
         };
         const is_entry = (f.linkage == .entry);
+        const is_init = (m.init_fn != null and m.init_fn.? == fi);
 
         // A `str` parameter is two i64 wasm params (ptr, len); an i64 is one.
         var params_width: usize = 0;
@@ -1178,7 +1182,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
 
         const ret = if (is_entry) none_type else wasmType(f.ret, i64_type, i32_type, none_type, pair_type, ptr_type);
         const body = try lw.inst(structured);
-        _ = c.BinaryenAddFunction(module, f.name.ptr, ptype, ret, if (n_extra > 0) @ptrCast(vts.ptr) else null, @intCast(n_extra), body);
+        const fref = c.BinaryenAddFunction(module, f.name.ptr, ptype, ret, if (n_extra > 0) @ptrCast(vts.ptr) else null, @intCast(n_extra), body);
+        if (is_init) start_ref = fref;
         if (is_entry) {
             _ = c.BinaryenAddFunctionExport(module, f.name.ptr, "_start");
         } else if (f.exported) {
@@ -1196,6 +1201,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             }
         }
     }
+
+    // Wire the module-init function as the wasm `start` — it runs once at
+    // instantiation (before any export call), allocating singleton globals.
+    if (start_ref) |sr| c.BinaryenSetStart(module, sr);
 
     if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
 
