@@ -1257,6 +1257,50 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     return out;
 }
 
+/// Run Binaryen's `asyncify` pass over an already-emitted core module so a host
+/// can suspend/resume the wasm at the named imports (e.g. `env.channel_recv`):
+/// the transform threads an unwind/rewind data path through the call graph and
+/// adds the `asyncify_*` control exports (`asyncify_start_unwind`,
+/// `asyncify_stop_unwind`, `asyncify_start_rewind`, `asyncify_stop_rewind`,
+/// `asyncify_get_state`). The host parks the wasm at a blocking host read and
+/// rewinds it when the next message arrives — the live `@channel_handler` loop.
+///
+/// `suspend_imports` is the comma-separated `module.base` list that may unwind
+/// (only those; everything else stays synchronous, so the transform is small).
+/// A separate, isolated post-pass: it reads the emitted wasm back into Binaryen,
+/// runs one pass, and re-serializes — `q64 emit … --asyncify` opts in. Caller
+/// owns the returned bytes.
+pub fn asyncifyWasm(allocator: std.mem.Allocator, wasm: []const u8, suspend_imports: []const u8, addr: AddressSpace) ![]u8 {
+    var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
+        c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
+        c.BinaryenFeatureNontrappingFPToInt();
+    if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
+
+    const buf = try allocator.dupe(u8, wasm); // ModuleRead takes a mutable buffer
+    defer allocator.free(buf);
+    const module = c.BinaryenModuleReadWithFeatures(buf.ptr, buf.len, features) orelse return Error.ModuleInvalid;
+    defer c.BinaryenModuleDispose(module);
+    c.BinaryenModuleSetFeatures(module, features);
+
+    // Only the listed imports unwind the stack; the rest stay synchronous.
+    const imports_z = try allocator.dupeZ(u8, suspend_imports);
+    defer allocator.free(imports_z);
+    c.BinaryenSetPassArgument("asyncify-imports", imports_z.ptr);
+    defer c.BinaryenClearPassArguments();
+
+    var passes = [_][*c]const u8{"asyncify"};
+    c.BinaryenModuleRunPasses(module, @ptrCast(&passes), passes.len);
+
+    if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
+    const result = c.BinaryenModuleAllocateAndWrite(module, null);
+    defer if (result.binary) |b| std.c.free(b);
+    const ptr = result.binary orelse return Error.SerializeEmpty;
+    if (result.binaryBytes == 0) return Error.SerializeEmpty;
+    const out = try allocator.alloc(u8, result.binaryBytes);
+    @memcpy(out, @as([*]const u8, @ptrCast(ptr))[0..result.binaryBytes]);
+    return out;
+}
+
 fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenType, none_type: c.BinaryenType, pair_type: c.BinaryenType, ptr_type: c.BinaryenType) c.BinaryenType {
     return switch (t) {
         .i64 => i64_type,

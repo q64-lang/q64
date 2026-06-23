@@ -279,6 +279,10 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // 32-bit module (the WebKit/iPad baseline) for the integer/import subset.
     var addr: emit.AddressSpace = .wasm64;
     var want_component = false;
+    // `--asyncify`: run Binaryen's asyncify pass over the emitted core so a host
+    // can suspend/resume the wasm at a blocking host read (the live
+    // `@channel_handler` loop parks at `env.channel_recv` between messages).
+    var want_asyncify = false;
     // WIT rung 2: the world name + WIT package id for the synthesized `.wit`,
     // set by `qube build` from the manifest (`wit.world` / `wit.package`).
     // Null = derive from the source filename / `q64:<world>`.
@@ -299,6 +303,8 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             // Also wrap the core module in a component (spec/q64-cli.md). The
             // core module is still written to `out`.
             want_component = true;
+        } else if (std.mem.eql(u8, a, "--asyncify")) {
+            want_asyncify = true;
         } else if (std.mem.eql(u8, a, "--export-interface")) {
             export_interface = args_it.next() orelse {
                 try usage(io);
@@ -410,7 +416,22 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     };
     defer gpa.free(bytes);
 
-    try writeFile(io, out, bytes);
+    // --asyncify: post-process the core so a host can park/resume it at the
+    // blocking remote-channel reads (the `@channel_handler` live loop). Only
+    // `env.channel_recv` / `env.presses` (the awaiting host reads) may unwind.
+    const out_bytes = if (want_asyncify) blk: {
+        const a = emit.asyncifyWasm(gpa, bytes, "env.channel_recv,env.presses", addr) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("q64: asyncify failed: {s}\n", .{@errorName(err)});
+            try w.interface.flush();
+            std.process.exit(1);
+        };
+        break :blk a;
+    } else bytes;
+    defer if (want_asyncify) gpa.free(out_bytes);
+
+    try writeFile(io, out, out_bytes);
 
     // --component: additionally wrap the core module in a WebAssembly component,
     // written to `<out without .wasm>.component.wasm` (spec/q64-cli.md). A

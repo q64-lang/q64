@@ -150,6 +150,66 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
     expect((instance.exports.count as WebAssembly.Global).value).toBe(2n);
   });
 
+  test("--asyncify lets a channel handler park at channel_recv and resume per message", async () => {
+    // The live `@channel_handler` loop: `q64 emit … --asyncify` runs Binaryen's
+    // asyncify pass so the host can suspend the wasm at `env.channel_recv` (no
+    // message yet) and rewind it when one arrives — `for _ in session` becomes a
+    // real coroutine that parks between messages. Drive `pump` (each inbound
+    // message → one send) through suspend/resume.
+    const out = join(work, "pump-async.wasm");
+    const r = runCli(["emit", fixture("channel-handler.q"), out, "--addr", "wasm32", "--asyncify"]);
+    expect(r.exitCode).toBe(0);
+    const mod = new WebAssembly.Module(readFileSync(out));
+    const exportNames = WebAssembly.Module.exports(mod).map((e) => e.name);
+    // The asyncify pass added the control surface.
+    expect(exportNames).toContain("asyncify_start_unwind");
+    expect(exportNames).toContain("asyncify_get_state");
+
+    const NORMAL = 0;
+    const UNWINDING = 1;
+    const REWINDING = 2;
+    const sent: bigint[] = [];
+    let resumeVal = 0n;
+    let exp: any;
+    const instance = await WebAssembly.instantiate(mod, {
+      env: {
+        channel_send: (_s: bigint, v: bigint) => void sent.push(v),
+        channel_recv: (_s: bigint): bigint => {
+          if (exp.asyncify_get_state() === REWINDING) {
+            exp.asyncify_stop_rewind();
+            return resumeVal; // the message we're resuming with
+          }
+          exp.asyncify_start_unwind(DATA); // no message → park the whole handler
+          return 0n;
+        },
+      },
+    });
+    exp = instance.exports;
+
+    // The asyncify stack lives high in page 0 (the handler's own arena is tiny).
+    const DATA = 0x9000;
+    const STACK = 0x2000;
+    const dv = new DataView((exp.memory as WebAssembly.Memory).buffer);
+    dv.setUint32(DATA, DATA + 8, true);
+    dv.setUint32(DATA + 4, DATA + 8 + STACK, true);
+
+    // Start: no message yet → the handler parks at the first recv.
+    exp.pump(1n);
+    expect(exp.asyncify_get_state()).toBe(UNWINDING);
+    exp.asyncify_stop_unwind();
+    expect(sent.length).toBe(0);
+
+    // Deliver three messages; each rewinds into recv (returns 1), sends, then
+    // parks again at the next recv.
+    for (let i = 0; i < 3; i++) {
+      resumeVal = 1n;
+      exp.asyncify_start_rewind(DATA);
+      exp.pump(1n);
+      if (exp.asyncify_get_state() === UNWINDING) exp.asyncify_stop_unwind();
+    }
+    expect(sent).toEqual([1n, 1n, 1n]); // one send per resumed message
+  });
+
   test("missing source file: non-zero exit", () => {
     const r = runCli(["emit", fixture("nope.q"), join(work, "x.wasm")]);
     expect(r.exitCode).not.toBe(0);
