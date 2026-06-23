@@ -96,6 +96,60 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
     expect((instance.exports.last as () => bigint)()).toBe(30n); // the last delivered value
   });
 
+  test("the twin-counter frontend qube emits as written and drives both wires", async () => {
+    // The full importer qube (the example's frontend.q): `import counter.{join}`
+    // resolves against the backend (the `counter` qube) via --module; every
+    // construct compiles — connect, the spawned redraw loop (`for n in twin`),
+    // the press loop (`for _press in presses()`), `twin.send(Tap)`, qview paints.
+    const out = join(work, "twin-frontend.wasm");
+    const r = runCli([
+      "emit",
+      fixture("twin-frontend.q"),
+      out,
+      "--addr",
+      "wasm32",
+      "--module",
+      `counter=${fixture("counter-mod")}`,
+    ]);
+    expect(r.exitCode).toBe(0);
+    const mod = new WebAssembly.Module(readFileSync(out));
+    const imports = WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`);
+    expect(imports).toContain("env.channel_connect"); // connect<counter.join>()
+    expect(imports).toContain("env.channel_take"); // for n in twin (value)
+    expect(imports).toContain("env.presses"); // for _press in presses()
+    expect(imports).toContain("env.channel_send"); // twin.send(Tap)
+
+    // Drive it: the twin broadcasts two counts (the spawned redraw loop), then
+    // the user presses twice and closes — each press sends a unit Tap up.
+    const recvTwin = [1n, 1n, 0n];
+    const take = [1n, 2n];
+    const recvPress = [1n, 1n, 0n];
+    let rt = 0;
+    let ti = 0;
+    let rp = 0;
+    const paints: number[] = [];
+    const taps: bigint[] = [];
+    const instance = await WebAssembly.instantiate(mod, {
+      env: {
+        channel_connect: () => 7n,
+        presses: () => 9n,
+        channel_recv: (h: bigint) => (h === 9n ? recvPress[rp++] : recvTwin[rt++]),
+        channel_take: (_h: bigint) => take[ti++],
+        channel_send: (_h: bigint, v: bigint) => void taps.push(v),
+      },
+      qview: {
+        text: () => {},
+        number: (_x: number, _y: number, n: bigint) => paints.push(Number(n)),
+        button: () => {},
+        present: () => {},
+      },
+    });
+    (instance.exports._start as () => void)();
+    expect(paints).toEqual([1, 2]); // redrew on each broadcast
+    expect(taps).toEqual([0n, 0n]); // a unit Tap per press
+    expect((instance.exports.count as WebAssembly.Global).value).toBe(2n);
+  });
+
   test("missing source file: non-zero exit", () => {
     const r = runCli(["emit", fixture("nope.q"), join(work, "x.wasm")]);
     expect(r.exitCode).not.toBe(0);
