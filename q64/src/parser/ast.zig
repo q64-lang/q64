@@ -2128,8 +2128,8 @@ pub const PathExpr = struct {
             // name including the `on` segment; `self` so a method body's
             // receiver access (`self.w`) reconstructs whole. `tell` so the
             // message-style dispatch `c.tell(Msg)` reconstructs its dotted name;
-            // `spawn` so `Actor.spawn()` does.
-            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL, .KW_SPAWN => true,
+            // `spawn` so `Actor.spawn()` does; `state` so `state.<field>` does.
+            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL, .KW_SPAWN, .KW_STATE => true,
             else => false,
         };
     }

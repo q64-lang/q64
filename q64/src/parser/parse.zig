@@ -2690,8 +2690,11 @@ const Parser = struct {
             // dispatches it to the named handler. `spawn` joins as a segment for
             // `Actor.spawn()` — a leading `spawn { … }` is intercepted in
             // parsePrimary before the path check, so admitting it after a `.`
-            // (where no spawn-block can follow) is unambiguous.
-            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL, .KW_SPAWN => true,
+            // (where no spawn-block can follow) is unambiguous. `state` joins so
+            // `state.<field>` (the qualified actor-state access) parses as a
+            // path — a `state <field>:` declaration is parsed in member
+            // position, never an expression, so there's no ambiguity.
+            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL, .KW_SPAWN, .KW_STATE => true,
             else => false,
         };
     }

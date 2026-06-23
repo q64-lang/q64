@@ -5178,8 +5178,11 @@ fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
 /// single-segment field of the actor's state. State fields are mutable.
 fn actorStateField(scope: *const Scope, name: []const u8) ?RecField {
     const si = scope.self_actor orelse return null;
-    if (std.mem.indexOfScalar(u8, name, '.') != null) return null;
-    const f = si.field(name) orelse return null;
+    // Accept the explicit `state.<field>` form as well as the bare field name —
+    // both resolve to `self.<field>` (concurrency.md §Actors).
+    const fname = if (std.mem.startsWith(u8, name, "state.")) name["state.".len..] else name;
+    if (std.mem.indexOfScalar(u8, fname, '.') != null) return null;
+    const f = si.field(fname) orelse return null;
     const loc = scope.find("self") orelse return null;
     return .{ .base_idx = loc.idx, .offset = f.offset, .ty = f.ty, .mutable = true };
 }
