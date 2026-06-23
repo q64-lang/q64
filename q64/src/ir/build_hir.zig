@@ -6219,6 +6219,7 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
             if (callPathName(b, cc)) |fsname| {
                 defer b.a.free(fsname);
                 if (std.mem.eql(u8, fsname, "Vec.from")) return null;
+                if (std.mem.eql(u8, fsname, "Vec.new")) return null;
                 if (std.mem.eql(u8, fsname, "env.fs.read")) {
                     var fa = cc.args();
                     const parg = fa.next() orelse return error.Unsupported;
@@ -6391,10 +6392,12 @@ fn genericRecCall(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecV
     return .{ .e = e, .si = si };
 }
 
-/// `Vec.from([…])` as a `let`/`var` initializer (the v0 Vec floor,
-/// spec/types.md §Growable): bind a fresh header and push each literal
-/// element (i64 expressions). Returns false when the initializer isn't
-/// the form; growth/representation live in the `__vec_*` helpers.
+/// `Vec.from([…])` / `Vec.new()` as a `let`/`var` initializer (the v0 Vec
+/// floor, spec/types.md §Growable): bind a fresh header, and for `Vec.from`
+/// push each literal element (i64 expressions). `Vec.new()` is the empty
+/// growable — the header with no pushes, for a set filled at runtime via
+/// `.push`. Returns false when the initializer isn't either form; growth /
+/// representation live in the `__vec_*` helpers.
 fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
     const cc = switch (init_expr) {
         .call => |x| x,
@@ -6402,16 +6405,10 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
     };
     const cname = (callPathName(b, cc)) orelse return false;
     defer b.a.free(cname);
-    if (!std.mem.eql(u8, cname, "Vec.from")) return false;
-    var ait = cc.args();
-    const arg = ait.next() orelse return error.Unsupported;
-    if (ait.next() != null) return error.Unsupported;
-    const arr = switch (arg) {
-        .array => |x| x,
-        else => return error.Unsupported, // Vec.from takes a slice literal
-    };
+    const is_new = std.mem.eql(u8, cname, "Vec.new");
+    if (!is_new and !std.mem.eql(u8, cname, "Vec.from")) return false;
 
-    // let v = vec_new()
+    // let v = vec_new()  (the fresh empty header, both forms share it)
     const v_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
     try scope.vecs.put(b.a, name, {});
     const nv = try b.a.create(hir.Expr);
@@ -6419,6 +6416,21 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
     const bind = try b.a.create(hir.Stmt);
     bind.* = .{ .let = .{ .idx = v_idx, .value = nv } };
     try out.append(b.a, bind);
+
+    if (is_new) {
+        // `Vec.new()` takes no value args — an empty vec, pushed into later.
+        var nit = cc.args();
+        if (nit.next() != null) return error.Unsupported;
+        return true;
+    }
+
+    var ait = cc.args();
+    const arg = ait.next() orelse return error.Unsupported;
+    if (ait.next() != null) return error.Unsupported;
+    const arr = switch (arg) {
+        .array => |x| x,
+        else => return error.Unsupported, // Vec.from takes a slice literal
+    };
 
     // one vec_push per element
     var eit = arr.elements();
@@ -12833,6 +12845,32 @@ test "str params: a second str param reads its own wasm slots (2, 3)" {
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "str_binding[2,3]") != null);
+}
+
+test "Vec.new: an empty growable filled at runtime, then iterated" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    var subs = Vec.new()
+        \\    subs.push(100)
+        \\    subs.push(200)
+        \\    for tx in subs {
+        \\        env.out(tx)
+        \\    }
+        \\    env.out(subs.len)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Vec.new() lowers to a bare vec_new header (no pushes baked in), then the
+    // runtime pushes + the for-loop's vec_len/vec_get drive the iteration.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
 }
 
 test "Vec v0 floor: from/push/len/index/for, growth, honest boundaries" {
