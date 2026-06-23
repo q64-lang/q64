@@ -253,28 +253,26 @@ capabilities that have a standard WASI counterpart, the import *is* the
 WASI Preview 3 (WASI 0.3) interface — no q64-specific host ABI. The mapping is
 a column-extension of the `Env`-fields table above; the same row keys.
 
-### Tracking the WASIp3 release candidate
+### WASIp3 — ratified (the pinned snapshot)
 
 q64 targets **WASIp3** (WASI 0.3), whose Component Model promotes `stream<T>`
 and `future<T>` to native canonical-ABI types and retires the Preview 2
-`wasi:io/poll` + `wasi:io/streams` resource ceremony. WASIp3 is at
-**release-candidate** status upstream; q64 commits to the RC and **re-pins on
-every upstream RC release** until WASI 1.0:
+`wasi:io/poll` + `wasi:io/streams` resource ceremony. WASIp3 was **ratified and
+declared stable in June 2026** — the RC treadmill is over. q64 now pins the
+released snapshot rather than re-pinning on every upstream RC:
 
 - The compiler and runtime adapters pin to a single WASI snapshot — currently
-  **`0.3.0-rc-2026-03-15`**, the snapshot Wasmtime 43 implements. The pin moves
-  forward as new RC snapshots land; interface and type names may shift between
-  snapshots, and a re-pin may be a breaking change for emitted components until
-  WASI 1.0.
+  the ratified **`0.3.0`**, the snapshot Wasmtime 46 implements and enables by
+  default. Pre-1.0 minor snapshots may still shift interface/type names, so a
+  re-pin can be a breaking change for emitted components until WASI 1.0 — but the
+  per-RC churn that preceded ratification is no longer required.
 - The pinned snapshot is recorded in the emitted component's WIT package
   versions and surfaced by `qube audit`, so a component declares exactly which
-  RC it was built against.
+  snapshot it was built against.
 - There is **no Preview 2 fallback**. q64 commits fully to WASIp3 — Preview 2
-  is not a selectable target. The only frozen ABI floor a consumer gets is the
-  pinned RC snapshot itself; until WASI 1.0 there is no long-term-stable WASI
-  target, and re-pinning is the mechanism for moving forward. (`preview1`
-  remains available for legacy **core-module** hosts that predate the
-  Component Model; it carries no component, no native async, and no RPC.)
+  is not a selectable target. (`preview1` remains available for legacy
+  **core-module** hosts that predate the Component Model; it carries no
+  component, no native async, and no RPC.)
 
 > **What "0.3" versions, and what stays 0.2.x.** WASIp3's `0.3` is the **async
 > `wasi:io`** layer (native `stream<T>`/`future<T>`, retiring the Preview 2
@@ -293,8 +291,10 @@ every upstream RC release** until WASI 1.0:
 > `fd_write` core import and lifts it with `wasm-tools component new --adapt`
 > (the vendored adapter), which yields a command using the *synchronous*
 > `wasi:io/streams@0.2.x` write — correct as a command but not yet the async
-> path. Emitting genuinely async `wasi:io@0.3` I/O (no adapter shortcut) is the
-> next codegen milestone; the runtime is already WASIp3 via `-S p3`.
+> path. Emitting genuinely async `wasi:io@0.3` I/O directly (no adapter
+> shortcut) is the next codegen milestone — now unblocked by ratification: the
+> stable `0.3.0` ABI is a fixed target to lower onto, and Wasmtime 46 runs it
+> by default (the pre-ratification `-S p3` opt-in is no longer needed).
 
 ### Env ↔ WASI Preview 3
 
