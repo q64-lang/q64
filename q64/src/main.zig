@@ -465,6 +465,11 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
                 defer gpa.free(lib.world);
                 try embedAndNewComponent(gpa, io, env, lib.core, lib.world, export_interface.?, comp_path);
             },
+            .kv_component => |kvc| {
+                defer gpa.free(kvc.core);
+                defer gpa.free(kvc.world);
+                try embedKvComponent(gpa, io, env, kvc.core, kvc.world, comp_path);
+            },
         }
 
         // WIT rung 1: also write the synthesized world to `<base>.wit` next to
@@ -596,6 +601,71 @@ fn embedAndNewComponent(
         const argv = [_][]const u8{ wasm_tools, "component", "new", tmp_embed, "-o", comp_path };
         const term = spawnInherit(io, &argv) catch fail(io, "could not run wasm-tools component new");
         if (termCode(term) != @as(u8, 0)) fail(io, "wasm-tools component new failed (interface export)");
+    }
+}
+
+/// Lift a **kv** core (one that reaches `env.kv`, with canonical
+/// `cm32p2|wasi:keyvalue/…` imports) into a component. Lay out a WIT dir with the
+/// synthesized world + the vendored `wasi:keyvalue` dep package, then
+/// `wasm-tools component embed <dir> --world qube <core>` + `component new`. The
+/// result imports `wasi:keyvalue/{store,atomics}` for the host to supply.
+fn embedKvComponent(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    core: []const u8,
+    world_wit: []const u8,
+    comp_path: []const u8,
+) !void {
+    const repo_root = findRepoRoot(gpa, io, ".") catch null;
+    defer if (repo_root) |r| gpa.free(r);
+    const wasm_tools = try resolveBinary(gpa, io, env, "Q64_WASM_TOOLS", repo_root, "vendor/wasm-tools/wasm-tools", "wasm-tools");
+    defer gpa.free(wasm_tools);
+
+    const fail = struct {
+        fn f(io2: std.Io, comptime msg: []const u8) noreturn {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io2, &buf);
+            w.interface.print("q64: {s}\n", .{msg}) catch {};
+            w.interface.print("q64: set Q64_WASM_TOOLS or run ./init.sh to vendor wasm-tools\n", .{}) catch {};
+            w.interface.flush() catch {};
+            std.process.exit(1);
+        }
+    }.f;
+
+    // WIT dir: <comp>.kvwit/world.wit + <comp>.kvwit/deps/wasi-keyvalue/keyvalue.wit.
+    const wit_dir = try std.fmt.allocPrint(gpa, "{s}.kvwit", .{comp_path});
+    defer gpa.free(wit_dir);
+    const deps_dir = try std.fmt.allocPrint(gpa, "{s}/deps/wasi-keyvalue", .{wit_dir});
+    defer gpa.free(deps_dir);
+    std.Io.Dir.cwd().createDirPath(io, deps_dir) catch fail(io, "could not create temp WIT dir for the kv lift");
+    defer std.Io.Dir.cwd().deleteTree(io, wit_dir) catch {};
+    const world_path = try std.fmt.allocPrint(gpa, "{s}/world.wit", .{wit_dir});
+    defer gpa.free(world_path);
+    const dep_path = try std.fmt.allocPrint(gpa, "{s}/keyvalue.wit", .{deps_dir});
+    defer gpa.free(dep_path);
+    try writeFile(io, world_path, world_wit);
+    try writeFile(io, dep_path, emit.wasi_keyvalue_wit);
+
+    const tmp_core = try std.fmt.allocPrint(gpa, "{s}.kvcore.wasm", .{comp_path});
+    defer gpa.free(tmp_core);
+    const tmp_embed = try std.fmt.allocPrint(gpa, "{s}.kvembed.wasm", .{comp_path});
+    defer gpa.free(tmp_embed);
+    try writeFile(io, tmp_core, core);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_core) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_embed) catch {};
+
+    // 1. embed the component type (world + wasi:keyvalue dep) into the core.
+    {
+        const argv = [_][]const u8{ wasm_tools, "component", "embed", wit_dir, "--world", "qube", tmp_core, "-o", tmp_embed };
+        const term = spawnInherit(io, &argv) catch fail(io, "could not run wasm-tools component embed");
+        if (termCode(term) != @as(u8, 0)) fail(io, "wasm-tools component embed failed (env.kv lift)");
+    }
+    // 2. lift the embedded core into a component importing wasi:keyvalue.
+    {
+        const argv = [_][]const u8{ wasm_tools, "component", "new", tmp_embed, "-o", comp_path };
+        const term = spawnInherit(io, &argv) catch fail(io, "could not run wasm-tools component new");
+        if (termCode(term) != @as(u8, 0)) fail(io, "wasm-tools component new failed (env.kv lift)");
     }
 }
 

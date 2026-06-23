@@ -239,7 +239,7 @@ pub fn emitFromSourceWithImports(
     // The raw core module keeps q64's `env.out` host face (the contract with
     // `runtime/wasmtime/` and `runtime/browser/`). The component path emits the
     // preview1 variant separately.
-    return lowerToWasm(allocator, &mmod, addr, .env_out, null);
+    return lowerToWasm(allocator, &mmod, addr, .env_out, null, false);
 }
 
 /// The product of `emitComponent`. Either a finished component (the import-free
@@ -268,7 +268,25 @@ pub const ComponentArtifact = union(enum) {
     /// imports the interface can be `wac`-linked against this provider. Both
     /// slices owned by the caller.
     interface_lib: struct { core: []u8, world: []u8 },
+    /// A qube that reaches `env.kv`: the core imports the **canonical**
+    /// `wasi:keyvalue/{store,atomics}` ABI (`cm32p2|…` core imports, the
+    /// adapter-held bucket opened host-side) plus the synthesized world `.wit`
+    /// importing those interfaces. The CLI embeds the vendored `wasi:keyvalue`
+    /// dep + this world and runs `wasm-tools component embed`+`new` to lift it.
+    /// Both slices owned by the caller. (spec/env.md §`env.kv`; the design of
+    /// record is `test/kv-component-reference/`.)
+    kv_component: struct { core: []u8, world: []u8 },
 };
+
+/// The vendored `wasi:keyvalue@0.2.0-draft2` WIT (store + atomics) — the dep
+/// package the kv component lift embeds. Committed as a build input
+/// (`src/codegen/wit/README.md`); embedded so emit needs no external file.
+pub const wasi_keyvalue_wit = @embedFile("wit/wasi-keyvalue.wit");
+
+/// The component-model interface ids `env.kv` lowers to (with the version pin).
+/// Core imports use the `cm32p2|<id>` form; the world imports the bare ids.
+pub const kv_store_iface = "wasi:keyvalue/store@0.2.0-draft2";
+pub const kv_atomics_iface = "wasi:keyvalue/atomics@0.2.0-draft2";
 
 /// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
 /// qube as a component"). A library lifts the import-free, scalar-signature
@@ -367,7 +385,19 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     // preview1 ABI is 32-bit (i32 iovec/fd_write); a wasm64 app isn't lowerable.
     if (usesEnvOut(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
-        return .{ .preview1_app = try lowerToWasm(allocator, &mmod, addr, .wasi_preview1, null) };
+        return .{ .preview1_app = try lowerToWasm(allocator, &mmod, addr, .wasi_preview1, null, false) };
+    }
+
+    // A qube that reaches `env.kv`: lower the core with the canonical
+    // `wasi:keyvalue` import ABI (cm32p2 imports, adapter-held bucket) and hand
+    // back the synthesized world for the CLI to embed + lift. The canonical ABI
+    // is 32-bit (cm32p2); a wasm64 qube isn't lowerable here.
+    if (usesEnvKv(&mmod)) {
+        if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
+        const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null, true);
+        errdefer allocator.free(core);
+        const world = try synthKvWorld(allocator, &hmod);
+        return .{ .kv_component = .{ .core = core, .world = world } };
     }
 
     // Interface-export library: emit the core with `<iface>#<fn>` export names
@@ -375,7 +405,7 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     // `wasm-tools component embed`+`new`. (The hand-rolled scalar encoder below
     // exports bare functions; this path exports a named interface instead.)
     if (export_interface) |iface| {
-        const core = try lowerToWasm(allocator, &mmod, addr, .env_out, iface);
+        const core = try lowerToWasm(allocator, &mmod, addr, .env_out, iface, false);
         errdefer allocator.free(core);
         if (coreHasImports(core)) {
             allocator.free(core);
@@ -385,7 +415,7 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
         return .{ .interface_lib = .{ .core = core, .world = world } };
     }
 
-    const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null);
+    const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null, false);
     defer allocator.free(core);
 
     // The only core imports the scalar encoder can wire are foreign WIT imports
@@ -806,7 +836,7 @@ fn mapReject(r: ir.hir.Reject) Error {
     };
 }
 
-fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace, stdout_abi: StdoutAbi, export_interface: ?[]const u8) ![]u8 {
+fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: AddressSpace, stdout_abi: StdoutAbi, export_interface: ?[]const u8, kv_component: bool) ![]u8 {
     const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
     defer c.BinaryenModuleDispose(module);
 
@@ -851,6 +881,17 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // iovec (8 bytes: i32 buf, i32 len) + nwritten (4 bytes), padded to 16.
     const iovec_scratch: usize = if (preview1) 16 else 0;
     const iovec_base: u32 = @intCast(m.data.len);
+
+    // env.kv → wasi:keyvalue component lowering. The core imports the canonical
+    // `cm32p2|…` ABI; the host writes each call's `result<…>` into a fixed
+    // return area we reserve just past the static data (the open result `{disc,
+    // handle:i32}` at `kv_open_ret`, increment's `{disc, s64@8}` at
+    // `kv_inc_ret`, 8-aligned so the host's i64 store lands clean). See
+    // `test/kv-component-reference/`.
+    const wants_kv = kv_component and usesEnvKv(m);
+    const kv_open_ret: u32 = @intCast((m.data.len + 7) & ~@as(usize, 7));
+    const kv_inc_ret: u32 = kv_open_ret + 8;
+    const kv_scratch: usize = if (wants_kv) (kv_inc_ret + 16) - @as(u32, @intCast(m.data.len)) else 0;
     if (wants_out) {
         switch (stdout_abi) {
             .env_out => {
@@ -883,11 +924,18 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         scanScratch(st2, &sc2);
         if (sc2.has_fs) any_fs = true;
     }
-    const mem_max: c.BinaryenIndex = if (preview1) 0xffff_ffff else if (any_fs) 256 else 1;
+    // The kv path keeps memory bounded but growable: the canonical `cabi_realloc`
+    // serves host-side allocations (e.g. an error variant's `other(string)`) from
+    // page 1 up, so reserve room above the page-0 data/scratch/arena.
+    const mem_min: c.BinaryenIndex = if (wants_kv) 2 else 1;
+    const mem_max: c.BinaryenIndex = if (preview1) 0xffff_ffff else if (wants_kv) 64 else if (any_fs) 256 else 1;
+    // The component model requires the canonical memory export to be named
+    // `cm32p2_memory`; the raw paths keep the plain `memory`.
+    const mem_export_name = if (wants_kv) "cm32p2_memory" else "memory";
 
     // One active data segment at offset 0 holds the whole memory image.
     if (m.data.len == 0) {
-        c.BinaryenSetMemory(module, 1, mem_max, "memory", null, null, null, null, null, 0, false, mem64, "0");
+        c.BinaryenSetMemory(module, mem_min, mem_max, mem_export_name, null, null, null, null, null, 0, false, mem64, "0");
     } else {
         var seg_datas = [_][*c]const u8{m.data.ptr};
         var seg_passives = [_]bool{false};
@@ -898,7 +946,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
                 c.BinaryenConst(module, c.BinaryenLiteralInt32(0)),
         };
         var seg_sizes = [_]c.BinaryenIndex{@intCast(m.data.len)};
-        c.BinaryenSetMemory(module, 1, mem_max, "memory", null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, mem64, "0");
+        c.BinaryenSetMemory(module, mem_min, mem_max, mem_export_name, null, @ptrCast(&seg_datas), @ptrCast(&seg_passives), @ptrCast(&seg_offsets), @ptrCast(&seg_sizes), seg_sizes.len, false, mem64, "0");
     }
 
     // Int formatting needs `__fmt_i64`; either formatting or a concat needs
@@ -953,9 +1001,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     if (needs_fmt_f64) needs_arena = true;
     if (needs_arena) {
         // The scope-arena bump pointer starts just past the static data — and,
-        // on the preview1 path, past the reserved iovec scratch — at the address
-        // width (i32 on wasm32, i64 on wasm64).
-        const arena_start = m.data.len + iovec_scratch;
+        // on the preview1 path, past the reserved iovec scratch, or on the kv
+        // path past the keyvalue return-area scratch — at the address width
+        // (i32 on wasm32, i64 on wasm64).
+        const arena_start = m.data.len + iovec_scratch + kv_scratch;
         const sp_init = if (mem64)
             c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(arena_start)))
         else
@@ -968,14 +1017,35 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const fs_params = c.BinaryenTypeCreate(&fsp, fsp.len);
         c.BinaryenAddFunctionImport(module, "env_fs_read", "env", "fs_read", fs_params, i64_type);
     }
-    if (needs_kv) {
-        // env.kv_increment : (key_ptr, key_len, delta) -> i64 (spec/env.md
-        // §`env.kv`). The key is a str (ptr,len on the address width); the
-        // keyless form passes (0, 0) — the host's empty key. delta + result
-        // are i64 regardless of address space.
+    if (needs_kv and !wants_kv) {
+        // Local `qube run` ABI — env.kv_increment : (key_ptr, key_len, delta) ->
+        // i64 (spec/env.md §`env.kv`). The key is a str (ptr,len on the address
+        // width); the keyless form passes (0, 0) — the host's empty key. delta +
+        // result are i64 regardless of address space.
         var kvp = [_]c.BinaryenType{ ptr_type, ptr_type, i64_type };
         const kv_params = c.BinaryenTypeCreate(&kvp, kvp.len);
         c.BinaryenAddFunctionImport(module, "env_kv_increment", "env", "kv_increment", kv_params, i64_type);
+    }
+    if (wants_kv) {
+        // Component ABI — the canonical `wasi:keyvalue` core imports (cm32p2):
+        //   store.open(identifier_ptr, identifier_len, retptr)   -> writes result<bucket,error>
+        //   atomics.increment(bucket, key_ptr, key_len, delta, retptr) -> writes result<s64,error>
+        // The adapter-held bucket is opened host-side (empty identifier; the host
+        // pins it to the qube's identity), cached in `kv_bucket` (-1 = unopened).
+        const store_mod = "cm32p2|" ++ kv_store_iface;
+        const atomics_mod = "cm32p2|" ++ kv_atomics_iface;
+        var op = [_]c.BinaryenType{ i32_type, i32_type, i32_type };
+        const open_params = c.BinaryenTypeCreate(&op, op.len);
+        c.BinaryenAddFunctionImport(module, "kv_store_open", store_mod, "open", open_params, none_type);
+        var ip = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i64_type, i32_type };
+        const inc_params = c.BinaryenTypeCreate(&ip, ip.len);
+        c.BinaryenAddFunctionImport(module, "kv_atomics_increment", atomics_mod, "increment", inc_params, none_type);
+        _ = c.BinaryenAddGlobal(module, "kv_bucket", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
+        // The canonical `cabi_realloc` bump allocator, exported as
+        // `cm32p2_realloc`. Allocations start at page 1 (65536), above page-0
+        // data/scratch/arena; `component new` requires the export to exist.
+        _ = c.BinaryenAddGlobal(module, "cabi_heap", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(65536)));
+        try emitCabiRealloc(module, i32_type);
     }
     if (needs_chan) {
         // env.channel_recv : (session) -> i64 (spec/env.md §"Channel entry
@@ -1158,6 +1228,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .global_names = global_names,
             .stdout_abi = stdout_abi,
             .iovec_base = iovec_base,
+            .kv_component = wants_kv,
+            .kv_open_ret = kv_open_ret,
+            .kv_inc_ret = kv_inc_ret,
         };
         defer lw.deinit();
 
@@ -1232,6 +1305,15 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
                 const qualified = try std.fmt.allocPrintSentinel(allocator, "{s}#{s}", .{ iface, f.name }, 0);
                 defer allocator.free(qualified);
                 _ = c.BinaryenAddFunctionExport(module, f.name.ptr, qualified.ptr);
+            } else if (wants_kv) {
+                // Component (kv) mode: exports follow the canonical `cm32p2||<name>`
+                // convention, kebab-cased to match the synthesized world export.
+                const ext = try std.fmt.allocPrintSentinel(allocator, "cm32p2||{s}", .{f.name}, 0);
+                defer allocator.free(ext);
+                for (ext) |*ch| if (ch.* == '_') {
+                    ch.* = '-';
+                };
+                _ = c.BinaryenAddFunctionExport(module, f.name.ptr, ext.ptr);
             } else {
                 _ = c.BinaryenAddFunctionExport(module, f.name.ptr, f.name.ptr);
             }
@@ -1399,6 +1481,57 @@ fn usesEnvOut(m: *const ir.mir.Module) bool {
         .cfg => {},
     };
     return false;
+}
+
+/// True if any function reaches `env.kv` (a `kv_increment` node). Reuses the
+/// scratch scan that already detects `has_kv` for the import declaration.
+fn usesEnvKv(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_kv) return true;
+    }
+    return false;
+}
+
+/// Synthesize the WIT world for a kv qube: it imports `wasi:keyvalue/store` +
+/// `wasi:keyvalue/atomics` (the `env.kv` lowering) and exports each scalar `pub`
+/// function. Named `qube` (the fixed world name the CLI passes to `component
+/// embed --world`). Caller owns the slice.
+fn synthKvWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "// synthesized WIT world (q64 env.kv → wasi:keyvalue)\n");
+    try out.appendSlice(allocator, "package q64:qube;\n\nworld qube {\n");
+    try out.print(allocator, "  import {s};\n", .{kv_store_iface});
+    try out.print(allocator, "  import {s};\n", .{kv_atomics_iface});
+    for (hmod.funcs) |f| {
+        if (f.visibility != .public) continue;
+        var scalar = true;
+        for (f.params) |p| {
+            if (component.Scalar.fromHir(p.ty) == null) scalar = false;
+        }
+        if (f.ret != .void and component.Scalar.fromHir(f.ret) == null) scalar = false;
+        if (!scalar) continue;
+        try out.appendSlice(allocator, "  export ");
+        try appendKebab(allocator, &out, f.name);
+        try out.appendSlice(allocator, ": func(");
+        for (f.params, 0..) |p, pi| {
+            if (pi > 0) try out.appendSlice(allocator, ", ");
+            try appendKebab(allocator, &out, p.name);
+            try out.appendSlice(allocator, ": ");
+            try out.appendSlice(allocator, witType(p.ty));
+        }
+        try out.appendSlice(allocator, ")");
+        if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
+        try out.appendSlice(allocator, ";\n");
+    }
+    try out.appendSlice(allocator, "}\n");
+    return out.toOwnedSlice(allocator);
 }
 
 fn instUsesEnvOut(inst: *const ir.mir.Inst) bool {
@@ -1808,6 +1941,13 @@ const Lowerer = struct {
     /// Static address of the reserved iovec scratch (preview1 path only): the
     /// iovec lives at `[iovec_base, iovec_base+8)`, `nwritten` at `iovec_base+8`.
     iovec_base: u32 = 0,
+    /// kv component lowering: `env.kv` lowers to the canonical `wasi:keyvalue`
+    /// imports (lazy `store.open` into `kv_bucket`, `atomics.increment`) instead
+    /// of the raw `env_kv_increment` host face. The two return areas the host
+    /// writes results into are at `kv_open_ret` / `kv_inc_ret`.
+    kv_component: bool = false,
+    kv_open_ret: u32 = 0,
+    kv_inc_ret: u32 = 0,
 
     fn deinit(self: *Lowerer) void {
         self.loops.deinit(self.allocator);
@@ -2083,6 +2223,9 @@ const Lowerer = struct {
                 return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.ptr_type);
             },
             .kv_increment => |kv| {
+                // Component lowering: the canonical `wasi:keyvalue` lazy-open +
+                // increment + result unwrap (see `kvComponentIncrement`).
+                if (self.kv_component) return try self.kvComponentIncrement(kv);
                 // n = env.kv_increment(key_ptr, key_len, delta), i64 result.
                 if (kv.key) |key| {
                     // Evaluate the str key into the pair scratch, then pass its
@@ -2328,6 +2471,66 @@ const Lowerer = struct {
     /// the trailing newline of `host_out_*` go through here.
     fn envOut(self: *Lowerer, off: i64, len: i64) c.BinaryenExpressionRef {
         return self.writeStdout(self.ptrConst(off), self.ptrConst(len));
+    }
+
+    /// `env.kv.increment` lowered to the canonical `wasi:keyvalue` ABI. Lazily
+    /// opens the adapter-held bucket (empty identifier; host pins identity) into
+    /// `kv_bucket`, calls `atomics.increment`, and unwraps the
+    /// `result<s64, error>` the host wrote into the return area: `ok` → the new
+    /// total, `err` → 0 (the source always boxes the call as `Ok(n)`; v0 host
+    /// always succeeds — see `test/kv-component-reference/`). i32 addresses
+    /// (cm32p2 is 32-bit). Returns an i64.
+    fn kvComponentIncrement(self: *Lowerer, kv: anytype) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const i32c = struct {
+            fn f(mod: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+                return c.BinaryenConst(mod, c.BinaryenLiteralInt32(v));
+            }
+        }.f;
+        const open_ret: i32 = @intCast(self.kv_open_ret);
+        const inc_ret: i32 = @intCast(self.kv_inc_ret);
+
+        // if (kv_bucket == -1) { open("", open_ret); kv_bucket = load_i32(open_ret+4) }
+        var open_args = [_]c.BinaryenExpressionRef{ i32c(m, 0), i32c(m, 0), i32c(m, open_ret) };
+        var open_then = [_]c.BinaryenExpressionRef{
+            c.BinaryenCall(m, "kv_store_open", @ptrCast(&open_args), open_args.len, self.none_type),
+            c.BinaryenGlobalSet(m, "kv_bucket", c.BinaryenLoad(m, 4, false, 4, 4, self.i32_type, i32c(m, open_ret), "0")),
+        };
+        const lazy_open = c.BinaryenIf(
+            m,
+            c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type), i32c(m, -1)),
+            c.BinaryenBlock(m, null, @ptrCast(&open_then), open_then.len, self.none_type),
+            null,
+        );
+
+        // key (ptr,len): a str pair for the keyed form, (0,0) for the keyless one.
+        // The keyed form sequences the pair eval before the call reads its extracts.
+        var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer pre.deinit(self.allocator);
+        try pre.append(self.allocator, lazy_open);
+        var key_ptr: c.BinaryenExpressionRef = i32c(m, 0);
+        var key_len: c.BinaryenExpressionRef = i32c(m, 0);
+        if (kv.key) |key| {
+            try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(key)));
+            key_ptr = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0);
+            key_len = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1);
+        }
+
+        // increment(kv_bucket, key_ptr, key_len, delta, inc_ret)
+        var inc_args = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type),
+            key_ptr,
+            key_len,
+            try self.inst(kv.delta),
+            i32c(m, inc_ret),
+        };
+        try pre.append(self.allocator, c.BinaryenCall(m, "kv_atomics_increment", @ptrCast(&inc_args), inc_args.len, self.none_type));
+
+        // result: (load8_u(inc_ret) == 0) ? load_i64(inc_ret+8) : 0
+        const ok = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, i32c(m, inc_ret), "0"), i32c(m, 0));
+        const total = c.BinaryenLoad(m, 8, false, 8, 8, self.i64_type, i32c(m, inc_ret), "0");
+        try pre.append(self.allocator, c.BinaryenSelect(m, ok, total, c.BinaryenConst(m, c.BinaryenLiteralInt64(0))));
+        return c.BinaryenBlock(m, null, @ptrCast(pre.items.ptr), @intCast(pre.items.len), self.i64_type);
     }
 
     /// Emit a single stdout write of the `(ptr, len)` pair, lowered per the
@@ -3060,6 +3263,48 @@ fn emitFmtF64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
 /// Emit `__str_eq(pa, la, pb, lb) -> i32`: byte-wise equality of two strings.
 /// Params are address-width (ptr, len, ptr, len); the result is i32 0/1. Lengths
 /// differ → 0; otherwise compare bytes until the end → 1, or a mismatch → 0.
+/// The canonical-ABI `cabi_realloc(old_ptr, old_size, align, new_size) -> ptr`,
+/// exported as `cm32p2_realloc` for the kv component lift. A bump allocator over
+/// the `cabi_heap` global (the component model only requires it exist + return
+/// aligned space; the kv calls trigger it only for an error variant's string).
+/// align-up: `p = (heap + align-1) & -align` (align is a power of two).
+fn emitCabiRealloc(module: c.BinaryenModuleRef, i32_type: c.BinaryenType) !void {
+    const OLD_P: c.BinaryenIndex = 0;
+    const OLD_S: c.BinaryenIndex = 1;
+    const ALIGN: c.BinaryenIndex = 2;
+    const NEW_S: c.BinaryenIndex = 3;
+    const P: c.BinaryenIndex = 4; // the aligned result pointer
+    _ = OLD_P;
+    _ = OLD_S;
+    const i32c = struct {
+        fn f(m: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+            return c.BinaryenConst(m, c.BinaryenLiteralInt32(v));
+        }
+    }.f;
+    const get = struct {
+        fn f(m: c.BinaryenModuleRef, idx: c.BinaryenIndex, t: c.BinaryenType) c.BinaryenExpressionRef {
+            return c.BinaryenLocalGet(m, idx, t);
+        }
+    }.f;
+    // p = (cabi_heap + (align - 1)) & (0 - align)
+    const heap_plus = c.BinaryenBinary(module, c.BinaryenAddInt32(), c.BinaryenGlobalGet(module, "cabi_heap", i32_type), c.BinaryenBinary(module, c.BinaryenSubInt32(), get(module, ALIGN, i32_type), i32c(module, 1)));
+    const neg_align = c.BinaryenBinary(module, c.BinaryenSubInt32(), i32c(module, 0), get(module, ALIGN, i32_type));
+    const aligned = c.BinaryenBinary(module, c.BinaryenAndInt32(), heap_plus, neg_align);
+    var stmts = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(module, P, aligned),
+        // cabi_heap = p + new_size
+        c.BinaryenGlobalSet(module, "cabi_heap", c.BinaryenBinary(module, c.BinaryenAddInt32(), get(module, P, i32_type), get(module, NEW_S, i32_type))),
+        c.BinaryenReturn(module, get(module, P, i32_type)),
+    };
+    const body = c.BinaryenBlock(module, null, @ptrCast(&stmts), stmts.len, i32_type);
+    var params = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type };
+    const ptype = c.BinaryenTypeCreate(&params, params.len);
+    var var_types = [_]c.BinaryenType{i32_type}; // P
+    const fref = c.BinaryenAddFunction(module, "cabi_realloc", ptype, i32_type, @ptrCast(&var_types), var_types.len, body);
+    _ = fref;
+    _ = c.BinaryenAddFunctionExport(module, "cabi_realloc", "cm32p2_realloc");
+}
+
 fn emitStrEq(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i32_type: c.BinaryenType, ptr_type: c.BinaryenType, mem64: bool) !void {
     const none = c.BinaryenTypeNone();
     const PA: c.BinaryenIndex = 0;
@@ -3997,6 +4242,36 @@ test "emitComponent: a declared-but-uncalled import is not wired (import what yo
             // No interface id baked in — the unused import was dropped.
             try testing.expect(std.mem.indexOf(u8, bytes, "acme:mathlib/math") == null);
             try testing.expect(std.mem.indexOf(u8, bytes, "compute") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.kv lowers to a wasi:keyvalue component core + world" {
+    const src =
+        \\pub fn bump() -> i64 {
+        \\    match env.kv.increment("count", 1) { Ok(n) -> n, Err(_) -> 0 }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "kv.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .kv_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            // Core (env-out path bytes) imports the canonical cm32p2 wasi:keyvalue
+            // interfaces + exports the canonical memory/realloc, named cm32p2||bump.
+            try testing.expectEqualSlices(u8, "\x00asm", kvc.core[0..4]);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:keyvalue/store@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:keyvalue/atomics@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2_memory") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2_realloc") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2||bump") != null);
+            // No raw env.kv face leaks into the component core.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "kv_increment") == null);
+            // The synthesized world imports both versioned interfaces + exports bump.
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:keyvalue/store@0.2.0-draft2;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:keyvalue/atomics@0.2.0-draft2;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export bump: func() -> s64;") != null);
         },
         else => return error.TestUnexpectedResult,
     }
