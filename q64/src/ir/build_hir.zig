@@ -581,6 +581,8 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 try out.append(b.a, st);
             } else if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let v = Vec.from([…])` — handled (vec_new + pushes).
+            } else if (try tryActorSpawn(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let c = Actor.spawn()` — an actor instance (default state record).
             } else if (try tryChannelNew(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let ch = channel(…)` — a Vec buffer + read cursor.
             } else if (try tryChannelRecv(b, init_expr, nm.text, ls.isVar(), scope, out)) {
@@ -6464,6 +6466,46 @@ fn genericRecCall(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecV
     return .{ .e = e, .si = si };
 }
 
+/// `let c = Actor.spawn()` — instantiate an actor with its `state` defaults.
+/// On the v0 cooperative floor an actor instance is its state record (handlers
+/// run synchronously, sharing it), so `spawn()` builds the same default record
+/// as `Actor {}` and binds its base pointer — registering `c` in `scope.recs`
+/// so `c.tell` / `c.ask` dispatch. Returns false when the init isn't the form.
+fn tryActorSpawn(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cname = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "spawn")) return false;
+    const ad = b.actor_decls.get(cname[0..dot]) orelse return false; // not an actor → not this form
+    const si = b.structs.get(cname[0..dot]) orelse return error.Unsupported;
+    {
+        var a0 = cc.args();
+        if (a0.next() != null) return error.Unsupported; // v0: spawn() takes no args
+    }
+    // Build the default state record (every `state … = <default>`), like `C {}`.
+    var inits: std.ArrayList(hir.FieldInit) = .empty;
+    var sit = ad.states();
+    while (sit.next()) |s| {
+        const sname = (s.name() orelse return error.Unsupported).text;
+        const f = si.field(sname) orelse return error.Unsupported;
+        const dval = s.value() orelse return error.Unsupported; // no default → must use `Actor {}`
+        if (narrowRange(f.ty) != null) {
+            try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildNarrowValue(b, f.ty, dval) });
+        } else {
+            if (scalarBindTy(try exprScalar(b, dval, scope)) != f.ty) return error.Unsupported;
+            try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildIntExpr(b, dval, scope) });
+        }
+    }
+    const rec = try b.a.create(hir.Expr);
+    rec.* = .{ .record_alloc = .{ .size = si.size, .alignment = si.alignment, .inits = try inits.toOwnedSlice(b.a) } };
+    try bindMainRecord(b, scope, name, is_var, rec, si, out);
+    return true;
+}
+
 /// `Vec.from([…])` / `Vec.new()` as a `let`/`var` initializer (the v0 Vec
 /// floor, spec/types.md §Growable): bind a fresh header, and for `Vec.from`
 /// push each literal element (i64 expressions). `Vec.new()` is the empty
@@ -9931,6 +9973,32 @@ test "graph v0: a named pipeline runs eagerly; terminal stage is the output" {
     defer testing.allocator.free(dump);
     // The graph lowers to a function returning its terminal binding.
     try testing.expect(std.mem.indexOf(u8, dump, "fn pipeline -> i64") != null);
+}
+
+test "actors v0: Actor.spawn() instantiates the default state record" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `Actor.spawn()` builds the same default record as `Actor {}` and binds it,
+    // so the instance dispatches `tell`/`ask` like a `var c = Actor {}` binding.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor Counter {
+        \\    state n: i64 = 0
+        \\    handle Bump { n = n + 1 }
+        \\    handle Get -> i64 { n }
+        \\}
+        \\fn main {
+        \\    let c = Counter.spawn()
+        \\    c.tell(Bump)
+        \\    env.out(c.ask(Get))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // spawn() lowers to the default-state record_alloc + handler dispatch.
+    try testing.expect(std.mem.indexOf(u8, dump, "record_alloc") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.Bump -> void") != null);
 }
 
 test "actors v0: message-style tell/ask dispatch (c.tell(Msg) / c.ask(Msg))" {

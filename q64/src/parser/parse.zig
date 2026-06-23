@@ -2687,8 +2687,11 @@ const Parser = struct {
             // (`c.tell(Msg)`, concurrency.md §Actors): KW_TELL appears in no
             // expression production either, so `c.tell(…)` parses as the same
             // greedy PATH_EXPR + CALL_EXPR a method call uses, and build_hir
-            // dispatches it to the named handler.
-            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL => true,
+            // dispatches it to the named handler. `spawn` joins as a segment for
+            // `Actor.spawn()` — a leading `spawn { … }` is intercepted in
+            // parsePrimary before the path check, so admitting it after a `.`
+            // (where no spawn-block can follow) is unambiguous.
+            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL, .KW_SPAWN => true,
             else => false,
         };
     }
