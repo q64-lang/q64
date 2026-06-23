@@ -36,6 +36,10 @@ const c = @cImport({
 var g_display: std.ArrayListUnmanaged(render.Op) = .empty;
 var g_alloc: std.mem.Allocator = undefined;
 
+// env.kv_increment's v0 single-counter store (no key yet). Process-global because
+// the wasmtime callback is a bare C function; one run = one counter.
+var g_kv_counter: i64 = 0;
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     // The qview display list lives for the whole run and is freed at exit; use
@@ -234,6 +238,41 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // -------------------------------------------------------------
+    // env.kv_increment :: (delta) -> i64 (spec/env.md §`env.kv`,
+    // `wasi:keyvalue/atomics.increment`). v0 floor: a single in-process counter
+    // (no key), so a module that increments sees a monotonic shared total — the
+    // shape qubepods backs with the project's key-value store. delta + result
+    // are i64 regardless of address space. Defined unconditionally; modules that
+    // don't import it are unaffected.
+    // -------------------------------------------------------------
+    {
+        var kv_param_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var kv_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&kv_params_vec, kv_param_types.len, @ptrCast(&kv_param_types));
+        var kv_result_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var kv_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&kv_results_vec, kv_result_types.len, @ptrCast(&kv_result_types));
+        const kv_type = c.wasm_functype_new(&kv_params_vec, &kv_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(kv_type);
+        const link_err = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "kv_increment",
+            "kv_increment".len,
+            kv_type,
+            envKvIncrementCallback,
+            null,
+            null,
+        );
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.kv_increment");
+            std.process.exit(1);
+        }
+    }
+
+    // -------------------------------------------------------------
     // Headless `qview.*` host face (spec/reactivity.md; the live web POC's
     // ABI). qview is an *open* face — any `qview.<op>(...)` a program invents
     // (`box`, `line`, `circle`, …) lowers to a host import. Rather than a fixed
@@ -407,6 +446,24 @@ pub fn main(init: std.process.Init) !void {
 // Called from C, so we can't accept an `Io` parameter. Reach for the
 // process-wide single-threaded Io. Fine for v0 since the host is
 // strictly single-threaded; revisit when we add concurrency.
+
+fn envKvIncrementCallback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = caller;
+    if (nargs != 1 or nresults != 1) return trap("env.kv_increment: expected (delta) -> i64");
+    if (args[0].kind != c.WASMTIME_I64) return trap("env.kv_increment: delta must be i64");
+    g_kv_counter += args[0].of.i64;
+    results[0].kind = c.WASMTIME_I64;
+    results[0].of.i64 = g_kv_counter;
+    return null;
+}
 
 fn envOutCallback(
     env_: ?*anyopaque,

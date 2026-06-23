@@ -354,6 +354,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
     switch (e.*) {
         // `env.fs.read` yields a boxed Result<str, i64> base pointer.
         .fs_read => |fr| return mk(ctx.a, .ptr, .{ .fs_read = .{ .path = try lowerStrExpr(ctx, fr.path) } }),
+        .kv_increment => |kv| return mk(ctx.a, .i64, .{ .kv_increment = .{ .delta = try lowerExpr(ctx, kv.delta) } }),
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .float_const => |v| return mk(ctx.a, .f64, .{ .const_f64 = v }),
         .num_cast => |nc| return mk(ctx.a, mapType(nc.to), .{ .num_cast = try lowerExpr(ctx, nc.value) }),

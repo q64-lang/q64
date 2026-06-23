@@ -909,6 +909,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_str_eq = false;
     var needs_vec = false;
     var needs_fs = false;
+    var needs_kv = false;
     var needs_index_of = false;
     var needs_starts_with = false;
     var needs_contains = false;
@@ -934,6 +935,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             needs_fs = true;
             needs_arena = true;
         }
+        if (sc.has_kv) needs_kv = true;
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -957,6 +959,13 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var fsp = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type };
         const fs_params = c.BinaryenTypeCreate(&fsp, fsp.len);
         c.BinaryenAddFunctionImport(module, "env_fs_read", "env", "fs_read", fs_params, i64_type);
+    }
+    if (needs_kv) {
+        // env.kv_increment : (delta) -> i64 (spec/env.md §`env.kv`). delta and
+        // the result are i64 regardless of address space (scalar at the wire).
+        var kvp = [_]c.BinaryenType{i64_type};
+        const kv_params = c.BinaryenTypeCreate(&kvp, kvp.len);
+        c.BinaryenAddFunctionImport(module, "env_kv_increment", "env", "kv_increment", kv_params, i64_type);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
     if (needs_fmt_f64) try emitFmtF64(module, allocator, i64_type, pair_type, ptr_type, mem64);
@@ -1274,6 +1283,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .elem_ptr => |ep| bodyHasOut(ep.base, want_int) or bodyHasOut(ep.index, want_int),
         .bounds_check => |bc| bodyHasOut(bc.index, want_int) or bodyHasOut(bc.count, want_int),
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
+        .kv_increment => |kv| bodyHasOut(kv.delta, want_int),
         .vec_new => false,
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
@@ -1347,6 +1357,8 @@ const Scratch = struct {
     has_bounds: bool = false,
     /// Contains an `env.fs.read` → declare the import + fs scratch.
     has_fs: bool = false,
+    /// Contains an `env.kv.increment` → declare the `env.kv_increment` import.
+    has_kv: bool = false,
     /// Contains a Vec op → emit the __vec_* helpers (+ the arena).
     has_vec: bool = false,
     /// Max nesting depth of frame-reclamation regions (a `.call` or a host
@@ -1368,6 +1380,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_bounds = s.has_bounds or sub.has_bounds;
     s.has_vec = s.has_vec or sub.has_vec;
     s.has_fs = s.has_fs or sub.has_fs;
+    s.has_kv = s.has_kv or sub.has_kv;
     if (sub.rec_depth > s.rec_depth) s.rec_depth = sub.rec_depth;
     if (sub.region_depth > s.region_depth) s.region_depth = sub.region_depth;
 }
@@ -1537,6 +1550,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_fs = true;
             s.host_out = true; // uses the pair scratch to split the path
             scanScratch(fr.path, s);
+        },
+        .kv_increment => |kv| {
+            s.has_kv = true;
+            scanScratch(kv.delta, s);
         },
         .vec_new => s.has_vec = true,
         .vec_push => |vp| {
@@ -1943,6 +1960,11 @@ const Lowerer = struct {
                     self.ptrGet(hdr),
                 };
                 return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.ptr_type);
+            },
+            .kv_increment => |kv| {
+                // n = env.kv_increment(delta) — one i64 arg, i64 result.
+                var call_args = [_]c.BinaryenExpressionRef{try self.inst(kv.delta)};
+                return c.BinaryenCall(module, "env_kv_increment", @ptrCast(&call_args), call_args.len, self.i64_type);
             },
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
             .vec_push => |vp| {

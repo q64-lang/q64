@@ -223,6 +223,9 @@ pub const Op = union(enum) {
     /// `env.fs_read` import with (dest=sp, path ptr, path len), trap on a
     /// negative length, bump `sp`, yield the (dest, len) str value.
     fs_read: struct { path: *Inst },
+    /// `env.kv.increment(delta)` (spec/env.md §`env.kv`): call the
+    /// `env.kv_increment` import with (delta) and yield its i64 result.
+    kv_increment: struct { delta: *Inst },
     /// `Vec` v0 floor (spec/types.md §Growable): a fresh empty vec —
     /// a 3-slot {data, len, cap} header in the scope arena, yielding
     /// its base pointer. Lowers to the `__vec_new` helper.

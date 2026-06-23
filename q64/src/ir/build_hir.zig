@@ -8408,6 +8408,17 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // `env.kv.increment(delta)` — the WASI key-value counter (spec/env.md
+            // §`env.kv`, `wasi:keyvalue/atomics.increment`). v0 floor: a single
+            // host-side counter (no key yet); one i64 `delta` arg, i64 result.
+            if (std.mem.eql(u8, cname, "env.kv.increment")) {
+                var ka = cc.args();
+                const darg = ka.next() orelse return error.Unsupported;
+                if (ka.next() != null) return error.Unsupported;
+                const kvout = try b.a.create(hir.Expr);
+                kvout.* = .{ .kv_increment = .{ .delta = try buildIntExpr(b, darg, scope) } };
+                return kvout;
+            }
             // `h.await()` — `await` isn't a keyword, so it parses as a call to
             // the dotted path `h.await`. On the v0 cooperative floor a task
             // that doesn't itself suspend has already completed (eager handle),
@@ -12872,6 +12883,24 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "env.kv.increment: an i64 @kv capability face" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    let n = env.kv.increment(1)
+        \\    env.out(n)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "kv_increment") != null);
+    // The effect pass marks main @kv (closed over @io).
+    try testing.expect(std.mem.indexOf(u8, dump, "@kv") != null);
 }
 
 test "str enum payloads: Result<str, i64>, Msg.Text(str), Option<str>, try" {
