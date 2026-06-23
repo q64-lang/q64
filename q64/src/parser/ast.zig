@@ -2126,8 +2126,9 @@ pub const PathExpr = struct {
             // path/field segment. `on` is needed so the host-face op
             // `qview.on(...)` (spec/qview-protocol.md) reconstructs its dotted
             // name including the `on` segment; `self` so a method body's
-            // receiver access (`self.w`) reconstructs whole.
-            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM => true,
+            // receiver access (`self.w`) reconstructs whole. `tell` so the
+            // message-style dispatch `c.tell(Msg)` reconstructs its dotted name.
+            .IDENT, .DOT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL => true,
             else => false,
         };
     }

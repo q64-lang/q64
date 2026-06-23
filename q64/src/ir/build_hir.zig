@@ -5623,6 +5623,16 @@ fn tryActorTell(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir
     if (std.mem.indexOfScalar(u8, mname, '.') != null) return null;
     const si = scope.recs.get(head) orelse return null;
     const loc = scope.find(head) orelse return null;
+    // Message-style: `c.tell(Bump)` / `c.tell(Add(x))` — the message argument
+    // names the handler. A `tell` carries a void handler (a reply-bearing one
+    // is an `ask`, CONC020); a value handler here falls through.
+    if (std.mem.eql(u8, mname, "tell")) {
+        const m = (try actorMessageCall(b, call, si, loc.idx, scope)) orelse return null;
+        if (m.ret != .void) return null;
+        const stt = try b.a.create(hir.Stmt);
+        stt.* = .{ .expr = m.e };
+        return stt;
+    }
     const fid = (try registerActorHandler(b, si, mname)) orelse return null;
     if (b.funcs.items[fid].ret != .void) return null; // a value handler isn't a tell
     const recv = try b.a.create(hir.Expr);
@@ -5632,6 +5642,51 @@ fn tryActorTell(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .expr = e };
     return st;
+}
+
+/// `c.tell(Msg)` / `c.ask(Msg)` — dispatch the message named by the single
+/// argument to actor `si`'s handler. The message is a bare variant name
+/// (`Bump`, no payload) or a payload construction (`Add(5)`). Returns the
+/// handler call (self + payload args) plus its return type; null if the arg
+/// isn't a message form or names no handler. Shared by `tell` (void) and
+/// `ask` (value).
+fn actorMessageCall(b: *Builder, call: ast.CallExpr, si: *const StructInfo, loc_idx: u32, scope: *Scope) BuildError!?struct { e: *hir.Expr, ret: hir.Type } {
+    var ait = call.args();
+    const marg = ait.next() orelse return null;
+    if (ait.next() != null) return null; // tell/ask take exactly one message
+    var name_buf: []const u8 = undefined;
+    var payload: ast.ArgIter = ast.ArgIter{ .children = &.{} };
+    switch (marg) {
+        .path => |p| name_buf = try p.text(b.a),
+        .call => |mc| {
+            name_buf = (callPathName(b, mc)) orelse return null;
+            payload = mc.args();
+        },
+        else => return null,
+    }
+    defer b.a.free(name_buf);
+    const fid = (try registerActorHandler(b, si, name_buf)) orelse return null;
+    const recv = try b.a.create(hir.Expr);
+    recv.* = .{ .local = .{ .idx = loc_idx, .ty = .ptr } };
+    const e = try b.a.create(hir.Expr);
+    e.* = .{ .call = .{ .func = fid, .args = try buildCallArgs(b, fid, payload, scope, recv) } };
+    return .{ .e = e, .ret = b.funcs.items[fid].ret };
+}
+
+/// `c.ask(Msg)` in value position — dispatch a value-returning handler and
+/// yield its result (the `ask` half of `actorMessageCall`). `ask` is not a
+/// keyword, so it already parses as a method call.
+fn tryActorAsk(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Expr {
+    const cname = (callPathName(b, call)) orelse return null;
+    defer b.a.free(cname);
+    const dot = std.mem.indexOfScalar(u8, cname, '.') orelse return null;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "ask")) return null;
+    const head = cname[0..dot];
+    const si = scope.recs.get(head) orelse return null;
+    const loc = scope.find(head) orelse return null;
+    const m = (try actorMessageCall(b, call, si, loc.idx, scope)) orelse return null;
+    if (m.ret == .void) return null; // a void handler isn't an ask
+    return m.e;
 }
 
 /// The single tail expression of a one-statement block, or null.
@@ -8458,6 +8513,9 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // `c.ask(Msg)` — a value-returning actor handler dispatched by the
+            // message name (the value half of message-style actors).
+            if (try tryActorAsk(b, cc, scope)) |ae| return ae;
             // `h.await()` — `await` isn't a keyword, so it parses as a call to
             // the dotted path `h.await`. On the v0 cooperative floor a task
             // that doesn't itself suspend has already completed (eager handle),
@@ -9873,6 +9931,36 @@ test "graph v0: a named pipeline runs eagerly; terminal stage is the output" {
     defer testing.allocator.free(dump);
     // The graph lowers to a function returning its terminal binding.
     try testing.expect(std.mem.indexOf(u8, dump, "fn pipeline -> i64") != null);
+}
+
+test "actors v0: message-style tell/ask dispatch (c.tell(Msg) / c.ask(Msg))" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // `tell` is a keyword admitted as a path segment, so `c.tell(Bump)` parses
+    // as a call; build_hir dispatches it to the `Bump` handler (no payload),
+    // `c.tell(Add(x))` to `Add` (payload), and `c.ask(Get)` to the value handler.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor C {
+        \\    state n: i64 = 0
+        \\    handle Bump { n = n + 1 }
+        \\    handle Add(x: i64) { n = n + x }
+        \\    handle Get -> i64 { n }
+        \\}
+        \\fn main {
+        \\    var c = C {}
+        \\    c.tell(Bump)
+        \\    c.tell(Add(5))
+        \\    env.out(c.ask(Get))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Each message lowers to a call into the named self-taking handler.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn C.Bump -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn C.Add -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn C.Get -> i64") != null);
 }
 
 test "actors v0: handlers lower to self-taking functions; tell/ask dispatch" {

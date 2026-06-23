@@ -2683,7 +2683,12 @@ const Parser = struct {
             // reads it). `from` joins for `Vec.from([…])` (spec/types.md
             // §"Slice literals") — KW_FROM appears in no expression
             // production, so admitting it as a segment is unambiguous.
-            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM => true,
+            // `tell` joins the same way for message-style actor dispatch
+            // (`c.tell(Msg)`, concurrency.md §Actors): KW_TELL appears in no
+            // expression production either, so `c.tell(…)` parses as the same
+            // greedy PATH_EXPR + CALL_EXPR a method call uses, and build_hir
+            // dispatches it to the named handler.
+            .IDENT, .KW_IN, .KW_OUT, .KW_REF, .KW_MOVE, .KW_ON, .KW_SELF, .KW_FROM, .KW_TELL => true,
             else => false,
         };
     }
