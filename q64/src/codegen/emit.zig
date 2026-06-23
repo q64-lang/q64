@@ -961,9 +961,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         c.BinaryenAddFunctionImport(module, "env_fs_read", "env", "fs_read", fs_params, i64_type);
     }
     if (needs_kv) {
-        // env.kv_increment : (delta) -> i64 (spec/env.md §`env.kv`). delta and
-        // the result are i64 regardless of address space (scalar at the wire).
-        var kvp = [_]c.BinaryenType{i64_type};
+        // env.kv_increment : (key_ptr, key_len, delta) -> i64 (spec/env.md
+        // §`env.kv`). The key is a str (ptr,len on the address width); the
+        // keyless form passes (0, 0) — the host's empty key. delta + result
+        // are i64 regardless of address space.
+        var kvp = [_]c.BinaryenType{ ptr_type, ptr_type, i64_type };
         const kv_params = c.BinaryenTypeCreate(&kvp, kvp.len);
         c.BinaryenAddFunctionImport(module, "env_kv_increment", "env", "kv_increment", kv_params, i64_type);
     }
@@ -1283,7 +1285,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .elem_ptr => |ep| bodyHasOut(ep.base, want_int) or bodyHasOut(ep.index, want_int),
         .bounds_check => |bc| bodyHasOut(bc.index, want_int) or bodyHasOut(bc.count, want_int),
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
-        .kv_increment => |kv| bodyHasOut(kv.delta, want_int),
+        .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .vec_new => false,
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
@@ -1553,6 +1555,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         },
         .kv_increment => |kv| {
             s.has_kv = true;
+            if (kv.key) |k| {
+                s.host_out = true; // the str key rides the pair scratch (ptr,len)
+                scanScratch(k, s);
+            }
             scanScratch(kv.delta, s);
         },
         .vec_new => s.has_vec = true,
@@ -1962,8 +1968,28 @@ const Lowerer = struct {
                 return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.ptr_type);
             },
             .kv_increment => |kv| {
-                // n = env.kv_increment(delta) — one i64 arg, i64 result.
-                var call_args = [_]c.BinaryenExpressionRef{try self.inst(kv.delta)};
+                // n = env.kv_increment(key_ptr, key_len, delta), i64 result.
+                if (kv.key) |key| {
+                    // Evaluate the str key into the pair scratch, then pass its
+                    // (ptr, len) plus delta. A block sequences the set before
+                    // the call so the extracts read the populated pair.
+                    const set_pair = c.BinaryenLocalSet(module, self.pair_idx, try self.inst(key));
+                    const pget = c.BinaryenLocalGet(module, self.pair_idx, self.pair_type);
+                    var call_args = [_]c.BinaryenExpressionRef{
+                        c.BinaryenTupleExtract(module, pget, 0),
+                        c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
+                        try self.inst(kv.delta),
+                    };
+                    const callex = c.BinaryenCall(module, "env_kv_increment", @ptrCast(&call_args), call_args.len, self.i64_type);
+                    var seq = [_]c.BinaryenExpressionRef{ set_pair, callex };
+                    return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.i64_type);
+                }
+                // Keyless: the empty key (ptr=0, len=0) — the host's single counter.
+                var call_args = [_]c.BinaryenExpressionRef{
+                    self.ptrConst(0),
+                    self.ptrConst(0),
+                    try self.inst(kv.delta),
+                };
                 return c.BinaryenCall(module, "env_kv_increment", @ptrCast(&call_args), call_args.len, self.i64_type);
             },
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),

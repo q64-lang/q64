@@ -36,9 +36,11 @@ const c = @cImport({
 var g_display: std.ArrayListUnmanaged(render.Op) = .empty;
 var g_alloc: std.mem.Allocator = undefined;
 
-// env.kv_increment's v0 single-counter store (no key yet). Process-global because
-// the wasmtime callback is a bare C function; one run = one counter.
-var g_kv_counter: i64 = 0;
+// env.kv_increment's v0 key-value store: counter per str key (the empty key is
+// the keyless form's single counter). Process-global because the wasmtime
+// callback is a bare C function; one run = one store. Keys are duped into
+// g_alloc (the guest-memory slice is transient).
+var g_kv_store: std.StringHashMapUnmanaged(i64) = .empty;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -246,7 +248,14 @@ pub fn main(init: std.process.Init) !void {
     // don't import it are unaffected.
     // -------------------------------------------------------------
     {
-        var kv_param_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        // (key_ptr, key_len, delta) -> i64. key ptr/len ride the address width
+        // (i32 on wasm32, i64 on wasm64 — same introspection as env.out); delta
+        // and the result are always i64.
+        var kv_param_types = [_]?*c.wasm_valtype_t{
+            c.wasm_valtype_new(arg_valkind),
+            c.wasm_valtype_new(arg_valkind),
+            c.wasm_valtype_new(c.WASM_I64),
+        };
         var kv_params_vec: c.wasm_valtype_vec_t = undefined;
         c.wasm_valtype_vec_new(&kv_params_vec, kv_param_types.len, @ptrCast(&kv_param_types));
         var kv_result_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
@@ -456,12 +465,38 @@ fn envKvIncrementCallback(
     nresults: usize,
 ) callconv(.c) ?*c.wasm_trap_t {
     _ = env_;
-    _ = caller;
-    if (nargs != 1 or nresults != 1) return trap("env.kv_increment: expected (delta) -> i64");
-    if (args[0].kind != c.WASMTIME_I64) return trap("env.kv_increment: delta must be i64");
-    g_kv_counter += args[0].of.i64;
+    if (nargs != 3 or nresults != 1) return trap("env.kv_increment: expected (key_ptr, key_len, delta) -> i64");
+    const key_ptr = argAddr(args[0]);
+    const key_len = argAddr(args[1]);
+    const delta = args[2].of.i64;
+    if (key_ptr < 0 or key_len < 0) return trap("env.kv_increment: negative key ptr/len");
+
+    // Read the str key out of guest memory (len 0 → the empty keyless key).
+    var memory_item: c.wasmtime_extern_t = undefined;
+    if (!c.wasmtime_caller_export_get(caller, "memory", "memory".len, &memory_item)) {
+        return trap("env.kv_increment: module has no `memory` export");
+    }
+    if (memory_item.kind != c.WASMTIME_EXTERN_MEMORY) {
+        return trap("env.kv_increment: `memory` export is not a memory");
+    }
+    const ctx = c.wasmtime_caller_context(caller);
+    const data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
+    const data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
+    const kp: usize = @intCast(key_ptr);
+    const kl: usize = @intCast(key_len);
+    if (kp + kl > data_size) return trap("env.kv_increment: key out of bounds");
+    const key = data[kp .. kp + kl];
+
+    // Increment the counter at `key`. New keys are duped into g_alloc — the
+    // guest-memory slice doesn't outlive the call.
+    const gop = g_kv_store.getOrPut(g_alloc, key) catch return trap("env.kv_increment: OOM");
+    if (!gop.found_existing) {
+        gop.key_ptr.* = g_alloc.dupe(u8, key) catch return trap("env.kv_increment: OOM");
+        gop.value_ptr.* = 0;
+    }
+    gop.value_ptr.* += delta;
     results[0].kind = c.WASMTIME_I64;
-    results[0].of.i64 = g_kv_counter;
+    results[0].of.i64 = gop.value_ptr.*;
     return null;
 }
 

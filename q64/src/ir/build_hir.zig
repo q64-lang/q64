@@ -6244,13 +6244,23 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                 // `kv_increment` node is the Ok payload. `match … { Ok(n) -> … }`
                 // reads it like any boxed enum.
                 if (std.mem.eql(u8, fsname, "env.kv.increment")) {
+                    // Two arities: `(key, delta)` keys the counter by a str;
+                    // `(delta)` is the keyless single-counter form (key = null).
                     var ka = cc.args();
-                    const darg = ka.next() orelse return error.Unsupported;
-                    if (ka.next() != null) return error.Unsupported;
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    const a1 = ka.next();
+                    if (a1 != null and ka.next() != null) return error.Unsupported;
                     const ok = enumVariantTag(b, "Ok") orelse return error.Unsupported;
                     const esi = ok.info.si orelse return error.Unsupported;
                     const kvnode = try b.a.create(hir.Expr);
-                    kvnode.* = .{ .kv_increment = .{ .delta = try buildIntExpr(b, darg, scope) } };
+                    if (a1) |delta_arg| {
+                        kvnode.* = .{ .kv_increment = .{
+                            .key = try buildStrExpr(b, a0, scope, null),
+                            .delta = try buildIntExpr(b, delta_arg, scope),
+                        } };
+                    } else {
+                        kvnode.* = .{ .kv_increment = .{ .key = null, .delta = try buildIntExpr(b, a0, scope) } };
+                    }
                     var pvals = [_]*hir.Expr{kvnode};
                     return .{ .e = try enumAlloc(b, esi, ok.tag, &pvals), .si = esi };
                 }
@@ -12963,6 +12973,27 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "env.kv.increment: keyed form (key, delta) marks @kv and carries the key" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    match env.kv.increment("count", 1) {
+        \\        Ok(n) -> env.out(n),
+        \\        Err(_) -> env.out("err"),
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "kv_increment") != null);
+    // The str key is lowered into the node (printed before the delta).
+    try testing.expect(std.mem.indexOf(u8, dump, "count") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@kv") != null);
 }
 
 test "env.kv.increment: a Result<i64, i64> @kv capability face" {

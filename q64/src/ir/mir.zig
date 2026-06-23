@@ -223,9 +223,10 @@ pub const Op = union(enum) {
     /// `env.fs_read` import with (dest=sp, path ptr, path len), trap on a
     /// negative length, bump `sp`, yield the (dest, len) str value.
     fs_read: struct { path: *Inst },
-    /// `env.kv.increment(delta)` (spec/env.md §`env.kv`): call the
-    /// `env.kv_increment` import with (delta) and yield its i64 result.
-    kv_increment: struct { delta: *Inst },
+    /// `env.kv.increment(key, delta)` (spec/env.md §`env.kv`): call the
+    /// `env.kv_increment` import with (key ptr, key len, delta) and yield its
+    /// i64 result. `key` is a str inst; null for the keyless (empty-key) form.
+    kv_increment: struct { key: ?*Inst, delta: *Inst },
     /// `Vec` v0 floor (spec/types.md §Growable): a fresh empty vec —
     /// a 3-slot {data, len, cap} header in the scope arena, yielding
     /// its base pointer. Lowers to the `__vec_new` helper.

@@ -380,11 +380,12 @@ pub const Expr = union(enum) {
     /// `env.fs.read(path)` — the file's bytes as a str value
     /// (spec/env.md §"Wire ABI: fs.read"). Marks the function `@fs`.
     fs_read: struct { path: *Expr },
-    /// `env.kv.increment(delta)` — atomically add `delta` to the project's
-    /// key-value counter and return the new total, i64 (spec/env.md §`env.kv`,
-    /// `wasi:keyvalue/atomics.increment`). v0 floor: a single host-side counter
-    /// (no key yet). Marks the function `@kv`.
-    kv_increment: struct { delta: *Expr },
+    /// `env.kv.increment(key, delta)` — atomically add `delta` to the counter
+    /// at `key` in the project's key-value store and return the new total, i64
+    /// (spec/env.md §`env.kv`, `wasi:keyvalue/atomics.increment`). `key` is a
+    /// `str`; the keyless `env.kv.increment(delta)` form leaves `key` null (the
+    /// host uses the empty key — a single shared counter). Marks the fn `@kv`.
+    kv_increment: struct { key: ?*Expr, delta: *Expr },
     /// `Vec` v0 floor: a fresh empty vec (header base pointer).
     vec_new,
     /// `v.len` — a live read of the vec's length, i64.

@@ -198,6 +198,7 @@ fn collectExpr(
         },
         .kv_increment => |kv| {
             d.insert(.kv);
+            if (kv.key) |k| try collectExpr(a, k, d, e);
             try collectExpr(a, kv.delta, d, e);
         },
         .vec_new => {},

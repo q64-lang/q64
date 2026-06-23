@@ -154,6 +154,10 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
         },
         .kv_increment => |kv| {
             try app(gpa, out, "kv_increment(", .{});
+            if (kv.key) |k| {
+                try hirExpr(gpa, out, k);
+                try app(gpa, out, ", ", .{});
+            }
             try hirExpr(gpa, out, kv.delta);
             try app(gpa, out, ")", .{});
         },
@@ -364,6 +368,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         },
         .kv_increment => |kv| {
             try app(gpa, out, "kv_increment\n", .{});
+            if (kv.key) |k| try mirInst(gpa, out, k, depth + 1);
             try mirInst(gpa, out, kv.delta, depth + 1);
         },
         .vec_new => try app(gpa, out, "vec_new\n", .{}),
