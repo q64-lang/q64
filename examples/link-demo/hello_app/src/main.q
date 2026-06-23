@@ -6,7 +6,7 @@
 //! Compile + run directly:
 //!
 //!   q64 emit src/main.q /tmp/app.wasm \
-//!     --module dev.q64.hello_world=../hello_world/src
+//!     --module dev.q64.hello_world=../hello_world/src/lib.q
 //!   runtime/wasmtime/zig-out/bin/q64-wasmtime-host /tmp/app.wasm
 //!
 //! Or via the end-to-end smoke test:

@@ -300,9 +300,9 @@ then for each qube's top-level entry file (per its manifest's
 q64 build <entry.q>
   --diagnostics json
   --target <triple-or-name>
-  --module dev.q64.audio=<absolute-path>/dev.q64.audio-0.3.0/src
-  --module com.openai.whisper=<absolute-path>/com.openai.whisper-1.0.2/src
-  --module dev.example.local_dep=/abs/path/to/local-dep/src   # path: deps look identical
+  --module dev.q64.audio=<absolute-path>/dev.q64.audio-0.3.0/src/lib.q
+  --module com.openai.whisper=<absolute-path>/com.openai.whisper-1.0.2/src/lib.q
+  --module dev.example.local_dep=/abs/path/to/local-dep/src/lib.q   # path: deps look identical
   --features fft,mp3                                    # union of activated features
   ...
   --out target/<host>/<qube-name>.wasm

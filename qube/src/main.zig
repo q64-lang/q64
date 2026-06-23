@@ -829,13 +829,45 @@ fn lastDottedSegment(name: []const u8) []const u8 {
     return name;
 }
 
-/// Resolve the manifest's `dependencies` map into `name=dir` strings for
-/// `q64 emit --module`. A local-path dependency resolves to
-/// `<dep-path>/src`, made absolute. A registry dependency (a version-range
-/// string) resolves only through `qube.lock` (spec/qube.lock.md): the
-/// locked sha256 names the extracted cache directory — the build path
-/// never touches the network. Caller owns each returned string and the
-/// list.
+/// Resolve a dependency's entry **source file** from ITS OWN manifest
+/// (`<dep_root>/qube.json5`): the `entry` field, defaulting per type (library →
+/// `src/lib.q`, application → `src/main.q`). The manifest is authoritative — the
+/// consumer reads it, exactly as `package.json`'s `main` / Cargo's `[lib] path`
+/// work — so a library that overrides its entry still links. Returns
+/// `<dep_root>/<entry>` (caller owns). A dependency with no readable manifest
+/// falls back to the library default `src/lib.q`.
+fn depEntryFile(gpa: std.mem.Allocator, io: std.Io, dep_root: []const u8) ![]u8 {
+    const manifest_path = try std.fs.path.join(gpa, &.{ dep_root, "qube.json5" });
+    defer gpa.free(manifest_path);
+
+    var owned_entry: ?[]u8 = null;
+    defer if (owned_entry) |b| gpa.free(b);
+    const entry_rel: []const u8 = blk: {
+        const src = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1 * 1024 * 1024)) catch break :blk resolve.DEFAULT_LIB_ENTRY;
+        defer gpa.free(src);
+        const json = json5ToJson(gpa, src) catch break :blk resolve.DEFAULT_LIB_ENTRY;
+        defer gpa.free(json);
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch break :blk resolve.DEFAULT_LIB_ENTRY;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |o| o,
+            else => break :blk resolve.DEFAULT_LIB_ENTRY,
+        };
+        const is_lib = !std.mem.eql(u8, manifestString(root, "type") orelse "library", "application");
+        // `entryOf` may return a slice into `parsed`; dupe it so it outlives the deinit.
+        owned_entry = try gpa.dupe(u8, resolve.entryOf(manifestString(root, "entry"), is_lib));
+        break :blk owned_entry.?;
+    };
+    return std.fs.path.join(gpa, &.{ dep_root, entry_rel });
+}
+
+/// Resolve the manifest's `dependencies` map into `name=file` strings for
+/// `q64 emit --module`. A local-path dependency resolves to its declared entry
+/// file under `<dep-path>/` (via `depEntryFile`), made absolute. A registry
+/// dependency (a version-range string) resolves only through `qube.lock`
+/// (spec/qube.lock.md): the locked sha256 names the extracted cache directory —
+/// the build path never touches the network — and its entry comes from the
+/// cached manifest the same way. Caller owns each returned string and the list.
 fn resolveModuleSpecs(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -869,10 +901,13 @@ fn resolveModuleSpecs(
                     try printStderr(io, "qube: dependency '{s}' has no `path`; v0 resolves `path` and locked registry deps\n", .{dep_name});
                     return error.UnsupportedDependency;
                 };
-                // Module source dir = <dep>/src, absolute and normalized.
-                const dir = try std.fs.path.resolve(gpa, &.{ project_dir, p, "src" });
-                defer gpa.free(dir);
-                const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, dir });
+                // The dependency's entry file, from ITS manifest (default
+                // src/lib.q), made absolute. The manifest is authoritative.
+                const dep_root = try std.fs.path.resolve(gpa, &.{ project_dir, p });
+                defer gpa.free(dep_root);
+                const entry_file = try depEntryFile(gpa, io, dep_root);
+                defer gpa.free(entry_file);
+                const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, entry_file });
                 try specs.append(gpa, spec);
             },
             .string => |range| {
@@ -913,9 +948,11 @@ fn resolveModuleSpecs(
                     try printStderr(io, "qube: PKG012: locked archive for '{s}@{s}' is not in the cache ({s}); run `qube add {s}@{s}`\n", .{ dep_name, e.version, cache_dir, dep_name, e.version });
                     return error.LockedArchiveMissing;
                 };
-                const dir = try std.fs.path.join(gpa, &.{ cache_dir, "src" });
-                defer gpa.free(dir);
-                const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, dir });
+                // The cached qube's entry file, from its manifest (default
+                // src/lib.q) — the Continuum archive carries its own qube.json5.
+                const entry_file = try depEntryFile(gpa, io, cache_dir);
+                defer gpa.free(entry_file);
+                const spec = try std.fmt.allocPrint(gpa, "{s}={s}", .{ dep_name, entry_file });
                 try specs.append(gpa, spec);
             },
             else => {

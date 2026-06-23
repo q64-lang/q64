@@ -97,7 +97,7 @@ fn usage(io: std.Io) !void {
         \\
         \\Commands:
         \\  check <file> [--diagnostics json]  Parse a single file and emit diagnostics.
-        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--component] [--module name=dir ...]
+        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--component] [--module name=file ...]
         \\                                     Compile a q64 source file to wasm via codegen.
         \\                                     --addr selects the linear-memory address space
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
@@ -106,7 +106,7 @@ fn usage(io: std.Io) !void {
         \\                                     --wit-import <file.wit> declares a foreign import (repeatable).
         \\                                     --export-interface <pkg>/<iface> exports the surface as a named interface.
         \\  emit-hello <out.wasm>              Emit the hello-world wasm module (hardcoded fixture).
-        \\  show <hir|mir|symbols> <file.q> [--module name=dir ...]
+        \\  show <hir|mir|symbols> <file.q> [--module name=file ...]
         \\                                     Dump the Q64 IR (HIR or MIR) for a source file.
         \\  show effects <fn> --qube <file.q>  Print a function's inferred capability effect set.
         \\  show capabilities --qube <file.q>  Print the qube's compiler-derived capability set.
@@ -265,10 +265,12 @@ fn cmdEmitHello(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.I
     try writeFile(io, out_path, bytes);
 }
 
-/// A `--module name=dir` mapping from a dependency's module path to its
-/// source directory. The compiler reads the module's entry (`lib.q`)
-/// from `dir`; it never reads `qube.json5` (spec/q64-cli.md §"--module").
-const ModuleArg = struct { name: []const u8, dir: []const u8 };
+/// A `--module name=file` mapping from a dependency's module path to its entry
+/// **source file**. `qube` resolves the file from the dependency's manifest
+/// `entry` (default `src/lib.q`) before invoking the compiler — so the manifest
+/// is authoritative and the compiler never guesses a filename or reads
+/// `qube.json5` (spec/q64-cli.md §"--module").
+const ModuleArg = struct { name: []const u8, path: []const u8 };
 
 fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, args_it: *std.process.Args.Iterator) !void {
     var src_path: ?[]const u8 = null;
@@ -349,11 +351,11 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
                 var buf: [4096]u8 = undefined;
                 var w = std.Io.File.stderr().writerStreaming(io, &buf);
-                try w.interface.print("q64: --module expects name=dir, got '{s}'\n", .{spec});
+                try w.interface.print("q64: --module expects name=file, got '{s}'\n", .{spec});
                 try w.interface.flush();
                 std.process.exit(2);
             };
-            try module_args.append(gpa, .{ .name = spec[0..eq], .dir = spec[eq + 1 ..] });
+            try module_args.append(gpa, .{ .name = spec[0..eq], .path = spec[eq + 1 ..] });
         } else if (std.mem.startsWith(u8, a, "--")) {
             // Flags q64 emit does not consume in v0 (e.g. --diagnostics)
             // are tolerated and ignored so the qube subprocess contract
@@ -821,10 +823,11 @@ fn writeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
     };
 }
 
-/// Read each dependency module's entry file (`<dir>/lib.q`) into a list of
-/// `ModuleSource`s for the compiler. The caller frees each `.source` and
-/// deinits the list. A read failure is a usage-level error (exit 2). Shared by
-/// `emit` and `show`.
+/// Read each dependency module's entry **file** (`ma.path`, resolved by `qube`
+/// from the dependency's manifest `entry`) into a list of `ModuleSource`s for
+/// the compiler. The compiler does not guess the filename or read `qube.json5` —
+/// `qube` already resolved it. A read failure is a usage-level error (exit 2).
+/// Shared by `emit` and `show`.
 fn readModuleSources(gpa: std.mem.Allocator, io: std.Io, module_args: []const ModuleArg) !std.ArrayList(emit.ModuleSource) {
     var out: std.ArrayList(emit.ModuleSource) = .empty;
     errdefer {
@@ -832,12 +835,10 @@ fn readModuleSources(gpa: std.mem.Allocator, io: std.Io, module_args: []const Mo
         out.deinit(gpa);
     }
     for (module_args) |ma| {
-        const lib_path = try std.fs.path.join(gpa, &.{ ma.dir, "lib.q" });
-        defer gpa.free(lib_path);
-        const lib_src = std.Io.Dir.cwd().readFileAlloc(io, lib_path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+        const lib_src = std.Io.Dir.cwd().readFileAlloc(io, ma.path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
-            try w.interface.print("q64: cannot read module {s} entry {s}: {s}\n", .{ ma.name, lib_path, @errorName(err) });
+            try w.interface.print("q64: cannot read module {s} entry {s}: {s}\n", .{ ma.name, ma.path, @errorName(err) });
             try w.interface.flush();
             std.process.exit(2);
         };
@@ -846,7 +847,7 @@ fn readModuleSources(gpa: std.mem.Allocator, io: std.Io, module_args: []const Mo
     return out;
 }
 
-/// `q64 show <hir|mir> <file.q> [--module name=dir ...]` — dump the Q64 IR
+/// `q64 show <hir|mir> <file.q> [--module name=file ...]` — dump the Q64 IR
 /// (HIR or MIR) for a source file to stdout (spec/q64-cli.md §"show"). The
 /// front matter (parse + import resolution) is shared with `emit`, so `show`
 /// surfaces the same honest diagnostics on a malformed program.
@@ -880,11 +881,11 @@ fn cmdShow(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterat
             const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
                 var buf: [4096]u8 = undefined;
                 var w = std.Io.File.stderr().writerStreaming(io, &buf);
-                try w.interface.print("q64: --module expects name=dir, got '{s}'\n", .{spec});
+                try w.interface.print("q64: --module expects name=file, got '{s}'\n", .{spec});
                 try w.interface.flush();
                 std.process.exit(2);
             };
-            try module_args.append(gpa, .{ .name = spec[0..eq], .dir = spec[eq + 1 ..] });
+            try module_args.append(gpa, .{ .name = spec[0..eq], .path = spec[eq + 1 ..] });
         } else if (std.mem.eql(u8, a, "--wit-import")) {
             try wit_import_paths.append(gpa, args_it.next() orelse {
                 try usage(io);
@@ -1173,7 +1174,7 @@ fn cmdWit(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterato
     }
 }
 
-/// `q64 doc --json [--qube <file.q>] [--module name=dir ...]` — emit the
+/// `q64 doc --json [--qube <file.q>] [--module name=file ...]` — emit the
 /// documentation index as JSON on stdout (spec/q64-cli.md §"doc"). With no
 /// `--qube`, emits the language-level index (keywords, builtin types,
 /// diagnostics). With `--qube`, additionally emits that qube's public surface.

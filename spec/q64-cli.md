@@ -50,7 +50,7 @@ subcommand, it is treated as `q64 run <file>`.
 | `q64 show capabilities <qube>`  | Compiler-derived capability set for `<qube>`'s `pub` surface  |
 | `q64 show denials <fn>`         | Call-graph reachability into `with_capabilities(deny: …)` blocks |
 | `q64 show world <qube> [--out <file.wit>]` | Synthesized WIT world for `<qube>`: exports (public surface) and imports (derived capability set + any imported remote worlds). The component-emission counterpart of `show capabilities`. Output is a valid standalone WIT document — a `package q64:<world>;` declaration plus the `world` block (component-model labels are kebab-cased from q64's snake_case). With `--out`, the document is written to `<file.wit>` instead of stdout. See [`modules.md` §"The qube as a component"](./modules.md). |
-| `q64 show hir <file.q>`         | Text dump of the **HIR** (Semantic QIR) for `<file.q>` — the name-resolved, desugared tier. Takes the same `--module name=dir` flags as `emit`. Compiler-introspection: the dump format is for humans/tests, not a stable serialization. See [`ARCHITECTURE.md` §ir](../ARCHITECTURE.md). |
+| `q64 show hir <file.q>`         | Text dump of the **HIR** (Semantic QIR) for `<file.q>` — the name-resolved, desugared tier. Takes the same `--module name=file` flags as `emit`. Compiler-introspection: the dump format is for humans/tests, not a stable serialization. See [`ARCHITECTURE.md` §ir](../ARCHITECTURE.md). |
 | `q64 show mir <file.q>`         | Text dump of the **MIR** (Executable QIR) — the ABI-lowered tier a backend consumes (`str` = `(ptr,len)`, structured control flow, the static memory image). Same `--module` flags. Compiler-introspection (unstable format). |
 | `q64 show symbols <file.q>`     | The sema pass's file-level symbol table: one line per top-level item and per import binding (kind, name, visibility, import origin), plus recorded name collisions and the body-resolution result (unresolved path heads per function). `fit` declarations are listed but are not name bindings. Compiler-introspection (unstable format); see `q64/src/sema/README.md`. |
 
@@ -58,7 +58,7 @@ The source qube is given positionally for `hir`/`mir`/`symbols` (`q64 show hir
 <file.q>`) and via `--qube <file.q>` for the kinds whose positional argument is
 a subject — a function, expression, type, or stage (`q64 show effects main
 --qube app.q`). The qube-level kinds (`capabilities`, `world`, `modules`) take
-only `--qube <file.q>`. All forms accept the same `--module name=dir` flags as
+only `--qube <file.q>`. All forms accept the same `--module name=file` flags as
 `emit`.
 
 **Implemented today:** `hir`, `mir`, `effects`, `capabilities`, `world` — the
@@ -128,7 +128,7 @@ package-level wrapper.
 | `--export-interface <pkg>/<iface>` | Export this library's scalar surface as a **named WIT interface** (e.g. `acme:mathlib/math`) instead of bare top-level functions — the export-mirror of `--wit-import`. The core is emitted with `<iface>#<fn>` export names and lifted via `wasm-tools component embed`+`new`. So a q64 consumer that `--wit-import`s the same interface can be `wac`-linked against this provider. `qube build` passes `<wit.package>/<wit.interface>` when the manifest sets `wit.interface`. |
 | `--target <name>`                 | Target name to compile for (resolves via the qube manifest if present)    |
 | `--addr <wasm32\|wasm64>`         | Address space to compile for. **Required** — there is no default: `q64` errors with a diagnostic if neither `--addr` nor a `--target` that fixes an `addressSpace` is given. `wasm32` = 32-bit (`i32` pointers, WebKit/iPad baseline); `wasm64` = 64-bit (Memory64 + Table64, `i64` pointers). See [`memory.md` §"The platform"](./memory.md). |
-| `--module <name>=<path>`          | Map a module name to a source directory. Repeatable. Set by `qube`. Paths are always absolute (also for local-path dependencies, which `qube` resolves to filesystem paths before invocation). |
+| `--module <name>=<path>`          | Map a module name to its entry **source file**. Repeatable. Set by `qube`, which resolves the file from the dependency's manifest `entry` (default `src/lib.q`) — the compiler reads exactly this file and never guesses a filename or reads `qube.json5`. Paths are always absolute (also for local-path dependencies, which `qube` resolves before invocation). |
 | `--features <comma-list>`         | Feature flags active in this build, e.g. `--features fft,mp3`. Repeatable; the union of all `--features` flags is the active set. `qube build` derives this from the manifest's `dependencies[].features` and `default-features` per-dependency rules. |
 | `--no-color`                      | Disable ANSI color in text diagnostics                                    |
 | `--quiet` / `-q`                  | Suppress non-error output                                                 |
@@ -142,9 +142,9 @@ compiler. `qube build` invokes:
 ```
 q64 build src/main.q
   --addr wasm32
-  --module dev.q64.audio=/home/user/.qube/cache/dev.q64.audio-0.3.0/src
-  --module dev.q64.ai=/home/user/.qube/cache/dev.q64.ai-0.3.0/src
-  --module com.openai.whisper=/home/user/.qube/cache/com.openai.whisper-1.0.2/src
+  --module dev.q64.audio=/home/user/.qube/cache/dev.q64.audio-0.3.0/src/lib.q
+  --module dev.q64.ai=/home/user/.qube/cache/dev.q64.ai-0.3.0/src/lib.q
+  --module com.openai.whisper=/home/user/.qube/cache/com.openai.whisper-1.0.2/src/lib.q
   --diagnostics json
   --out target/debug/wasm32/main.wasm
 ```

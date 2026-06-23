@@ -4,7 +4,7 @@
 # End-to-end smoke test for cross-qube linking (todo.md "linking ladder"):
 #
 #   examples/link-demo/hello_app/src/main.q
-#     -> q64 emit --module dev.q64.hello_world=<lib>/src   (resolve + emit version())
+#     -> q64 emit --module dev.q64.hello_world=<lib>/src/lib.q   (resolve + emit version())
 #     -> app.wasm
 #     -> q64-wasmtime-host                                  (runtime adapter)
 #     -> stdout == "0.1.0"
@@ -55,8 +55,8 @@ if "$Q64_BIN" emit "$APP" "$wasm" 2>/dev/null; then
 fi
 echo "    ok: errored as expected"
 
-echo "==> q64 emit --module dev.q64.hello_world=$LIB_SRC"
-"$Q64_BIN" emit "$APP" "$wasm" --module "dev.q64.hello_world=$LIB_SRC"
+echo "==> q64 emit --module dev.q64.hello_world=$LIB_SRC/lib.q"
+"$Q64_BIN" emit "$APP" "$wasm" --module "dev.q64.hello_world=$LIB_SRC/lib.q"
 
 if [[ ! -s "$wasm" ]]; then
     echo "FAIL: emit produced an empty file" >&2
@@ -99,7 +99,7 @@ fn main {
     env.out("q64 v{version()} ok")
 }
 Q64
-"$Q64_BIN" emit "$concat_app" "$concat_wasm" --module "dev.q64.hello_world=$LIB_SRC"
+"$Q64_BIN" emit "$concat_app" "$concat_wasm" --module "dev.q64.hello_world=$LIB_SRC/lib.q"
 concat_out="$("$HOST_BIN" "$concat_wasm")"
 concat_expected="q64 v0.1.0 ok"
 if [[ "$concat_out" != "$concat_expected" ]]; then
@@ -125,7 +125,7 @@ fn main {
     env.out(id("passed"))
 }
 Q64
-"$Q64_BIN" emit "$param_app" "$param_wasm" --module "dev.q64.strlib=$param_lib"
+"$Q64_BIN" emit "$param_app" "$param_wasm" --module "dev.q64.strlib=$param_lib/lib.q"
 param_out="$("$HOST_BIN" "$param_wasm")"
 if [[ "$param_out" != "passed" ]]; then
     echo "FAIL: param output mismatch" >&2
@@ -148,7 +148,7 @@ fn main {
     env.out(shout("loud"))
 }
 Q64
-"$Q64_BIN" emit "$shout_app" "$shout_wasm" --module "dev.q64.strlib=$param_lib"
+"$Q64_BIN" emit "$shout_app" "$shout_wasm" --module "dev.q64.strlib=$param_lib/lib.q"
 shout_out="$("$HOST_BIN" "$shout_wasm")"
 if [[ "$shout_out" != "loud!" ]]; then
     echo "FAIL: param-transform output mismatch" >&2
@@ -174,7 +174,7 @@ fn main {
     env.out(shout(vshout()))
 }
 Q64
-"$Q64_BIN" emit "$multi_app" "$multi_wasm" --module "dev.q64.strlib=$param_lib"
+"$Q64_BIN" emit "$multi_app" "$multi_wasm" --module "dev.q64.strlib=$param_lib/lib.q"
 multi_out="$("$HOST_BIN" "$multi_wasm")"
 multi_expected=$'a-b\n0.1.0!'
 if [[ "$multi_out" != "$multi_expected" ]]; then
@@ -200,7 +200,7 @@ fn main {
     env.out(name)
 }
 Q64
-"$Q64_BIN" emit "$bind_app" "$bind_wasm" --module "dev.q64.strlib=$param_lib"
+"$Q64_BIN" emit "$bind_app" "$bind_wasm" --module "dev.q64.strlib=$param_lib/lib.q"
 bind_out="$("$HOST_BIN" "$bind_wasm")"
 bind_expected=$'Hello, world! (q64 v0.1.0)\nworld'
 if [[ "$bind_out" != "$bind_expected" ]]; then
@@ -225,7 +225,7 @@ fn main {
     env.out("got: {g} and {g}")
 }
 Q64
-"$Q64_BIN" emit "$rt_app" "$rt_wasm" --module "dev.q64.strlib=$param_lib"
+"$Q64_BIN" emit "$rt_app" "$rt_wasm" --module "dev.q64.strlib=$param_lib/lib.q"
 rt_out="$("$HOST_BIN" "$rt_wasm")"
 rt_expected=$'hi!\ngot: hi! and hi!'
 if [[ "$rt_out" != "$rt_expected" ]]; then
@@ -252,7 +252,7 @@ fn main {
     env.out("nested: {w}")
 }
 Q64
-"$Q64_BIN" emit "$arg_app" "$arg_wasm" --module "dev.q64.strlib=$param_lib"
+"$Q64_BIN" emit "$arg_app" "$arg_wasm" --module "dev.q64.strlib=$param_lib/lib.q"
 arg_out="$("$HOST_BIN" "$arg_wasm")"
 arg_expected=$'[hi!]\nnested: [hi!]'
 if [[ "$arg_out" != "$arg_expected" ]]; then
@@ -311,7 +311,7 @@ fn main {
     env.out("{g}: a={a}, b={b}")
 }
 Q64
-"$Q64_BIN" emit "$intfn_app" "$intfn_wasm" --module "dev.q64.intlib=$intfn_lib"
+"$Q64_BIN" emit "$intfn_app" "$intfn_wasm" --module "dev.q64.intlib=$intfn_lib/lib.q"
 intfn_out="$("$HOST_BIN" "$intfn_wasm")"
 intfn_expected=$'42\n1234567\n-7\n50\nhi!: a=42, b=50'
 if [[ "$intfn_out" != "$intfn_expected" ]]; then
@@ -339,7 +339,7 @@ fn main {
     env.out("{g}: a={a}, b={b}")
 }
 Q64
-"$Q64_BIN" emit "$ib_app" "$ib_wasm" --module "dev.q64.intlib=$intfn_lib"
+"$Q64_BIN" emit "$ib_app" "$ib_wasm" --module "dev.q64.intlib=$intfn_lib/lib.q"
 ib_out="$("$HOST_BIN" "$ib_wasm")"
 ib_expected=$'50\nhi!: a=42, b=50'
 if [[ "$ib_out" != "$ib_expected" ]]; then
@@ -376,7 +376,7 @@ fn main {
     env.out("max={m}, clamped={c}")
 }
 Q64
-"$Q64_BIN" emit "$cf_app" "$cf_wasm" --module "dev.q64.cflib=$cf_lib"
+"$Q64_BIN" emit "$cf_app" "$cf_wasm" --module "dev.q64.cflib=$cf_lib/lib.q"
 cf_out="$("$HOST_BIN" "$cf_wasm")"
 cf_expected=$'9\n-1\n13\nmax=10, clamped=7'
 if [[ "$cf_out" != "$cf_expected" ]]; then
@@ -413,7 +413,7 @@ fn main {
     env.out("sum_to(100)={s}")
 }
 Q64
-"$Q64_BIN" emit "$it_app" "$it_wasm" --module "dev.q64.itlib=$it_lib"
+"$Q64_BIN" emit "$it_app" "$it_wasm" --module "dev.q64.itlib=$it_lib/lib.q"
 it_out="$("$HOST_BIN" "$it_wasm")"
 it_expected=$'55\n120\n12\nsum_to(100)=5050'
 if [[ "$it_out" != "$it_expected" ]]; then
@@ -451,7 +451,7 @@ fn main {
     env.out(hyp_sq(3, 4))
 }
 Q64
-"$Q64_BIN" emit "$rc_app" "$rc_wasm" --module "dev.q64.rclib=$rc_lib"
+"$Q64_BIN" emit "$rc_app" "$rc_wasm" --module "dev.q64.rclib=$rc_lib/lib.q"
 rc_out="$("$HOST_BIN" "$rc_wasm")"
 rc_expected=$'720\n55\n12\n25'
 if [[ "$rc_out" != "$rc_expected" ]]; then
@@ -491,7 +491,7 @@ fn main {
     env.out("count_to_sum(10)={c}")
 }
 Q64
-"$Q64_BIN" emit "$flow_app" "$flow_wasm" --module "dev.q64.flowlib=$flow_lib"
+"$Q64_BIN" emit "$flow_app" "$flow_wasm" --module "dev.q64.flowlib=$flow_lib/lib.q"
 flow_out="$("$HOST_BIN" "$flow_wasm")"
 flow_expected=$'3\n7\n1\n0\n25\ncount_to_sum(10)=4'
 if [[ "$flow_out" != "$flow_expected" ]]; then
@@ -509,7 +509,7 @@ echo "    ok: break/continue/return/loop -> 3 / 7 / 1 / 0 / 25 / count_to_sum(10
 # address-space-agnostic env.out (i32 ptr/len introspected from the import).
 # This is the same `intfn` program exercised above on wasm64 — same output.
 echo "==> wasm32: full string ABI (str calls, int format, concat, bindings)"
-"$Q64_BIN" emit "$intfn_app" "$tmp/intfn32.wasm" --addr wasm32 --module "dev.q64.intlib=$intfn_lib"
+"$Q64_BIN" emit "$intfn_app" "$tmp/intfn32.wasm" --addr wasm32 --module "dev.q64.intlib=$intfn_lib/lib.q"
 w32_out="$("$HOST_BIN" "$tmp/intfn32.wasm")"
 if [[ "$w32_out" != "$intfn_expected" ]]; then
     echo "FAIL: wasm32 string-ABI output mismatch" >&2
