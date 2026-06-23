@@ -13,6 +13,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const resolve = @import("resolve.zig");
+
+test {
+    // Pull resolve.zig's tests into `zig build test` (the shared resolution core).
+    _ = resolve;
+}
 
 const version_string = "qube 0.0.1 (pre-alpha)";
 
@@ -982,7 +988,7 @@ fn cmdRun(
     }
 
     // Resolve entry; default per spec is src/main.q for applications.
-    const entry_rel = manifestString(root, "entry") orelse "src/main.q";
+    const entry_rel = resolve.entryOf(manifestString(root, "entry"), false);
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
 
@@ -1139,7 +1145,7 @@ fn cmdBuild(
     // A library defaults its entry to src/lib.q; an application to src/main.q.
     const type_str = manifestString(root, "type");
     const is_lib = if (type_str) |t| std.mem.eql(u8, t, "library") else false;
-    const entry_rel = manifestString(root, "entry") orelse if (is_lib) "src/lib.q" else "src/main.q";
+    const entry_rel = resolve.entryOf(manifestString(root, "entry"), is_lib);
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
 
@@ -1558,8 +1564,7 @@ fn buildWorldInvocation(
         std.process.exit(@intFromEnum(ExitCode.input));
     };
     const type_str = manifestString(m.root, "type") orelse "library";
-    const entry_rel = manifestString(m.root, "entry") orelse
-        (if (std.mem.eql(u8, type_str, "application")) "src/main.q" else "src/lib.q");
+    const entry_rel = resolve.entryOf(manifestString(m.root, "entry"), !std.mem.eql(u8, type_str, "application"));
     const entry = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     errdefer gpa.free(entry);
 
@@ -2007,7 +2012,7 @@ fn cmdWeb(
         std.process.exit(@intFromEnum(ExitCode.usage));
     }
 
-    const entry_rel = manifestString(root, "entry") orelse "src/main.q";
+    const entry_rel = resolve.entryOf(manifestString(root, "entry"), false);
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
 
@@ -2695,8 +2700,7 @@ fn syncManifestCapabilities(
     defer gpa.free(q64_bin);
 
     const type_str = manifestString(m.root, "type") orelse "library";
-    const entry_rel = manifestString(m.root, "entry") orelse
-        (if (std.mem.eql(u8, type_str, "application")) "src/main.q" else "src/lib.q");
+    const entry_rel = resolve.entryOf(manifestString(m.root, "entry"), !std.mem.eql(u8, type_str, "application"));
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
 
@@ -2784,8 +2788,7 @@ fn synthesizeWitWorld(
     defer gpa.free(q64_bin);
 
     const type_str = manifestString(m.root, "type") orelse "library";
-    const entry_rel = manifestString(m.root, "entry") orelse
-        (if (std.mem.eql(u8, type_str, "application")) "src/main.q" else "src/lib.q");
+    const entry_rel = resolve.entryOf(manifestString(m.root, "entry"), !std.mem.eql(u8, type_str, "application"));
     const entry_path = try std.fs.path.join(gpa, &.{ project_dir, entry_rel });
     defer gpa.free(entry_path);
 
