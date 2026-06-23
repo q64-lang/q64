@@ -6643,13 +6643,23 @@ fn tryChannelSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*h
     const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return null;
     if (!std.mem.eql(u8, cname[dot + 1 ..], "send")) return null;
     const head = cname[0..dot];
-    if (!scope.chans.contains(head)) return null;
+    const is_chan = scope.chans.contains(head);
     const loc = scope.find(head) orelse return null;
+    // A sender *value* (a plain i64 local holding a channel-buffer pointer — a
+    // `Vec<Sender>` element or a moved sender) also supports `.send`: narrow it
+    // back to the buffer pointer. Only an i64 local qualifies.
+    if (!is_chan and loc.ty != .i64) return null;
     var ait = call.args();
     const a0 = ait.next() orelse return error.Unsupported;
     if (ait.next() != null) return error.Unsupported; // v0: one value per send
     const vref = try b.a.create(hir.Expr);
-    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    if (is_chan) {
+        vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    } else {
+        const lref = try b.a.create(hir.Expr);
+        lref.* = .{ .local = .{ .idx = loc.idx, .ty = .i64 } };
+        vref.* = .{ .num_cast = .{ .to = .ptr, .value = lref } };
+    }
     const elem = scope.chan_elem.get(head);
     // A record or enum channel passes the payload by pointer: the value already
     // lives in an arena (records are boxed, enums are tag+payload boxes), so its
@@ -8408,6 +8418,17 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             // Closure inlining (slice 3b): a lambda parameter resolves to the
             // argument expression substituted at the inlined call site.
             if (scope.subst.get(txt)) |se| return se;
+            // A Sender/Receiver in value position is its channel-buffer pointer,
+            // widened to i64 — so it can be pushed into a `Vec<Sender>`, moved,
+            // or carried as a message payload. (`.send`/`.recv` keep their own
+            // forms; this is the bare-name use.) The buffer local is `.ptr`.
+            if (std.mem.indexOfScalar(u8, txt, '.') == null and scope.chans.contains(txt)) {
+                const loc = scope.find(txt) orelse return error.Unsupported;
+                const lref = try b.a.create(hir.Expr);
+                lref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                out.* = .{ .num_cast = .{ .to = .i64, .value = lref } };
+                return out;
+            }
             // `s.len` parses as the dotted path "s.len" (like `qview.set_attr`),
             // not a FieldExpr. If the prefix names a `str` local, it's the i64
             // byte-length read. (`loc.idx` is the ptr slot, `+1` the len slot.)
@@ -13043,6 +13064,31 @@ test "str params: a second str param reads its own wasm slots (2, 3)" {
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "str_binding[2,3]") != null);
+}
+
+test "channels v0: a Sender pushed into a Vec, fanned out via the element's .send" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A Sender used as a value is its channel-buffer pointer (i64), so it pushes
+    // into a Vec and `s.send(n)` on a vec element narrows back to the buffer.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    var subs = Vec.new()
+        \\    let (tx, rx) = channel<i64>(policy: Unbounded)
+        \\    subs.push(tx)
+        \\    for s in subs { s.send(7) }
+        \\    let v = rx.recv()
+        \\    env.out(v)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The sender value is the buffer pointer widened to i64 and pushed
+    // (`<- i64(...)`); `.send` on the vec element narrows it back (`ptr(...)`).
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "ptr(") != null);
 }
 
 test "Vec.new: an empty growable filled at runtime, then iterated" {
