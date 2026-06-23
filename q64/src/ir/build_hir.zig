@@ -3466,6 +3466,24 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
         // own — the value-callee statement builder handles them identically.
         .let_stmt, .assign_stmt, .break_stmt, .continue_stmt => try out.append(b.a, try buildIntStmt(b, stmt, scope)),
         .scope_stmt => |ss| try buildVoidScopeStmt(b, ss, scope, out),
+        .for_stmt => |fs| {
+            // `for x in lo..hi { … }` / `for s in state.subs { … }` inside a
+            // handler. The for-builders use `scope.callee` to build the body via
+            // buildVoidStmt; rt is unused on that path, so an empty map suffices.
+            var rt: RtMap = .empty;
+            const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            const iter = fs.iterable() orelse return error.Unsupported;
+            if (iter == .range) {
+                try buildForRange(b, fs, iter.range, pat.text, scope, &rt, out);
+                return;
+            }
+            const iname = switch (iter) {
+                .path => |p| try p.text(b.a),
+                else => return error.Unsupported,
+            };
+            defer b.a.free(iname);
+            try buildForVec(b, fs, iname, pat.text, scope, &rt, out);
+        },
         else => return error.Unsupported,
     }
 }
@@ -5106,6 +5124,21 @@ fn isVecType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!bool {
     }
 }
 
+/// A `Sender<…>` / `Receiver<…>` / `Vec<…>` type — all carried as an i64 value
+/// (a buffer / header pointer). A handler param of one of these is accepted as
+/// i64 (a sender value), so `handle Join(tx: Sender<…>)` compiles.
+fn isEndpointOrVecType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!bool {
+    const te = te_opt orelse return false;
+    switch (te) {
+        .path => |pt| {
+            const nm = try pt.name(b.a);
+            defer b.a.free(nm);
+            return std.mem.eql(u8, nm, "Sender") or std.mem.eql(u8, nm, "Receiver") or std.mem.eql(u8, nm, "Vec");
+        },
+        else => return false,
+    }
+}
+
 fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInfo {
     const te = te_opt orelse return null;
     switch (te) {
@@ -5532,11 +5565,13 @@ fn registerActorHandler(b: *Builder, si: *const StructInfo, mname: []const u8) B
     if (handle.params()) |ps| {
         var pit = ps.iter();
         while (pit.next()) |p| {
-            const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
-            const pty: hir.Type = switch (psc) {
+            const pty: hir.Type = if (try paramScalar(b, p)) |psc| switch (psc) {
                 .bool, .i64, .f64, .f32 => psc,
                 else => return error.Unsupported,
-            };
+            } else if (try isEndpointOrVecType(b, p.type_()))
+                .i64 // a Sender/Receiver/Vec param is an i64 value (a pointer)
+            else
+                return error.Unsupported;
             const pn = (p.name() orelse return error.Unsupported).text;
             _ = try scope.declare(pn, false, pty);
             try params.append(b.a, .{ .name = pn, .ty = pty });
@@ -7147,8 +7182,23 @@ fn tryVecReduce(b: *Builder, init_expr: ast.Expr, dname: []const u8, mutable: bo
 /// `for x in v { … }` over a vec binding: an index loop reading the
 /// live length each test (`while i < vec_len(v) { x = v[i]; …; i += 1 }`),
 /// so a body that pushes still terminates against the grown bound.
+/// A fresh vec-header-pointer expr for a for-loop source: a local vec binding
+/// (`vloc_idx`) or a `Vec` actor-state field (`state_rf`, the i64 cell narrowed).
+fn forVecRef(b: *Builder, vloc_idx: ?u32, state_rf: ?RecField) BuildError!*hir.Expr {
+    if (vloc_idx) |idx| {
+        const v = try b.a.create(hir.Expr);
+        v.* = .{ .local = .{ .idx = idx, .ty = .ptr } };
+        return v;
+    }
+    return vecStateRef(b, state_rf.?);
+}
+
 fn buildForVec(b: *Builder, fs: ast.ForStmt, vname: []const u8, xname: []const u8, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
-    const vloc = scope.find(vname) orelse return error.Unsupported;
+    // The source is a local vec binding or a `Vec` actor-state field (the latter
+    // iterated inside a handler — `for tx in state.subs { … }`).
+    const vloc_idx: ?u32 = if (scope.vecs.contains(vname)) (scope.find(vname) orelse return error.Unsupported).idx else null;
+    const state_rf: ?RecField = if (vloc_idx == null) (try vecStateField(b, scope, vname)) else null;
+    if (vloc_idx == null and state_rf == null) return error.Unsupported;
     const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{xname});
     const i_idx = try declareBodyLocal(b, scope, hidden, true, .i64);
     const x_idx = try declareBodyLocal(b, scope, xname, false, .i64);
@@ -7163,18 +7213,18 @@ fn buildForVec(b: *Builder, fs: ast.ForStmt, vname: []const u8, xname: []const u
     // body: x = v[i]; <source body>; i = i + 1
     var items: std.ArrayList(*hir.Stmt) = .empty;
     {
-        const vref = try b.a.create(hir.Expr);
-        vref.* = .{ .local = .{ .idx = vloc.idx, .ty = .ptr } };
         const iref = try b.a.create(hir.Expr);
         iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
         const get = try b.a.create(hir.Expr);
-        get.* = .{ .vec_get = .{ .vec = vref, .idx = iref } };
+        get.* = .{ .vec_get = .{ .vec = try forVecRef(b, vloc_idx, state_rf), .idx = iref } };
         const setx = try b.a.create(hir.Stmt);
         setx.* = .{ .assign = .{ .idx = x_idx, .value = get } };
         try items.append(b.a, setx);
     }
     var bit = (fs.body() orelse return error.Unsupported).statements();
-    while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, &items);
+    while (bit.next()) |bstmt| {
+        if (scope.callee) try buildVoidStmt(b, bstmt, scope, &items) else try buildMainStmt(b, bstmt, scope, rt, &items);
+    }
     {
         const iref = try b.a.create(hir.Expr);
         iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
@@ -7191,10 +7241,8 @@ fn buildForVec(b: *Builder, fs: ast.ForStmt, vname: []const u8, xname: []const u
     // while i < v.len (read live)
     const iref2 = try b.a.create(hir.Expr);
     iref2.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
-    const vref2 = try b.a.create(hir.Expr);
-    vref2.* = .{ .local = .{ .idx = vloc.idx, .ty = .ptr } };
     const lenx = try b.a.create(hir.Expr);
-    lenx.* = .{ .vec_len = .{ .vec = vref2 } };
+    lenx.* = .{ .vec_len = .{ .vec = try forVecRef(b, vloc_idx, state_rf) } };
     const cond = try b.a.create(hir.Expr);
     cond.* = .{ .bin = .{ .kind = .lt, .lhs = iref2, .rhs = lenx } };
     const st = try b.a.create(hir.Stmt);
@@ -7224,7 +7272,9 @@ fn buildForRange(b: *Builder, fs: ast.ForStmt, range: ast.RangeExpr, xname: []co
     // body: <source body>; i = i + 1
     var items: std.ArrayList(*hir.Stmt) = .empty;
     var bit = (fs.body() orelse return error.Unsupported).statements();
-    while (bit.next()) |bstmt| try buildMainStmt(b, bstmt, scope, rt, &items);
+    while (bit.next()) |bstmt| {
+        if (scope.callee) try buildVoidStmt(b, bstmt, scope, &items) else try buildMainStmt(b, bstmt, scope, rt, &items);
+    }
     {
         const iref = try b.a.create(hir.Expr);
         iref.* = .{ .local = .{ .idx = i_idx, .ty = .i64 } };
@@ -10080,6 +10130,37 @@ test "graph v0: a named pipeline runs eagerly; terminal stage is the output" {
     defer testing.allocator.free(dump);
     // The graph lowers to a function returning its terminal binding.
     try testing.expect(std.mem.indexOf(u8, dump, "fn pipeline -> i64") != null);
+}
+
+test "actors v0: the live fan-out — Vec<Sender> state, Join pushes, Bump broadcasts" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // The twin's pattern: an actor holds a subscriber set in a `Vec` state field,
+    // a Sender-typed handler pushes into it, and another iterates it to fan out.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor Twin {
+        \\    state subs: Vec<i64> = Vec.new()
+        \\    handle Join(tx: Sender<i64, Unbounded>) { state.subs.push(tx) }
+        \\    handle Bump { for s in state.subs { s.send(99) } }
+        \\}
+        \\fn main {
+        \\    let t = Twin.spawn()
+        \\    let (tx, rx) = channel<i64>(policy: Unbounded)
+        \\    t.tell(Join(move tx))
+        \\    t.tell(Bump)
+        \\    let v = rx.recv()
+        \\    env.out(v)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Join pushes the sender value into the state Vec; Bump iterates it and sends.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Twin.Join -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "fn Twin.Bump -> void") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
 }
 
 test "actors v0: Actor.spawn() instantiates the default state record" {
