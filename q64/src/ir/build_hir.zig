@@ -3537,6 +3537,11 @@ fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.Array
         try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
         return;
     }
+    // `v.push(x)` — a vec binding or a `Vec` actor-state field (`state.subs.push`).
+    if (try tryVecPush(b, call, scope)) |st| {
+        try out.append(b.a, st);
+        return;
+    }
     // `ch.send(x)` on a channel binding (vec_push), and `c.bump()` — an actor
     // void handler (tell) — both dispatch on a record/channel binding.
     if (try tryChannelSend(b, call, scope)) |st| {
@@ -5049,7 +5054,11 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
                     ok = false;
                     break;
                 };
-                const fty = (try semaScalar(b, s.type_())) orelse {
+                const fty: hir.Type = if (try semaScalar(b, s.type_())) |sc|
+                    sc
+                else if (try isVecType(b, s.type_()))
+                    .i64 // a Vec field is an i64 cell holding the header pointer
+                else {
                     ok = false;
                     break;
                 };
@@ -5082,6 +5091,21 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
 
 /// The registered struct a type annotation names, if any. Generic paths and
 /// non-path types are not records on the v0 floor.
+/// Is `te` a `Vec<…>` type? A `Vec` actor-state field is stored as an i64 cell
+/// holding the vec header pointer (widened) — the same representation a Sender
+/// value uses — so `state.<vec>` reuses the i64 Vec machinery.
+fn isVecType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!bool {
+    const te = te_opt orelse return false;
+    switch (te) {
+        .path => |pt| {
+            const nm = try pt.name(b.a);
+            defer b.a.free(nm);
+            return std.mem.eql(u8, nm, "Vec");
+        },
+        else => return false,
+    }
+}
+
 fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInfo {
     const te = te_opt orelse return null;
     switch (te) {
@@ -6474,6 +6498,23 @@ fn genericRecCall(b: *Builder, cc: ast.CallExpr, scope: *Scope) BuildError!?RecV
 /// run synchronously, sharing it), so `spawn()` builds the same default record
 /// as `Actor {}` and binds its base pointer — registering `c` in `scope.recs`
 /// so `c.tell` / `c.ask` dispatch. Returns false when the init isn't the form.
+/// The i64 cell value for a `Vec<T>` actor-state field default — a fresh empty
+/// vec header (`Vec.new()`) widened to i64. (`Vec.from(...)` defaults: later.)
+fn vecFieldDefault(b: *Builder, dval: ast.Expr) BuildError!*hir.Expr {
+    const cc = switch (dval) {
+        .call => |x| x,
+        else => return error.Unsupported,
+    };
+    const cn = (callPathName(b, cc)) orelse return error.Unsupported;
+    defer b.a.free(cn);
+    if (!std.mem.eql(u8, cn, "Vec.new")) return error.Unsupported; // only the empty default for now
+    const nv = try b.a.create(hir.Expr);
+    nv.* = .vec_new;
+    const widened = try b.a.create(hir.Expr);
+    widened.* = .{ .num_cast = .{ .to = .i64, .value = nv } };
+    return widened;
+}
+
 fn tryActorSpawn(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
     const cc = switch (init_expr) {
         .call => |x| x,
@@ -6496,7 +6537,10 @@ fn tryActorSpawn(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: boo
         const sname = (s.name() orelse return error.Unsupported).text;
         const f = si.field(sname) orelse return error.Unsupported;
         const dval = s.value() orelse return error.Unsupported; // no default → must use `Actor {}`
-        if (narrowRange(f.ty) != null) {
+        if (try isVecType(b, s.type_())) {
+            // `subs: Vec<T> = Vec.new()` — a fresh vec header, widened to i64.
+            try inits.append(b.a, .{ .offset = f.offset, .ty = .i64, .value = try vecFieldDefault(b, dval) });
+        } else if (narrowRange(f.ty) != null) {
             try inits.append(b.a, .{ .offset = f.offset, .ty = f.ty, .value = try buildNarrowValue(b, f.ty, dval) });
         } else {
             if (scalarBindTy(try exprScalar(b, dval, scope)) != f.ty) return error.Unsupported;
@@ -7322,18 +7366,50 @@ fn buildIntForVec(b: *Builder, fs: ast.ForStmt, vname: []const u8, xname: []cons
 }
 
 /// A statement-position `v.push(x)` on a vec binding, or null.
+/// `state.<field>` / bare `<field>` naming a `Vec` actor-state field → its i64
+/// field info (the cell holds the vec header pointer); null otherwise.
+fn vecStateField(b: *Builder, scope: *Scope, txt: []const u8) BuildError!?RecField {
+    const si = scope.self_actor orelse return null;
+    const fname = if (std.mem.startsWith(u8, txt, "state.")) txt["state.".len..] else txt;
+    if (std.mem.indexOfScalar(u8, fname, '.') != null) return null;
+    const ad = b.actor_decls.get(si.name) orelse return null;
+    var sit = ad.states();
+    const is_vec = while (sit.next()) |s| {
+        const sn = (s.name() orelse continue).text;
+        if (std.mem.eql(u8, sn, fname)) break (try isVecType(b, s.type_()));
+    } else false;
+    if (!is_vec) return null;
+    return actorStateField(scope, fname);
+}
+
+/// The vec header pointer for a `Vec` actor-state field — the i64 cell narrowed.
+fn vecStateRef(b: *Builder, rf: RecField) BuildError!*hir.Expr {
+    const load = try recFieldExpr(b, rf); // i64 load of the cell
+    const ptr = try b.a.create(hir.Expr);
+    ptr.* = .{ .num_cast = .{ .to = .ptr, .value = load } };
+    return ptr;
+}
+
 fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
     const cname = (callPathName(b, call)) orelse return null;
     defer b.a.free(cname);
     const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return null;
     if (!std.mem.eql(u8, cname[dot + 1 ..], "push")) return null;
-    if (!scope.vecs.contains(cname[0..dot])) return null;
-    const loc = scope.find(cname[0..dot]) orelse return null;
+    const head = cname[0..dot];
+    // A local vec binding, or a `Vec` actor-state field (`state.subs.push(…)`):
+    // the latter loads the i64 cell and narrows it to the buffer pointer.
+    const vref = if (scope.vecs.contains(head)) blk: {
+        const loc = scope.find(head) orelse return null;
+        const v = try b.a.create(hir.Expr);
+        v.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+        break :blk v;
+    } else if (try vecStateField(b, scope, head)) |rf|
+        try vecStateRef(b, rf)
+    else
+        return null;
     var ait = call.args();
     const arg = ait.next() orelse return error.Unsupported;
     if (ait.next() != null) return error.Unsupported;
-    const vref = try b.a.create(hir.Expr);
-    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .vec_push = .{ .vec = vref, .value = try buildIntExpr(b, arg, scope) } };
     return st;
