@@ -37,3 +37,9 @@ dist/
 /q64/.zig-cache/
 /runtime/wasmtime/zig-out/
 /runtime/wasmtime/.zig-cache/
+
+# qube build outputs (q64 emit / qube build); the tracked hello target/web host stays tracked
+examples/*/target/debug/
+examples/*/target/release/
+examples/*/target/wasm32/
+examples/*/target/wasm64/
