@@ -8306,6 +8306,13 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
                 const base = try b.a.create(hir.Expr);
                 base.* = .{ .local = .{ .idx = rf.base_idx, .ty = .ptr } };
                 out.* = .{ .field_set = .{ .base = base, .offset = rf.offset, .ty = rf.ty, .value = value } };
+            } else if (b.globals.get(tname)) |gi| {
+                // A module-level `state` global (`count = count + 1`) — the same
+                // global_set a `main`/handler body builds, now reachable from a
+                // value-returning `pub fn` (so `pub fn bump() -> i64 { count =
+                // count + 1  count }` compiles: a state command that returns).
+                if (op.kind != .EQ) return error.Unsupported;
+                out.* = .{ .global_set = .{ .idx = gi, .value = try buildIntExpr(b, rhs_ast, scope) } };
             } else return error.Unsupported;
         },
         .if_stmt => |is| return buildIfStmtNode(b, is, scope),
@@ -9918,6 +9925,24 @@ test "surface: a reached local pub fn is upgraded to a public export" {
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "pub fn shout -> str") != null);
+}
+
+test "surface: a value-returning pub fn mutates module state then returns it" {
+    // The backend-twin handler shape (qubepods ProjectTwin DO drives it): a
+    // module `state` global + a `pub fn` that bumps it and returns the new value.
+    // The value-fn body builder didn't handle a global assignment before its tail
+    // expression (only `main`/void handlers did), so this rejected as NoMainFunction.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        "state count = 0\npub fn bump() -> i64 { count = count + 1\n  count }\npub fn read() -> i64 { count }\n")) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    try testing.expect(mod.entry == null); // a library (no fn main)
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn bump -> i64") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "global_set") != null); // the mutation
 }
 
 test "surface: a main-less library of pub fns builds (not NoMainFunction)" {
