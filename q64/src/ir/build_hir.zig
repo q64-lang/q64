@@ -4954,6 +4954,10 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
                 const base_info = b.enums.get("Result") orelse return null;
                 return try instantiateEnum(b, base_info, &.{ "s", "i", "i", "i" });
             }
+            if (std.mem.eql(u8, txt, "env.kv.increment")) {
+                // Result<i64, i64> — both payloads i64, so the default Result.
+                return b.enums.get("Result");
+            }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (resolveFn(b, txt)) |fd| return enumOfRet(b, fd);
             }
@@ -6224,6 +6228,23 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                     const e2 = try b.a.create(hir.Expr);
                     e2.* = .{ .fs_read = .{ .path = try buildStrExpr(b, parg, scope, null) } };
                     return .{ .e = e2, .si = inst.si.? };
+                }
+                // `env.kv.increment(delta)` in a Result position yields a boxed
+                // Result<i64, i64> (spec/env.md §`env.kv`): the host always
+                // succeeds in v0, so the value is `Ok(<new total>)`. Reuse the
+                // enum-construction boxing (no hand-rolled layout); the i64
+                // `kv_increment` node is the Ok payload. `match … { Ok(n) -> … }`
+                // reads it like any boxed enum.
+                if (std.mem.eql(u8, fsname, "env.kv.increment")) {
+                    var ka = cc.args();
+                    const darg = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const ok = enumVariantTag(b, "Ok") orelse return error.Unsupported;
+                    const esi = ok.info.si orelse return error.Unsupported;
+                    const kvnode = try b.a.create(hir.Expr);
+                    kvnode.* = .{ .kv_increment = .{ .delta = try buildIntExpr(b, darg, scope) } };
+                    var pvals = [_]*hir.Expr{kvnode};
+                    return .{ .e = try enumAlloc(b, esi, ok.tag, &pvals), .si = esi };
                 }
             }
             // C3: a payload-variant construction (`Shape.Circle(7)`):
@@ -8408,17 +8429,6 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
-            // `env.kv.increment(delta)` — the WASI key-value counter (spec/env.md
-            // §`env.kv`, `wasi:keyvalue/atomics.increment`). v0 floor: a single
-            // host-side counter (no key yet); one i64 `delta` arg, i64 result.
-            if (std.mem.eql(u8, cname, "env.kv.increment")) {
-                var ka = cc.args();
-                const darg = ka.next() orelse return error.Unsupported;
-                if (ka.next() != null) return error.Unsupported;
-                const kvout = try b.a.create(hir.Expr);
-                kvout.* = .{ .kv_increment = .{ .delta = try buildIntExpr(b, darg, scope) } };
-                return kvout;
-            }
             // `h.await()` — `await` isn't a keyword, so it parses as a call to
             // the dotted path `h.await`. On the v0 cooperative floor a task
             // that doesn't itself suspend has already completed (eager handle),
@@ -12885,13 +12895,15 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
 }
 
-test "env.kv.increment: an i64 @kv capability face" {
+test "env.kv.increment: a Result<i64, i64> @kv capability face" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
     var mod = (try buildLocal(testing.allocator, &tr,
         \\fn main {
-        \\    let n = env.kv.increment(1)
-        \\    env.out(n)
+        \\    match env.kv.increment(1) {
+        \\        Ok(n) -> env.out(n),
+        \\        Err(_) -> env.out("err"),
+        \\    }
         \\}
         \\
     )) orelse return error.TestUnexpectedResult;
