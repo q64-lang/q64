@@ -448,6 +448,13 @@ fn buildTupleDestructure(b: *Builder, pat: ast.Pattern, init_expr: ast.Expr, sco
 /// `qview.*`) and have no value/tail — so this handles the host shapes *and*
 /// control flow, recursing into `while`/`if` bodies via `buildMainBlock`.
 fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    // A statement-position `spawn { … }` (fire-and-forget) in `main` or a
+    // `while`/`if` body: on the v0 cooperative floor a non-suspending task runs
+    // to completion eagerly, so emit its body inline for effect. A handle
+    // binding (`let h = spawn …`) is the `.let_stmt` arm; spawns inside a
+    // `scope { }` are routed by `buildScopeStmt` (which never forwards them
+    // here), so this can't double-emit.
+    if (spawnExprOf(stmt)) |sp| return emitSpawnTaskMain(b, sp, scope, rt, out);
     switch (stmt) {
         .let_stmt => |ls| {
             const init_expr = ls.initializer() orelse return error.Unsupported;
@@ -10797,6 +10804,31 @@ test "channels: the (tx, rx) split aliases one buffer (tx sends, rx receives)" {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, dump, i, "vec_new")) |p| : (i = p + 1) n += 1;
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "structured concurrency v0: fire-and-forget spawn runs its body eagerly" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A statement-position `spawn { … }` with no handle (main + a for body):
+    // the body runs inline for effect on the v0 cooperative floor.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn tick() { env.out("tick") }
+        \\fn main {
+        \\    spawn { env.out("first") }
+        \\    for i in 0..2 {
+        \\        spawn { tick() }
+        \\    }
+        \\    env.out("after")
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The spawn bodies are emitted inline — both the env.out and the tick call.
+    try testing.expect(std.mem.indexOf(u8, dump, "first") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "after") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "call") != null);
 }
 
 test "structured concurrency v0: let h = spawn { e } + h.await() (eager handle)" {
