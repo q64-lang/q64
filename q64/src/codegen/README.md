@@ -50,6 +50,37 @@ AST → Wasm 3.0 emission. Uses the Binaryen C API.
 | `emit.zig`      | partial  | Binaryen bindings, `emitFromSource`, `emitComponent`, `emitHelloWasm`. |
 | `component.zig` | v0 slice | Pure-Zig WebAssembly **component** encoder for the import-free **library** lift — wraps the core module in a component whose WIT world is the synthesized scalar (`s64`/`bool`/`f64`) export surface. An **app** (one that reaches `@stdout`) isn't encoded here: `emit.zig` emits it as a WASI **preview1** core (`env.out` → `wasi_snapshot_preview1.fd_write`, `StdoutAbi.wasi_preview1`) and the CLI runs `wasm-tools component new --adapt` (vendor/wasi/) to lift it into a `wasi:cli/run` command importing `wasi:cli/stdout`. Library components are validated + called via `q64-component-check`; an app is run with the vendored wasmtime CLI under the async WASIp3 runtime (`wasmtime run -S p3`). |
 
+## Capability lowering: `env.kv` → `wasi:keyvalue` (in progress)
+
+Beyond `@stdout` (preview1 → `wasi:cli/run`), a capability face becomes a
+component **import** the host supplies (spec/env.md §"Env ↔ WASI Preview 3").
+`env.kv` is the first key-value lowering. Two distinct core ABIs come from one
+source, picked by target — exactly like `StdoutAbi`:
+
+- **local `qube run`** — the core imports q64's raw `env.kv_increment` face; the
+  vendored wasmtime host serves it directly (no component).
+- **`--component`** — the core imports the **canonical** `wasi:keyvalue` core ABI
+  (`wasm-tools` `cm32p2|wasi:keyvalue/store@0.2.0-draft2#open` +
+  `…/atomics@…#increment`), then `emit.zig` shells out to `wasm-tools component
+  embed` (with the vendored `wit/wasi-keyvalue.wit` dep) + `component new` to lift
+  it — the same shape as the `--adapt` path.
+
+The component lowering pins:
+
+- **adapter-held bucket** — `store.open` is the *host's* step, called lazily with
+  an empty identifier; the host pins the bucket to the qube's identity. The handle
+  is cached in a module global, so the qube never names a namespace.
+- **canonical result layout** — `open → result<bucket,error>` lands `{disc:u8 @0,
+  handle:i32 @4}`; `increment → result<s64,error>` lands `{disc:u8 @0, s64 @8}`.
+- **required exports** — `cm32p2_memory`, `cm32p2_realloc`, `cm32p2_initialize`;
+  exports named `cm32p2||<name>`.
+
+The byte-exact target is the design of record in
+[`../../test/kv-component-reference/`](../../test/kv-component-reference/) — a
+hand-written reference core + `run.sh` that builds and validates the component
+through `wasm-tools`, independent of the q64 build. `src/codegen/wit/` holds the
+vendored `wasi:keyvalue` WIT dep the emit shells out with.
+
 ## External
 
 - **Binaryen** — Wasm 3.0 backend, called via its C API. Vendored

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "kv-counter",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "kv.q",
+
+  // Emit a component in addition to the core module. The qube reaches `env.kv`,
+  // so the component imports wasi:keyvalue/{store,atomics} (spec/env.md §env.kv);
+  // the host supplies them, pinning the bucket to the qube's identity.
+  "component": {
+    "emit": true,
+    "world": "kv-counter",
+    "worlds": ["wasi:keyvalue/store", "wasi:keyvalue/atomics"],
+  },
+}

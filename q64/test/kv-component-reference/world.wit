@@ -1,0 +1,11 @@
+// The synthesized world for a `bump() -> s64` qube that reaches `env.kv`.
+// `q64 emit --component` generates the equivalent from the qube's public surface
+// + its effect set: each used capability face contributes an `import`, each
+// public fn an `export`. Here `env.kv` → store + atomics imports.
+package q64:qube;
+
+world qube {
+  import wasi:keyvalue/store@0.2.0-draft2;
+  import wasi:keyvalue/atomics@0.2.0-draft2;
+  export bump: func() -> s64;
+}
