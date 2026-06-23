@@ -822,6 +822,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 try buildForRange(b, fs, iter.range, pat.text, scope, rt, out);
                 return;
             }
+            // `for _press in presses() { … }` — a host event stream (HOST SEAM
+            // 2): the iterable is a nullary opener call, not a binding.
+            if (iter == .call) {
+                if (try tryForHostStream(b, fs, iter.call, scope, rt, out)) return;
+                return error.Unsupported;
+            }
             const iname = switch (iter) {
                 .path => |p| try p.text(b.a),
                 else => return error.Unsupported, // v0 iterates array bindings (ranges later)
@@ -3695,10 +3701,32 @@ fn tryConnect(b: *Builder, init_expr: ast.Expr, name: []const u8, scope: *Scope,
     const idx = try declareBodyLocal(b, scope, name, false, .i64);
     try scope.sessions.put(b.a, name, idx);
     const cx = try b.a.create(hir.Expr);
-    cx.* = .chan_connect;
+    cx.* = .{ .chan_open = "channel_connect" };
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .let = .{ .idx = idx, .value = cx } };
     try out.append(b.a, st);
+    return true;
+}
+
+/// `for _ in presses() { … }` — iterate a host event stream (HOST SEAM 2). The
+/// opener (`presses()`) is a nullary call that returns a session handle; bind it
+/// to a hidden local and drive the body off it like any inbound session. Returns
+/// false when the iterable isn't a recognized host-stream opener.
+fn tryForHostStream(b: *Builder, fs: ast.ForStmt, cc: ast.CallExpr, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cn = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cn);
+    if (!std.mem.eql(u8, cn, "presses")) return false; // v0: the one host event source
+    {
+        var ait = cc.args();
+        if (ait.next() != null) return false; // presses() takes no args
+    }
+    const sidx = try declareBodyLocal(b, scope, "#stream", false, .i64);
+    const open = try b.a.create(hir.Expr);
+    open.* = .{ .chan_open = "presses" };
+    const lt = try b.a.create(hir.Stmt);
+    lt.* = .{ .let = .{ .idx = sidx, .value = open } };
+    try out.append(b.a, lt);
+    try buildForSession(b, fs, sidx, scope, rt, out);
     return true;
 }
 
@@ -10639,7 +10667,7 @@ test "channels v0: connect<…>() opens a session; for n in twin binds the paylo
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
     // The importer side of a remote channel: `connect<iface.fn>()` opens a
-    // session (the nullary `chan_connect` import), `for n in twin` drives off
+    // session (the nullary `chan_open` import), `for n in twin` drives off
     // `chan_recv` and binds each payload via `chan_take` (a value-bearing Rx),
     // and `twin.send(Tap)` sends a unit message (the 0 marker) via channel_send.
     var mod = (try buildLocal(testing.allocator, &tr,
@@ -10655,11 +10683,36 @@ test "channels v0: connect<…>() opens a session; for n in twin binds the paylo
     defer mod.deinit();
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
-    try testing.expect(std.mem.indexOf(u8, dump, "chan_connect") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "chan_open(channel_connect)") != null);
     // for n in twin → while chan_recv(session) != 0 { let n = chan_take(session); … }
     try testing.expect(std.mem.indexOf(u8, dump, "while (chan_recv(local#0) ne 0)") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "chan_take(local#0)") != null);
     // twin.send(Tap) — a unit message lowers to env.channel_send(session, 0)
+    try testing.expect(std.mem.indexOf(u8, dump, "host_call env.channel_send(local#0, 0)") != null);
+}
+
+test "channels v0: for _ in presses() iterates a host event stream (HOST SEAM 2)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // The frontend's press loop: `presses()` opens a host event stream
+    // (`chan_open presses`) bound to a hidden session, driven like any inbound
+    // channel — each press fires the body (here, a unit send back up the wire).
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\struct Tap {}
+        \\fn main @wire {
+        \\    let twin = connect<counter.join>()
+        \\    for _press in presses() {
+        \\        twin.send(Tap)
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "chan_open(presses)") != null);
+    // the press stream drives a recv loop; each press sends a unit message
+    try testing.expect(std.mem.indexOf(u8, dump, "while (chan_recv(local#1) ne 0)") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "host_call env.channel_send(local#0, 0)") != null);
 }
 

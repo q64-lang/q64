@@ -209,7 +209,7 @@ fn collectExpr(
             d.insert(.wire);
             try collectExpr(a, h, d, e);
         },
-        .chan_connect => d.insert(.wire),
+        .chan_open => d.insert(.wire),
         .vec_new => {},
         .vec_len => |vl| try collectExpr(a, vl.vec, d, e),
         .vec_get => |vg| {

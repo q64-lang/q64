@@ -913,6 +913,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_chan = false;
     var needs_take = false;
     var needs_connect = false;
+    var needs_presses = false;
     var needs_index_of = false;
     var needs_starts_with = false;
     var needs_contains = false;
@@ -942,6 +943,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (sc.has_chan) needs_chan = true;
         if (sc.has_take) needs_take = true;
         if (sc.has_connect) needs_connect = true;
+        if (sc.has_presses) needs_presses = true;
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -997,6 +999,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         // env.channel_connect : () -> i64 — open the dual end of an imported
         // channel export (`connect<iface.fn>()`), yielding a session handle.
         c.BinaryenAddFunctionImport(module, "env_channel_connect", "env", "channel_connect", none_type, i64_type);
+    }
+    if (needs_presses) {
+        // env.presses : () -> i64 — open the host press event stream (HOST SEAM
+        // 2), yielding a session handle iterated like any inbound channel.
+        c.BinaryenAddFunctionImport(module, "env_presses", "env", "presses", none_type, i64_type);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
     if (needs_fmt_f64) try emitFmtF64(module, allocator, i64_type, pair_type, ptr_type, mem64);
@@ -1326,7 +1333,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .chan_recv => |h| bodyHasOut(h, want_int),
         .chan_take => |h| bodyHasOut(h, want_int),
-        .chan_connect => false,
+        .chan_open => false,
         .vec_new => false,
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
@@ -1406,8 +1413,10 @@ const Scratch = struct {
     has_chan: bool = false,
     /// Contains a `chan_take` → declare the `env.channel_take` import.
     has_take: bool = false,
-    /// Contains a `chan_connect` → declare the `env.channel_connect` import.
+    /// Contains a `chan_open("channel_connect")` → declare `env.channel_connect`.
     has_connect: bool = false,
+    /// Contains a `chan_open("presses")` → declare the `env.presses` import.
+    has_presses: bool = false,
     /// Contains a Vec op → emit the __vec_* helpers (+ the arena).
     has_vec: bool = false,
     /// Max nesting depth of frame-reclamation regions (a `.call` or a host
@@ -1433,6 +1442,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
     s.has_connect = s.has_connect or sub.has_connect;
+    s.has_presses = s.has_presses or sub.has_presses;
     if (sub.rec_depth > s.rec_depth) s.rec_depth = sub.rec_depth;
     if (sub.region_depth > s.region_depth) s.region_depth = sub.region_depth;
 }
@@ -1619,7 +1629,9 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_take = true;
             scanScratch(h, s);
         },
-        .chan_connect => s.has_connect = true,
+        .chan_open => |name| {
+            if (std.mem.eql(u8, name, "presses")) s.has_presses = true else s.has_connect = true;
+        },
         .vec_new => s.has_vec = true,
         .vec_push => |vp| {
             s.has_vec = true;
@@ -2061,7 +2073,12 @@ const Lowerer = struct {
                 var call_args = [_]c.BinaryenExpressionRef{try self.inst(h)};
                 return c.BinaryenCall(module, "env_channel_take", @ptrCast(&call_args), call_args.len, self.i64_type);
             },
-            .chan_connect => return c.BinaryenCall(module, "env_channel_connect", null, 0, self.i64_type),
+            .chan_open => |name| {
+                // env.<name>() -> i64 — open a host stream (channel_connect / presses).
+                const internal = std.fmt.allocPrintSentinel(self.allocator, "env_{s}", .{name}, 0) catch return Error.OutOfMemory;
+                defer self.allocator.free(internal);
+                return c.BinaryenCall(module, internal.ptr, null, 0, self.i64_type);
+            },
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
             .vec_push => |vp| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vp.vec), try self.inst(vp.value) };

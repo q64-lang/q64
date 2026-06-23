@@ -404,11 +404,11 @@ pub const Expr = union(enum) {
     /// returned 1. The operand is the session handle (i64); yields the i64
     /// payload. Carries `@wire`.
     chan_take: *Expr,
-    /// `connect<iface.fn>()` — open the dual end of an imported channel export,
-    /// yielding a session handle (i64). Lowers to the nullary `env.channel_connect`
-    /// host import. The type argument is resolved at deploy (the rpc-import
-    /// binding), not in the wasm. Carries `@wire`.
-    chan_connect,
+    /// Open a host-backed channel/event stream, yielding a session handle (i64):
+    /// `connect<iface.fn>()` (`name` = "channel_connect", a remote channel) or a
+    /// host event source like `presses()` (`name` = "presses", HOST SEAM 2).
+    /// Lowers to the nullary `env.<name>` host import. Carries `@wire`.
+    chan_open: []const u8,
     /// `Vec` v0 floor: a fresh empty vec (header base pointer).
     vec_new,
     /// `v.len` — a live read of the vec's length, i64.
