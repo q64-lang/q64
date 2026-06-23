@@ -564,6 +564,13 @@ const Parser = struct {
             try children.append(self.arena, .{ .node = try self.parseReturnType() });
             try self.eatTrivia(&children);
         }
+        // EffectSpec: `@marker (+ @marker)*` after the signature, like a `fn`
+        // (`handle Bump @kv { … }`). Structured so the check pass reads the
+        // declared effect set; without this the `@kv` would orphan the body.
+        if (self.peek() == .AT) {
+            try children.append(self.arena, .{ .node = try self.parseEffectSpec() });
+            try self.eatTrivia(&children);
+        }
         if (self.peek() == .L_BRACE) {
             try children.append(self.arena, .{ .node = try self.parseBlock() });
         }
@@ -2929,6 +2936,34 @@ test "actor decl: structures name / state fields / handle methods" {
     const h1 = handlers.next().?;
     try testing.expectEqualStrings("get", h1.name().?.text);
     try testing.expect(h1.returnType() != null); // `-> i64`
+    try testing.expect(handlers.next() == null);
+}
+
+test "handle decl: an effect spec after the signature keeps the body structured" {
+    // `handle Bump @kv { … }` — the trailing effect spec must not orphan the
+    // block (the twin's `@kv` handlers depend on this).
+    const src =
+        "actor Counter {\n" ++
+        "    state n: i64 = 0\n" ++
+        "    handle Bump @kv {\n" ++
+        "        n = n + 1\n" ++
+        "    }\n" ++
+        "    handle Join(tx: i64) @kv + @wire {\n" ++
+        "        n = tx\n" ++
+        "    }\n" ++
+        "}\n";
+    const r = try parse(testing.allocator, src, "a.q");
+    defer r.deinit(testing.allocator);
+    var items = ast.SourceFile.items(.{ .cst = r.root });
+    const actor = items.next().?.actor_decl;
+    var handlers = actor.handlers();
+    const h0 = handlers.next().?;
+    try testing.expectEqualStrings("Bump", h0.name().?.text);
+    try testing.expect(h0.body() != null); // the block survived the `@kv`
+    const h1 = handlers.next().?;
+    try testing.expectEqualStrings("Join", h1.name().?.text);
+    try testing.expect(h1.params() != null); // `(tx: i64)` still structured
+    try testing.expect(h1.body() != null); // body survives `@kv + @wire`
     try testing.expect(handlers.next() == null);
 }
 
