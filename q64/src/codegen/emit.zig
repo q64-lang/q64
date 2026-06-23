@@ -596,7 +596,7 @@ pub fn showWorld(
     var any_import = false;
     var it = caps.iterator();
     while (it.next()) |eff| {
-        if (eff.witImport()) |wit| {
+        for (eff.witImports()) |wit| {
             try out.print(allocator, "  import {s};\n", .{wit});
             any_import = true;
         }

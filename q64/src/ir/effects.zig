@@ -250,12 +250,17 @@ test "Effect.implies: fine-grained capabilities imply @io; peers and @io do not"
     try testing.expect(hir.Effect.io.implies() == null); // umbrella implies nothing
 }
 
-test "Effect.marker / witImport" {
+test "Effect.marker / witImports" {
     try testing.expectEqualStrings("@stdout", hir.Effect.stdout.marker());
-    try testing.expectEqualStrings("wasi:cli/stdout", hir.Effect.stdout.witImport().?);
-    try testing.expectEqualStrings("q64:host/ui", hir.Effect.ui.witImport().?);
-    try testing.expect(hir.Effect.io.witImport() == null); // umbrella: no single import
-    try testing.expect(hir.Effect.wire.witImport() == null); // import is the remote world
+    try testing.expectEqualStrings("wasi:cli/stdout", hir.Effect.stdout.witImports()[0]);
+    try testing.expectEqualStrings("q64:host/ui", hir.Effect.ui.witImports()[0]);
+    // `env.kv` maps to a PAIR: `store` (the adapter opens the bucket) + `atomics`
+    // (the qube's `increment`) — spec/env.md §"Env ↔ WASI Preview 3".
+    try testing.expectEqual(@as(usize, 2), hir.Effect.kv.witImports().len);
+    try testing.expectEqualStrings("wasi:keyvalue/store", hir.Effect.kv.witImports()[0]);
+    try testing.expectEqualStrings("wasi:keyvalue/atomics", hir.Effect.kv.witImports()[1]);
+    try testing.expectEqual(@as(usize, 0), hir.Effect.io.witImports().len); // umbrella: no single import
+    try testing.expectEqual(@as(usize, 0), hir.Effect.wire.witImports().len); // import is the remote world
 }
 
 test "close: @stdout pulls in @io transitively" {

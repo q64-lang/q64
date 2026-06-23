@@ -179,22 +179,30 @@ pub const Effect = enum {
     /// remote qube's own `world`, not a fixed interface). The WASI rows pin to
     /// the WASIp3 snapshot env.md tracks; the host-custom rows (`@audio`/`@midi`/
     /// `@ui`/`@inference`) have no WASI P2 interface.
-    pub fn witImport(self: Effect) ?[]const u8 {
+    /// The WASI/host WIT interface(s) a capability lowers to (spec/env.md §"Env
+    /// ↔ WASI Preview 3"). A face can map to **more than one** interface — e.g.
+    /// `env.kv` is `wasi:keyvalue/{store, atomics}`: the adapter opens the bucket
+    /// via `store` and the qube's `increment` is `atomics.increment`. Returns an
+    /// empty slice for `@io` (the umbrella — only its finer-grained members
+    /// import) and `@wire` (the import is the remote qube's own `world`, not a
+    /// fixed interface). The WASI rows pin to the WASIp3 snapshot env.md tracks.
+    pub fn witImports(self: Effect) []const []const u8 {
         return switch (self) {
-            .stdout => "wasi:cli/stdout",
-            .stderr => "wasi:cli/stderr",
-            .network => "wasi:sockets/*",
-            .fs => "wasi:filesystem/*",
-            .kv => "wasi:keyvalue/store",
-            .time => "wasi:clocks/*",
-            .random => "wasi:random/random",
-            .envvars => "wasi:cli/environment",
-            .exit => "wasi:cli/exit",
-            .audio => "q64:host/audio",
-            .midi => "q64:host/midi",
-            .ui => "q64:host/ui",
-            .inference => "q64:host/inference",
-            .io, .wire => null,
+            .stdout => &.{"wasi:cli/stdout"},
+            .stderr => &.{"wasi:cli/stderr"},
+            // `env.net`: outbound sockets + outbound HTTP (spec/env.md table).
+            .network => &.{ "wasi:sockets/tcp", "wasi:sockets/udp", "wasi:sockets/instance-network", "wasi:sockets/ip-name-lookup", "wasi:http/handler" },
+            .fs => &.{ "wasi:filesystem/types", "wasi:filesystem/preopens" },
+            .kv => &.{ "wasi:keyvalue/store", "wasi:keyvalue/atomics" },
+            .time => &.{ "wasi:clocks/wall-clock", "wasi:clocks/monotonic-clock" },
+            .random => &.{"wasi:random/random"},
+            .envvars => &.{"wasi:cli/environment"},
+            .exit => &.{"wasi:cli/exit"},
+            .audio => &.{"q64:host/audio"},
+            .midi => &.{"q64:host/midi"},
+            .ui => &.{"q64:host/ui"},
+            .inference => &.{"q64:host/inference"},
+            .io, .wire => &.{},
         };
     }
 };
