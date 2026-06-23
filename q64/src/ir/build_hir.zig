@@ -3104,6 +3104,13 @@ fn buildScreenFuncs(b: *Builder, sf: ast.SourceFile) BuildError!void {
             const nm = fd.name() orelse continue;
             if (std.mem.eql(u8, nm.text, "main")) continue;
             if (fd.isGeneric()) continue; // exists only monomorphized (B5)
+            // `@channel_handler pub fn join(session: Channel<…>)` — a remote
+            // channel entry point. Built through the full void-body machinery
+            // (it has `for`/`spawn`/channels), exported by name.
+            if (ast.hasAnnotation(fd.cst, "channel_handler")) {
+                try buildChannelHandler(b, fd);
+                continue;
+            }
             if (fd.visibility() == null) continue; // private — built on demand if reached
             if (fd.returnType() == null) {
                 try buildScreenFunc(b, fd); // void-returning handler
@@ -3170,6 +3177,60 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
         .locals = locals,
         .body = block,
         .visibility = vis,
+        .is_screen = true,
+    });
+}
+
+/// Build a `@channel_handler pub fn join(session: Channel<Tx, Rx>) @wire { … }`
+/// — a remote channel entry point. The session is one i64 handle param; the body
+/// is a void procedure with the full callee statement set (`for`/`spawn`/local
+/// channels/host calls), so it reuses `buildVoidBlock`. The function is exported
+/// by name. `session.send(x)` lowers to the `env.channel_send` host call and
+/// `for _ in session { … }` to a `chan_recv` loop (the host-import seam — the
+/// spec's eventual lowering is paired WASIp3 streams). v0: exactly one `Channel`
+/// param, a void return.
+fn buildChannelHandler(b: *Builder, fd: ast.FnDecl) BuildError!void {
+    var scope = Scope{ .a = b.a, .callee = true };
+    var params: std.ArrayList(hir.Param) = .empty;
+    // The session param: a single `Channel<Tx, Rx>`, carried as an i64 handle.
+    const ps = fd.params() orelse return error.Unsupported;
+    var pit = ps.iter();
+    const sp = pit.next() orelse return error.Unsupported;
+    if (!try isChannelType(b, sp.type_())) return error.Unsupported;
+    if (pit.next() != null) return error.Unsupported; // v0: one session param
+    const sname = (sp.name() orelse return error.Unsupported).text;
+    const sidx = try scope.declare(sname, false, .i64);
+    try scope.sessions.put(b.a, sname, sidx);
+    try params.append(b.a, .{ .name = sname, .ty = .i64 });
+    scope.n_params = @intCast(params.items.len);
+    const param_slice = try params.toOwnedSlice(b.a);
+
+    const body_blk = fd.body() orelse return error.Unsupported;
+    const block = try buildVoidBlock(b, body_blk, &scope);
+    // Body locals by SLOT index, not by `scope.locals` position: a split channel
+    // (`let (tx, rx) = channel(…)`) aliases `rx` onto `tx`'s slot, so there are
+    // more `scope.locals` entries than slots. Map each slot `[n_params, next_idx)`
+    // to the type of the entry declared at that idx (str → ptr).
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals, 0..) |*t, j| {
+        const slot: u32 = scope.n_params + @as(u32, @intCast(j));
+        var ty: hir.Type = .i64;
+        for (scope.locals.items) |loc| {
+            if (loc.idx == slot) {
+                ty = loc.ty;
+                break;
+            }
+        }
+        t.* = if (ty == .str) .ptr else ty;
+    }
+    try b.funcs.append(b.a, .{
+        .name = try b.a.dupe(u8, (fd.name() orelse return error.Unsupported).text),
+        .params = param_slice,
+        .ret = .void,
+        .locals = locals,
+        .body = block,
+        .visibility = .public,
         .is_screen = true,
     });
 }
@@ -3545,6 +3606,11 @@ fn buildVoidBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.
 /// side effects (`if`/`while`) recurses through `buildVoidBlock`; expression
 /// statements are `env.out`, host-face calls, or void user calls.
 fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    // A statement-position `spawn { … }` (fire-and-forget) in a void callee body
+    // — the callee mirror of `main`'s eager spawn. Its body runs inline for
+    // effect (the v0 cooperative floor; a `scope { … }` engages the round-robin
+    // scheduler when tasks must interleave).
+    if (spawnExprOf(stmt)) |sp| return emitSpawnTaskVoid(b, sp, scope, out);
     switch (stmt) {
         .expr_stmt => |es| try buildVoidExprStmt(b, es.expression() orelse return error.Unsupported, scope, out),
         .if_stmt => |is| try out.append(b.a, try buildVoidIfNode(b, is, scope)),
@@ -3582,10 +3648,43 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
                 else => return error.Unsupported,
             };
             defer b.a.free(iname);
+            // `for _tap in session { … }` — drive the loop off the remote
+            // channel's inbound stream: run the body once per received message,
+            // end when the peer closes. The loop binder carries no payload in v0
+            // (an empty `Rx` like `Tap`), so it is ignored.
+            if (scope.sessions.get(iname)) |sidx| {
+                try buildForSession(b, fs, sidx, scope, out);
+                return;
+            }
             try buildForVec(b, fs, iname, pat.text, scope, &rt, out);
         },
         else => return error.Unsupported,
     }
+}
+
+/// `for _ in session { … }` — the inbound half of a remote channel session.
+/// Lowers to `while chan_recv(session) != 0 { <body> }`: each `chan_recv` awaits
+/// the next inbound message (1) or reports the peer closed (0), so the body runs
+/// once per message and the loop ends on close. The body builds through
+/// `buildVoidStmt` (callee position).
+fn buildForSession(b: *Builder, fs: ast.ForStmt, sidx: u32, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    var items: std.ArrayList(*hir.Stmt) = .empty;
+    var bit = (fs.body() orelse return error.Unsupported).statements();
+    while (bit.next()) |bs| try buildVoidStmt(b, bs, scope, &items);
+    const body_blk = try b.a.create(hir.Stmt);
+    body_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
+
+    const sref = try b.a.create(hir.Expr);
+    sref.* = .{ .local = .{ .idx = sidx, .ty = .i64 } };
+    const recv = try b.a.create(hir.Expr);
+    recv.* = .{ .chan_recv = sref };
+    const zero = try b.a.create(hir.Expr);
+    zero.* = .{ .int_const = 0 };
+    const cond = try b.a.create(hir.Expr);
+    cond.* = .{ .bin = .{ .kind = .ne, .lhs = recv, .rhs = zero } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
+    try out.append(b.a, st);
 }
 
 /// `scope { … }` in a void procedure — the callee analogue of
@@ -3641,6 +3740,30 @@ fn buildVoidScopeStmt(b: *Builder, ss: ast.ScopeStmt, scope: *Scope, out: *std.A
 
 /// A void expression statement: `env.out(…)`, a host-face call, or a
 /// statement-position call to another void procedure. Shared by
+/// `session.send(x)` — the outbound half of a remote channel session: a void
+/// `env.channel_send(handle, x)` host call (auto-declared by the host-call scan,
+/// since `env.channel_send` returns void). `x` is one i64 message value. Returns
+/// null when `call` isn't `<session>.send(arg)` for a session in scope.
+fn trySessionSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
+    const cname = (callPathName(b, call)) orelse return null;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return null;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "send")) return null;
+    const sidx = scope.sessions.get(cname[0..dot]) orelse return null;
+    var ait = call.args();
+    const arg = ait.next() orelse return null;
+    if (ait.next() != null) return null; // v0: send one i64 value
+    const argv = try buildIntExpr(b, arg, scope);
+    const sref = try b.a.create(hir.Expr);
+    sref.* = .{ .local = .{ .idx = sidx, .ty = .i64 } };
+    const args = try b.a.alloc(*hir.Expr, 2);
+    args[0] = sref;
+    args[1] = argv;
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .host_call = .{ .name = "env.channel_send", .args = args } };
+    return st;
+}
+
 /// `buildVoidStmt` and `buildVoidMatch`'s single-expression arms.
 fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
     const call = switch (expr) {
@@ -3653,6 +3776,11 @@ fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.Array
     }
     if (try hostFaceName(b, call)) |fname| {
         try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
+        return;
+    }
+    // `session.send(x)` — the outbound half of a remote channel session.
+    if (try trySessionSend(b, call, scope)) |st| {
+        try out.append(b.a, st);
         return;
     }
     // `v.push(x)` — a vec binding or a `Vec` actor-state field (`state.subs.push`).
@@ -5234,6 +5362,21 @@ fn isEndpointOrVecType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!bool {
             const nm = try pt.name(b.a);
             defer b.a.free(nm);
             return std.mem.eql(u8, nm, "Sender") or std.mem.eql(u8, nm, "Receiver") or std.mem.eql(u8, nm, "Vec");
+        },
+        else => return false,
+    }
+}
+
+/// A `Channel<Tx, Rx>` type — a remote channel session (`@channel_handler`'s
+/// param). Carried as an i64 session handle; `session.send` and `for _ in
+/// session` lower to the `env.channel_*` host imports.
+fn isChannelType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!bool {
+    const te = te_opt orelse return false;
+    switch (te) {
+        .path => |pt| {
+            const nm = try pt.name(b.a);
+            defer b.a.free(nm);
+            return std.mem.eql(u8, nm, "Channel");
         },
         else => return false,
     }
@@ -8262,6 +8405,11 @@ const Scope = struct {
     /// name (`n`) resolves to `self.n` (read, write, and type), the implicit-
     /// self convention. `self` itself is registered in `recs`.
     self_actor: ?*const StructInfo = null,
+    /// Remote-channel session params (`@channel_handler`'s `session: Channel<…>`):
+    /// name → the local index holding the i64 session handle. `session.send(x)`
+    /// lowers to the `env.channel_send` host call; `for _ in session { … }` to a
+    /// `while chan_recv(session) != 0 { … }` loop.
+    sessions: std.StringHashMapUnmanaged(u32) = .empty,
     /// True for a plain callee body (registerFunc), whose locals are
     /// tracked by `declare` alone — entry-style bodies (`main`,
     /// stamped generics) mirror every local into `b.cur_locals` too.
@@ -10384,6 +10532,33 @@ test "actors v0: module-level singleton (let twin = C.spawn()) — module-lifeti
     try testing.expect(std.mem.indexOf(u8, dump, "call#1(ptr(global#0))") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.Bump -> void") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "fn Counter.Get -> i64") != null);
+}
+
+test "channels v0: @channel_handler lowers session.send + for _ in session to host imports" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // A remote channel entry point: `for _ in session` drives off `chan_recv`
+    // (the `env.channel_recv` import — run the body per inbound message, stop on
+    // close) and `session.send(x)` is the `env.channel_send` host call. The
+    // function is exported by name.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\struct Tap {}
+        \\@channel_handler
+        \\pub fn pump(session: Channel<i64, Tap>) @wire {
+        \\    for _tap in session {
+        \\        session.send(1)
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "pub fn pump -> void") != null);
+    // for _ in session → while chan_recv(session) != 0
+    try testing.expect(std.mem.indexOf(u8, dump, "while (chan_recv(local#0) ne 0)") != null);
+    // session.send(1) → env.channel_send host call
+    try testing.expect(std.mem.indexOf(u8, dump, "host_call env.channel_send(local#0, 1)") != null);
 }
 
 test "actors v0: message-style tell/ask dispatch (c.tell(Msg) / c.ask(Msg))" {

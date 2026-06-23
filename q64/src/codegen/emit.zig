@@ -910,6 +910,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_vec = false;
     var needs_fs = false;
     var needs_kv = false;
+    var needs_chan = false;
     var needs_index_of = false;
     var needs_starts_with = false;
     var needs_contains = false;
@@ -936,6 +937,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             needs_arena = true;
         }
         if (sc.has_kv) needs_kv = true;
+        if (sc.has_chan) needs_chan = true;
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -968,6 +970,17 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var kvp = [_]c.BinaryenType{ ptr_type, ptr_type, i64_type };
         const kv_params = c.BinaryenTypeCreate(&kvp, kvp.len);
         c.BinaryenAddFunctionImport(module, "env_kv_increment", "env", "kv_increment", kv_params, i64_type);
+    }
+    if (needs_chan) {
+        // env.channel_recv : (session) -> i64 (spec/env.md §"Channel entry
+        // point"). Receives the next inbound message on a remote channel
+        // session: 1 = a message arrived (run the loop body), 0 = the peer
+        // closed (end the loop). The session handle + result are i64 regardless
+        // of address space. (The outbound `env.channel_send` is a void host call,
+        // auto-declared by the host-call scan.) v0 host-import seam.
+        var chp = [_]c.BinaryenType{i64_type};
+        const ch_params = c.BinaryenTypeCreate(&chp, chp.len);
+        c.BinaryenAddFunctionImport(module, "env_channel_recv", "env", "channel_recv", ch_params, i64_type);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
     if (needs_fmt_f64) try emitFmtF64(module, allocator, i64_type, pair_type, ptr_type, mem64);
@@ -1295,6 +1308,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .bounds_check => |bc| bodyHasOut(bc.index, want_int) or bodyHasOut(bc.count, want_int),
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
+        .chan_recv => |h| bodyHasOut(h, want_int),
         .vec_new => false,
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
@@ -1370,6 +1384,8 @@ const Scratch = struct {
     has_fs: bool = false,
     /// Contains an `env.kv.increment` → declare the `env.kv_increment` import.
     has_kv: bool = false,
+    /// Contains a `chan_recv` → declare the `env.channel_recv` import.
+    has_chan: bool = false,
     /// Contains a Vec op → emit the __vec_* helpers (+ the arena).
     has_vec: bool = false,
     /// Max nesting depth of frame-reclamation regions (a `.call` or a host
@@ -1392,6 +1408,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_vec = s.has_vec or sub.has_vec;
     s.has_fs = s.has_fs or sub.has_fs;
     s.has_kv = s.has_kv or sub.has_kv;
+    s.has_chan = s.has_chan or sub.has_chan;
     if (sub.rec_depth > s.rec_depth) s.rec_depth = sub.rec_depth;
     if (sub.region_depth > s.region_depth) s.region_depth = sub.region_depth;
 }
@@ -1569,6 +1586,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
                 scanScratch(k, s);
             }
             scanScratch(kv.delta, s);
+        },
+        .chan_recv => |h| {
+            s.has_chan = true;
+            scanScratch(h, s);
         },
         .vec_new => s.has_vec = true,
         .vec_push => |vp| {
@@ -2000,6 +2021,11 @@ const Lowerer = struct {
                     try self.inst(kv.delta),
                 };
                 return c.BinaryenCall(module, "env_kv_increment", @ptrCast(&call_args), call_args.len, self.i64_type);
+            },
+            .chan_recv => |h| {
+                // got = env.channel_recv(session) — 1 (message) or 0 (closed).
+                var call_args = [_]c.BinaryenExpressionRef{try self.inst(h)};
+                return c.BinaryenCall(module, "env_channel_recv", @ptrCast(&call_args), call_args.len, self.i64_type);
             },
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
             .vec_push => |vp| {

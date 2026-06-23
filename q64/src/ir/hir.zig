@@ -391,6 +391,13 @@ pub const Expr = union(enum) {
     /// `str`; the keyless `env.kv.increment(delta)` form leaves `key` null (the
     /// host uses the empty key — a single shared counter). Marks the fn `@kv`.
     kv_increment: struct { key: ?*Expr, delta: *Expr },
+    /// `chan_recv(session)` — receive the next inbound message on a remote
+    /// channel session (`@channel_handler`'s `for _ in session`). Lowers to the
+    /// `env.channel_recv` host import: returns 1 when a message arrived (run the
+    /// loop body), 0 when the peer closed (end the loop). The operand is the
+    /// session handle (an i64). Carries `@wire`. v0 host-import seam (parallel to
+    /// `env.kv`); the spec's eventual lowering is a WASIp3 `stream<Rx>`.
+    chan_recv: *Expr,
     /// `Vec` v0 floor: a fresh empty vec (header base pointer).
     vec_new,
     /// `v.len` — a live read of the vec's length, i64.

@@ -42,6 +42,31 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
     expect(ping()).toBe(3n);
   });
 
+  test("a @channel_handler emits a session entry point driven by host imports", async () => {
+    // The remote channel seam: `for _ in session` is `env.channel_recv` (1 = a
+    // message arrived, 0 = closed) and `session.send` is `env.channel_send`.
+    // Drive it with a host that delivers three messages then closes; the handler
+    // must send once per message and stop on close.
+    const out = join(work, "channel-handler.wasm");
+    const r = runCli(["emit", fixture("channel-handler.q"), out, "--addr", "wasm32"]);
+    expect(r.exitCode).toBe(0);
+    const mod = new WebAssembly.Module(readFileSync(out));
+    expect(WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`).sort()).toEqual([
+      "env.channel_recv",
+      "env.channel_send",
+    ]);
+    let inbound = 3; // three taps, then the peer closes
+    const sent: bigint[] = [];
+    const instance = await WebAssembly.instantiate(mod, {
+      env: {
+        channel_recv: (_session: bigint) => (inbound-- > 0 ? 1n : 0n),
+        channel_send: (_session: bigint, value: bigint) => void sent.push(value),
+      },
+    });
+    (instance.exports.pump as (session: bigint) => void)(7n);
+    expect(sent).toEqual([1n, 1n, 1n]); // one send per received tap, then stop
+  });
+
   test("missing source file: non-zero exit", () => {
     const r = runCli(["emit", fixture("nope.q"), join(work, "x.wasm")]);
     expect(r.exitCode).not.toBe(0);

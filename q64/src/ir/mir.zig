@@ -231,6 +231,10 @@ pub const Op = union(enum) {
     /// `env.kv_increment` import with (key ptr, key len, delta) and yield its
     /// i64 result. `key` is a str inst; null for the keyless (empty-key) form.
     kv_increment: struct { key: ?*Inst, delta: *Inst },
+    /// `chan_recv(session)` — receive the next inbound channel message (the
+    /// `env.channel_recv` host import). Operand is the session handle (i64);
+    /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.
+    chan_recv: *Inst,
     /// `Vec` v0 floor (spec/types.md §Growable): a fresh empty vec —
     /// a 3-slot {data, len, cap} header in the scope arena, yielding
     /// its base pointer. Lowers to the `__vec_new` helper.
