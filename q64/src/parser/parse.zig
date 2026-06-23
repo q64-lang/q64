@@ -203,10 +203,12 @@ const Parser = struct {
         return self.tokens[i].kind;
     }
 
-    /// Is `base` the bare `channel` path (a single IDENT "channel")? The only
-    /// name for which `<…>(` is parsed as a turbofish call rather than a
-    /// comparison (the channel constructor needs its element type).
-    fn isChannelBase(base: *const cst.Node) bool {
+    /// Is `base` a bare single-IDENT path whose name takes a turbofish call
+    /// (`<…>(`) rather than a comparison? Two names qualify: `channel` (the
+    /// constructor needs its element type) and `connect` (the remote-channel
+    /// opener needs the imported export — `connect<iface.fn>()`). General
+    /// `a<b>(c)` stays a comparison.
+    fn isTurbofishBase(base: *const cst.Node) bool {
         if (base.kind != .PATH_EXPR) return false;
         var name: ?[]const u8 = null;
         var n: usize = 0;
@@ -219,7 +221,8 @@ const Parser = struct {
             },
             .node => return false,
         };
-        return n == 1 and name != null and std.mem.eql(u8, name.?, "channel");
+        return n == 1 and name != null and
+            (std.mem.eql(u8, name.?, "channel") or std.mem.eql(u8, name.?, "connect"));
     }
 
     /// At a `<`, is there a balanced `<…>` whose closing `>` is immediately
@@ -2412,11 +2415,12 @@ const Parser = struct {
                     base = try cst.makeNode(self.arena, .CALL_EXPR, children.items);
                 },
                 .L_ANGLE => {
-                    // `channel<T>(…)` — the one turbofish call form q64 parses (the
-                    // channel constructor needs its element type; general `a<b>(c)`
-                    // stays a comparison). Fires only when the base is the `channel`
-                    // path and a balanced `<…>` is immediately followed by `(`.
-                    if (base.kind != .PATH_EXPR or !isChannelBase(base) or !self.angleThenParen()) break;
+                    // `channel<T>(…)` / `connect<iface.fn>()` — the turbofish call
+                    // forms q64 parses (the constructor / opener need their type
+                    // argument; general `a<b>(c)` stays a comparison). Fires only
+                    // when the base is one of those paths and a balanced `<…>` is
+                    // immediately followed by `(`.
+                    if (base.kind != .PATH_EXPR or !isTurbofishBase(base) or !self.angleThenParen()) break;
                     var children: std.ArrayList(cst.Element) = .empty;
                     try children.append(self.arena, .{ .node = base });
                     try children.append(self.arena, .{ .node = try self.parseGenericArgs() });

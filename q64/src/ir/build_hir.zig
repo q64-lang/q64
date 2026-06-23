@@ -668,6 +668,8 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // `let v = Vec.from([…])` — handled (vec_new + pushes).
             } else if (try tryActorSpawn(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let c = Actor.spawn()` — an actor instance (default state record).
+            } else if (try tryConnect(b, init_expr, nm.text, scope, out)) {
+                // `let twin = connect<iface.fn>()` — open a remote channel session.
             } else if (try tryChannelNew(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let ch = channel(…)` — a Vec buffer + read cursor.
             } else if (try tryChannelRecv(b, init_expr, nm.text, ls.isVar(), scope, out)) {
@@ -825,6 +827,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 else => return error.Unsupported, // v0 iterates array bindings (ranges later)
             };
             defer b.a.free(iname);
+            // `for n in twin { … }` over a connected remote channel session
+            // (`let twin = connect<…>()`) — the inbound stream drives the loop.
+            if (scope.sessions.get(iname)) |sidx| {
+                try buildForSession(b, fs, sidx, scope, rt, out);
+                return;
+            }
             if (scope.vecs.contains(iname)) {
                 try buildForVec(b, fs, iname, pat.text, scope, rt, out);
                 return;
@@ -2881,6 +2889,13 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                     }
                 }
             }
+            // `twin.send(x)` on a connected remote channel session — BEFORE the
+            // channel/vec sends, since a session handle is an i64 a `Sender`-style
+            // `.send` would otherwise mistake for a buffer pointer (vec_push).
+            if (try trySessionSend(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
+            }
             // `v.push(x)` on a vec binding (the v0 Vec floor).
             if (try tryVecPush(b, call, scope)) |st| {
                 try out.append(b.a, st);
@@ -3653,7 +3668,7 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
             // end when the peer closes. The loop binder carries no payload in v0
             // (an empty `Rx` like `Tap`), so it is ignored.
             if (scope.sessions.get(iname)) |sidx| {
-                try buildForSession(b, fs, sidx, scope, out);
+                try buildForSession(b, fs, sidx, scope, &rt, out);
                 return;
             }
             try buildForVec(b, fs, iname, pat.text, scope, &rt, out);
@@ -3662,15 +3677,58 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
     }
 }
 
-/// `for _ in session { … }` — the inbound half of a remote channel session.
-/// Lowers to `while chan_recv(session) != 0 { <body> }`: each `chan_recv` awaits
-/// the next inbound message (1) or reports the peer closed (0), so the body runs
-/// once per message and the loop ends on close. The body builds through
-/// `buildVoidStmt` (callee position).
-fn buildForSession(b: *Builder, fs: ast.ForStmt, sidx: u32, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+/// `let twin = connect<iface.fn>()` — open the dual end of an imported channel
+/// export (spec/rpc.md §"Remote channels"). Binds an i64 session handle from the
+/// nullary `env.channel_connect` host import and registers `name` as a session,
+/// so `twin.send(x)` / `for n in twin { … }` drive the same `env.channel_*` seam
+/// as the exporter's `@channel_handler` param. The `<iface.fn>` type argument is
+/// resolved at deploy (the rpc-import binding), not in the wasm. Entry-style
+/// position (`fn main`). Returns false when `init_expr` isn't `connect<…>()`.
+fn tryConnect(b: *Builder, init_expr: ast.Expr, name: []const u8, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cn = (callPathName(b, cc)) orelse return false;
+    defer b.a.free(cn);
+    if (!std.mem.eql(u8, cn, "connect")) return false;
+    const idx = try declareBodyLocal(b, scope, name, false, .i64);
+    try scope.sessions.put(b.a, name, idx);
+    const cx = try b.a.create(hir.Expr);
+    cx.* = .chan_connect;
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .let = .{ .idx = idx, .value = cx } };
+    try out.append(b.a, st);
+    return true;
+}
+
+/// `for x in session { … }` — the inbound half of a remote channel session.
+/// Lowers to `while chan_recv(session) != 0 { [let x = chan_take(session)]
+/// <body> }`: each `chan_recv` awaits the next inbound message (1) or reports the
+/// peer closed (0), so the body runs once per message and ends on close. A
+/// value-bearing binder (`for n in twin`, an i64 `Rx`) reads the payload via
+/// `chan_take`; a discard binder (`for _tap in session`, an empty `Rx` like
+/// `Tap`) takes nothing. The body builds callee- or main-style per `scope.callee`.
+fn buildForSession(b: *Builder, fs: ast.ForStmt, sidx: u32, scope: *Scope, rt: *RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    // A binder that isn't `_`-prefixed carries the message value (chan_take).
+    const binder = (fs.pattern() orelse return error.Unsupported).bindingName();
+    const valued = if (binder) |bn| !std.mem.startsWith(u8, bn.text, "_") else false;
+
     var items: std.ArrayList(*hir.Stmt) = .empty;
+    if (valued) {
+        const nidx = try declareBodyLocal(b, scope, binder.?.text, true, .i64);
+        const sref = try b.a.create(hir.Expr);
+        sref.* = .{ .local = .{ .idx = sidx, .ty = .i64 } };
+        const take = try b.a.create(hir.Expr);
+        take.* = .{ .chan_take = sref };
+        const lt = try b.a.create(hir.Stmt);
+        lt.* = .{ .let = .{ .idx = nidx, .value = take } };
+        try items.append(b.a, lt);
+    }
     var bit = (fs.body() orelse return error.Unsupported).statements();
-    while (bit.next()) |bs| try buildVoidStmt(b, bs, scope, &items);
+    while (bit.next()) |bs| {
+        if (scope.callee) try buildVoidStmt(b, bs, scope, &items) else try buildMainStmt(b, bs, scope, rt, &items);
+    }
     const body_blk = try b.a.create(hir.Stmt);
     body_blk.* = .{ .block = try items.toOwnedSlice(b.a) };
 
@@ -3752,8 +3810,22 @@ fn trySessionSend(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*h
     const sidx = scope.sessions.get(cname[0..dot]) orelse return null;
     var ait = call.args();
     const arg = ait.next() orelse return null;
-    if (ait.next() != null) return null; // v0: send one i64 value
-    const argv = try buildIntExpr(b, arg, scope);
+    if (ait.next() != null) return null; // v0: send one value
+    // The payload: an i64 value, or a unit message (`twin.send(Tap)`, where `Tap`
+    // is an empty struct) — a bare path that names no value binding carries no
+    // payload, so it lowers to a 0 marker.
+    const argv: *hir.Expr = blk: {
+        if (arg == .path) {
+            const pn = try arg.path.text(b.a);
+            defer b.a.free(pn);
+            if (std.mem.indexOfScalar(u8, pn, '.') == null and scope.find(pn) == null and b.globals.get(pn) == null) {
+                const z = try b.a.create(hir.Expr);
+                z.* = .{ .int_const = 0 };
+                break :blk z;
+            }
+        }
+        break :blk try buildIntExpr(b, arg, scope);
+    };
     const sref = try b.a.create(hir.Expr);
     sref.* = .{ .local = .{ .idx = sidx, .ty = .i64 } };
     const args = try b.a.alloc(*hir.Expr, 2);
@@ -3778,7 +3850,9 @@ fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.Array
         try out.append(b.a, try buildHostCall(b, fname, call, scope, null));
         return;
     }
-    // `session.send(x)` — the outbound half of a remote channel session.
+    // `session.send(x)` — the outbound half of a remote channel session (before
+    // the vec/channel sends: a session handle is an i64 that a `Sender`-style
+    // `.send` would otherwise mistake for a buffer pointer).
     if (try trySessionSend(b, call, scope)) |st| {
         try out.append(b.a, st);
         return;
@@ -10559,6 +10633,34 @@ test "channels v0: @channel_handler lowers session.send + for _ in session to ho
     try testing.expect(std.mem.indexOf(u8, dump, "while (chan_recv(local#0) ne 0)") != null);
     // session.send(1) → env.channel_send host call
     try testing.expect(std.mem.indexOf(u8, dump, "host_call env.channel_send(local#0, 1)") != null);
+}
+
+test "channels v0: connect<…>() opens a session; for n in twin binds the payload" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // The importer side of a remote channel: `connect<iface.fn>()` opens a
+    // session (the nullary `chan_connect` import), `for n in twin` drives off
+    // `chan_recv` and binds each payload via `chan_take` (a value-bearing Rx),
+    // and `twin.send(Tap)` sends a unit message (the 0 marker) via channel_send.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\struct Tap {}
+        \\state count = 0
+        \\fn main @wire {
+        \\    let twin = connect<counter.join>()
+        \\    spawn { for n in twin { count = n } }
+        \\    twin.send(Tap)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "chan_connect") != null);
+    // for n in twin → while chan_recv(session) != 0 { let n = chan_take(session); … }
+    try testing.expect(std.mem.indexOf(u8, dump, "while (chan_recv(local#0) ne 0)") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "chan_take(local#0)") != null);
+    // twin.send(Tap) — a unit message lowers to env.channel_send(session, 0)
+    try testing.expect(std.mem.indexOf(u8, dump, "host_call env.channel_send(local#0, 0)") != null);
 }
 
 test "actors v0: message-style tell/ask dispatch (c.tell(Msg) / c.ask(Msg))" {

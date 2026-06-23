@@ -67,6 +67,35 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
     expect(sent).toEqual([1n, 1n, 1n]); // one send per received tap, then stop
   });
 
+  test("connect<…>() opens a session and for n in twin drains the inbound stream", async () => {
+    // The importer side of a remote channel: `connect` → env.channel_connect,
+    // `for n in twin` → env.channel_recv (1 = message, 0 = closed) + a value
+    // read via env.channel_take. Deliver three values then close; the module
+    // `state` ends on the last one.
+    const out = join(work, "connect.wasm");
+    const r = runCli(["emit", fixture("connect.q"), out, "--addr", "wasm32"]);
+    expect(r.exitCode).toBe(0);
+    const mod = new WebAssembly.Module(readFileSync(out));
+    expect(WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`).sort()).toEqual([
+      "env.channel_connect",
+      "env.channel_recv",
+      "env.channel_take",
+    ]);
+    const recv = [1n, 1n, 1n, 0n]; // three messages, then closed
+    const take = [10n, 20n, 30n];
+    let ri = 0;
+    let ti = 0;
+    const instance = await WebAssembly.instantiate(mod, {
+      env: {
+        channel_connect: () => 42n,
+        channel_recv: (_h: bigint) => recv[ri++],
+        channel_take: (_h: bigint) => take[ti++],
+      },
+    });
+    (instance.exports._start as () => void)();
+    expect((instance.exports.last as () => bigint)()).toBe(30n); // the last delivered value
+  });
+
   test("missing source file: non-zero exit", () => {
     const r = runCli(["emit", fixture("nope.q"), join(work, "x.wasm")]);
     expect(r.exitCode).not.toBe(0);

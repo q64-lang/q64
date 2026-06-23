@@ -911,6 +911,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_fs = false;
     var needs_kv = false;
     var needs_chan = false;
+    var needs_take = false;
+    var needs_connect = false;
     var needs_index_of = false;
     var needs_starts_with = false;
     var needs_contains = false;
@@ -938,6 +940,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         }
         if (sc.has_kv) needs_kv = true;
         if (sc.has_chan) needs_chan = true;
+        if (sc.has_take) needs_take = true;
+        if (sc.has_connect) needs_connect = true;
         if (sc.has_str_eq) needs_str_eq = true;
         if (sc.has_index_of) needs_index_of = true;
         if (sc.has_starts_with) needs_starts_with = true;
@@ -981,6 +985,18 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var chp = [_]c.BinaryenType{i64_type};
         const ch_params = c.BinaryenTypeCreate(&chp, chp.len);
         c.BinaryenAddFunctionImport(module, "env_channel_recv", "env", "channel_recv", ch_params, i64_type);
+    }
+    if (needs_take) {
+        // env.channel_take : (session) -> i64 — the i64 payload of the message
+        // `channel_recv` just reported (a value-bearing `for n in session`).
+        var ctp = [_]c.BinaryenType{i64_type};
+        const ct_params = c.BinaryenTypeCreate(&ctp, ctp.len);
+        c.BinaryenAddFunctionImport(module, "env_channel_take", "env", "channel_take", ct_params, i64_type);
+    }
+    if (needs_connect) {
+        // env.channel_connect : () -> i64 — open the dual end of an imported
+        // channel export (`connect<iface.fn>()`), yielding a session handle.
+        c.BinaryenAddFunctionImport(module, "env_channel_connect", "env", "channel_connect", none_type, i64_type);
     }
     if (needs_fmt) try emitFmtI64(module, allocator, i64_type, pair_type, ptr_type, mem64);
     if (needs_fmt_f64) try emitFmtF64(module, allocator, i64_type, pair_type, ptr_type, mem64);
@@ -1309,6 +1325,8 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .chan_recv => |h| bodyHasOut(h, want_int),
+        .chan_take => |h| bodyHasOut(h, want_int),
+        .chan_connect => false,
         .vec_new => false,
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
@@ -1386,6 +1404,10 @@ const Scratch = struct {
     has_kv: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
     has_chan: bool = false,
+    /// Contains a `chan_take` → declare the `env.channel_take` import.
+    has_take: bool = false,
+    /// Contains a `chan_connect` → declare the `env.channel_connect` import.
+    has_connect: bool = false,
     /// Contains a Vec op → emit the __vec_* helpers (+ the arena).
     has_vec: bool = false,
     /// Max nesting depth of frame-reclamation regions (a `.call` or a host
@@ -1409,6 +1431,8 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_fs = s.has_fs or sub.has_fs;
     s.has_kv = s.has_kv or sub.has_kv;
     s.has_chan = s.has_chan or sub.has_chan;
+    s.has_take = s.has_take or sub.has_take;
+    s.has_connect = s.has_connect or sub.has_connect;
     if (sub.rec_depth > s.rec_depth) s.rec_depth = sub.rec_depth;
     if (sub.region_depth > s.region_depth) s.region_depth = sub.region_depth;
 }
@@ -1591,6 +1615,11 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_chan = true;
             scanScratch(h, s);
         },
+        .chan_take => |h| {
+            s.has_take = true;
+            scanScratch(h, s);
+        },
+        .chan_connect => s.has_connect = true,
         .vec_new => s.has_vec = true,
         .vec_push => |vp| {
             s.has_vec = true;
@@ -2027,6 +2056,12 @@ const Lowerer = struct {
                 var call_args = [_]c.BinaryenExpressionRef{try self.inst(h)};
                 return c.BinaryenCall(module, "env_channel_recv", @ptrCast(&call_args), call_args.len, self.i64_type);
             },
+            .chan_take => |h| {
+                // n = env.channel_take(session) — the reported message's payload.
+                var call_args = [_]c.BinaryenExpressionRef{try self.inst(h)};
+                return c.BinaryenCall(module, "env_channel_take", @ptrCast(&call_args), call_args.len, self.i64_type);
+            },
+            .chan_connect => return c.BinaryenCall(module, "env_channel_connect", null, 0, self.i64_type),
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
             .vec_push => |vp| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vp.vec), try self.inst(vp.value) };

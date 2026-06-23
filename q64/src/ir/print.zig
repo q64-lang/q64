@@ -166,6 +166,12 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, h);
             try app(gpa, out, ")", .{});
         },
+        .chan_take => |h| {
+            try app(gpa, out, "chan_take(", .{});
+            try hirExpr(gpa, out, h);
+            try app(gpa, out, ")", .{});
+        },
+        .chan_connect => try app(gpa, out, "chan_connect", .{}),
         .vec_new => try app(gpa, out, "vec_new", .{}),
         .vec_len => |vl| {
             try app(gpa, out, "vec_len(", .{});
@@ -380,6 +386,11 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "chan_recv\n", .{});
             try mirInst(gpa, out, h, depth + 1);
         },
+        .chan_take => |h| {
+            try app(gpa, out, "chan_take\n", .{});
+            try mirInst(gpa, out, h, depth + 1);
+        },
+        .chan_connect => try app(gpa, out, "chan_connect\n", .{}),
         .vec_new => try app(gpa, out, "vec_new\n", .{}),
         .vec_push => |vp| {
             try app(gpa, out, "vec_push\n", .{});

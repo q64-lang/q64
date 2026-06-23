@@ -235,6 +235,12 @@ pub const Op = union(enum) {
     /// `env.channel_recv` host import). Operand is the session handle (i64);
     /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.
     chan_recv: *Inst,
+    /// `chan_take(session)` — the `env.channel_take` host import: the i64 payload
+    /// of the message `chan_recv` just reported. Operand is the session handle.
+    chan_take: *Inst,
+    /// `connect<…>()` — the nullary `env.channel_connect` host import, yielding a
+    /// session handle (i64).
+    chan_connect,
     /// `Vec` v0 floor (spec/types.md §Growable): a fresh empty vec —
     /// a 3-slot {data, len, cap} header in the scope arena, yielding
     /// its base pointer. Lowers to the `__vec_new` helper.

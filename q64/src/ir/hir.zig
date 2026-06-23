@@ -398,6 +398,17 @@ pub const Expr = union(enum) {
     /// session handle (an i64). Carries `@wire`. v0 host-import seam (parallel to
     /// `env.kv`); the spec's eventual lowering is a WASIp3 `stream<Rx>`.
     chan_recv: *Expr,
+    /// `chan_take(session)` — take the value of the message `chan_recv` just
+    /// reported (the `env.channel_take` host import). Called once per iteration
+    /// of a value-bearing `for n in session` (an i64 `Rx`), AFTER `chan_recv`
+    /// returned 1. The operand is the session handle (i64); yields the i64
+    /// payload. Carries `@wire`.
+    chan_take: *Expr,
+    /// `connect<iface.fn>()` — open the dual end of an imported channel export,
+    /// yielding a session handle (i64). Lowers to the nullary `env.channel_connect`
+    /// host import. The type argument is resolved at deploy (the rpc-import
+    /// binding), not in the wasm. Carries `@wire`.
+    chan_connect,
     /// `Vec` v0 floor: a fresh empty vec (header base pointer).
     vec_new,
     /// `v.len` — a live read of the vec's length, i64.

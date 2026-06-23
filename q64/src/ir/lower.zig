@@ -360,6 +360,8 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             .delta = try lowerExpr(ctx, kv.delta),
         } }),
         .chan_recv => |h| return mk(ctx.a, .i64, .{ .chan_recv = try lowerExpr(ctx, h) }),
+        .chan_take => |h| return mk(ctx.a, .i64, .{ .chan_take = try lowerExpr(ctx, h) }),
+        .chan_connect => return mk(ctx.a, .i64, .chan_connect),
         .int_const => |v| return mk(ctx.a, .i64, .{ .const_i64 = v }),
         .float_const => |v| return mk(ctx.a, .f64, .{ .const_f64 = v }),
         .num_cast => |nc| return mk(ctx.a, mapType(nc.to), .{ .num_cast = try lowerExpr(ctx, nc.value) }),
