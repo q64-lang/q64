@@ -39,4 +39,18 @@ pub fn build(b: *std.Build) void {
     cli_tests.step.dependOn(b.getInstallStep());
     const cli_tests_step = b.step("cli-tests", "Run the qube CLI black-box suite (bun test)");
     cli_tests_step.dependOn(&cli_tests.step);
+
+    // qube-resolve.wasm — the manifest-resolution core (src/wasm.zig) compiled to
+    // wasm32, so the browser shell runs the SAME `qube` logic as the native CLI
+    // (one implementation; see src/wasm.zig). `zig build wasm`.
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+        .optimize = .ReleaseSmall,
+    });
+    const wasm = b.addExecutable(.{ .name = "qube-resolve", .root_module = wasm_mod });
+    wasm.entry = .disabled; // a library of exports, no _start
+    wasm.rdynamic = true; // keep the `export fn`s
+    const wasm_step = b.step("wasm", "Build qube-resolve.wasm (the wasm resolution core)");
+    wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
 }
