@@ -88,6 +88,7 @@ const CATALOG = [
   'Icons',           // 32  icon section label
   'Search',          // 33  icon button label
   'Turning cube',    // 34  scene_overlay demo title (a 3D scene + a form on top)
+  'Counter',         // 35  twin-counter example heading (text_id 1035)
 ];
 
 // Vector-icon catalog (Lucide path data, ISC). Referenced by integer id via
