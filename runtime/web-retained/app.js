@@ -24,6 +24,12 @@ import { computeLayout } from './arrange.js';
 import { resolvePlatform } from './platform.js';
 import { themeFor } from './theme.js';
 
+// Module-evaluated signal: set once ALL static imports above resolved and the
+// body started running. A page-level boot probe (the deployed host injects one)
+// reads this after a timeout to tell "the module never executed" (a failed
+// import / MIME error — nothing here can log) apart from a later runtime error.
+if (typeof window !== 'undefined') window.__qviewBooted = true;
+
 // One self-drawn renderer, three looks: iOS-ish on iOS, Material-ish on Android,
 // a neutral house look on desktop. The platform is resolved once (sniff +
 // ?platform= override); the per-platform theme tokens flow to every widget via
