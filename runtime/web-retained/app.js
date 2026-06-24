@@ -175,6 +175,57 @@ function glyphFor(node) {
 // Scene.face wires create/set_attr/remove/on to the validated applier; present()
 // is this backend's frame commit (render + drain the mutation log). A set_attr
 // may change a node's text, so we evict its glyph key around the applier.
+// ---- the remote-channel seam (q64 spec/env.md §"Channel entry point") --------
+// The host realization of q64's channel ABI for a LOCAL `qube run` Preview of a
+// twin frontend — the web parallel of qubepods' server-side channel-host.ts. A
+// twin frontend (e.g. the counter example) lowers `connect<…>()` / `for n in …`
+// to env.channel_* imports (all i64 handles); without them the module can't even
+// instantiate (LinkError: env:channel_recv must be callable) and nothing renders.
+//
+// v0 — render: `channel_connect()` hands back a session pre-seeded with the
+// current count, so the frontend's single-pass `_start` recv loop paints once
+// (the count starts at 0 on a fresh local run, as the backend twin's `join`
+// would report via `read()`). `presses()` is an empty stream this pass, so the
+// run completes. Live taps — re-driving `_start` on a press and pumping the local
+// backend twin — are the next step (the runtime ABI's job); the kv + send plumbing
+// is already here so that wiring is additive. Extra `env` imports are ignored by
+// programs that don't use them, so this is inert for non-twin qubes.
+function channelSeam() {
+  const kv = new Map();            // env.kv — the shared count (0 until bumped)
+  const sessions = new Map();      // handle -> { inbound:[i64…], pending, outbound:[i64…] }
+  let next = 1n;
+  const open = (inbound = []) => {
+    const h = next++;
+    sessions.set(h, { inbound: [...inbound], pending: 0n, outbound: [] });
+    return h;
+  };
+  return {
+    // Importer side: open the dual end, seeded with the current count so the
+    // frontend's `for n in twin { count = n; paint() }` paints immediately.
+    channel_connect: () => open([kv.get('count') ?? 0n]),
+    // Host event stream (button presses). Empty this pass — see v0 note above.
+    presses: () => open(),
+    // 1 = an inbound message is ready (payload staged for channel_take), 0 = drained.
+    channel_recv: (h) => {
+      const s = sessions.get(h);
+      if (s && s.inbound.length) { s.pending = s.inbound.shift(); return 1n; }
+      return 0n;
+    },
+    channel_take: (h) => sessions.get(h)?.pending ?? 0n,
+    // Outbound (a Tap up, or the backend's count down) — collected; the live pump
+    // that feeds these to the backend twin is the interactivity follow-up.
+    channel_send: (h, v) => { sessions.get(h)?.outbound.push(BigInt(v)); },
+    // Atomic add at a key (the backend's `env.kv.increment`); kept coherent so the
+    // count survives once the local backend twin is driven.
+    kv_increment: (keyPtr, keyLen, delta) => {
+      const key = Number(keyLen) > 0 ? readUtf8(keyPtr, keyLen) : 'count';
+      const n = (kv.get(key) ?? 0n) + BigInt(delta);
+      kv.set(key, n);
+      return n;
+    },
+  };
+}
+
 function ops() {
   const sceneFace = scene.face(() => {
     // present() = the tree just changed -> relayout (Phase 1) then render (Phase 2).
@@ -185,7 +236,7 @@ function ops() {
     if (m.length) log('mutate: ' + m.join(', '));
   });
   return {
-    env: { out: () => {} },
+    env: { out: () => {}, ...channelSeam() },
     qview: {
       ...sceneFace,
       set_attr: (id, attr, value) => { glyphKey.delete(Number(id)); sceneFace.set_attr(id, attr, value); },
