@@ -220,7 +220,10 @@ function channelSeam() {
   let next = 1n, connectH = null, sentTaps = 0;
   seamFlush = () => {
     if (TWIN && twinWs && twinWs.readyState === WebSocket.OPEN)
-      for (let i = 0; i < sentTaps; i++) twinWs.send('{}');   // each Tap → one frame up
+      // Each Tap is the channel's `Tap` value — an empty record → a ZERO-byte
+      // binary frame (canonical-ABI / wRPC value encoding). The twin types it by
+      // the channel direction (up = Tap); no hand-coded discriminator.
+      for (let i = 0; i < sentTaps; i++) twinWs.send(new ArrayBuffer(0));
     twinPresses = 0;                                          // consumed by this re-drive
   };
   return {
@@ -283,16 +286,19 @@ function redrive() {
 }
 
 // Connect the live socket to the backend twin and re-drive on every count it
-// broadcasts (`{type:'state',count}`), so a tap on any device repaints here too.
+// broadcasts, so a tap on any device repaints here too. The channel's down-type
+// is `i64` (the count): a binary frame is its canonical-ABI value — 8 bytes,
+// little-endian (the wRPC value encoding). Text frames are heartbeats, ignored.
 function connectTwin(wsUrl) {
   try { twinWs = new WebSocket(wsUrl); } catch (e) { log('twin: ' + (e?.message || e)); return; }
+  twinWs.binaryType = 'arraybuffer';
   twinWs.onopen = () => log('twin: connected');
   twinWs.onclose = () => log('twin: disconnected');
   twinWs.onerror = () => log('twin: socket error');
   twinWs.onmessage = (ev) => {
-    let n = null;
-    try { const f = JSON.parse(ev.data); if (f && f.type === 'state' && typeof f.count === 'number') n = f.count; } catch { /* heartbeat / non-JSON */ }
-    if (n !== null) { twinCount = BigInt(n); redrive(); }
+    if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 8) return; // heartbeat / non-value
+    twinCount = new DataView(ev.data).getBigInt64(0, true);
+    redrive();
   };
 }
 
