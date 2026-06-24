@@ -177,57 +177,62 @@ function glyphFor(node) {
 // is this backend's frame commit (render + drain the mutation log). A set_attr
 // may change a node's text, so we evict its glyph key around the applier.
 // ---- the remote-channel seam (q64 spec/env.md §"Channel entry point") --------
-// The host realization of q64's channel ABI for a LOCAL `qube run` Preview of a
-// twin frontend — the web parallel of qubepods' server-side channel-host.ts. A
-// twin frontend (e.g. the counter example) lowers `connect<…>()` / `for n in …`
-// to env.channel_* imports (all i64 handles); without them the module can't even
-// instantiate (LinkError: env:channel_recv must be callable) and nothing renders.
+// The host realization of q64's channel ABI for a twin frontend (e.g. the counter
+// example), which lowers `connect<…>()` / `for n in …` / `presses()` to env.channel_*
+// imports (all i64 handles; without them the module can't even instantiate —
+// LinkError: env:channel_recv must be callable — and nothing renders). Two modes:
 //
-// v0 — render: `channel_connect()` hands back a session pre-seeded with the
-// current count, so the frontend's single-pass `_start` recv loop paints once
-// (the count starts at 0 on a fresh local run, as the backend twin's `join`
-// would report via `read()`). `presses()` is an empty stream this pass, so the
-// run completes. Live taps — re-driving `_start` on a press and pumping the local
-// backend twin — are the next step (the runtime ABI's job); the kv + send plumbing
-// is already here so that wiring is additive. Extra `env` imports are ignored by
-// programs that don't use them, so this is inert for non-twin qubes.
+//   • LOCAL stub (no twin config): `channel_connect()` seeds the current count so a
+//     `qube run` Preview paints once; `presses()` is empty, so `_start` completes.
+//   • TWIN (window.__twinConfig = { wsUrl }): a live WebSocket to the deployed
+//     backend twin. The frontend's single-pass `_start` is HOST-DRIVEN by re-running
+//     it per event — validated against the compiled counter wasm: a WS-delivered
+//     count re-drives `_start` to paint the new value; a button press enqueues a Tap
+//     and re-drives so the `for _press in presses()` loop sends it up the wire. The
+//     backend (a qubepods ProjectTwin DO) owns the shared count + fan-out; the wasm
+//     only computes the delta. So a tap on ANY device updates this screen too.
+//
+// Wire protocol (matches apps/twin's TwinCore): the backend sends
+// `{type:'state',count}` frames DOWN; any JSON frame UP is a tap (we send `{}`).
+// Extra `env` imports are ignored by programs that don't use them — inert for
+// non-twin qubes.
+const TWIN = (typeof window !== 'undefined' && window.__twinConfig) || null;
+let twinWs = null;        // the live socket (twin mode)
+let twinCount = 0n;       // latest count from the backend (seeds channel_connect)
+let twinPresses = 0;      // button taps queued for the next re-drive
+let programBytes = null;  // the running program's wasm, kept so we can re-drive _start
+let seamFlush = null;     // set per-run: flush the Taps the program sent to the socket
+
+// One `_start`'s worth of channel state. channel_connect/presses hand out i64
+// handles whose recv() drains a queued list; channel_send on the connect handle is
+// a Tap up the wire (collected, flushed after `_start` returns by seamFlush).
 function channelSeam() {
-  const kv = new Map();            // env.kv — the shared count (0 until bumped)
-  const sessions = new Map();      // handle -> { inbound:[i64…], pending, outbound:[i64…] }
-  let next = 1n;
-  const open = (inbound = []) => {
-    const h = next++;
-    sessions.set(h, { inbound: [...inbound], pending: 0n, outbound: [] });
-    return h;
+  const sessions = new Map();
+  let next = 1n, connectH = null, sentTaps = 0;
+  seamFlush = () => {
+    if (TWIN && twinWs && twinWs.readyState === WebSocket.OPEN)
+      for (let i = 0; i < sentTaps; i++) twinWs.send('{}');   // each Tap → one frame up
+    twinPresses = 0;                                          // consumed by this re-drive
   };
   return {
     // Importer side: open the dual end, seeded with the current count so the
     // frontend's `for n in twin { count = n; paint() }` paints immediately.
-    channel_connect: () => open([kv.get('count') ?? 0n]),
-    // Host event stream (button presses). Empty this pass — see v0 note above.
-    presses: () => open(),
-    // 1 = an inbound message is ready (payload staged for channel_take), 0 = drained.
-    channel_recv: (h) => {
-      const s = sessions.get(h);
-      if (s && s.inbound.length) { s.pending = s.inbound.shift(); return 1n; }
-      return 0n;
-    },
-    channel_take: (h) => sessions.get(h)?.pending ?? 0n,
-    // Outbound (a Tap up, or the backend's count down) — collected; the live pump
-    // that feeds these to the backend twin is the interactivity follow-up.
-    channel_send: (h, v) => { sessions.get(h)?.outbound.push(BigInt(v)); },
-    // Atomic add at a key (the backend's `env.kv.increment`); kept coherent so the
-    // count survives once the local backend twin is driven.
-    kv_increment: (keyPtr, keyLen, delta) => {
-      const key = Number(keyLen) > 0 ? readUtf8(keyPtr, keyLen) : 'count';
-      const n = (kv.get(key) ?? 0n) + BigInt(delta);
-      kv.set(key, n);
-      return n;
-    },
+    channel_connect: () => { const h = next++; connectH = h; sessions.set(h, { in: [twinCount] }); return h; },
+    // Host press stream: yields the queued button taps for this re-drive (empty in
+    // the local stub, so `_start` completes after the first paint).
+    presses: () => { const h = next++; const a = []; for (let i = 0; i < twinPresses; i++) a.push(1n); sessions.set(h, { in: a }); return h; },
+    // 1 = an inbound item is staged for channel_take, 0 = drained.
+    channel_recv: (h) => { const s = sessions.get(h); if (s && s.in.length) { s._t = s.in.shift(); return 1n; } return 0n; },
+    channel_take: (h) => sessions.get(h)?._t ?? 0n,
+    // A Tap up the wire (channel_send on the connect handle). Collected; seamFlush
+    // sends them once `_start` returns (one socket frame per tap).
+    channel_send: (h) => { if (h === connectH) sentTaps++; },
   };
 }
 
-function ops() {
+// The qview face (create/set_attr/remove/on/present) — built ONCE over the scene,
+// so re-driving `_start` reuses the same retained tree (create is idempotent).
+const qviewFace = (() => {
   const sceneFace = scene.face(() => {
     // present() = the tree just changed -> relayout (Phase 1) then render (Phase 2).
     layout();
@@ -237,22 +242,54 @@ function ops() {
     if (m.length) log('mutate: ' + m.join(', '));
   });
   return {
-    env: { out: () => {}, ...channelSeam() },
-    qview: {
-      ...sceneFace,
-      set_attr: (id, attr, value) => { glyphKey.delete(Number(id)); sceneFace.set_attr(id, attr, value); },
-      // A STRING op: the app passed (ptr, len) into wasm linear memory; read the
-      // UTF-8 and stash it on the node under `key` (TEXTKEY: value | placeholder).
-      // The text_input widget renders node._text; a changed string re-rasterizes
-      // via the string-keyed glyph cache (no per-node invalidation needed).
-      set_text: (id, key, ptr, len) => {
-        const n = nodes.get(Number(id));
-        if (!n) return;
-        (n._text ??= {})[Number(key)] = readUtf8(ptr, len);
-      },
+    ...sceneFace,
+    set_attr: (id, attr, value) => { glyphKey.delete(Number(id)); sceneFace.set_attr(id, attr, value); },
+    // A STRING op: the app passed (ptr, len) into wasm linear memory; read the
+    // UTF-8 and stash it on the node under `key` (TEXTKEY: value | placeholder).
+    // The text_input widget renders node._text; a changed string re-rasterizes
+    // via the string-keyed glyph cache (no per-node invalidation needed).
+    set_text: (id, key, ptr, len) => {
+      const n = nodes.get(Number(id));
+      if (!n) return;
+      (n._text ??= {})[Number(key)] = readUtf8(ptr, len);
     },
   };
+})();
+
+// The wasm import object: env (out + the channel seam) + the qview face. A fresh
+// seam per run holds that run's channel handles; the qview face is shared.
+function ops(seam) {
+  return { env: { out: () => {}, ...(seam || channelSeam()) }, qview: qviewFace };
 }
+
+// Re-drive: re-instantiate the program and run `_start` with a fresh seam over the
+// current twinCount / twinPresses. The retained scene persists (create is
+// idempotent), so build() re-resolves the nodes and paint() updates them.
+function redrive() {
+  if (!programBytes) return;
+  const seam = channelSeam();
+  instance = new WebAssembly.Instance(new WebAssembly.Module(programBytes), ops(seam));
+  instance.exports._start();
+  if (seamFlush) seamFlush();
+}
+
+// Connect the live socket to the backend twin and re-drive on every count it
+// broadcasts (`{type:'state',count}`), so a tap on any device repaints here too.
+function connectTwin(wsUrl) {
+  try { twinWs = new WebSocket(wsUrl); } catch (e) { log('twin: ' + (e?.message || e)); return; }
+  twinWs.onopen = () => log('twin: connected');
+  twinWs.onclose = () => log('twin: disconnected');
+  twinWs.onerror = () => log('twin: socket error');
+  twinWs.onmessage = (ev) => {
+    let n = null;
+    try { const f = JSON.parse(ev.data); if (f && f.type === 'state' && typeof f.count === 'number') n = f.count; } catch { /* heartbeat / non-JSON */ }
+    if (n !== null) { twinCount = BigInt(n); redrive(); }
+  };
+}
+
+// A button press in twin mode: queue a Tap and re-drive so the program's
+// `for _press in presses()` loop sends it up the wire.
+function twinPress() { twinPresses++; redrive(); }
 
 // Decode a (ptr, len) span of the wasm instance's linear memory as UTF-8. Used
 // by the string ops (set_text) and to read back validated/echoed text.
@@ -939,11 +976,16 @@ async function main() {
   } else {
     bytes = new Uint8Array(await (await fetch('./screen.wasm')).arrayBuffer());
   }
-  const { instance: inst } = await WebAssembly.instantiate(bytes, ops());
-  instance = inst;
-  log(`retained host v${PROTOCOL_VERSION} · wasm32 (${bytes.byteLength} B${injected ? ', injected program' : ' demo'}) · WebGPU`);
+  programBytes = bytes;        // kept so twin mode can re-drive `_start` per event
+  instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), ops());
+  log(`retained host v${PROTOCOL_VERSION} · wasm32 (${bytes.byteLength} B${injected ? ', injected program' : ' demo'})${TWIN ? ' · twin' : ''} · WebGPU`);
 
   instance.exports._start();   // builds the retained tree + first present()
+
+  // Twin frontend: open the live socket to the deployed backend twin. The first
+  // `{type:'state',count}` it broadcasts re-drives `_start` to paint the real count
+  // (until then the boot paint shows 0); button presses send Taps up the wire.
+  if (TWIN) connectTwin(TWIN.wsUrl);
 
   // Pin the title bar (nodes 90/91) so it sticks at the top while content scrolls
   // beneath it. Scrollable content is CLIPPED to below the header (render() sets a
@@ -1120,7 +1162,11 @@ async function main() {
     // flash a press for it.
     if (w && w.contextMenu && !(hit.handlers && hit.handlers.size)) return;
     pressedId = hit.id; render();                       // immediate pressed-state flash
-    dispatch(hit, EVENT.press);                         // wasm mutates + presents
+    // Twin frontend: a button press is a `presses()` event — queue a Tap and
+    // re-drive `_start` to send it up the wire (the streaming model). Otherwise
+    // the event-model path: dispatch to the node's wired wasm handler.
+    if (TWIN && hit.kind === KIND.button) twinPress();
+    else dispatch(hit, EVENT.press);                    // wasm mutates + presents
     setTimeout(() => { pressedId = null; render(); }, 120);
   }, { passive: false });
 
