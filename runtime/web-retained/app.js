@@ -937,11 +937,17 @@ async function main() {
   // Lead the title with the short git sha so it stays visible even when the
   // header ellipsizes on a narrow iPhone (the long full stamp is cut from the
   // right). e.g. "build 5530203 · QView retained".
+  // An embedding host can brand the header via window.__appTitle (the deployed
+  // qubepods page sets "Qubepods" — the name a non-technical user recognizes,
+  // not "QView"). Default to the q64 build label. The full build stamp stays on
+  // hover either way, so you can still confirm the live deploy.
   const ttl = document.querySelector('header .ttl');
   if (ttl) {
     const sha = (BUILD.match(/\(([^)]+)\)/) || [, BUILD])[1];
-    ttl.textContent = `build ${sha} · QView retained`;
+    const appTitle = (typeof window !== 'undefined' && window.__appTitle) || null;
+    ttl.textContent = appTitle || `build ${sha} · QView retained`;
     ttl.title = BUILD;   // full stamp on long-press / desktop hover
+    if (appTitle) document.title = appTitle;
   }
   wireSnapButton();
 
