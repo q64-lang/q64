@@ -60,7 +60,8 @@ BINARYEN_REPO="https://github.com/WebAssembly/binaryen.git"
 # CDN bucket under `toolchain/`; verified against the pinned sha256 below, with
 # the from-source build as the fallback on miss / mismatch / unpinned platform.
 BINARYEN_CACHE_URL="${BINARYEN_CACHE_URL-https://cdn.q64.dev/toolchain}"
-BINARYEN_CACHE_SHA256_x86_64_linux="7258855e9e193b50252124f1c2d6a4ab67072acd501f9c782ee154321006d7d5"
+BINARYEN_CACHE_SHA256_x86_64_linux="b5832372417ab28bc8c2a32e4404d85110e04a33c4a5dc57206af71eb1145503"
+BINARYEN_CACHE_SHA256_aarch64_linux="737be1ea11586d7bbc00723d29eb76cdad82851e59520579dee6d3ea57e19062"
 BINARYEN_CACHE_SHA256_aarch64_darwin="d6d00cfec33fdf9cd0324be5c6d7606579b0877ad59338ef7d2d0c28bac9ac38"
 BINARYEN_CACHE_SHA256_x86_64_darwin="30ac3d1da0fc183e41df93708f3a7391443cff9bc8aa7a217098ae1fdb91d14e"
 
@@ -395,7 +396,11 @@ install_binaryen() {
             echo "init.sh: no pinned binaryen cache for ${c_arch}-${c_os}; building from source"
         else
             c_key="binaryen-${BINARYEN_VERSION}-${c_arch}-${c_os}.tar.gz"
-            c_url="${BINARYEN_CACHE_URL%/}/$c_key"
+            # Cache-bust the CDN edge by the pinned sha: when the lib's content
+            # changes (e.g. a rebuild under a different C++ ABI) the query string
+            # changes too, so Cloudflare can never serve a stale cached object
+            # for a reused key. Unchanged content reuses the edge cache.
+            c_url="${BINARYEN_CACHE_URL%/}/$c_key?v=$pin"
             c_tar="$tmpdir/$c_key"
             echo "init.sh: trying binaryen cache $c_url"
             if curl -fsSL "$c_url" -o "$c_tar" && [ -s "$c_tar" ]; then
