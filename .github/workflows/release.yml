@@ -51,12 +51,12 @@ env:
 
 jobs:
   build:
-    # One x86_64 Linux runner cross-compiles every published target. q64 for
-    # linux-arm64 and windows is intentionally NOT built here: linkBinaryen's
-    # Linux branch resolves libstdc++ via the host's g++ (x86_64 only), and
-    # Windows needs an MSVC-ABI Binaryen — both await dedicated toolchains.
-    # qube (pure Zig) ships all six. Adding a q64 platform = one CDN lib + one
-    # matrix-style entry in the macOS-style swap loop below.
+    # One x86_64 Linux runner cross-compiles every published target. Deferred:
+    #   * q64 linux-arm64 — linkBinaryen's Linux branch resolves libstdc++ via
+    #     the host's g++ (x86_64 only).
+    #   * windows (q64 AND qube) — q64 needs an MSVC-ABI Binaryen, and qube's
+    #     CLI is POSIX-specific (std.process.args / tcgetattr).
+    # Adding a q64 platform = one CDN Binaryen lib + one entry in the swap loop.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +77,10 @@ jobs:
       - name: init.sh (Zig + wasmtime + Binaryen)
         run: ./init.sh
 
-      # qube is pure Zig: cross-compile every OS/arch straight from the runner.
-      - name: Build qube (all targets)
+      # qube is pure Zig: cross-compile every supported OS/arch from the runner.
+      # Windows is deferred — qube's CLI is POSIX-specific (std.process.args
+      # needs initAllocator on Windows; raw-mode uses tcgetattr on an int fd).
+      - name: Build qube (linux + macOS, amd64 + arm64)
         working-directory: qube
         run: |
           set -euo pipefail
@@ -87,19 +89,13 @@ jobs:
             [linux-arm64]=aarch64-linux
             [macos-amd64]=x86_64-macos
             [macos-arm64]=aarch64-macos
-            [windows-amd64]=x86_64-windows
-            [windows-arm64]=aarch64-windows
           )
           mkdir -p ../out
           for plat in "${!T[@]}"; do
             triple="${T[$plat]}"
             echo "::group::qube $plat ($triple)"
             ../vendor/zig/zig build -Doptimize=ReleaseFast -Dtarget="$triple"
-            if [[ "$plat" == windows-* ]]; then
-              cp zig-out/bin/qube.exe "../out/qube-${plat}.exe"
-            else
-              cp zig-out/bin/qube "../out/qube-${plat}"
-            fi
+            cp zig-out/bin/qube "../out/qube-${plat}"
             echo "::endgroup::"
           done
 
@@ -243,9 +239,10 @@ jobs:
           notes="q64 + qube binaries built from ${GITHUB_SHA}.
 
           Consumed by sibling repos and the qubepods builder container via
-          \`manifest.json\` (binary URLs + sha256). qube ships linux/macOS/windows
-          on amd64+arm64; q64 ships linux-amd64 + macOS (amd64+arm64) — q64 for
-          linux-arm64 and windows await dedicated Binaryen toolchains."
+          \`manifest.json\` (binary URLs + sha256). qube ships linux + macOS on
+          amd64+arm64; q64 ships linux-amd64 + macOS (amd64+arm64). Deferred:
+          q64 linux-arm64 / windows (need dedicated Binaryen toolchains) and all
+          windows (qube's CLI is not yet Windows-ready)."
           assets=(release/q64-* release/qube-* release/SHA256SUMS release/manifest.json release/doc.json)
 
           if [ "${{ steps.assemble.outputs.prerelease }}" = "true" ]; then
