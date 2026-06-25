@@ -52,11 +52,10 @@ env:
 jobs:
   build:
     # One x86_64 Linux runner cross-compiles every published target. q64 swaps
-    # in a per-target Binaryen lib from the CDN (macОS + windows-gnu); qube is
-    # pure Zig. Deferred q64 targets: linux-arm64 (linkBinaryen's Linux branch
-    # resolves libstdc++ via the host's g++, x86_64 only) and windows-arm64
-    # (no aarch64-windows Binaryen lib built yet). Adding one = a CDN Binaryen
-    # lib + one entry in the build_q64 list below.
+    # in a per-target Binaryen lib from the CDN (every lib is built with zig c++,
+    # so a single link_libcpp in build.zig links them all); qube is pure Zig.
+    # Only deferred q64 target: windows-arm64 (no aarch64-windows Binaryen lib
+    # built yet). Adding it = one CDN Binaryen lib + one build_q64 entry below.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -114,10 +113,11 @@ jobs:
           ../vendor/zig/zig build -Doptimize=ReleaseFast
           cp zig-out/bin/q64 ../out/q64-linux-amd64
 
-      # q64 (macОS + windows): swap the CDN Binaryen lib for the target's, then
-      # cross-build. build.zig's non-Linux branch links zig's bundled libc++,
-      # ABI-matched to the zig-built archive — so these link cleanly from Linux.
-      - name: Build q64 (macOS amd64+arm64, windows amd64)
+      # q64 (cross targets): swap the CDN Binaryen lib for the target's, then
+      # cross-build. Every Binaryen lib is built with zig c++, so build.zig's
+      # single `link_libcpp = true` is ABI-correct for all of them and these
+      # link cleanly from the x86_64 Linux runner — including linux-arm64.
+      - name: Build q64 (linux-arm64, macOS amd64+arm64, windows amd64)
         working-directory: q64
         run: |
           set -euo pipefail
@@ -136,6 +136,7 @@ jobs:
             cp "$src" "../out/$out"
             echo "::endgroup::"
           }
+          build_q64 aarch64-linux      aarch64-linux  q64-linux-arm64
           build_q64 x86_64-macos       x86_64-darwin  q64-macos-amd64
           build_q64 aarch64-macos      aarch64-darwin q64-macos-arm64
           build_q64 x86_64-windows-gnu x86_64-windows q64-windows-amd64.exe
@@ -251,9 +252,9 @@ jobs:
 
           Consumed by sibling repos and the qubepods builder container via
           \`manifest.json\` (binary URLs + sha256). qube ships linux + macOS +
-          windows on amd64+arm64; q64 ships linux-amd64, macOS (amd64+arm64),
-          and windows-amd64. Deferred: q64 linux-arm64 and q64 windows-arm64
-          (need their Binaryen libs)."
+          windows on amd64+arm64; q64 ships linux (amd64+arm64), macOS
+          (amd64+arm64), and windows-amd64. Deferred: q64 windows-arm64 (needs
+          its Binaryen lib)."
           assets=(release/q64-* release/qube-* release/SHA256SUMS release/manifest.json release/doc.json)
 
           if [ "${{ steps.assemble.outputs.prerelease }}" = "true" ]; then

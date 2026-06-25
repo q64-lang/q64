@@ -190,43 +190,23 @@ fn addPlainTest(
     test_step.dependOn(&b.addRunArtifact(t).step);
 }
 
-// Binaryen is vendored as a static archive (libbinaryen.a) built from
-// source by ../init.sh on every host. Because the archive is produced
-// by the host's C++ toolchain (Apple Clang on macOS, gcc on Linux,
-// MSVC on Windows), it is automatically ABI-consistent with whatever
-// linkLibCpp() resolves to on that target — no per-OS shenanigans
-// needed.
+// Binaryen is vendored as a static archive (libbinaryen.a) built from source
+// by ../init.sh (or restored from the CDN cache). It is built with `zig c++`
+// on every platform, so it carries zig's bundled libc++ ABI — meaning a single
+// `link_libcpp = true` is ABI-correct for every target, including Linux, and
+// the whole thing cross-compiles from one host (the macOS/windows/linux-arm64
+// release binaries are all produced this way).
 fn linkBinaryen(
     mod: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     include_path: std.Build.LazyPath,
     lib_path: std.Build.LazyPath,
 ) void {
+    _ = target;
     mod.link_libc = true;
     mod.addIncludePath(include_path);
     mod.addObjectFile(lib_path);
-
-    // Binaryen is built from source by init.sh using the host C++
-    // toolchain. On Linux that is gcc, so libbinaryen.a carries the GNU
-    // libstdc++ ABI (the `__cxx11` symbols); link the system libstdc++
-    // rather than zig's bundled libc++, which would leave those symbols
-    // undefined. On macOS / Windows the host toolchain and zig's
-    // linkLibCpp agree (Apple libc++ / MSVC), so use the bundled path.
-    if (target.result.os.tag == .linux) {
-        // `linkSystemLibrary("stdc++")` is intercepted by zig and routed
-        // to its bundled libc++ (wrong ABI here). Link the GNU libstdc++
-        // by its absolute path instead. Ask gcc where it lives, since
-        // the linker symlink sits in gcc's own lib directory rather than
-        // on the default search path.
-        const mod_b = mod.owner;
-        // libstdc++.so is a real ELF; libgcc_s.so is a GNU ld script, so
-        // ask for the concrete `.so.1` (it provides `_Unwind_*`).
-        for ([_][]const u8{ "libstdc++.so", "libgcc_s.so.1" }) |lib| {
-            const printed = mod_b.run(&.{ "g++", mod_b.fmt("-print-file-name={s}", .{lib}) });
-            const so_path = std.mem.trim(u8, printed, " \r\n");
-            mod.addObjectFile(.{ .cwd_relative = so_path });
-        }
-    } else {
-        mod.link_libcpp = true;
-    }
+    // Zig's bundled libc++ — matches how libbinaryen.a is compiled (zig c++)
+    // on all platforms, and is arch-agnostic so cross-linking just works.
+    mod.link_libcpp = true;
 }

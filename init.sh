@@ -429,7 +429,18 @@ install_binaryen() {
     git clone --depth 1 --branch "$tag" --recurse-submodules "$BINARYEN_REPO" "$src"
 
     echo "init.sh: configuring binaryen (cmake)"
+    # Build Binaryen with `zig c++`, not the host gcc, so libbinaryen.a carries
+    # zig's libc++ ABI — matching q64/build.zig's `link_libcpp = true` on every
+    # platform (the CDN cache libs are built the same way). A host-gcc build
+    # would emit GNU libstdc++ symbols that won't resolve against libc++.
+    local zig_abs zcc zcxx
+    zig_abs="$(cd "$(dirname "$ZIG_DEST")" && pwd)/$(basename "$ZIG_DEST")/zig"
+    zcc="$tmpdir/zig-cc"; zcxx="$tmpdir/zig-cxx"
+    printf '#!/bin/sh\nexec "%s" cc "$@"\n'  "$zig_abs" > "$zcc";  chmod +x "$zcc"
+    printf '#!/bin/sh\nexec "%s" c++ "$@"\n' "$zig_abs" > "$zcxx"; chmod +x "$zcxx"
     cmake -S "$src" -B "$build" \
+        -DCMAKE_C_COMPILER="$zcc" \
+        -DCMAKE_CXX_COMPILER="$zcxx" \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_STATIC_LIB=ON \
         -DBUILD_TESTS=OFF \
