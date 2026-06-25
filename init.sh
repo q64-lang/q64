@@ -61,6 +61,8 @@ BINARYEN_REPO="https://github.com/WebAssembly/binaryen.git"
 # the from-source build as the fallback on miss / mismatch / unpinned platform.
 BINARYEN_CACHE_URL="${BINARYEN_CACHE_URL-https://cdn.q64.dev/toolchain}"
 BINARYEN_CACHE_SHA256_x86_64_linux="7258855e9e193b50252124f1c2d6a4ab67072acd501f9c782ee154321006d7d5"
+BINARYEN_CACHE_SHA256_aarch64_darwin="d6d00cfec33fdf9cd0324be5c6d7606579b0877ad59338ef7d2d0c28bac9ac38"
+BINARYEN_CACHE_SHA256_x86_64_darwin="30ac3d1da0fc183e41df93708f3a7391443cff9bc8aa7a217098ae1fdb91d14e"
 
 # wabt (wat2wasm / wasm2wat) — OPTIONAL developer tooling: compile the WAT
 # fixtures + component helper modules to wasm, and inspect emitted modules.
