@@ -33,7 +33,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(70);
     }
 
-    var args_it = init.minimal.args.iterate();
+    // iterateAllocator (not iterate) so this compiles on Windows, where
+    // decoding the UTF-16 command line into argv needs an allocator. POSIX
+    // ignores the allocator; the process exits right after, so we don't deinit.
+    var args_it = try init.minimal.args.iterateAllocator(gpa);
     // Skip argv[0].
     _ = args_it.next();
 
