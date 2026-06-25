@@ -61,18 +61,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # vendor/ is populated by ./init.sh: Zig toolchain, wasmtime C API, and
-      # the linux-amd64 Binaryen static lib (restored from the CDN cache, with
-      # a from-source fallback). Key includes init.sh so a toolchain/pin bump
-      # invalidates the cache.
+      # Cache only the slow, immutable downloads: the Zig toolchain + wasmtime
+      # C API. NOT vendor/binaryen — the q64 cross-build step below rewrites it
+      # per target (macOS, then windows), so caching it would persist the LAST
+      # swapped lib under this linux key and poison the next run's linux build
+      # (init.sh would skip its restore and q64-linux would link the windows
+      # archive). init.sh re-fetches the linux binaryen from the CDN in seconds.
       - name: Cache vendored toolchain
         uses: actions/cache@v4
         with:
           path: |
             vendor/zig
             vendor/wasmtime
-            vendor/binaryen
-          key: vendor-linux-amd64-${{ hashFiles('init.sh') }}
+          key: vendor-linux-amd64-v2-${{ hashFiles('init.sh') }}
 
       - name: init.sh (Zig + wasmtime + Binaryen)
         run: ./init.sh
