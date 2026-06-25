@@ -66,7 +66,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(@intFromEnum(ExitCode.internal));
     }
 
-    var args_it = init.minimal.args.iterate();
+    // iterateAllocator (not iterate) so this compiles on Windows, where
+    // decoding the UTF-16 command line into argv needs an allocator. POSIX
+    // ignores the allocator; the process exits right after, so we don't deinit.
+    var args_it = try init.minimal.args.iterateAllocator(gpa);
     _ = args_it.next(); // argv[0]
 
     const sub = args_it.next() orelse {
@@ -3406,18 +3409,50 @@ fn readStdinLineAlloc(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     return gpa.dupe(u8, trimmed);
 }
 
-// POSIX-only: disable terminal echo while reading the password.
+// Read a line from stdin with terminal echo disabled. POSIX uses termios;
+// Windows toggles the console mode (see readPasswordSilentWindows). Either
+// way, a non-interactive stdin (piped input, CI without QUBE_PASSWORD) falls
+// back to a plain read.
 fn readPasswordSilent(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    const fd = std.posix.STDIN_FILENO;
-    const old = std.posix.tcgetattr(fd) catch {
-        // Not a TTY (piped input, CI without QUBE_PASSWORD). Read plainly.
+    // builtin.os.tag is comptime-known, so the untaken branch is never
+    // analysed — the POSIX termios code doesn't reach the Windows compile.
+    if (builtin.os.tag == .windows) {
+        return readPasswordSilentWindows(gpa, io);
+    } else {
+        const fd = std.posix.STDIN_FILENO;
+        const old = std.posix.tcgetattr(fd) catch {
+            // Not a TTY (piped input, CI without QUBE_PASSWORD). Read plainly.
+            return try readStdinLineAlloc(gpa, io);
+        };
+        var new = old;
+        new.lflag.ECHO = false;
+        new.lflag.ECHONL = true;
+        std.posix.tcsetattr(fd, .FLUSH, new) catch {};
+        defer std.posix.tcsetattr(fd, .FLUSH, old) catch {};
         return try readStdinLineAlloc(gpa, io);
+    }
+}
+
+// Windows: disable console echo via SetConsoleMode for the duration of the
+// read. kernel32's console-mode calls aren't surfaced by std, so declare them
+// here (analysed only on a Windows build — this fn is unreferenced elsewhere).
+fn readPasswordSilentWindows(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const w = std.os.windows;
+    const STD_INPUT_HANDLE: w.DWORD = 0xFFFFFFF6; // (DWORD)-10
+    const ENABLE_ECHO_INPUT: w.DWORD = 0x0004;
+    const k = struct {
+        extern "kernel32" fn GetStdHandle(id: w.DWORD) callconv(.winapi) w.HANDLE;
+        extern "kernel32" fn GetConsoleMode(h: w.HANDLE, mode: *w.DWORD) callconv(.winapi) w.BOOL;
+        extern "kernel32" fn SetConsoleMode(h: w.HANDLE, mode: w.DWORD) callconv(.winapi) w.BOOL;
     };
-    var new = old;
-    new.lflag.ECHO = false;
-    new.lflag.ECHONL = true;
-    std.posix.tcsetattr(fd, .FLUSH, new) catch {};
-    defer std.posix.tcsetattr(fd, .FLUSH, old) catch {};
+    const h = k.GetStdHandle(STD_INPUT_HANDLE);
+    var mode: w.DWORD = 0;
+    if (h == w.INVALID_HANDLE_VALUE or !k.GetConsoleMode(h, &mode).toBool()) {
+        // Redirected / not a console — read plainly (mirrors the POSIX path).
+        return try readStdinLineAlloc(gpa, io);
+    }
+    _ = k.SetConsoleMode(h, mode & ~ENABLE_ECHO_INPUT);
+    defer _ = k.SetConsoleMode(h, mode);
     return try readStdinLineAlloc(gpa, io);
 }
 
