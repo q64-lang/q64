@@ -64,6 +64,7 @@ BINARYEN_CACHE_SHA256_x86_64_linux="b5832372417ab28bc8c2a32e4404d85110e04a33c4a5
 BINARYEN_CACHE_SHA256_aarch64_linux="737be1ea11586d7bbc00723d29eb76cdad82851e59520579dee6d3ea57e19062"
 BINARYEN_CACHE_SHA256_aarch64_darwin="d6d00cfec33fdf9cd0324be5c6d7606579b0877ad59338ef7d2d0c28bac9ac38"
 BINARYEN_CACHE_SHA256_x86_64_darwin="30ac3d1da0fc183e41df93708f3a7391443cff9bc8aa7a217098ae1fdb91d14e"
+BINARYEN_CACHE_SHA256_aarch64_windows="04f3d2cdfb0b5818807845669c37fe734ef040fe1657e2aa62dda77142d85853"
 
 # wabt (wat2wasm / wasm2wat) — OPTIONAL developer tooling: compile the WAT
 # fixtures + component helper modules to wasm, and inspect emitted modules.
