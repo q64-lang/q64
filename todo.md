@@ -1129,6 +1129,20 @@ concatenation for interpolation.
 - [ ] `--frozen` / `--locked` flags; `add` dedup.
 - [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
 - [ ] `qube remove` / `outdated` still stubs.
+- [ ] **`qube pod deploy` rejects static-asset qubes.** A qube with
+      `static: { dir: "web" }` and no component (the `qubepods-examples`
+      `qube_rocks`/`blackbird` shape) fails with `manifest has no
+      component.wasm, component.module, or component.variants` — but the
+      qubepods server already accepts a component-less bundle (the component is
+      **optional** server-side; a manifest + asset tree is a valid deploy). So
+      today static qubes must be shipped by hand-rolling the
+      `POST <api>/api/deploy` multipart (verified — see `qubeworlds/qubekit`
+      `apps/editor/deploy.sh`, live at `qubekit-editor.qubepod.app`). Fix: when
+      there's no `component.*`, pack `qubepod.jsonc` + `assets.directory` only.
+      Also update `spec/qube-cli.md` §`qube pod deploy` — it currently says the
+      bundle is "the manifest, every component wasm, and the asset tree", which
+      reads as component-required; spec the static-only case explicitly (spec is
+      the source of truth, so it should define it).
 
 ### Notes for the next agent
 - Build with the **vendored** zig: `vendor/zig/zig build` (homebrew zig at
