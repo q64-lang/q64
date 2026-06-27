@@ -957,8 +957,25 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
         },
         .scope_stmt => |ss| try buildScopeStmt(b, ss, scope, rt, out),
         .select_stmt => |sel| try buildSelectStmt(b, sel, scope, rt, out),
+        .panic_stmt => |ps| try buildPanic(b, ps, scope, rt, out),
         else => return error.Unsupported,
     }
+}
+
+/// `panic <msg?>`: a `str` message is written to stderr then the program traps;
+/// a non-str / absent payload traps without a message (the v0 floor). Shared by
+/// `main` and callee bodies.
+fn buildPanic(b: *Builder, ps: ast.PanicStmt, scope: *Scope, rt: ?*const RtMap, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    var msg: ?*hir.Expr = null;
+    if (ps.value()) |v| {
+        msg = buildStrExpr(b, v, scope, rt) catch |e| switch (e) {
+            error.Unsupported => null, // non-str payload: trap without a message (v0)
+            else => return e,
+        };
+    }
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .panic = msg };
+    try out.append(b.a, st);
 }
 
 /// `select { v = ch.recv() -> body, … }` on the v0 cooperative floor: a
@@ -3716,6 +3733,7 @@ fn buildVoidStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayList
             }
             try buildForVec(b, fs, iname, pat.text, scope, &rt, out);
         },
+        .panic_stmt => |ps| try buildPanic(b, ps, scope, null, out),
         else => return error.Unsupported,
     }
 }
@@ -14067,6 +14085,24 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "panic: a string message builds a panic stmt (no capability marked)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    env.out("before")
+        \\    panic "boom"
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "panic \"boom\"") != null);
+    // `panic` is divergence, not a capability — only env.out's @stdout shows.
+    try testing.expect(std.mem.indexOf(u8, dump, "@stderr") == null);
 }
 
 test "env.envvars.get: a str value marking @envvars" {

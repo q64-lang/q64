@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
     // module's import — introspect it. The callback then reads each arg by its
     // runtime kind, so one host binary runs modules of either address space.
     // -------------------------------------------------------------
-    const env_out_i32 = envOutWantsI32(module);
+    const env_out_i32 = moduleAddrIsI32(module);
     // env.args layout uses the module's address width; argv[0] is the program.
     g_ptr_width = if (env_out_i32) 4 else 8;
     try g_args.insert(g_alloc, 0, wasm_path);
@@ -978,7 +978,12 @@ fn argAddr(v: c.wasmtime_val_t) i64 {
 /// Inspect the module's imports for `env`/`out` and report whether its first
 /// parameter is i32 (wasm32). The host defines a matching func type. Defaults
 /// to i64 (wasm64) when the import is absent or not a function.
-fn envOutWantsI32(module: ?*c.wasmtime_module_t) bool {
+/// Detect the module's address width (wasm32 → i32, wasm64 → i64) from the
+/// first parameter of any `env.*` face that takes an address-width argument —
+/// `out`/`err` (ptr,len), `fs_read`/`args`/`envvar` (dest,…). Checking several
+/// faces (not just `env.out`) means a module that imports only `env.err` (a
+/// bare `panic`) or only `env.args` still detects the width correctly.
+fn moduleAddrIsI32(module: ?*c.wasmtime_module_t) bool {
     var imports: c.wasm_importtype_vec_t = undefined;
     c.wasmtime_module_imports(module, &imports);
     defer c.wasm_importtype_vec_delete(&imports);
@@ -986,11 +991,13 @@ fn envOutWantsI32(module: ?*c.wasmtime_module_t) bool {
     while (i < imports.size) : (i += 1) {
         const imp = imports.data[i] orelse continue;
         if (!nameEql(c.wasm_importtype_module(imp), "env")) continue;
-        if (!nameEql(c.wasm_importtype_name(imp), "out")) continue;
-        const ft = c.wasm_externtype_as_functype(@constCast(c.wasm_importtype_type(imp))) orelse return false;
+        const nm = c.wasm_importtype_name(imp);
+        const addr_face = nameEql(nm, "out") or nameEql(nm, "err") or
+            nameEql(nm, "fs_read") or nameEql(nm, "args") or nameEql(nm, "envvar");
+        if (!addr_face) continue;
+        const ft = c.wasm_externtype_as_functype(@constCast(c.wasm_importtype_type(imp))) orelse continue;
         const ps = c.wasm_functype_params(ft);
         if (ps.*.size >= 1) return c.wasm_valtype_kind(ps.*.data[0]) == c.WASM_I32;
-        return false;
     }
     return false;
 }

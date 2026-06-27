@@ -164,6 +164,14 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try app(gpa, out, "\n", .{});
         },
         .cont => try app(gpa, out, "continue\n", .{}),
+        .panic => |maybe| {
+            try app(gpa, out, "panic", .{});
+            if (maybe) |msg| {
+                try app(gpa, out, " ", .{});
+                try hirExpr(gpa, out, msg);
+            }
+            try app(gpa, out, "\n", .{});
+        },
     }
 }
 

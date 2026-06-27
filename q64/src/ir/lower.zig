@@ -139,6 +139,20 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             } });
         },
         .host_exit => |e| return mk(ctx.a, .void, .{ .host_exit = .{ .code = try lowerExpr(ctx, e) } }),
+        .panic => |maybe| {
+            // Write the message (if any) to stderr, then trap. The host
+            // surfaces the trap as exit 1.
+            var items: std.ArrayList(*mir.Inst) = .empty;
+            if (maybe) |msg| switch (msg.*) {
+                .str_const => |bytes| try items.append(ctx.a, try hostOutConst(ctx, bytes, .err)),
+                else => {
+                    const nl = try ctx.newline();
+                    try items.append(ctx.a, try mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, msg), .nl_off = nl, .stream = .err } }));
+                },
+            };
+            try items.append(ctx.a, try mk(ctx.a, .void, .@"unreachable"));
+            return mk(ctx.a, .void, .{ .block = try items.toOwnedSlice(ctx.a) });
+        },
         .host_call => |hc| {
             // A `str`-valued argument lowers to a (ptr, len) str inst; any other
             // is an i64. The backend reads each arg's `.ty` to push 2 or 1 wasm

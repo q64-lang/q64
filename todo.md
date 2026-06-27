@@ -1501,13 +1501,27 @@ spec/q64-cli.md `--component`).
       `zig build cli-tests` now builds the host and points
       `Q64_WASMTIME_HOST` at it. Verified: hello → stdout + exit 0; `env.exit(3)`
       → 3; panic/compile-error → 1; missing file → 65.
-      - **Note:** an uncaught `panic` currently exits 1 via a *compile* error
-        (`panic` codegen is unimplemented — `UnsupportedExpression`), not a
-        runtime trap; the exit code is correct either way. Lowering `panic` to a
-        trap, `q64 build`, and the `--quiet`/`--help` flag surface are follow-ons.
+      - **Note:** `q64 build` and the `--quiet`/`--help` flag surface are
+        follow-ons.
       - **Pre-existing (unrelated) red:** `build.test.ts` twin-counter
         (`--module name=DIR` reads the dir as a file → `IsDir`); fails on the
         unmodified binary too — a module-resolution bug, not part of `run`.
+- [x] **`panic <msg>` → a real runtime trap.** `panic` was parsed + typechecked
+      but unimplemented in codegen (`UnsupportedExpression`). Now it lowers to a
+      stderr write of the message (reusing the `host_out_str`/`host_out_const`
+      stream machinery with `stream = .err`) followed by a wasm `unreachable`,
+      which the host surfaces as exit 1. New `hir.Stmt.panic: ?*Expr`, built in
+      both `main` and callee bodies; `panic` is divergence (control flow), not a
+      capability, so it marks **no** effect. Also fixed a host bug surfaced by
+      the bare-`panic` case: `q64-wasmtime-host` detected the module's address
+      width from `env.out` only, so a module importing just `env.err` (a
+      message-only panic) mis-detected — now it checks any address-width `env`
+      face (`out`/`err`/`fs_read`/`args`/`envvar`). Verified: `panic "boom"`
+      prints `boom` to stderr and exits 1; output before the panic still
+      flushes. +1 unit test; 543 green.
+      - **Boundaries (v0):** a non-str / absent payload traps without a message;
+        the `Panic` face (custom payload types, `fit T : Panic`) and `try`/`Err`
+        propagation that the spec pairs with panic are follow-ons.
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.

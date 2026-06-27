@@ -118,6 +118,10 @@ fn collectStmt(
             d.insert(.exit);
             try collectExpr(a, expr, d, e);
         },
+        // `panic` is control-flow (divergence), not a capability — the stderr
+        // write is the runtime's, so it marks no effect. Collect the message's
+        // own effects (a nested call) only.
+        .panic => |maybe| if (maybe) |expr| try collectExpr(a, expr, d, e),
         .host_call => |hc| {
             d.insert(faceEffect(hc.name));
             for (hc.args) |arg| try collectExpr(a, arg, d, e);

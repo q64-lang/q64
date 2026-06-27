@@ -339,6 +339,10 @@ pub const Stmt = union(enum) {
     loop_: *Stmt,
     brk,
     cont,
+    /// `panic <msg?>` — write the message (a `str`, when present) to stderr,
+    /// then trap (a wasm `unreachable`, which the host surfaces as exit 1).
+    /// A non-str / absent payload traps without a message on the v0 floor.
+    panic: ?*Expr,
 };
 
 /// High-level expressions. `str` stays abstract; the `(ptr, len)` ABI is a
