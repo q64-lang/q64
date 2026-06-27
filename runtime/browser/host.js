@@ -8,6 +8,11 @@
 //     and forwards them to a caller-supplied sink. UTF-8 is the
 //     producer contract; the host does not validate it.
 //
+//   env.err :: (ptr: i32, len: i32) -> ()
+//     The stderr twin of env.out (`wasi:cli/stderr`). Same decode;
+//     forwards to the caller's `errSink` (defaulting to `sink` when
+//     none is given, so a single-stream caller still sees the bytes).
+//
 //   env.exit :: (code: i64) -> ()
 //     Terminates the run with `code` as its exit status (the browser
 //     mirror of wasi:cli/exit). There is no process to kill, so it
@@ -35,26 +40,34 @@ class Q64Exit {
  *
  * @param {string} url - URL to the .wasm artifact.
  * @param {(text: string) => void} sink - Receives each env.out write.
+ * @param {(text: string) => void} [errSink] - Receives each env.err write;
+ *   defaults to `sink` so single-stream callers still see stderr bytes.
  * @returns {Promise<number>} the exit code (0 if `_start` returns normally,
  *   or the code passed to `env.exit`).
  */
-export async function runWasm(url, sink) {
+export async function runWasm(url, sink, errSink) {
     const resp = await fetch(url);
     if (!resp.ok) {
         throw new Error(`fetch ${url}: ${resp.status} ${resp.statusText}`);
     }
     const bytes = await resp.arrayBuffer();
+    const toErr = errSink ?? sink;
 
     let instance;
+    const read = (name, ptr, len) => {
+        const mem = instance.exports.memory;
+        if (!(mem instanceof WebAssembly.Memory)) {
+            throw new Error(`${name}: module has no \`memory\` export`);
+        }
+        return decoder.decode(new Uint8Array(mem.buffer, ptr >>> 0, len >>> 0));
+    };
     const imports = {
         env: {
             out(ptr, len) {
-                const mem = instance.exports.memory;
-                if (!(mem instanceof WebAssembly.Memory)) {
-                    throw new Error("env.out: module has no `memory` export");
-                }
-                const view = new Uint8Array(mem.buffer, ptr >>> 0, len >>> 0);
-                sink(decoder.decode(view));
+                sink(read("env.out", ptr, len));
+            },
+            err(ptr, len) {
+                toErr(read("env.err", ptr, len));
             },
             exit(code) {
                 // `code` is a wasm i64 → JS BigInt. Keep the low byte.

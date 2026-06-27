@@ -1420,11 +1420,26 @@ spec/q64-cli.md `--component`).
       both wasm32 + wasm64 via `q64-wasmtime-host`; `runtime/browser` unwinds
       `_start` and returns the code. +3 unit tests (HIR `host_exit` + `@exit`,
       raw-face import, preview1 `proc_exit`). 536 unit tests green.
-      - **Follow-on:** the rest of `wasi:cli` — `@stderr` (`fd_write` fd 2 →
-        `wasi:cli/stderr`) and `env.args`/`env.envvars`
-        (`args_get`/`environ_get` → `wasi:cli/environment`). The `q64 run`
-        subcommand (then the `run.test.ts` `env.exit(N)` exit-code test flips
-        from `test.failing` to green).
+      - **Follow-on:** the rest of `wasi:cli` — `@stderr` (done, below) and
+        `env.args`/`env.envvars` (`args_get`/`environ_get` →
+        `wasi:cli/environment`). The `q64 run` subcommand (then the
+        `run.test.ts` `env.exit(N)` exit-code test flips from `test.failing` to
+        green).
+- [x] **`env.err` → `wasi:cli/stderr` (the third `wasi:cli` command
+      capability).** `env.err(<expr>)` reuses the full `env.out` value
+      classification (const/runtime str, interpolation, bool, float, i64) — the
+      `host_out*` family now carries a `Stream` tag (`out`/`err`) rather than
+      duplicating into a parallel `host_err*` set, so only the final sink
+      differs. The effect pass marks `@stderr` (closes over `@io`); the backend
+      writes to the raw `(import "env" "err")` face (declared per-stream, so an
+      err-only module imports `env.err` and *not* `env.out`) or, on the
+      preview1 path, `fd_write` to **fd 2** (one `fd_write` import serves both
+      fds), which the adapter lifts to `wasi:cli/stderr`. Hosts:
+      `runtime/wasmtime` writes to the process stderr; `runtime/browser` routes
+      to an `errSink` (defaulting to the stdout sink). Verified end-to-end: raw
+      core keeps stdout/stderr separate via the host; the component imports
+      `wasi:cli/stderr` and separates the streams under `wasmtime run`. +2 unit
+      tests; 538 green.
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.

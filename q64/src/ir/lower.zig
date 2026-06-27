@@ -109,33 +109,33 @@ fn lowerEntry(ctx: Ctx, body: *const hir.Stmt) Error!*mir.Inst {
 
 fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
     switch (s.*) {
-        .host_out => |e| {
+        .host_out => |h| {
             // env.out("X") writes "X\n": fold value + newline into `data`.
-            const bytes = switch (e.*) {
+            const bytes = switch (h.value.*) {
                 .str_const => |b| b,
                 else => unreachable,
             };
-            return hostOutConst(ctx, bytes);
+            return hostOutConst(ctx, bytes, h.stream);
         },
-        .host_out_int => |e| {
+        .host_out_int => |h| {
             const nl = try ctx.newline();
-            return mk(ctx.a, .void, .{ .host_out_int = .{ .value = try lowerExpr(ctx, e), .nl_off = nl } });
+            return mk(ctx.a, .void, .{ .host_out_int = .{ .value = try lowerExpr(ctx, h.value), .nl_off = nl, .stream = mapStream(h.stream) } });
         },
-        .host_out_float => |e| {
+        .host_out_float => |h| {
             const nl = try ctx.newline();
-            return mk(ctx.a, .void, .{ .host_out_float = .{ .value = try lowerExpr(ctx, e), .nl_off = nl } });
+            return mk(ctx.a, .void, .{ .host_out_float = .{ .value = try lowerExpr(ctx, h.value), .nl_off = nl, .stream = mapStream(h.stream) } });
         },
-        .host_out_str => |e| {
+        .host_out_str => |h| {
             const nl = try ctx.newline();
-            return mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, e), .nl_off = nl } });
+            return mk(ctx.a, .void, .{ .host_out_str = .{ .value = try lowerStrExpr(ctx, h.value), .nl_off = nl, .stream = mapStream(h.stream) } });
         },
-        .host_out_bool => |e| {
+        .host_out_bool => |h| {
             // `env.out(<bool>)` → `if e { out("true") } else { out("false") }`.
-            const cond = try lowerCond(ctx, e);
+            const cond = try lowerCond(ctx, h.value);
             return mk(ctx.a, .void, .{ .if_ = .{
                 .cond = cond,
-                .then_ = try hostOutConst(ctx, "true"),
-                .else_ = try hostOutConst(ctx, "false"),
+                .then_ = try hostOutConst(ctx, "true", h.stream),
+                .else_ = try hostOutConst(ctx, "false", h.stream),
             } });
         },
         .host_exit => |e| return mk(ctx.a, .void, .{ .host_exit = .{ .code = try lowerExpr(ctx, e) } }),
@@ -179,13 +179,23 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
     }
 }
 
-/// Fold `bytes` + a trailing newline into the data image and emit the
-/// `env.out` of that constant run (the `env.out("X")` shape).
-fn hostOutConst(ctx: Ctx, bytes: []const u8) Error!*mir.Inst {
+/// Map an HIR stream tag to its MIR twin (the two enums are kept distinct so
+/// `mir` does not import `hir`).
+fn mapStream(s: hir.Stream) mir.Stream {
+    return switch (s) {
+        .out => .out,
+        .err => .err,
+    };
+}
+
+/// Fold `bytes` + a trailing newline into the data image and emit the host
+/// write of that constant run on `stream` (the `env.out("X")` / `env.err("X")`
+/// shape).
+fn hostOutConst(ctx: Ctx, bytes: []const u8, stream: hir.Stream) Error!*mir.Inst {
     const off: u32 = @intCast(ctx.data.items.len);
     try ctx.data.appendSlice(ctx.a, bytes);
     try ctx.data.append(ctx.a, '\n');
-    return mk(ctx.a, .void, .{ .host_out_const = .{ .off = off, .len = @intCast(bytes.len + 1) } });
+    return mk(ctx.a, .void, .{ .host_out_const = .{ .off = off, .len = @intCast(bytes.len + 1), .stream = mapStream(stream) } });
 }
 
 fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {

@@ -36,6 +36,23 @@ fn hirEffects(gpa: std.mem.Allocator, out: *Buf, effs: []const hir.Effect) Error
     }
 }
 
+/// Dump verb for a host write: `host_out<suffix>` to stdout, `host_err<suffix>`
+/// to stderr. Keeping the `host_out*` spelling for stdout holds existing golden
+/// dumps stable; stderr writes read as `host_err*`.
+fn hostVerb(stream: hir.Stream, comptime suffix: []const u8) []const u8 {
+    return switch (stream) {
+        .out => "host_out" ++ suffix,
+        .err => "host_err" ++ suffix,
+    };
+}
+
+fn mirHostVerb(stream: mir.Stream, comptime suffix: []const u8) []const u8 {
+    return switch (stream) {
+        .out => "host_out" ++ suffix,
+        .err => "host_err" ++ suffix,
+    };
+}
+
 fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) Error!void {
     try indent(gpa, out, depth);
     switch (s.*) {
@@ -43,29 +60,29 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try app(gpa, out, "block\n", .{});
             for (items) |child| try hirStmt(gpa, out, child, depth + 1);
         },
-        .host_out => |e| {
-            try app(gpa, out, "host_out ", .{});
-            try hirExpr(gpa, out, e);
+        .host_out => |h| {
+            try app(gpa, out, "{s} ", .{hostVerb(h.stream, "")});
+            try hirExpr(gpa, out, h.value);
             try app(gpa, out, "\n", .{});
         },
-        .host_out_int => |e| {
-            try app(gpa, out, "host_out_int ", .{});
-            try hirExpr(gpa, out, e);
+        .host_out_int => |h| {
+            try app(gpa, out, "{s} ", .{hostVerb(h.stream, "_int")});
+            try hirExpr(gpa, out, h.value);
             try app(gpa, out, "\n", .{});
         },
-        .host_out_float => |e| {
-            try app(gpa, out, "host_out_float ", .{});
-            try hirExpr(gpa, out, e);
+        .host_out_float => |h| {
+            try app(gpa, out, "{s} ", .{hostVerb(h.stream, "_float")});
+            try hirExpr(gpa, out, h.value);
             try app(gpa, out, "\n", .{});
         },
-        .host_out_str => |e| {
-            try app(gpa, out, "host_out_str ", .{});
-            try hirExpr(gpa, out, e);
+        .host_out_str => |h| {
+            try app(gpa, out, "{s} ", .{hostVerb(h.stream, "_str")});
+            try hirExpr(gpa, out, h.value);
             try app(gpa, out, "\n", .{});
         },
-        .host_out_bool => |e| {
-            try app(gpa, out, "host_out_bool ", .{});
-            try hirExpr(gpa, out, e);
+        .host_out_bool => |h| {
+            try app(gpa, out, "{s} ", .{hostVerb(h.stream, "_bool")});
+            try hirExpr(gpa, out, h.value);
             try app(gpa, out, "\n", .{});
         },
         .host_exit => |e| {
@@ -415,7 +432,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "block : {s}\n", .{@tagName(inst.ty)});
             for (items) |child| try mirInst(gpa, out, child, depth + 1);
         },
-        .host_out_const => |hc| try app(gpa, out, "host_out_const off={d} len={d}\n", .{ hc.off, hc.len }),
+        .host_out_const => |hc| try app(gpa, out, "{s} off={d} len={d}\n", .{ mirHostVerb(hc.stream, "_const"), hc.off, hc.len }),
         .host_call => |hc| {
             try app(gpa, out, "host_call {s} ({d} args)\n", .{ hc.name, hc.args.len });
             for (hc.args) |a| try mirInst(gpa, out, a, depth + 1);
@@ -460,11 +477,11 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             if (v) |val| try mirInst(gpa, out, val, depth + 1);
         },
         .host_out_int => |hi| {
-            try app(gpa, out, "host_out_int nl_off={d}\n", .{hi.nl_off});
+            try app(gpa, out, "{s} nl_off={d}\n", .{ mirHostVerb(hi.stream, "_int"), hi.nl_off });
             try mirInst(gpa, out, hi.value, depth + 1);
         },
         .host_out_float => |hf| {
-            try app(gpa, out, "host_out_float nl_off={d}\n", .{hf.nl_off});
+            try app(gpa, out, "{s} nl_off={d}\n", .{ mirHostVerb(hf.stream, "_float"), hf.nl_off });
             try mirInst(gpa, out, hf.value, depth + 1);
         },
         .str_const_val => |sc| try app(gpa, out, "str_const_val off={d} len={d}\n", .{ sc.off, sc.len }),
@@ -479,7 +496,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try mirInst(gpa, out, sb.value, depth + 1);
         },
         .host_out_str => |hs| {
-            try app(gpa, out, "host_out_str nl_off={d}\n", .{hs.nl_off});
+            try app(gpa, out, "{s} nl_off={d}\n", .{ mirHostVerb(hs.stream, "_str"), hs.nl_off });
             try mirInst(gpa, out, hs.value, depth + 1);
         },
         .host_exit => |he| {
@@ -597,7 +614,7 @@ const testing = std.testing;
 test "mir CFG escape hatch: a hand-built basic-block body prints" {
     // No pass produces CFG bodies yet; this exercises the reserved seam so
     // the types stay live and the dumper handles both forms.
-    var inst: mir.Inst = .{ .ty = .void, .op = .{ .host_out_const = .{ .off = 0, .len = 4 } } };
+    var inst: mir.Inst = .{ .ty = .void, .op = .{ .host_out_const = .{ .off = 0, .len = 4, .stream = .out } } };
     const bb: mir.BasicBlock = .{ .insts = &.{&inst}, .term = .{ .ret = null } };
     var cfg: mir.Cfg = .{ .blocks = &.{bb}, .entry = 0 };
     const func: mir.Func = .{ .name = "start", .body = .{ .cfg = &cfg }, .linkage = .entry };

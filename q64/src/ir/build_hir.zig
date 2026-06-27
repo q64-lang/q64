@@ -2940,6 +2940,12 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 try out.append(b.a, st);
                 return;
             }
+            // `env.err(expr)` — same value-classification as `env.out`, but the
+            // write targets stderr (`@stderr` → `wasi:cli/stderr`).
+            if (isEnvErr(b.a, call)) {
+                try buildHostWrite(b, call, scope, rt, .err, out);
+                return;
+            }
             // A statement-position call to a void procedure (`log(5)`): build
             // the call and discard its (absent) result. A non-void call here
             // is rejected — a value may not be left on the stack.
@@ -2957,52 +2963,60 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 try out.append(b.a, st);
                 return;
             }
-            const arg = firstArg(call) orelse return error.Unsupported;
+            try buildHostWrite(b, call, scope, rt, .out, out);
+}
 
-            const st = try b.a.create(hir.Stmt);
-            if (try tryConst(b, arg)) |bytes| {
-                // A constant string/number/interpolation → fold into the data.
-                const e = try b.a.create(hir.Expr);
-                e.* = .{ .str_const = bytes };
-                st.* = .{ .host_out = e };
-            } else if (arg == .path and rt.get(try pathText(b, arg.path)) != null) {
-                // env.out(g) where g is a runtime str binding.
-                const bnd = rt.get(try pathText(b, arg.path)).?;
-                const e = try b.a.create(hir.Expr);
-                e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
-                st.* = .{ .host_out_str = e };
-            } else if (arg == .string_lit) {
-                // A string literal with interpolation. If it folds entirely to
-                // a constant (e.g. only untyped fold-only helpers), emit a
-                // folded `host_out`; otherwise a runtime concat.
-                const v = try buildConcat(b, arg.string_lit, scope, false, rt);
-                st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
-            } else if (try isStrCall(b, arg, scope)) {
-                // A real call to a str-returning function.
-                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
-            } else if ((try exprScalar(b, arg, scope)) == .str) {
-                // A str-valued expression (`s.slice(0, 5)`, a binding copy).
-                st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, rt) };
-            } else if (try exprIsBool(b, arg, scope)) {
-                // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool
-                // binding, or a `-> bool` call. Printed as "true" / "false".
-                st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
-            } else if (isFloatSc(try exprScalar(b, arg, scope))) {
-                // A float: formatted via __fmt_f64 (decimal, ≤6 frac
-                // digits); an f32 promotes to f64 first — one formatter.
-                var fv = try buildIntExpr(b, arg, scope);
-                if ((try exprScalar(b, arg, scope)) == .f32) {
-                    const w = try b.a.create(hir.Expr);
-                    w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
-                    fv = w;
-                }
-                st.* = .{ .host_out_float = fv };
-            } else {
-                // Otherwise an i64 expression (a call to an i64 function).
-                const e = try buildIntExpr(b, arg, scope);
-                st.* = .{ .host_out_int = e };
-            }
-            try out.append(b.a, st);
+/// Build an `env.out(expr)` / `env.err(expr)` host write. The argument is
+/// classified by type — const string, runtime str binding, interpolation, a
+/// str-returning call/expression, a bool, a float, or an i64 — into the
+/// matching `host_out*` statement. `stream` selects stdout vs stderr; the
+/// classification + formatting are identical for both, so this is shared.
+fn buildHostWrite(b: *Builder, call: ast.CallExpr, scope: *Scope, rt: *RtMap, stream: hir.Stream, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const arg = firstArg(call) orelse return error.Unsupported;
+    const st = try b.a.create(hir.Stmt);
+    if (try tryConst(b, arg)) |bytes| {
+        // A constant string/number/interpolation → fold into the data.
+        const e = try b.a.create(hir.Expr);
+        e.* = .{ .str_const = bytes };
+        st.* = .{ .host_out = .{ .value = e, .stream = stream } };
+    } else if (arg == .path and rt.get(try pathText(b, arg.path)) != null) {
+        // env.out(g) where g is a runtime str binding.
+        const bnd = rt.get(try pathText(b, arg.path)).?;
+        const e = try b.a.create(hir.Expr);
+        e.* = .{ .str_binding = .{ .ptr_idx = bnd.ptr_idx, .len_idx = bnd.len_idx } };
+        st.* = .{ .host_out_str = .{ .value = e, .stream = stream } };
+    } else if (arg == .string_lit) {
+        // A string literal with interpolation. If it folds entirely to a
+        // constant (e.g. only untyped fold-only helpers), emit a folded
+        // `host_out`; otherwise a runtime concat.
+        const v = try buildConcat(b, arg.string_lit, scope, false, rt);
+        st.* = if (v.* == .str_const) .{ .host_out = .{ .value = v, .stream = stream } } else .{ .host_out_str = .{ .value = v, .stream = stream } };
+    } else if (try isStrCall(b, arg, scope)) {
+        // A real call to a str-returning function.
+        st.* = .{ .host_out_str = .{ .value = try buildStrExpr(b, arg, scope, rt), .stream = stream } };
+    } else if ((try exprScalar(b, arg, scope)) == .str) {
+        // A str-valued expression (`s.slice(0, 5)`, a binding copy).
+        st.* = .{ .host_out_str = .{ .value = try buildStrExpr(b, arg, scope, rt), .stream = stream } };
+    } else if (try exprIsBool(b, arg, scope)) {
+        // A boolean: a comparison, `&&`/`||`/`!`, a literal, a bool binding, or
+        // a `-> bool` call. Printed as "true" / "false".
+        st.* = .{ .host_out_bool = .{ .value = try buildIntExpr(b, arg, scope), .stream = stream } };
+    } else if (isFloatSc(try exprScalar(b, arg, scope))) {
+        // A float: formatted via __fmt_f64 (decimal, ≤6 frac digits); an f32
+        // promotes to f64 first — one formatter.
+        var fv = try buildIntExpr(b, arg, scope);
+        if ((try exprScalar(b, arg, scope)) == .f32) {
+            const w = try b.a.create(hir.Expr);
+            w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
+            fv = w;
+        }
+        st.* = .{ .host_out_float = .{ .value = fv, .stream = stream } };
+    } else {
+        // Otherwise an i64 expression (a call to an i64 function).
+        const e = try buildIntExpr(b, arg, scope);
+        st.* = .{ .host_out_int = .{ .value = e, .stream = stream } };
+    }
+    try out.append(b.a, st);
 }
 
 /// Build a `{ … }` block of `main` statements into one HIR block.
@@ -3882,7 +3896,19 @@ fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.Array
         else => return error.Unsupported,
     };
     if (isEnvOut(b.a, call)) {
-        try out.append(b.a, try buildVoidEnvOut(b, call, scope));
+        try out.append(b.a, try buildVoidEnvOut(b, call, scope, .out));
+        return;
+    }
+    if (isEnvErr(b.a, call)) {
+        try out.append(b.a, try buildVoidEnvOut(b, call, scope, .err));
+        return;
+    }
+    if (isEnvExit(b.a, call)) {
+        const arg = firstArg(call) orelse return error.Unsupported;
+        const e = try buildIntExpr(b, arg, scope);
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .host_exit = e };
+        try out.append(b.a, st);
         return;
     }
     if (try hostFaceName(b, call)) |fname| {
@@ -4046,18 +4072,18 @@ fn buildVoidIfNode(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.S
 /// `env.out(<arg>)` in a void procedure: the same str/bool/float/i64
 /// classification as `main`'s form, but without const-folding or runtime
 /// str-binding lookups (callee bodies have neither).
-fn buildVoidEnvOut(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!*hir.Stmt {
+fn buildVoidEnvOut(b: *Builder, call: ast.CallExpr, scope: *Scope, stream: hir.Stream) BuildError!*hir.Stmt {
     const arg = firstArg(call) orelse return error.Unsupported;
     const st = try b.a.create(hir.Stmt);
     if (arg == .string_lit) {
         // A string literal, possibly interpolated: a fully-constant run folds
         // to `host_out`, otherwise a runtime concat.
         const v = try buildConcat(b, arg.string_lit, scope, true, null);
-        st.* = if (v.* == .str_const) .{ .host_out = v } else .{ .host_out_str = v };
+        st.* = if (v.* == .str_const) .{ .host_out = .{ .value = v, .stream = stream } } else .{ .host_out_str = .{ .value = v, .stream = stream } };
     } else if ((try isStrCall(b, arg, scope)) or (try exprScalar(b, arg, scope)) == .str) {
-        st.* = .{ .host_out_str = try buildStrExpr(b, arg, scope, null) };
+        st.* = .{ .host_out_str = .{ .value = try buildStrExpr(b, arg, scope, null), .stream = stream } };
     } else if (try exprIsBool(b, arg, scope)) {
-        st.* = .{ .host_out_bool = try buildIntExpr(b, arg, scope) };
+        st.* = .{ .host_out_bool = .{ .value = try buildIntExpr(b, arg, scope), .stream = stream } };
     } else if (isFloatSc(try exprScalar(b, arg, scope))) {
         var fv = try buildIntExpr(b, arg, scope);
         if ((try exprScalar(b, arg, scope)) == .f32) {
@@ -4065,9 +4091,9 @@ fn buildVoidEnvOut(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!*h
             w.* = .{ .num_cast = .{ .to = .f64, .value = fv } };
             fv = w;
         }
-        st.* = .{ .host_out_float = fv };
+        st.* = .{ .host_out_float = .{ .value = fv, .stream = stream } };
     } else {
-        st.* = .{ .host_out_int = try buildIntExpr(b, arg, scope) };
+        st.* = .{ .host_out_int = .{ .value = try buildIntExpr(b, arg, scope), .stream = stream } };
     }
     return st;
 }
@@ -9526,6 +9552,17 @@ fn isEnvExit(a: std.mem.Allocator, call: ast.CallExpr) bool {
     return std.mem.eql(u8, txt, "env.exit");
 }
 
+fn isEnvErr(a: std.mem.Allocator, call: ast.CallExpr) bool {
+    const callee = call.callee() orelse return false;
+    const path = switch (callee) {
+        .path => |p| p,
+        else => return false,
+    };
+    const txt = path.text(a) catch return false;
+    defer a.free(txt);
+    return std.mem.eql(u8, txt, "env.err");
+}
+
 fn firstArg(call: ast.CallExpr) ?ast.Expr {
     var args = call.args();
     return args.next();
@@ -13891,6 +13928,31 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "env.err: writes build host_err* and mark @stderr" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn shout(n: i64) -> i64 { n + 1 }
+        \\fn main {
+        \\    env.out("to out")
+        \\    env.err("to err")
+        \\    env.err(shout(6))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // stdout writes still print as `host_out*`; stderr writes as `host_err*`.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out \"to out\"") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_err \"to err\"") != null);
+    // A non-constant i64 to err takes the formatted path → `host_err_int`.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_err_int") != null);
+    // Both capabilities are inferred (each closes over @io).
+    try testing.expect(std.mem.indexOf(u8, dump, "@stdout") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@stderr") != null);
 }
 
 test "env.exit: an i64 code builds host_exit and marks @exit (not @io)" {

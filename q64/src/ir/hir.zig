@@ -282,24 +282,36 @@ pub const Func = struct {
 /// resolved index assigned by the builder (parameters first, then in-body
 /// bindings in declaration order). Compound assignment (`+=` …) is desugared
 /// to `assign(idx, bin(op, local(idx), rhs))`.
+/// Which standard byte stream a host write targets. `out` → `env.out` /
+/// `wasi:cli/stdout`; `err` → `env.err` / `wasi:cli/stderr`. The formatting and
+/// newline handling are identical; only the final sink (the raw `env.*` face or
+/// the preview1 fd) differs, so the whole `host_out*` family carries this tag
+/// rather than duplicating into a parallel `host_err*` set.
+pub const Stream = enum { out, err };
+
+/// One host byte-write: the value expression plus its target stream. Shared by
+/// every `host_out*` statement form (`env.out` and `env.err` differ only in
+/// `.stream`).
+pub const HostWrite = struct { value: *Expr, stream: Stream };
+
 pub const Stmt = union(enum) {
     block: []const *Stmt,
     /// `v.push(x)` — append an i64 element to a vec (copy-on-grow).
     vec_push: struct { vec: *Expr, value: *Expr },
-    /// `env.out(expr)` — `expr` is `str`-typed. The trailing newline is the
+    /// `env.out/err(expr)` — `expr` is `str`-typed. The trailing newline is the
     /// capability ABI's, materialized during lowering.
-    host_out: *Expr,
-    /// `env.out(expr)` where `expr` is `i64` — formatted to decimal on lowering.
-    host_out_int: *Expr,
-    /// `env.out(expr)` where `expr` is `f64` — formatted via `__fmt_f64`.
-    host_out_float: *Expr,
-    /// `env.out(expr)` where `expr` is a runtime `str` value (e.g. a call to a
-    /// str-returning function) — its `(ptr, len)` is written, then a newline.
-    host_out_str: *Expr,
-    /// `env.out(expr)` where `expr` is a boolean (a comparison, `&&`/`||`/`!`,
+    host_out: HostWrite,
+    /// `env.out/err(expr)` where `expr` is `i64` — formatted to decimal on lowering.
+    host_out_int: HostWrite,
+    /// `env.out/err(expr)` where `expr` is `f64` — formatted via `__fmt_f64`.
+    host_out_float: HostWrite,
+    /// `env.out/err(expr)` where `expr` is a runtime `str` value (e.g. a call to
+    /// a str-returning function) — its `(ptr, len)` is written, then a newline.
+    host_out_str: HostWrite,
+    /// `env.out/err(expr)` where `expr` is a boolean (a comparison, `&&`/`||`/`!`,
     /// a `true`/`false` literal, or a `-> bool` call). Lowers to a value `if`
     /// that writes the constant `"true"` / `"false"` text.
-    host_out_bool: *Expr,
+    host_out_bool: HostWrite,
     /// `env.exit(expr)` — `expr` is the `i64` process exit code. Lowers to the
     /// raw `env.exit` host face (browser / wasmtime-core hosts) or, on the
     /// preview1/component path, `wasi_snapshot_preview1.proc_exit` (which the

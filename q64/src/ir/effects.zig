@@ -106,10 +106,11 @@ fn collectStmt(
 ) std.mem.Allocator.Error!void {
     switch (stmt.*) {
         .block => |stmts| for (stmts) |s| try collectStmt(a, s, d, e),
-        // Every `env.out` form writes stdout.
-        .host_out, .host_out_int, .host_out_float, .host_out_str, .host_out_bool => |expr| {
-            d.insert(.stdout);
-            try collectExpr(a, expr, d, e);
+        // Every host-write form reaches stdout (`env.out`) or stderr (`env.err`),
+        // per its stream tag. Both close over `@io` (`Effect.implies`).
+        .host_out, .host_out_int, .host_out_float, .host_out_str, .host_out_bool => |h| {
+            d.insert(if (h.stream == .err) .stderr else .stdout);
+            try collectExpr(a, h.value, d, e);
         },
         // `env.exit` reaches the exit capability. Unlike the byte-I/O faces it
         // does not imply `@io` (`Effect.implies`) — it targets `wasi:cli/exit`.

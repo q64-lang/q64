@@ -877,7 +877,13 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // The preview1 path also reserves a fixed scratch region (`iovec_base`) just
     // past the static data for the iovec + `nwritten` cell `fd_write` needs; the
     // arena starts past it so concat buffers never clobber the iovec.
+    // `usesEnvOut` is stream-blind: true for any host byte-write (stdout OR
+    // stderr), which is the right gate for the shared iovec scratch + the single
+    // `fd_write` import (it serves both fd 1 and fd 2). The raw-face import
+    // declaration, by contrast, is stream-specific — `env.out` vs `env.err`.
     const wants_out = usesEnvOut(m);
+    const writes_stdout = usesHostStream(m, .out);
+    const writes_stderr = usesHostStream(m, .err);
     const preview1 = (stdout_abi == .wasi_preview1) and wants_out;
     // iovec (8 bytes: i32 buf, i32 len) + nwritten (4 bytes), padded to 16.
     const iovec_scratch: usize = if (preview1) 16 else 0;
@@ -896,12 +902,17 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     if (wants_out) {
         switch (stdout_abi) {
             .env_out => {
-                var env_out_params = [_]c.BinaryenType{ ptr_type, ptr_type };
-                const env_out_params_type = c.BinaryenTypeCreate(&env_out_params, env_out_params.len);
-                c.BinaryenAddFunctionImport(module, "env_out", "env", "out", env_out_params_type, none_type);
+                // Raw host faces: `(import "env" "out")` / `(import "env" "err")`,
+                // each `(ptr, len) -> ()`. Declared per stream actually written,
+                // so an err-only (or out-only) module imports exactly what it calls.
+                var io_params = [_]c.BinaryenType{ ptr_type, ptr_type };
+                const io_params_type = c.BinaryenTypeCreate(&io_params, io_params.len);
+                if (writes_stdout) c.BinaryenAddFunctionImport(module, "env_out", "env", "out", io_params_type, none_type);
+                if (writes_stderr) c.BinaryenAddFunctionImport(module, "env_err", "env", "err", io_params_type, none_type);
             },
             .wasi_preview1 => {
                 // fd_write(fd: i32, iovs: i32, iovs_len: i32, nwritten: i32) -> errno: i32.
+                // One import serves both fd 1 (stdout) and fd 2 (stderr).
                 var fd_params = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type };
                 const fd_params_type = c.BinaryenTypeCreate(&fd_params, fd_params.len);
                 c.BinaryenAddFunctionImport(module, "fd_write", "wasi_snapshot_preview1", "fd_write", fd_params_type, i32_type);
@@ -1620,6 +1631,51 @@ fn instUsesEnvExit(inst: *const ir.mir.Inst) bool {
     return false;
 }
 
+/// True if any function performs a host byte-write to `stream` (a `host_out*`
+/// node tagged with it). Drives the per-stream raw-face import declaration so an
+/// `env.err`-only (or `env.out`-only) module imports exactly the face it calls.
+fn usesHostStream(m: *const ir.mir.Module, stream: ir.mir.Stream) bool {
+    for (m.funcs) |f| switch (f.body) {
+        .structured => |root| if (instUsesHostStream(root, stream)) return true,
+        .cfg => {},
+    };
+    return false;
+}
+
+fn instUsesHostStream(inst: *const ir.mir.Inst, stream: ir.mir.Stream) bool {
+    switch (inst.op) {
+        .host_out_const => |hc| return hc.stream == stream,
+        .host_out_int => |hi| return hi.stream == stream or instUsesHostStream(hi.value, stream),
+        .host_out_float => |hf| return hf.stream == stream or instUsesHostStream(hf.value, stream),
+        .host_out_str => |hs| return hs.stream == stream or instUsesHostStream(hs.value, stream),
+        .str_concat => |pieces| for (pieces) |p| {
+            if (instUsesHostStream(p, stream)) return true;
+        },
+        .fmt_int_to_str => |inner| return instUsesHostStream(inner, stream),
+        .block => |items| for (items) |ch| {
+            if (instUsesHostStream(ch, stream)) return true;
+        },
+        .local_set => |ls| return instUsesHostStream(ls.value, stream),
+        .bin => |b| return instUsesHostStream(b.lhs, stream) or instUsesHostStream(b.rhs, stream),
+        .un => |u| return instUsesHostStream(u.operand, stream),
+        .call => |cl| for (cl.args) |a| {
+            if (instUsesHostStream(a, stream)) return true;
+        },
+        .ret => |v| if (v) |val| return instUsesHostStream(val, stream),
+        .if_ => |iff| return instUsesHostStream(iff.cond, stream) or instUsesHostStream(iff.then_, stream) or
+            (iff.else_ != null and instUsesHostStream(iff.else_.?, stream)),
+        .while_ => |w| return instUsesHostStream(w.cond, stream) or instUsesHostStream(w.body, stream),
+        .loop => |body| return instUsesHostStream(body, stream),
+        .host_call => |hc| for (hc.args) |a| {
+            if (instUsesHostStream(a, stream)) return true;
+        },
+        .global_set => |gs| return instUsesHostStream(gs.value, stream),
+        .str_bind => |sb| return instUsesHostStream(sb.value, stream),
+        else => {},
+    }
+    return false;
+}
+
 const Scratch = struct {
     host_out: bool = false,
     has_concat: bool = false,
@@ -2023,7 +2079,7 @@ const Lowerer = struct {
                 for (items, 0..) |child, i| children[i] = try self.inst(child);
                 return c.BinaryenBlock(module, null, @ptrCast(children.ptr), @intCast(children.len), self.wty(n.ty));
             },
-            .host_out_const => |hc| return self.envOut(@intCast(hc.off), @intCast(hc.len)),
+            .host_out_const => |hc| return self.envWrite(hc.stream, @intCast(hc.off), @intCast(hc.len)),
             .host_exit => |he| return self.envExit(try self.inst(he.code)),
             .const_i64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt64(v)),
             .const_f64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralFloat64(v)),
@@ -2180,7 +2236,7 @@ const Lowerer = struct {
                 defer self.region_lvl -= 1;
                 var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(hi.value)};
                 const fmt = c.BinaryenCall(module, "__fmt_i64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
-                return self.resetAfter(d, self.hostOutPair(fmt, @intCast(hi.nl_off)));
+                return self.resetAfter(d, self.hostWritePair(hi.stream, fmt, @intCast(hi.nl_off)));
             },
             .host_out_float => |hf| {
                 // __fmt_f64(value) → (ptr, len), then write it + the newline.
@@ -2189,13 +2245,13 @@ const Lowerer = struct {
                 defer self.region_lvl -= 1;
                 var fmt_args = [_]c.BinaryenExpressionRef{try self.inst(hf.value)};
                 const fmt = c.BinaryenCall(module, "__fmt_f64", @ptrCast(&fmt_args), fmt_args.len, self.pair_type);
-                return self.resetAfter(d, self.hostOutPair(fmt, @intCast(hf.nl_off)));
+                return self.resetAfter(d, self.hostWritePair(hf.stream, fmt, @intCast(hf.nl_off)));
             },
             .host_out_str => |hs| {
                 const d = self.region_lvl;
                 self.region_lvl += 1;
                 defer self.region_lvl -= 1;
-                return self.resetAfter(d, self.hostOutPair(try self.inst(hs.value), @intCast(hs.nl_off)));
+                return self.resetAfter(d, self.hostWritePair(hs.stream, try self.inst(hs.value), @intCast(hs.nl_off)));
             },
             .host_call => |hc| {
                 // A `str` argument expands to two operands (ptr, len), exactly
@@ -2524,10 +2580,10 @@ const Lowerer = struct {
         }
     }
 
-    /// Write `[off, off+len)` of linear memory to stdout — `host_out_const` and
-    /// the trailing newline of `host_out_*` go through here.
-    fn envOut(self: *Lowerer, off: i64, len: i64) c.BinaryenExpressionRef {
-        return self.writeStdout(self.ptrConst(off), self.ptrConst(len));
+    /// Write `[off, off+len)` of linear memory to `stream` — `host_out_const`
+    /// and the trailing newline of `host_out_*` go through here.
+    fn envWrite(self: *Lowerer, stream: ir.mir.Stream, off: i64, len: i64) c.BinaryenExpressionRef {
+        return self.writeStream(stream, self.ptrConst(off), self.ptrConst(len));
     }
 
     /// `env.kv.increment` lowered to the canonical `wasi:keyvalue` ABI. Lazily
@@ -2609,32 +2665,41 @@ const Lowerer = struct {
         };
     }
 
-    /// Emit a single stdout write of the `(ptr, len)` pair, lowered per the
-    /// build's `StdoutAbi`: a direct `env.out(ptr, len)` call, or a WASI
-    /// `fd_write` of one iovec to fd 1.
-    fn writeStdout(self: *Lowerer, ptr_expr: c.BinaryenExpressionRef, len_expr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+    /// Emit a single write of the `(ptr, len)` pair to `stream`, lowered per the
+    /// build's `StdoutAbi`: a direct `env.out`/`env.err(ptr, len)` call, or a
+    /// WASI `fd_write` of one iovec to fd 1 (stdout) / fd 2 (stderr).
+    fn writeStream(self: *Lowerer, stream: ir.mir.Stream, ptr_expr: c.BinaryenExpressionRef, len_expr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
         return switch (self.stdout_abi) {
             .env_out => blk: {
                 var args = [_]c.BinaryenExpressionRef{ ptr_expr, len_expr };
-                break :blk c.BinaryenCall(self.module, "env_out", @ptrCast(&args), args.len, self.none_type);
+                const face = switch (stream) {
+                    .out => "env_out",
+                    .err => "env_err",
+                };
+                break :blk c.BinaryenCall(self.module, face, @ptrCast(&args), args.len, self.none_type);
             },
-            .wasi_preview1 => self.fdWrite(ptr_expr, len_expr),
+            .wasi_preview1 => self.fdWrite(stream, ptr_expr, len_expr),
         };
     }
 
-    /// WASI preview1 stdout write: assemble an iovec `{buf: ptr, len}` at the
-    /// reserved scratch address and `fd_write(1, iovec, 1, nwritten)`, dropping
-    /// the errno. The preview1 ABI is 32-bit, so addresses/values are i32.
-    fn fdWrite(self: *Lowerer, ptr_expr: c.BinaryenExpressionRef, len_expr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+    /// WASI preview1 byte write: assemble an iovec `{buf: ptr, len}` at the
+    /// reserved scratch address and `fd_write(fd, iovec, 1, nwritten)`, dropping
+    /// the errno. `fd` is 1 (stdout) or 2 (stderr). The preview1 ABI is 32-bit,
+    /// so addresses/values are i32.
+    fn fdWrite(self: *Lowerer, stream: ir.mir.Stream, ptr_expr: c.BinaryenExpressionRef, len_expr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
         const m = self.module;
         const i32c = struct {
             fn f(mod: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
                 return c.BinaryenConst(mod, c.BinaryenLiteralInt32(v));
             }
         }.f;
+        const fd: i32 = switch (stream) {
+            .out => 1,
+            .err => 2,
+        };
         const base: i32 = @intCast(self.iovec_base);
         var call_args = [_]c.BinaryenExpressionRef{
-            i32c(m, 1), // fd 1 = stdout
+            i32c(m, fd), // fd 1 = stdout, fd 2 = stderr
             i32c(m, base), // iovs: the iovec we just stored
             i32c(m, 1), // iovs_len: one iovec
             i32c(m, base + 8), // nwritten: 4-byte scratch cell
@@ -2777,18 +2842,19 @@ const Lowerer = struct {
         }
     }
 
-    /// Write a `(ptr, len)` pair value to env.out, then the newline byte:
-    /// stash the pair in the scratch local, extract both halves, env.out them,
-    /// then env.out(nl, 1).
-    fn hostOutPair(self: *Lowerer, pair: c.BinaryenExpressionRef, nl_off: i64) c.BinaryenExpressionRef {
+    /// Write a `(ptr, len)` pair value to `stream`, then the newline byte: stash
+    /// the pair in the scratch local, extract both halves, write them, then
+    /// write `(nl, 1)`. The value and its newline go to the same stream.
+    fn hostWritePair(self: *Lowerer, stream: ir.mir.Stream, pair: c.BinaryenExpressionRef, nl_off: i64) c.BinaryenExpressionRef {
         const module = self.module;
         var seq = [_]c.BinaryenExpressionRef{
             c.BinaryenLocalSet(module, self.pair_idx, pair),
-            self.writeStdout(
+            self.writeStream(
+                stream,
                 c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 0),
                 c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, self.pair_idx, self.pair_type), 1),
             ),
-            self.envOut(nl_off, 1),
+            self.envWrite(stream, nl_off, 1),
         };
         return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
     }
@@ -4321,6 +4387,23 @@ test "emitComponent: a declared-but-uncalled import is not wired (import what yo
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "emitFromSource: env.err declares the raw env.err face; out+err declares both" {
+    // An err-only program imports `(import "env" "err")` and NOT `env.out`
+    // (the raw-face declaration is stream-precise).
+    const err_only = "fn main { env.err(\"oops\") }\n";
+    const eo = try emitFromSource(testing.allocator, err_only, "main.q", &.{}, .wasm32);
+    defer testing.allocator.free(eo);
+    try testing.expectEqualSlices(u8, "\x00asm", eo[0..4]);
+    try testing.expect(std.mem.indexOf(u8, eo, "err") != null);
+
+    // out + err (newline-separated statements) → both faces declared.
+    const both = "fn main {\n    env.out(\"a\")\n    env.err(\"b\")\n}\n";
+    const b = try emitFromSource(testing.allocator, both, "main.q", &.{}, .wasm32);
+    defer testing.allocator.free(b);
+    try testing.expect(std.mem.indexOf(u8, b, "out") != null);
+    try testing.expect(std.mem.indexOf(u8, b, "err") != null);
 }
 
 test "emitFromSource: env.exit declares the raw env.exit host face import" {

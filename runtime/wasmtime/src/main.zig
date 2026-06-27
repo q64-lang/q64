@@ -203,6 +203,26 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // env.err :: (ptr, len) -> () — the stderr twin of env.out (same
+    // address-width signature, `wasi:cli/stderr`). Reuses `env_out_type`.
+    {
+        const link_err = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "err",
+            "err".len,
+            env_out_type,
+            envErrCallback,
+            null,
+            null,
+        );
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.err");
+            std.process.exit(1);
+        }
+    }
+
     // -------------------------------------------------------------
     // env.fs_read :: (dest, path_ptr, path_len) -> i64 (spec/env.md
     // §"Wire ABI: fs.read"). Same address-width introspection as env.out.
@@ -565,21 +585,41 @@ fn envOutCallback(
     _ = env_;
     _ = results;
     _ = nresults;
+    return hostByteWrite(caller, args, nargs, false);
+}
 
-    if (nargs != 2) return trap("env.out: expected (ptr, len)");
+/// `env.err(ptr, len)` — the stderr twin of `env.out` (`wasi:cli/stderr`).
+fn envErrCallback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = results;
+    _ = nresults;
+    return hostByteWrite(caller, args, nargs, true);
+}
 
-    // ptr/len are i32 (wasm32) or i64 (wasm64); read each by its runtime kind
-    // so the host is address-space-agnostic.
+/// Shared body of `env.out` / `env.err`: read `(ptr, len)` from guest memory and
+/// write the bytes verbatim to stdout (`to_stderr == false`) or stderr. ptr/len
+/// are i32 (wasm32) or i64 (wasm64), read by runtime kind so one host binary
+/// serves either address space.
+fn hostByteWrite(caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, nargs: usize, to_stderr: bool) ?*c.wasm_trap_t {
+    if (nargs != 2) return trap(if (to_stderr) "env.err: expected (ptr, len)" else "env.out: expected (ptr, len)");
+
     const ptr_i64 = argAddr(args[0]);
     const len_i64 = argAddr(args[1]);
-    if (ptr_i64 < 0 or len_i64 < 0) return trap("env.out: negative ptr/len");
+    if (ptr_i64 < 0 or len_i64 < 0) return trap(if (to_stderr) "env.err: negative ptr/len" else "env.out: negative ptr/len");
 
     var memory_item: c.wasmtime_extern_t = undefined;
     if (!c.wasmtime_caller_export_get(caller, "memory", "memory".len, &memory_item)) {
-        return trap("env.out: module has no `memory` export");
+        return trap(if (to_stderr) "env.err: module has no `memory` export" else "env.out: module has no `memory` export");
     }
     if (memory_item.kind != c.WASMTIME_EXTERN_MEMORY) {
-        return trap("env.out: `memory` export is not a memory");
+        return trap(if (to_stderr) "env.err: `memory` export is not a memory" else "env.out: `memory` export is not a memory");
     }
 
     const ctx = c.wasmtime_caller_context(caller);
@@ -588,15 +628,14 @@ fn envOutCallback(
 
     const ptr: usize = @intCast(ptr_i64);
     const len: usize = @intCast(len_i64);
-    if (ptr + len > data_size) return trap("env.out: out-of-bounds write");
+    if (ptr + len > data_size) return trap(if (to_stderr) "env.err: out-of-bounds write" else "env.out: out-of-bounds write");
 
     const slice = data[ptr .. ptr + len];
     const io = std.Io.Threaded.global_single_threaded.io();
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
-    w.interface.writeAll(slice) catch return trap("env.out: stdout write failed");
-    w.interface.flush() catch return trap("env.out: stdout flush failed");
-
+    var w = if (to_stderr) std.Io.File.stderr().writer(io, &buf) else std.Io.File.stdout().writer(io, &buf);
+    w.interface.writeAll(slice) catch return trap(if (to_stderr) "env.err: stderr write failed" else "env.out: stdout write failed");
+    w.interface.flush() catch return trap(if (to_stderr) "env.err: stderr flush failed" else "env.out: stdout flush failed");
     return null;
 }
 

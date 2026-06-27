@@ -148,9 +148,14 @@ pub const Inst = struct {
 ///   const_i64/local_get/local_set/bin/un/call/ret — the i64 value + call ops.
 ///   host_out_int   — `env.out` of an i64: format to decimal then write,
 ///                    followed by the shared newline byte at `nl_off`.
+/// Target byte stream of a host write (`env.out` → stdout, `env.err` → stderr).
+/// Mirrors `hir.Stream`; only the final sink differs (fd 1/2 or the raw
+/// `env.out`/`env.err` face), so the formatting ops carry the tag.
+pub const Stream = enum { out, err };
+
 pub const Op = union(enum) {
     block: []const *Inst,
-    host_out_const: struct { off: u32, len: u32 },
+    host_out_const: struct { off: u32, len: u32, stream: Stream },
     const_i64: i64,
     const_f64: f64,
     /// An explicit numeric conversion; the target type is `inst.ty`, the
@@ -170,9 +175,9 @@ pub const Op = union(enum) {
     un: struct { kind: ops.UnKind, operand: *Inst },
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
-    host_out_int: struct { value: *Inst, nl_off: u32 },
+    host_out_int: struct { value: *Inst, nl_off: u32, stream: Stream },
     /// `env.out` of an f64: `__fmt_f64` to decimal text, write, newline.
-    host_out_float: struct { value: *Inst, nl_off: u32 },
+    host_out_float: struct { value: *Inst, nl_off: u32, stream: Stream },
     /// A constant `str` value: the `(ptr, len)` pointing at `off`/`len` in the
     /// memory image (no trailing newline — it's a value, not a host write).
     str_const_val: struct { off: u32, len: u32 },
@@ -190,7 +195,7 @@ pub const Op = union(enum) {
     str_binding: struct { ptr_idx: u32, len_idx: u32 },
     /// `env.out` of a runtime `str` value (a `(ptr, len)` pair) followed by the
     /// shared newline byte at `nl_off`.
-    host_out_str: struct { value: *Inst, nl_off: u32 },
+    host_out_str: struct { value: *Inst, nl_off: u32, stream: Stream },
     /// A call to a host import face (e.g. `qview.text`). `name` is the dotted
     /// source name; the backend declares the matching wasm import
     /// (`(import "qview" "text" …)`) and emits the call. Args are i64 values

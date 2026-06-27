@@ -287,11 +287,12 @@ released snapshot rather than re-pinning on every upstream RC:
 > version is the latest the upstream command world ships, not a separate q64
 > choice.
 >
-> **Implementation status.** Today q64 lowers `env.out` to a `preview1`
-> `fd_write` core import and `env.exit` to a `preview1` `proc_exit` import, both
-> lifted with `wasm-tools component new --adapt` (the vendored adapter): the
-> result is a `wasi:cli/run` command importing `wasi:cli/stdout` +
-> `wasi:cli/exit`. `env.out` uses the *synchronous* `wasi:io/streams@0.2.x`
+> **Implementation status.** Today q64 lowers `env.out`/`env.err` to a
+> `preview1` `fd_write` core import (fd 1 / fd 2) and `env.exit` to a `preview1`
+> `proc_exit` import, all lifted with `wasm-tools component new --adapt` (the
+> vendored adapter): the result is a `wasi:cli/run` command importing
+> `wasi:cli/stdout` + `wasi:cli/stderr` + `wasi:cli/exit`. `env.out`/`env.err`
+> use the *synchronous* `wasi:io/streams@0.2.x`
 > write — correct as a command but not yet the async path. Note `wasi:cli/exit`
 > carries a `result<(), ()>`, so a non-zero `env.exit(N)` collapses to exit
 > status 1 on the component path; the **raw `env.*` face** path (the
