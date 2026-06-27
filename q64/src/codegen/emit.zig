@@ -1493,6 +1493,11 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .elem_ptr => |ep| bodyHasOut(ep.base, want_int) or bodyHasOut(ep.index, want_int),
         .bounds_check => |bc| bodyHasOut(bc.index, want_int) or bodyHasOut(bc.count, want_int),
         .host_exit => |he| bodyHasOut(he.code, want_int),
+        .strlist_make => |inits| blk: {
+            for (inits) |it| if (bodyHasOut(it, want_int)) break :blk true;
+            break :blk false;
+        },
+        .strlist_get => |g| bodyHasOut(g.list, want_int) or bodyHasOut(g.idx, want_int),
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .chan_recv => |h| bodyHasOut(h, want_int),
@@ -1936,6 +1941,25 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(vg.idx, s);
         },
         .host_exit => |he| scanScratch(he.code, s),
+        .strlist_make => |inits| {
+            // Like array_make: a base-ptr scratch (rec level) holds the block
+            // while elements evaluate; the pair scratch splits each element.
+            s.host_out = true;
+            var inner: u32 = 0;
+            for (inits) |it| {
+                var sub = Scratch{};
+                scanScratch(it, &sub);
+                if (sub.rec_depth > inner) inner = sub.rec_depth;
+                mergeScratch(s, &sub);
+            }
+            if (inner + 1 > s.rec_depth) s.rec_depth = inner + 1;
+        },
+        .strlist_get => |g| {
+            s.host_out = true; // the list pair rides the pair scratch
+            s.has_bounds = true; // the index rides the bounds scratch
+            scanScratch(g.list, s);
+            scanScratch(g.idx, s);
+        },
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
@@ -2465,6 +2489,8 @@ const Lowerer = struct {
             },
             .record_make => |rm| return self.emitRecordMake(rm),
             .array_make => |am| return self.emitArrayMake(am),
+            .strlist_make => |inits| return self.emitStrlistMake(inits),
+            .strlist_get => |g| return self.emitStrlistGet(g),
             .elem_ptr => |ep| {
                 // base + index·stride (index is i64; narrow to the address
                 // width on wasm32).
@@ -3052,6 +3078,81 @@ const Lowerer = struct {
 
         try stmts.append(self.allocator, self.ptrGet(ridx));
         return c.BinaryenBlock(m, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), self.ptr_type);
+    }
+
+    /// A `[str]` literal: bump-allocate `count` consecutive `(ptr, len)` str
+    /// cells (stride = two address-width words) in the scope arena, store each
+    /// element's pair, and yield the `(base, count)` pair — the str-list value.
+    /// `base` rides the rec-base scratch (like `emitArrayMake`); each element is
+    /// stashed in the pair scratch so its two halves can be split out.
+    fn emitStrlistMake(self: *Lowerer, inits: []const *const ir.mir.Inst) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const w: u32 = if (self.ptr_type == self.i32_type) 4 else 8; // address width
+        const stride: u32 = 2 * w; // (ptr, len) per element
+        const ridx = self.rec_base + self.rec_level;
+        var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer stmts.deinit(self.allocator);
+
+        // Align the bump pointer to the address width, then carve count·stride.
+        const bumped = self.ptrAdd(c.BinaryenGlobalGet(m, "sp", self.ptr_type), self.ptrConst(@intCast(w - 1)));
+        try stmts.append(self.allocator, c.BinaryenGlobalSet(m, "sp", self.ptrAnd(bumped, self.ptrConst(-@as(i64, w)))));
+        try stmts.append(self.allocator, c.BinaryenLocalSet(m, ridx, c.BinaryenGlobalGet(m, "sp", self.ptr_type)));
+        const total: i64 = @as(i64, stride) * @as(i64, @intCast(inits.len));
+        try stmts.append(self.allocator, c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(ridx), self.ptrConst(total))));
+
+        for (inits, 0..) |init_v, i| {
+            const slot_off: u32 = @intCast(@as(u64, stride) * i);
+            self.rec_level += 1;
+            const pair = try self.inst(init_v);
+            self.rec_level -= 1;
+            // Stash the element's (ptr, len) pair, then store each half.
+            try stmts.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, pair));
+            const eptr = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0);
+            const elen = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1);
+            try stmts.append(self.allocator, c.BinaryenStore(m, w, slot_off, 0, self.ptrGet(ridx), eptr, self.ptr_type, "0"));
+            try stmts.append(self.allocator, c.BinaryenStore(m, w, slot_off + w, 0, self.ptrGet(ridx), elen, self.ptr_type, "0"));
+        }
+
+        // Yield the (data_ptr, count) pair.
+        var elems = [_]c.BinaryenExpressionRef{ self.ptrGet(ridx), self.ptrConst(@intCast(inits.len)) };
+        try stmts.append(self.allocator, c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len));
+        return c.BinaryenBlock(m, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), self.pair_type);
+    }
+
+    /// `xs[i]` on a `[str]` value: stash the `(data_ptr, count)` list pair and
+    /// the index, trap unless `0 <= i < count` (unsigned compare), then load the
+    /// i-th `(ptr, len)` cell as a str pair. Binaryen needs a tree (no shared
+    /// refs), so each `data_ptr`/index read is rebuilt fresh from its local.
+    fn emitStrlistGet(self: *Lowerer, g: anytype) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const w: u32 = if (self.ptr_type == self.i32_type) 4 else 8;
+        const stride: u32 = 2 * w;
+        const mul = if (self.ptr_type == self.i32_type) c.BinaryenMulInt32() else c.BinaryenMulInt64();
+        // Fresh `data_ptr + i·stride` each call (the list pair lives in pair_idx,
+        // the index in bounds_idx).
+        const elemAddr = struct {
+            fn f(s: *Lowerer, mm: c.BinaryenModuleRef, st: u32, mulop: c.BinaryenOp) c.BinaryenExpressionRef {
+                const dp = c.BinaryenTupleExtract(mm, c.BinaryenLocalGet(mm, s.pair_idx, s.pair_type), 0);
+                const off = c.BinaryenBinary(mm, mulop, s.toPtr(c.BinaryenLocalGet(mm, s.bounds_idx, s.i64_type)), s.ptrConst(@intCast(st)));
+                return s.ptrAdd(dp, off);
+            }
+        }.f;
+        var elems = [_]c.BinaryenExpressionRef{
+            c.BinaryenLoad(m, w, false, 0, 0, self.ptr_type, elemAddr(self, m, stride, mul), "0"),
+            c.BinaryenLoad(m, w, false, w, 0, self.ptr_type, elemAddr(self, m, stride, mul), "0"),
+        };
+        var seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenLocalSet(m, self.pair_idx, try self.inst(g.list)),
+            c.BinaryenLocalSet(m, self.bounds_idx, try self.inst(g.idx)),
+            c.BinaryenIf(
+                m,
+                c.BinaryenBinary(m, c.BinaryenGeUInt64(), c.BinaryenLocalGet(m, self.bounds_idx, self.i64_type), self.toI64(c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1))),
+                c.BinaryenUnreachable(m),
+                null,
+            ),
+            c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len),
+        };
+        return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.pair_type);
     }
 
     /// Pointer-width bitwise AND — for aligning the arena bump pointer.

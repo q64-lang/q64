@@ -1440,6 +1440,23 @@ spec/q64-cli.md `--component`).
       core keeps stdout/stderr separate via the host; the component imports
       `wasi:cli/stderr` and separates the streams under `wasmtime run`. +2 unit
       tests; 538 green.
+- [x] **`[str]` value type (list of strings) — the foundation for `env.args`.**
+      A `[str]` value is a `(data_ptr, count)` pair (the same two-cell shape as
+      `str`) where `data_ptr` points to `count` consecutive `(ptr, len)` str
+      cells. Implemented: a `["a", "b", "c"]` literal (`strlist_make` —
+      bump-allocates the cells in the scope arena), a `let` binding (stored as
+      the str-binding pair + tracked in `scope.strlists`), bounds-checked
+      indexing `xs[i]` → str (`strlist_get`), and `.len()` → i64 (reuses
+      `str_len`, since the count rides the len component). Threads HIR→MIR→emit
+      + the effect/print passes; `exprScalar` classifies `xs[i]`/`xs.len()` so
+      the host-write/let classification doesn't reject. Verified end-to-end
+      (wasm32 + wasm64): `["alpha","beta","gamma"]` → `len()==3`, `xs[0]=alpha`,
+      `xs[2]=gamma`; `xs[5]` traps (bounds). +2 unit tests; 540 green.
+      - **Boundaries (v0):** elements must be string constants/literals — a
+        runtime str-binding element (`[name, …]`) isn't classified yet
+        (`UnsupportedExpression`); no `[str]` params/returns, iteration
+        (`for s in xs`), or `.get(i) -> Result` yet; the host-provided form
+        (`env.args`) builds on this next.
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.

@@ -652,6 +652,23 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     try out.append(b.a, st);
                 }
                 if (!any) return error.Unsupported; // empty literal binds nothing
+            } else if (init_expr == .array and try isStrArrayLit(b, init_expr.array, scope)) {
+                // A `[str]` literal: materialize the `(ptr, len)` cells in the
+                // scope arena; the binding holds the `(data_ptr, count)` pair in
+                // two `.ptr` locals (the str-binding shape), tracked in
+                // `scope.strlists` for index / `.len()` dispatch.
+                const sl = try buildStrlistLit(b, init_expr.array, scope, rt);
+                const ptr_idx: u32 = @intCast(b.cur_locals.items.len);
+                try b.cur_locals.append(b.a, .ptr);
+                try b.cur_locals.append(b.a, .ptr);
+                try scope.strlists.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
+                scope.next_idx = ptr_idx;
+                _ = try scope.declare(nm.text, ls.isVar(), .str);
+                const len_hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{nm.text});
+                _ = try scope.declare(len_hidden, false, .ptr);
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = sl.e } };
+                try out.append(b.a, st);
             } else if (init_expr == .array) {
                 // An array literal: materialize in the scope arena; the
                 // binding holds the base pointer (one .ptr local), the
@@ -4538,6 +4555,18 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             const end = try buildIntExpr(b, ait.next() orelse return error.Unsupported, scope);
             out.* = .{ .str_slice = .{ .str = sval, .start = start, .end = end } };
         },
+        .index => |ix| {
+            // `xs[i]` on a `[str]` binding → the i-th str element.
+            const base = ix.base() orelse return error.Unsupported;
+            if (base != .path) return error.Unsupported;
+            const bn = try base.path.text(b.a);
+            defer b.a.free(bn);
+            const sb = scope.strlists.get(bn) orelse return error.Unsupported;
+            const list = try b.a.create(hir.Expr);
+            list.* = .{ .str_binding = .{ .ptr_idx = sb.ptr_idx, .len_idx = sb.len_idx } };
+            const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
+            out.* = .{ .strlist_get = .{ .list = list, .idx = idx } };
+        },
         else => return error.Unsupported,
     }
     return out;
@@ -6226,6 +6255,36 @@ fn buildArrayLit(b: *Builder, ae: ast.ArrayExpr, scope: *Scope) BuildError!struc
         .inits = try inits.toOwnedSlice(b.a),
     } };
     return .{ .e = out, .count = @intCast(elems.items.len), .stride = w.size, .elem = .{ .scalar = ety } };
+}
+
+/// Is `ae` a `[str]` literal — a non-empty array whose first element is a str
+/// expression? (`["a", "b"]`, `[name, "x"]`.) Used to route the binding to the
+/// str-list path before the scalar/record array path.
+fn isStrArrayLit(b: *Builder, ae: ast.ArrayExpr, scope: *Scope) BuildError!bool {
+    var it = ae.elements();
+    const first = it.next() orelse return false;
+    if (first == .string_lit) return true;
+    if (try isStrCall(b, first, scope)) return true;
+    return (try exprScalar(b, first, scope)) == .str;
+}
+
+/// Build a `[str]` literal (`["a", "b"]`) into a `strlist_make` expr. Every
+/// element is built as a str value; the result is the `(data_ptr, count)` pair.
+/// Returns the expr and the element count.
+fn buildStrlistLit(b: *Builder, ae: ast.ArrayExpr, scope: *Scope, rt: ?*const RtMap) BuildError!struct { e: *hir.Expr, count: u32 } {
+    var inits: std.ArrayList(*hir.Expr) = .empty;
+    var it = ae.elements();
+    while (it.next()) |el| {
+        const sv = if (el == .string_lit)
+            try buildConcat(b, el.string_lit, scope, rt == null, rt)
+        else
+            try buildStrExpr(b, el, scope, rt);
+        try inits.append(b.a, sv);
+    }
+    if (inits.items.len == 0) return error.Unsupported;
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .strlist_make = try inits.toOwnedSlice(b.a) };
+    return .{ .e = out, .count = @intCast(inits.items.len) };
 }
 
 /// The element address `base_ptr_local[index]` with the spec's trapping
@@ -7975,6 +8034,10 @@ fn exprIsBool(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
 /// typer through the bridge). Drives binding types, env.out routing,
 /// and the no-implicit-conversion checks.
 fn exprScalar(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!sema.exprtype.ScalarType {
+    // A `[str]` binding's `xs[i]` is str and `xs.len()` is i64. Classify these
+    // up front — the generic scalar typer would try to resolve `len` as a
+    // function (or index a non-str) and reject.
+    if (strlistExprKind(b, arg, scope)) |k| return k;
     var bridge = ExprTypeBridge{ .b = b, .scope = scope };
     return sema.exprtype.scalarOf(b.a, arg, .{
         .ctx = @ptrCast(&bridge),
@@ -7983,6 +8046,31 @@ fn exprScalar(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!sema.e
         .fieldType = ExprTypeBridge.fieldType,
         .fnRet = ExprTypeBridge.fnRet,
     });
+}
+
+/// If `arg` is an operation on a `[str]` binding, its scalar kind: `xs[i]` is
+/// `.str`, `xs.len()` is `.i64`. Else null (the generic typer handles it).
+/// `xs.len()` parses as a call on the dotted path `xs.len`.
+fn strlistExprKind(b: *Builder, arg: ast.Expr, scope: *const Scope) ?sema.exprtype.ScalarType {
+    switch (arg) {
+        .index => |ix| {
+            const base = ix.base() orelse return null;
+            if (base != .path) return null;
+            const bn = base.path.text(b.a) catch return null;
+            defer b.a.free(bn);
+            if (scope.strlists.contains(bn)) return .str;
+        },
+        .call => |cc| {
+            const callee = cc.callee() orelse return null;
+            if (callee != .path) return null;
+            const cn = callee.path.text(b.a) catch return null;
+            defer b.a.free(cn);
+            const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return null;
+            if (std.mem.eql(u8, cn[dot + 1 ..], "len") and scope.strlists.contains(cn[0..dot])) return .i64;
+        },
+        else => {},
+    }
+    return null;
 }
 
 /// Binding type for a value of this scalar (the typed-local floor).
@@ -8512,6 +8600,12 @@ const Scope = struct {
     /// present. The header base pointer lives in `locals` under the
     /// same name (a `.ptr`); elements are i64.
     vecs: std.StringHashMapUnmanaged(void) = .empty,
+    /// `[str]` (str-list) bindings: name → the two address-width locals
+    /// holding the `(data_ptr, count)` pair (the same shape a `str` binding
+    /// uses). Indexing reads them as a list; `.len()` reads the count via
+    /// `str_len`. Tracked separately from `arrs`/`vecs` because the element
+    /// is a str pair, not a scalar.
+    strlists: std.StringHashMapUnmanaged(StrBinding) = .empty,
     /// Channel bindings (concurrency v0): name → the i64 read-cursor local
     /// index. The buffer is a Vec under the same name (also in `vecs`):
     /// `send` is a `vec_push`, `recv` reads `buf[cursor]` then bumps the
@@ -9142,6 +9236,20 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // `xs.len()` on a `[str]` binding → the element count. `.len()`
+            // parses as a call on the dotted path `xs.len`; the count rides the
+            // len component of the `(data_ptr, count)` pair, so `str_len` reads
+            // it. (Indexing `xs[i]` is str-valued — see `buildStrExpr`.)
+            if (std.mem.lastIndexOfScalar(u8, cname, '.')) |dot| {
+                if (std.mem.eql(u8, cname[dot + 1 ..], "len")) {
+                    if (scope.strlists.get(cname[0..dot])) |sb| {
+                        const list = try b.a.create(hir.Expr);
+                        list.* = .{ .str_binding = .{ .ptr_idx = sb.ptr_idx, .len_idx = sb.len_idx } };
+                        out.* = .{ .str_len = list };
+                        return out;
+                    }
+                }
+            }
             // `c.ask(Msg)` — a value-returning actor handler dispatched by the
             // message name (the value half of message-style actors).
             if (try tryActorAsk(b, cc, scope)) |ae| return ae;
@@ -13928,6 +14036,28 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "[str] value: a literal binding, .len(), and [i] indexing" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    let xs = ["alpha", "beta", "gamma"]
+        \\    env.out(xs.len())
+        \\    env.out(xs[0])
+        \\    env.out(xs[2])
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The literal builds a strlist_make; `.len()` reads the count via str_len;
+    // `xs[i]` is a strlist_get yielding a str the host write consumes.
+    try testing.expect(std.mem.indexOf(u8, dump, "strlist_make[") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "strlist_get(") != null);
 }
 
 test "env.err: writes build host_err* and mark @stderr" {

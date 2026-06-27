@@ -276,6 +276,14 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .fmt_float => |inner| return mk(ctx.a, .str, .{ .fmt_float_to_str = try lowerExpr(ctx, inner) }),
         // `s.slice(a, b)` -> str (ptr+a, b-a). str operand + two i64 bounds.
         .str_slice => |sl| return mk(ctx.a, .str, .{ .str_slice = .{ .str = try lowerStrExpr(ctx, sl.str), .start = try lowerExpr(ctx, sl.start), .end = try lowerExpr(ctx, sl.end) } }),
+        // A `[str]` literal yields the `(data_ptr, count)` pair (str-shaped).
+        .strlist_make => |inits| {
+            const xs = try ctx.a.alloc(*mir.Inst, inits.len);
+            for (inits, 0..) |it, i| xs[i] = try lowerStrExpr(ctx, it);
+            return mk(ctx.a, .str, .{ .strlist_make = xs });
+        },
+        // `xs[i]` yields the i-th str element (a str value).
+        .strlist_get => |g| return mk(ctx.a, .str, .{ .strlist_get = .{ .list = try lowerStrExpr(ctx, g.list), .idx = try lowerExpr(ctx, g.idx) } }),
         else => return error.Unsupported,
     }
 }
@@ -470,6 +478,10 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         },
         // `s.len` — lower the str operand to its (ptr, len) value; the backend
         // reads the len component and zero-extends it to i64.
+        // `[str]` values are str-shaped (a `(data_ptr, count)` pair); route to
+        // the str lowering (a strlist in an i64 position is a type error caught
+        // earlier).
+        .strlist_make, .strlist_get => return lowerStrExpr(ctx, e),
         .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
         // `s[i]` — str operand to (ptr, len), idx to i64; backend loads the byte.
         .str_index => |si| return mk(ctx.a, .i64, .{ .str_index = .{ .str = try lowerStrExpr(ctx, si.str), .idx = try lowerExpr(ctx, si.idx) } }),
@@ -557,6 +569,29 @@ test "lower: literals fold into the memory image with newlines" {
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_const off=0 len=4") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "host_out_const off=4 len=4") != null);
+}
+
+test "lower: a [str] literal lowers to strlist_make + strlist_get" {
+    const noLib: hir.ModuleResolver = .{ .ctx = undefined, .lookupFn = struct {
+        fn f(_: *anyopaque, _: u32, _: []const u8) ?hir.Resolved {
+            return null;
+        }
+    }.f };
+    const pr = try parser.parse.parse(testing.allocator, "fn main {\n let xs = [\"a\", \"b\"]\n env.out(xs[1])\n}\n", "<t>");
+    defer pr.deinit(testing.allocator);
+    const sf = parser.ast.SourceFile.cast(pr.root).?;
+    var h = switch (try build_hir.tryBuild(testing.allocator, sf, noLib, &.{})) {
+        .module => |m| m,
+        else => return error.TestUnexpectedResult,
+    };
+    defer h.deinit();
+
+    var m = try lower(testing.allocator, &h);
+    defer m.deinit();
+    const dump = try print.mirToString(testing.allocator, &m);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "strlist_make n=2") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "strlist_get") != null);
 }
 
 const TestResolver = struct {

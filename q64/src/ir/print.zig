@@ -357,6 +357,21 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, bc.count);
             try app(gpa, out, ")", .{});
         },
+        .strlist_make => |inits| {
+            try app(gpa, out, "strlist_make[", .{});
+            for (inits, 0..) |iv, i| {
+                if (i != 0) try app(gpa, out, ", ", .{});
+                try hirExpr(gpa, out, iv);
+            }
+            try app(gpa, out, "]", .{});
+        },
+        .strlist_get => |g| {
+            try app(gpa, out, "strlist_get(", .{});
+            try hirExpr(gpa, out, g.list);
+            try app(gpa, out, "[", .{});
+            try hirExpr(gpa, out, g.idx);
+            try app(gpa, out, "])", .{});
+        },
     }
 }
 
@@ -502,6 +517,15 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .host_exit => |he| {
             try app(gpa, out, "host_exit\n", .{});
             try mirInst(gpa, out, he.code, depth + 1);
+        },
+        .strlist_make => |inits| {
+            try app(gpa, out, "strlist_make n={d}\n", .{inits.len});
+            for (inits) |it| try mirInst(gpa, out, it, depth + 1);
+        },
+        .strlist_get => |g| {
+            try app(gpa, out, "strlist_get\n", .{});
+            try mirInst(gpa, out, g.list, depth + 1);
+            try mirInst(gpa, out, g.idx, depth + 1);
         },
         .fmt_int_to_str => |inner| {
             try app(gpa, out, "fmt_int_to_str\n", .{});

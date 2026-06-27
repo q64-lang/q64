@@ -228,6 +228,16 @@ pub const Op = union(enum) {
     /// Byte-wise equality of two str values as i32 (0/1). Both are str-typed
     /// insts; lowers to a `__str_eq(pa, la, pb, lb)` helper call.
     str_eq: struct { lhs: *Inst, rhs: *Inst },
+    /// A `[str]` literal: bump-allocate `inits.len` consecutive `(ptr, len)`
+    /// str cells (stride = two address-width words) in the scope arena, store
+    /// each str element, and yield the `(data_ptr, count)` pair (a str-shaped
+    /// value). `.ty` is `.str` — the pair representation is shared with `str`;
+    /// the count rides the len component, read back by `str_len`.
+    strlist_make: []const *Inst,
+    /// `xs[i]` on a `[str]` value (`list` a str-shaped `(data_ptr, count)`
+    /// pair): trap if `i >= count` (unsigned; negatives trap too), then load
+    /// the i-th `(ptr, len)` cell and yield it as a str value. `.ty` is `.str`.
+    strlist_get: struct { list: *Inst, idx: *Inst },
     /// `env.exit(code)` (spec/env.md §`env.exit`): call the `env.exit` host
     /// import (raw face) or `wasi_snapshot_preview1.proc_exit` (preview1 path)
     /// with the i64 `code`. Void — the host terminates the instance.

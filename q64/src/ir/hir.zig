@@ -478,4 +478,13 @@ pub const Expr = union(enum) {
     /// `index < 0` (spec/types.md: bounds violations trap; `a.get(i)` is
     /// the fallible form, later).
     bounds_check: struct { index: *Expr, count: *Expr },
+    /// A `[str]` literal (`["a", "b"]`): materialize `count` consecutive
+    /// `(ptr, len)` str cells in the scope arena and yield the `(data_ptr,
+    /// count)` pair — the str-list value. Each init is a `str` expr. Indexing
+    /// (`strlist_get`) yields a str; `.len()` reads the count via `str_len`
+    /// (the second pair component). Represented as the same pair as `str`.
+    strlist_make: []const *Expr,
+    /// `xs[i]` on a `[str]` value: bounds-check `i < count`, load the i-th
+    /// `(ptr, len)` cell, and yield it as a str value.
+    strlist_get: struct { list: *Expr, idx: *Expr },
 };
