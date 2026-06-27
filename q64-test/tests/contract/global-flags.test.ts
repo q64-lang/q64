@@ -7,7 +7,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { binaryAvailable, fixture, runCli } from "../../src/harness";
+import { binaryAvailable, fixture, hostAvailable, runCli } from "../../src/harness";
 
 describe.skipIf(!binaryAvailable())("global flags (implemented)", () => {
   test("--version prints a version line on stdout and exits 0", () => {
@@ -36,13 +36,16 @@ describe.skipIf(!binaryAvailable())("global flags (spec surface)", () => {
     expect(runCli(["build", fixture("hello.q"), "--out", out, "--features", "fft,mp3"]).exitCode).toBe(0);
   });
 
-  test.failing("--quiet suppresses non-error output on a successful run", () => {
-    const r = runCli(["run", fixture("hello.q"), "--quiet"]);
-    expect(r.exitCode).toBe(0);
-  });
-
   test.failing("--no-color disables ANSI color in text diagnostics", () => {
     const r = runCli(["check", fixture("parse-error.q"), "--no-color"]);
     expect(r.stderr).toMatch(/error\[NAM003\]:/);
+  });
+});
+
+describe.skipIf(!binaryAvailable() || !hostAvailable())("global flags (run surface)", () => {
+  test("--quiet is accepted on a successful run (exit 0)", () => {
+    // v0 tolerates the flag; output suppression lands with the flag surface.
+    const r = runCli(["run", fixture("hello.q"), "--quiet"]);
+    expect(r.exitCode).toBe(0);
   });
 });

@@ -40,6 +40,20 @@ export function binaryAvailable(): boolean {
   return existsSync(Q64_BIN);
 }
 
+/**
+ * Absolute path to the wasmtime runtime host `q64 run` shells out to. Located
+ * via Q64_WASMTIME_HOST (set by `zig build cli-tests`), else the sibling
+ * runtime build output.
+ */
+export const Q64_WASMTIME_HOST = process.env.Q64_WASMTIME_HOST
+  ? resolve(process.env.Q64_WASMTIME_HOST)
+  : resolve(here, "../../runtime/wasmtime/zig-out/bin/q64-wasmtime-host");
+
+/** True when the wasmtime host exists, so `q64 run` can execute programs. */
+export function hostAvailable(): boolean {
+  return existsSync(Q64_WASMTIME_HOST);
+}
+
 export type Severity = "error" | "warning" | "note" | "help" | "internal";
 
 export interface Diagnostic {

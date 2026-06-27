@@ -60,6 +60,23 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "run")) {
+        const file = args_it.next() orelse {
+            try usage(io);
+            std.process.exit(2);
+        };
+        try cmdRun(gpa, io, init.environ_map, file, &args_it);
+        return;
+    }
+
+    // Implicit run: `q64 <file.q>` dispatches to `run` (spec/q64-cli.md
+    // §Synopsis). A bare `.q` path that isn't a known subcommand is a program
+    // to compile and execute.
+    if (std.mem.endsWith(u8, sub, ".q")) {
+        try cmdRun(gpa, io, init.environ_map, sub, &args_it);
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "show")) {
         try cmdShow(gpa, io, &args_it);
         return;
@@ -494,6 +511,87 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
         defer gpa.free(wit_path);
         try writeFile(io, wit_path, wit_text);
     }
+}
+
+/// `q64 run <file.q> [-- args…]` (spec/q64-cli.md §"run"): compile the file to
+/// a raw wasm core (the `env.*` host faces) and execute it on the q64 runtime
+/// host, propagating its exit code. The raw path is used (not the WASI
+/// component) because it preserves the full `env.exit(N)` code and the host
+/// satisfies every `env.*` face. The host binary is located via
+/// `Q64_WASMTIME_HOST`, then the repo's `runtime/wasmtime/zig-out/bin/`, then
+/// `PATH`. Anything after `--` becomes the program's `env.args`.
+fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, src: []const u8, args_it: *std.process.Args.Iterator) !void {
+    // Collect the program's own args. q64 flags (`--quiet`, …) before a `--`
+    // separator are tolerated and ignored in v0; everything after `--` (and any
+    // bare token before it) is the program's `env.args`.
+    var qube_args: std.ArrayList([]const u8) = .empty;
+    defer qube_args.deinit(gpa);
+    var saw_sep = false;
+    while (args_it.next()) |a| {
+        if (saw_sep) {
+            try qube_args.append(gpa, a);
+        } else if (std.mem.eql(u8, a, "--")) {
+            saw_sep = true;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // A q64-level flag — ignored in v0 (the flag surface lands later).
+        } else {
+            try qube_args.append(gpa, a);
+        }
+    }
+
+    const source = std.Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("q64: cannot read {s}: {s}\n", .{ src, @errorName(err) });
+        try w.interface.flush();
+        // Input error (spec/q64-cli.md §"Exit codes": 65 = input).
+        std.process.exit(65);
+    };
+    defer gpa.free(source);
+
+    // Compile to a raw wasm32 core (the `env.*` host faces). wasm32 is the
+    // broad-compatibility target; the host introspects the address width.
+    const bytes = emit.emitFromSourceWithImports(gpa, source, src, &.{}, .wasm32, &.{}) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("q64: compile failed: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        std.process.exit(1);
+    };
+    defer gpa.free(bytes);
+
+    // Write the core to a temp file the host can load, then clean it up.
+    const tmp_dir = if (env.get("TMPDIR")) |t| t else "/tmp";
+    const base = std.fs.path.basename(src);
+    const tmp_wasm = try std.fmt.allocPrint(gpa, "{s}/q64-run-{s}.wasm", .{ tmp_dir, base });
+    defer gpa.free(tmp_wasm);
+    try writeFile(io, tmp_wasm, bytes);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_wasm) catch {};
+
+    const repo_root = findRepoRoot(gpa, io, ".") catch null;
+    defer if (repo_root) |r| gpa.free(r);
+    const host = try resolveBinary(gpa, io, env, "Q64_WASMTIME_HOST", repo_root, "runtime/wasmtime/zig-out/bin/q64-wasmtime-host", "q64-wasmtime-host");
+    defer gpa.free(host);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, host);
+    try argv.append(gpa, tmp_wasm);
+    if (qube_args.items.len > 0) {
+        try argv.append(gpa, "--");
+        for (qube_args.items) |a| try argv.append(gpa, a);
+    }
+
+    const term = spawnInherit(io, argv.items) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        try w.interface.print("q64: could not run the host ({s}): {s}\n", .{ host, @errorName(err) });
+        try w.interface.print("q64: set Q64_WASMTIME_HOST, or build runtime/wasmtime (zig build)\n", .{});
+        try w.interface.flush();
+        std.process.exit(1);
+    };
+    // Propagate the qube's exit code (env.exit(N) → N; a trap/panic → 1).
+    std.process.exit(termCode(term) orelse 1);
 }
 
 /// Lift a WASI **preview1 core module** into a real component by shelling out to

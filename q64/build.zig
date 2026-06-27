@@ -170,6 +170,12 @@ pub fn build(b: *std.Build) void {
     cli_tests.setCwd(b.path("../q64-test"));
     cli_tests.setEnvironmentVariable("Q64_BIN", "../q64/zig-out/bin/q64");
     cli_tests.step.dependOn(b.getInstallStep());
+    // `q64 run` executes through the wasmtime host; build it (the sibling zig
+    // project) and point the suite at it so the `run` tests are exercised.
+    // (cwd is `q64/` here, mirroring the `../scripts/` roundtrips above.)
+    const build_run_host = b.addSystemCommand(&.{ "bash", "-c", "cd .. && vendor/zig/zig build --build-file runtime/wasmtime/build.zig" });
+    cli_tests.step.dependOn(&build_run_host.step);
+    cli_tests.setEnvironmentVariable("Q64_WASMTIME_HOST", "../runtime/wasmtime/zig-out/bin/q64-wasmtime-host");
     const cli_tests_step = b.step("cli-tests", "Run the q64 CLI black-box suite (bun test)");
     cli_tests_step.dependOn(&cli_tests.step);
 }

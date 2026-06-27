@@ -5,7 +5,7 @@
  * `.todo` until the owning subcommand lands.
  */
 import { describe, expect, test } from "bun:test";
-import { binaryAvailable, fixture, runCli } from "../../src/harness";
+import { binaryAvailable, fixture, hostAvailable, runCli } from "../../src/harness";
 
 describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
   test("no subcommand → usage error, exit 2", () => {
@@ -36,22 +36,25 @@ describe.skipIf(!binaryAvailable())("exit codes (implemented paths)", () => {
   });
 });
 
-// Test-first: spec exit codes not reachable through implemented commands.
-// `test.failing` until the owning subcommand (run/build) lands.
-describe.skipIf(!binaryAvailable())("exit codes (spec surface)", () => {
-  test.failing("compile error (any error-severity diagnostic) exits 64", () => {
-    expect(runCli(["build", fixture("parse-error.q"), "--out", "/tmp/q64-ec.wasm"]).exitCode).toBe(64);
-  });
-
-  test.failing("input error (file not found) exits 65", () => {
+// `run`-reachable exit codes — now that `q64 run` lands, these run for real
+// (gated on the runtime host being built). `build`-based codes stay test-first.
+describe.skipIf(!binaryAvailable() || !hostAvailable())("exit codes (run surface)", () => {
+  test("input error (file not found) exits 65", () => {
     expect(runCli(["run", fixture("missing.q")]).exitCode).toBe(65);
   });
 
-  test.failing("uncaught program panic exits 1", () => {
+  test("uncaught program panic exits 1", () => {
     expect(runCli(["run", fixture("panic.q")]).exitCode).toBe(1);
   });
 
-  test.failing("`env.exit(N)` exits with code N", () => {
+  test("`env.exit(N)` exits with code N", () => {
     expect(runCli(["run", fixture("exit.q")]).exitCode).toBe(3);
+  });
+});
+
+// Test-first: exit codes not reachable through implemented commands (`build`).
+describe.skipIf(!binaryAvailable())("exit codes (spec surface)", () => {
+  test.failing("compile error (any error-severity diagnostic) exits 64", () => {
+    expect(runCli(["build", fixture("parse-error.q"), "--out", "/tmp/q64-ec.wasm"]).exitCode).toBe(64);
   });
 });

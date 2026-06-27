@@ -1487,6 +1487,27 @@ spec/q64-cli.md `--component`).
       - **Boundaries (v0):** unset vs set-to-empty both yield the empty str (no
         `Option<str>`); no key iteration / `[str]` of `"K=V"` entries; the
         preview1 `environ_get` → component mapping is a follow-on.
+- [x] **`q64 run <file>` (+ implicit `q64 <file.q>`) — compile and execute.**
+      Compiles the file to a raw wasm32 core (the `env.*` host faces) and runs
+      it on `q64-wasmtime-host`, propagating the exit code. The **raw** path is
+      used (not the WASI component) because it preserves the full `env.exit(N)`
+      code and the host satisfies every `env.*` face (out/err/exit/args/envvar/
+      fs/kv). Host located via `Q64_WASMTIME_HOST`, then the repo's
+      `runtime/wasmtime/zig-out/bin/`, then `PATH`. Args after `--` become the
+      program's `env.args`; q64 flags before `--` are tolerated; a missing file
+      exits 65 (input error). Flips the pre-written `run.test.ts` to live tests,
+      plus the run-reachable `contract/{io-routing,exit-codes,global-flags}`
+      cases (un-marked from `test.failing`, gated on a new `hostAvailable()`).
+      `zig build cli-tests` now builds the host and points
+      `Q64_WASMTIME_HOST` at it. Verified: hello → stdout + exit 0; `env.exit(3)`
+      → 3; panic/compile-error → 1; missing file → 65.
+      - **Note:** an uncaught `panic` currently exits 1 via a *compile* error
+        (`panic` codegen is unimplemented — `UnsupportedExpression`), not a
+        runtime trap; the exit code is correct either way. Lowering `panic` to a
+        trap, `q64 build`, and the `--quiet`/`--help` flag surface are follow-ons.
+      - **Pre-existing (unrelated) red:** `build.test.ts` twin-counter
+        (`--module name=DIR` reads the dir as a file → `IsDir`); fails on the
+        unmodified binary too — a module-resolution bug, not part of `run`.
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.
