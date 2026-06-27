@@ -1,8 +1,13 @@
 /**
  * `q64 build <file>` (spec §Subcommands) compiles to wasm and emits
  * `<file>.wasm` or `--out <path>`. The implemented v0 spelling is
- * `q64 emit <file.q> <out.wasm> [--module name=dir ...]`; the spec'd
+ * `q64 emit <file.q> <out.wasm> [--module name=file ...]`; the spec'd
  * `build` surface and its flags are encoded as `.todo` until they land.
+ *
+ * `--module name=<path>` maps to the dependency's entry *source file* (e.g.
+ * `…/src/lib.q`) — `qube` resolves it from the manifest `entry`; the compiler
+ * reads exactly that file and never guesses a filename (spec/q64-cli.md
+ * §"--module").
  */
 import { tmpdir } from "node:os";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -109,7 +114,9 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
       "--addr",
       "wasm32",
       "--module",
-      `counter=${fixture("counter-mod")}`,
+      // Map the `counter` module to its entry source file (spec/q64-cli.md
+      // §"--module": a file, not a directory — the compiler never guesses).
+      `counter=${fixture("counter-mod/lib.q")}`,
     ]);
     expect(r.exitCode).toBe(0);
     const mod = new WebAssembly.Module(readFileSync(out));
@@ -220,7 +227,7 @@ describe.skipIf(!binaryAvailable())("q64 emit (implemented build surface)", () =
     expect(r.exitCode).toBe(2);
   });
 
-  test("--module expects name=dir; malformed mapping is a usage error", () => {
+  test("--module expects name=file; malformed mapping is a usage error", () => {
     const r = runCli(["emit", fixture("hello.q"), join(work, "x.wasm"), "--module", "bogus"]);
     expect(r.exitCode).toBe(2);
   });

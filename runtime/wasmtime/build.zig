@@ -26,11 +26,13 @@ pub fn build(b: *std.Build) void {
     exe_mod.addIncludePath(wasmtime_include);
     exe_mod.addLibraryPath(wasmtime_lib_dir);
     exe_mod.linkSystemLibrary("wasmtime", .{});
-    // Embed rpath so the binary finds libwasmtime.so at run time
-    // without needing LD_LIBRARY_PATH. The path is absolute at build
-    // time; for distribution we'll relocate the .so next to the
-    // binary and switch to `$ORIGIN`-style rpath.
-    exe_mod.addRPath(wasmtime_lib_dir);
+    // Embed an `$ORIGIN`-relative rpath so the binary finds libwasmtime.so at
+    // run time from its own location — not the process cwd. The binary sits at
+    // `runtime/wasmtime/zig-out/bin/`, so the vendored lib is four levels up.
+    // (A plain `addRPath(lib_dir)` emits a cwd-relative RUNPATH, which only
+    // resolves when run from the repo root — e.g. `q64 run` spawning the host
+    // from another directory would fail to load the lib.)
+    exe_mod.addRPathSpecial("$ORIGIN/../../../../vendor/wasmtime/lib");
 
     const exe = b.addExecutable(.{
         .name = "q64-wasmtime-host",
@@ -65,7 +67,7 @@ pub fn build(b: *std.Build) void {
     check_mod.addIncludePath(wasmtime_include);
     check_mod.addLibraryPath(wasmtime_lib_dir);
     check_mod.linkSystemLibrary("wasmtime", .{});
-    check_mod.addRPath(wasmtime_lib_dir);
+    check_mod.addRPathSpecial("$ORIGIN/../../../../vendor/wasmtime/lib");
     const check_exe = b.addExecutable(.{
         .name = "q64-component-check",
         .root_module = check_mod,

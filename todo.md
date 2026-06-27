@@ -1503,9 +1503,14 @@ spec/q64-cli.md `--component`).
       → 3; panic/compile-error → 1; missing file → 65.
       - **Note:** `q64 build` and the `--quiet`/`--help` flag surface are
         follow-ons.
-      - **Pre-existing (unrelated) red:** `build.test.ts` twin-counter
-        (`--module name=DIR` reads the dir as a file → `IsDir`); fails on the
-        unmodified binary too — a module-resolution bug, not part of `run`.
+      - **Suite now fully green.** The lone red (`build.test.ts` twin-counter)
+        was a *test* bug — it passed `--module counter=<DIR>`, but the spec
+        (q64-cli.md §"--module") says the value is the dependency's entry
+        *source file*; the compiler reads exactly that file and never guesses.
+        Fixed the test to pass `counter-mod/lib.q`. Also fixed the host's
+        `libwasmtime.so` rpath (was cwd-relative → only loaded from the repo
+        root; now `$ORIGIN`-relative so `q64 run` works from any cwd), so
+        `zig build cli-tests` is green end-to-end (94/0).
 - [x] **`panic <msg>` → a real runtime trap.** `panic` was parsed + typechecked
       but unimplemented in codegen (`UnsupportedExpression`). Now it lowers to a
       stderr write of the message (reusing the `host_out_str`/`host_out_const`

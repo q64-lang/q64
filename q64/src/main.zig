@@ -573,9 +573,21 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, src
     const host = try resolveBinary(gpa, io, env, "Q64_WASMTIME_HOST", repo_root, "runtime/wasmtime/zig-out/bin/q64-wasmtime-host", "q64-wasmtime-host");
     defer gpa.free(host);
 
+    // Spawn the host by its absolute path: a relative `argv[0]` defeats the
+    // host's `$ORIGIN` rpath for `libwasmtime.so` (it would fail to load). A
+    // bare PATH name (no separator) is left for the OS to resolve via PATH.
+    const host_abs = if (std.fs.path.isAbsolute(host) or std.mem.indexOfScalar(u8, host, std.fs.path.sep) == null)
+        try gpa.dupe(u8, host)
+    else blk: {
+        const cwd = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd);
+        break :blk try std.fs.path.join(gpa, &.{ cwd, host });
+    };
+    defer gpa.free(host_abs);
+
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.append(gpa, host);
+    try argv.append(gpa, host_abs);
     try argv.append(gpa, tmp_wasm);
     if (qube_args.items.len > 0) {
         try argv.append(gpa, "--");
@@ -585,7 +597,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, src
     const term = spawnInherit(io, argv.items) catch |err| {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writerStreaming(io, &buf);
-        try w.interface.print("q64: could not run the host ({s}): {s}\n", .{ host, @errorName(err) });
+        try w.interface.print("q64: could not run the host ({s}): {s}\n", .{ host_abs, @errorName(err) });
         try w.interface.print("q64: set Q64_WASMTIME_HOST, or build runtime/wasmtime (zig build)\n", .{});
         try w.interface.flush();
         std.process.exit(1);
