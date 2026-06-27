@@ -2929,6 +2929,17 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 try out.append(b.a, st);
                 return;
             }
+            // `env.exit(code)` — the exit capability. `code` is an i64
+            // expression; lowers to the raw `env.exit` host face / preview1
+            // `proc_exit`. Marks `@exit` via the effect pass.
+            if (isEnvExit(b.a, call)) {
+                const arg = firstArg(call) orelse return error.Unsupported;
+                const e = try buildIntExpr(b, arg, scope);
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .host_exit = e };
+                try out.append(b.a, st);
+                return;
+            }
             // A statement-position call to a void procedure (`log(5)`): build
             // the call and discard its (absent) result. A non-void call here
             // is rejected — a value may not be left on the stack.
@@ -9504,6 +9515,17 @@ fn isEnvOut(a: std.mem.Allocator, call: ast.CallExpr) bool {
     return std.mem.eql(u8, txt, "env.out");
 }
 
+fn isEnvExit(a: std.mem.Allocator, call: ast.CallExpr) bool {
+    const callee = call.callee() orelse return false;
+    const path = switch (callee) {
+        .path => |p| p,
+        else => return false,
+    };
+    const txt = path.text(a) catch return false;
+    defer a.free(txt);
+    return std.mem.eql(u8, txt, "env.exit");
+}
+
 fn firstArg(call: ast.CallExpr) ?ast.Expr {
     var args = call.args();
     return args.next();
@@ -13869,6 +13891,25 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "env.exit: an i64 code builds host_exit and marks @exit (not @io)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    env.out("bye")
+        \\    env.exit(2)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "host_exit") != null);
+    // The effect pass marks main @exit. `@exit` targets `wasi:cli/exit` and,
+    // unlike the byte-I/O faces, does not imply @io.
+    try testing.expect(std.mem.indexOf(u8, dump, "@exit") != null);
 }
 
 test "env.kv.increment: keyed form (key, delta) marks @kv and carries the key" {

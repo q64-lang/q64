@@ -288,10 +288,15 @@ released snapshot rather than re-pinning on every upstream RC:
 > choice.
 >
 > **Implementation status.** Today q64 lowers `env.out` to a `preview1`
-> `fd_write` core import and lifts it with `wasm-tools component new --adapt`
-> (the vendored adapter), which yields a command using the *synchronous*
-> `wasi:io/streams@0.2.x` write — correct as a command but not yet the async
-> path. Emitting genuinely async `wasi:io@0.3` I/O directly (no adapter
+> `fd_write` core import and `env.exit` to a `preview1` `proc_exit` import, both
+> lifted with `wasm-tools component new --adapt` (the vendored adapter): the
+> result is a `wasi:cli/run` command importing `wasi:cli/stdout` +
+> `wasi:cli/exit`. `env.out` uses the *synchronous* `wasi:io/streams@0.2.x`
+> write — correct as a command but not yet the async path. Note `wasi:cli/exit`
+> carries a `result<(), ()>`, so a non-zero `env.exit(N)` collapses to exit
+> status 1 on the component path; the **raw `env.*` face** path (the
+> `runtime/wasmtime` core host + `runtime/browser`) preserves the full byte
+> code. Emitting genuinely async `wasi:io@0.3` I/O directly (no adapter
 > shortcut) is the next codegen milestone — now unblocked by ratification: the
 > stable `0.3.0` ABI is a fixed target to lower onto, and Wasmtime 46 runs it
 > by default (the pre-ratification `-S p3` opt-in is no longer needed).

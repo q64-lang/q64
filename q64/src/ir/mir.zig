@@ -223,6 +223,10 @@ pub const Op = union(enum) {
     /// Byte-wise equality of two str values as i32 (0/1). Both are str-typed
     /// insts; lowers to a `__str_eq(pa, la, pb, lb)` helper call.
     str_eq: struct { lhs: *Inst, rhs: *Inst },
+    /// `env.exit(code)` (spec/env.md §`env.exit`): call the `env.exit` host
+    /// import (raw face) or `wasi_snapshot_preview1.proc_exit` (preview1 path)
+    /// with the i64 `code`. Void — the host terminates the instance.
+    host_exit: struct { code: *Inst },
     /// `env.fs.read(path)` (spec/env.md §"Wire ABI: fs.read"): call the
     /// `env.fs_read` import with (dest=sp, path ptr, path len), trap on a
     /// negative length, bump `sp`, yield the (dest, len) str value.

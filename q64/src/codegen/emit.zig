@@ -379,11 +379,12 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     };
     defer mmod.deinit();
 
-    // An app reaches stdout (`env.out` → `@stdout`). Emit a preview1 core module
-    // — `wasi_snapshot_preview1.fd_write`, `_start` — and hand it back for the
-    // WASI adapter to lift into `wasi:cli/run` importing `wasi:cli/stdout`. The
+    // An app reaches a `wasi:cli` command capability — stdout (`env.out` →
+    // `@stdout` → `fd_write`) and/or exit (`env.exit` → `@exit` → `proc_exit`).
+    // Emit a preview1 core module and hand it back for the WASI adapter to lift
+    // into a `wasi:cli/run` command importing `wasi:cli/{stdout,exit}`. The
     // preview1 ABI is 32-bit (i32 iovec/fd_write); a wasm64 app isn't lowerable.
-    if (usesEnvOut(&mmod)) {
+    if (usesEnvOut(&mmod) or usesEnvExit(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
         return .{ .preview1_app = try lowerToWasm(allocator, &mmod, addr, .wasi_preview1, null, false) };
     }
@@ -908,10 +909,35 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         }
     }
 
+    // The `env.exit` capability import — declared only when the program calls
+    // it. Same two shapes as `env.out` (see `StdoutAbi`): the raw host face
+    // `(import "env" "exit" (func (param i64)))`, satisfied directly by
+    // `runtime/wasmtime/` and `runtime/browser/`; or WASI preview1
+    // `(import "wasi_snapshot_preview1" "proc_exit" (func (param i32)))`, which
+    // the adapter lifts to `wasi:cli/exit`. The code is an i64 value (not an
+    // address), so the raw face is i64 on either address space.
+    const wants_exit = usesEnvExit(m);
+    if (wants_exit) {
+        switch (stdout_abi) {
+            .env_out => {
+                var exit_params = [_]c.BinaryenType{i64_type};
+                const exit_params_type = c.BinaryenTypeCreate(&exit_params, exit_params.len);
+                c.BinaryenAddFunctionImport(module, "env_exit", "env", "exit", exit_params_type, none_type);
+            },
+            .wasi_preview1 => {
+                // proc_exit(code: i32) -> () (noreturn; typed as no result).
+                var pe_params = [_]c.BinaryenType{i32_type};
+                const pe_params_type = c.BinaryenTypeCreate(&pe_params, pe_params.len);
+                c.BinaryenAddFunctionImport(module, "proc_exit", "wasi_snapshot_preview1", "proc_exit", pe_params_type, none_type);
+            },
+        }
+    }
+
     // Memory maximum. The preview1 path leaves it unbounded (Binaryen's
     // `kUnlimitedSize` sentinel emits no max) because the WASI adapter grows the
     // memory to carve its own stack at startup — a fixed 1-page max would trap
-    // `allocate_stack`. The raw `env.out`/library paths keep the 1-page cap.
+    // `allocate_stack`. This holds for any preview1 module (stdout or exit-only).
+    // The raw `env.out`/library paths keep the 1-page cap.
     // fs.read lets the HOST grow memory for file contents (spec/env.md
     // §"Wire ABI: fs.read"), so the max must allow it.
     var any_fs = false;
@@ -928,7 +954,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // serves host-side allocations (e.g. an error variant's `other(string)`) from
     // page 1 up, so reserve room above the page-0 data/scratch/arena.
     const mem_min: c.BinaryenIndex = if (wants_kv) 2 else 1;
-    const mem_max: c.BinaryenIndex = if (preview1) 0xffff_ffff else if (wants_kv) 64 else if (any_fs) 256 else 1;
+    const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_kv) 64 else if (any_fs) 256 else 1;
     // The component model requires the canonical memory export to be named
     // `cm32p2_memory`; the raw paths keep the plain `memory`.
     const mem_export_name = if (wants_kv) "cm32p2_memory" else "memory";
@@ -1455,6 +1481,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .elem_ptr => |ep| bodyHasOut(ep.base, want_int) or bodyHasOut(ep.index, want_int),
         .bounds_check => |bc| bodyHasOut(bc.index, want_int) or bodyHasOut(bc.count, want_int),
+        .host_exit => |he| bodyHasOut(he.code, want_int),
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .chan_recv => |h| bodyHasOut(h, want_int),
@@ -1478,6 +1505,17 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
 fn usesEnvOut(m: *const ir.mir.Module) bool {
     for (m.funcs) |f| switch (f.body) {
         .structured => |root| if (instUsesEnvOut(root)) return true,
+        .cfg => {},
+    };
+    return false;
+}
+
+/// True if any function calls `env.exit` (a `host_exit` node) — drives both the
+/// `env.exit`/`proc_exit` import declaration and the component-emit decision to
+/// route the qube down the preview1 → `wasi:cli/run` command path.
+fn usesEnvExit(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| switch (f.body) {
+        .structured => |root| if (instUsesEnvExit(root)) return true,
         .cfg => {},
     };
     return false;
@@ -1560,6 +1598,23 @@ fn instUsesEnvOut(inst: *const ir.mir.Inst) bool {
         },
         .global_set => |gs| return instUsesEnvOut(gs.value),
         .str_bind => |sb| return instUsesEnvOut(sb.value),
+        else => {},
+    }
+    return false;
+}
+
+fn instUsesEnvExit(inst: *const ir.mir.Inst) bool {
+    switch (inst.op) {
+        .host_exit => return true,
+        .block => |items| for (items) |ch| {
+            if (instUsesEnvExit(ch)) return true;
+        },
+        .if_ => |iff| return instUsesEnvExit(iff.cond) or instUsesEnvExit(iff.then_) or
+            (iff.else_ != null and instUsesEnvExit(iff.else_.?)),
+        .while_ => |w| return instUsesEnvExit(w.cond) or instUsesEnvExit(w.body),
+        .loop => |body| return instUsesEnvExit(body),
+        .local_set => |ls| return instUsesEnvExit(ls.value),
+        .ret => |v| if (v) |val| return instUsesEnvExit(val),
         else => {},
     }
     return false;
@@ -1824,6 +1879,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(vg.vec, s);
             scanScratch(vg.idx, s);
         },
+        .host_exit => |he| scanScratch(he.code, s),
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
 }
@@ -1968,6 +2024,7 @@ const Lowerer = struct {
                 return c.BinaryenBlock(module, null, @ptrCast(children.ptr), @intCast(children.len), self.wty(n.ty));
             },
             .host_out_const => |hc| return self.envOut(@intCast(hc.off), @intCast(hc.len)),
+            .host_exit => |he| return self.envExit(try self.inst(he.code)),
             .const_i64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt64(v)),
             .const_f64 => |v| return c.BinaryenConst(module, c.BinaryenLiteralFloat64(v)),
             .num_cast => |src| {
@@ -2531,6 +2588,25 @@ const Lowerer = struct {
         const total = c.BinaryenLoad(m, 8, false, 8, 8, self.i64_type, i32c(m, inc_ret), "0");
         try pre.append(self.allocator, c.BinaryenSelect(m, ok, total, c.BinaryenConst(m, c.BinaryenLiteralInt64(0))));
         return c.BinaryenBlock(m, null, @ptrCast(pre.items.ptr), @intCast(pre.items.len), self.i64_type);
+    }
+
+    /// `env.exit(code)` lowered per the build's host ABI: a raw `env.exit(code)`
+    /// call (the i64 code), or WASI preview1 `proc_exit(code)` with the code
+    /// wrapped to i32. Void — the host terminates the instance.
+    fn envExit(self: *Lowerer, code_expr: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
+        const m = self.module;
+        return switch (self.stdout_abi) {
+            .env_out => blk: {
+                var args = [_]c.BinaryenExpressionRef{code_expr};
+                break :blk c.BinaryenCall(m, "env_exit", @ptrCast(&args), args.len, self.none_type);
+            },
+            .wasi_preview1 => blk: {
+                // proc_exit takes an i32 code; the source value is i64.
+                const code32 = c.BinaryenUnary(m, c.BinaryenWrapInt64(), code_expr);
+                var args = [_]c.BinaryenExpressionRef{code32};
+                break :blk c.BinaryenCall(m, "proc_exit", @ptrCast(&args), args.len, self.none_type);
+            },
+        };
     }
 
     /// Emit a single stdout write of the `(ptr, len)` pair, lowered per the
@@ -4242,6 +4318,36 @@ test "emitComponent: a declared-but-uncalled import is not wired (import what yo
             // No interface id baked in — the unused import was dropped.
             try testing.expect(std.mem.indexOf(u8, bytes, "acme:mathlib/math") == null);
             try testing.expect(std.mem.indexOf(u8, bytes, "compute") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitFromSource: env.exit declares the raw env.exit host face import" {
+    // The raw (non-component) path imports q64's `env.exit` face directly —
+    // satisfied by runtime/wasmtime + runtime/browser. No preview1 proc_exit here.
+    const app = "fn main { env.exit(1) }\n";
+    const bytes = try emitFromSource(testing.allocator, app, "main.q", &.{}, .wasm32);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+    try testing.expect(std.mem.indexOf(u8, bytes, "exit") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "proc_exit") == null);
+}
+
+test "emitComponent: env.exit lowers to a preview1 proc_exit app (→ wasi:cli/exit)" {
+    // An app reaching `@exit` (even without stdout) routes down the preview1
+    // path: the core imports `wasi_snapshot_preview1.proc_exit`, which the WASI
+    // adapter lifts to a `wasi:cli/run` command importing `wasi:cli/exit`.
+    const app = "fn main { env.exit(2) }\n";
+    const artifact = try emitComponent(testing.allocator, app, "exit.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .preview1_app => |core| {
+            defer testing.allocator.free(core);
+            try testing.expectEqualSlices(u8, "\x00asm", core[0..4]);
+            try testing.expect(std.mem.indexOf(u8, core, "proc_exit") != null);
+            try testing.expect(std.mem.indexOf(u8, core, "wasi_snapshot_preview1") != null);
+            // No raw env.exit face leaks into the preview1 core.
+            try testing.expect(std.mem.indexOf(u8, core, "env_exit") == null);
         },
         else => return error.TestUnexpectedResult,
     }

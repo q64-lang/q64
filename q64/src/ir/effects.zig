@@ -111,6 +111,12 @@ fn collectStmt(
             d.insert(.stdout);
             try collectExpr(a, expr, d, e);
         },
+        // `env.exit` reaches the exit capability. Unlike the byte-I/O faces it
+        // does not imply `@io` (`Effect.implies`) — it targets `wasi:cli/exit`.
+        .host_exit => |expr| {
+            d.insert(.exit);
+            try collectExpr(a, expr, d, e);
+        },
         .host_call => |hc| {
             d.insert(faceEffect(hc.name));
             for (hc.args) |arg| try collectExpr(a, arg, d, e);

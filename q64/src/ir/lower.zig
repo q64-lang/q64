@@ -138,6 +138,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
                 .else_ = try hostOutConst(ctx, "false"),
             } });
         },
+        .host_exit => |e| return mk(ctx.a, .void, .{ .host_exit = .{ .code = try lowerExpr(ctx, e) } }),
         .host_call => |hc| {
             // A `str`-valued argument lowers to a (ptr, len) str inst; any other
             // is an i64. The backend reads each arg's `.ty` to push 2 or 1 wasm

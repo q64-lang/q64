@@ -300,6 +300,11 @@ pub const Stmt = union(enum) {
     /// a `true`/`false` literal, or a `-> bool` call). Lowers to a value `if`
     /// that writes the constant `"true"` / `"false"` text.
     host_out_bool: *Expr,
+    /// `env.exit(expr)` — `expr` is the `i64` process exit code. Lowers to the
+    /// raw `env.exit` host face (browser / wasmtime-core hosts) or, on the
+    /// preview1/component path, `wasi_snapshot_preview1.proc_exit` (which the
+    /// WASI adapter lifts to `wasi:cli/exit`). Marks `@exit`.
+    host_exit: *Expr,
     /// A call to a host import face (`qview.text(…)`): `name` is the dotted
     /// source name; `args` are i64 expressions. Lowers to a wasm import call.
     host_call: struct { name: []const u8, args: []const *Expr },

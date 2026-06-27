@@ -1403,6 +1403,28 @@ spec/q64-cli.md `--component`).
         0.3 stream write) — no adapter shortcut exists. That's the next slice;
         the runtime is already p3 via `-S p3`. Plus multiple capabilities
         (`@fs`, `@time`, …).
+- [x] **`env.exit` → `wasi:cli/exit` (the second `wasi:cli` command
+      capability).** `env.exit(<i64>)` is recognized in `build_hir` (a
+      `host_exit` HIR stmt → `mir.host_exit`), the effect pass marks `@exit`
+      (which targets `wasi:cli/exit` and does **not** imply `@io`), and the
+      backend lowers it two ways behind the existing `StdoutAbi` selector:
+      the raw host face `(import "env" "exit" (func (param i64)))` — satisfied
+      directly by `runtime/wasmtime` (core host) + `runtime/browser`, full byte
+      code preserved — and, on the component path, `wasi_snapshot_preview1`
+      `proc_exit(i32)`, which the vendored adapter lifts to `wasi:cli/exit`. An
+      app reaching `@exit` (even without stdout) now routes down the preview1 →
+      `wasi:cli/run` command path. Verified end-to-end: `q64 show world` lists
+      `import wasi:cli/exit`; the emitted component runs under `wasmtime run
+      -S p3` (`exit(0)` → 0, non-zero → 1, since `wasi:cli/exit` carries a
+      `result<(),()>`); the raw core preserves the full code (`exit(7)` → 7) on
+      both wasm32 + wasm64 via `q64-wasmtime-host`; `runtime/browser` unwinds
+      `_start` and returns the code. +3 unit tests (HIR `host_exit` + `@exit`,
+      raw-face import, preview1 `proc_exit`). 536 unit tests green.
+      - **Follow-on:** the rest of `wasi:cli` — `@stderr` (`fd_write` fd 2 →
+        `wasi:cli/stderr`) and `env.args`/`env.envvars`
+        (`args_get`/`environ_get` → `wasi:cli/environment`). The `q64 run`
+        subcommand (then the `run.test.ts` `env.exit(N)` exit-code test flips
+        from `test.failing` to green).
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.

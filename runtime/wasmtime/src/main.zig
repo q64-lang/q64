@@ -282,6 +282,39 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // -------------------------------------------------------------
+    // env.exit :: (code: i64) -> () (spec/env.md §`env.exit`,
+    // `wasi:cli/exit`). The host terminates the process with the low byte of
+    // `code` as its exit status (POSIX exit codes are 0–255). `code` is a value,
+    // not an address, so it is i64 on either address space. Defined
+    // unconditionally; modules that don't import it are unaffected.
+    // -------------------------------------------------------------
+    {
+        var exit_param_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var exit_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&exit_params_vec, exit_param_types.len, @ptrCast(&exit_param_types));
+        var exit_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new_empty(&exit_results_vec);
+        const exit_type = c.wasm_functype_new(&exit_params_vec, &exit_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(exit_type);
+        const link_err = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "exit",
+            "exit".len,
+            exit_type,
+            envExitCallback,
+            null,
+            null,
+        );
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.exit");
+            std.process.exit(1);
+        }
+    }
+
+    // -------------------------------------------------------------
     // Headless `qview.*` host face (spec/reactivity.md; the live web POC's
     // ABI). qview is an *open* face — any `qview.<op>(...)` a program invents
     // (`box`, `line`, `circle`, …) lowers to a host import. Rather than a fixed
@@ -498,6 +531,27 @@ fn envKvIncrementCallback(
     results[0].kind = c.WASMTIME_I64;
     results[0].of.i64 = gop.value_ptr.*;
     return null;
+}
+
+/// `env.exit(code)` — terminate the runner with the low byte of `code` as its
+/// exit status (the qube's exit code becomes the host's, matching
+/// `wasi:cli/exit`). Does not return; instance `defer`s do not run, exactly as
+/// `proc_exit` aborts the instance.
+fn envExitCallback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = caller;
+    _ = results;
+    _ = nresults;
+    if (nargs != 1) return trap("env.exit: expected (code)");
+    const code: u8 = @truncate(@as(u64, @bitCast(args[0].of.i64)));
+    std.process.exit(code);
 }
 
 fn envOutCallback(

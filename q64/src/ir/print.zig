@@ -68,6 +68,11 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, e);
             try app(gpa, out, "\n", .{});
         },
+        .host_exit => |e| {
+            try app(gpa, out, "host_exit ", .{});
+            try hirExpr(gpa, out, e);
+            try app(gpa, out, "\n", .{});
+        },
         .host_call => |hc| {
             try app(gpa, out, "host_call {s}(", .{hc.name});
             for (hc.args, 0..) |a, i| {
@@ -476,6 +481,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .host_out_str => |hs| {
             try app(gpa, out, "host_out_str nl_off={d}\n", .{hs.nl_off});
             try mirInst(gpa, out, hs.value, depth + 1);
+        },
+        .host_exit => |he| {
+            try app(gpa, out, "host_exit\n", .{});
+            try mirInst(gpa, out, he.code, depth + 1);
         },
         .fmt_int_to_str => |inner| {
             try app(gpa, out, "fmt_int_to_str\n", .{});
