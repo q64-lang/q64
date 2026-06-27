@@ -517,6 +517,24 @@ component/preview1 mapping (`wasi:cli/environment.get-arguments`) is a
 follow-on; the raw face is satisfied by `runtime/wasmtime` (native
 argv) and `runtime/browser` (empty list).
 
+## Wire ABI: `env.envvars.get` (v0)
+
+`env.envvars.get(key: str) -> str` reads one environment variable;
+the result is its value, or the **empty str** if unset. Marks
+`@envvars` (`wasi:cli/environment.get-environment`).
+
+Import: `env.envvar : (dest, key_ptr, key_len) -> i64`, all three
+parameters address-width. The guest passes `dest = sp` and the key's
+`(ptr, len)`; the host writes the value's bytes at `dest` (**growing
+guest memory if needed**) and returns the byte length (`0` if unset
+or empty). The guest bumps `sp` by the length and yields the str
+`(dest, len)`.
+
+v0 collapses "unset" and "set-to-empty" to the empty str (no
+`Option`); a fallible `get` returning `Option<str>` is a follow-on.
+The raw face is satisfied by `runtime/wasmtime` (`getenv`) and
+`runtime/browser` (always unset).
+
 ## `main` signature
 
 `main` may be declared two ways. Both are valid; the runtime

@@ -4490,6 +4490,15 @@ fn buildStrExpr(b: *Builder, expr: ast.Expr, scope: *Scope, rt: ?*const RtMap) B
             };
             const cname = try cpath.text(b.a);
             defer b.a.free(cname);
+            // `env.envvars.get(key)` — the variable's value as a str (empty if
+            // unset). Marks `@envvars` (wasi:cli/environment.get-environment).
+            if (std.mem.eql(u8, cname, "env.envvars.get")) {
+                var eit = cc.args();
+                const karg = eit.next() orelse return error.Unsupported;
+                const ke = try b.a.create(hir.Expr);
+                ke.* = .{ .envvar_get = try buildStrExpr(b, karg, scope, rt) };
+                return ke;
+            }
             // B4: a str-returning fit method on a record binding/param
             // (`r.fmt()`) — same static dispatch as the i64 path.
             if (std.mem.indexOfScalar(u8, cname, '.')) |dot| {
@@ -8085,6 +8094,8 @@ fn strlistExprKind(b: *Builder, arg: ast.Expr, scope: *const Scope) ?sema.exprty
             if (callee != .path) return null;
             const cn = callee.path.text(b.a) catch return null;
             defer b.a.free(cn);
+            // `env.envvars.get(key)` is a str.
+            if (std.mem.eql(u8, cn, "env.envvars.get")) return .str;
             const dot = std.mem.lastIndexOfScalar(u8, cn, '.') orelse return null;
             if (std.mem.eql(u8, cn[dot + 1 ..], "len") and scope.strlists.contains(cn[0..dot])) return .i64;
         },
@@ -14056,6 +14067,26 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "env.envvars.get: a str value marking @envvars" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    let h = env.envvars.get("HOME")
+        \\    env.out(h)
+        \\    env.out(h.len)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `env.envvars.get(key)` builds an `envvar_get` str value, bound + printed.
+    try testing.expect(std.mem.indexOf(u8, dump, "envvar_get(\"HOME\")") != null);
+    // The effect pass marks @envvars (wasi:cli/environment).
+    try testing.expect(std.mem.indexOf(u8, dump, "@envvars") != null);
 }
 
 test "env.args: a [str] binding via host_args, with .len() and [i]" {

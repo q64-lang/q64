@@ -487,6 +487,11 @@ pub const Expr = union(enum) {
     /// `xs[i]` on a `[str]` value: bounds-check `i < count`, load the i-th
     /// `(ptr, len)` cell, and yield it as a str value.
     strlist_get: struct { list: *Expr, idx: *Expr },
+    /// `env.envvars.get(key)` — the value of environment variable `key` as a
+    /// `str` (empty if unset). The host (`env.envvar` face) writes the value
+    /// into the scope arena and returns its length. Marks `@envvars`
+    /// (`wasi:cli/environment.get-environment`).
+    envvar_get: *Expr,
     /// `env.args` — the command-line arguments as a `[str]` value. The host
     /// (`env.args` face) materializes the `(ptr, len)` cells + bytes into the
     /// scope arena and the guest yields the `(data_ptr, count)` pair. Pure per

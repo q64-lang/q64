@@ -238,6 +238,11 @@ pub const Op = union(enum) {
     /// pair): trap if `i >= count` (unsigned; negatives trap too), then load
     /// the i-th `(ptr, len)` cell and yield it as a str value. `.ty` is `.str`.
     strlist_get: struct { list: *Inst, idx: *Inst },
+    /// `env.envvars.get(key)` — call the `env.envvar` host import with
+    /// `(dest=sp, key ptr, key len)`, which writes the value at `dest` and
+    /// returns its byte length (0 if unset). Bump `sp`, yield the `(dest, len)`
+    /// str value. `.ty` is `.str`.
+    envvar_get: struct { key: *Inst },
     /// `env.args` — materialize the command-line arguments as a `[str]` value.
     /// Calls the `env.args` host import with the arena pointer; the host writes
     /// `[count][cells…][bytes…]` there and returns the total bytes; the guest

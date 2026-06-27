@@ -1471,8 +1471,22 @@ spec/q64-cli.md `--component`).
       ABI documented in spec/env.md §"Wire ABI: env.args". 541 green.
       - **Follow-on:** direct `env.args[i]` (without a `let`); the
         component/preview1 `args_sizes_get`/`args_get` →
-        `wasi:cli/environment.get-arguments` mapping; `env.envvars`
-        (`environ_get`). `q64 run` (flips the pre-written `run.test.ts`).
+        `wasi:cli/environment.get-arguments` mapping. `q64 run` (flips the
+        pre-written `run.test.ts`).
+- [x] **`env.envvars.get` → `wasi:cli/environment.get-environment` (completes
+      the `wasi:cli/environment` pair).** `env.envvars.get(key: str) -> str`
+      reads one environment variable (empty str if unset), modeled like the
+      `fs.read` wire ABI but yielding a plain str. New `envvar_get` HIR/MIR
+      node → the raw `env.envvar : (dest, key_ptr, key_len) -> i64` host face
+      (host writes the value at dest, returns its length, growing guest memory
+      if needed); reuses the fs dest/len scratch. Marks `@envvars`. Hosts:
+      `runtime/wasmtime` (`getenv`), `runtime/browser` (always unset).
+      Verified end-to-end (wasm32 + wasm64): `Q64_GREETING=… host ev.wasm` →
+      the value + its `.len`; unset → empty + 0. +1 unit test; wire ABI in
+      spec/env.md. 542 green.
+      - **Boundaries (v0):** unset vs set-to-empty both yield the empty str (no
+        `Option<str>`); no key iteration / `[str]` of `"K=V"` entries; the
+        preview1 `environ_get` → component mapping is a follow-on.
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.

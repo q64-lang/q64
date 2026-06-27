@@ -241,6 +241,11 @@ fn collectExpr(
         },
         // `env.args` is pure (spec/env.md) — no capability, no children.
         .host_args => {},
+        // `env.envvars.get` reaches the @envvars capability (wasi:cli/environment).
+        .envvar_get => |key| {
+            d.insert(.envvars);
+            try collectExpr(a, key, d, e);
+        },
         .elem_ptr => |ep| {
             try collectExpr(a, ep.base, d, e);
             try collectExpr(a, ep.index, d, e);

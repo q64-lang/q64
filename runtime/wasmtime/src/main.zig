@@ -381,6 +381,43 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // -------------------------------------------------------------
+    // env.envvar :: (dest, key_ptr, key_len) -> i64 (spec/env.md §`env.envvars`,
+    // `wasi:cli/environment.get-environment`). The host writes the variable's
+    // value at dest and returns its byte length (0 if unset). Same address-width
+    // introspection as env.fs_read.
+    // -------------------------------------------------------------
+    {
+        var ev_param_types = [_]?*c.wasm_valtype_t{
+            c.wasm_valtype_new(arg_valkind),
+            c.wasm_valtype_new(arg_valkind),
+            c.wasm_valtype_new(arg_valkind),
+        };
+        var ev_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&ev_params_vec, ev_param_types.len, @ptrCast(&ev_param_types));
+        var ev_result_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var ev_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&ev_results_vec, ev_result_types.len, @ptrCast(&ev_result_types));
+        const ev_type = c.wasm_functype_new(&ev_params_vec, &ev_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(ev_type);
+        const link_err = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "envvar",
+            "envvar".len,
+            ev_type,
+            envEnvvarCallback,
+            null,
+            null,
+        );
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.envvar");
+            std.process.exit(1);
+        }
+    }
+
+    // -------------------------------------------------------------
     // Headless `qview.*` host face (spec/reactivity.md; the live web POC's
     // ABI). qview is an *open* face — any `qview.<op>(...)` a program invents
     // (`box`, `line`, `circle`, …) lowers to a host import. Rather than a fixed
@@ -832,6 +869,68 @@ fn envArgsCallback(
     results[0].kind = c.WASMTIME_I64;
     results[0].of.i64 = @intCast(total);
     return null;
+}
+
+/// `env.envvar(dest, key_ptr, key_len) -> i64` — write the value of the env var
+/// named by the guest key at `dest` and return its byte length (0 if unset).
+/// Grows guest memory if needed.
+fn envEnvvarCallback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    if (nargs != 3 or nresults != 1) return trap("env.envvar: expected (dest, key_ptr, key_len) -> i64");
+    const dest_i64 = argAddr(args[0]);
+    const key_ptr_i64 = argAddr(args[1]);
+    const key_len_i64 = argAddr(args[2]);
+    if (dest_i64 < 0 or key_ptr_i64 < 0 or key_len_i64 < 0) return trap("env.envvar: negative ptr/len");
+
+    var memory_item: c.wasmtime_extern_t = undefined;
+    if (!c.wasmtime_caller_export_get(caller, "memory", "memory".len, &memory_item)) {
+        return trap("env.envvar: module has no `memory` export");
+    }
+    if (memory_item.kind != c.WASMTIME_EXTERN_MEMORY) {
+        return trap("env.envvar: `memory` export is not a memory");
+    }
+    const ctx = c.wasmtime_caller_context(caller);
+
+    const ret0 = struct {
+        fn f(res: [*c]c.wasmtime_val_t, v: i64) ?*c.wasm_trap_t {
+            res[0].kind = c.WASMTIME_I64;
+            res[0].of.i64 = v;
+            return null;
+        }
+    }.f;
+
+    var data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
+    var data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
+    const kptr: usize = @intCast(key_ptr_i64);
+    const klen: usize = @intCast(key_len_i64);
+    if (kptr + klen > data_size) return trap("env.envvar: key out of bounds");
+    var key_buf: [4096]u8 = undefined;
+    if (klen + 1 > key_buf.len) return ret0(results, 0); // implausibly long key → unset
+    @memcpy(key_buf[0..klen], data[kptr .. kptr + klen]);
+    key_buf[klen] = 0; // NUL-terminate for libc getenv
+    const val_c = std.c.getenv(@ptrCast(&key_buf)) orelse return ret0(results, 0);
+    const val = std.mem.span(val_c);
+
+    const dest: usize = @intCast(dest_i64);
+    const size = val.len;
+    if (dest + size > data_size) {
+        const page = 65536;
+        const needed_pages: u64 = @intCast((dest + size - data_size + page - 1) / page);
+        var prev: u64 = 0;
+        if (c.wasmtime_memory_grow(ctx, &memory_item.of.memory, needed_pages, &prev) != null) return trap("env.envvar: out of memory");
+        data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
+        data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
+        if (dest + size > data_size) return trap("env.envvar: out of memory");
+    }
+    if (size > 0) @memcpy(data[dest .. dest + size], val);
+    return ret0(results, @intCast(size));
 }
 
 /// `qview.*` callback: records the op into the global display list (for

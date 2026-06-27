@@ -85,6 +85,12 @@ export async function runWasm(url, sink, errSink) {
                 new DataView(mem.buffer).setUint32(dest >>> 0, 0, true);
                 return 4n; // i64 return → BigInt
             },
+            envvar(_dest, _keyPtr, _keyLen) {
+                // The browser has no process environment: every variable is
+                // unset (length 0 → the empty str). A future host could resolve
+                // injected config here.
+                return 0n; // i64 return → BigInt
+            },
         },
     };
 

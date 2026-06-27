@@ -961,7 +961,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var sc2 = Scratch{};
         scanScratch(st2, &sc2);
         if (sc2.has_fs) any_fs = true;
-        if (sc2.has_args) any_args = true;
+        if (sc2.has_args or sc2.has_envvar) any_args = true;
     }
     // The kv path keeps memory bounded but growable: the canonical `cabi_realloc`
     // serves host-side allocations (e.g. an error variant's `other(string)`) from
@@ -998,6 +998,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_vec = false;
     var needs_fs = false;
     var needs_args = false;
+    var needs_envvar = false;
     var needs_kv = false;
     var needs_chan = false;
     var needs_take = false;
@@ -1031,6 +1032,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (sc.has_args) {
             needs_args = true;
             needs_arena = true; // env.args materializes into the scope arena
+        }
+        if (sc.has_envvar) {
+            needs_envvar = true;
+            needs_arena = true; // the value rides the scope arena
         }
         if (sc.has_kv) needs_kv = true;
         if (sc.has_chan) needs_chan = true;
@@ -1069,6 +1074,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var ap = [_]c.BinaryenType{ptr_type};
         const args_params = c.BinaryenTypeCreate(&ap, ap.len);
         c.BinaryenAddFunctionImport(module, "env_args", "env", "args", args_params, i64_type);
+    }
+    if (needs_envvar) {
+        // env.envvar : (dest, key_ptr, key_len) -> i64. The host writes the
+        // variable's value at dest and returns its byte length (0 if unset),
+        // growing guest memory if needed. `wasi:cli/environment.get-environment`.
+        var ep = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type };
+        const envvar_params = c.BinaryenTypeCreate(&ep, ep.len);
+        c.BinaryenAddFunctionImport(module, "env_envvar", "env", "envvar", envvar_params, i64_type);
     }
     if (needs_kv and !wants_kv) {
         // Local `qube run` ABI — env.kv_increment : (key_ptr, key_len, delta) ->
@@ -1290,7 +1303,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         // varTypes (locals beyond params): declared locals, then tuple slots,
         // then the concat scratch (buf/off/len) when concatenating, then one
         // base-ptr scratch per record_make nesting level.
-        const n_fs: u32 = if (sc.has_fs) 2 else 0;
+        const n_fs: u32 = if (sc.has_fs or sc.has_envvar) 2 else 0;
         const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
@@ -1316,10 +1329,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             vts[g + 5] = pair_type;
             vts[g + 6] = ptr_type;
         }
-        if (sc.has_fs) {
+        if (sc.has_fs or sc.has_envvar) {
             const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7;
-            vts[g] = ptr_type; // fs dest
-            vts[g + 1] = i64_type; // fs len
+            vts[g] = ptr_type; // fs/envvar dest
+            vts[g + 1] = i64_type; // fs/envvar len
         }
 
         // Parameter wasm types (a `str` param → two address-width ptr/len).
@@ -1515,6 +1528,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         },
         .strlist_get => |g| bodyHasOut(g.list, want_int) or bodyHasOut(g.idx, want_int),
         .host_args => false,
+        .envvar_get => |eg| bodyHasOut(eg.key, want_int),
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .chan_recv => |h| bodyHasOut(h, want_int),
@@ -1720,6 +1734,9 @@ const Scratch = struct {
     /// Contains an `env.args` → declare the `env.args` import + allow the host
     /// to grow guest memory for the materialized args.
     has_args: bool = false,
+    /// Contains an `env.envvars.get` → declare the `env.envvar` import + use the
+    /// fs dest/len scratch + allow memory growth (the value rides the arena).
+    has_envvar: bool = false,
     /// Contains an `env.kv.increment` → declare the `env.kv_increment` import.
     has_kv: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
@@ -1752,6 +1769,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_vec = s.has_vec or sub.has_vec;
     s.has_fs = s.has_fs or sub.has_fs;
     s.has_args = s.has_args or sub.has_args;
+    s.has_envvar = s.has_envvar or sub.has_envvar;
     s.has_kv = s.has_kv or sub.has_kv;
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
@@ -1984,6 +2002,11 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         .host_args => {
             s.has_args = true; // declare the import + allow memory growth
             if (s.rec_depth < 1) s.rec_depth = 1; // a base-ptr scratch for `dest`
+        },
+        .envvar_get => |eg| {
+            s.has_envvar = true; // import + fs-style dest/len scratch + growth
+            s.host_out = true; // the key str rides the pair scratch
+            scanScratch(eg.key, s);
         },
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
@@ -2517,6 +2540,7 @@ const Lowerer = struct {
             .strlist_make => |inits| return self.emitStrlistMake(inits),
             .strlist_get => |g| return self.emitStrlistGet(g),
             .host_args => return self.emitHostArgs(),
+            .envvar_get => |eg| return self.emitEnvvarGet(eg),
             .elem_ptr => |ep| {
                 // base + index·stride (index is i64; narrow to the address
                 // width on wasm32).
@@ -3177,6 +3201,35 @@ const Lowerer = struct {
                 null,
             ),
             c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len),
+        };
+        return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.pair_type);
+    }
+
+    /// `env.envvars.get(key)` → the variable's value as a str. Stash the key
+    /// pair, record `dest = sp`, call `env.envvar(dest, key…)` (the host writes
+    /// the value at dest, returns its length), bump `sp` past it, and yield
+    /// `(dest, len)`. A length of 0 (unset/empty) yields the empty str.
+    fn emitEnvvarGet(self: *Lowerer, eg: anytype) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const dest = self.fs_dest_idx;
+        const lenl = self.fs_len_idx;
+        const pget = c.BinaryenLocalGet(m, self.pair_idx, self.pair_type);
+        var call_args = [_]c.BinaryenExpressionRef{
+            self.ptrGet(dest),
+            c.BinaryenTupleExtract(m, pget, 0),
+            c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1),
+        };
+        var result = [_]c.BinaryenExpressionRef{
+            self.ptrGet(dest),
+            self.toPtr(c.BinaryenLocalGet(m, lenl, self.i64_type)),
+        };
+        var seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenLocalSet(m, self.pair_idx, try self.inst(eg.key)),
+            c.BinaryenLocalSet(m, dest, c.BinaryenGlobalGet(m, "sp", self.ptr_type)),
+            c.BinaryenLocalSet(m, lenl, c.BinaryenCall(m, "env_envvar", @ptrCast(&call_args), call_args.len, self.i64_type)),
+            // sp = dest + len (len >= 0; the host clamps "unset" to 0).
+            c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(dest), self.toPtr(c.BinaryenLocalGet(m, lenl, self.i64_type)))),
+            c.BinaryenTupleMake(m, @ptrCast(&result), result.len),
         };
         return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.pair_type);
     }
