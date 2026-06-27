@@ -493,6 +493,30 @@ parameters address-width (i32 on wasm32, i64 on wasm64).
 The v0 host grants `@fs` unconditionally; the runtime-denial story
 (ENV030, `with_capabilities`) gates it later.
 
+## Wire ABI: `env.args` (v0)
+
+`env.args` is a `[str]` value (the list-of-strings type) — the
+command-line arguments, `argv[0]` first. It is **pure** (no
+capability marker; arguments are immutable host data).
+
+Import: `env.args : (dest) -> i64`, `dest` address-width (i32 on
+wasm32, i64 on wasm64). The guest passes `dest = sp`; the host writes
+a self-describing block there and **grows guest memory if needed**:
+
+```
+dest+0          : count            (one address-width word)
+dest+W          : count × (ptr, len) cells   (each (ptr, len) at the address width)
+dest+W+count·2W : the argument bytes (each cell's ptr is the absolute guest address)
+```
+
+The host returns the **total bytes written**. The guest bumps `sp`
+past the block and yields the `[str]` value `(data_ptr = dest+W,
+count = load(dest))`. Indexing and `.len()` then reuse the `[str]`
+ops (`xs[i]` is a cell load, `xs.len()` reads the count). The
+component/preview1 mapping (`wasi:cli/environment.get-arguments`) is a
+follow-on; the raw face is satisfied by `runtime/wasmtime` (native
+argv) and `runtime/browser` (empty list).
+
 ## `main` signature
 
 `main` may be declared two ways. Both are valid; the runtime

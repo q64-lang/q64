@@ -372,6 +372,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, g.idx);
             try app(gpa, out, "])", .{});
         },
+        .host_args => try app(gpa, out, "host_args", .{}),
     }
 }
 
@@ -527,6 +528,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try mirInst(gpa, out, g.list, depth + 1);
             try mirInst(gpa, out, g.idx, depth + 1);
         },
+        .host_args => try app(gpa, out, "host_args\n", .{}),
         .fmt_int_to_str => |inner| {
             try app(gpa, out, "fmt_int_to_str\n", .{});
             try mirInst(gpa, out, inner, depth + 1);

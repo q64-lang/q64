@@ -487,4 +487,9 @@ pub const Expr = union(enum) {
     /// `xs[i]` on a `[str]` value: bounds-check `i < count`, load the i-th
     /// `(ptr, len)` cell, and yield it as a str value.
     strlist_get: struct { list: *Expr, idx: *Expr },
+    /// `env.args` — the command-line arguments as a `[str]` value. The host
+    /// (`env.args` face) materializes the `(ptr, len)` cells + bytes into the
+    /// scope arena and the guest yields the `(data_ptr, count)` pair. Pure per
+    /// spec/env.md (no capability), so it marks no effect.
+    host_args,
 };

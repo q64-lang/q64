@@ -73,6 +73,18 @@ export async function runWasm(url, sink, errSink) {
                 // `code` is a wasm i64 → JS BigInt. Keep the low byte.
                 throw new Q64Exit(Number(BigInt.asUintN(8, BigInt(code))));
             },
+            args(dest) {
+                // The browser has no command line: materialize an empty `[str]`
+                // (count = 0) and return the 4-byte count header. (wasm32 is the
+                // browser target's address width.) A future host could inject
+                // args here the same way native passes argv.
+                const mem = instance.exports.memory;
+                if (!(mem instanceof WebAssembly.Memory)) {
+                    throw new Error("env.args: module has no `memory` export");
+                }
+                new DataView(mem.buffer).setUint32(dest >>> 0, 0, true);
+                return 4n; // i64 return → BigInt
+            },
         },
     };
 

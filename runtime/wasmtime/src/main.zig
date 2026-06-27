@@ -42,6 +42,13 @@ var g_alloc: std.mem.Allocator = undefined;
 // g_alloc (the guest-memory slice is transient).
 var g_kv_store: std.StringHashMapUnmanaged(i64) = .empty;
 
+// The qube's command-line arguments (`env.args`): argv[0] is the program path,
+// followed by anything after a `--` separator on the host command line. Set in
+// main; read by `envArgsCallback`. `g_ptr_width` is the module's address width
+// (4 on wasm32, 8 on wasm64) — the cell pointers/lengths are stored at it.
+var g_args: std.ArrayListUnmanaged([]const u8) = .empty;
+var g_ptr_width: usize = 8;
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     // The qview display list lives for the whole run and is freed at exit; use
@@ -89,6 +96,9 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, arg, "--bg")) {
             if (it.next()) |hex| cv_bg = std.fmt.parseInt(u32, hex, 16) catch cv_bg;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            // Everything after `--` is the qube's own argv (env.args[1..]).
+            while (it.next()) |qa| try g_args.append(g_alloc, qa);
         } else if (path == null) {
             path = arg;
         }
@@ -166,6 +176,9 @@ pub fn main(init: std.process.Init) !void {
     // runtime kind, so one host binary runs modules of either address space.
     // -------------------------------------------------------------
     const env_out_i32 = envOutWantsI32(module);
+    // env.args layout uses the module's address width; argv[0] is the program.
+    g_ptr_width = if (env_out_i32) 4 else 8;
+    try g_args.insert(g_alloc, 0, wasm_path);
 
     const linker = c.wasmtime_linker_new(engine) orelse return error.LinkerNewFailed;
     defer c.wasmtime_linker_delete(linker);
@@ -330,6 +343,39 @@ pub fn main(init: std.process.Init) !void {
         );
         if (link_err) |e| {
             try printErrorAndDelete(io, e, "linker_define_func env.exit");
+            std.process.exit(1);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // env.args :: (dest) -> i64 (spec/env.md §`env.args`,
+    // `wasi:cli/environment.get-arguments`). The host writes
+    // `[count][cells…][bytes…]` at `dest` and returns the total bytes. `dest` is
+    // address-width (introspected, like env.out); the result is always i64.
+    // -------------------------------------------------------------
+    {
+        var args_param_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(arg_valkind)};
+        var args_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&args_params_vec, args_param_types.len, @ptrCast(&args_param_types));
+        var args_result_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var args_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&args_results_vec, args_result_types.len, @ptrCast(&args_result_types));
+        const args_type = c.wasm_functype_new(&args_params_vec, &args_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(args_type);
+        const link_err = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "args",
+            "args".len,
+            args_type,
+            envArgsCallback,
+            null,
+            null,
+        );
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.args");
             std.process.exit(1);
         }
     }
@@ -715,6 +761,76 @@ fn envFsReadCallback(
 
     results[0].kind = c.WASMTIME_I64;
     results[0].of.i64 = @intCast(size);
+    return null;
+}
+
+/// `env.args(dest) -> i64` — materialize `g_args` as a `[str]` at `dest`:
+/// `[count][cells…][bytes…]`, where each cell is `(guest_ptr, len)` at the
+/// module's address width and `guest_ptr` is the absolute guest address of that
+/// arg's bytes. Grows guest memory if needed; returns the total bytes written.
+fn envArgsCallback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    if (nargs != 1 or nresults != 1) return trap("env.args: expected (dest) -> i64");
+    const dest_i64 = argAddr(args[0]);
+    if (dest_i64 < 0) return trap("env.args: negative dest");
+
+    var memory_item: c.wasmtime_extern_t = undefined;
+    if (!c.wasmtime_caller_export_get(caller, "memory", "memory".len, &memory_item)) {
+        return trap("env.args: module has no `memory` export");
+    }
+    if (memory_item.kind != c.WASMTIME_EXTERN_MEMORY) {
+        return trap("env.args: `memory` export is not a memory");
+    }
+    const ctx = c.wasmtime_caller_context(caller);
+
+    const w = g_ptr_width;
+    const count = g_args.items.len;
+    var bytes_total: usize = 0;
+    for (g_args.items) |a| bytes_total += a.len;
+    const total = w + count * 2 * w + bytes_total;
+
+    const dest: usize = @intCast(dest_i64);
+    var data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
+    var data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
+    if (dest + total > data_size) {
+        const page = 65536;
+        const needed_pages: u64 = @intCast((dest + total - data_size + page - 1) / page);
+        var prev: u64 = 0;
+        if (c.wasmtime_memory_grow(ctx, &memory_item.of.memory, needed_pages, &prev) != null) return trap("env.args: out of memory");
+        data = c.wasmtime_memory_data(ctx, &memory_item.of.memory);
+        data_size = c.wasmtime_memory_data_size(ctx, &memory_item.of.memory);
+        if (dest + total > data_size) return trap("env.args: out of memory");
+    }
+
+    // Write an address-width little-endian value at `data[off]`.
+    const putW = struct {
+        fn f(d: [*c]u8, off: usize, width: usize, v: usize) void {
+            var i: usize = 0;
+            while (i < width) : (i += 1) d[off + i] = @truncate(v >> @intCast(i * 8));
+        }
+    }.f;
+
+    putW(data, dest, w, count); // count header
+    const cells_base = dest + w;
+    const bytes_base = dest + w + count * 2 * w;
+    var byte_off: usize = 0;
+    for (g_args.items, 0..) |a, i| {
+        const guest_ptr = bytes_base + byte_off;
+        putW(data, cells_base + i * 2 * w, w, guest_ptr); // cell[i].ptr
+        putW(data, cells_base + i * 2 * w + w, w, a.len); // cell[i].len
+        if (a.len > 0) @memcpy(data[guest_ptr .. guest_ptr + a.len], a);
+        byte_off += a.len;
+    }
+
+    results[0].kind = c.WASMTIME_I64;
+    results[0].of.i64 = @intCast(total);
     return null;
 }
 

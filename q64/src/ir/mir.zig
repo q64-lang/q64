@@ -238,6 +238,11 @@ pub const Op = union(enum) {
     /// pair): trap if `i >= count` (unsigned; negatives trap too), then load
     /// the i-th `(ptr, len)` cell and yield it as a str value. `.ty` is `.str`.
     strlist_get: struct { list: *Inst, idx: *Inst },
+    /// `env.args` — materialize the command-line arguments as a `[str]` value.
+    /// Calls the `env.args` host import with the arena pointer; the host writes
+    /// `[count][cells…][bytes…]` there and returns the total bytes; the guest
+    /// bumps `sp` and yields the `(data_ptr, count)` pair. `.ty` is `.str`.
+    host_args,
     /// `env.exit(code)` (spec/env.md §`env.exit`): call the `env.exit` host
     /// import (raw face) or `wasi_snapshot_preview1.proc_exit` (preview1 path)
     /// with the i64 `code`. Void — the host terminates the instance.

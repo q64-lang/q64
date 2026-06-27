@@ -1455,8 +1455,24 @@ spec/q64-cli.md `--component`).
       - **Boundaries (v0):** elements must be string constants/literals — a
         runtime str-binding element (`[name, …]`) isn't classified yet
         (`UnsupportedExpression`); no `[str]` params/returns, iteration
-        (`for s in xs`), or `.get(i) -> Result` yet; the host-provided form
-        (`env.args`) builds on this next.
+        (`for s in xs`), or `.get(i) -> Result` yet.
+- [x] **`env.args` → a host-provided `[str]` (toward `wasi:cli/environment`).**
+      `let a = env.args` binds the command-line arguments as a `[str]` value
+      (`host_args` HIR/MIR node), so `a.len()` and `a[i]` reuse the `[str]`
+      machinery directly. The raw host face `env.args : (dest) -> i64` has the
+      host write `[count][cells…][bytes…]` into the scope arena (growing guest
+      memory if needed) and return the total bytes; the guest yields
+      `(dest+W, count)`. `env.args` is **pure** (no capability marker, per
+      spec/env.md). Hosts: `runtime/wasmtime` materializes the real argv
+      (`argv[0]` = program path, plus anything after `--` on the host command
+      line); `runtime/browser` returns an empty list. Verified end-to-end
+      (wasm32 + wasm64): `q64-wasmtime-host args.wasm -- hello world` →
+      `len()==3`, `a[0]`=program, `a[1]`=hello, `a[2]`=world. +1 unit test; wire
+      ABI documented in spec/env.md §"Wire ABI: env.args". 541 green.
+      - **Follow-on:** direct `env.args[i]` (without a `let`); the
+        component/preview1 `args_sizes_get`/`args_get` →
+        `wasi:cli/environment.get-arguments` mapping; `env.envvars`
+        (`environ_get`). `q64 run` (flips the pre-written `run.test.ts`).
 - [ ] **String / list exports.** Lift `str`-returning / `str`-param exports via
       the canonical ABI string representation (memory + realloc canon options);
       today they're skipped from the component surface.

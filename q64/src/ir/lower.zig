@@ -284,6 +284,8 @@ fn lowerStrExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         },
         // `xs[i]` yields the i-th str element (a str value).
         .strlist_get => |g| return mk(ctx.a, .str, .{ .strlist_get = .{ .list = try lowerStrExpr(ctx, g.list), .idx = try lowerExpr(ctx, g.idx) } }),
+        // `env.args` materializes the args as a `[str]` (str-shaped) value.
+        .host_args => return mk(ctx.a, .str, .host_args),
         else => return error.Unsupported,
     }
 }
@@ -481,7 +483,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         // `[str]` values are str-shaped (a `(data_ptr, count)` pair); route to
         // the str lowering (a strlist in an i64 position is a type error caught
         // earlier).
-        .strlist_make, .strlist_get => return lowerStrExpr(ctx, e),
+        .strlist_make, .strlist_get, .host_args => return lowerStrExpr(ctx, e),
         .str_len => |s| return mk(ctx.a, .i64, .{ .str_len = try lowerStrExpr(ctx, s) }),
         // `s[i]` — str operand to (ptr, len), idx to i64; backend loads the byte.
         .str_index => |si| return mk(ctx.a, .i64, .{ .str_index = .{ .str = try lowerStrExpr(ctx, si.str), .idx = try lowerExpr(ctx, si.idx) } }),

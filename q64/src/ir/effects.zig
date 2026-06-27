@@ -239,6 +239,8 @@ fn collectExpr(
             try collectExpr(a, g.list, d, e);
             try collectExpr(a, g.idx, d, e);
         },
+        // `env.args` is pure (spec/env.md) — no capability, no children.
+        .host_args => {},
         .elem_ptr => |ep| {
             try collectExpr(a, ep.base, d, e);
             try collectExpr(a, ep.index, d, e);

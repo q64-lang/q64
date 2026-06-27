@@ -952,6 +952,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // fs.read lets the HOST grow memory for file contents (spec/env.md
     // §"Wire ABI: fs.read"), so the max must allow it.
     var any_fs = false;
+    var any_args = false;
     for (m.funcs) |*f2| {
         const st2 = switch (f2.body) {
             .structured => |inst| inst,
@@ -960,12 +961,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var sc2 = Scratch{};
         scanScratch(st2, &sc2);
         if (sc2.has_fs) any_fs = true;
+        if (sc2.has_args) any_args = true;
     }
     // The kv path keeps memory bounded but growable: the canonical `cabi_realloc`
     // serves host-side allocations (e.g. an error variant's `other(string)`) from
-    // page 1 up, so reserve room above the page-0 data/scratch/arena.
+    // page 1 up, so reserve room above the page-0 data/scratch/arena. fs.read and
+    // env.args let the host grow guest memory, so they also need headroom.
     const mem_min: c.BinaryenIndex = if (wants_kv) 2 else 1;
-    const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_kv) 64 else if (any_fs) 256 else 1;
+    const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_kv) 64 else if (any_fs or any_args) 256 else 1;
     // The component model requires the canonical memory export to be named
     // `cm32p2_memory`; the raw paths keep the plain `memory`.
     const mem_export_name = if (wants_kv) "cm32p2_memory" else "memory";
@@ -994,6 +997,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_str_eq = false;
     var needs_vec = false;
     var needs_fs = false;
+    var needs_args = false;
     var needs_kv = false;
     var needs_chan = false;
     var needs_take = false;
@@ -1024,6 +1028,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             needs_fs = true;
             needs_arena = true;
         }
+        if (sc.has_args) {
+            needs_args = true;
+            needs_arena = true; // env.args materializes into the scope arena
+        }
         if (sc.has_kv) needs_kv = true;
         if (sc.has_chan) needs_chan = true;
         if (sc.has_take) needs_take = true;
@@ -1053,6 +1061,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var fsp = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type };
         const fs_params = c.BinaryenTypeCreate(&fsp, fsp.len);
         c.BinaryenAddFunctionImport(module, "env_fs_read", "env", "fs_read", fs_params, i64_type);
+    }
+    if (needs_args) {
+        // env.args : (dest) -> i64. The host writes `[count][cells…][bytes…]`
+        // at dest (growing guest memory if needed) and returns the total bytes
+        // (spec/env.md §`env.args`). `wasi:cli/environment.get-arguments`.
+        var ap = [_]c.BinaryenType{ptr_type};
+        const args_params = c.BinaryenTypeCreate(&ap, ap.len);
+        c.BinaryenAddFunctionImport(module, "env_args", "env", "args", args_params, i64_type);
     }
     if (needs_kv and !wants_kv) {
         // Local `qube run` ABI — env.kv_increment : (key_ptr, key_len, delta) ->
@@ -1498,6 +1514,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
             break :blk false;
         },
         .strlist_get => |g| bodyHasOut(g.list, want_int) or bodyHasOut(g.idx, want_int),
+        .host_args => false,
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .chan_recv => |h| bodyHasOut(h, want_int),
@@ -1700,6 +1717,9 @@ const Scratch = struct {
     has_bounds: bool = false,
     /// Contains an `env.fs.read` → declare the import + fs scratch.
     has_fs: bool = false,
+    /// Contains an `env.args` → declare the `env.args` import + allow the host
+    /// to grow guest memory for the materialized args.
+    has_args: bool = false,
     /// Contains an `env.kv.increment` → declare the `env.kv_increment` import.
     has_kv: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
@@ -1731,6 +1751,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_bounds = s.has_bounds or sub.has_bounds;
     s.has_vec = s.has_vec or sub.has_vec;
     s.has_fs = s.has_fs or sub.has_fs;
+    s.has_args = s.has_args or sub.has_args;
     s.has_kv = s.has_kv or sub.has_kv;
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
@@ -1959,6 +1980,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_bounds = true; // the index rides the bounds scratch
             scanScratch(g.list, s);
             scanScratch(g.idx, s);
+        },
+        .host_args => {
+            s.has_args = true; // declare the import + allow memory growth
+            if (s.rec_depth < 1) s.rec_depth = 1; // a base-ptr scratch for `dest`
         },
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => {},
     }
@@ -2491,6 +2516,7 @@ const Lowerer = struct {
             .array_make => |am| return self.emitArrayMake(am),
             .strlist_make => |inits| return self.emitStrlistMake(inits),
             .strlist_get => |g| return self.emitStrlistGet(g),
+            .host_args => return self.emitHostArgs(),
             .elem_ptr => |ep| {
                 // base + index·stride (index is i64; narrow to the address
                 // width on wasm32).
@@ -3151,6 +3177,34 @@ const Lowerer = struct {
                 null,
             ),
             c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len),
+        };
+        return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.pair_type);
+    }
+
+    /// `env.args` → materialize the args as a `[str]` value. Hand the host the
+    /// current arena pointer (`dest`); it writes `[count][cells…][bytes…]`
+    /// there (growing guest memory if needed) and returns the total bytes. The
+    /// guest bumps `sp` past the written region and yields `(dest+W, count)` —
+    /// the cells start one address-word past the count header.
+    fn emitHostArgs(self: *Lowerer) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const w: u32 = if (self.ptr_type == self.i32_type) 4 else 8;
+        const ridx = self.rec_base + self.rec_level;
+        // sp is address-width; env.args returns total bytes as i64.
+        var call_args = [_]c.BinaryenExpressionRef{self.ptrGet(ridx)};
+        var seq = [_]c.BinaryenExpressionRef{
+            // dest = sp.
+            c.BinaryenLocalSet(m, ridx, c.BinaryenGlobalGet(m, "sp", self.ptr_type)),
+            // sp = dest + total (the host wrote `total` bytes at dest).
+            c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(ridx), self.toPtr(c.BinaryenCall(m, "env_args", @ptrCast(&call_args), call_args.len, self.i64_type)))),
+            // yield (data_ptr = dest + W, count = load_uW(dest)).
+            blk: {
+                var elems = [_]c.BinaryenExpressionRef{
+                    self.ptrAdd(self.ptrGet(ridx), self.ptrConst(@intCast(w))),
+                    c.BinaryenLoad(m, w, false, 0, 0, self.ptr_type, self.ptrGet(ridx), "0"),
+                };
+                break :blk c.BinaryenTupleMake(m, @ptrCast(&elems), elems.len);
+            },
         };
         return c.BinaryenBlock(m, null, @ptrCast(&seq), seq.len, self.pair_type);
     }

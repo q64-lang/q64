@@ -652,23 +652,18 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                     try out.append(b.a, st);
                 }
                 if (!any) return error.Unsupported; // empty literal binds nothing
+            } else if (init_expr == .path and isEnvArgsPath(b, init_expr.path)) {
+                // `let a = env.args` — bind the command-line args `[str]` value.
+                const hv = try b.a.create(hir.Expr);
+                hv.* = .host_args;
+                try bindStrlist(b, scope, nm.text, ls.isVar(), hv, out);
             } else if (init_expr == .array and try isStrArrayLit(b, init_expr.array, scope)) {
                 // A `[str]` literal: materialize the `(ptr, len)` cells in the
                 // scope arena; the binding holds the `(data_ptr, count)` pair in
                 // two `.ptr` locals (the str-binding shape), tracked in
                 // `scope.strlists` for index / `.len()` dispatch.
                 const sl = try buildStrlistLit(b, init_expr.array, scope, rt);
-                const ptr_idx: u32 = @intCast(b.cur_locals.items.len);
-                try b.cur_locals.append(b.a, .ptr);
-                try b.cur_locals.append(b.a, .ptr);
-                try scope.strlists.put(b.a, nm.text, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
-                scope.next_idx = ptr_idx;
-                _ = try scope.declare(nm.text, ls.isVar(), .str);
-                const len_hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{nm.text});
-                _ = try scope.declare(len_hidden, false, .ptr);
-                const st = try b.a.create(hir.Stmt);
-                st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = sl.e } };
-                try out.append(b.a, st);
+                try bindStrlist(b, scope, nm.text, ls.isVar(), sl.e, out);
             } else if (init_expr == .array) {
                 // An array literal: materialize in the scope arena; the
                 // binding holds the base pointer (one .ptr local), the
@@ -6285,6 +6280,31 @@ fn buildStrlistLit(b: *Builder, ae: ast.ArrayExpr, scope: *Scope, rt: ?*const Rt
     const out = try b.a.create(hir.Expr);
     out.* = .{ .strlist_make = try inits.toOwnedSlice(b.a) };
     return .{ .e = out, .count = @intCast(inits.items.len) };
+}
+
+/// Bind a `[str]` value (`value`) to `name`: store its `(data_ptr, count)` pair
+/// in two `.ptr` locals (the str-binding shape) and register it in
+/// `scope.strlists` so `name[i]` / `name.len()` dispatch to the list ops.
+/// Shared by the `[str]` literal and `env.args` bindings.
+fn bindStrlist(b: *Builder, scope: *Scope, name: []const u8, is_var: bool, value: *hir.Expr, out: *std.ArrayList(*hir.Stmt)) BuildError!void {
+    const ptr_idx: u32 = @intCast(b.cur_locals.items.len);
+    try b.cur_locals.append(b.a, .ptr);
+    try b.cur_locals.append(b.a, .ptr);
+    try scope.strlists.put(b.a, name, .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1 });
+    scope.next_idx = ptr_idx;
+    _ = try scope.declare(name, is_var, .str);
+    const len_hidden = try std.fmt.allocPrint(b.a, "{s}#len", .{name});
+    _ = try scope.declare(len_hidden, false, .ptr);
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .str_let = .{ .ptr_idx = ptr_idx, .len_idx = ptr_idx + 1, .value = value } };
+    try out.append(b.a, st);
+}
+
+/// Is `p` the dotted path `env.args`?
+fn isEnvArgsPath(b: *Builder, p: ast.PathExpr) bool {
+    const txt = p.text(b.a) catch return false;
+    defer b.a.free(txt);
+    return std.mem.eql(u8, txt, "env.args");
 }
 
 /// The element address `base_ptr_local[index]` with the spec's trapping
@@ -14036,6 +14056,28 @@ test "env.fs.read: a Result<str, i64> @fs capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "fs_read") != null);
     // The effect pass marks main @fs (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@fs") != null);
+}
+
+test "env.args: a [str] binding via host_args, with .len() and [i]" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    let a = env.args
+        \\    env.out(a.len())
+        \\    env.out(a[0])
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `env.args` lowers to `host_args` bound as a str-list; `.len()`/`[i]`
+    // reuse the [str] ops. It's pure — no capability beyond env.out's @stdout.
+    try testing.expect(std.mem.indexOf(u8, dump, "host_args") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "str_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "strlist_get") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@args") == null); // pure
 }
 
 test "[str] value: a literal binding, .len(), and [i] indexing" {
