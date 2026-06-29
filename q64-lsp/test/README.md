@@ -20,10 +20,15 @@ pnpm -C test test
 
 Point at a different server build with `Q64_LSP_SERVER=/path/to/server.js`.
 
-## Coverage (v0)
+## Coverage
 
 - `initialize` capabilities (full text sync, diagnostics).
-- `publishDiagnostics`: clean source → none; `\r` → `LEX010`.
+- `publishDiagnostics`:
+  - clean source → none; empty buffer → none (zero-length input path);
+  - `\r` → `LEX010` (lexer);
+  - `@realtime + @io` fn → `EFF120` — a *semantic* code, proving the sema
+    passes (not just the parser) are wired into the wasm core.
+- document lifecycle: `didChange` re-validates the buffer; `didClose` clears.
 
 As the server grows hover/definition/formatting, add cases here against the
 same black-box transport.

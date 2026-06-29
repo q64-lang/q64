@@ -42,15 +42,24 @@ export class Core {
   /** Parse `source` and return its diagnostic envelope. */
   diagnose(source: string): Envelope {
     const bytes = new TextEncoder().encode(source);
-    const inPtr = this.e.q64_alloc(bytes.length);
-    if (inPtr === 0) throw new Error("q64-core: allocation failed");
 
-    // Re-read .buffer after each wasm call: a grow detaches old views.
-    new Uint8Array(this.e.memory.buffer, inPtr, bytes.length).set(bytes);
+    // Zero-length input: `q64_alloc(0)` hands back a dangling sentinel pointer
+    // (a valid zero-length allocation, but not a real buffer — it reads as -1 in
+    // JS), so for an empty source we never allocate or write. We pass the core a
+    // null base with length 0; it reads `src[0..0]` and never touches the
+    // pointer, returning the empty-file envelope. A blank/new `.q` buffer is the
+    // common case — the previous code passed the sentinel straight to
+    // `new Uint8Array(buffer, -1, 0)` and threw a RangeError.
+    const inPtr = bytes.length === 0 ? 0 : this.e.q64_alloc(bytes.length);
+    if (bytes.length > 0) {
+      if (inPtr === 0) throw new Error("q64-core: allocation failed");
+      // Re-read .buffer after each wasm call: a grow detaches old views.
+      new Uint8Array(this.e.memory.buffer, inPtr, bytes.length).set(bytes);
+    }
 
     const packed = this.e.q64_diagnose(inPtr, bytes.length);
     if (packed === 0n) {
-      this.e.q64_free(inPtr, bytes.length);
+      if (bytes.length > 0) this.e.q64_free(inPtr, bytes.length);
       throw new Error("q64-core: diagnose failed");
     }
 
@@ -58,7 +67,7 @@ export class Core {
     const outLen = Number(packed & 0xffffffffn);
     const out = new Uint8Array(this.e.memory.buffer, outPtr, outLen).slice();
 
-    this.e.q64_free(inPtr, bytes.length);
+    if (bytes.length > 0) this.e.q64_free(inPtr, bytes.length);
     this.e.q64_free(outPtr, outLen);
 
     return JSON.parse(new TextDecoder().decode(out)) as Envelope;

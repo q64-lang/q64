@@ -33,8 +33,9 @@ export function runServer(
         // simplest and sufficient — there is no incremental parse yet.
         textDocumentSync: TextDocumentSyncKind.Full,
         positionEncoding: utf8 ? "utf-8" : "utf-16",
-        // v0 advertises diagnostics only. Hover / definition / formatting /
-        // code actions arrive as typeck and fmt land in ../../../q64.
+        // Diagnostics (parse + sema) only for now. Hover / definition /
+        // formatting / code actions arrive once the core exports positional
+        // queries (q64_hover, …) and fmt lands in ../../../q64.
       },
     };
   });

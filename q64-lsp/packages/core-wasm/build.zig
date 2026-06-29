@@ -1,7 +1,8 @@
 //! Build script for q64-core.wasm.
 //!
-//! Compiles q64's *analysis* modules (parser today; typeck/effect/region
-//! as they land) to a freestanding wasm32 module exporting a small C ABI.
+//! Compiles q64's *analysis* modules (parser + sema; effect/region checks
+//! live inside sema today) to a freestanding wasm32 module exporting a small
+//! C ABI.
 //!
 //! Critically, this build NEVER links Binaryen. The analysis path
 //! (parse → diagnostics) is pure Zig, which is exactly what lets the same
@@ -28,12 +29,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // q64's sema package (name resolution + type/effect/region checks). It
+    // depends only on `std` and `parser` — NOT on ir/codegen/Binaryen — which is
+    // exactly what lets it cross the same freestanding-wasm line the parser does.
+    // Wired the same way the native build.zig does (sema_mod -> parser_mod).
+    const sema_mod = b.createModule(.{
+        .root_source_file = b.path("../../../q64/src/sema/lib.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    sema_mod.addImport("parser", parser_mod);
+
     const wasm_mod = b.createModule(.{
         .root_source_file = b.path("src/wasm.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
     wasm_mod.addImport("parser", parser_mod);
+    wasm_mod.addImport("sema", sema_mod);
 
     const wasm = b.addExecutable(.{
         .name = "q64-core",

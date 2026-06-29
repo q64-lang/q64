@@ -24,8 +24,8 @@ transport differs, because the analysis is the wasm.
 |---|---|
 | `initialize` / `initialized` / `shutdown` | ✅ |
 | `textDocument/didOpen` · `didChange` · `didClose` | ✅ (full sync) |
-| `textDocument/publishDiagnostics` | ✅ (from the parser) |
-| hover · definition · formatting · code actions | ⏳ awaits `typeck`/`fmt` in [`../../../q64`](../../../q64) |
+| `textDocument/publishDiagnostics` | ✅ (parse + sema check — LEX/PAR/NAM/TYP/EFF/REG) |
+| hover · definition · formatting · code actions | ⏳ await positional query exports (`q64_hover`, …) + `fmt` in [`../../../q64`](../../../q64) |
 
 ## Run
 

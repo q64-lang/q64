@@ -3,8 +3,11 @@
 The q64 language server, its editor clients, and the WebAssembly build of
 the q64 analysis core they all run on.
 
-> **Status: v0 — diagnostics only.** Hover, go-to-definition, formatting,
-> and code actions wait on `typeck`/`fmt` landing in [`../q64`](../q64).
+> **Status: diagnostics complete.** The core runs the full `q64 check`
+> pipeline (parse + sema → LEX/PAR/NAM/TYP/EFF/REG), so the editor sees the
+> same semantic diagnostics the compiler does — not just parse errors. Hover,
+> go-to-definition, and formatting wait on positional query exports
+> (`q64_hover`, …) and `fmt` in [`../q64`](../q64).
 
 ## Why this exists
 

@@ -127,6 +127,29 @@ export class LspClient {
     });
   }
 
+  /** Replace the whole buffer (the server advertises full text sync). */
+  changeDocument(uri: string, text: string, version = 2): void {
+    this.notify("textDocument/didChange", {
+      textDocument: { uri, version },
+      contentChanges: [{ text }],
+    });
+  }
+
+  closeDocument(uri: string): void {
+    this.notify("textDocument/didClose", { textDocument: { uri } });
+  }
+
+  /** Resolve on the NEXT notification matching `method` — ignoring any already
+   *  buffered. Register it BEFORE triggering the change you want to observe, so
+   *  the post-open publish (e.g.) can't satisfy a didChange/didClose assertion. */
+  nextNotification(
+    method: string,
+    match: (m: LspMessage) => boolean = () => true,
+  ): Promise<LspMessage> {
+    const pred = (m: LspMessage) => m.method === method && match(m);
+    return new Promise((resolve) => this.waiters.push({ match: pred, resolve }));
+  }
+
   async shutdown(): Promise<void> {
     await this.request("shutdown", null);
     this.notify("exit", null);

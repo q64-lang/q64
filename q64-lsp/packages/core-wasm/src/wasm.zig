@@ -16,8 +16,10 @@
 
 const std = @import("std");
 const parser = @import("parser");
+const sema = @import("sema");
 const parse = parser.parse;
 const diag = parser.diag;
+const ast = parser.ast;
 
 /// Caller-facing buffers (the source the host writes, and the JSON we hand
 /// back) are allocated from the page allocator so their lifetime is
@@ -40,16 +42,63 @@ export fn q64_diagnose(src_ptr: [*]const u8, src_len: usize) u64 {
 }
 
 fn diagnoseInner(source: []const u8) !u64 {
-    // Everything transient — the parse tree, the diagnostics, the JSON
-    // builder's scratch — lives in a per-call arena that is freed on return.
+    // Everything transient — the parse tree, the symbol table, the type store,
+    // the diagnostics, the JSON builder's scratch — lives in a per-call arena
+    // that is freed on return. So the per-pass `deinit`s below free back into the
+    // arena (a no-op); the arena is the single owner.
     var arena_state = std.heap.ArenaAllocator.init(host_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const result = try parse.parse(arena, source, "buffer.q");
+    const path = "buffer.q";
+    const result = try parse.parse(arena, source, path);
+
+    // Collect parse diagnostics, then the semantic passes — the same order and
+    // sources as the native `q64 check` pipeline (q64/src/main.zig), so the
+    // editor surfaces the same LEX/PAR/NAM/TYP/EFF/REG diagnostics the compiler
+    // does. The one omission is NAM002 (a relative import escaping the qube): it
+    // walks the filesystem for the qube root, and the language server has no disk
+    // — it only ever sees the single buffer the host hands it.
+    var all: std.ArrayList(diag.Diagnostic) = .empty;
+    try all.appendSlice(arena, result.diagnostics);
+
+    if (ast.SourceFile.cast(result.root)) |sf| {
+        // Name resolution (NAM*): file-level symbol table + import-scope checks.
+        var table = try sema.build(arena, sf);
+        defer table.deinit();
+        try all.appendSlice(arena, try sema.fileDiagnostics(arena, &table, path));
+
+        // The fit registry powers the fit-form checks (TYP200/201/202).
+        var fitreg = try sema.fits.build(arena, sf);
+        defer fitreg.deinit();
+
+        // The A4 check pass (TYP*/EFF*/REG*), typed against the signature table.
+        var store = try sema.types.TypeStore.init(arena);
+        defer store.deinit();
+        var sigs = try sema.types.collectSignatures(&store, &table, sf);
+        defer sigs.deinit();
+        const check_diags = try sema.check.checkFile(arena, sf, &table, &store, &sigs, &fitreg);
+
+        // check + fit diagnostics carry only a code + byte offset; widen them to
+        // the full envelope shape (severity/message/file) exactly as main.zig does.
+        for (check_diags) |cd| try all.append(arena, .{
+            .code = cd.code,
+            .severity = .err,
+            .message = diag.messageFor(cd.code),
+            .file = path,
+            .offset = cd.offset,
+        });
+        for (fitreg.diags.items) |fd| try all.append(arena, .{
+            .code = fd.code,
+            .severity = .err,
+            .message = diag.messageFor(fd.code),
+            .file = path,
+            .offset = fd.offset,
+        });
+    }
 
     var aw: std.Io.Writer.Allocating = .init(arena);
-    try diag.emitJson(&aw.writer, source, result.diagnostics, arena);
+    try diag.emitJson(&aw.writer, source, all.items, arena);
     const json = aw.writer.buffered();
 
     // Copy the envelope out of the arena into a host-owned buffer that
