@@ -154,6 +154,8 @@ shipped by the runtime are:
 | `env.net`     | `Net`           | `@network`     | HTTP, WebSocket, raw sockets. See `q64.net`.                   |
 | `env.fs`      | `Fs`            | `@fs`          | Filesystem read / write / list / watch. See `q64.fs`.          |
 | `env.kv`      | `KeyValue`      | `@kv`          | Key-value store: get / set / delete / list / atomics. See `q64.kv`. |
+| `env.db`      | `Database`      | `@db`          | SQL database: query / execute / batch (SQLite dialect). See `q64.db`. |
+| `env.blob`    | `BlobStore`     | `@blob`        | Object store: get / put / delete / list of opaque blobs. See `q64.blob`. |
 | `env.audio`   | `Audio`         | `@audio`       | PCM input/output, audio worklets. See `q64.audio`.             |
 | `env.midi`    | `Midi`          | `@midi`        | MIDI input/output. See `q64.midi`.                             |
 | `env.ai`      | `AiEnv`         | `@inference`   | Model loading, inference, vocabularies. See `q64.ai`.          |
@@ -206,6 +208,35 @@ pub face KeyValue {
 
 pub struct KvPage { keys: [str], cursor: Option<str> }   // cursor None = listing complete
 ```
+
+`env.db` and `env.blob` follow the same host-opened, identity-pinned pattern as
+`env.kv` (the host performs the `open` step and binds the handle to the qube's
+identity; user code never names a database or bucket). Both map to separate WASI
+proposals — `wasi:sql`/`wasi:rdbms` and `wasi:blobstore` — versioned
+independently of the pinned `wasip3` core snapshot, like `wasi:keyvalue`.
+
+```q64
+pub face Database {
+    fn query   (self, sql: str, params: [Value]) -> Result<Rows, IoError>  @db
+    fn execute (self, sql: str, params: [Value]) -> Result<u64, IoError>   @db   // rows affected
+    fn batch   (self, stmts: [Statement])        -> Result<[Rows], IoError> @db
+}
+
+pub face BlobStore {
+    fn get    (self, key: str)              -> Result<Option<Bytes>, IoError> @blob
+    fn put    (self, key: str, data: Bytes) -> Result<(), IoError>           @blob
+    fn delete (self, key: str)              -> Result<(), IoError>           @blob
+    fn list   (self, prefix: str, cursor: Option<str>) -> Result<BlobPage, IoError> @blob
+}
+
+pub struct BlobPage { keys: [str], cursor: Option<str> }   // cursor None = listing complete
+```
+
+The SQL **dialect** is SQLite. q64 declares only the `@db` face; *which* backing
+store satisfies it — a co-located store, a replicated managed DB, or an external
+engine — is a **host** decision, invisible to the qube (on qubepods this is the
+project's storage *tier*, see that host's docs). The qube is portable across all
+of them.
 
 Effects compose with `+` per
 [`effects.md` §"Effect annotations on functions"](./effects.md);
@@ -316,6 +347,8 @@ released snapshot rather than re-pinning on every upstream RC:
 | `env.net`     | `Net`      | `wasi:sockets/{tcp, udp, instance-network, ip-name-lookup}` + `wasi:http/handler` (outbound HTTP, imported) |
 | `env.fs`      | `Fs`       | `wasi:filesystem/{types, preopens}`                     |
 | `env.kv`      | `KeyValue` | `wasi:keyvalue/{store, atomics}` (separate WASI proposal — see note) |
+| `env.db`      | `Database` | `wasi:sql` / `wasi:rdbms` (separate WASI proposal — see note) |
+| `env.blob`    | `BlobStore`| `wasi:blobstore` (separate WASI proposal — see note) |
 | `env.audio`   | `Audio`    | **no WASI equivalent** — host-specific custom WIT       |
 | `env.midi`    | `Midi`     | **no WASI equivalent** — host-specific custom WIT       |
 | `env.ui`      | `Ui`       | **no WASI equivalent** — host-specific custom WIT       |
