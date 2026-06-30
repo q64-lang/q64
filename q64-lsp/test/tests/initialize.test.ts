@@ -13,5 +13,6 @@ test("initialize advertises full text sync and diagnostics", async () => {
   expect(caps.hoverProvider).toBe(true);
   expect(caps.definitionProvider).toBe(true);
   expect(caps.documentSymbolProvider).toBe(true);
+  expect((caps.completionProvider as { resolveProvider: boolean }).resolveProvider).toBe(false);
   await client.shutdown();
 });

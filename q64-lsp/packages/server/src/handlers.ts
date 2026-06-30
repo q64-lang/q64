@@ -11,6 +11,7 @@ import {
   TextDocumentSyncKind,
   MarkupKind,
   SymbolKind,
+  CompletionItemKind,
   type Connection,
   type InitializeParams,
   type InitializeResult,
@@ -33,6 +34,22 @@ const SYMBOL_KINDS: Record<string, SymbolKind> = {
   screen: SymbolKind.Class,
   actor: SymbolKind.Class,
   graph: SymbolKind.Class,
+};
+
+// q64 completion-kind label → LSP CompletionItemKind.
+const COMPLETION_KINDS: Record<string, CompletionItemKind> = {
+  fn: CompletionItemKind.Function,
+  struct: CompletionItemKind.Struct,
+  enum: CompletionItemKind.Enum,
+  type: CompletionItemKind.Class,
+  const: CompletionItemKind.Constant,
+  state: CompletionItemKind.Variable,
+  face: CompletionItemKind.Interface,
+  screen: CompletionItemKind.Class,
+  actor: CompletionItemKind.Class,
+  graph: CompletionItemKind.Class,
+  import: CompletionItemKind.Module,
+  keyword: CompletionItemKind.Keyword,
 };
 
 // The core indexes source by UTF-8 byte; LSP positions are (line, character) in
@@ -76,6 +93,7 @@ export function runServer(
         hoverProvider: true,
         definitionProvider: true,
         documentSymbolProvider: true,
+        completionProvider: { resolveProvider: false },
         // Formatting / code actions arrive once the core exports fmt.
       },
     };
@@ -122,6 +140,16 @@ export function runServer(
         end: positionAtByte(doc, d.offset + d.len),
       },
     };
+  });
+
+  connection.onCompletion(async (params) => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return null;
+    const items = (await getCore()).complete(doc.getText(), byteOffsetAt(doc, params.position));
+    return items.map((it) => ({
+      label: it.label,
+      kind: COMPLETION_KINDS[it.kind] ?? CompletionItemKind.Text,
+    }));
   });
 
   connection.onDocumentSymbol(async (params) => {

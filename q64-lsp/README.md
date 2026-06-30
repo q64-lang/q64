@@ -8,8 +8,9 @@ the q64 analysis core they all run on.
 > sees the same semantic diagnostics the compiler does — not just parse errors.
 > Hover and go-to-definition work for top-level symbols and locals (params,
 > `let`/pattern bindings); functions hover with their full signature; the file
-> outline (document symbols) is served too. Still pending: field/member hover
-> (needs the type checker) and formatting (`fmt`) in [`../q64`](../q64).
+> outline (document symbols) and completion (symbols + keywords) are served
+> too. Still pending: scope-aware/field completion and field/member hover (the
+> type checker) and formatting (`fmt`) in [`../q64`](../q64).
 
 ## Why this exists
 

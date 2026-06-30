@@ -26,6 +26,7 @@ const parse = parser.parse;
 const diag = parser.diag;
 const ast = parser.ast;
 const cst = parser.cst;
+const lex = parser.lex;
 
 /// Caller-facing buffers (the source the host writes, and the JSON we hand
 /// back) are allocated from the page allocator so their lifetime is
@@ -283,6 +284,54 @@ fn symbolsInner(source: []const u8) !u64 {
         try writeJsonString(&aw.writer, s.name);
         try aw.writer.print(",\"kind\":\"{s}\",\"offset\":{d},\"len\":{d}}}", .{ s.kind.label(), s.offset, s.name.len });
     }
+    try aw.writer.writeAll("]}");
+    return ownJson(aw.writer.buffered());
+}
+
+/// Emit one completion item `{ "label": …, "kind": … }`, handling the
+/// leading comma via `first`.
+fn emitItem(w: *std.Io.Writer, first: *bool, label: []const u8, kind: []const u8) !void {
+    if (!first.*) try w.writeByte(',');
+    first.* = false;
+    try w.writeAll("{\"label\":");
+    try writeJsonString(w, label);
+    try w.writeAll(",\"kind\":\"");
+    try w.writeAll(kind);
+    try w.writeAll("\"}");
+}
+
+/// Completion: `{ "items": [ { "name"/"kind" }, … ] }` — the file's top-level
+/// symbols plus the language keywords. The LSP client filters by the typed
+/// prefix, so we offer the whole in-scope set rather than reading the partial
+/// word. `off` is accepted for a future scope-aware locals pass. Returns 0
+/// only on allocation failure.
+export fn q64_complete(src_ptr: [*]const u8, src_len: usize, off: u32) u64 {
+    return completeInner(src_ptr[0..src_len], off) catch 0;
+}
+
+fn completeInner(source: []const u8, off: u32) !u64 {
+    _ = off; // file-wide for now; reserved for scope-aware local completions
+    var arena_state = std.heap.ArenaAllocator.init(host_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try parse.parse(arena, source, "buffer.q");
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"items\":[");
+    var first = true;
+
+    // Top-level declarations (skip `fit` — its label is a duplicate type name).
+    if (ast.SourceFile.cast(result.root)) |sf| {
+        const table = try sema.build(arena, sf);
+        for (table.syms.items) |s| {
+            if (s.kind == .fit) continue;
+            try emitItem(&aw.writer, &first, s.name, s.kind.label());
+        }
+    }
+    // The language keywords (authoritative list from the lexer).
+    for (lex.keywords) |kw| try emitItem(&aw.writer, &first, kw.text, "keyword");
+
     try aw.writer.writeAll("]}");
     return ownJson(aw.writer.buffered());
 }

@@ -42,6 +42,13 @@ export interface SymbolEntry {
   len: number;
 }
 
+/** One completion candidate. `kind` is the q64 label ("fn", "struct", …) or
+ *  "keyword"; the LSP client filters these by the typed prefix. */
+export interface CompletionEntry {
+  label: string;
+  kind: string;
+}
+
 interface CoreExports {
   memory: WebAssembly.Memory;
   q64_alloc(len: number): number;
@@ -50,6 +57,7 @@ interface CoreExports {
   q64_hover(ptr: number, len: number, off: number): bigint;
   q64_definition(ptr: number, len: number, off: number): bigint;
   q64_symbols(ptr: number, len: number): bigint;
+  q64_complete(ptr: number, len: number, off: number): bigint;
 }
 
 export class Core {
@@ -83,6 +91,11 @@ export class Core {
   /** The file outline: every top-level declaration in source order. */
   documentSymbols(source: string): SymbolEntry[] {
     return (this.query(source, (p, l) => this.e.q64_symbols(p, l)) as { symbols: SymbolEntry[] }).symbols;
+  }
+
+  /** Completion candidates at UTF-8 byte `offset`: in-scope symbols + keywords. */
+  complete(source: string, offset: number): CompletionEntry[] {
+    return (this.query(source, (p, l) => this.e.q64_complete(p, l, offset)) as { items: CompletionEntry[] }).items;
   }
 
   /** Shared memory protocol for every query: write `source` into wasm memory,
