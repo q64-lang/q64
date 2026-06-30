@@ -34,12 +34,15 @@ export interface Definition {
 }
 
 /** One entry in the file outline. `kind` is the q64 label ("fn", "struct",
- *  "enum", …); `offset`/`len` are the name token's UTF-8 byte span. */
+ *  "enum", …). `offset`/`len` are the name token's UTF-8 byte span (the
+ *  selection range); `start`/`end` are the full declaration span (the range). */
 export interface SymbolEntry {
   name: string;
   kind: string;
   offset: number;
   len: number;
+  start: number;
+  end: number;
 }
 
 /** One completion candidate. `kind` is the q64 label ("fn", "struct", …) or

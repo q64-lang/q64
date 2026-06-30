@@ -35,7 +35,8 @@ Point at a different server build with `Q64_LSP_SERVER=/path/to/server.js`.
   — a parameter and a `let` use each render `local <name>` and jump to their
   binding site.
 - document symbols: the outline lists every top-level declaration in order
-  with its LSP `SymbolKind` (empty list for an empty buffer).
+  with its LSP `SymbolKind`, a full-declaration `range`, and a name
+  `selectionRange` (empty list for an empty buffer).
 - completion: offers in-scope symbols (right `CompletionItemKind`), the
   enclosing function's params + `let` bindings, plus the language keywords; an
   empty buffer still offers the keywords.

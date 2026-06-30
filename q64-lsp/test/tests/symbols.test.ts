@@ -6,11 +6,15 @@ const SERVER = process.env.Q64_LSP_SERVER ?? "../packages/server/dist/node.js";
 const SRC =
   "struct Point { x: i64 }\nconst MAX: i64 = 10\nfn add(a: i64) -> i64 { a }\n";
 
+interface Pos {
+  line: number;
+  character: number;
+}
 interface DocSymbol {
   name: string;
   kind: number;
-  range: { start: { line: number; character: number }; end: { line: number; character: number } };
-  selectionRange: { start: { line: number; character: number } };
+  range: { start: Pos; end: Pos };
+  selectionRange: { start: Pos; end: Pos };
 }
 
 test("documentSymbol lists top-level declarations with kinds", async () => {
@@ -28,6 +32,10 @@ test("documentSymbol lists top-level declarations with kinds", async () => {
   expect(syms.map((s) => s.kind)).toEqual([23, 14, 12]);
   // The selection range points at the name token (`add` on line 2, char 3).
   expect(syms[2].selectionRange.start).toEqual({ line: 2, character: 3 });
+  // The full range spans the whole declaration: `fn add(...) { a }` on line 2,
+  // from column 0 to the end — wider than (and containing) the name.
+  expect(syms[2].range.start).toEqual({ line: 2, character: 0 });
+  expect(syms[2].range.end).toEqual({ line: 2, character: 27 });
 
   await client.shutdown();
 });

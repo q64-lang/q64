@@ -28,7 +28,7 @@ filesystem for the qube root — and the core has no disk.
 | `q64_diagnose` | `(ptr, len) -> u64` | parse + sema check; returns `(out_ptr << 32) \| out_len` of a UTF-8 JSON envelope |
 | `q64_hover` | `(ptr, len, off) -> u64` | symbol under byte `off` → `{"contents":"fn add(a: i64) -> i64"\|"local x"\|null}` |
 | `q64_definition` | `(ptr, len, off) -> u64` | declaration of the symbol under byte `off` → `{"found":true,"offset":N,"len":M}` or `{"found":false}` |
-| `q64_symbols` | `(ptr, len) -> u64` | file outline → `{"symbols":[{"name","kind","offset","len"},…]}` in declaration order |
+| `q64_symbols` | `(ptr, len) -> u64` | file outline → `{"symbols":[{"name","kind","offset","len","start","end"},…]}` (name span + full decl span) in declaration order |
 | `q64_complete` | `(ptr, len, off) -> u64` | completion candidates → `{"items":[{"label","kind"},…]}` (top-level symbols + keywords) |
 | `q64_free` | `(ptr, len)` | release a buffer (both the input and the returned output) |
 | `memory` | — | the module's linear memory |

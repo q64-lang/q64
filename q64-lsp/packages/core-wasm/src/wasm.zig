@@ -252,11 +252,36 @@ fn definitionInner(source: []const u8, off: u32) !u64 {
     return ownJson(json);
 }
 
-/// Document symbols: the file outline as
-/// `{ "symbols": [ { "name", "kind", "offset", "len" }, … ] }` in declaration
-/// order — every top-level declaration (fn / struct / enum / type / const /
-/// state / face / screen / actor / graph). `offset`/`len` are the name token's
-/// byte span; the host maps them to editor ranges. Returns 0 only on
+/// One outline entry: a top-level declaration's kind label, its name token,
+/// and its CST node (for the full-declaration span).
+const ItemSym = struct { label: []const u8, name: cst.Token, node: *const cst.Node };
+
+/// The outline view of a top-level item — its kind + name token — or null for
+/// items that aren't named declarations (`fit` duplicates a type name;
+/// `effect` binds no name). A top-level `let` lists as a `const`.
+fn itemSym(item: ast.Item) ?ItemSym {
+    return switch (item) {
+        .fn_decl => |d| .{ .label = "fn", .name = d.name() orelse return null, .node = d.cst },
+        .struct_decl => |d| .{ .label = "struct", .name = d.name() orelse return null, .node = d.cst },
+        .enum_decl => |d| .{ .label = "enum", .name = d.name() orelse return null, .node = d.cst },
+        .type_decl => |d| .{ .label = "type", .name = d.name() orelse return null, .node = d.cst },
+        .const_decl => |d| .{ .label = "const", .name = d.name() orelse return null, .node = d.cst },
+        .state_decl => |d| .{ .label = "state", .name = d.name() orelse return null, .node = d.cst },
+        .face_decl => |d| .{ .label = "face", .name = d.name() orelse return null, .node = d.cst },
+        .screen_decl => |d| .{ .label = "screen", .name = d.name() orelse return null, .node = d.cst },
+        .actor_decl => |d| .{ .label = "actor", .name = d.name() orelse return null, .node = d.cst },
+        .graph_decl => |d| .{ .label = "graph", .name = d.name() orelse return null, .node = d.cst },
+        .let_decl => |d| .{ .label = "const", .name = (d.pattern() orelse return null).bindingName() orelse return null, .node = d.cst },
+        else => null,
+    };
+}
+
+/// Document symbols: the file outline as `{ "symbols": [ { "name", "kind",
+/// "offset", "len", "start", "end" }, … ] }` in declaration order — every
+/// top-level declaration (fn / struct / enum / type / const / state / face /
+/// screen / actor / graph). `offset`/`len` are the name token (the selection
+/// range); `start`/`end` are the full declaration span (the fold range). All
+/// are byte offsets the host maps to editor ranges. Returns 0 only on
 /// allocation failure.
 export fn q64_symbols(src_ptr: [*]const u8, src_len: usize) u64 {
     return symbolsInner(src_ptr[0..src_len]) catch 0;
@@ -269,20 +294,26 @@ fn symbolsInner(source: []const u8) !u64 {
 
     const result = try parse.parse(arena, source, "buffer.q");
     const sf = ast.SourceFile.cast(result.root) orelse return ownJson("{\"symbols\":[]}");
-    const table = try sema.build(arena, sf);
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     try aw.writer.writeAll("{\"symbols\":[");
     var first = true;
-    for (table.syms.items) |s| {
-        // `fit` and `import_binding` are introspection entries, not outline
-        // declarations (a fit's name is its type's; imports aren't decls).
-        if (s.kind == .fit or s.kind == .import_binding) continue;
+    var it = sf.items();
+    while (it.next()) |item| {
+        const isym = itemSym(item) orelse continue;
+        const start = firstTokenOffset(isym.node) orelse isym.name.offset;
+        const len: u32 = @intCast((cst.Element{ .node = isym.node }).textLen());
         if (!first) try aw.writer.writeByte(',');
         first = false;
         try aw.writer.writeAll("{\"name\":");
-        try writeJsonString(&aw.writer, s.name);
-        try aw.writer.print(",\"kind\":\"{s}\",\"offset\":{d},\"len\":{d}}}", .{ s.kind.label(), s.offset, s.name.len });
+        try writeJsonString(&aw.writer, isym.name.text);
+        try aw.writer.print(",\"kind\":\"{s}\",\"offset\":{d},\"len\":{d},\"start\":{d},\"end\":{d}}}", .{
+            isym.label,
+            isym.name.offset,
+            isym.name.text.len,
+            start,
+            start + len,
+        });
     }
     try aw.writer.writeAll("]}");
     return ownJson(aw.writer.buffered());

@@ -157,21 +157,21 @@ export function runServer(
     const doc = documents.get(params.textDocument.uri);
     if (!doc) return null;
     const syms = (await getCore()).documentSymbols(doc.getText());
-    return syms.map((s) => {
-      // The name token is the only span the core reports, so range and
-      // selectionRange coincide (range must contain selectionRange — equal is
-      // fine). Full-declaration ranges arrive when the core reports decl spans.
-      const range = {
+    return syms.map((s) => ({
+      name: s.name,
+      kind: SYMBOL_KINDS[s.kind] ?? SymbolKind.Object,
+      // `range` is the whole declaration (folding / expand-selection);
+      // `selectionRange` is the name (what gets revealed/highlighted). The core
+      // guarantees the name span sits inside the declaration span.
+      range: {
+        start: positionAtByte(doc, s.start),
+        end: positionAtByte(doc, s.end),
+      },
+      selectionRange: {
         start: positionAtByte(doc, s.offset),
         end: positionAtByte(doc, s.offset + s.len),
-      };
-      return {
-        name: s.name,
-        kind: SYMBOL_KINDS[s.kind] ?? SymbolKind.Object,
-        range,
-        selectionRange: range,
-      };
-    });
+      },
+    }));
   });
 
   documents.listen(connection);
