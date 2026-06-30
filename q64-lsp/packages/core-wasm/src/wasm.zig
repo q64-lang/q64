@@ -250,3 +250,39 @@ fn definitionInner(source: []const u8, off: u32) !u64 {
     const json = try std.fmt.allocPrint(arena, "{{\"found\":true,\"offset\":{d},\"len\":{d}}}", .{ info.def_offset, info.name.len });
     return ownJson(json);
 }
+
+/// Document symbols: the file outline as
+/// `{ "symbols": [ { "name", "kind", "offset", "len" }, … ] }` in declaration
+/// order — every top-level declaration (fn / struct / enum / type / const /
+/// state / face / screen / actor / graph). `offset`/`len` are the name token's
+/// byte span; the host maps them to editor ranges. Returns 0 only on
+/// allocation failure.
+export fn q64_symbols(src_ptr: [*]const u8, src_len: usize) u64 {
+    return symbolsInner(src_ptr[0..src_len]) catch 0;
+}
+
+fn symbolsInner(source: []const u8) !u64 {
+    var arena_state = std.heap.ArenaAllocator.init(host_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const result = try parse.parse(arena, source, "buffer.q");
+    const sf = ast.SourceFile.cast(result.root) orelse return ownJson("{\"symbols\":[]}");
+    const table = try sema.build(arena, sf);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"symbols\":[");
+    var first = true;
+    for (table.syms.items) |s| {
+        // `fit` and `import_binding` are introspection entries, not outline
+        // declarations (a fit's name is its type's; imports aren't decls).
+        if (s.kind == .fit or s.kind == .import_binding) continue;
+        if (!first) try aw.writer.writeByte(',');
+        first = false;
+        try aw.writer.writeAll("{\"name\":");
+        try writeJsonString(&aw.writer, s.name);
+        try aw.writer.print(",\"kind\":\"{s}\",\"offset\":{d},\"len\":{d}}}", .{ s.kind.label(), s.offset, s.name.len });
+    }
+    try aw.writer.writeAll("]}");
+    return ownJson(aw.writer.buffered());
+}

@@ -10,6 +10,7 @@ import {
   TextDocuments,
   TextDocumentSyncKind,
   MarkupKind,
+  SymbolKind,
   type Connection,
   type InitializeParams,
   type InitializeResult,
@@ -18,6 +19,21 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 import type { Core } from "@q64/core-wasm";
 import { toLspDiagnostics } from "./diagnostics.js";
+
+// Map a q64 symbol-kind label (as `q64_symbols` emits) to an LSP SymbolKind.
+// Unknown kinds fall back to Object so the outline still lists them.
+const SYMBOL_KINDS: Record<string, SymbolKind> = {
+  fn: SymbolKind.Function,
+  struct: SymbolKind.Struct,
+  enum: SymbolKind.Enum,
+  type: SymbolKind.Class,
+  const: SymbolKind.Constant,
+  state: SymbolKind.Variable,
+  face: SymbolKind.Interface,
+  screen: SymbolKind.Class,
+  actor: SymbolKind.Class,
+  graph: SymbolKind.Class,
+};
 
 // The core indexes source by UTF-8 byte; LSP positions are (line, character) in
 // UTF-16 code units of the document. These two helpers translate across that
@@ -59,6 +75,7 @@ export function runServer(
         positionEncoding: wantsUtf8 ? "utf-8" : "utf-16",
         hoverProvider: true,
         definitionProvider: true,
+        documentSymbolProvider: true,
         // Formatting / code actions arrive once the core exports fmt.
       },
     };
@@ -105,6 +122,27 @@ export function runServer(
         end: positionAtByte(doc, d.offset + d.len),
       },
     };
+  });
+
+  connection.onDocumentSymbol(async (params) => {
+    const doc = documents.get(params.textDocument.uri);
+    if (!doc) return null;
+    const syms = (await getCore()).documentSymbols(doc.getText());
+    return syms.map((s) => {
+      // The name token is the only span the core reports, so range and
+      // selectionRange coincide (range must contain selectionRange — equal is
+      // fine). Full-declaration ranges arrive when the core reports decl spans.
+      const range = {
+        start: positionAtByte(doc, s.offset),
+        end: positionAtByte(doc, s.offset + s.len),
+      };
+      return {
+        name: s.name,
+        kind: SYMBOL_KINDS[s.kind] ?? SymbolKind.Object,
+        range,
+        selectionRange: range,
+      };
+    });
   });
 
   documents.listen(connection);

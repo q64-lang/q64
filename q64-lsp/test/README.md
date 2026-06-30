@@ -34,6 +34,8 @@ Point at a different server build with `Q64_LSP_SERVER=/path/to/server.js`.
   from a use to the declaration's range (null on a non-identifier). Locals too
   — a parameter and a `let` use each render `local <name>` and jump to their
   binding site.
+- document symbols: the outline lists every top-level declaration in order
+  with its LSP `SymbolKind` (empty list for an empty buffer).
 
 As the server grows formatting / locals support, add cases here against the
 same black-box transport.

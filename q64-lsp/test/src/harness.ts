@@ -153,6 +153,10 @@ export class LspClient {
     });
   }
 
+  documentSymbols(uri: string): Promise<LspMessage> {
+    return this.request("textDocument/documentSymbol", { textDocument: { uri } });
+  }
+
   /** Resolve on the NEXT notification matching `method` — ignoring any already
    *  buffered. Register it BEFORE triggering the change you want to observe, so
    *  the post-open publish (e.g.) can't satisfy a didChange/didClose assertion. */

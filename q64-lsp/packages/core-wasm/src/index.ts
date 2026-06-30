@@ -33,6 +33,15 @@ export interface Definition {
   len?: number;
 }
 
+/** One entry in the file outline. `kind` is the q64 label ("fn", "struct",
+ *  "enum", …); `offset`/`len` are the name token's UTF-8 byte span. */
+export interface SymbolEntry {
+  name: string;
+  kind: string;
+  offset: number;
+  len: number;
+}
+
 interface CoreExports {
   memory: WebAssembly.Memory;
   q64_alloc(len: number): number;
@@ -40,6 +49,7 @@ interface CoreExports {
   q64_diagnose(ptr: number, len: number): bigint;
   q64_hover(ptr: number, len: number, off: number): bigint;
   q64_definition(ptr: number, len: number, off: number): bigint;
+  q64_symbols(ptr: number, len: number): bigint;
 }
 
 export class Core {
@@ -68,6 +78,11 @@ export class Core {
   /** Declaration location for the symbol at UTF-8 byte `offset`. */
   definition(source: string, offset: number): Definition {
     return this.query(source, (p, l) => this.e.q64_definition(p, l, offset)) as Definition;
+  }
+
+  /** The file outline: every top-level declaration in source order. */
+  documentSymbols(source: string): SymbolEntry[] {
+    return (this.query(source, (p, l) => this.e.q64_symbols(p, l)) as { symbols: SymbolEntry[] }).symbols;
   }
 
   /** Shared memory protocol for every query: write `source` into wasm memory,
