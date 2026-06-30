@@ -49,6 +49,7 @@ const COMPLETION_KINDS: Record<string, CompletionItemKind> = {
   actor: CompletionItemKind.Class,
   graph: CompletionItemKind.Class,
   import: CompletionItemKind.Module,
+  local: CompletionItemKind.Variable,
   keyword: CompletionItemKind.Keyword,
 };
 

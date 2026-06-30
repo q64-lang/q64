@@ -36,8 +36,9 @@ Point at a different server build with `Q64_LSP_SERVER=/path/to/server.js`.
   binding site.
 - document symbols: the outline lists every top-level declaration in order
   with its LSP `SymbolKind` (empty list for an empty buffer).
-- completion: offers in-scope symbols (right `CompletionItemKind`) plus the
-  language keywords; an empty buffer still offers the keywords.
+- completion: offers in-scope symbols (right `CompletionItemKind`), the
+  enclosing function's params + `let` bindings, plus the language keywords; an
+  empty buffer still offers the keywords.
 
 As the server grows formatting / locals support, add cases here against the
 same black-box transport.

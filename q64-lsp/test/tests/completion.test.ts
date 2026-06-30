@@ -31,6 +31,26 @@ test("completion offers in-scope symbols and keywords", async () => {
   expect(byLabel.get("match")).toBe(14);
 });
 
+test("completion inside a function offers its params and bindings", async () => {
+  const client = new LspClient(SERVER);
+  await client.initialize();
+  const uri = "file:///complete-locals.q";
+  // `a`/`b` are params; `sum` is a let binding. Cursor on line 2 (`sum`), in body.
+  client.openDocument(uri, "fn calc(a: i64, b: i64) -> i64 {\n  let sum = a\n  sum\n}\n");
+  const res = await client.completion(uri, 2, 3);
+  const items = res.result as CompletionItem[];
+  const byLabel = new Map(items.map((i) => [i.label, i.kind]));
+
+  // Locals are CompletionItemKind.Variable = 6.
+  expect(byLabel.get("a")).toBe(6);
+  expect(byLabel.get("b")).toBe(6);
+  expect(byLabel.get("sum")).toBe(6);
+  // The enclosing function and keywords are still offered.
+  expect(byLabel.get("calc")).toBe(3);
+  expect(byLabel.get("fn")).toBe(14);
+  await client.shutdown();
+});
+
 test("completion on an empty document still offers keywords", async () => {
   const client = new LspClient(SERVER);
   await client.initialize();

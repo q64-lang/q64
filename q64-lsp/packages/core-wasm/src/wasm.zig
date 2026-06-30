@@ -300,6 +300,82 @@ fn emitItem(w: *std.Io.Writer, first: *bool, label: []const u8, kind: []const u8
     try w.writeAll("\"}");
 }
 
+/// Byte offset of the leftmost token under `node` (its start), or null if the
+/// node has no tokens.
+fn firstTokenOffset(node: *const cst.Node) ?u32 {
+    for (node.children) |c| switch (c) {
+        .token => |t| return t.offset,
+        .node => |n| if (firstTokenOffset(n)) |o| return o,
+    };
+    return null;
+}
+
+/// The top-level function whose body contains byte `off`, or null. The CST is
+/// lossless and contiguous, so a node's span is [firstToken, firstToken+textLen).
+fn fnContaining(sf: ast.SourceFile, off: u32) ?ast.FnDecl {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .fn_decl => |fd| {
+            const body = fd.body() orelse continue;
+            const start = firstTokenOffset(body.cst) orelse continue;
+            const len: u32 = @intCast((cst.Element{ .node = body.cst }).textLen());
+            if (off >= start and off <= start + len) return fd;
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Emit every `IDENT_PATTERN` binding under `node` as a `local` completion,
+/// deduped via `seen`.
+fn emitPatternLocals(
+    node: *const cst.Node,
+    w: *std.Io.Writer,
+    first: *bool,
+    seen: *std.StringHashMapUnmanaged(void),
+    arena: std.mem.Allocator,
+) !void {
+    if (node.kind == .IDENT_PATTERN) {
+        for (node.children) |c| switch (c) {
+            .token => |t| if (t.kind == .IDENT) {
+                const gop = try seen.getOrPut(arena, t.text);
+                if (!gop.found_existing) try emitItem(w, first, t.text, "local");
+            },
+            .node => {},
+        };
+        return;
+    }
+    for (node.children) |c| switch (c) {
+        .node => |n| try emitPatternLocals(n, w, first, seen, arena),
+        .token => {},
+    };
+}
+
+/// Add the locals of the function enclosing `off` — its params and every
+/// `let`/pattern binding in its body — as `local` completions. Function-scoped,
+/// so it may over-offer a binding from a sibling block or one declared below
+/// the cursor; the client filters by prefix, and precise per-cursor scoping is
+/// a future refinement.
+fn appendLocals(
+    w: *std.Io.Writer,
+    first: *bool,
+    arena: std.mem.Allocator,
+    sf: ast.SourceFile,
+    off: u32,
+) !void {
+    const fd = fnContaining(sf, off) orelse return;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    if (fd.params()) |ps| {
+        var pit = ps.iter();
+        while (pit.next()) |p| if (p.name()) |t| {
+            const gop = try seen.getOrPut(arena, t.text);
+            if (!gop.found_existing) try emitItem(w, first, t.text, "local");
+        };
+    }
+    const body = fd.body() orelse return;
+    try emitPatternLocals(body.cst, w, first, &seen, arena);
+}
+
 /// Completion: `{ "items": [ { "name"/"kind" }, … ] }` — the file's top-level
 /// symbols plus the language keywords. The LSP client filters by the typed
 /// prefix, so we offer the whole in-scope set rather than reading the partial
@@ -310,7 +386,6 @@ export fn q64_complete(src_ptr: [*]const u8, src_len: usize, off: u32) u64 {
 }
 
 fn completeInner(source: []const u8, off: u32) !u64 {
-    _ = off; // file-wide for now; reserved for scope-aware local completions
     var arena_state = std.heap.ArenaAllocator.init(host_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -321,13 +396,15 @@ fn completeInner(source: []const u8, off: u32) !u64 {
     try aw.writer.writeAll("{\"items\":[");
     var first = true;
 
-    // Top-level declarations (skip `fit` — its label is a duplicate type name).
+    // Top-level declarations (skip `fit` — its label is a duplicate type name)
+    // plus the locals of the function the cursor sits in.
     if (ast.SourceFile.cast(result.root)) |sf| {
         const table = try sema.build(arena, sf);
         for (table.syms.items) |s| {
             if (s.kind == .fit) continue;
             try emitItem(&aw.writer, &first, s.name, s.kind.label());
         }
+        try appendLocals(&aw.writer, &first, arena, sf, off);
     }
     // The language keywords (authoritative list from the lexer).
     for (lex.keywords) |kw| try emitItem(&aw.writer, &first, kw.text, "keyword");

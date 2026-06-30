@@ -65,10 +65,12 @@ Diagnostics run the full check pipeline; `q64_hover` / `q64_definition` cover
 and `let`/pattern bindings, via `sema.resolve`'s use→binding map. Functions
 hover with their full signature (sliced verbatim from the CST); other symbols
 hover as `kind name`. `q64_symbols` gives the file outline; `q64_complete`
-offers top-level symbols + keywords. Still open:
+offers top-level symbols, the enclosing function's locals (params + bindings),
+and keywords. Still open:
 
-- scope-aware completion — locals visible at the cursor (a scope snapshot at
-  `off`), and struct fields / member access (`a.field`, the type checker);
+- precise per-cursor completion scope — today locals are function-scoped (it
+  may over-offer a sibling-block or below-cursor binding), and struct fields /
+  member access (`a.field`) need the type checker;
 - richer hover for non-functions — a struct's fields, a const's value/type;
 - `q64_format` once `fmt` is wired in (for `textDocument/formatting`).
 

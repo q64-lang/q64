@@ -27,7 +27,7 @@ transport differs, because the analysis is the wasm.
 | `textDocument/publishDiagnostics` | ✅ (parse + sema check — LEX/PAR/NAM/TYP/EFF/REG) |
 | `textDocument/hover` · `textDocument/definition` | ✅ top-level symbols + locals; functions hover with their full signature |
 | `textDocument/documentSymbol` | ✅ file outline (top-level declarations, declaration order) |
-| `textDocument/completion` | ✅ top-level symbols + keywords (client filters by prefix) |
+| `textDocument/completion` | ✅ top-level symbols + the enclosing function's locals + keywords (client filters by prefix) |
 | formatting · code actions · field/member hover | ⏳ await `fmt` + the type checker in [`../../../q64`](../../../q64) |
 
 ## Run
