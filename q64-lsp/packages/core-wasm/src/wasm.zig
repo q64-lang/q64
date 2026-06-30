@@ -132,9 +132,38 @@ fn diagnoseInner(source: []const u8) !u64 {
     return ownJson(aw.writer.buffered());
 }
 
+/// What an identifier under the cursor resolves to: a rendered `kind` label
+/// (`"fn"`, `"struct"`, `"local"`, …), the symbol's name, and the byte offset
+/// of its declaration. Hover renders `kind name`; definition uses `def_offset`.
+const SymInfo = struct { kind: []const u8, name: []const u8, def_offset: u32 };
+
+/// Resolve the identifier at byte `off`. Locals win over file-level symbols
+/// (a local shadows a same-named top-level), matching q64's scoping — so we
+/// consult the body resolution first, then the file symbol table.
+fn symbolAt(arena: std.mem.Allocator, source: []const u8, off: u32) !?SymInfo {
+    const result = try parse.parse(arena, source, "buffer.q");
+    const sf = ast.SourceFile.cast(result.root) orelse return null;
+    const tok = identAtOffset(result.root, off) orelse return null;
+
+    const table = try sema.build(arena, sf);
+    const res = try sema.resolve.resolveBodies(arena, sf, &table);
+
+    // A local: the cursor is on a use of a binding, or on the binding itself.
+    for (res.locals.items) |l| {
+        if (tok.offset == l.offset or tok.offset == l.def_offset) {
+            return .{ .kind = "local", .name = l.name, .def_offset = l.def_offset };
+        }
+    }
+    // Otherwise a file-level symbol (fn / struct / enum / const / …).
+    if (table.lookup(tok.text)) |sym| {
+        return .{ .kind = sym.kind.label(), .name = sym.name, .def_offset = sym.offset };
+    }
+    return null;
+}
+
 /// Hover: `{ "contents": "<kind> <name>" }` for the symbol under `off`
-/// (e.g. `"fn greet"`), or `{ "contents": null }` when nothing names a
-/// top-level symbol there. Returns 0 only on allocation failure.
+/// (e.g. `"fn greet"`, `"local x"`), or `{ "contents": null }`. Returns 0
+/// only on allocation failure.
 export fn q64_hover(src_ptr: [*]const u8, src_len: usize, off: u32) u64 {
     return hoverInner(src_ptr[0..src_len], off) catch 0;
 }
@@ -144,16 +173,8 @@ fn hoverInner(source: []const u8, off: u32) !u64 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const none = "{\"contents\":null}";
-    const result = try parse.parse(arena, source, "buffer.q");
-    const sf = ast.SourceFile.cast(result.root) orelse return ownJson(none);
-    const tok = identAtOffset(result.root, off) orelse return ownJson(none);
-
-    var table = try sema.build(arena, sf);
-    defer table.deinit();
-    const sym = table.lookup(tok.text) orelse return ownJson(none);
-
-    const json = try std.fmt.allocPrint(arena, "{{\"contents\":\"{s} {s}\"}}", .{ sym.kind.label(), sym.name });
+    const info = (try symbolAt(arena, source, off)) orelse return ownJson("{\"contents\":null}");
+    const json = try std.fmt.allocPrint(arena, "{{\"contents\":\"{s} {s}\"}}", .{ info.kind, info.name });
     return ownJson(json);
 }
 
@@ -170,15 +191,7 @@ fn definitionInner(source: []const u8, off: u32) !u64 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const none = "{\"found\":false}";
-    const result = try parse.parse(arena, source, "buffer.q");
-    const sf = ast.SourceFile.cast(result.root) orelse return ownJson(none);
-    const tok = identAtOffset(result.root, off) orelse return ownJson(none);
-
-    var table = try sema.build(arena, sf);
-    defer table.deinit();
-    const sym = table.lookup(tok.text) orelse return ownJson(none);
-
-    const json = try std.fmt.allocPrint(arena, "{{\"found\":true,\"offset\":{d},\"len\":{d}}}", .{ sym.offset, sym.name.len });
+    const info = (try symbolAt(arena, source, off)) orelse return ownJson("{\"found\":false}");
+    const json = try std.fmt.allocPrint(arena, "{{\"found\":true,\"offset\":{d},\"len\":{d}}}", .{ info.def_offset, info.name.len });
     return ownJson(json);
 }

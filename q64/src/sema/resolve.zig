@@ -9,6 +9,10 @@
 //! and emitting NAM010 here would double-diagnose until rung A3 makes
 //! sema the single source of truth. `q64 show symbols` surfaces the list.
 //!
+//! Resolved *local* references (a use → its binding site) are likewise
+//! recorded, in `Resolution.locals`, so the language server can answer
+//! hover and go-to-definition for params and `let`/pattern bindings.
+//!
 //! v0 boundaries (documented, not bugs):
 //! - References inside string interpolation (`"{name}"`) live in raw
 //!   string tokens, not CST nodes — invisible here until interpolation
@@ -39,9 +43,22 @@ pub const Ref = struct {
     offset: u32,
 };
 
+/// A resolved reference to a local binding (param, `let`/`var`, or a
+/// pattern binding from `for`/`match`/`if let`/`scope`). Recorded so the
+/// language server can answer hover / go-to-definition for locals: `offset`
+/// is the use site, `def_offset` the binding's declaration. Both are byte
+/// offsets into the source.
+pub const Local = struct {
+    /// Owned by the Resolution.
+    name: []const u8,
+    offset: u32,
+    def_offset: u32,
+};
+
 pub const Resolution = struct {
     gpa: std.mem.Allocator,
     unresolved: std.ArrayList(Ref) = .empty,
+    locals: std.ArrayList(Local) = .empty,
 
     pub fn deinit(self: *Resolution) void {
         for (self.unresolved.items) |r| {
@@ -49,13 +66,16 @@ pub const Resolution = struct {
             self.gpa.free(r.in_fn);
         }
         self.unresolved.deinit(self.gpa);
+        for (self.locals.items) |l| self.gpa.free(l.name);
+        self.locals.deinit(self.gpa);
     }
 };
 
 const Scopes = struct {
     gpa: std.mem.Allocator,
-    /// Innermost last. Each level maps a bound name to {} (presence set).
-    levels: std.ArrayList(std.StringHashMapUnmanaged(void)) = .empty,
+    /// Innermost last. Each level maps a bound name to its declaration's byte
+    /// offset (so a use can point back at the binding site).
+    levels: std.ArrayList(std.StringHashMapUnmanaged(u32)) = .empty,
 
     fn push(self: *Scopes) !void {
         try self.levels.append(self.gpa, .empty);
@@ -67,18 +87,22 @@ const Scopes = struct {
         lvl.deinit(self.gpa);
         self.levels.items.len -= 1;
     }
-    fn bind(self: *Scopes, name: []const u8) !void {
+    fn bind(self: *Scopes, name: []const u8, offset: u32) !void {
         var lvl = &self.levels.items[self.levels.items.len - 1];
         if (lvl.contains(name)) return; // shadow within one level: keep first
-        try lvl.put(self.gpa, try self.gpa.dupe(u8, name), {});
+        try lvl.put(self.gpa, try self.gpa.dupe(u8, name), offset);
     }
-    fn contains(self: *const Scopes, name: []const u8) bool {
+    /// The declaration offset of `name`'s nearest enclosing binding, or null.
+    fn lookup(self: *const Scopes, name: []const u8) ?u32 {
         var i = self.levels.items.len;
         while (i > 0) {
             i -= 1;
-            if (self.levels.items[i].contains(name)) return true;
+            if (self.levels.items[i].get(name)) |off| return off;
         }
-        return false;
+        return null;
+    }
+    fn contains(self: *const Scopes, name: []const u8) bool {
+        return self.lookup(name) != null;
     }
     fn deinit(self: *Scopes) void {
         while (self.levels.items.len > 0) self.pop();
@@ -96,7 +120,15 @@ const Walker = struct {
     fn resolveHead(w: *Walker, tok: cst.Token) !void {
         for (ambient) |a| if (std.mem.eql(u8, tok.text, a)) return;
         if (prelude.contains(tok.text)) return;
-        if (w.scopes.contains(tok.text)) return;
+        if (w.scopes.lookup(tok.text)) |def_offset| {
+            // A local: record the use → declaration link for the LSP.
+            try w.res.locals.append(w.res.gpa, .{
+                .name = try w.res.gpa.dupe(u8, tok.text),
+                .offset = tok.offset,
+                .def_offset = def_offset,
+            });
+            return;
+        }
         if (w.table.lookup(tok.text) != null) return;
         try w.res.unresolved.append(w.res.gpa, .{
             .name = try w.res.gpa.dupe(u8, tok.text),
@@ -143,7 +175,7 @@ const Walker = struct {
         if (node.kind == .IDENT_PATTERN) {
             for (node.children) |c| switch (c) {
                 .token => |t| if (t.kind == .IDENT) {
-                    try w.scopes.bind(t.text);
+                    try w.scopes.bind(t.text, t.offset);
                     return;
                 },
                 .node => {},
@@ -221,7 +253,7 @@ const Walker = struct {
                 while (arms.next()) |arm| {
                     try w.scopes.push();
                     defer w.scopes.pop();
-                    if (arm.binding()) |tok| try w.scopes.bind(tok.text);
+                    if (arm.binding()) |tok| try w.scopes.bind(tok.text, tok.offset);
                     if (arm.block()) |b| try w.walkBlock(b.cst);
                 }
             },
@@ -297,7 +329,7 @@ pub fn resolveBodies(
             if (fd.params()) |ps| {
                 var pit = ps.iter();
                 while (pit.next()) |p| {
-                    if (p.name()) |t| try w.scopes.bind(t.text);
+                    if (p.name()) |t| try w.scopes.bind(t.text, t.offset);
                 }
             }
             try w.walkBlock(body.cst);

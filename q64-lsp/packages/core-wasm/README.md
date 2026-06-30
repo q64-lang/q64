@@ -59,10 +59,11 @@ round-trip diagnostics from JS — including the semantic codes (e.g. a
 ## Roadmap
 
 Diagnostics run the full check pipeline; `q64_hover` / `q64_definition` cover
-**top-level** symbols (fn / struct / enum / const / …). Still open:
+**top-level** symbols (fn / struct / enum / const / …) **and locals** — params
+and `let`/pattern bindings, via `sema.resolve`'s use→binding map. Still open:
 
-- locals — params, `let` bindings, struct fields — need scope-aware resolution
-  (`sema.resolve`), not just the file symbol table;
+- struct fields / member access (`a.field`) — owned by the type checker, not
+  the name resolver;
 - hover enrichment — function signatures / types, not just `kind name`;
 - `q64_format` once `fmt` is wired in (for `textDocument/formatting`).
 

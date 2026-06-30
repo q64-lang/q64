@@ -6,9 +6,9 @@ the q64 analysis core they all run on.
 > **Status: diagnostics + hover/definition.** The core runs the full
 > `q64 check` pipeline (parse + sema → LEX/PAR/NAM/TYP/EFF/REG), so the editor
 > sees the same semantic diagnostics the compiler does — not just parse errors.
-> Hover and go-to-definition work for top-level symbols. Still pending:
-> locals/field hover (scope-aware resolution) and formatting (`fmt`) in
-> [`../q64`](../q64).
+> Hover and go-to-definition work for top-level symbols and locals (params,
+> `let`/pattern bindings). Still pending: field/member hover (needs the type
+> checker) and formatting (`fmt`) in [`../q64`](../q64).
 
 ## Why this exists
 

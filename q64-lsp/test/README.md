@@ -31,7 +31,8 @@ Point at a different server build with `Q64_LSP_SERVER=/path/to/server.js`.
 - document lifecycle: `didChange` re-validates the buffer; `didClose` clears.
 - positional queries: `hover` over a use renders `fn greet` (null on a
   keyword); `definition` jumps from a use to the declaration's range (null on a
-  non-identifier).
+  non-identifier). Locals too — a parameter and a `let` use each render
+  `local <name>` and jump to their binding site.
 
 As the server grows formatting / locals support, add cases here against the
 same black-box transport.

@@ -52,3 +52,44 @@ test("definition on a non-identifier returns null", async () => {
   expect(res.result).toBeNull();
   await client.shutdown();
 });
+
+// Locals: scope-aware hover + definition for params and `let` bindings.
+
+async function openSrc(uri: string, src: string) {
+  const client = new LspClient(SERVER);
+  await client.initialize();
+  client.openDocument(uri, src);
+  return client;
+}
+
+test("hover + definition resolve a parameter use to its binding", async () => {
+  // `a` is the parameter (char 7) and is used in the body (char 32).
+  const uri = "file:///param.q";
+  const src = "fn add(a: i64, b: i64) -> i64 { a }\n";
+  const client = await openSrc(uri, src);
+
+  const hov = await client.hover(uri, 0, 32);
+  expect((hov.result as { contents: { value: string } } | null)?.contents.value).toBe("local a");
+
+  const def = await client.definition(uri, 0, 32);
+  const loc = def.result as { range: { start: { line: number; character: number }; end: { line: number; character: number } } } | null;
+  expect(loc?.range.start).toEqual({ line: 0, character: 7 });
+  expect(loc?.range.end).toEqual({ line: 0, character: 8 });
+  await client.shutdown();
+});
+
+test("hover + definition resolve a let-binding use to its declaration", async () => {
+  // `count` is declared on line 1 (char 6) and used on line 2 (char 10).
+  const uri = "file:///let.q";
+  const src = "fn main() {\n  let count = 1\n  env.out(count)\n}\n";
+  const client = await openSrc(uri, src);
+
+  const hov = await client.hover(uri, 2, 12);
+  expect((hov.result as { contents: { value: string } } | null)?.contents.value).toBe("local count");
+
+  const def = await client.definition(uri, 2, 12);
+  const loc = def.result as { range: { start: { line: number; character: number }; end: { line: number; character: number } } } | null;
+  expect(loc?.range.start).toEqual({ line: 1, character: 6 });
+  expect(loc?.range.end).toEqual({ line: 1, character: 11 });
+  await client.shutdown();
+});
