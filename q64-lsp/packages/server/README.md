@@ -25,7 +25,7 @@ transport differs, because the analysis is the wasm.
 | `initialize` / `initialized` / `shutdown` | ✅ |
 | `textDocument/didOpen` · `didChange` · `didClose` | ✅ (full sync) |
 | `textDocument/publishDiagnostics` | ✅ (parse + sema check — LEX/PAR/NAM/TYP/EFF/REG) |
-| `textDocument/hover` · `textDocument/definition` | ✅ top-level symbols + locals (params, `let`/pattern bindings) |
+| `textDocument/hover` · `textDocument/definition` | ✅ top-level symbols + locals; functions hover with their full signature |
 | formatting · code actions · field/member hover | ⏳ await `fmt` + the type checker in [`../../../q64`](../../../q64) |
 
 ## Run

@@ -14,11 +14,23 @@ async function open(uri: string) {
   return client;
 }
 
-test("hover over a use shows the symbol kind + name", async () => {
+test("hover over a use shows the function signature", async () => {
   const client = await open("file:///hover.q");
   const res = await client.hover("file:///hover.q", 1, 13);
   const hover = res.result as { contents: { kind: string; value: string } } | null;
-  expect(hover?.contents.value).toBe("fn greet");
+  // `greet` takes no params and declares no return type.
+  expect(hover?.contents.value).toBe("fn greet()");
+  await client.shutdown();
+});
+
+test("hover renders the full signature (params + return + pub)", async () => {
+  const uri = "file:///sig.q";
+  const src = "pub fn add(a: i64, b: i64) -> i64 { a }\n";
+  const client = await openSrc(uri, src);
+  // hover over the declaration name `add` (char 7).
+  const res = await client.hover(uri, 0, 7);
+  const hover = res.result as { contents: { value: string } } | null;
+  expect(hover?.contents.value).toBe("pub fn add(a: i64, b: i64) -> i64");
   await client.shutdown();
 });
 

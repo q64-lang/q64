@@ -134,8 +134,55 @@ fn diagnoseInner(source: []const u8) !u64 {
 
 /// What an identifier under the cursor resolves to: a rendered `kind` label
 /// (`"fn"`, `"struct"`, `"local"`, …), the symbol's name, and the byte offset
-/// of its declaration. Hover renders `kind name`; definition uses `def_offset`.
-const SymInfo = struct { kind: []const u8, name: []const u8, def_offset: u32 };
+/// of its declaration. Definition uses `def_offset`. Hover renders `signature`
+/// when present (a function's full `fn name(params) -> ret`), else `kind name`.
+const SymInfo = struct {
+    kind: []const u8,
+    name: []const u8,
+    def_offset: u32,
+    signature: ?[]const u8 = null,
+};
+
+/// The source text of a top-level function's signature — everything from `fn`
+/// (or `pub fn …`) up to, but not including, the body block. Reproduced
+/// verbatim from the lossless CST, so it shows exactly as written
+/// (`fn add(a: i64, b: i64) -> i64`). `name_offset` is the symbol's name token,
+/// used to find the matching declaration. Null if no such function is found.
+fn fnSignature(arena: std.mem.Allocator, sf: ast.SourceFile, name_offset: u32) !?[]const u8 {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .fn_decl => |fd| {
+            const nt = fd.name() orelse continue;
+            if (nt.offset != name_offset) continue;
+            var buf: std.ArrayList(u8) = .empty;
+            for (fd.cst.children) |c| switch (c) {
+                .node => |n| {
+                    if (n.kind == .BLOCK) break; // stop at the body
+                    try cst.serialize(n, arena, &buf);
+                },
+                .token => |t| try buf.appendSlice(arena, t.text),
+            };
+            return std.mem.trim(u8, buf.items, " \t\r\n");
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Write `s` as a JSON string literal (quotes included), escaping `"` and `\`
+/// and folding control characters to spaces. Signatures can carry a quote (a
+/// string-typed param default), so hover contents must be escaped, not
+/// concatenated raw.
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |ch| switch (ch) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        0...0x1f => try w.writeByte(' '),
+        else => try w.writeByte(ch),
+    };
+    try w.writeByte('"');
+}
 
 /// Resolve the identifier at byte `off`. Locals win over file-level symbols
 /// (a local shadows a same-named top-level), matching q64's scoping — so we
@@ -156,7 +203,8 @@ fn symbolAt(arena: std.mem.Allocator, source: []const u8, off: u32) !?SymInfo {
     }
     // Otherwise a file-level symbol (fn / struct / enum / const / …).
     if (table.lookup(tok.text)) |sym| {
-        return .{ .kind = sym.kind.label(), .name = sym.name, .def_offset = sym.offset };
+        const sig = if (sym.kind == .function) try fnSignature(arena, sf, sym.offset) else null;
+        return .{ .kind = sym.kind.label(), .name = sym.name, .def_offset = sym.offset, .signature = sig };
     }
     return null;
 }
@@ -174,8 +222,15 @@ fn hoverInner(source: []const u8, off: u32) !u64 {
     const arena = arena_state.allocator();
 
     const info = (try symbolAt(arena, source, off)) orelse return ownJson("{\"contents\":null}");
-    const json = try std.fmt.allocPrint(arena, "{{\"contents\":\"{s} {s}\"}}", .{ info.kind, info.name });
-    return ownJson(json);
+    // A function shows its full signature; everything else shows `kind name`.
+    const text = info.signature orelse
+        try std.fmt.allocPrint(arena, "{s} {s}", .{ info.kind, info.name });
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"contents\":");
+    try writeJsonString(&aw.writer, text);
+    try aw.writer.writeByte('}');
+    return ownJson(aw.writer.buffered());
 }
 
 /// Go-to-definition: `{ "found": true, "offset": <byte>, "len": <bytes> }`

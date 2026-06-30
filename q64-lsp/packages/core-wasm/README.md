@@ -26,7 +26,7 @@ filesystem for the qube root — and the core has no disk.
 |---|---|---|
 | `q64_alloc` | `(len) -> ptr` | allocate `len` bytes; host writes source there |
 | `q64_diagnose` | `(ptr, len) -> u64` | parse + sema check; returns `(out_ptr << 32) \| out_len` of a UTF-8 JSON envelope |
-| `q64_hover` | `(ptr, len, off) -> u64` | symbol under byte `off` → `{"contents":"fn greet"\|null}` |
+| `q64_hover` | `(ptr, len, off) -> u64` | symbol under byte `off` → `{"contents":"fn add(a: i64) -> i64"\|"local x"\|null}` |
 | `q64_definition` | `(ptr, len, off) -> u64` | declaration of the symbol under byte `off` → `{"found":true,"offset":N,"len":M}` or `{"found":false}` |
 | `q64_free` | `(ptr, len)` | release a buffer (both the input and the returned output) |
 | `memory` | — | the module's linear memory |
@@ -60,11 +60,13 @@ round-trip diagnostics from JS — including the semantic codes (e.g. a
 
 Diagnostics run the full check pipeline; `q64_hover` / `q64_definition` cover
 **top-level** symbols (fn / struct / enum / const / …) **and locals** — params
-and `let`/pattern bindings, via `sema.resolve`'s use→binding map. Still open:
+and `let`/pattern bindings, via `sema.resolve`'s use→binding map. Functions
+hover with their full signature (sliced verbatim from the CST); other symbols
+hover as `kind name`. Still open:
 
 - struct fields / member access (`a.field`) — owned by the type checker, not
   the name resolver;
-- hover enrichment — function signatures / types, not just `kind name`;
+- richer hover for non-functions — a struct's fields, a const's value/type;
 - `q64_format` once `fmt` is wired in (for `textDocument/formatting`).
 
 Each stays a pure `(source, position) -> JSON` query over the same parser + sema
