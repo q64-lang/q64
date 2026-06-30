@@ -26,6 +26,8 @@ filesystem for the qube root — and the core has no disk.
 |---|---|---|
 | `q64_alloc` | `(len) -> ptr` | allocate `len` bytes; host writes source there |
 | `q64_diagnose` | `(ptr, len) -> u64` | parse + sema check; returns `(out_ptr << 32) \| out_len` of a UTF-8 JSON envelope |
+| `q64_hover` | `(ptr, len, off) -> u64` | symbol under byte `off` → `{"contents":"fn greet"\|null}` |
+| `q64_definition` | `(ptr, len, off) -> u64` | declaration of the symbol under byte `off` → `{"found":true,"offset":N,"len":M}` or `{"found":false}` |
 | `q64_free` | `(ptr, len)` | release a buffer (both the input and the returned output) |
 | `memory` | — | the module's linear memory |
 
@@ -56,8 +58,13 @@ round-trip diagnostics from JS — including the semantic codes (e.g. a
 
 ## Roadmap
 
-Diagnostics now run the full check pipeline. The remaining surface is
-*positional* queries — `q64_hover`, `q64_definition`, `q64_effects`, etc., each
-a pure `(source, position) -> JSON` query over the same parser + sema modules —
-plus `q64_format` once `fmt` is wired in. That query surface is what the LSP
-server consumes for hover / go-to-definition / formatting.
+Diagnostics run the full check pipeline; `q64_hover` / `q64_definition` cover
+**top-level** symbols (fn / struct / enum / const / …). Still open:
+
+- locals — params, `let` bindings, struct fields — need scope-aware resolution
+  (`sema.resolve`), not just the file symbol table;
+- hover enrichment — function signatures / types, not just `kind name`;
+- `q64_format` once `fmt` is wired in (for `textDocument/formatting`).
+
+Each stays a pure `(source, position) -> JSON` query over the same parser + sema
+modules — the query surface the LSP server consumes.

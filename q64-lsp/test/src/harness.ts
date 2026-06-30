@@ -139,6 +139,20 @@ export class LspClient {
     this.notify("textDocument/didClose", { textDocument: { uri } });
   }
 
+  hover(uri: string, line: number, character: number): Promise<LspMessage> {
+    return this.request("textDocument/hover", {
+      textDocument: { uri },
+      position: { line, character },
+    });
+  }
+
+  definition(uri: string, line: number, character: number): Promise<LspMessage> {
+    return this.request("textDocument/definition", {
+      textDocument: { uri },
+      position: { line, character },
+    });
+  }
+
   /** Resolve on the NEXT notification matching `method` — ignoring any already
    *  buffered. Register it BEFORE triggering the change you want to observe, so
    *  the post-open publish (e.g.) can't satisfy a didChange/didClose assertion. */

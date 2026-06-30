@@ -29,6 +29,9 @@ Point at a different server build with `Q64_LSP_SERVER=/path/to/server.js`.
   - `@realtime + @io` fn → `EFF120` — a *semantic* code, proving the sema
     passes (not just the parser) are wired into the wasm core.
 - document lifecycle: `didChange` re-validates the buffer; `didClose` clears.
+- positional queries: `hover` over a use renders `fn greet` (null on a
+  keyword); `definition` jumps from a use to the declaration's range (null on a
+  non-identifier).
 
-As the server grows hover/definition/formatting, add cases here against the
+As the server grows formatting / locals support, add cases here against the
 same black-box transport.

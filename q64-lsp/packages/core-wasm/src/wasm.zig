@@ -1,16 +1,21 @@
 //! Wasm ABI over q64's analysis core.
 //!
 //! The host (the TypeScript LSP server, or any browser / Worker) drives
-//! this module through three exports. All language intelligence lives in
-//! q64's Zig modules, imported as `parser`; this file is only the boundary
+//! this module through a few exports. All language intelligence lives in
+//! q64's Zig modules (`parser`, `sema`); this file is only the boundary
 //! that turns "bytes in, JSON out" into calls on them.
 //!
-//! Memory protocol:
+//! Memory protocol (every query shares it):
 //!   1. `q64_alloc(len)` → ptr. Host writes `len` source bytes there.
-//!   2. `q64_diagnose(ptr, len)` → packed result: (out_ptr << 32) | out_len.
-//!      `out` is a UTF-8 JSON diagnostic envelope (spec/diagnostics.md).
+//!   2. A query — `q64_diagnose(ptr, len)`, `q64_hover(ptr, len, off)`,
+//!      `q64_definition(ptr, len, off)` — returns a packed result:
+//!      (out_ptr << 32) | out_len, a UTF-8 JSON payload.
 //!   3. Host reads [out_ptr .. out_ptr+out_len], then frees BOTH buffers
 //!      with `q64_free(ptr, len)`.
+//!
+//! Positional queries take a UTF-8 *byte* offset into the source (the host
+//! maps an editor position to bytes). They report the definition's byte
+//! offset + name length back; the host maps those to editor coordinates.
 //!
 //! wasm32 pointers are 32-bit, so packing ptr+len into a u64 is lossless.
 
@@ -20,6 +25,7 @@ const sema = @import("sema");
 const parse = parser.parse;
 const diag = parser.diag;
 const ast = parser.ast;
+const cst = parser.cst;
 
 /// Caller-facing buffers (the source the host writes, and the JSON we hand
 /// back) are allocated from the page allocator so their lifetime is
@@ -33,6 +39,30 @@ export fn q64_alloc(len: usize) ?[*]u8 {
 
 export fn q64_free(ptr: [*]u8, len: usize) void {
     host_allocator.free(ptr[0..len]);
+}
+
+/// Copy `json` into a host-owned buffer that outlives the per-call arena and
+/// pack its (ptr, len) into the u64 the host unpacks. The host frees it via
+/// `q64_free`. Every query returns through here.
+fn ownJson(json: []const u8) !u64 {
+    const out = try host_allocator.alloc(u8, json.len);
+    @memcpy(out, json);
+    const ptr_bits: u64 = @intFromPtr(out.ptr);
+    return (ptr_bits << 32) | @as(u64, out.len);
+}
+
+/// The innermost IDENT token whose byte span contains `off`, or null. Walks
+/// the CST depth-first; only identifiers can name a symbol, so keywords,
+/// punctuation, and trivia are skipped.
+fn identAtOffset(node: *const cst.Node, off: u32) ?cst.Token {
+    for (node.children) |child| switch (child) {
+        .token => |t| {
+            const end = t.offset + @as(u32, @intCast(t.text.len));
+            if (t.kind == .IDENT and off >= t.offset and off < end) return t;
+        },
+        .node => |n| if (identAtOffset(n, off)) |found| return found,
+    };
+    return null;
 }
 
 /// Parse `src` and return a JSON diagnostic envelope. Returns 0 on
@@ -99,13 +129,56 @@ fn diagnoseInner(source: []const u8) !u64 {
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     try diag.emitJson(&aw.writer, source, all.items, arena);
-    const json = aw.writer.buffered();
+    return ownJson(aw.writer.buffered());
+}
 
-    // Copy the envelope out of the arena into a host-owned buffer that
-    // outlives this call; the host frees it via q64_free.
-    const out = try host_allocator.alloc(u8, json.len);
-    @memcpy(out, json);
+/// Hover: `{ "contents": "<kind> <name>" }` for the symbol under `off`
+/// (e.g. `"fn greet"`), or `{ "contents": null }` when nothing names a
+/// top-level symbol there. Returns 0 only on allocation failure.
+export fn q64_hover(src_ptr: [*]const u8, src_len: usize, off: u32) u64 {
+    return hoverInner(src_ptr[0..src_len], off) catch 0;
+}
 
-    const ptr_bits: u64 = @intFromPtr(out.ptr);
-    return (ptr_bits << 32) | @as(u64, out.len);
+fn hoverInner(source: []const u8, off: u32) !u64 {
+    var arena_state = std.heap.ArenaAllocator.init(host_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const none = "{\"contents\":null}";
+    const result = try parse.parse(arena, source, "buffer.q");
+    const sf = ast.SourceFile.cast(result.root) orelse return ownJson(none);
+    const tok = identAtOffset(result.root, off) orelse return ownJson(none);
+
+    var table = try sema.build(arena, sf);
+    defer table.deinit();
+    const sym = table.lookup(tok.text) orelse return ownJson(none);
+
+    const json = try std.fmt.allocPrint(arena, "{{\"contents\":\"{s} {s}\"}}", .{ sym.kind.label(), sym.name });
+    return ownJson(json);
+}
+
+/// Go-to-definition: `{ "found": true, "offset": <byte>, "len": <bytes> }`
+/// locating the declaration of the symbol under `off`, or `{ "found": false }`.
+/// The host turns the byte span into an editor range. Returns 0 only on
+/// allocation failure.
+export fn q64_definition(src_ptr: [*]const u8, src_len: usize, off: u32) u64 {
+    return definitionInner(src_ptr[0..src_len], off) catch 0;
+}
+
+fn definitionInner(source: []const u8, off: u32) !u64 {
+    var arena_state = std.heap.ArenaAllocator.init(host_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const none = "{\"found\":false}";
+    const result = try parse.parse(arena, source, "buffer.q");
+    const sf = ast.SourceFile.cast(result.root) orelse return ownJson(none);
+    const tok = identAtOffset(result.root, off) orelse return ownJson(none);
+
+    var table = try sema.build(arena, sf);
+    defer table.deinit();
+    const sym = table.lookup(tok.text) orelse return ownJson(none);
+
+    const json = try std.fmt.allocPrint(arena, "{{\"found\":true,\"offset\":{d},\"len\":{d}}}", .{ sym.offset, sym.name.len });
+    return ownJson(json);
 }

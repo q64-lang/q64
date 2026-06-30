@@ -25,7 +25,8 @@ transport differs, because the analysis is the wasm.
 | `initialize` / `initialized` / `shutdown` | ✅ |
 | `textDocument/didOpen` · `didChange` · `didClose` | ✅ (full sync) |
 | `textDocument/publishDiagnostics` | ✅ (parse + sema check — LEX/PAR/NAM/TYP/EFF/REG) |
-| hover · definition · formatting · code actions | ⏳ await positional query exports (`q64_hover`, …) + `fmt` in [`../../../q64`](../../../q64) |
+| `textDocument/hover` · `textDocument/definition` | ✅ top-level symbols (`q64_hover` / `q64_definition`) |
+| formatting · code actions · locals/field hover | ⏳ await `fmt` + scope-aware resolution in [`../../../q64`](../../../q64) |
 
 ## Run
 
