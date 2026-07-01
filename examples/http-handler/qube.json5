@@ -1,0 +1,17 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "http-handler",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "http.q",
+
+  // Emit a component. The qube exports an @http_handler function, so the
+  // component exports `serve: func(method, path, body: string) -> string` (the
+  // v0 q64-owned string handler). The host calls it per request. Raw
+  // wasi:http/proxy (streamed bodies) is a follow-up — see http.q's header.
+  "component": {
+    "emit": true,
+    "world": "http-handler",
+  },
+}

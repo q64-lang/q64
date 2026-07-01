@@ -488,6 +488,22 @@ Component Model HTTP lifting (`wasmtime serve`, componentize-js / jco on
 Cloudflare Workers, or wasmCloud) with no qubepods-specific ABI. The same
 endpoint doubles as a wRPC server (see [`rpc.md`](./rpc.md)).
 
+> **Implementation status (`@http_handler`).** A **v0 string handler** is
+> implemented: an `@http_handler pub fn serve(method: str, path: str, body: str)
+> -> str` emits a component that **exports** the handler
+> (`serve: func(method, path, body: string) -> string`), and the host calls it
+> per request (request in, response body out). The `-> str` return goes through
+> a canonical-ABI return-area wrapper (q64 returns a `str` as a `(ptr, len)`
+> multivalue, but a component export `-> string` must return a pointer to
+> `{ptr, len}`). This is a **q64-owned string shape**, not yet raw
+> `wasi:http/handler` — that needs `wasi:io` stream bodies + the `request` /
+> `response` resource types q64 does not yet emit (the same stream gap as
+> `wasi:blobstore` writes). Also v0: a str-returning body is a single tail
+> expression, so reading storage *in the response path* (a `let n = match
+> env.kv.…` before the returned string) awaits str-returning
+> bodies-with-statements. See `examples/http-handler/` and
+> `test/http-handler-reference/`.
+
 ### Channel entry point (`@channel_handler`)
 
 A qube can serve a **long-lived bidirectional stream** instead of a run-once

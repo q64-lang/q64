@@ -420,7 +420,7 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     // `wasi:keyvalue` import ABI (cm32p2 imports, adapter-held bucket) and hand
     // back the synthesized world for the CLI to embed + lift. The canonical ABI
     // is 32-bit (cm32p2); a wasm64 qube isn't lowerable here.
-    if (usesEnvKv(&mmod) or usesEnvBlob(&mmod) or usesEnvDb(&mmod) or usesEnvConfig(&mmod)) {
+    if (usesEnvKv(&mmod) or usesEnvBlob(&mmod) or usesEnvDb(&mmod) or usesEnvConfig(&mmod) or usesStrExport(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
         const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null, true);
         errdefer allocator.free(core);
@@ -932,7 +932,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     const wants_blob = kv_component and usesEnvBlob(m);
     const wants_db = kv_component and usesEnvDb(m);
     const wants_config = kv_component and usesEnvConfig(m);
-    const wants_store = wants_kv or wants_blob or wants_db or wants_config;
+    // A str-returning export needs the component scaffolding (cm32p2 memory +
+    // realloc for the return-area wrapper) even with no storage capability.
+    const wants_str_export = kv_component and usesStrExport(m);
+    const wants_store = wants_kv or wants_blob or wants_db or wants_config or wants_str_export;
     const kv_open_ret: u32 = @intCast((m.data.len + 7) & ~@as(usize, 7));
     const kv_inc_ret: u32 = kv_open_ret + 8;
     // The op return area is 24 bytes: kv/blob results fit in 16, but a
@@ -1515,7 +1518,18 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
                 for (ext) |*ch| if (ch.* == '_') {
                     ch.* = '-';
                 };
-                _ = c.BinaryenAddFunctionExport(module, f.name.ptr, ext.ptr);
+                if (f.ret == .str) {
+                    // A `-> str` export needs the canonical-ABI return-area
+                    // wrapper (q64 returns str as a `(ptr,len)` multivalue; the
+                    // component export must return a pointer to `{ptr,len}`).
+                    // Export the wrapper as `cm32p2||<name>`; the internal fn
+                    // stays under `f.name`.
+                    const wrapper = try std.fmt.allocPrintSentinel(allocator, "{s}$cmexport", .{f.name}, 0);
+                    defer allocator.free(wrapper);
+                    try emitStrExportWrapper(module, allocator, f.name.ptr, wrapper.ptr, ext.ptr, pbuf, i32_type, pair_type);
+                } else {
+                    _ = c.BinaryenAddFunctionExport(module, f.name.ptr, ext.ptr);
+                }
             } else {
                 _ = c.BinaryenAddFunctionExport(module, f.name.ptr, f.name.ptr);
             }
@@ -1828,6 +1842,18 @@ fn usesEnvDb(m: *const ir.mir.Module) bool {
     return false;
 }
 
+/// True if any public function returns `str` — such a qube needs the component
+/// (store) scaffolding (cm32p2 memory + `cabi_realloc`) so the `-> string`
+/// export can go through the canonical-ABI return-area wrapper, even when it
+/// touches no storage capability. This is what lets a pure `@http_handler`
+/// (`serve(method, path, body) -> str`) emit a component.
+fn usesStrExport(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        if (f.exported and f.ret == .str) return true;
+    }
+    return false;
+}
+
 /// True if any function reaches `env.config` (a `config_get` node) — gates the
 /// `wasi:config/store` import + the component (store) path.
 fn usesEnvConfig(m: *const ir.mir.Module) bool {
@@ -1905,12 +1931,22 @@ fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use
     }
     for (hmod.funcs) |f| {
         if (f.visibility != .public) continue;
-        var scalar = true;
+        // A param/return is exportable if it's a component scalar OR a `str`
+        // (lifted to `string`): scalars pass through directly; a `str` return
+        // goes through the canonical-ABI return-area wrapper (see
+        // `emitStrExportWrapper`). This is what lets an `@http_handler` function
+        // — `serve(method: str, path: str, body: str) -> str` — export.
+        const exportable = struct {
+            fn f2(t: ir.hir.Type) bool {
+                return t == .str or component.Scalar.fromHir(t) != null;
+            }
+        }.f2;
+        var ok = true;
         for (f.params) |p| {
-            if (component.Scalar.fromHir(p.ty) == null) scalar = false;
+            if (!exportable(p.ty)) ok = false;
         }
-        if (f.ret != .void and component.Scalar.fromHir(f.ret) == null) scalar = false;
-        if (!scalar) continue;
+        if (f.ret != .void and !exportable(f.ret)) ok = false;
+        if (!ok) continue;
         try out.appendSlice(allocator, "  export ");
         try appendKebab(allocator, &out, f.name);
         try out.appendSlice(allocator, ": func(");
@@ -4373,6 +4409,53 @@ fn emitFmtF64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
 /// the `cabi_heap` global (the component model only requires it exist + return
 /// aligned space; the kv calls trigger it only for an error variant's string).
 /// align-up: `p = (heap + align-1) & -align` (align is a power of two).
+/// Emit a canonical-ABI wrapper for a **str-returning** component export and
+/// export it as `ext_name`. q64 returns a `str` as a `(ptr, len)` multivalue
+/// (its normal ABI), but a component export `-> string` must return an i32
+/// pointer to a `{ptr, len}` return-area the host reads. The wrapper calls the
+/// internal function, allocates 8 bytes via `cabi_realloc`, writes the pair, and
+/// returns the pointer — the shape validated against `wasm-tools component new`
+/// + jco. `flat_params` are the internal function's flattened wasm param types
+/// (a `str` param is two ptr-width slots); the wrapper forwards them verbatim.
+/// Used by the store-component export path so a qube can export a `-> str`
+/// function (the `@http_handler` HTTP entry, or any string-returning API).
+fn emitStrExportWrapper(
+    module: c.BinaryenModuleRef,
+    allocator: std.mem.Allocator,
+    internal_name: [*:0]const u8,
+    wrapper_name: [*:0]const u8,
+    ext_name: [*:0]const u8,
+    flat_params: []const c.BinaryenType,
+    i32_type: c.BinaryenType,
+    pair_type: c.BinaryenType,
+) !void {
+    const i32c = struct {
+        fn f(m: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+            return c.BinaryenConst(m, c.BinaryenLiteralInt32(v));
+        }
+    }.f;
+    // Forward every param slot to the internal function (str → two slots).
+    const args = try allocator.alloc(c.BinaryenExpressionRef, flat_params.len);
+    defer allocator.free(args);
+    for (flat_params, 0..) |pt, i| args[i] = c.BinaryenLocalGet(module, @intCast(i), pt);
+    const call = c.BinaryenCall(module, internal_name, @ptrCast(args.ptr), @intCast(args.len), pair_type);
+    const res_idx: c.BinaryenIndex = @intCast(flat_params.len); // pair result
+    const ra_idx: c.BinaryenIndex = @intCast(flat_params.len + 1); // return-area ptr
+    var realloc_args = [_]c.BinaryenExpressionRef{ i32c(module, 0), i32c(module, 0), i32c(module, 4), i32c(module, 8) };
+    var stmts = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(module, res_idx, call),
+        c.BinaryenLocalSet(module, ra_idx, c.BinaryenCall(module, "cabi_realloc", @ptrCast(&realloc_args), realloc_args.len, i32_type)),
+        c.BinaryenStore(module, 4, 0, 0, c.BinaryenLocalGet(module, ra_idx, i32_type), c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, res_idx, pair_type), 0), i32_type, "0"),
+        c.BinaryenStore(module, 4, 4, 0, c.BinaryenLocalGet(module, ra_idx, i32_type), c.BinaryenTupleExtract(module, c.BinaryenLocalGet(module, res_idx, pair_type), 1), i32_type, "0"),
+        c.BinaryenReturn(module, c.BinaryenLocalGet(module, ra_idx, i32_type)),
+    };
+    const body = c.BinaryenBlock(module, null, @ptrCast(&stmts), stmts.len, i32_type);
+    const ptype = c.BinaryenTypeCreate(@constCast(flat_params.ptr), @intCast(flat_params.len));
+    var vts = [_]c.BinaryenType{ pair_type, i32_type };
+    _ = c.BinaryenAddFunction(module, wrapper_name, ptype, i32_type, @ptrCast(&vts), vts.len, body);
+    _ = c.BinaryenAddFunctionExport(module, wrapper_name, ext_name);
+}
+
 fn emitCabiRealloc(module: c.BinaryenModuleRef, i32_type: c.BinaryenType) !void {
     const OLD_P: c.BinaryenIndex = 0;
     const OLD_S: c.BinaryenIndex = 1;
@@ -5571,6 +5654,29 @@ test "emitComponent: env.config lowers to a wasi:config/store component (handle-
             try testing.expect(std.mem.indexOf(u8, kvc.core, "wasi:keyvalue") == null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:config/store@0.2.0-draft;") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "export read: func() -> s64;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: an @http_handler str-in/str-out export lowers to a component" {
+    // A str-returning pub fn triggers the component path (no storage needed) and
+    // exports through the canonical-ABI return-area wrapper.
+    const src =
+        \\@http_handler
+        \\pub fn serve(method: str, path: str, body: str) -> str {
+        \\    "{method} {path} ({body})"
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "http.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export serve: func(method: string, path: string, body: string) -> string;") != null);
+            // The canonical realloc + memory export the return-area wrapper needs.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2_memory") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2_realloc") != null);
         },
         else => return error.TestUnexpectedResult,
     }
