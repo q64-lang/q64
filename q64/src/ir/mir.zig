@@ -278,6 +278,15 @@ pub const Op = union(enum) {
     blob_get: struct { key: *Inst },
     /// `env.blob.delete(key)`: `[method]bucket.delete`, boxed `Result<(), IoError>`.
     blob_delete: struct { key: *Inst },
+    /// `env.db.execute(sql)`: lazy `open` + `[method]connection.exec`, scalar
+    /// `result<u64, error>` boxed as `Result<u64, IoError>` (`.ptr`).
+    db_execute: struct { sql: *Inst },
+    /// `env.db.query_value(sql)`: `[method]connection.query-value`, boxed
+    /// `Result<Option<i64>, IoError>` (`.ptr`).
+    db_query_value: struct { sql: *Inst },
+    /// `env.db.query_text(sql)`: `[method]connection.query-text`, boxed
+    /// `Result<Option<Bytes>, IoError>` (`.ptr`).
+    db_query_text: struct { sql: *Inst },
     /// `chan_recv(session)` — receive the next inbound channel message (the
     /// `env.channel_recv` host import). Operand is the session handle (i64);
     /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.

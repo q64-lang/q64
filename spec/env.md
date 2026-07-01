@@ -226,11 +226,20 @@ independently of the pinned `wasip3` core snapshot, like `wasi:keyvalue`.
 > `wasi:io` stream emission. (`list` is not yet implemented.) See
 > `q64/src/codegen/wit/q64-blob.wit` and `test/blob-component-reference/`.
 >
-> **Implementation status (env.db).** Not yet implemented. Note also that
-> `wasi:rdbms` is not a real WASI package — only `wasi:sql` exists (Phase 1,
-> `0.2.0-draft`), and its `row = { field-name, value }` single-cell model and
-> lack of a `batch` do not map 1:1 to the `Database` face below; `env.db` will
-> need a translation layer or a q64-owned interface like `env.blob`.
+> **Implementation status (env.db).** A **v0 scalar surface** is implemented:
+> `execute(sql)` (DDL / INSERT / UPDATE / DELETE → `Result<u64>` rows-affected),
+> `query_value(sql)` (first column of the first row as an integer →
+> `Result<Option<i64>>` — `COUNT(*)`, `SUM`, `MAX(id)`, `LIMIT 1`), and
+> `query_text(sql)` (first cell as text → `Result<Option<Bytes>>`). Like
+> `env.blob`, these lower to a **q64-owned `q64:db/sql`** interface, *not* raw
+> `wasi:sql`: `wasi:rdbms` is not a real WASI package, and `wasi:sql` (Phase 1,
+> `0.2.0-draft`) has a `row = { field-name, value }` single-cell model, a
+> 13-case value variant, and no `batch` — none of which map to a landed q64
+> decode. **Deferred:** the typed multi-row `query(...) -> Rows` + typed
+> `[Value]` params + `batch` in the `Database` face below need a variable-length
+> typed decode + a first-class dynamic `Value` q64 does not yet have; v0 takes
+> literal SQL only. See `q64/src/codegen/wit/q64-db.wit` and
+> `test/db-component-reference/`.
 
 ```q64
 pub face Database {

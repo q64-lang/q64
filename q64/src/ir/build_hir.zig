@@ -5407,6 +5407,43 @@ fn blobGetResultEnum(b: *Builder) BuildError!?*const EnumInfo {
     return info;
 }
 
+/// The `Result<Option<Bytes>, IoError>` enum that `env.db.query_text` yields —
+/// the same nested-Ok<str> shape as `blobGetResultEnum`, distinct cache key.
+fn dbQueryTextResultEnum(b: *Builder) BuildError!?*const EnumInfo {
+    if (b.enum_insts.get("Result\x00dbtext")) |inst| return inst;
+    const opt_base = b.enums.get("Option") orelse return null;
+    if (opt_base.si == null) return null;
+    const opt_bytes = try instantiateEnum(b, opt_base, &.{ "s", "i", "i", "i" });
+    const res_base = b.enums.get("Result") orelse return null;
+    const res_si = res_base.si orelse return null;
+    const vars = try b.a.alloc(EnumVariant, 2);
+    vars[0] = .{ .name = "Ok", .arity = 1, .kind = .ints, .pidx = 0, .nested = opt_bytes };
+    vars[1] = .{ .name = "Err", .arity = 1, .kind = .ints, .pidx = 1 };
+    const info = try b.a.create(EnumInfo);
+    info.* = .{ .name = "Result", .variants = vars, .si = res_si };
+    try b.enum_insts.put(b.a, "Result\x00dbtext", info);
+    return info;
+}
+
+/// The `Result<Option<i64>, IoError>` enum that `env.db.query_value` yields:
+/// the outer Result's Ok slot nests the **default (int-payload)** `Option`, so
+/// `Ok(Some(n))` binds an i64 (`n`) from the inner box's single payload cell —
+/// vs `query_text`'s str-payload Option. Distinct cache key.
+fn dbQueryValueResultEnum(b: *Builder) BuildError!?*const EnumInfo {
+    if (b.enum_insts.get("Result\x00dbval")) |inst| return inst;
+    const opt_int = b.enums.get("Option") orelse return null; // default: Some(i64), 2-cell box
+    if (opt_int.si == null) return null;
+    const res_base = b.enums.get("Result") orelse return null;
+    const res_si = res_base.si orelse return null;
+    const vars = try b.a.alloc(EnumVariant, 2);
+    vars[0] = .{ .name = "Ok", .arity = 1, .kind = .ints, .pidx = 0, .nested = opt_int };
+    vars[1] = .{ .name = "Err", .arity = 1, .kind = .ints, .pidx = 1 };
+    const info = try b.a.create(EnumInfo);
+    info.* = .{ .name = "Result", .variants = vars, .si = res_si };
+    try b.enum_insts.put(b.a, "Result\x00dbval", info);
+    return info;
+}
+
 /// Flatten a variant's non-trivia tokens (past the name) into `buf`.
 /// `top` skips the leading variant-name token (an IDENT, or `KW_NONE`
 /// — the prelude `Option.None`); a `{` (record payload) or overflow
@@ -5550,6 +5587,16 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             if (std.mem.eql(u8, txt, "env.blob.get")) {
                 // Result<Option<Bytes>, IoError> — the nested-Ok box shape.
                 return try blobGetResultEnum(b);
+            }
+            if (std.mem.eql(u8, txt, "env.db.execute")) {
+                // Result<u64, IoError> — the scalar Result box (spec/env.md §`env.db`).
+                return b.enums.get("Result");
+            }
+            if (std.mem.eql(u8, txt, "env.db.query_value")) {
+                return try dbQueryValueResultEnum(b);
+            }
+            if (std.mem.eql(u8, txt, "env.db.query_text")) {
+                return try dbQueryTextResultEnum(b);
             }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (resolveFn(b, txt)) |fd| return enumOfRet(b, fd);
@@ -7117,6 +7164,38 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                     const esi = res.si orelse return error.Unsupported;
                     const node = try b.a.create(hir.Expr);
                     node.* = .{ .blob_delete = .{ .key = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
+                }
+                // `env.db.execute/query_value/query_text` — the SQL database
+                // (spec/env.md §`env.db`). v0: literal SQL, scalar projections.
+                if (std.mem.eql(u8, fsname, "env.db.execute")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const res = b.enums.get("Result") orelse return error.Unsupported;
+                    const esi = res.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .db_execute = .{ .sql = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
+                }
+                if (std.mem.eql(u8, fsname, "env.db.query_value")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const info = (try dbQueryValueResultEnum(b)) orelse return error.Unsupported;
+                    const esi = info.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .db_query_value = .{ .sql = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
+                }
+                if (std.mem.eql(u8, fsname, "env.db.query_text")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const info = (try dbQueryTextResultEnum(b)) orelse return error.Unsupported;
+                    const esi = info.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .db_query_text = .{ .sql = try buildStrExpr(b, a0, scope, null) } };
                     return .{ .e = node, .si = esi };
                 }
             }
@@ -14584,6 +14663,31 @@ test "env.blob: put/get/delete are @blob faces mirroring env.kv's store shapes" 
     try testing.expect(std.mem.indexOf(u8, dump, "blob_get") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "blob_delete") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "@blob") != null);
+}
+
+test "env.db: execute/query_value/query_text are @db faces reusing the store shapes" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn setup() -> i64 {
+        \\    match env.db.execute("CREATE TABLE t(x)") { Ok(rows) -> rows, Err(_) -> 0 - 1 }
+        \\}
+        \\fn n() -> i64 {
+        \\    match env.db.query_value("SELECT COUNT(*) FROM t") { Ok(Some(v)) -> v, Ok(None) -> 0, Err(_) -> 0 - 1 }
+        \\}
+        \\fn s() -> i64 {
+        \\    match env.db.query_text("SELECT x FROM t LIMIT 1") { Ok(Some(v)) -> v.len, Ok(None) -> 0, Err(_) -> 0 - 1 }
+        \\}
+        \\fn main { env.out(setup() + n() + s()) }
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "db_execute") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "db_query_value") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "db_query_text") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@db") != null);
 }
 
 test "str enum payloads: Result<str, i64>, Msg.Text(str), Option<str>, try" {

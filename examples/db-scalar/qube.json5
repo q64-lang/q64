@@ -1,0 +1,19 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "db-scalar",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "db.q",
+
+  // Emit a component in addition to the core module. The qube reaches `env.db`,
+  // so the component imports q64:db/sql (spec/env.md §env.db); the host supplies
+  // it, pinning the connection to the qube's identity. It is a q64-owned
+  // interface (exec + scalar query projections), not raw wasi:sql — see the
+  // qube's db.q header and src/codegen/wit/q64-db.wit for why.
+  "component": {
+    "emit": true,
+    "world": "db-scalar",
+    "worlds": ["q64:db/sql"],
+  },
+}

@@ -220,6 +220,21 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, bl.key);
             try app(gpa, out, ")", .{});
         },
+        .db_execute => |db| {
+            try app(gpa, out, "db_execute(", .{});
+            try hirExpr(gpa, out, db.sql);
+            try app(gpa, out, ")", .{});
+        },
+        .db_query_value => |db| {
+            try app(gpa, out, "db_query_value(", .{});
+            try hirExpr(gpa, out, db.sql);
+            try app(gpa, out, ")", .{});
+        },
+        .db_query_text => |db| {
+            try app(gpa, out, "db_query_text(", .{});
+            try hirExpr(gpa, out, db.sql);
+            try app(gpa, out, ")", .{});
+        },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv(", .{});
             try hirExpr(gpa, out, h);
@@ -483,6 +498,18 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .blob_delete => |bl| {
             try app(gpa, out, "blob_delete\n", .{});
             try mirInst(gpa, out, bl.key, depth + 1);
+        },
+        .db_execute => |db| {
+            try app(gpa, out, "db_execute\n", .{});
+            try mirInst(gpa, out, db.sql, depth + 1);
+        },
+        .db_query_value => |db| {
+            try app(gpa, out, "db_query_value\n", .{});
+            try mirInst(gpa, out, db.sql, depth + 1);
+        },
+        .db_query_text => |db| {
+            try app(gpa, out, "db_query_text\n", .{});
+            try mirInst(gpa, out, db.sql, depth + 1);
         },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv\n", .{});

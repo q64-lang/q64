@@ -1,0 +1,61 @@
+// q64-owned SQL interface for `env.db` (spec/env.md §`env.db`).
+//
+// NOT raw wasi:sql: that draft's `row = record { field-name, value }` is a
+// SINGLE COLUMN CELL (so `query -> list<row>` is a flat cell stream with no
+// logical-row grouping — a known draft gap), its value is a 13-case variant,
+// and it has no `batch`. None of that maps to a landed q64 decode: `kvBoxAlloc`
+// reserves only fixed 2/3-cell boxes, there is no variable-length `list<row>`
+// decoder, and q64 has no first-class dynamic `Value`. So v0 exposes exactly
+// the projections q64 CAN decode today by reusing `env.blob.get`'s nested
+// `Result<Option<…>>` box + `env.kv.increment`'s scalar `Result<u64>` unwrap:
+//
+//   - exec        — no-row statements (DDL / INSERT / UPDATE / DELETE), rows affected.
+//   - query-value — first column of the first row as an integer (COUNT(*), SUM, id…).
+//   - query-text  — first column of the first row as text.
+//
+// The connection is host-opened + identity-pinned (empty identifier) exactly
+// like env.kv / env.blob, so a qube never names a database. Typed multi-row
+// `query -> Rows`, positional `params`, and `batch` are deferred to a later,
+// additive extension of THIS interface (q64 needs a variable-length typed
+// decode + a dynamic Value first). v0 takes literal SQL only.
+//
+// 0.2.0-draft2 tag mirrors wasi:keyvalue / q64:blob (wit-component's world-item
+// resolution rejects a plain 0.1.0 here — a semver-match quirk).
+
+package q64:db@0.2.0-draft2;
+
+interface sql {
+    /// The set of errors a SQL operation may raise.
+    variant error {
+        /// The host has no database for this qube's identity.
+        no-such-database,
+        /// The qube may not access the database.
+        access-denied,
+        /// The statement failed (syntax, constraint, …); the string is the message.
+        query-error(string),
+        /// An implementation-specific error (e.g. backend I/O).
+        other(string)
+    }
+
+    /// A connection scoped to the qube's identity. The host opens it via `open`
+    /// (empty identifier) and pins it, so a qube never names a database.
+    resource connection {
+        /// Run a no-row statement (DDL / INSERT / UPDATE / DELETE).
+        /// `Ok(n)` = rows affected.
+        exec: func(sql: string) -> result<u64, error>;
+
+        /// Run a query and return the first column of the first row as an
+        /// integer: `Ok(some(v))` when a row matched, `Ok(none)` when the
+        /// result set was empty, `Err` on a statement error. Covers
+        /// `COUNT(*)`, `SUM(...)`, `MAX(id)`, `SELECT n ... LIMIT 1`.
+        query-value: func(sql: string) -> result<option<s64>, error>;
+
+        /// Run a query and return the first column of the first row as text:
+        /// `Ok(some(s))` / `Ok(none)` / `Err`.
+        query-text: func(sql: string) -> result<option<string>, error>;
+    }
+
+    /// Open the identity-pinned connection. The host ignores `identifier` (the
+    /// qube passes an empty string) and binds it to org/project/app.
+    open: func(identifier: string) -> result<connection, error>;
+}

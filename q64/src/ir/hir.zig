@@ -130,6 +130,7 @@ pub const Effect = enum {
     fs,
     kv,
     blob,
+    db,
     audio,
     midi,
     ui,
@@ -150,6 +151,7 @@ pub const Effect = enum {
             .fs => "@fs",
             .kv => "@kv",
             .blob => "@blob",
+            .db => "@db",
             .audio => "@audio",
             .midi => "@midi",
             .ui => "@ui",
@@ -169,7 +171,7 @@ pub const Effect = enum {
     /// not imply `@io` — they target dedicated host surfaces.
     pub fn implies(self: Effect) ?Effect {
         return switch (self) {
-            .stdout, .stderr, .network, .fs, .kv, .blob, .wire => .io,
+            .stdout, .stderr, .network, .fs, .kv, .blob, .db, .wire => .io,
             else => null,
         };
     }
@@ -203,6 +205,11 @@ pub const Effect = enum {
             // list<u8> path (spec/env.md §`env.blob`). Revisit once wasi:io
             // stream emission lands.
             .blob => &.{"q64:blob/store"},
+            // `env.db` targets a q64-owned SQL interface (our host supplies it),
+            // NOT raw wasi:sql: that draft's single-cell row model, 13-case value
+            // variant, and lack of batch don't map to a landed q64 decode. v0
+            // exposes exec + scalar query projections (spec/env.md §`env.db`).
+            .db => &.{"q64:db/sql"},
             .time => &.{ "wasi:clocks/wall-clock", "wasi:clocks/monotonic-clock" },
             .random => &.{"wasi:random/random"},
             .envvars => &.{"wasi:cli/environment"},
@@ -458,6 +465,20 @@ pub const Expr = union(enum) {
     /// `env.blob.delete(key)` — remove the object at `key` (idempotent;
     /// `q64:blob/store.bucket.delete`). Boxed `Result<(), IoError>`. Marks `@blob`.
     blob_delete: struct { key: *Expr },
+    /// `env.db.execute(sql)` — run a no-row statement (DDL / INSERT / UPDATE /
+    /// DELETE) on the project's SQL database (spec/env.md §`env.db`,
+    /// `q64:db/sql.connection.exec`). `sql` is a `str`. Lowers to a lazy
+    /// `open` + `[method]connection.exec`, boxed `Result<u64, IoError>`
+    /// (`Ok(rows-affected)`). Marks the fn `@db`.
+    db_execute: struct { sql: *Expr },
+    /// `env.db.query_value(sql)` — the first column of the first row as an
+    /// integer (`q64:db/sql.connection.query-value`). Boxed
+    /// `Result<Option<i64>, IoError>` (`Ok(Some(n))`/`Ok(None)`/`Err`). Marks `@db`.
+    db_query_value: struct { sql: *Expr },
+    /// `env.db.query_text(sql)` — the first column of the first row as text
+    /// (`q64:db/sql.connection.query-text`). Boxed
+    /// `Result<Option<Bytes>, IoError>` (`Ok(Some(s))`/`Ok(None)`/`Err`). Marks `@db`.
+    db_query_text: struct { sql: *Expr },
     /// `chan_recv(session)` — receive the next inbound message on a remote
     /// channel session (`@channel_handler`'s `for _ in session`). Lowers to the
     /// `env.channel_recv` host import: returns 1 when a message arrived (run the
