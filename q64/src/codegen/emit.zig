@@ -5682,6 +5682,40 @@ test "emitComponent: an @http_handler str-in/str-out export lowers to a componen
     }
 }
 
+test "emitComponent: a str-returning @http_handler that routes (if/else) and matches env stores" {
+    // The real handler shape — routing on method/path with `==`, each leaf a
+    // `match` on a store call's `Result` (kv + db + blob), payload bindings
+    // interpolated (`Ok(Some(s)) -> "note: {s}"`). Exercises buildStrIf +
+    // buildStrMatch and the str value-block lowering.
+    const src =
+        \\@http_handler
+        \\pub fn serve(method: str, path: str, body: str) -> str {
+        \\    if method == "POST" && path == "/visit" {
+        \\        match env.kv.increment("visits", 1) { Ok(_) -> "visited" Err(_) -> "kv-error" }
+        \\    } else if method == "GET" && path == "/note" {
+        \\        match env.db.query_text("SELECT body FROM notes LIMIT 1") { Ok(Some(s)) -> "note: {s}" Ok(None) -> "none" Err(_) -> "db-error" }
+        \\    } else if method == "PUT" && path == "/asset" {
+        \\        match env.blob.put("asset", body) { Ok(()) -> "stored" Err(_) -> "blob-error" }
+        \\    } else {
+        \\        "not found"
+        \\    }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "api.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            // Exports the sync str handler and imports all three stores.
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export serve: func(method: string, path: string, body: string) -> string;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "wasi:keyvalue/atomics") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "q64:db/sql") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "q64:blob/store") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 /// The `Vec` v0 floor's runtime (spec/types.md §Growable, "v0 floor"):
 /// a 3-slot header {data, len, cap} at address width; i64 elements;
 /// copy-on-grow ×2 (min capacity 4). Growth bumps `sp` directly — these

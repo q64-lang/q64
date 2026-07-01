@@ -219,7 +219,10 @@ fn lowerCallee(ctx: Ctx, hf: hir.Func) Error!mir.Func {
     for (hf.locals, 0..) |t, i| locals[i] = mapType(t);
 
     const body = switch (hf.ret) {
-        .str => try lowerStrExpr(ctx, singleTail(hf.body) orelse return error.Unsupported),
+        // A bare str tail (`"…"` / interpolation / str call) folds directly; a
+        // str value chain (`match env.kv.… { Ok(_) -> "a" … }`) rides the
+        // str-aware value-block path (setup stmts + a pair-typed if-chain).
+        .str => if (singleTail(hf.body)) |t| try lowerStrExpr(ctx, t) else try lowerIntBlock(ctx, hf.body, .str),
         else => try lowerIntBlock(ctx, hf.body, mapType(hf.ret)),
     };
 
@@ -341,8 +344,11 @@ fn lowerIntBlock(ctx: Ctx, blk: *const hir.Stmt, value_ty: ?mir.ValueType) Error
     }
 
     const tail_val: *mir.Inst = switch (tail.*) {
-        .expr => |e| try lowerExpr(ctx, e),
-        .ret => |e| try lowerExpr(ctx, e orelse return error.Unsupported),
+        // A `str` value chain threads `str` through the tail (and, via
+        // `lowerValueIf`, both if-branches) so a str-returning `match` lowers to
+        // a pair-typed if-chain, not an i64 one.
+        .expr => |e| if (vty == .str) try lowerStrExpr(ctx, e) else try lowerExpr(ctx, e),
+        .ret => |e| if (vty == .str) try lowerStrExpr(ctx, e orelse return error.Unsupported) else try lowerExpr(ctx, e orelse return error.Unsupported),
         .if_ => |iff| try lowerValueIf(ctx, iff, vty),
         // A nested value block (a callee-tail `match` desugar: the
         // hidden scrutinee set + the value if-chain).

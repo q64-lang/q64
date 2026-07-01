@@ -4515,14 +4515,27 @@ fn registerStrFunc(b: *Builder, owned: []const u8, fd: ast.FnDecl) BuildError!hi
     dummy.* = .{ .block = &.{} };
     try b.funcs.append(b.a, .{ .name = owned, .params = param_slice, .ret = .str, .body = dummy });
 
-    const tail = try singleTailExpr(fd) orelse return error.Unsupported;
-    const value = try buildStrExpr(b, tail, &scope, null); // callee bodies have no runtime bindings
-    const vstmt = try b.a.create(hir.Stmt);
-    vstmt.* = .{ .expr = value };
-    const block = try b.a.create(hir.Stmt);
-    block.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+    // The body must be a single statement: a `match` value chain, an `if`/`else`
+    // route, or a plain str expression (`buildStrStmt`). Str bodies with leading
+    // `let` statements are the next extension.
+    const fbody = fd.body() orelse return error.Unsupported;
+    var sit = fbody.statements();
+    const first = sit.next() orelse return error.Unsupported;
+    if (sit.next() != null) return error.Unsupported;
+    const block = try buildStrStmt(b, first, &scope);
 
-    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .str, .body = block };
+    // Non-parameter locals the body declared (a `match` scrutinee scratch,
+    // payload bindings, …) must be reflected in the func's `locals` so emit
+    // sizes the wasm locals — else the scrutinee slot collides with the str
+    // pair scratch. Mirrors the i64 callee path; str backing slots are ptr-width.
+    const extra = scope.extra();
+    const locals = try b.a.alloc(hir.Type, extra);
+    for (locals, 0..) |*t, j| {
+        const ty = scope.locals.items[scope.n_params + j].ty;
+        t.* = if (ty == .str) .ptr else ty;
+    }
+
+    b.funcs.items[id] = .{ .name = owned, .params = param_slice, .ret = .str, .locals = locals, .body = block };
     return id;
 }
 
@@ -9391,6 +9404,189 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
     // A *value* chain must yield on every path. An exhaustive match
     // without `_` makes the last arm's test redundant — it becomes the
     // chain's else.
+    var arm_slice: []const LoweredArm = arms.items;
+    var dflt = default;
+    if (dflt == null) {
+        dflt = arm_slice[arm_slice.len - 1].body;
+        arm_slice = arm_slice[0 .. arm_slice.len - 1];
+    }
+    try foldMatchChain(b, s_idx, boxed, arm_slice, dflt, &stmts);
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .block = try stmts.toOwnedSlice(b.a) };
+    return out;
+}
+
+/// A single str-value statement in a callee str body — the shared dispatch for
+/// the whole-body tail and every `if`/`match` branch. A `match` lowers as a str
+/// value chain; an `if`/`else` routes (`if method == "POST" { … } else { … }`);
+/// a plain str expression (literal / interpolation / str call) folds directly.
+/// (Str statements *before* the tail — `let x = …` — are the next extension.)
+fn buildStrStmt(b: *Builder, s: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt {
+    switch (s) {
+        .match_stmt => |ms| return buildStrMatch(b, ms, scope),
+        .if_stmt => |is| {
+            // Wrap the value `if` in a block — the str value-block lowering
+            // (lowerIntBlock with a str result) expects a block whose tail is
+            // the if-chain, and each if-branch to itself be a block.
+            const iff = try buildStrIf(b, is, scope);
+            const blk = try b.a.create(hir.Stmt);
+            blk.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{iff}) };
+            return blk;
+        },
+        .expr_stmt, .return_stmt => {
+            const e = switch (s) {
+                .expr_stmt => |es| es.expression() orelse return error.Unsupported,
+                .return_stmt => |rs| rs.value() orelse return error.Unsupported,
+                else => unreachable,
+            };
+            const value = try buildStrExpr(b, e, scope, null);
+            const vstmt = try b.a.create(hir.Stmt);
+            vstmt.* = .{ .expr = value };
+            const blk = try b.a.create(hir.Stmt);
+            blk.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{vstmt}) };
+            return blk;
+        },
+        else => return error.Unsupported,
+    }
+}
+
+/// A branch body of a str `if`/`else`: a single statement (`match`, nested
+/// `if`, or a str expression). Multi-statement branches await str
+/// bodies-with-statements.
+fn buildStrBranch(b: *Builder, body: ast.Block, scope: *Scope) BuildError!*hir.Stmt {
+    var it = body.statements();
+    const first = it.next() orelse return error.Unsupported;
+    if (it.next() != null) return error.Unsupported;
+    return buildStrStmt(b, first, scope);
+}
+
+/// A str-returning `if`/`else(-if)` — routing (`if method == "POST" { … } else
+/// { … }`). The str analogue of `buildIfStmtNode`: each branch yields a str, and
+/// emit types the `if` as the str pair. An `else` is required (a value `if` with
+/// no else has a path that yields nothing).
+fn buildStrIf(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.Stmt {
+    const cond = try buildIntExpr(b, is.condition() orelse return error.Unsupported, scope);
+    const then_ = try buildStrBranch(b, is.thenBody() orelse return error.Unsupported, scope);
+    const else_: *hir.Stmt = if (is.elseIf()) |eif| blk: {
+        // The else-if chain rides in a block (a value if-branch is a block).
+        const inner = try buildStrIf(b, eif, scope);
+        const wrap = try b.a.create(hir.Stmt);
+        wrap.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+        break :blk wrap;
+    } else if (is.elseBody()) |eb|
+        try buildStrBranch(b, eb, scope)
+    else
+        return error.Unsupported; // a str `if` must have an `else` (every path yields)
+    const out = try b.a.create(hir.Stmt);
+    out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
+    return out;
+}
+
+/// A `str`-returning `match` as a callee body's tail (the `@http_handler` /
+/// str-API shape: `match env.kv.…/env.db.…/env.blob.… { Ok(_) -> "a" … }`).
+/// The str analogue of `buildIntMatch`: each arm yields a `str` value (a literal,
+/// interpolation, payload binding — `Ok(Some(s)) -> "note: {s}"` — or another str
+/// call), the taken arm's value becomes the function's tail, and `foldMatchChain`
+/// selects it. All arms must be `str` (no scalar `vty` mixing).
+fn buildStrMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.Stmt {
+    const scrut = ms.scrutinee() orelse return error.Unsupported;
+    const info_opt = try enumOfExpr(b, scope, scrut);
+    if (info_opt == null and (try exprScalar(b, scrut, scope)) != .i64) return error.Unsupported;
+    const boxed = if (info_opt) |info| info.si != null else false;
+
+    var stmts: std.ArrayList(*hir.Stmt) = .empty;
+    const s_idx = try declareMatchScrutinee(b, scope, scrut, boxed, &stmts);
+
+    var arms: std.ArrayList(LoweredArm) = .empty;
+    defer arms.deinit(b.a);
+    var default: ?*hir.Stmt = null;
+    var seen: u64 = 0;
+    var nested_seen = [_]u64{0} ** 64; // per outer tag: bitmask of inner tags covered
+
+    // One arm → a block whose tail is the arm's str value.
+    const strBody = struct {
+        fn f(bb: *Builder, e: ast.Expr, sc: *Scope) BuildError!*hir.Stmt {
+            const value = try buildStrExpr(bb, e, sc, null);
+            const vstmt = try bb.a.create(hir.Stmt);
+            vstmt.* = .{ .expr = value };
+            const body = try bb.a.create(hir.Stmt);
+            body.* = .{ .block = try bb.a.dupe(*hir.Stmt, &.{vstmt}) };
+            return body;
+        }
+    }.f;
+
+    var it = ms.arms();
+    while (it.next()) |arm| {
+        const pat = arm.pattern() orelse return error.Unsupported;
+        if (pat.kind() == .OR_PATTERN) {
+            if (arm.guard() != null) return error.Unsupported; // guards on or-patterns: later
+            const e = arm.expression() orelse return error.Unsupported;
+            const body = try strBody(b, e, scope);
+            var alts = pat.alternatives();
+            var n: usize = 0;
+            while (alts.next()) |alt| {
+                n += 1;
+                const ap2 = (if (info_opt) |info|
+                    try resolveArmPattern(b, info, alt, scope, s_idx)
+                else
+                    try resolveLiteralPattern(b, alt)) orelse return error.Unsupported;
+                if (ap2.prelude.len != 0 or ap2.cond != null) return error.Unsupported;
+                try arms.append(b.a, .{ .tag = ap2.tag, .body = body });
+                if (info_opt != null) seen |= @as(u64, 1) << @intCast(ap2.tag);
+            }
+            if (n == 0) return error.Unsupported;
+            continue;
+        }
+        if (info_opt == null and pat.kind() == .IDENT_PATTERN) {
+            const nm = pat.bindingName() orelse return error.Unsupported;
+            try aliasLocal(scope, nm.text, s_idx, .i64);
+            const e = arm.expression() orelse return error.Unsupported;
+            const body = try strBody(b, e, scope);
+            if (arm.guard()) |gexpr| {
+                if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+                const guard = try buildIntExpr(b, gexpr, scope);
+                try arms.append(b.a, .{ .tag = 0, .body = body, .guard = guard, .any = true });
+            } else {
+                if (default != null) return error.Unsupported;
+                default = body;
+            }
+            continue;
+        }
+        // Pattern first: payload bindings (e.g. `Ok(Some(s))`) must be in scope
+        // for the arm's str value.
+        const rp = if (info_opt) |info|
+            try resolveArmPattern(b, info, pat, scope, s_idx)
+        else
+            try resolveLiteralPattern(b, pat);
+        const e = arm.expression() orelse return error.Unsupported;
+        const body = try strBody(b, e, scope);
+        const ap = rp orelse {
+            if (arm.guard() != null) return error.Unsupported; // guarded `_`: later
+            if (default != null) return error.Unsupported; // two `_` arms
+            default = body;
+            continue;
+        };
+        var guard: ?*hir.Expr = null;
+        if (arm.guard()) |gexpr| {
+            if (ap.prelude.len != 0) return error.Unsupported;
+            if (!try exprIsBool(b, gexpr, scope)) return error.Unsupported;
+            guard = try buildIntExpr(b, gexpr, scope);
+        }
+        const combined = try andOpt(b, ap.cond, guard);
+        try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = combined });
+        if (info_opt != null) {
+            if (ap.nested_tag) |itag| {
+                nested_seen[@intCast(ap.tag)] |= @as(u64, 1) << @intCast(itag);
+                if (@popCount(nested_seen[@intCast(ap.tag)]) >= ap.nested_variants) seen |= @as(u64, 1) << @intCast(ap.tag);
+            } else if (combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        }
+    }
+    if (default == null) {
+        const info = info_opt orelse return error.Unsupported;
+        if (@popCount(seen) < info.variants.len) return error.Unsupported;
+    }
+    // A value chain must yield on every path: an exhaustive match without `_`
+    // turns the last arm into the chain's else.
     var arm_slice: []const LoweredArm = arms.items;
     var dflt = default;
     if (dflt == null) {
