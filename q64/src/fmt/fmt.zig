@@ -27,8 +27,8 @@
 //! verified across every `.q` file in the repo.
 //!
 //! What it deliberately does NOT do yet: reflow/wrap long lines, and grid
-//! alignment of `[ … ]` array rows / multi-line call arguments (only
-//! record literals get grids). See `README.md` §"Deferred".
+//! alignment of multi-line call arguments (record and array literals get
+//! grids; ordinary calls are left alone). See `README.md` §"Deferred".
 //!
 //! Indentation model — each open bracket records the indent of the
 //! *line it was opened on*. A line's indent is one level deeper than
@@ -324,7 +324,7 @@ fn isContinuationLead(k: cst.SyntaxKind) bool {
 /// An alignment tab-stop: a byte offset into a row's `text` and what kind
 /// of construct sits there. The column *before* the offset is padded so
 /// the text *at* the offset lines up down a block.
-const StopKind = enum(u8) { eq, field, brace, cmt };
+const StopKind = enum(u8) { eq, field, brace, brack, cmt };
 const Stop = struct { off: usize, kind: StopKind };
 
 /// One formatted line, held until the alignment pass can look across a
@@ -560,14 +560,15 @@ const Formatter = struct {
             if ((t.kind == .LINE_COMMENT or t.kind == .DOC_COMMENT) and prev != null) {
                 try stops.append(self.gpa, .{ .off = body.items.len, .kind = .cmt });
             }
-            // The closing `}` of a multi-field record is a tab-stop, so the
-            // last field's column (hence the `}`) aligns too. Pop before
-            // appending so the offset points at the `}`.
+            // The closing `}`/`]` of a multi-element record/array is a
+            // tab-stop, so the last column (hence the closer) aligns too.
+            // Pop before appending so the offset points at the closer.
             if (isCloser(t.kind)) {
                 if (brackets.items.len > 0) {
                     const e = brackets.pop().?;
-                    if (t.kind == .R_BRACE and e.had_field) {
-                        try stops.append(self.gpa, .{ .off = body.items.len, .kind = .brace });
+                    if (e.had_field) {
+                        if (t.kind == .R_BRACE) try stops.append(self.gpa, .{ .off = body.items.len, .kind = .brace });
+                        if (t.kind == .R_BRACK) try stops.append(self.gpa, .{ .off = body.items.len, .kind = .brack });
                     }
                 }
             }
@@ -577,7 +578,8 @@ const Formatter = struct {
             if (isOpener(t.kind)) {
                 try brackets.append(self.gpa, .{ .kind = t.kind, .had_field = false });
             } else if (t.kind == .COMMA and brackets.items.len > 0 and
-                brackets.items[brackets.items.len - 1].kind == .L_BRACE)
+                (brackets.items[brackets.items.len - 1].kind == .L_BRACE or
+                    brackets.items[brackets.items.len - 1].kind == .L_BRACK))
             {
                 brackets.items[brackets.items.len - 1].had_field = true;
                 pending_field = true;
@@ -845,6 +847,13 @@ test "aligns record-literal field columns across rows (grid)" {
             "        Color { r: 0,   g: 0,   b: 255 },\n" ++
             "    ])\n" ++
             "}\n",
+    );
+}
+
+test "aligns array-literal columns across rows (grid)" {
+    try expectFmt(
+        "fn f {\n    let m = [\n        [1, 2, 3],\n        [40, 5, 6],\n        [7, 80, 900],\n    ]\n}\n",
+        "fn f {\n    let m = [\n        [1,  2,  3   ],\n        [40, 5,  6   ],\n        [7,  80, 900 ],\n    ]\n}\n",
     );
 }
 

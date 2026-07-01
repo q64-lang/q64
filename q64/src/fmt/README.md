@@ -25,9 +25,10 @@ token stream the parser produces:
   fragile token heuristics.
 - **Column alignment** (tabwriter) — a maximal run of consecutive lines
   at the same indent that share a *shape* has its columns aligned.
-  Recognized tab-stops: a depth-0 assignment `=`, each field of a
-  multi-field record literal (`Color { r: …, g: …, b: … }` grids align
-  every column, including the closing `}`), and a trailing `//` comment.
+  Recognized tab-stops: a depth-0 assignment `=`, each element of a
+  multi-element record literal or array literal (`Color { r: …, g: …,
+  b: … }` and `[1, 2, 3]` grids align every column, including the closing
+  `}`/`]`), and a trailing `//` comment.
   A blank line, an indent change, or a differently-shaped line breaks the
   run, so a column never spills across unrelated code. Runs operate on
   the canonically-spaced text, so alignment is idempotent (a re-format
@@ -72,10 +73,10 @@ non-idempotent).
 
 Future slices, each still inside the safety invariant:
 
-- **Array-row / call-argument grids** — column alignment currently covers
-  record literals (`{ … }`); the same treatment for `[ … ]` array rows and
-  multi-line call arguments is a natural extension (deliberately scoped out
-  for now to avoid over-aligning ordinary calls).
+- **Call-argument grids** — column alignment covers record and array
+  literals; the same treatment for multi-line call arguments is a natural
+  extension (deliberately scoped out for now to avoid over-aligning
+  ordinary calls).
 - **Line reflow / wrapping** long lines.
 - **Generic call in expression position.** `Point<f32>(0.0)` (no
   turbofish) is parsed as comparisons (`<` / `>`) — the PAR040 ambiguity —

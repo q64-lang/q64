@@ -128,17 +128,17 @@ crash mid-write never leaves a truncated `.q` on disk.
 > and lambda `|` from the CST. It also collapses blank-line runs, strips trailing
 > whitespace, and normalizes the trailing newline — preserving every significant
 > token and every comment. It also aligns columns tabwriter-style: a run of
-> consecutive same-indent lines that share a shape has its `=`, multi-field
-> record-literal columns (`Color { r: …, g: …, b: … }` grids), and trailing `//`
-> comments aligned (a blank line, indent change, or differently-shaped line ends
+> consecutive same-indent lines that share a shape has its `=`, record- and
+> array-literal columns (`Color { r: …, g: …, b: … }` and `[1, 2, 3]` grids), and
+> trailing `//` comments aligned (a blank line, indent change, or differently-shaped line ends
 > the run). Safety is enforced at runtime (the output is re-parsed and its
 > token sequence compared to the input's; on any mismatch other than trailing
 > commas the formatter inserts before a closer, the source is returned
 > untouched), so a format can never alter a program's meaning. It also indents
 > continuation lines (a wrapped `-> ReturnType`, `.method()` chain, or `|>`
 > pipeline) one level under the line they continue, and adds a trailing comma to
-> multi-line comma-lists (call args, arrays, records, match arms). Array-row /
-> call grids and line reflow are later slices. See
+> multi-line comma-lists (call args, arrays, records, match arms). Call-argument
+> grids and line reflow are later slices. See
 > [`q64/src/fmt/README.md`](../q64/src/fmt/README.md).
 
 ## Global options
