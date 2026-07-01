@@ -1130,7 +1130,7 @@ concatenation for interpolation.
 - [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
 - [ ] `qube remove` / `outdated` still stubs.
 - [ ] **`qube pod deploy` rejects static-asset qubes.** A qube with
-      `static: { dir: "web" }` and no component (the `qubepods-examples`
+      `static: { dir: "web" }` and no component (the `qubits`
       `qube_rocks`/`blackbird` shape) fails with `manifest has no
       component.wasm, component.module, or component.variants` — but the
       qubepods server already accepts a component-less bundle (the component is
