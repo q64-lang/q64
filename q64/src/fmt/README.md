@@ -32,6 +32,12 @@ token stream the parser produces:
   run, so a column never spills across unrelated code. Runs operate on
   the canonically-spaced text, so alignment is idempotent (a re-format
   collapses the padding to single spaces, then re-adds it).
+- **Continuation indent** — a wrapped line that begins with an
+  infix/postfix lead (`->`, `|>`, `.`, `?.`, and binary operators that
+  can't start a statement) indents one level under the line it continues,
+  so a wrapped `-> ReturnType`, a `.method()` chain, or a `|>` pipeline
+  reads as subordinate. Prefix-capable tokens (`-`, `!`, `~`, `&`, `*`,
+  `<`) are excluded, so a real statement is never mis-indented.
 - **Vertical whitespace** — runs of blank lines collapse to one; leading
   blank lines are dropped; the file ends with exactly one newline.
 - **Trailing whitespace** — stripped from every line (including inside a
@@ -61,9 +67,6 @@ Future slices, each still inside the safety invariant:
   multi-line call arguments is a natural extension (deliberately scoped out
   for now to avoid over-aligning ordinary calls).
 - **Trailing-comma normalization.**
-- **Continuation-line indentation** for bracket-free wrapped lines (e.g.
-  a `-> ReturnType` on its own line under a `fn` signature — v0 leaves it
-  at the declaration's indent).
 - **Line reflow / wrapping** long lines.
 - **Generic call in expression position.** `Point<f32>(0.0)` (no
   turbofish) is parsed as comparisons (`<` / `>`) — the PAR040 ambiguity —

@@ -133,9 +133,10 @@ crash mid-write never leaves a truncated `.q` on disk.
 > comments aligned (a blank line, indent change, or differently-shaped line ends
 > the run). The invariant that only trivia changes is enforced at runtime (the
 > output is re-lexed; on any token-sequence mismatch the source is returned
-> untouched), so a format can never alter a program's meaning. Array-row / call
-> grids, trailing-comma normalization, line reflow, and continuation-line
-> indentation are later slices. See
+> untouched), so a format can never alter a program's meaning. It also indents
+> continuation lines (a wrapped `-> ReturnType`, `.method()` chain, or `|>`
+> pipeline) one level under the line they continue. Array-row / call grids,
+> trailing-comma normalization, and line reflow are later slices. See
 > [`q64/src/fmt/README.md`](../q64/src/fmt/README.md).
 
 ## Global options

@@ -274,6 +274,21 @@ fn isCloser(k: cst.SyntaxKind) bool {
     };
 }
 
+/// A token that, at the start of a line, marks the line as a *continuation*
+/// of the previous one rather than a new statement. Deliberately excludes
+/// tokens that can legitimately begin a fresh statement in prefix position
+/// (`-`, `!`, `~`, `&`, `*`, `<`) — only unambiguous infix/postfix leaders
+/// qualify, so the heuristic never mis-indents a real statement.
+fn isContinuationLead(k: cst.SyntaxKind) bool {
+    return switch (k) {
+        .ARROW, .FAT_ARROW, .PIPE_GT, .DOT, .QUESTION_DOT => true,
+        .PLUS, .SLASH, .PERCENT => true,
+        .EQ_EQ, .BANG_EQ, .LT_EQ, .GT_EQ => true,
+        .AMP_AMP, .PIPE_PIPE => true,
+        else => false,
+    };
+}
+
 /// An alignment tab-stop: a byte offset into a row's `text` and what kind
 /// of construct sits there. The column *before* the offset is padded so
 /// the text *at* the offset lines up down a block.
@@ -431,12 +446,21 @@ const Formatter = struct {
         else
             null;
         const first_is_closer = has_content and isCloser(line[first_sig.?].kind);
-        const disp: usize = if (first_is_closer)
+        var disp: usize = if (first_is_closer)
             (top orelse 0)
         else if (top) |t|
             t + 1
         else
             0;
+
+        // Continuation lines — a wrapped statement that begins with an
+        // operator/`.`/`->`/`|>` (a token that can't start a fresh
+        // statement) — indent one level under the line they continue, so
+        // a wrapped `-> ReturnType`, a `.method()` chain, or a `|>`
+        // pipeline reads as subordinate rather than as a new statement.
+        if (has_content and !first_is_closer and isContinuationLead(line[first_sig.?].kind)) {
+            disp += 1;
+        }
 
         try self.recordLine(disp, line);
         self.updateNesting(disp, line);
@@ -751,6 +775,33 @@ test "grid alignment only groups same-shape (field-count) rows" {
     try expectFmt(
         "fn f {\n    P { x: 1, y: 22 }\n    P { x: 333, y: 4 }\n    Q { a: 1 }\n}\n",
         "fn f {\n    P { x: 1,   y: 22 }\n    P { x: 333, y: 4  }\n    Q { a: 1 }\n}\n",
+    );
+}
+
+test "indents a wrapped return type under its signature" {
+    try expectFmt(
+        "fn denoise(x: i64)\n-> Signal\n{\n    x\n}\n",
+        "fn denoise(x: i64)\n    -> Signal\n{\n    x\n}\n",
+    );
+}
+
+test "indents method-chain and pipe continuations" {
+    try expectFmt(
+        "fn f {\n    clean\n|> denoise()\n|> play\n}\n",
+        "fn f {\n    clean\n        |> denoise()\n        |> play\n}\n",
+    );
+    try expectFmt(
+        "fn f {\n    thing\n.bar()\n.baz()\n}\n",
+        "fn f {\n    thing\n        .bar()\n        .baz()\n}\n",
+    );
+}
+
+test "ordinary consecutive statements are not treated as continuations" {
+    // Neither line starts with a continuation lead, so both stay at the
+    // block indent (no spurious extra level).
+    try expectFmt(
+        "fn f {\n    aaa()\n    bbb()\n}\n",
+        "fn f {\n    aaa()\n    bbb()\n}\n",
     );
 }
 
