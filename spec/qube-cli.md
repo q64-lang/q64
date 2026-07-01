@@ -195,10 +195,14 @@ the saved `qube pod login` credentials.
 the qube's **own manifest — `qube.json5`** (there is no separate deploy file),
 and is the **same command** whether run in the qubepods web shell or a terminal.
 
-It packs a **bundle zip** from `qube.json5` — the manifest, the component
-artifact (a classic JS worker's `component.module`, a single `component.wasm`,
-or each `component.variants.<addr>.wasm` for a dual-address-space qube), and the
-asset tree named by `assets.directory` — into `target/deploy/<name>.zip`, then
+It packs a **bundle zip** from `qube.json5` — a synthesized, strict
+`qubepod.jsonc` (the wire manifest: `qube deploy` injects `apiVersion`/`kind`,
+keeps the deploy keys `project`/`name`/`version`/`component`/`runtime`/`exports`/
+`imports`/`assets`, and drops qube-only fields, so the repo stays a single
+`qube.json5`), the component artifact (a classic JS worker's `component.module`,
+a single `component.wasm`, or each `component.variants.<addr>.wasm` for a
+dual-address-space qube), and the asset tree named by `assets.directory` — into
+`target/deploy/<name>.zip`, then
 uploads it to qubepods as a multipart `POST <api>/api/deploy` (`environment` +
 `bundle`). If `qube.json5` has a `build` command it runs first (unless
 `--no-build`). The server unzips it, content-addresses the artifact and every

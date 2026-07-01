@@ -4219,6 +4219,45 @@ fn stripDotSlash(s: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, s, "./")) s[2..] else s;
 }
 
+/// Synthesize the qubepods deploy manifest (`qubepod.jsonc`) from the parsed
+/// `qube.json5` root. The deploy API validates a STRICT QubePod schema (unknown
+/// keys rejected; `apiVersion` + `kind` required), so inject those and copy only
+/// the allowed keys — dropping qube-only fields (`type`, `entry`, `dependencies`,
+/// `license`, `description`, `build`, …). This is the same manifest the qubepods
+/// web shell posts, so a terminal deploy and a shell deploy are byte-compatible —
+/// and the developer's repo stays a single `qube.json5`, never a checked-in
+/// `qubepod.jsonc` (the wire manifest is generated at pack time). Caller owns the
+/// returned JSON.
+fn synthesizeQubepodJson(gpa: std.mem.Allocator, root: std.json.ObjectMap) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    // Stringify one std.json.Value and append it (keys below need no escaping).
+    const appendValue = struct {
+        fn f(a: std.mem.Allocator, o: *std.ArrayList(u8), v: std.json.Value) !void {
+            const s = try std.json.Stringify.valueAlloc(a, v, .{});
+            defer a.free(s);
+            try o.appendSlice(a, s);
+        }
+    }.f;
+
+    try out.appendSlice(gpa, "{\"apiVersion\":");
+    try appendValue(gpa, &out, root.get("apiVersion") orelse .{ .string = "qubepods.dev/v0.1" });
+    try out.appendSlice(gpa, ",\"kind\":\"QubePod\"");
+    // The keys the strict QubePod schema accepts (spec: qubepod-schema QubePodSchema).
+    const allowed = [_][]const u8{ "$schema", "project", "name", "version", "component", "runtime", "exports", "imports", "assets", "providers" };
+    for (allowed) |k| {
+        if (root.get(k)) |v| {
+            try out.appendSlice(gpa, ",\"");
+            try out.appendSlice(gpa, k);
+            try out.appendSlice(gpa, "\":");
+            try appendValue(gpa, &out, v);
+        }
+    }
+    try out.append(gpa, '}');
+    return out.toOwnedSlice(gpa);
+}
+
 // Stage the manifest, every component wasm (each at its manifest-relative path),
 // and the asset tree, then zip them at the archive root (no wrapping folder).
 // OUT is absolute so the trailing `zip` (run from $STAGE) writes to the right
@@ -4226,14 +4265,13 @@ fn stripDotSlash(s: []const u8) []const u8 {
 // both its wasm32 and wasm64 build.
 const pod_pack_script =
     \\set -e
-    \\PROJECT="$1"; OUT="$2"; ASSETS="$3"; shift 3
+    \\PROJECT="$1"; OUT="$2"; MANIFEST="$3"; ASSETS="$4"; shift 4
     \\STAGE="$(mktemp -d)"
     \\mkdir -p "$(dirname "$OUT")"
     \\cd "$PROJECT"
-    \\# Strip the CLI-only `build` field from the packed manifest — it is a
-    \\# deploy-time hook (run above), not part of the deployed artifact, and older
-    \\# server schemas reject unknown keys. Drops a single-line "build": … entry.
-    \\grep -vE '^[[:space:]]*"?build"?[[:space:]]*:' qube.json5 > "$STAGE/qube.json5" || cp qube.json5 "$STAGE/qube.json5"
+    \\# The wire manifest is the synthesized, strict qubepod.jsonc (built from
+    \\# qube.json5 by the caller) — the repo itself only carries qube.json5.
+    \\cp "$MANIFEST" "$STAGE/qubepod.jsonc"
     \\for WASM in "$@"; do
     \\  mkdir -p "$STAGE/$(dirname "$WASM")"
     \\  cp "$WASM" "$STAGE/$WASM"
@@ -4341,6 +4379,14 @@ fn cmdDeploy(
     });
     defer gpa.free(name);
 
+    // `project` (the qubepods project slug) is required by the deploy API and is
+    // pinned to your deploy token. Fail early with a clear message rather than a
+    // server-side schema rejection.
+    if (manifestString(root, "project") == null) {
+        try writeStderr(io, "qube deploy: qube.json5 has no \"project\" — set it to your qubepods project slug\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+
     // Optional `build` command: run it (cwd = manifest dir) BEFORE packing, so the
     // bundle ships freshly-compiled wasm/assets rather than stale on-disk bytes.
     // String form only for now (run via `sh -c`); an array form (argv) is a
@@ -4430,11 +4476,28 @@ fn cmdDeploy(
     const out_zip_full = try std.fmt.allocPrint(gpa, "{s}.zip", .{out_zip});
     defer gpa.free(out_zip_full);
 
+    // Synthesize the strict qubepod.jsonc from qube.json5 and stage it on disk;
+    // the packer copies it into the bundle as the wire manifest (the repo stays a
+    // single qube.json5 — nothing to check in).
+    const deploy_dir = try std.fs.path.join(gpa, &.{ cwd_path, "target", "deploy" });
+    defer gpa.free(deploy_dir);
+    try std.Io.Dir.cwd().createDirPath(io, deploy_dir);
+    const manifest_out = try std.fs.path.join(gpa, &.{ deploy_dir, "qubepod.jsonc" });
+    defer gpa.free(manifest_out);
     {
-        // sh -c <script> sh PROJECT OUT ASSETS <wasm...>
+        const manifest_body = synthesizeQubepodJson(gpa, root) catch |err| {
+            try printStderr(io, "qube deploy: cannot build the deploy manifest: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        defer gpa.free(manifest_body);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_out, .data = manifest_body });
+    }
+
+    {
+        // sh -c <script> sh PROJECT OUT MANIFEST ASSETS <wasm...>
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
-        try argv.appendSlice(gpa, &.{ "sh", "-c", pod_pack_script, "sh", cwd_path, out_zip_full, assets_norm });
+        try argv.appendSlice(gpa, &.{ "sh", "-c", pod_pack_script, "sh", cwd_path, out_zip_full, manifest_out, assets_norm });
         try argv.appendSlice(gpa, wasm_norms.items);
         const term = try spawnInherit(io, argv.items);
         if (termCode(term) != 0) {
