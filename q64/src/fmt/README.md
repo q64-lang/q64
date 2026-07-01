@@ -24,12 +24,14 @@ token stream the parser produces:
   `|` (lambda vs bit-or) — are disambiguated from the **CST**, not from
   fragile token heuristics.
 - **Column alignment** (tabwriter) — a maximal run of consecutive lines
-  at the same indent that share a *shape* has its columns aligned:
-  consecutive assignments align their `=`, and trailing `//` comments
-  align. A blank line, an indent change, or a differently-shaped line
-  breaks the run, so a column never spills across unrelated code. Runs
-  operate on the canonically-spaced text, so alignment is idempotent (a
-  re-format collapses the padding to single spaces, then re-adds it).
+  at the same indent that share a *shape* has its columns aligned.
+  Recognized tab-stops: a depth-0 assignment `=`, each field of a
+  multi-field record literal (`Color { r: …, g: …, b: … }` grids align
+  every column, including the closing `}`), and a trailing `//` comment.
+  A blank line, an indent change, or a differently-shaped line breaks the
+  run, so a column never spills across unrelated code. Runs operate on
+  the canonically-spaced text, so alignment is idempotent (a re-format
+  collapses the padding to single spaces, then re-adds it).
 - **Vertical whitespace** — runs of blank lines collapse to one; leading
   blank lines are dropped; the file ends with exactly one newline.
 - **Trailing whitespace** — stripped from every line (including inside a
@@ -54,10 +56,10 @@ every `.q` file in the repo (0 token mismatches, 0 non-idempotent).
 
 Future slices, each still inside the safety invariant:
 
-- **Grid alignment of comma-separated rows** — consecutive record/array
-  rows (`Color { r: 255, g: 0, b: 0 },` …) don't yet have their per-field
-  columns aligned; only `=` and trailing comments do. (The single-column
-  tabwriter is in place; this is the multi-column extension.)
+- **Array-row / call-argument grids** — alignment currently covers record
+  literals (`{ … }`); the same column treatment for `[ … ]` array rows and
+  multi-line call arguments is a natural extension (deliberately scoped out
+  for now to avoid over-aligning ordinary calls).
 - **Trailing-comma normalization.**
 - **Continuation-line indentation** for bracket-free wrapped lines (e.g.
   a `-> ReturnType` on its own line under a `fn` signature — v0 leaves it

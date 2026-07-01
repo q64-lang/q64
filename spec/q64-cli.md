@@ -128,13 +128,14 @@ crash mid-write never leaves a truncated `.q` on disk.
 > and lambda `|` from the CST. It also collapses blank-line runs, strips trailing
 > whitespace, and normalizes the trailing newline — preserving every significant
 > token and every comment. It also aligns columns tabwriter-style: a run of
-> consecutive same-indent lines that share a shape has its `=` and trailing `//`
+> consecutive same-indent lines that share a shape has its `=`, multi-field
+> record-literal columns (`Color { r: …, g: …, b: … }` grids), and trailing `//`
 > comments aligned (a blank line, indent change, or differently-shaped line ends
 > the run). The invariant that only trivia changes is enforced at runtime (the
 > output is re-lexed; on any token-sequence mismatch the source is returned
-> untouched), so a format can never alter a program's meaning. Grid alignment of
-> comma-separated rows, trailing-comma normalization, line reflow, and
-> continuation-line indentation are later slices. See
+> untouched), so a format can never alter a program's meaning. Array-row / call
+> grids, trailing-comma normalization, line reflow, and continuation-line
+> indentation are later slices. See
 > [`q64/src/fmt/README.md`](../q64/src/fmt/README.md).
 
 ## Global options

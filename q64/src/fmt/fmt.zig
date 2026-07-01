@@ -249,19 +249,15 @@ fn buildRoles(gpa: std.mem.Allocator, node: *const cst.Node, in_generic: bool, m
     };
 }
 
-/// A row's alignment tab-stops in ascending order (`eq` before `cmt`),
-/// written into `buf` and returned as a slice.
-fn rowStops(r: Row, buf: *[2]usize) []usize {
-    var n: usize = 0;
-    if (r.eq) |e| {
-        buf[n] = e;
-        n += 1;
+/// Two content rows belong to the same alignment block iff they sit at the
+/// same indent and expose the identical sequence of stop kinds (offsets may
+/// differ). Same shape ⇒ same column count ⇒ every column is meaningful.
+fn sameShape(a: Row, b: Row) bool {
+    if (b.blank or a.indent != b.indent or a.stops.len != b.stops.len) return false;
+    for (a.stops, b.stops) |x, y| {
+        if (x.kind != y.kind) return false;
     }
-    if (r.cmt) |c| {
-        buf[n] = c;
-        n += 1;
-    }
-    return buf[0..n];
+    return true;
 }
 
 fn isOpener(k: cst.SyntaxKind) bool {
@@ -278,17 +274,23 @@ fn isCloser(k: cst.SyntaxKind) bool {
     };
 }
 
+/// An alignment tab-stop: a byte offset into a row's `text` and what kind
+/// of construct sits there. The column *before* the offset is padded so
+/// the text *at* the offset lines up down a block.
+const StopKind = enum(u8) { eq, field, brace, cmt };
+const Stop = struct { off: usize, kind: StopKind };
+
 /// One formatted line, held until the alignment pass can look across a
 /// block of them. `text` is the canonically-spaced content (no leading
-/// indent, no trailing newline). `eq`/`cmt` are byte offsets of the
-/// alignment tab-stops within `text`: a depth-0 assignment `=` and the
-/// start of a trailing line comment. A `blank` row separates blocks.
+/// indent, no trailing newline). `stops` are the tab-stops in ascending
+/// order (owned): a depth-0 assignment `=`, each record-literal field
+/// start (`{ … , →here }`), the closing `}` of a multi-field record, and
+/// a trailing line comment. A `blank` row separates blocks.
 const Row = struct {
     blank: bool = false,
     indent: usize = 0,
     text: []u8 = &.{},
-    eq: ?usize = null,
-    cmt: ?usize = null,
+    stops: []Stop = &.{},
 };
 
 const Formatter = struct {
@@ -310,7 +312,10 @@ const Formatter = struct {
 
     fn deinit(self: *Formatter) void {
         self.out.deinit(self.gpa);
-        for (self.rows.items) |r| self.gpa.free(r.text);
+        for (self.rows.items) |r| {
+            self.gpa.free(r.text);
+            self.gpa.free(r.stops);
+        }
         self.rows.deinit(self.gpa);
         self.stack.deinit(self.gpa);
     }
@@ -321,26 +326,21 @@ const Formatter = struct {
         try self.serialize();
     }
 
-    /// Tabwriter pass. Aligns the tab-stops (`=`, trailing comments) of
-    /// each maximal run of consecutive content rows that share the same
-    /// indent *and* the same shape (same set of tab-stops). Rows with no
-    /// tab-stop, blank rows, and indent changes all break a run, so an
-    /// assignment column never spills across an unrelated line.
+    /// Tabwriter pass. Aligns the tab-stops of each maximal run of
+    /// consecutive content rows that share the same indent *and* the same
+    /// shape (the same sequence of stop kinds). Rows with no tab-stop,
+    /// blank rows, indent changes, and differently-shaped rows all break a
+    /// run, so a column never spills across unrelated code.
     fn alignRows(self: *Formatter) !void {
         var i: usize = 0;
         while (i < self.rows.items.len) {
             const r = self.rows.items[i];
-            if (r.blank or (r.eq == null and r.cmt == null)) {
+            if (r.blank or r.stops.len == 0) {
                 i += 1;
                 continue;
             }
             var j = i + 1;
-            while (j < self.rows.items.len) : (j += 1) {
-                const s = self.rows.items[j];
-                if (s.blank or s.indent != r.indent) break;
-                if ((s.eq != null) != (r.eq != null)) break;
-                if ((s.cmt != null) != (r.cmt != null)) break;
-            }
+            while (j < self.rows.items.len and sameShape(r, self.rows.items[j])) : (j += 1) {}
             if (j - i > 1) try self.alignBlock(self.rows.items[i..j]);
             i = j;
         }
@@ -352,31 +352,31 @@ const Formatter = struct {
     /// free. A one-row block is a no-op (width == its own cell), so the gap
     /// is exactly the canonical single space.
     fn alignBlock(self: *Formatter, block: []Row) !void {
-        var stops: [2]usize = undefined;
+        const ncols = block[0].stops.len;
 
         // Column widths = max trimmed-prefix width across the block.
-        var widths = [2]usize{ 0, 0 };
+        var widths: std.ArrayList(usize) = .empty;
+        defer widths.deinit(self.gpa);
+        try widths.appendNTimes(self.gpa, 0, ncols);
         for (block) |r| {
-            const s = rowStops(r, &stops);
             var start: usize = 0;
-            for (s, 0..) |off, k| {
-                const w = std.mem.trimEnd(u8, r.text[start..off], " ").len;
-                if (w > widths[k]) widths[k] = w;
-                start = off;
+            for (r.stops, 0..) |stop, k| {
+                const w = std.mem.trimEnd(u8, r.text[start..stop.off], " ").len;
+                if (w > widths.items[k]) widths.items[k] = w;
+                start = stop.off;
             }
         }
 
         // Rebuild each row's text with padded columns.
         for (block) |*r| {
-            const s = rowStops(r.*, &stops);
             var rebuilt: std.ArrayList(u8) = .empty;
             errdefer rebuilt.deinit(self.gpa);
             var start: usize = 0;
-            for (s, 0..) |off, k| {
-                const cell = std.mem.trimEnd(u8, r.text[start..off], " ");
+            for (r.stops, 0..) |stop, k| {
+                const cell = std.mem.trimEnd(u8, r.text[start..stop.off], " ");
                 try rebuilt.appendSlice(self.gpa, cell);
-                try rebuilt.appendNTimes(self.gpa, ' ', widths[k] - cell.len + 1);
-                start = off;
+                try rebuilt.appendNTimes(self.gpa, ' ', widths.items[k] - cell.len + 1);
+                start = stop.off;
             }
             try rebuilt.appendSlice(self.gpa, r.text[start..]); // free final cell
             const owned = try rebuilt.toOwnedSlice(self.gpa);
@@ -443,9 +443,8 @@ const Formatter = struct {
     }
 
     /// Build the canonically-spaced text for one content line and push it
-    /// as a `Row` (deferring output until the alignment pass). Records the
-    /// alignment tab-stops — a depth-0 assignment `=` and a trailing line
-    /// comment — as byte offsets into the text.
+    /// as a `Row` (deferring output until the alignment pass), recording
+    /// its alignment tab-stops as byte offsets into the text.
     fn recordLine(self: *Formatter, disp: usize, line: []const cst.Token) !void {
         // Build the body from the significant/comment tokens, inserting
         // canonical spacing between each adjacent pair (leading whitespace
@@ -453,10 +452,18 @@ const Formatter = struct {
         // are dropped — spacing is decided from token kinds and CST roles.
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.gpa);
+        var stops: std.ArrayList(Stop) = .empty;
+        errdefer stops.deinit(self.gpa);
+
+        // Bracket stack for this line: kind + whether the group has seen a
+        // top-level comma (i.e. it's a multi-field record when `{`).
+        const Bracket = struct { kind: cst.SyntaxKind, had_field: bool };
+        var brackets: std.ArrayList(Bracket) = .empty;
+        defer brackets.deinit(self.gpa);
+
         var prev: ?cst.Token = null;
-        var depth: usize = 0;
-        var eq: ?usize = null;
-        var cmt: ?usize = null;
+        var have_eq = false;
+        var pending_field = false; // a record-field comma awaits its next field
         for (line) |t| {
             if (t.kind == .WHITESPACE) continue; // spacing is recomputed
             if (prev) |p| {
@@ -464,17 +471,44 @@ const Formatter = struct {
                     try body.append(self.gpa, ' ');
                 }
             }
-            // Tab-stops (recorded before the token's own text is appended,
-            // so the offset points at `=` / `//`).
-            if (t.kind == .EQ and depth == 0 and eq == null) eq = body.items.len;
-            if ((t.kind == .LINE_COMMENT or t.kind == .DOC_COMMENT) and prev != null and cmt == null) {
-                cmt = body.items.len;
+
+            // A record-field comma's tab-stop is the *start* of the next
+            // field (so fields line up). Skip it if the next token closes
+            // the record (a trailing comma).
+            if (pending_field) {
+                pending_field = false;
+                if (!isCloser(t.kind)) try stops.append(self.gpa, .{ .off = body.items.len, .kind = .field });
             }
+            // Assignment `=` at bracket depth 0 (first one only).
+            if (t.kind == .EQ and brackets.items.len == 0 and !have_eq) {
+                try stops.append(self.gpa, .{ .off = body.items.len, .kind = .eq });
+                have_eq = true;
+            }
+            // Trailing line comment (there is at most one, and it's last).
+            if ((t.kind == .LINE_COMMENT or t.kind == .DOC_COMMENT) and prev != null) {
+                try stops.append(self.gpa, .{ .off = body.items.len, .kind = .cmt });
+            }
+            // The closing `}` of a multi-field record is a tab-stop, so the
+            // last field's column (hence the `}`) aligns too. Pop before
+            // appending so the offset points at the `}`.
+            if (isCloser(t.kind)) {
+                if (brackets.items.len > 0) {
+                    const e = brackets.pop().?;
+                    if (t.kind == .R_BRACE and e.had_field) {
+                        try stops.append(self.gpa, .{ .off = body.items.len, .kind = .brace });
+                    }
+                }
+            }
+
             try body.appendSlice(self.gpa, t.text);
+
             if (isOpener(t.kind)) {
-                depth += 1;
-            } else if (isCloser(t.kind) and depth > 0) {
-                depth -= 1;
+                try brackets.append(self.gpa, .{ .kind = t.kind, .had_field = false });
+            } else if (t.kind == .COMMA and brackets.items.len > 0 and
+                brackets.items[brackets.items.len - 1].kind == .L_BRACE)
+            {
+                brackets.items[brackets.items.len - 1].had_field = true;
+                pending_field = true;
             }
             prev = t;
         }
@@ -482,7 +516,10 @@ const Formatter = struct {
         // comment; interior bytes are never touched, so raw-string
         // contents survive exactly).
         const trimmed = std.mem.trimEnd(u8, body.items, " \t");
-        if (trimmed.len == 0) return; // nothing but whitespace after all
+        if (trimmed.len == 0) {
+            stops.deinit(self.gpa);
+            return; // nothing but whitespace after all
+        }
 
         // Collapse deferred blank lines to one (never at file start).
         if (self.wrote_content and self.pending_blanks > 0) {
@@ -493,8 +530,7 @@ const Formatter = struct {
         try self.rows.append(self.gpa, .{
             .indent = disp,
             .text = try self.gpa.dupe(u8, trimmed),
-            .eq = eq,
-            .cmt = cmt,
+            .stops = try stops.toOwnedSlice(self.gpa),
         });
         self.wrote_content = true;
     }
@@ -688,6 +724,34 @@ test "aligns `=` and trailing comments together" {
 
 test "a single assignment is left with one space (no spurious gap)" {
     try expectFmt("fn f {\n    let x = 1\n}\n", "fn f {\n    let x = 1\n}\n");
+}
+
+test "aligns record-literal field columns across rows (grid)" {
+    try expectFmt(
+        "fn main {\n" ++
+            "    print_all([\n" ++
+            "        Color { r: 255, g: 0, b: 0 },\n" ++
+            "        Color { r: 0, g: 255, b: 0 },\n" ++
+            "        Color { r: 0, g: 0, b: 255 },\n" ++
+            "    ])\n" ++
+            "}\n",
+        "fn main {\n" ++
+            "    print_all([\n" ++
+            "        Color { r: 255, g: 0,   b: 0   },\n" ++
+            "        Color { r: 0,   g: 255, b: 0   },\n" ++
+            "        Color { r: 0,   g: 0,   b: 255 },\n" ++
+            "    ])\n" ++
+            "}\n",
+    );
+}
+
+test "grid alignment only groups same-shape (field-count) rows" {
+    // The two two-field rows align (fields and the closing `}`); the
+    // single-field `Q { a: 1 }` has no field comma, so it's left alone.
+    try expectFmt(
+        "fn f {\n    P { x: 1, y: 22 }\n    P { x: 333, y: 4 }\n    Q { a: 1 }\n}\n",
+        "fn f {\n    P { x: 1,   y: 22 }\n    P { x: 333, y: 4  }\n    Q { a: 1 }\n}\n",
+    );
 }
 
 test "collapses blank lines and strips leading/trailing ones" {
