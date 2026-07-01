@@ -1487,9 +1487,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
                 const qualified = try std.fmt.allocPrintSentinel(allocator, "{s}#{s}", .{ iface, f.name }, 0);
                 defer allocator.free(qualified);
                 _ = c.BinaryenAddFunctionExport(module, f.name.ptr, qualified.ptr);
-            } else if (wants_kv) {
-                // Component (kv) mode: exports follow the canonical `cm32p2||<name>`
-                // convention, kebab-cased to match the synthesized world export.
+            } else if (wants_store) {
+                // Store-component (kv/blob/db) mode: exports follow the canonical
+                // `cm32p2||<name>` convention, kebab-cased to match the synthesized
+                // world export (a `_` in the fn name → `-`, or the world's kebab
+                // export wouldn't resolve against the core's raw name).
                 const ext = try std.fmt.allocPrintSentinel(allocator, "cm32p2||{s}", .{f.name}, 0);
                 defer allocator.free(ext);
                 for (ext) |*ch| if (ch.* == '_') {
