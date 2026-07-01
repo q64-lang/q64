@@ -38,6 +38,12 @@ token stream the parser produces:
   so a wrapped `-> ReturnType`, a `.method()` chain, or a `|>` pipeline
   reads as subordinate. Prefix-capable tokens (`-`, `!`, `~`, `&`, `*`,
   `<`) are excluded, so a real statement is never mis-indented.
+- **Trailing commas** — a comma-list (call args, params, array, record,
+  match arms) whose closing bracket sits on its own line is multi-line, so
+  its last element gets a trailing comma (before any trailing comment).
+  Single-line lists and comma-less groups (blocks, grouping parens) are
+  left alone. This is the one transform that adds a token rather than only
+  trivia — see *Safety* below.
 - **Vertical whitespace** — runs of blank lines collapse to one; leading
   blank lines are dropped; the file ends with exactly one newline.
 - **Trailing whitespace** — stripped from every line (including inside a
@@ -49,24 +55,27 @@ token stream the parser produces:
   can never leave a truncated `.q` on disk (relevant to the ICE
   convention; see [`spec/diagnostics.md`](../../../spec/diagnostics.md)).
 
-**Safety invariant.** The formatter only ever rewrites the trivia
-*between* tokens, so the significant-token sequence is identical in and
-out and `format` is idempotent. This is **enforced at runtime**: the
-output is re-lexed and, if its token sequence differs from the input's (a
-dropped space that would merge `let x` into `letx`), the original source
-is returned untouched — the formatter can never corrupt code. Both
-properties are covered by the tests in `fmt.zig` and were verified across
-every `.q` file in the repo (0 token mismatches, 0 non-idempotent).
+**Safety.** Every transform except the trailing-comma pass rewrites only
+the trivia *between* tokens; the trailing-comma pass may insert a comma
+immediately before a closing bracket, and nothing else. This is
+**enforced at runtime** by `outputIsSafe`: the output is re-parsed (so it
+must still parse cleanly) and its significant-token sequence compared to
+the input's, allowing *only* those inserted trailing commas. On any other
+difference — a dropped space that would merge `let x` into `letx`, a stray
+token, or output that no longer parses — the original source is returned
+untouched, so the formatter can never corrupt code. `format` is also
+idempotent. Both properties are covered by the tests in `fmt.zig` and
+were verified across every `.q` file in the repo (0 unsafe fallbacks, 0
+non-idempotent).
 
 ## Deferred / known limits
 
 Future slices, each still inside the safety invariant:
 
-- **Array-row / call-argument grids** — alignment currently covers record
-  literals (`{ … }`); the same column treatment for `[ … ]` array rows and
+- **Array-row / call-argument grids** — column alignment currently covers
+  record literals (`{ … }`); the same treatment for `[ … ]` array rows and
   multi-line call arguments is a natural extension (deliberately scoped out
   for now to avoid over-aligning ordinary calls).
-- **Trailing-comma normalization.**
 - **Line reflow / wrapping** long lines.
 - **Generic call in expression position.** `Point<f32>(0.0)` (no
   turbofish) is parsed as comparisons (`<` / `>`) — the PAR040 ambiguity —

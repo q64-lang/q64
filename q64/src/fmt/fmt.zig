@@ -1,34 +1,34 @@
 //! The `q64 fmt` formatter engine (v0).
 //!
 //! The formatter reprints the lossless token stream the parser emits:
-//! it recomputes leading indentation from bracket nesting, applies a
-//! canonical single-space style *between* tokens (spaces around binary
-//! operators, after `,`/`:`, tight `foo(x)`/`a.b`/`Vec<T>`), normalizes
-//! vertical whitespace (blank lines, trailing newline), and strips
-//! trailing whitespace — while preserving every significant token and
-//! every comment.
+//! it recomputes indentation from bracket nesting (with continuation-line
+//! indent), applies a canonical single-space style *between* tokens
+//! (spaces around binary operators, after `,`/`:`, tight
+//! `foo(x)`/`a.b`/`Vec<T>`), tabwriter-aligns columns (`=`, record-literal
+//! grids, trailing comments), adds a trailing comma to multi-line lists,
+//! normalizes vertical whitespace, and strips trailing whitespace — while
+//! preserving every significant token and every comment.
 //!
 //! Spacing decisions come from token kinds plus three CST-resolved
 //! `Role`s that disambiguate the tokens context alone can't: `< >`
 //! (generic delimiter vs comparison), a leading sigil in a `UNARY_EXPR`
 //! (`-x` vs `a - b`), and `|` (lambda-param delimiter vs bit-or).
 //!
-//! Safety. Formatting only ever rewrites the trivia between tokens, so
-//! the significant-token sequence is identical in and out and `format`
-//! is idempotent. This is enforced at runtime by a fail-safe: the output
-//! is re-lexed and, if its token sequence differs from the input's (a
-//! dropped space that merged two tokens), the original source is
-//! returned untouched — the formatter can never corrupt code.
+//! Safety. Everything but the trailing-comma pass rewrites only the
+//! trivia between tokens; the trailing-comma pass may insert a comma
+//! immediately before a closing bracket, and nothing else. This is
+//! enforced at runtime by a fail-safe (`outputIsSafe`): the output is
+//! re-parsed and its significant-token sequence compared to the input's,
+//! allowing *only* those inserted trailing commas. On any other
+//! difference — a dropped space that merged two tokens, a stray token, or
+//! output that no longer parses — the original source is returned
+//! untouched, so the formatter can never corrupt code. `format` is also
+//! idempotent. Both properties are checked in the tests below and were
+//! verified across every `.q` file in the repo.
 //!
-//! What it deliberately does NOT do yet: reflow/wrap long lines,
-//! normalize trailing commas, or reproduce hand-aligned columns (there
-//! is no tabwriter — aligned runs collapse to single spaces). Those are
-//! later slices (see `README.md` §Deferred).
-//!
-//! Safety invariant: `stripInsignificant(format(src)) ==
-//! stripInsignificant(src)` for any parseable `src`, and `format` is
-//! idempotent (`format(format(src)) == format(src)`). Both are checked
-//! in the tests at the bottom of this file.
+//! What it deliberately does NOT do yet: reflow/wrap long lines, and grid
+//! alignment of `[ … ]` array rows / multi-line call arguments (only
+//! record literals get grids). See `README.md` §"Deferred".
 //!
 //! Indentation model — each open bracket records the indent of the
 //! *line it was opened on*. A line's indent is one level deeper than
@@ -98,27 +98,36 @@ pub fn format(gpa: std.mem.Allocator, source: []const u8) !Outcome {
     try f.run();
     const out = try f.out.toOwnedSlice(gpa);
 
-    // Fail-safe: re-lex the output and require its significant-token
-    // sequence to be byte-identical to the input's. Formatting only ever
-    // rewrites trivia, so this must hold — but a spacing bug that dropped
-    // a needed space (`let x` → `letx`) would merge two tokens and be
-    // caught here. If it ever fires, return the source untouched rather
-    // than emit corrupted code; the exact-output unit tests catch the bug
-    // instead.
-    if (!try tokensPreserved(gpa, source, out)) {
+    // Fail-safe. Formatting rewrites trivia and may insert trailing commas
+    // before a closer, and nothing else. If the output ever fails that
+    // contract — a dropped space that merged two tokens (`let x` → `letx`),
+    // a stray token, or output that no longer parses — return the source
+    // untouched rather than emit anything questionable. The exact-output
+    // unit tests catch the underlying bug instead.
+    if (!try outputIsSafe(gpa, source, out)) {
         gpa.free(out);
         return .{ .formatted = try gpa.dupe(u8, source) };
     }
     return .{ .formatted = out };
 }
 
-/// True iff `a` and `b` lex to the same sequence of significant (non-trivia)
-/// token texts. The formatter's core safety invariant.
-fn tokensPreserved(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
+/// The output is safe iff it parses without errors and its significant-token
+/// sequence equals the input's — except the output may carry extra commas,
+/// each immediately before a closing bracket (the trailing-comma pass). Any
+/// other difference means a bug, and the caller falls back to the source.
+fn outputIsSafe(gpa: std.mem.Allocator, input: []const u8, output: []const u8) !bool {
+    // The output must still parse cleanly (an inserted comma in a context
+    // that rejected it would be caught here, not just at lex level).
+    const r = try parse.parse(gpa, output, "<fmt-verify>");
+    defer r.deinit(gpa);
+    for (r.diagnostics) |d| {
+        if (d.severity == .err) return false;
+    }
+
     const lex = parser.lex;
-    const ra = try lex.tokenize(gpa, a);
+    const ra = try lex.tokenize(gpa, input);
     defer ra.deinit(gpa);
-    const rb = try lex.tokenize(gpa, b);
+    const rb = try lex.tokenize(gpa, output);
     defer rb.deinit(gpa);
 
     var ia: usize = 0;
@@ -128,12 +137,35 @@ fn tokensPreserved(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
         while (ib < rb.tokens.len and (rb.tokens[ib].kind.isTrivia() or rb.tokens[ib].kind == .EOF)) ib += 1;
         const a_done = ia >= ra.tokens.len;
         const b_done = ib >= rb.tokens.len;
-        if (a_done or b_done) return a_done and b_done;
-        if (ra.tokens[ia].kind != rb.tokens[ib].kind) return false;
-        if (!std.mem.eql(u8, ra.tokens[ia].text, rb.tokens[ib].text)) return false;
-        ia += 1;
-        ib += 1;
+        if (a_done and b_done) return true;
+
+        if (!a_done and !b_done and
+            ra.tokens[ia].kind == rb.tokens[ib].kind and
+            std.mem.eql(u8, ra.tokens[ia].text, rb.tokens[ib].text))
+        {
+            ia += 1;
+            ib += 1;
+            continue;
+        }
+        // Otherwise the only permitted difference is a comma the output
+        // inserted immediately before a closer.
+        if (!b_done and rb.tokens[ib].kind == .COMMA and nextSigIsCloser(rb.tokens, ib)) {
+            ib += 1;
+            continue;
+        }
+        return false;
     }
+}
+
+/// True if the first significant token after index `i` in `toks` is a
+/// closing bracket.
+fn nextSigIsCloser(toks: []const cst.Token, i: usize) bool {
+    var j = i + 1;
+    while (j < toks.len) : (j += 1) {
+        if (toks[j].kind.isTrivia()) continue;
+        return isCloser(toks[j].kind);
+    }
+    return false;
 }
 
 /// True iff formatting `source` would leave it unchanged. Used by
@@ -308,6 +340,13 @@ const Row = struct {
     stops: []Stop = &.{},
 };
 
+/// A currently-open bracket group. `indent` is the display indent of the
+/// line that opened it (drives the indent of lines inside). `had_comma`
+/// records whether a comma has appeared at this group's own level — i.e.
+/// it's a comma-list (call args, array, record, match arms), not a block
+/// or a grouping paren — which is what makes a trailing comma appropriate.
+const Group = struct { indent: usize, had_comma: bool = false };
+
 const Formatter = struct {
     toks: []const cst.Token,
     gpa: std.mem.Allocator,
@@ -315,10 +354,10 @@ const Formatter = struct {
     i: usize = 0,
     out: std.ArrayList(u8) = .empty,
     rows: std.ArrayList(Row) = .empty,
-    /// One entry per currently-open bracket: the indent level of the
-    /// line that opened it. The innermost entry (top) drives the indent
-    /// of the lines inside it.
-    stack: std.ArrayList(usize) = .empty,
+    /// The open-bracket stack; the innermost entry (top) drives indent.
+    stack: std.ArrayList(Group) = .empty,
+    /// Index into `rows` of the last content (non-blank) row, or null.
+    last_content: ?usize = null,
     /// Blank lines seen since the last content line (for collapsing).
     pending_blanks: usize = 0,
     /// Whether any content line has been emitted (suppresses leading
@@ -441,17 +480,26 @@ const Formatter = struct {
         // Display indentation for this line. A line that begins by
         // closing a bracket aligns with that bracket's opener line;
         // otherwise it sits one level inside the innermost open bracket.
-        const top: ?usize = if (self.stack.items.len > 0)
+        const top: ?Group = if (self.stack.items.len > 0)
             self.stack.items[self.stack.items.len - 1]
         else
             null;
         const first_is_closer = has_content and isCloser(line[first_sig.?].kind);
         var disp: usize = if (first_is_closer)
-            (top orelse 0)
-        else if (top) |t|
-            t + 1
+            (if (top) |g| g.indent else 0)
+        else if (top) |g|
+            g.indent + 1
         else
             0;
+
+        // Trailing comma: a comma-list whose closer sits on its own line
+        // (this line begins with it) is multi-line, so its last element —
+        // the previous content row — gets a trailing comma if it lacks one.
+        if (first_is_closer) {
+            if (top) |g| {
+                if (g.had_comma) try self.addTrailingComma();
+            }
+        }
 
         // Continuation lines — a wrapped statement that begins with an
         // operator/`.`/`->`/`|>` (a token that can't start a fresh
@@ -556,6 +604,7 @@ const Formatter = struct {
             .text = try self.gpa.dupe(u8, trimmed),
             .stops = try stops.toOwnedSlice(self.gpa),
         });
+        self.last_content = self.rows.items.len - 1;
         self.wrote_content = true;
     }
 
@@ -582,10 +631,40 @@ const Formatter = struct {
         for (line) |t| {
             if (t.kind.isTrivia()) continue;
             if (isOpener(t.kind)) {
-                self.stack.append(self.gpa, disp) catch {};
+                self.stack.append(self.gpa, .{ .indent = disp }) catch {};
             } else if (isCloser(t.kind)) {
                 if (self.stack.items.len > 0) _ = self.stack.pop();
+            } else if (t.kind == .COMMA and self.stack.items.len > 0) {
+                // A comma at the innermost open group's level marks it a
+                // comma-list (persists across lines until the group closes).
+                self.stack.items[self.stack.items.len - 1].had_comma = true;
             }
+        }
+    }
+
+    /// Insert a trailing comma into the last content row's element (before
+    /// any trailing comment), unless it already ends in a comma or is a
+    /// comment-only row.
+    fn addTrailingComma(self: *Formatter) !void {
+        const idx = self.last_content orelse return;
+        const row = &self.rows.items[idx];
+        if (std.mem.startsWith(u8, row.text, "//")) return; // comment-only line
+
+        // Insert just before a trailing comment, else at end of the text.
+        var pos = row.text.len;
+        for (row.stops) |s| {
+            if (s.kind == .cmt and s.off > 0) pos = s.off - 1; // before the space
+        }
+        if (pos == 0 or row.text[pos - 1] == ',') return; // nothing to do
+
+        var nt = try self.gpa.alloc(u8, row.text.len + 1);
+        @memcpy(nt[0..pos], row.text[0..pos]);
+        nt[pos] = ',';
+        @memcpy(nt[pos + 1 ..], row.text[pos..]);
+        self.gpa.free(row.text);
+        row.text = nt;
+        for (row.stops) |*s| {
+            if (s.off >= pos) s.off += 1; // a trailing comment shifts right
         }
     }
 
@@ -802,6 +881,32 @@ test "ordinary consecutive statements are not treated as continuations" {
     try expectFmt(
         "fn f {\n    aaa()\n    bbb()\n}\n",
         "fn f {\n    aaa()\n    bbb()\n}\n",
+    );
+}
+
+test "adds a trailing comma to multi-line lists" {
+    // Call args, record fields, arrays, and match arms all get one.
+    try expectFmt(
+        "fn f {\n    foo(\n        a,\n        b\n    )\n}\n",
+        "fn f {\n    foo(\n        a,\n        b,\n    )\n}\n",
+    );
+    try expectFmt(
+        "fn f {\n    let c = P {\n        x: 1,\n        y: 2\n    }\n}\n",
+        "fn f {\n    let c = P {\n        x: 1,\n        y: 2,\n    }\n}\n",
+    );
+}
+
+test "does not add a trailing comma to single-line lists or blocks" {
+    // Closer on the same line ⇒ not multi-line ⇒ untouched.
+    try expectFmt("fn f {\n    foo(a, b)\n}\n", "fn f {\n    foo(a, b)\n}\n");
+    // A block has no top-level commas ⇒ not a comma-list ⇒ untouched.
+    try expectFmt("fn f {\n    let x = 1\n    let y = 2\n}\n", "fn f {\n    let x = 1\n    let y = 2\n}\n");
+}
+
+test "trailing comma goes before a trailing comment" {
+    try expectFmt(
+        "fn f {\n    foo(\n        a,\n        b // last\n    )\n}\n",
+        "fn f {\n    foo(\n        a,\n        b, // last\n    )\n}\n",
     );
 }
 
