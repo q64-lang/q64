@@ -5,7 +5,7 @@ them up:
 
 | You have | Verb | Destination |
 |---|---|---|
-| An application (a **Qube** — `type: "application"`, has `main`) | `qube pod deploy` | [qubepods](https://qubepods.com) — the hosting runtime |
+| An application (a **Qube** — `type: "application"`, has `main`) | `qube deploy` | [qubepods](https://qubepods.com) — the hosting runtime |
 | A library (a **qube** — `type: "library"`, exports a surface) | `qube publish` | the Continuum — browse at [continuum.q64.dev](https://continuum.q64.dev) |
 
 This page covers the first. For publishing libraries, see
@@ -19,15 +19,14 @@ This page covers the first. For publishing libraries, see
 
 ```sh
 qube build --component --addr wasm32        # 1. build the component
-qube pod init --project my-project \
-  --wasm ./target/<profile>/wasm32/my_app.component.wasm \
-  --wit-package <pkg> --wit-world <world>   # 2. scaffold qubepod.jsonc
-qube pod login                              # 3. paste a token from the qubepods console
-qube pod deploy                             # 4. pack + upload the bundle
+qube pod login                              # 2. paste a token from the qubepods console
+qube deploy                                 # 3. pack + upload the bundle
 ```
 
-Each step in detail below. The full flag reference for every command is
-[`spec/qube-cli.md`](./spec/qube-cli.md) §"`qube pod`".
+`qube deploy` reads the qube's own `qube.json5` — there is **no** separate
+deploy manifest to scaffold, and it is the **same command** in the qubepods web
+shell and a terminal. Each step in detail below; the full flag reference is
+[`spec/qube-cli.md`](./spec/qube-cli.md) §"`qube deploy`".
 
 ## 0. Get the toolchain
 
@@ -68,23 +67,20 @@ qube build --component --addr wasm32
 
 Output lands under `target/<profile>/<addr>/`.
 
-## 2. Scaffold the deploy manifest
+## 2. Declare the deploy target in `qube.json5`
 
-```sh
-qube pod init --project <slug> --wasm <path-to-component> \
-  --wit-package <pkg> --wit-world <world>
-```
+There is **no separate deploy manifest** — `qube deploy` reads the qube's own
+`qube.json5`. Point `component` at the artifact to ship:
 
-This writes `qubepod.jsonc` — the QubePod deploy manifest (project slug,
-name, the component + its WIT world, optional `exports.http` routes and
-an `assets` directory). Run it with **no flags** for an interactive
-wizard. Useful extras:
+- `component.module` — a classic JS worker entry (no wasm on the server).
+- `component.wasm` — a single wasm component / core module.
+- `component.variants.{wasm32,wasm64}.wasm` — one build per address space, the
+  recommended shape for a Qube that must reach WebKit *and* wants 64-bit
+  elsewhere.
 
-- `--addr wasm32,wasm64` — declare per-address-space variants
-  (`component.variants`), the recommended shape for a Qube that must
-  reach WebKit *and* wants 64-bit elsewhere.
-- `--http-route <r>` — expose an HTTP handler.
-- `--assets <dir>` — ship a static asset tree alongside the wasm.
+Optional `assets.directory` ships a static asset tree alongside the artifact,
+and an `exports.http` route exposes an HTTP handler. See
+[`spec/qube.json5.md`](./spec/qube.json5.md).
 
 ## 3. Authenticate
 
@@ -97,21 +93,22 @@ qube pod login        # reads the token from stdin (or --token <t>)
 
 Tokens are stored in `~/.qube/pods.toml`, separate from your Continuum
 registry credentials (`~/.qube/credentials.toml`) — the two never
-clobber each other. `qube pod deploy` resolves its token in order:
+clobber each other. `qube deploy` resolves its token in order:
 `--token` → `$QUBEPODS_TOKEN` → the saved login. `qube pod info` shows
 the provider and auth status; `qube pod logout` forgets the token.
 
 ## 4. Deploy
 
 ```sh
-qube pod deploy
+qube deploy
 ```
 
-Packs a bundle zip (`target/deploy/<name>.zip`) from the
-`qubepod.jsonc` in the current directory — manifest, every component
-wasm (single or per-variant), and the asset tree — and uploads it.
-The server content-addresses the wasm and assets into your tenant
-store and materializes the deployment.
+Packs a bundle zip (`target/deploy/<name>.zip`) from the `qube.json5` in the
+current directory — manifest, the component artifact (JS module, single wasm,
+or per-variant), and the asset tree — and uploads it. The server
+content-addresses the artifact and assets into your tenant store and
+materializes the deployment. The **same command** runs in the qubepods web
+shell.
 
 ## Test locally first
 

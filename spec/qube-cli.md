@@ -21,11 +21,10 @@ qube --help    | -h
 |----------------------------------|--------------------------------------------------------------------|
 | `qube new <name>`                | Create a new qube directory with a starter manifest and `src/`     |
 | `qube init`                      | Initialize a qube in the current directory                         |
-| `qube pod <new\|init>`           | Scaffold a QubePod deploy manifest (`qubepod.jsonc`)               |
+| `qube deploy`                    | Deploy this qube to qubepods — pack the bundle (`qube.json5` + wasm/JS module + assets) and upload. The **same** command in the qubepods web shell and a terminal. |
 | `qube pod login`                 | Save a qubepods token (from the console) for deploys              |
 | `qube pod info`                  | Show the qubepods provider, API origin, and auth status          |
 | `qube pod logout`                | Remove the saved qubepods token                                  |
-| `qube pod deploy`                | Pack the bundle (manifest + wasm + assets) and deploy to qubepods |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |
@@ -187,21 +186,24 @@ exchange. With `--token <t>` it stores that token; with no flag it reads one
 | `qube pod info [--url <origin>]` | Print the provider, API origin, and whether a token is saved. |
 | `qube pod logout` | Delete `~/.qube/pods.toml`. |
 
-`qube pod deploy` resolves its token in order: `--token` → `$QUBEPODS_TOKEN` →
+`qube deploy` resolves its token in order: `--token` → `$QUBEPODS_TOKEN` →
 the saved `qube pod login` credentials.
 
-### `qube pod deploy`
+### `qube deploy`
 
-`qube pod deploy` packs a **bundle zip** from the `qubepod.jsonc` in the
-current directory — the manifest, every component wasm (the single
-`component.wasm`, or each `component.variants.<addr>.wasm` for a
-dual-address-space qube), and the asset tree named by `assets.directory` —
-into `target/deploy/<name>.zip`, then uploads it to qubepods as a
-multipart `POST <api>/api/deploy` (`environment` + `bundle`). The server
-unzips it, content-addresses the wasm and every asset into the tenant
-store, and materializes the deployment. Files are zipped at the archive
-root (no wrapping folder); an optional single wrapping directory is
-tolerated on the server side.
+`qube deploy` deploys the qube in the current directory to qubepods. It reads
+the qube's **own manifest — `qube.json5`** (there is no separate deploy file),
+and is the **same command** whether run in the qubepods web shell or a terminal.
+
+It packs a **bundle zip** from `qube.json5` — the manifest, the component
+artifact (a classic JS worker's `component.module`, a single `component.wasm`,
+or each `component.variants.<addr>.wasm` for a dual-address-space qube), and the
+asset tree named by `assets.directory` — into `target/deploy/<name>.zip`, then
+uploads it to qubepods as a multipart `POST <api>/api/deploy` (`environment` +
+`bundle`). If `qube.json5` has a `build` command it runs first (unless
+`--no-build`). The server unzips it, content-addresses the artifact and every
+asset into the tenant store, and materializes the deployment. Files are zipped
+at the archive root (no wrapping folder).
 
 | Flag             | Default                          | Meaning                              |
 |------------------|----------------------------------|--------------------------------------|

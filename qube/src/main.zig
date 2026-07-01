@@ -158,6 +158,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "deploy")) {
+        cmdDeploy(gpa, io, env, &args_it) catch |err| {
+            try printStderr(io, "qube: deploy failed: {s}\n", .{@errorName(err)});
+            std.process.exit(@intFromEnum(ExitCode.internal));
+        };
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "pod")) {
         cmdPod(gpa, io, env, &args_it) catch |err| {
             try printStderr(io, "qube: pod failed: {s}\n", .{@errorName(err)});
@@ -224,11 +232,10 @@ fn usage(io: std.Io) !void {
         \\Subcommands (v0):
         \\  new [name] [flags]      Scaffold a new qube in a new directory (wizard if no flags).
         \\  init [flags]            Scaffold a qube in the current directory (wizard if no flags).
-        \\  pod <new|init> [flags]  Scaffold a QubePod deploy manifest (wizard if no flags).
+        \\  deploy [flags]          Deploy this qube to qubepods (reads qube.json5). Same command in the web shell and a terminal.
         \\  pod login [--token <t>] Save a qubepods token (minted in the console) for deploys.
         \\  pod info                Show the qubepods provider, API origin, and auth status.
         \\  pod logout              Remove the saved qubepods token.
-        \\  pod deploy [flags]      Pack the bundle (manifest+wasm+assets) and deploy to qubepods.
         \\  build [--component] [--addr wasm32|wasm64] [--release]
         \\                          Compile the qube to wasm under target/<profile>/<addr>/.
         \\  run                     Build and run the qube in the current directory.
@@ -3802,7 +3809,7 @@ fn isSlug(s: []const u8) bool {
 
 fn podHelp(io: std.Io) !void {
     try writeStdout(io,
-        \\usage: qube pod <new [name] | init | login | logout | info | deploy> [flags]
+        \\usage: qube pod <new [name] | init | login | logout | info | hostname> [flags]
         \\
         \\Auth (qubepods provider):
         \\  qube pod login [--token <t>] [--url <origin>]
@@ -3837,7 +3844,7 @@ fn podHelp(io: std.Io) !void {
         \\  --assets <dir>         Ship a static asset tree from <dir>, e.g. ./public.
         \\  --dir <path>           Target directory (new only; default: name).
         \\
-        \\See `qube pod deploy --help` to pack and upload the bundle.
+        \\See `qube deploy --help` to pack and upload the bundle.
         \\
     );
 }
@@ -4029,7 +4036,7 @@ fn cmdPod(
     args_it: *std.process.Args.Iterator,
 ) !void {
     const subsub = args_it.next() orelse {
-        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|deploy|hostname> [flags]\n");
+        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|hostname> [flags]\n");
         std.process.exit(@intFromEnum(ExitCode.usage));
     };
     if (std.mem.eql(u8, subsub, "--help") or std.mem.eql(u8, subsub, "-h")) {
@@ -4041,7 +4048,12 @@ fn cmdPod(
     if (std.mem.eql(u8, subsub, "login")) return cmdPodLogin(gpa, io, env, args_it);
     if (std.mem.eql(u8, subsub, "logout")) return cmdPodLogout(gpa, io, env, args_it);
     if (std.mem.eql(u8, subsub, "info")) return cmdPodInfo(gpa, io, env, args_it);
-    if (std.mem.eql(u8, subsub, "deploy")) return cmdPodDeploy(gpa, io, env, args_it);
+    if (std.mem.eql(u8, subsub, "deploy")) {
+        // `qube pod deploy` was removed — deploy is the top-level `qube deploy`
+        // (same command in the shell and a Linux terminal), reading qube.json5.
+        try writeStderr(io, "qube pod deploy was removed — use `qube deploy` (reads qube.json5).\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
     if (std.mem.eql(u8, subsub, "hostname")) return cmdPodHostname(gpa, io, env, args_it);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
@@ -4197,7 +4209,7 @@ fn cmdPodInfo(
     });
 }
 
-// qube pod deploy  (pack the bundle zip and upload it to qubepods)
+// qube deploy  (pack the bundle zip and upload it to qubepods)
 // ---------------------------------------------------------------------------
 
 const default_pods_api = "https://api-stage.qubepods.com";
@@ -4221,7 +4233,7 @@ const pod_pack_script =
     \\# Strip the CLI-only `build` field from the packed manifest — it is a
     \\# deploy-time hook (run above), not part of the deployed artifact, and older
     \\# server schemas reject unknown keys. Drops a single-line "build": … entry.
-    \\grep -v '^[[:space:]]*"build"[[:space:]]*:' qubepod.jsonc > "$STAGE/qubepod.jsonc" || cp qubepod.jsonc "$STAGE/qubepod.jsonc"
+    \\grep -vE '^[[:space:]]*"?build"?[[:space:]]*:' qube.json5 > "$STAGE/qube.json5" || cp qube.json5 "$STAGE/qube.json5"
     \\for WASM in "$@"; do
     \\  mkdir -p "$STAGE/$(dirname "$WASM")"
     \\  cp "$WASM" "$STAGE/$WASM"
@@ -4237,14 +4249,17 @@ const pod_pack_script =
     \\rm -rf "$STAGE"
 ;
 
-fn podDeployHelp(io: std.Io) !void {
+fn deployHelp(io: std.Io) !void {
     try writeStdout(io,
-        \\usage: qube pod deploy [flags]
+        \\usage: qube deploy [flags]
         \\
-        \\If the manifest has a `build` command, run it first (cwd = manifest dir),
-        \\then pack the QubePod bundle (qubepod.jsonc + the component wasm + the
-        \\asset tree named by assets.directory) into target/deploy/<name>.zip and
-        \\upload it to qubepods. Run from the directory holding qubepod.jsonc.
+        \\Deploy this qube to qubepods. Reads qube.json5 (the qube's manifest — no
+        \\separate deploy file). If it has a `build` command, run it first (cwd =
+        \\manifest dir), then pack the bundle (qube.json5 + the component wasm or JS
+        \\module + the asset tree named by assets.directory) into
+        \\target/deploy/<name>.zip and upload it. Run from the qube directory.
+        \\
+        \\The SAME command in the qubepods web shell and a Linux terminal.
         \\
         \\Flags:
         \\  --env <name>     Target environment (default: production).
@@ -4255,7 +4270,7 @@ fn podDeployHelp(io: std.Io) !void {
     );
 }
 
-fn cmdPodDeploy(
+fn cmdDeploy(
     gpa: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
@@ -4267,7 +4282,7 @@ fn cmdPodDeploy(
     var skip_build = false;
     while (args_it.next()) |a| {
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            try podDeployHelp(io);
+            try deployHelp(io);
             return;
         } else if (std.mem.eql(u8, a, "--url")) {
             api_url = try flagValue(io, args_it, "--url");
@@ -4278,7 +4293,7 @@ fn cmdPodDeploy(
         } else if (std.mem.eql(u8, a, "--no-build")) {
             skip_build = true;
         } else {
-            try printStderr(io, "qube pod deploy: unknown flag: {s}\n", .{a});
+            try printStderr(io, "qube deploy: unknown flag: {s}\n", .{a});
             std.process.exit(@intFromEnum(ExitCode.usage));
         }
     }
@@ -4286,72 +4301,108 @@ fn cmdPodDeploy(
     const cwd_path = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd_path);
 
-    const manifest_path = try std.fs.path.join(gpa, &.{ cwd_path, "qubepod.jsonc" });
+    // The qube's OWN manifest — qube.json5. There is no separate deploy file;
+    // `qube deploy` reads the same manifest `qube run`/`qube build` do.
+    const manifest_path = try std.fs.path.join(gpa, &.{ cwd_path, "qube.json5" });
     defer gpa.free(manifest_path);
     if (!fileExists(io, manifest_path)) {
-        try writeStderr(io, "qube pod deploy: no qubepod.jsonc in this directory\n");
+        try writeStderr(io, "qube deploy: no qube.json5 in this directory\n");
         std.process.exit(@intFromEnum(ExitCode.input));
     }
 
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
     defer gpa.free(raw);
 
-    const name = extractStringField(raw, "\"name\"") orelse {
-        try writeStderr(io, "qube pod deploy: manifest has no \"name\" field\n");
+    // qube.json5 is JSON5 (unquoted keys, comments) — convert then parse, so
+    // fields are read structurally, not by scanning the raw text.
+    const manifest_json = json5.toJson(gpa, raw) catch |err| {
+        try printStderr(io, "qube deploy: cannot parse qube.json5: {s}\n", .{@errorName(err)});
         std.process.exit(@intFromEnum(ExitCode.input));
     };
+    defer gpa.free(manifest_json);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, manifest_json, .{}) catch |err| {
+        try printStderr(io, "qube deploy: cannot parse qube.json5: {s}\n", .{@errorName(err)});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try writeStderr(io, "qube deploy: qube.json5 is not a JSON object\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        },
+    };
+
+    const name = try gpa.dupe(u8, manifestString(root, "name") orelse {
+        try writeStderr(io, "qube deploy: qube.json5 has no \"name\" field\n");
+        std.process.exit(@intFromEnum(ExitCode.input));
+    });
+    defer gpa.free(name);
 
     // Optional `build` command: run it (cwd = manifest dir) BEFORE packing, so the
     // bundle ships freshly-compiled wasm/assets rather than stale on-disk bytes.
     // String form only for now (run via `sh -c`); an array form (argv) is a
     // follow-up. `--no-build` skips it.
     if (!skip_build) {
-        if (extractStringField(raw, "\"build\"")) |build_cmd| {
-            try printStdout(io, "qube pod deploy: build: {s}\n", .{build_cmd});
-            // cwd is already the manifest dir (we read qubepod.jsonc from cwd).
+        if (manifestString(root, "build")) |build_cmd| {
+            try printStdout(io, "qube deploy: build: {s}\n", .{build_cmd});
+            // cwd is already the manifest dir (we read qube.json5 from cwd).
             const argv = [_][]const u8{ "sh", "-c", build_cmd };
             const term = spawnInherit(io, &argv) catch |err| {
-                try printStderr(io, "qube pod deploy: cannot run build: {s}\n", .{@errorName(err)});
+                try printStderr(io, "qube deploy: cannot run build: {s}\n", .{@errorName(err)});
                 std.process.exit(@intFromEnum(ExitCode.internal));
             };
             if (termCode(term) != 0) {
-                try writeStderr(io, "qube pod deploy: build command failed\n");
+                try writeStderr(io, "qube deploy: build command failed\n");
                 std.process.exit(@intFromEnum(ExitCode.internal));
             }
         }
     }
 
-    // Component wasm path(s): a `variants` map ships one per address space
-    // (wasm32 / wasm64); a legacy manifest has a single `component.wasm`.
+    // The component artifact(s) to ship, from `component`:
+    //   module   -> a classic JS worker entry (no wasm on the server);
+    //   wasm     -> a single wasm component / core module;
+    //   variants -> one wasm per address space (wasm32 / wasm64).
+    // The API bundler accepts a `.js` module as well as wasm (apps/api/src/bundle.ts),
+    // so a classic JS qube deploys the same way — the packer just stages the named
+    // entry file alongside the manifest + assets.
     var wasm_norms: std.ArrayList([]const u8) = .empty;
-    defer wasm_norms.deinit(gpa);
-    if (std.mem.indexOf(u8, raw, "\"variants\"") != null) {
-        for ([_][]const u8{ "\"wasm32\"", "\"wasm64\"" }) |key| {
-            if (std.mem.indexOf(u8, raw, key)) |k| {
-                if (extractStringField(raw[k..], "\"wasm\"")) |p| {
-                    try wasm_norms.append(gpa, stripDotSlash(p));
-                }
-            }
-        }
+    defer {
+        for (wasm_norms.items) |p| gpa.free(p);
+        wasm_norms.deinit(gpa);
+    }
+    if (manifestNestedString(root, "component", "module")) |mod_rel| {
+        try wasm_norms.append(gpa, try gpa.dupe(u8, stripDotSlash(mod_rel)));
+    } else if (manifestNestedString(root, "component", "wasm")) |wasm_rel| {
+        try wasm_norms.append(gpa, try gpa.dupe(u8, stripDotSlash(wasm_rel)));
+    } else {
+        // component.variants.{wasm32,wasm64}.wasm — one build per address space.
+        if (root.get("component")) |comp| switch (comp) {
+            .object => |co| if (co.get("variants")) |variants| switch (variants) {
+                .object => |vo| {
+                    for ([_][]const u8{ "wasm32", "wasm64" }) |addr| {
+                        if (vo.get(addr)) |av| switch (av) {
+                            .object => |ao| if (manifestString(ao, "wasm")) |p| {
+                                try wasm_norms.append(gpa, try gpa.dupe(u8, stripDotSlash(p)));
+                            },
+                            else => {},
+                        };
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        };
         if (wasm_norms.items.len == 0) {
-            try writeStderr(io, "qube pod deploy: component.variants has no wasm32/wasm64 build\n");
+            try writeStderr(io, "qube deploy: qube.json5 has no component.module, component.wasm, or component.variants\n");
             std.process.exit(@intFromEnum(ExitCode.input));
         }
-    } else if (extractStringField(raw, "\"wasm\"")) |wasm_rel| {
-        try wasm_norms.append(gpa, stripDotSlash(wasm_rel));
-    } else if (extractStringField(raw, "\"module\"")) |mod_rel| {
-        // A JS-module component (`component.module`): the API bundler accepts a
-        // `.js` entry as well as wasm (apps/api/src/bundle.ts), so a stateless JS
-        // qube (e.g. a static-PWA handler) deploys the same way — the packer just
-        // stages the named entry file alongside the manifest + assets.
-        try wasm_norms.append(gpa, stripDotSlash(mod_rel));
-    } else {
-        try writeStderr(io, "qube pod deploy: manifest has no component.wasm, component.module, or component.variants\n");
-        std.process.exit(@intFromEnum(ExitCode.input));
     }
 
-    // Optional asset tree: assets.directory is the only "directory" key.
-    const assets_dir_opt = extractStringField(raw, "\"directory\"");
+    // Optional asset tree: assets.directory.
+    const assets_dir_opt = manifestNestedString(root, "assets", "directory");
     const assets_norm = if (assets_dir_opt) |d| stripDotSlash(d) else "";
 
     // Token: --token wins, else QUBEPODS_TOKEN, else the saved `qube pod login`
@@ -4365,7 +4416,7 @@ fn cmdPodDeploy(
             break :blk0 t;
         }
         const t = readPodToken(gpa, io, env) catch {
-            try writeStderr(io, "qube pod deploy: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
+            try writeStderr(io, "qube deploy: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
             std.process.exit(@intFromEnum(ExitCode.registry));
         };
         token_source = "saved login (~/.qube/pod-token)";
@@ -4387,11 +4438,11 @@ fn cmdPodDeploy(
         try argv.appendSlice(gpa, wasm_norms.items);
         const term = try spawnInherit(io, argv.items);
         if (termCode(term) != 0) {
-            try writeStderr(io, "qube pod deploy: packing the bundle failed\n");
+            try writeStderr(io, "qube deploy: packing the bundle failed\n");
             std.process.exit(@intFromEnum(ExitCode.internal));
         }
     }
-    try printStdout(io, "qube pod deploy: packed {s}\n", .{out_zip_full});
+    try printStdout(io, "qube deploy: packed {s}\n", .{out_zip_full});
 
     // Upload the bundle (multipart: environment + bundle zip).
     const url = try std.fmt.allocPrint(gpa, "{s}/api/deploy", .{api_url});
@@ -4422,7 +4473,7 @@ fn cmdPodDeploy(
         try printStdout(io, "Deployed {s} to {s}.\n{s}\n", .{ name, environment_name, body });
         return;
     }
-    try printStderr(io, "qube pod deploy: api returned {d}:\n{s}\n", .{ status, body });
+    try printStderr(io, "qube deploy: api returned {d}:\n{s}\n", .{ status, body });
     // A wrong/stale key is the usual cause — show exactly which token
     // was sent and where it came from, so the mismatch is visible.
     try printStderr(io, "  token used ({s}): QUBEPODS_TOKEN={s}\n", .{ token_source, token });

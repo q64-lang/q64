@@ -30,6 +30,7 @@ pub const usage_text =
     \\  run   [file.q|.wasm]    build the manifest entry (or a file) and run it
     \\  wac plug <socket> ...   link components on device
     \\  webgpu                  probe the browser's WebGPU support (adapter, device, render)
+    \\  deploy                  deploy this qube to qubepods (reads qube.json5; needs a login token)
     \\  help                    show this help
     \\
     \\run from a qube directory (where qube.json5 is); the entry defaults to src/main.q.
@@ -37,7 +38,7 @@ pub const usage_text =
 
 /// A command the front-end must execute — it needs a host capability (compile,
 /// run, link, GPU probe) the pure router can't perform itself.
-pub const Command = enum { build, run, wac, webgpu, pod };
+pub const Command = enum { build, run, wac, webgpu, pod, deploy };
 
 /// The routing decision for one `qube <args>` invocation.
 pub const Route = union(enum) {
@@ -75,6 +76,7 @@ pub fn route(args: []const []const u8) Route {
     if (eq(sub, "run")) return .{ .command = .{ .cmd = .run, .rest = rest } };
     if (eq(sub, "wac")) return .{ .command = .{ .cmd = .wac, .rest = rest } };
     if (eq(sub, "webgpu") or eq(sub, "gpu")) return .{ .command = .{ .cmd = .webgpu, .rest = rest } };
+    if (eq(sub, "deploy")) return .{ .command = .{ .cmd = .deploy, .rest = rest } };
     if (eq(sub, "pod")) return .{ .command = .{ .cmd = .pod, .rest = rest } };
 
     return .{ .unknown = sub };
@@ -92,6 +94,7 @@ pub fn name(cmd: Command) []const u8 {
         .wac => "wac",
         .webgpu => "webgpu",
         .pod => "pod",
+        .deploy => "deploy",
     };
 }
 
@@ -127,6 +130,7 @@ test "route: real commands carry the rest" {
     try t.expectEqual(Command.webgpu, route(&.{"gpu"}).command.cmd);
     try t.expectEqual(Command.run, route(&.{"run"}).command.cmd);
     try t.expectEqual(Command.wac, route(&.{ "wac", "plug" }).command.cmd);
+    try t.expectEqual(Command.deploy, route(&.{"deploy"}).command.cmd);
 }
 
 test "route: unknown subcommand" {

@@ -144,7 +144,7 @@ The remaining bootstrap pieces (still in progress; folders are scaffolded):
 - [`CLAUDE.md`](./CLAUDE.md) — repo conventions, chiefly the naming/casing
   rules (`Q64` vs `q64`, `Qube` vs `qube`, the Continuum).
 - [`DEPLOYMENT.md`](./DEPLOYMENT.md) — deploying a Qube: build the
-  component, scaffold `qubepod.jsonc`, `qube pod login`, `qube pod deploy`.
+  component, `qube pod login`, `qube deploy` (reads `qube.json5`).
   (Publishing a library is `qube publish` → the Continuum.)
 
 ## License

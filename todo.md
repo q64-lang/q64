@@ -1129,7 +1129,7 @@ concatenation for interpolation.
 - [ ] `--frozen` / `--locked` flags; `add` dedup.
 - [ ] `qube publish` clean-release-build check (`qube-cli.md` publish step 4) — blocked on compiler.
 - [ ] `qube remove` / `outdated` still stubs.
-- [ ] **`qube pod deploy` rejects static-asset qubes.** A qube with
+- [ ] **`qube deploy` rejects static-asset qubes.** A qube with
       `static: { dir: "web" }` and no component (the `qubits`
       `qube_rocks`/`blackbird` shape) fails with `manifest has no
       component.wasm, component.module, or component.variants` — but the
@@ -1139,7 +1139,7 @@ concatenation for interpolation.
       `POST <api>/api/deploy` multipart (verified — see `qubeworlds/qubekit`
       `apps/editor/deploy.sh`, live at `qubekit-editor.qubepod.app`). Fix: when
       there's no `component.*`, pack `qubepod.jsonc` + `assets.directory` only.
-      Also update `spec/qube-cli.md` §`qube pod deploy` — it currently says the
+      Also update `spec/qube-cli.md` §`qube deploy` — it currently says the
       bundle is "the manifest, every component wasm, and the asset tree", which
       reads as component-required; spec the static-only case explicitly (spec is
       the source of truth, so it should define it).
@@ -3563,7 +3563,7 @@ Implementation:
 - [x] **`qube pod` CLI (deploy manifest):** `qube pod new`/`init` take
       `--addr <wasm32|wasm64>[,…]` and emit a `component.variants` map (per-addr
       paths derived from `--wasm`); legacy single-`wasm` is unchanged when
-      `--addr` is omitted. `qube pod deploy` packs **every** declared variant
+      `--addr` is omitted. `qube deploy` packs **every** declared variant
       into the bundle zip. Mirrors qubepods' `component.variants` schema; the
       generated manifest round-trips through `@qubepods/qubepod-schema`.
       (`qube/src/main.zig`, tests in `qube-test/tests/pod.test.ts`.)
