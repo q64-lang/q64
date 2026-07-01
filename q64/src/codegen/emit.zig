@@ -299,6 +299,10 @@ pub const q64_blob_wit = @embedFile("wit/q64-blob.wit");
 /// wasi:sql).
 pub const q64_db_wit = @embedFile("wit/q64-db.wit");
 
+/// The vendored `wasi:config@0.2.0-draft` WIT — the `env.config` capability
+/// target (read-only config/secrets; spec/env.md §`env.config`).
+pub const wasi_config_wit = @embedFile("wit/wasi-config.wit");
+
 /// The component-model interface ids `env.kv` lowers to (with the version pin).
 /// Core imports use the `cm32p2|<id>` form; the world imports the bare ids.
 pub const kv_store_iface = "wasi:keyvalue/store@0.2.0-draft2";
@@ -308,6 +312,8 @@ pub const kv_atomics_iface = "wasi:keyvalue/atomics@0.2.0-draft2";
 pub const blob_store_iface = "q64:blob/store@0.2.0-draft2";
 /// The interface id `env.db` lowers to (q64-owned; version pin mirrors kv/blob).
 pub const db_sql_iface = "q64:db/sql@0.2.0-draft2";
+/// The interface id `env.config` lowers to — the real `wasi:config` proposal.
+pub const config_store_iface = "wasi:config/store@0.2.0-draft";
 
 /// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
 /// qube as a component"). A library lifts the import-free, scalar-signature
@@ -414,11 +420,11 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     // `wasi:keyvalue` import ABI (cm32p2 imports, adapter-held bucket) and hand
     // back the synthesized world for the CLI to embed + lift. The canonical ABI
     // is 32-bit (cm32p2); a wasm64 qube isn't lowerable here.
-    if (usesEnvKv(&mmod) or usesEnvBlob(&mmod) or usesEnvDb(&mmod)) {
+    if (usesEnvKv(&mmod) or usesEnvBlob(&mmod) or usesEnvDb(&mmod) or usesEnvConfig(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
         const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null, true);
         errdefer allocator.free(core);
-        const world = try synthStoreWorld(allocator, &hmod, usesEnvKv(&mmod), usesEnvBlob(&mmod), usesEnvDb(&mmod));
+        const world = try synthStoreWorld(allocator, &hmod, usesEnvKv(&mmod), usesEnvBlob(&mmod), usesEnvDb(&mmod), usesEnvConfig(&mmod));
         return .{ .store_component = .{ .core = core, .world = world } };
     }
 
@@ -925,7 +931,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     const wants_kv = kv_component and usesEnvKv(m);
     const wants_blob = kv_component and usesEnvBlob(m);
     const wants_db = kv_component and usesEnvDb(m);
-    const wants_store = wants_kv or wants_blob or wants_db;
+    const wants_config = kv_component and usesEnvConfig(m);
+    const wants_store = wants_kv or wants_blob or wants_db or wants_config;
     const kv_open_ret: u32 = @intCast((m.data.len + 7) & ~@as(usize, 7));
     const kv_inc_ret: u32 = kv_open_ret + 8;
     // The op return area is 24 bytes: kv/blob results fit in 16, but a
@@ -1073,7 +1080,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (sc.has_kv) needs_kv = true;
         // set/get box their `result<…>` into the scope arena (like fs_read),
         // so the qube needs the `sp` bump pointer even if nothing else uses it.
-        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text) needs_arena = true;
+        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) needs_arena = true;
         if (sc.has_chan) needs_chan = true;
         if (sc.has_take) needs_take = true;
         if (sc.has_connect) needs_connect = true;
@@ -1207,6 +1214,16 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (usesDbQueryValue(m)) c.BinaryenAddFunctionImport(module, "db_conn_query_value", db_mod, "[method]connection.query-value", m_params, none_type);
         if (usesDbQueryText(m)) c.BinaryenAddFunctionImport(module, "db_conn_query_text", db_mod, "[method]connection.query-text", m_params, none_type);
         _ = c.BinaryenAddGlobal(module, "db_connection", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
+    }
+    if (wants_config) {
+        // `env.config` → the real `wasi:config/store` core import (cm32p2).
+        // `get` is a TOP-LEVEL interface function (no resource, no host `open`),
+        // so it's a plain `get(key_ptr, key_len, ret) -> result<option<string>,
+        // error>` — no handle arg and no bucket global.
+        const cfg_mod = "cm32p2|" ++ config_store_iface;
+        var gp = [_]c.BinaryenType{ i32_type, i32_type, i32_type };
+        const get_params = c.BinaryenTypeCreate(&gp, gp.len);
+        c.BinaryenAddFunctionImport(module, "config_store_get", cfg_mod, "get", get_params, none_type);
     }
     if (wants_store) {
         // The canonical `cabi_realloc` bump allocator, exported as
@@ -1399,6 +1416,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .kv_component = wants_kv,
             .blob_component = wants_blob,
             .db_component = wants_db,
+            .config_component = wants_config,
             .kv_open_ret = kv_open_ret,
             .kv_inc_ret = kv_inc_ret,
             .kv_hdr_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0),
@@ -1413,7 +1431,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const n_fs: u32 = if (sc.has_fs or sc.has_envvar) 2 else 0;
         // kv set/get need three address-width scratch locals (box header ptr +
         // saved key ptr/len); allocated after the fs/envvar scratch group.
-        const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text) 3 else 0;
+        const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) 3 else 0;
         const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs + n_kv;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
@@ -1444,7 +1462,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             vts[g] = ptr_type; // fs/envvar dest
             vts[g + 1] = i64_type; // fs/envvar len
         }
-        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text) {
+        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) {
             const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
             vts[g] = ptr_type; // kv box header ptr
             vts[g + 1] = ptr_type; // kv saved key ptr
@@ -1657,6 +1675,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .db_execute => |db| bodyHasOut(db.sql, want_int),
         .db_query_value => |db| bodyHasOut(db.sql, want_int),
         .db_query_text => |db| bodyHasOut(db.sql, want_int),
+        .config_get => |cf| bodyHasOut(cf.key, want_int),
         .chan_recv => |h| bodyHasOut(h, want_int),
         .chan_take => |h| bodyHasOut(h, want_int),
         .chan_open => false,
@@ -1809,6 +1828,21 @@ fn usesEnvDb(m: *const ir.mir.Module) bool {
     return false;
 }
 
+/// True if any function reaches `env.config` (a `config_get` node) — gates the
+/// `wasi:config/store` import + the component (store) path.
+fn usesEnvConfig(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_config_get) return true;
+    }
+    return false;
+}
+
 /// Per-op db predicates — each gates its own `[method]connection.*` import.
 fn usesDbExec(m: *const ir.mir.Module) bool {
     for (m.funcs) |f| {
@@ -1851,7 +1885,7 @@ fn usesDbQueryText(m: *const ir.mir.Module) bool {
 /// `wasi:keyvalue/atomics` (the `env.kv` lowering) and exports each scalar `pub`
 /// function. Named `qube` (the fixed world name the CLI passes to `component
 /// embed --world`). Caller owns the slice.
-fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use_kv: bool, use_blob: bool, use_db: bool) ![]u8 {
+fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use_kv: bool, use_blob: bool, use_db: bool, use_config: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "// synthesized WIT world (q64 storage capabilities → host interfaces)\n");
@@ -1865,6 +1899,9 @@ fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use
     }
     if (use_db) {
         try out.print(allocator, "  import {s};\n", .{db_sql_iface});
+    }
+    if (use_config) {
+        try out.print(allocator, "  import {s};\n", .{config_store_iface});
     }
     for (hmod.funcs) |f| {
         if (f.visibility != .public) continue;
@@ -2025,6 +2062,8 @@ const Scratch = struct {
     has_db_execute: bool = false,
     has_db_query_value: bool = false,
     has_db_query_text: bool = false,
+    /// Contains an `env.config.get` → declare the `wasi:config/store.get` import.
+    has_config_get: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
     has_chan: bool = false,
     /// Contains a `chan_take` → declare the `env.channel_take` import.
@@ -2065,6 +2104,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_db_execute = s.has_db_execute or sub.has_db_execute;
     s.has_db_query_value = s.has_db_query_value or sub.has_db_query_value;
     s.has_db_query_text = s.has_db_query_text or sub.has_db_query_text;
+    s.has_config_get = s.has_config_get or sub.has_config_get;
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
     s.has_connect = s.has_connect or sub.has_connect;
@@ -2291,6 +2331,11 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.host_out = true;
             scanScratch(db.sql, s);
         },
+        .config_get => |cf| {
+            s.has_config_get = true;
+            s.host_out = true; // key rides the pair scratch (ptr,len)
+            scanScratch(cf.key, s);
+        },
         .chan_recv => |h| {
             s.has_chan = true;
             scanScratch(h, s);
@@ -2478,6 +2523,10 @@ const Lowerer = struct {
     /// imports (lazy `open` into `db_connection`, connection methods). Reuses the
     /// shared store return areas + scratch locals; only the handle global differs.
     db_component: bool = false,
+    /// config (wasi:config) component lowering: `env.config.get` lowers to the
+    /// top-level `wasi:config/store.get` — no handle, no lazy-open. Reuses the
+    /// shared store return area + box helpers.
+    config_component: bool = false,
     kv_open_ret: u32 = 0,
     kv_inc_ret: u32 = 0,
     /// kv set/get scratch locals: `kv_hdr_idx` holds the boxed-Result header
@@ -2826,6 +2875,12 @@ const Lowerer = struct {
             .db_query_value => |db| {
                 if (!self.db_component) return c.BinaryenUnreachable(module);
                 return try self.storeComponentQueryValue(db.sql, "db_conn_query_value", "db_connection", "db_conn_open");
+            },
+            .config_get => |cf| {
+                if (!self.config_component) return c.BinaryenUnreachable(module);
+                // wasi:config/store.get is a top-level function — no handle,
+                // no lazy-open; reuse the get-decode with null handle/open.
+                return try self.storeComponentGet(cf.key, "config_store_get", null, null);
             },
             .chan_recv => |h| {
                 // got = env.channel_recv(session) — 1 (message) or 0 (closed).
@@ -3226,13 +3281,15 @@ const Lowerer = struct {
     /// tag 1 = `Err`. Inner box (Option<Bytes>, `{ #tag, #p0, #p1 }`): tag 0 =
     /// `Some`, #p0/#p1 = the value (ptr, len); tag 1 = `None`. Yields the outer
     /// box pointer. (Consumed by nested `Ok(Some(v))` / `Ok(None)` matching.)
-    fn storeComponentGet(self: *Lowerer, key: *const ir.mir.Inst, get_import: [*:0]const u8, bucket_global: [*:0]const u8, open_import: [*:0]const u8) Error!c.BinaryenExpressionRef {
+    fn storeComponentGet(self: *Lowerer, key: *const ir.mir.Inst, get_import: [*:0]const u8, handle_global: ?[*:0]const u8, open_import: ?[*:0]const u8) Error!c.BinaryenExpressionRef {
         const m = self.module;
         const get_ret: i32 = @intCast(self.kv_inc_ret);
 
         var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
         defer pre.deinit(self.allocator);
-        try pre.append(self.allocator, self.storeLazyOpen(open_import, bucket_global));
+        // Handle-backed stores (kv/blob/db) lazily open a handle; a top-level
+        // interface function (env.config.get) has no handle — skip the open.
+        if (handle_global) |hg| try pre.append(self.allocator, self.storeLazyOpen(open_import.?, hg));
 
         // key → pair; stash (ptr,len) in kv_a/kv_b so the arena bump for the two
         // boxes below can't clobber a pair-local read.
@@ -3240,14 +3297,23 @@ const Lowerer = struct {
         try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0)));
         try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1)));
 
-        // get(bucket, key_ptr, key_len, get_ret)
-        var get_args = [_]c.BinaryenExpressionRef{
-            c.BinaryenGlobalGet(m, bucket_global, self.i32_type),
-            self.ptrGet(self.kv_a_idx),
-            self.ptrGet(self.kv_b_idx),
-            self.kvI32(get_ret),
-        };
-        try pre.append(self.allocator, c.BinaryenCall(m, get_import, @ptrCast(&get_args), get_args.len, self.none_type));
+        // get([handle,] key_ptr, key_len, get_ret) — handle omitted for config.
+        if (handle_global) |hg| {
+            var get_args = [_]c.BinaryenExpressionRef{
+                c.BinaryenGlobalGet(m, hg, self.i32_type),
+                self.ptrGet(self.kv_a_idx),
+                self.ptrGet(self.kv_b_idx),
+                self.kvI32(get_ret),
+            };
+            try pre.append(self.allocator, c.BinaryenCall(m, get_import, @ptrCast(&get_args), get_args.len, self.none_type));
+        } else {
+            var get_args = [_]c.BinaryenExpressionRef{
+                self.ptrGet(self.kv_a_idx),
+                self.ptrGet(self.kv_b_idx),
+                self.kvI32(get_ret),
+            };
+            try pre.append(self.allocator, c.BinaryenCall(m, get_import, @ptrCast(&get_args), get_args.len, self.none_type));
+        }
 
         // Inner Option box (3 cells) at kv_hdr; stash its address in kv_a.
         const inner = self.kvBoxAlloc(3);
@@ -5481,6 +5547,30 @@ test "emitComponent: env.db lowers to a q64:db/sql component" {
             try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]connection.query-value") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]connection.query-text") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "import q64:db/sql@0.2.0-draft2;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.config lowers to a wasi:config/store component (handle-less get)" {
+    const src =
+        \\pub fn read() -> i64 {
+        \\    match env.config.get("k") { Ok(Some(v)) -> v.len, Ok(None) -> 0, Err(_) -> 0 }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "cfg.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            // The core imports the config interface module (the import base name
+            // is the generic `get`; `config_store_get` is binaryen's internal
+            // handle, not in the wasm bytes). A config-only qube pulls in no
+            // handle-based store.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:config/store@0.2.0-draft") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "wasi:keyvalue") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:config/store@0.2.0-draft;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export read: func() -> s64;") != null);
         },
         else => return error.TestUnexpectedResult,
     }

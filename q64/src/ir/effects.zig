@@ -246,6 +246,10 @@ fn collectExpr(
             d.insert(.db);
             try collectExpr(a, db.sql, d, e);
         },
+        .config_get => |cf| {
+            d.insert(.config);
+            try collectExpr(a, cf.key, d, e);
+        },
         .chan_recv => |h| {
             d.insert(.wire); // a remote channel receive crosses the wire
             try collectExpr(a, h, d, e);

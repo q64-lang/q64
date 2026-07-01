@@ -1,0 +1,18 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "config-read",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "config.q",
+
+  // Emit a component in addition to the core module. The qube reaches
+  // `env.config`, so the component imports wasi:config/store (spec/env.md
+  // §env.config); the host supplies it, scoping config to the qube's identity.
+  // This is the real wasi:config proposal (get/get-all are top-level functions).
+  "component": {
+    "emit": true,
+    "world": "config-read",
+    "worlds": ["wasi:config/store"],
+  },
+}

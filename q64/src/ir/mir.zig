@@ -287,6 +287,9 @@ pub const Op = union(enum) {
     /// `env.db.query_text(sql)`: `[method]connection.query-text`, boxed
     /// `Result<Option<Bytes>, IoError>` (`.ptr`).
     db_query_text: struct { sql: *Inst },
+    /// `env.config.get(key)`: the top-level `wasi:config/store.get` (no handle),
+    /// boxed `Result<Option<Bytes>, IoError>` (`.ptr`).
+    config_get: struct { key: *Inst },
     /// `chan_recv(session)` — receive the next inbound channel message (the
     /// `env.channel_recv` host import). Operand is the session handle (i64);
     /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.

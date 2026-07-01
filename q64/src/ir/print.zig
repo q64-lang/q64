@@ -235,6 +235,11 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, db.sql);
             try app(gpa, out, ")", .{});
         },
+        .config_get => |cf| {
+            try app(gpa, out, "config_get(", .{});
+            try hirExpr(gpa, out, cf.key);
+            try app(gpa, out, ")", .{});
+        },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv(", .{});
             try hirExpr(gpa, out, h);
@@ -510,6 +515,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .db_query_text => |db| {
             try app(gpa, out, "db_query_text\n", .{});
             try mirInst(gpa, out, db.sql, depth + 1);
+        },
+        .config_get => |cf| {
+            try app(gpa, out, "config_get\n", .{});
+            try mirInst(gpa, out, cf.key, depth + 1);
         },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv\n", .{});

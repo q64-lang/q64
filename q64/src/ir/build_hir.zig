@@ -5425,6 +5425,24 @@ fn dbQueryTextResultEnum(b: *Builder) BuildError!?*const EnumInfo {
     return info;
 }
 
+/// The `Result<Option<Bytes>, IoError>` enum that `env.config.get` yields —
+/// the same nested-Ok<str> shape as `blobGetResultEnum`, distinct cache key.
+fn configGetResultEnum(b: *Builder) BuildError!?*const EnumInfo {
+    if (b.enum_insts.get("Result\x00cfgget")) |inst| return inst;
+    const opt_base = b.enums.get("Option") orelse return null;
+    if (opt_base.si == null) return null;
+    const opt_bytes = try instantiateEnum(b, opt_base, &.{ "s", "i", "i", "i" });
+    const res_base = b.enums.get("Result") orelse return null;
+    const res_si = res_base.si orelse return null;
+    const vars = try b.a.alloc(EnumVariant, 2);
+    vars[0] = .{ .name = "Ok", .arity = 1, .kind = .ints, .pidx = 0, .nested = opt_bytes };
+    vars[1] = .{ .name = "Err", .arity = 1, .kind = .ints, .pidx = 1 };
+    const info = try b.a.create(EnumInfo);
+    info.* = .{ .name = "Result", .variants = vars, .si = res_si };
+    try b.enum_insts.put(b.a, "Result\x00cfgget", info);
+    return info;
+}
+
 /// The `Result<Option<i64>, IoError>` enum that `env.db.query_value` yields:
 /// the outer Result's Ok slot nests the **default (int-payload)** `Option`, so
 /// `Ok(Some(n))` binds an i64 (`n`) from the inner box's single payload cell —
@@ -5597,6 +5615,9 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             }
             if (std.mem.eql(u8, txt, "env.db.query_text")) {
                 return try dbQueryTextResultEnum(b);
+            }
+            if (std.mem.eql(u8, txt, "env.config.get")) {
+                return try configGetResultEnum(b);
             }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (resolveFn(b, txt)) |fd| return enumOfRet(b, fd);
@@ -7196,6 +7217,19 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                     const esi = info.si orelse return error.Unsupported;
                     const node = try b.a.create(hir.Expr);
                     node.* = .{ .db_query_text = .{ .sql = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
+                }
+                // `env.config.get(key)` — read-only config/secret (spec/env.md
+                // §`env.config`, `wasi:config/store.get`). Same nested-Ok<str>
+                // box as blob/db-text, but a handle-less top-level call.
+                if (std.mem.eql(u8, fsname, "env.config.get")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const info = (try configGetResultEnum(b)) orelse return error.Unsupported;
+                    const esi = info.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .config_get = .{ .key = try buildStrExpr(b, a0, scope, null) } };
                     return .{ .e = node, .si = esi };
                 }
             }
@@ -14688,6 +14722,23 @@ test "env.db: execute/query_value/query_text are @db faces reusing the store sha
     try testing.expect(std.mem.indexOf(u8, dump, "db_query_value") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "db_query_text") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "@db") != null);
+}
+
+test "env.config.get: a handle-less @config face over Result<Option<Bytes>>" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn read() -> i64 {
+        \\    match env.config.get("greeting") { Ok(Some(v)) -> v.len, Ok(None) -> 0, Err(_) -> 0 - 1 }
+        \\}
+        \\fn main { env.out(read()) }
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "config_get") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@config") != null);
 }
 
 test "str enum payloads: Result<str, i64>, Msg.Text(str), Option<str>, try" {

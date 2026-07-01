@@ -156,6 +156,7 @@ shipped by the runtime are:
 | `env.kv`      | `KeyValue`      | `@kv`          | Key-value store: get / set / delete / list / atomics. See `q64.kv`. |
 | `env.db`      | `Database`      | `@db`          | SQL database: query / execute / batch (SQLite dialect). See `q64.db`. |
 | `env.blob`    | `BlobStore`     | `@blob`        | Object store: get / put / delete / list of opaque blobs. See `q64.blob`. |
+| `env.config`  | `Config`        | `@config`      | Read-only application configuration / secrets, keyed by string. See `q64.config`. |
 | `env.audio`   | `Audio`         | `@audio`       | PCM input/output, audio worklets. See `q64.audio`.             |
 | `env.midi`    | `Midi`          | `@midi`        | MIDI input/output. See `q64.midi`.                             |
 | `env.ai`      | `AiEnv`         | `@inference`   | Model loading, inference, vocabularies. See `q64.ai`.          |
@@ -257,6 +258,26 @@ pub face BlobStore {
 
 pub struct BlobPage { keys: [str], cursor: Option<str> }   // cursor None = listing complete
 ```
+
+`env.config` is read-only application configuration / secrets, keyed by string.
+Unlike the stores above it is **not** host-opened — `wasi:config/store`'s `get`
+and `get-all` are top-level interface functions, so the host scopes config to
+the qube's identity itself and there is no handle:
+
+```q64
+pub face Config {
+    fn get     (self, key: str) -> Result<Option<Bytes>, IoError>          @config
+    fn get_all (self)           -> Result<[(str, Bytes)], IoError>         @config
+}
+```
+
+> **Implementation status (env.config).** `get(key)` is implemented and lowers
+> to the real **`wasi:config/store`** `get` (a handle-less top-level call), boxed
+> `Result<Option<Bytes>>` — the same nested-Ok<str> decode as `env.kv.get`.
+> **Deferred:** `get_all` returns a variable-length `list<tuple<string,string>>`
+> that needs the same variable-length typed decode as `env.db`'s typed `Rows`,
+> which q64 does not yet emit. See `q64/src/codegen/wit/wasi-config.wit` and
+> `test/config-component-reference/`.
 
 The SQL **dialect** is SQLite. q64 declares only the `@db` face; *which* backing
 store satisfies it — a co-located store, a replicated managed DB, or an external

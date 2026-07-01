@@ -131,6 +131,7 @@ pub const Effect = enum {
     kv,
     blob,
     db,
+    config,
     audio,
     midi,
     ui,
@@ -152,6 +153,7 @@ pub const Effect = enum {
             .kv => "@kv",
             .blob => "@blob",
             .db => "@db",
+            .config => "@config",
             .audio => "@audio",
             .midi => "@midi",
             .ui => "@ui",
@@ -171,7 +173,7 @@ pub const Effect = enum {
     /// not imply `@io` — they target dedicated host surfaces.
     pub fn implies(self: Effect) ?Effect {
         return switch (self) {
-            .stdout, .stderr, .network, .fs, .kv, .blob, .db, .wire => .io,
+            .stdout, .stderr, .network, .fs, .kv, .blob, .db, .config, .wire => .io,
             else => null,
         };
     }
@@ -210,6 +212,9 @@ pub const Effect = enum {
             // variant, and lack of batch don't map to a landed q64 decode. v0
             // exposes exec + scalar query projections (spec/env.md §`env.db`).
             .db => &.{"q64:db/sql"},
+            // `env.config` maps to the real `wasi:config/store` proposal
+            // (read-only config/secrets; spec/env.md §`env.config`).
+            .config => &.{"wasi:config/store"},
             .time => &.{ "wasi:clocks/wall-clock", "wasi:clocks/monotonic-clock" },
             .random => &.{"wasi:random/random"},
             .envvars => &.{"wasi:cli/environment"},
@@ -479,6 +484,12 @@ pub const Expr = union(enum) {
     /// (`q64:db/sql.connection.query-text`). Boxed
     /// `Result<Option<Bytes>, IoError>` (`Ok(Some(s))`/`Ok(None)`/`Err`). Marks `@db`.
     db_query_text: struct { sql: *Expr },
+    /// `env.config.get(key)` — read a config/secret value by key
+    /// (spec/env.md §`env.config`, `wasi:config/store.get`). `key` is a `str`.
+    /// `get` is a TOP-LEVEL interface function (no host handle), so it lowers to
+    /// a direct `get(key, ret)` — no lazy `open`. Boxed `Result<Option<Bytes>,
+    /// IoError>` (`Ok(Some(v))`/`Ok(None)`/`Err`). Marks the fn `@config`.
+    config_get: struct { key: *Expr },
     /// `chan_recv(session)` — receive the next inbound message on a remote
     /// channel session (`@channel_handler`'s `for _ in session`). Lowers to the
     /// `env.channel_recv` host import: returns 1 when a message arrived (run the
