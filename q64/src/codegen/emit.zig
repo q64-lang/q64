@@ -1038,6 +1038,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             needs_arena = true; // the value rides the scope arena
         }
         if (sc.has_kv) needs_kv = true;
+        // set/get box their `result<…>` into the scope arena (like fs_read),
+        // so the qube needs the `sp` bump pointer even if nothing else uses it.
+        if (sc.has_kv_set or sc.has_kv_get) needs_arena = true;
         if (sc.has_chan) needs_chan = true;
         if (sc.has_take) needs_take = true;
         if (sc.has_connect) needs_connect = true;
@@ -1106,6 +1109,23 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var ip = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i64_type, i32_type };
         const inc_params = c.BinaryenTypeCreate(&ip, ip.len);
         c.BinaryenAddFunctionImport(module, "kv_atomics_increment", atomics_mod, "increment", inc_params, none_type);
+        // Bucket resource methods (only when the qube reaches them, so an
+        // increment-only qube's import surface is unchanged). The canonical
+        // `wit-component` names are `[method]bucket.set` / `[method]bucket.get`
+        // on the `store` interface; the bucket handle is the leading param and
+        // the trailing i32 is the return-area pointer the host writes into.
+        //   set(bucket, key_ptr, key_len, val_ptr, val_len, ret) -> result<_,error>
+        //   get(bucket, key_ptr, key_len, ret)                   -> result<option<list<u8>>,error>
+        if (usesKvSet(m)) {
+            var sp = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type, i32_type, i32_type };
+            const set_params = c.BinaryenTypeCreate(&sp, sp.len);
+            c.BinaryenAddFunctionImport(module, "kv_bucket_set", store_mod, "[method]bucket.set", set_params, none_type);
+        }
+        if (usesKvGet(m)) {
+            var gp = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type };
+            const get_params = c.BinaryenTypeCreate(&gp, gp.len);
+            c.BinaryenAddFunctionImport(module, "kv_bucket_get", store_mod, "[method]bucket.get", get_params, none_type);
+        }
         _ = c.BinaryenAddGlobal(module, "kv_bucket", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
         // The canonical `cabi_realloc` bump allocator, exported as
         // `cm32p2_realloc`. Allocations start at page 1 (65536), above page-0
@@ -1297,6 +1317,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .kv_component = wants_kv,
             .kv_open_ret = kv_open_ret,
             .kv_inc_ret = kv_inc_ret,
+            .kv_hdr_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0),
+            .kv_a_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0) + 1,
+            .kv_b_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0) + 2,
         };
         defer lw.deinit();
 
@@ -1304,7 +1327,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         // then the concat scratch (buf/off/len) when concatenating, then one
         // base-ptr scratch per record_make nesting level.
         const n_fs: u32 = if (sc.has_fs or sc.has_envvar) 2 else 0;
-        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
+        // kv set/get need three address-width scratch locals (box header ptr +
+        // saved key ptr/len); allocated after the fs/envvar scratch group.
+        const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get) 3 else 0;
+        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs + n_kv;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
         for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type, ptr_type);
@@ -1333,6 +1359,12 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7;
             vts[g] = ptr_type; // fs/envvar dest
             vts[g + 1] = i64_type; // fs/envvar len
+        }
+        if (sc.has_kv_set or sc.has_kv_get) {
+            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
+            vts[g] = ptr_type; // kv box header ptr
+            vts[g + 1] = ptr_type; // kv saved key ptr
+            vts[g + 2] = ptr_type; // kv saved key len
         }
 
         // Parameter wasm types (a `str` param → two address-width ptr/len).
@@ -1531,6 +1563,8 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .envvar_get => |eg| bodyHasOut(eg.key, want_int),
         .fs_read => |fr| bodyHasOut(fr.path, want_int),
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
+        .kv_set => |kv| bodyHasOut(kv.key, want_int) or bodyHasOut(kv.value, want_int),
+        .kv_get => |kv| bodyHasOut(kv.key, want_int),
         .chan_recv => |h| bodyHasOut(h, want_int),
         .chan_take => |h| bodyHasOut(h, want_int),
         .chan_open => false,
@@ -1579,6 +1613,37 @@ fn usesEnvKv(m: *const ir.mir.Module) bool {
         var sc = Scratch{};
         scanScratch(root, &sc);
         if (sc.has_kv) return true;
+    }
+    return false;
+}
+
+/// True if any function reaches `env.kv.set` (a `kv_set` node) — gates the
+/// `[method]bucket.set` store import (declared only when used, so the
+/// increment-only kv qube's component surface is unchanged).
+fn usesKvSet(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_kv_set) return true;
+    }
+    return false;
+}
+
+/// True if any function reaches `env.kv.get` (a `kv_get` node) — gates the
+/// `[method]bucket.get` store import.
+fn usesKvGet(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_kv_get) return true;
     }
     return false;
 }
@@ -1739,6 +1804,10 @@ const Scratch = struct {
     has_envvar: bool = false,
     /// Contains an `env.kv.increment` → declare the `env.kv_increment` import.
     has_kv: bool = false,
+    /// Contains an `env.kv.set` → declare the `[method]bucket.set` store import.
+    has_kv_set: bool = false,
+    /// Contains an `env.kv.get` → declare the `[method]bucket.get` store import.
+    has_kv_get: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
     has_chan: bool = false,
     /// Contains a `chan_take` → declare the `env.channel_take` import.
@@ -1771,6 +1840,8 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_args = s.has_args or sub.has_args;
     s.has_envvar = s.has_envvar or sub.has_envvar;
     s.has_kv = s.has_kv or sub.has_kv;
+    s.has_kv_set = s.has_kv_set or sub.has_kv_set;
+    s.has_kv_get = s.has_kv_get or sub.has_kv_get;
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
     s.has_connect = s.has_connect or sub.has_connect;
@@ -1953,6 +2024,19 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             }
             scanScratch(kv.delta, s);
         },
+        .kv_set => |kv| {
+            s.has_kv = true; // shares the lazy `store.open` + return-area scratch
+            s.has_kv_set = true;
+            s.host_out = true; // key + value ride the pair scratch (ptr,len)
+            scanScratch(kv.key, s);
+            scanScratch(kv.value, s);
+        },
+        .kv_get => |kv| {
+            s.has_kv = true;
+            s.has_kv_get = true;
+            s.host_out = true; // key rides the pair scratch (ptr,len)
+            scanScratch(kv.key, s);
+        },
         .chan_recv => |h| {
             s.has_chan = true;
             scanScratch(h, s);
@@ -2132,6 +2216,13 @@ const Lowerer = struct {
     kv_component: bool = false,
     kv_open_ret: u32 = 0,
     kv_inc_ret: u32 = 0,
+    /// kv set/get scratch locals: `kv_hdr_idx` holds the boxed-Result header
+    /// pointer while the result is decoded; `kv_a_idx`/`kv_b_idx` stash the key
+    /// (ptr, len) across the value's evaluation in `set` (one pair local can't
+    /// hold two live str pairs). Address-width; allocated only for set/get.
+    kv_hdr_idx: c.BinaryenIndex = 0,
+    kv_a_idx: c.BinaryenIndex = 0,
+    kv_b_idx: c.BinaryenIndex = 0,
 
     fn deinit(self: *Lowerer) void {
         self.loops.deinit(self.allocator);
@@ -2435,6 +2526,17 @@ const Lowerer = struct {
                 };
                 return c.BinaryenCall(module, "env_kv_increment", @ptrCast(&call_args), call_args.len, self.i64_type);
             },
+            .kv_set => |kv| {
+                // env.kv.set exists only on the component (`wasi:keyvalue`) path;
+                // the local `qube run` host face has no set/get. Trap if reached
+                // without --component (the CLI only lowers set/get for wants_kv).
+                if (!self.kv_component) return c.BinaryenUnreachable(module);
+                return try self.kvComponentSet(kv);
+            },
+            .kv_get => |kv| {
+                if (!self.kv_component) return c.BinaryenUnreachable(module);
+                return try self.kvComponentGet(kv);
+            },
             .chan_recv => |h| {
                 // got = env.channel_recv(session) — 1 (message) or 0 (closed).
                 var call_args = [_]c.BinaryenExpressionRef{try self.inst(h)};
@@ -2671,34 +2773,15 @@ const Lowerer = struct {
     /// (cm32p2 is 32-bit). Returns an i64.
     fn kvComponentIncrement(self: *Lowerer, kv: anytype) Error!c.BinaryenExpressionRef {
         const m = self.module;
-        const i32c = struct {
-            fn f(mod: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
-                return c.BinaryenConst(mod, c.BinaryenLiteralInt32(v));
-            }
-        }.f;
-        const open_ret: i32 = @intCast(self.kv_open_ret);
         const inc_ret: i32 = @intCast(self.kv_inc_ret);
-
-        // if (kv_bucket == -1) { open("", open_ret); kv_bucket = load_i32(open_ret+4) }
-        var open_args = [_]c.BinaryenExpressionRef{ i32c(m, 0), i32c(m, 0), i32c(m, open_ret) };
-        var open_then = [_]c.BinaryenExpressionRef{
-            c.BinaryenCall(m, "kv_store_open", @ptrCast(&open_args), open_args.len, self.none_type),
-            c.BinaryenGlobalSet(m, "kv_bucket", c.BinaryenLoad(m, 4, false, 4, 4, self.i32_type, i32c(m, open_ret), "0")),
-        };
-        const lazy_open = c.BinaryenIf(
-            m,
-            c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type), i32c(m, -1)),
-            c.BinaryenBlock(m, null, @ptrCast(&open_then), open_then.len, self.none_type),
-            null,
-        );
 
         // key (ptr,len): a str pair for the keyed form, (0,0) for the keyless one.
         // The keyed form sequences the pair eval before the call reads its extracts.
         var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
         defer pre.deinit(self.allocator);
-        try pre.append(self.allocator, lazy_open);
-        var key_ptr: c.BinaryenExpressionRef = i32c(m, 0);
-        var key_len: c.BinaryenExpressionRef = i32c(m, 0);
+        try pre.append(self.allocator, self.kvLazyOpen());
+        var key_ptr: c.BinaryenExpressionRef = self.kvI32(0);
+        var key_len: c.BinaryenExpressionRef = self.kvI32(0);
         if (kv.key) |key| {
             try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(key)));
             key_ptr = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0);
@@ -2711,15 +2794,177 @@ const Lowerer = struct {
             key_ptr,
             key_len,
             try self.inst(kv.delta),
-            i32c(m, inc_ret),
+            self.kvI32(inc_ret),
         };
         try pre.append(self.allocator, c.BinaryenCall(m, "kv_atomics_increment", @ptrCast(&inc_args), inc_args.len, self.none_type));
 
         // result: (load8_u(inc_ret) == 0) ? load_i64(inc_ret+8) : 0
-        const ok = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, i32c(m, inc_ret), "0"), i32c(m, 0));
-        const total = c.BinaryenLoad(m, 8, false, 8, 8, self.i64_type, i32c(m, inc_ret), "0");
+        const ok = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, self.kvI32(inc_ret), "0"), self.kvI32(0));
+        const total = c.BinaryenLoad(m, 8, false, 8, 8, self.i64_type, self.kvI32(inc_ret), "0");
         try pre.append(self.allocator, c.BinaryenSelect(m, ok, total, c.BinaryenConst(m, c.BinaryenLiteralInt64(0))));
         return c.BinaryenBlock(m, null, @ptrCast(pre.items.ptr), @intCast(pre.items.len), self.i64_type);
+    }
+
+    /// An i32 constant — the cm32p2 keyvalue ABI is 32-bit, so bucket handles,
+    /// return-area addresses, and discriminants are all i32.
+    fn kvI32(self: *Lowerer, v: i32) c.BinaryenExpressionRef {
+        return c.BinaryenConst(self.module, c.BinaryenLiteralInt32(v));
+    }
+
+    /// The lazy `store.open` guard shared by every `env.kv` op. On first use it
+    /// opens the identity-pinned bucket (empty identifier — the host pins it to
+    /// the qube's identity) and caches the handle in `kv_bucket`; later ops
+    /// reuse it (`kv_bucket == -1` means unopened). `open` writes
+    /// `result<bucket, error>` into `kv_open_ret`; the handle is at +4.
+    fn kvLazyOpen(self: *Lowerer) c.BinaryenExpressionRef {
+        const m = self.module;
+        const open_ret: i32 = @intCast(self.kv_open_ret);
+        var open_args = [_]c.BinaryenExpressionRef{ self.kvI32(0), self.kvI32(0), self.kvI32(open_ret) };
+        var open_then = [_]c.BinaryenExpressionRef{
+            c.BinaryenCall(m, "kv_store_open", @ptrCast(&open_args), open_args.len, self.none_type),
+            c.BinaryenGlobalSet(m, "kv_bucket", c.BinaryenLoad(m, 4, false, 4, 4, self.i32_type, self.kvI32(open_ret), "0")),
+        };
+        return c.BinaryenIf(
+            m,
+            c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type), self.kvI32(-1)),
+            c.BinaryenBlock(m, null, @ptrCast(&open_then), open_then.len, self.none_type),
+            null,
+        );
+    }
+
+    /// Reserve an 8-aligned, `cells`×8-byte boxed-enum header in the scope arena
+    /// (`sp` bump), leaving its address in `kv_hdr_idx`. Mirrors `fs_read`'s box
+    /// discipline: `hdr = align8(sp); sp = hdr + cells*8`.
+    fn kvBoxAlloc(self: *Lowerer, cells: u32) [2]c.BinaryenExpressionRef {
+        const m = self.module;
+        const set_hdr = c.BinaryenLocalSet(m, self.kv_hdr_idx, self.ptrAnd(self.ptrAdd(c.BinaryenGlobalGet(m, "sp", self.ptr_type), self.ptrConst(7)), self.ptrConst(-8)));
+        const bump = c.BinaryenGlobalSet(m, "sp", self.ptrAdd(self.ptrGet(self.kv_hdr_idx), self.ptrConst(@intCast(cells * 8))));
+        return .{ set_hdr, bump };
+    }
+
+    /// `env.kv.set(key, value)` lowered to the canonical `wasi:keyvalue` ABI:
+    /// lazy-open the bucket, call `[method]bucket.set(bucket, key, value, ret)`,
+    /// and box the host's `result<_, error>` as a `Result<(), IoError>`
+    /// (`{ #tag, #p0 }`, 2 cells): tag = the result discriminant (0 = `Ok(())`,
+    /// 1 = `Err`); the payload cell is unused. Yields the box pointer.
+    fn kvComponentSet(self: *Lowerer, kv: anytype) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const set_ret: i32 = @intCast(self.kv_inc_ret); // shared op return area (16B)
+
+        var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer pre.deinit(self.allocator);
+        try pre.append(self.allocator, self.kvLazyOpen());
+
+        // Evaluate key → stash (ptr, len) in kv_a/kv_b (one pair local can't hold
+        // two live str pairs), then evaluate value into the pair local.
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(kv.key)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(kv.value)));
+        const val_ptr = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0);
+        const val_len = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1);
+
+        // Reserve the box AFTER operands (a concat value may bump `sp` first).
+        const box = self.kvBoxAlloc(2);
+        try pre.append(self.allocator, box[0]);
+        try pre.append(self.allocator, box[1]);
+
+        // set(bucket, key_ptr, key_len, val_ptr, val_len, set_ret)
+        var set_args = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type),
+            self.ptrGet(self.kv_a_idx),
+            self.ptrGet(self.kv_b_idx),
+            val_ptr,
+            val_len,
+            self.kvI32(set_ret),
+        };
+        try pre.append(self.allocator, c.BinaryenCall(m, "kv_bucket_set", @ptrCast(&set_args), set_args.len, self.none_type));
+
+        // Box: #tag = (i64) result-disc (0 = Ok, 1 = Err); #p0 unused.
+        const disc = c.BinaryenUnary(m, c.BinaryenExtendUInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, self.kvI32(set_ret), "0"));
+        try pre.append(self.allocator, c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_hdr_idx), disc, self.i64_type, "0"));
+        try pre.append(self.allocator, c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_hdr_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"));
+        try pre.append(self.allocator, self.ptrGet(self.kv_hdr_idx));
+        return c.BinaryenBlock(m, null, @ptrCast(pre.items.ptr), @intCast(pre.items.len), self.ptr_type);
+    }
+
+    /// `env.kv.get(key)` lowered to the canonical `wasi:keyvalue` ABI: lazy-open
+    /// the bucket, call `[method]bucket.get(bucket, key, ret)`, and box the
+    /// host's `result<option<list<u8>>, error>` as a nested
+    /// `Result<Option<Bytes>, IoError>`. The return area (16B) holds: result
+    /// disc @0, option disc @4, list ptr @8, list len @12. Outer box (Result,
+    /// `{ #tag, #p0 }`): tag 0 = `Ok`, #p0 = pointer to the inner Option box;
+    /// tag 1 = `Err`. Inner box (Option<Bytes>, `{ #tag, #p0, #p1 }`): tag 0 =
+    /// `Some`, #p0/#p1 = the value (ptr, len); tag 1 = `None`. Yields the outer
+    /// box pointer. (Consumed by nested `Ok(Some(v))` / `Ok(None)` matching.)
+    fn kvComponentGet(self: *Lowerer, kv: anytype) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const get_ret: i32 = @intCast(self.kv_inc_ret);
+
+        var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer pre.deinit(self.allocator);
+        try pre.append(self.allocator, self.kvLazyOpen());
+
+        // key → pair; stash (ptr,len) in kv_a/kv_b so the arena bump for the two
+        // boxes below can't clobber a pair-local read.
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(kv.key)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1)));
+
+        // get(bucket, key_ptr, key_len, get_ret)
+        var get_args = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type),
+            self.ptrGet(self.kv_a_idx),
+            self.ptrGet(self.kv_b_idx),
+            self.kvI32(get_ret),
+        };
+        try pre.append(self.allocator, c.BinaryenCall(m, "kv_bucket_get", @ptrCast(&get_args), get_args.len, self.none_type));
+
+        // Inner Option box (3 cells) at kv_hdr; stash its address in kv_a.
+        const inner = self.kvBoxAlloc(3);
+        try pre.append(self.allocator, inner[0]);
+        try pre.append(self.allocator, inner[1]);
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, self.ptrGet(self.kv_hdr_idx)));
+        // option disc @4 == 1 → Some(ptr@8, len@12); else None.
+        const some = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 4, 1, self.i32_type, self.kvI32(get_ret), "0"), self.kvI32(1));
+        var some_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_a_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"),
+            c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_a_idx), self.toI64(c.BinaryenLoad(m, 4, false, 8, 4, self.i32_type, self.kvI32(get_ret), "0")), self.i64_type, "0"),
+            c.BinaryenStore(m, 8, 16, 0, self.ptrGet(self.kv_a_idx), self.toI64(c.BinaryenLoad(m, 4, false, 12, 4, self.i32_type, self.kvI32(get_ret), "0")), self.i64_type, "0"),
+        };
+        var none_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_a_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(1)), self.i64_type, "0"),
+        };
+        try pre.append(self.allocator, c.BinaryenIf(
+            m,
+            some,
+            c.BinaryenBlock(m, null, @ptrCast(&some_seq), some_seq.len, self.none_type),
+            c.BinaryenBlock(m, null, @ptrCast(&none_seq), none_seq.len, self.none_type),
+        ));
+
+        // Outer Result box (2 cells) at kv_hdr; stash its address in kv_b.
+        const outer = self.kvBoxAlloc(2);
+        try pre.append(self.allocator, outer[0]);
+        try pre.append(self.allocator, outer[1]);
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, self.ptrGet(self.kv_hdr_idx)));
+        // result disc @0 == 0 → Ok(inner ptr); else Err (code 0, unread).
+        const ok = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, self.kvI32(get_ret), "0"), self.kvI32(0));
+        var ok_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_b_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"),
+            c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_b_idx), self.toI64(self.ptrGet(self.kv_a_idx)), self.i64_type, "0"),
+        };
+        var err_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_b_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(1)), self.i64_type, "0"),
+            c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_b_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"),
+        };
+        try pre.append(self.allocator, c.BinaryenIf(
+            m,
+            ok,
+            c.BinaryenBlock(m, null, @ptrCast(&ok_seq), ok_seq.len, self.none_type),
+            c.BinaryenBlock(m, null, @ptrCast(&err_seq), err_seq.len, self.none_type),
+        ));
+        try pre.append(self.allocator, self.ptrGet(self.kv_b_idx));
+        return c.BinaryenBlock(m, null, @ptrCast(pre.items.ptr), @intCast(pre.items.len), self.ptr_type);
     }
 
     /// `env.exit(code)` lowered per the build's host ABI: a raw `env.exit(code)`
@@ -4669,6 +4914,47 @@ test "emitComponent: env.kv lowers to a wasi:keyvalue component core + world" {
             try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:keyvalue/store@0.2.0-draft2;") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:keyvalue/atomics@0.2.0-draft2;") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "export bump: func() -> s64;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.kv.set imports the store `[method]bucket.set`" {
+    const src =
+        \\pub fn put() -> i64 {
+        \\    match env.kv.set("k", "v") { Ok(()) -> 1, Err(_) -> 0 }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "kv.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .kv_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:keyvalue/store@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.set") != null);
+            // set doesn't reach atomics.increment; that import stays out.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.get") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export put: func() -> s64;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.kv.get imports the store `[method]bucket.get`" {
+    const src =
+        \\pub fn read() -> i64 {
+        \\    match env.kv.get("k") { Ok(Some(v)) -> v.len, Ok(None) -> 0, Err(_) -> 0 }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "kv.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .kv_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:keyvalue/store@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.get") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.set") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export read: func() -> s64;") != null);
         },
         else => return error.TestUnexpectedResult,
     }

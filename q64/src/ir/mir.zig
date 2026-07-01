@@ -260,6 +260,16 @@ pub const Op = union(enum) {
     /// `env.kv_increment` import with (key ptr, key len, delta) and yield its
     /// i64 result. `key` is a str inst; null for the keyless (empty-key) form.
     kv_increment: struct { key: ?*Inst, delta: *Inst },
+    /// `env.kv.set(key, value)` (spec/env.md §`env.kv`): lazily `store.open` the
+    /// identity-pinned bucket, call `[method]bucket.set` with (bucket, key ptr,
+    /// key len, value ptr, value len, ret) and decode `result<_, error>` into a
+    /// boxed `Result<(), IoError>` (`.ptr`). `key`/`value` are str insts.
+    kv_set: struct { key: *Inst, value: *Inst },
+    /// `env.kv.get(key)` (spec/env.md §`env.kv`): lazily `store.open` the bucket,
+    /// call `[method]bucket.get` with (bucket, key ptr, key len, ret) and decode
+    /// `result<option<list<u8>>, error>` into a boxed `Result<Option<Bytes>,
+    /// IoError>` (`.ptr`). `key` is a str inst.
+    kv_get: struct { key: *Inst },
     /// `chan_recv(session)` — receive the next inbound channel message (the
     /// `env.channel_recv` host import). Operand is the session handle (i64);
     /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.

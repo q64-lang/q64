@@ -2445,7 +2445,17 @@ fn declareMatchScrutinee(b: *Builder, scope: *Scope, scrut: ast.Expr, boxed: boo
 /// from literal sub-patterns (`Move(0, y)` — slot 0 must equal 0). The
 /// condition is ANDed onto the tag test like a guard, so a conditional
 /// payload arm never satisfies exhaustiveness on its own.
-const ArmPattern = struct { tag: i64, prelude: []const *hir.Stmt, cond: ?*hir.Expr = null };
+const ArmPattern = struct {
+    tag: i64,
+    prelude: []const *hir.Stmt,
+    cond: ?*hir.Expr = null,
+    /// For a nested arm (`Ok(Some(v))` / `Ok(None)`): the inner variant's tag
+    /// and the inner enum's variant count. The outer tag `tag` alone can't mark
+    /// coverage (two arms share it), so exhaustiveness tracks the inner tags and
+    /// counts the outer variant covered once every inner variant is matched.
+    nested_tag: ?i64 = null,
+    nested_variants: u32 = 0,
+};
 
 /// AND two optional conditions, collapsing the `null`s (an absent condition
 /// is "always true"). Returns `null` only when both are absent.
@@ -2559,6 +2569,8 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
             const arity = info.variants[tag].arity;
             var prelude: std.ArrayList(*hir.Stmt) = .empty;
             var cond: ?*hir.Expr = null;
+            var nested_tag: ?i64 = null;
+            var nested_variants: u32 = 0;
             var n: u32 = 0;
             for (pat.cst.children) |c| switch (c) {
                 .node => |sub| {
@@ -2566,6 +2578,16 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
                     if (n == arity) return error.Unsupported; // too many sub-patterns
                     switch (sp.kind()) {
                         .WILD_PATTERN => {},
+                        .TUPLE_PATTERN => {
+                            // `Ok(())` — a unit `()` sub-pattern matches the
+                            // variant and binds nothing (the payload is unit /
+                            // ignored). A non-empty tuple `(a, b)` isn't a v0
+                            // floor pattern.
+                            for (sp.cst.children) |gc| switch (gc) {
+                                .node => |gn| if (ast.Pattern.cast(gn) != null) return error.Unsupported,
+                                .token => {},
+                            };
+                        },
                         .IDENT_PATTERN => {
                             const snm = sp.bindingName() orelse return error.Unsupported;
                             const idx = try declareBodyLocal(b, scope, snm.text, false, .i64);
@@ -2594,14 +2616,59 @@ fn resolveArmPattern(b: *Builder, info: *const EnumInfo, pat: ast.Pattern, scope
                             eq.* = .{ .bin = .{ .kind = .eq, .lhs = ld, .rhs = lv } };
                             cond = try andOpt(b, cond, eq);
                         },
-                        else => return error.Unsupported, // nested enum/record sub-patterns: later
+                        .TUPLE_STRUCT_PATTERN, .ENUM_VARIANT_PATTERN => {
+                            // A nested boxed-enum sub-pattern (`Ok(Some(v))` /
+                            // `Ok(None)` on `env.kv.get`'s Result<Option<Bytes>,
+                            // …>). The slot cell holds a pointer to the inner
+                            // box; recurse against the variant's `nested` enum.
+                            const nested = info.variants[tag].nested orelse return error.Unsupported;
+                            const off: u32 = 8 * (n + 1);
+                            // inner_idx = (ptr) field_get(s_idx, off) — the inner
+                            // box base, bound BEFORE the recursive binds use it.
+                            const inner_idx = try declareBodyLocal(b, scope, try std.fmt.allocPrint(b.a, "#nest{d}_{d}", .{ s_idx, n }), false, .ptr);
+                            {
+                                const base = try b.a.create(hir.Expr);
+                                base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+                                const ld = try b.a.create(hir.Expr);
+                                ld.* = .{ .field_get = .{ .base = base, .offset = off, .ty = .i64 } };
+                                const cast = try b.a.create(hir.Expr);
+                                cast.* = .{ .num_cast = .{ .to = .ptr, .value = ld } };
+                                const st = try b.a.create(hir.Stmt);
+                                st.* = .{ .let = .{ .idx = inner_idx, .value = cast } };
+                                try prelude.append(b.a, st);
+                            }
+                            const inner_ap = (try resolveArmPattern(b, nested, sp, scope, inner_idx)) orelse return error.Unsupported;
+                            if (inner_ap.cond != null) return error.Unsupported; // nested literal guards: later
+                            // Inner tag check. The arm guard runs BEFORE the
+                            // prelude binds, so load the inner base inline here
+                            // (not via `inner_idx`, which isn't set yet).
+                            {
+                                const base = try b.a.create(hir.Expr);
+                                base.* = .{ .local = .{ .idx = s_idx, .ty = .ptr } };
+                                const ld = try b.a.create(hir.Expr);
+                                ld.* = .{ .field_get = .{ .base = base, .offset = off, .ty = .i64 } };
+                                const cast = try b.a.create(hir.Expr);
+                                cast.* = .{ .num_cast = .{ .to = .ptr, .value = ld } };
+                                const tagld = try b.a.create(hir.Expr);
+                                tagld.* = .{ .field_get = .{ .base = cast, .offset = 0, .ty = .i64 } };
+                                const tagv = try b.a.create(hir.Expr);
+                                tagv.* = .{ .int_const = inner_ap.tag };
+                                const eq = try b.a.create(hir.Expr);
+                                eq.* = .{ .bin = .{ .kind = .eq, .lhs = tagld, .rhs = tagv } };
+                                cond = try andOpt(b, cond, eq);
+                            }
+                            for (inner_ap.prelude) |st| try prelude.append(b.a, st);
+                            nested_tag = inner_ap.tag;
+                            nested_variants = @intCast(nested.variants.len);
+                        },
+                        else => return error.Unsupported, // record sub-patterns: later
                     }
                     n += 1;
                 },
                 .token => {},
             };
             if (n != arity) return error.Unsupported; // too few sub-patterns
-            return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a), .cond = cond };
+            return .{ .tag = @intCast(tag), .prelude = try prelude.toOwnedSlice(b.a), .cond = cond, .nested_tag = nested_tag, .nested_variants = nested_variants };
         },
         else => return error.Unsupported, // literal patterns: later
     }
@@ -2786,6 +2853,7 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
     defer arms.deinit(b.a);
     var default: ?*hir.Stmt = null;
     var seen: u64 = 0;
+    var nested_seen = [_]u64{0} ** 64; // per outer tag: bitmask of inner tags covered
     var it = me.arms();
     while (it.next()) |arm| {
         const pat = arm.pattern() orelse return error.Unsupported;
@@ -2879,7 +2947,14 @@ fn buildMatchInto(b: *Builder, me: ast.MatchExpr, scope: *Scope, out: *std.Array
         try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = combined });
         // Coverage only counts for enums (a literal can be any i64); a
         // guarded arm may fail, so it never contributes to exhaustiveness.
-        if (info_opt != null and combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        // A nested arm (`Ok(Some)` / `Ok(None)`) carries an inner-tag guard, so
+        // it covers the outer variant only once every inner variant is matched.
+        if (info_opt != null) {
+            if (ap.nested_tag) |itag| {
+                nested_seen[@intCast(ap.tag)] |= @as(u64, 1) << @intCast(itag);
+                if (@popCount(nested_seen[@intCast(ap.tag)]) >= ap.nested_variants) seen |= @as(u64, 1) << @intCast(ap.tag);
+            } else if (combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        }
     }
     // Structural exhaustiveness, like the statement form.
     if (default == null) {
@@ -5029,7 +5104,18 @@ const PayKind = enum {
     /// the stored record (the B2b whole-value boundary).
     rec,
 };
-const EnumVariant = struct { name: []const u8, arity: u32, kind: PayKind = .ints, pidx: u8 = 0, rec_si: ?*const StructInfo = null };
+const EnumVariant = struct {
+    name: []const u8,
+    arity: u32,
+    kind: PayKind = .ints,
+    pidx: u8 = 0,
+    rec_si: ?*const StructInfo = null,
+    /// A single-slot payload that is itself a boxed enum (`Ok(Option<Bytes>)` on
+    /// `env.kv.get`'s `Result<Option<Bytes>, IoError>`): the cell holds a pointer
+    /// to the inner box, so `match … { Ok(Some(v)) -> … }` recurses through it
+    /// (`resolveArmPattern`). `null` for the non-nested variants.
+    nested: ?*const EnumInfo = null,
+};
 
 /// A registered enum: variant names in declaration order (a variant's
 /// tag is its index). All-unit enums are *immediate* — a value is its
@@ -5281,6 +5367,27 @@ fn instantiateEnum(b: *Builder, info: *const EnumInfo, descs: []const []const u8
     return inst;
 }
 
+/// The `Result<Option<Bytes>, IoError>` enum that `env.kv.get` yields
+/// (spec/env.md §`env.kv`). Same 2-cell Result box shape as any `Result`, but
+/// the `Ok` slot is a **nested** boxed `Option<Bytes>` (its cell holds a pointer
+/// to the inner Option box), so `match … { Ok(Some(v)) -> …, Ok(None) -> … }`
+/// recurses through it. Cached so its type identity is stable.
+fn kvGetResultEnum(b: *Builder) BuildError!?*const EnumInfo {
+    if (b.enum_insts.get("Result\x00kvget")) |inst| return inst;
+    const opt_base = b.enums.get("Option") orelse return null;
+    if (opt_base.si == null) return null;
+    const opt_bytes = try instantiateEnum(b, opt_base, &.{ "s", "i", "i", "i" }); // Option<Bytes>
+    const res_base = b.enums.get("Result") orelse return null;
+    const res_si = res_base.si orelse return null;
+    const vars = try b.a.alloc(EnumVariant, 2);
+    vars[0] = .{ .name = "Ok", .arity = 1, .kind = .ints, .pidx = 0, .nested = opt_bytes };
+    vars[1] = .{ .name = "Err", .arity = 1, .kind = .ints, .pidx = 1 };
+    const info = try b.a.create(EnumInfo);
+    info.* = .{ .name = "Result", .variants = vars, .si = res_si };
+    try b.enum_insts.put(b.a, "Result\x00kvget", info);
+    return info;
+}
+
 /// Flatten a variant's non-trivia tokens (past the name) into `buf`.
 /// `top` skips the leading variant-name token (an IDENT, or `KW_NONE`
 /// — the prelude `Option.None`); a `{` (record payload) or overflow
@@ -5407,6 +5514,15 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             if (std.mem.eql(u8, txt, "env.kv.increment")) {
                 // Result<i64, i64> — both payloads i64, so the default Result.
                 return b.enums.get("Result");
+            }
+            if (std.mem.eql(u8, txt, "env.kv.set")) {
+                // Result<(), IoError> — the unit-Ok / error-code Err box rides
+                // the default Result shape (spec/env.md §`env.kv`).
+                return b.enums.get("Result");
+            }
+            if (std.mem.eql(u8, txt, "env.kv.get")) {
+                // Result<Option<Bytes>, IoError> — the nested-Ok box shape.
+                return try kvGetResultEnum(b);
             }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (resolveFn(b, txt)) |fd| return enumOfRet(b, fd);
@@ -6904,6 +7020,41 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                     }
                     var pvals = [_]*hir.Expr{kvnode};
                     return .{ .e = try enumAlloc(b, esi, ok.tag, &pvals), .si = esi };
+                }
+                // `env.kv.set(key, value)` yields a boxed `Result<(), IoError>`
+                // (spec/env.md §`env.kv`, `wasi:keyvalue/store.bucket.set`). The
+                // `kv_set` node decodes the host's `result<_, error>` and writes
+                // the box itself (like `fs_read`): tag 0 = `Ok(())`, tag 1 = an
+                // `Err` carrying the store error code. `match … { Ok(()) -> …,
+                // Err(_) -> … }` reads it like any boxed enum.
+                if (std.mem.eql(u8, fsname, "env.kv.set")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    const a1 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const res = b.enums.get("Result") orelse return error.Unsupported;
+                    const esi = res.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .kv_set = .{
+                        .key = try buildStrExpr(b, a0, scope, null),
+                        .value = try buildStrExpr(b, a1, scope, null),
+                    } };
+                    return .{ .e = node, .si = esi };
+                }
+                // `env.kv.get(key)` yields a boxed `Result<Option<Bytes>,
+                // IoError>` (spec/env.md §`env.kv`, `wasi:keyvalue/store.bucket.get`).
+                // The `kv_get` node decodes the host's `result<option<list<u8>>,
+                // error>` into the nested box; `match … { Ok(Some(v)) -> …,
+                // Ok(None) -> …, Err(_) -> … }` reads it (nested matching).
+                if (std.mem.eql(u8, fsname, "env.kv.get")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const info = (try kvGetResultEnum(b)) orelse return error.Unsupported;
+                    const esi = info.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .kv_get = .{ .key = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
                 }
             }
             // C3: a payload-variant construction (`Shape.Circle(7)`):
@@ -8948,6 +9099,7 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
     defer arms.deinit(b.a);
     var default: ?*hir.Stmt = null;
     var seen: u64 = 0;
+    var nested_seen = [_]u64{0} ** 64; // per outer tag: bitmask of inner tags covered
     var vty: ?hir.Type = null;
     var it = ms.arms();
     while (it.next()) |arm| {
@@ -9047,7 +9199,14 @@ fn buildIntMatch(b: *Builder, ms: ast.MatchStmt, scope: *Scope) BuildError!*hir.
         // A literal sub-pattern condition (`Move(0, y)`) ANDs onto the guard.
         const combined = try andOpt(b, ap.cond, guard);
         try arms.append(b.a, .{ .tag = ap.tag, .body = try prependPrelude(b, ap.prelude, body), .guard = combined });
-        if (info_opt != null and combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        // Nested arms (`Ok(Some)` / `Ok(None)`) carry an inner-tag guard; the
+        // outer variant is covered only once every inner variant is matched.
+        if (info_opt != null) {
+            if (ap.nested_tag) |itag| {
+                nested_seen[@intCast(ap.tag)] |= @as(u64, 1) << @intCast(itag);
+                if (@popCount(nested_seen[@intCast(ap.tag)]) >= ap.nested_variants) seen |= @as(u64, 1) << @intCast(ap.tag);
+            } else if (combined == null) seen |= @as(u64, 1) << @intCast(ap.tag);
+        }
     }
     if (default == null) {
         const info = info_opt orelse return error.Unsupported;
@@ -12693,10 +12852,9 @@ test "arrays: literals, for-in desugar, trapping index, len, record elements" {
     try testing.expect(std.mem.indexOf(u8, dump, "fn Color.fmt -> str") != null);
 }
 
-test "arrays: mixed element types are Unsupported; empty literal too" {
+test "arrays: mixed element types are Unsupported" {
     const cases = [_][]const u8{
         "fn main {\n    let xs = [1, 2.5]\n    env.out(xs.len)\n}\n",
-        "fn main {\n    let xs = []\n    env.out(xs.len)\n}\n",
     };
     for (cases) |src| {
         var tr = TestResolver{ .a = testing.allocator };
@@ -12704,6 +12862,18 @@ test "arrays: mixed element types are Unsupported; empty literal too" {
         try tr.addLib(src);
         try testing.expect((try buildFromSource(testing.allocator, src, tr.resolver())) == null);
     }
+}
+
+test "arrays: the empty literal `[]` builds (a zero-length array)" {
+    // `[]` lowers to a zero-length array_lit (df4fcb0) — the seed for
+    // `push`/growth and the shape API-Classic / twin-counter examples rely on.
+    const src = "fn main {\n    let xs = []\n    env.out(xs.len)\n}\n";
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib(src);
+    var mod = (try buildFromSource(testing.allocator, src, tr.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
 }
 
 test "B5: the golden triangle — print_all<T: Display> stamps and runs" {
@@ -14269,6 +14439,63 @@ test "env.kv.increment: a Result<i64, i64> @kv capability face" {
     try testing.expect(std.mem.indexOf(u8, dump, "kv_increment") != null);
     // The effect pass marks main @kv (closed over @io).
     try testing.expect(std.mem.indexOf(u8, dump, "@kv") != null);
+}
+
+test "env.kv.set: a Result<(), IoError> @kv face; Ok(()) matches the unit ok" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    match env.kv.set("name", "ada") {
+        \\        Ok(()) -> env.out("saved"),
+        \\        Err(_) -> env.out("err"),
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "kv_set") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "name") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@kv") != null);
+}
+
+test "env.kv.get: a Result<Option<Bytes>, IoError> @kv face; nested Ok(Some(v)) / Ok(None)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn read(k: str) -> i64 {
+        \\    match env.kv.get(k) {
+        \\        Ok(Some(v)) -> v.len,
+        \\        Ok(None) -> 0,
+        \\        Err(_) -> 0 - 1,
+        \\    }
+        \\}
+        \\fn main { env.out(read("name")) }
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "kv_get") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@kv") != null);
+}
+
+test "env.kv.get: `Ok(Some)` without `Ok(None)` is non-exhaustive (Unsupported)" {
+    // The nested-coverage rule: both inner variants of the Ok slot must be
+    // matched (or a `_`) — matching only `Some` leaves the `None` case open.
+    const src =
+        "fn read(k: str) -> i64 {\n" ++
+        "    match env.kv.get(k) {\n" ++
+        "        Ok(Some(v)) -> v.len,\n" ++
+        "        Err(_) -> 0,\n" ++
+        "    }\n" ++
+        "}\n";
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib(src);
+    try testing.expect((try buildFromSource(testing.allocator, src, tr.resolver())) == null);
 }
 
 test "str enum payloads: Result<str, i64>, Msg.Text(str), Option<str>, try" {

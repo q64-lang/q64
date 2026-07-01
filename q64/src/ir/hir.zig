@@ -420,6 +420,20 @@ pub const Expr = union(enum) {
     /// `str`; the keyless `env.kv.increment(delta)` form leaves `key` null (the
     /// host uses the empty key — a single shared counter). Marks the fn `@kv`.
     kv_increment: struct { key: ?*Expr, delta: *Expr },
+    /// `env.kv.set(key, value)` — store `value` (a `Bytes`/`str`, ptr+len) at
+    /// `key` in the project's key-value store, overwriting any existing value
+    /// (spec/env.md §`env.kv`, `wasi:keyvalue/store.bucket.set`). Both operands
+    /// are `str`-shaped `(ptr, len)` pairs. Lowers to a lazy `store.open` +
+    /// `[method]bucket.set` and yields a boxed `Result<(), IoError>` (`Ok(())`
+    /// on success, `Err` carrying the store error code). Marks the fn `@kv`.
+    kv_set: struct { key: *Expr, value: *Expr },
+    /// `env.kv.get(key)` — read the value stored at `key` in the project's
+    /// key-value store (spec/env.md §`env.kv`, `wasi:keyvalue/store.bucket.get`).
+    /// `key` is a `str` `(ptr, len)`. Lowers to a lazy `store.open` +
+    /// `[method]bucket.get` and yields a boxed `Result<Option<Bytes>, IoError>`
+    /// (`Ok(Some(v))` when present, `Ok(None)` when absent, `Err` on a store
+    /// error). Marks the fn `@kv`.
+    kv_get: struct { key: *Expr },
     /// `chan_recv(session)` — receive the next inbound message on a remote
     /// channel session (`@channel_handler`'s `for _ in session`). Lowers to the
     /// `env.channel_recv` host import: returns 1 when a message arrived (run the

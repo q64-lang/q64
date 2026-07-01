@@ -396,6 +396,13 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             .key = if (kv.key) |k| try lowerStrExpr(ctx, k) else null,
             .delta = try lowerExpr(ctx, kv.delta),
         } }),
+        // set/get yield a boxed Result value (a `.ptr` to the arena box), like
+        // fs_read — the whole result is decoded and boxed by the codegen.
+        .kv_set => |kv| return mk(ctx.a, .ptr, .{ .kv_set = .{
+            .key = try lowerStrExpr(ctx, kv.key),
+            .value = try lowerStrExpr(ctx, kv.value),
+        } }),
+        .kv_get => |kv| return mk(ctx.a, .ptr, .{ .kv_get = .{ .key = try lowerStrExpr(ctx, kv.key) } }),
         .chan_recv => |h| return mk(ctx.a, .i64, .{ .chan_recv = try lowerExpr(ctx, h) }),
         .chan_take => |h| return mk(ctx.a, .i64, .{ .chan_take = try lowerExpr(ctx, h) }),
         .chan_open => |name| return mk(ctx.a, .i64, .{ .chan_open = name }),

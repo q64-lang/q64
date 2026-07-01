@@ -191,6 +191,18 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, kv.delta);
             try app(gpa, out, ")", .{});
         },
+        .kv_set => |kv| {
+            try app(gpa, out, "kv_set(", .{});
+            try hirExpr(gpa, out, kv.key);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, kv.value);
+            try app(gpa, out, ")", .{});
+        },
+        .kv_get => |kv| {
+            try app(gpa, out, "kv_get(", .{});
+            try hirExpr(gpa, out, kv.key);
+            try app(gpa, out, ")", .{});
+        },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv(", .{});
             try hirExpr(gpa, out, h);
@@ -432,6 +444,15 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "kv_increment\n", .{});
             if (kv.key) |k| try mirInst(gpa, out, k, depth + 1);
             try mirInst(gpa, out, kv.delta, depth + 1);
+        },
+        .kv_set => |kv| {
+            try app(gpa, out, "kv_set\n", .{});
+            try mirInst(gpa, out, kv.key, depth + 1);
+            try mirInst(gpa, out, kv.value, depth + 1);
+        },
+        .kv_get => |kv| {
+            try app(gpa, out, "kv_get\n", .{});
+            try mirInst(gpa, out, kv.key, depth + 1);
         },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv\n", .{});

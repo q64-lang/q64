@@ -212,6 +212,15 @@ fn collectExpr(
             if (kv.key) |k| try collectExpr(a, k, d, e);
             try collectExpr(a, kv.delta, d, e);
         },
+        .kv_set => |kv| {
+            d.insert(.kv);
+            try collectExpr(a, kv.key, d, e);
+            try collectExpr(a, kv.value, d, e);
+        },
+        .kv_get => |kv| {
+            d.insert(.kv);
+            try collectExpr(a, kv.key, d, e);
+        },
         .chan_recv => |h| {
             d.insert(.wire); // a remote channel receive crosses the wire
             try collectExpr(a, h, d, e);
