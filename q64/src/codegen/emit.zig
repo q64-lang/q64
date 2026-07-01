@@ -275,7 +275,13 @@ pub const ComponentArtifact = union(enum) {
     /// dep + this world and runs `wasm-tools component embed`+`new` to lift it.
     /// Both slices owned by the caller. (spec/env.md §`env.kv`; the design of
     /// record is `test/kv-component-reference/`.)
-    kv_component: struct { core: []u8, world: []u8 },
+    ///
+    /// Covers every storage capability that lowers to a host-opened,
+    /// identity-pinned bucket over the canonical `cm32p2|…` ABI: `env.kv`
+    /// (`wasi:keyvalue/{store,atomics}`) and `env.blob` (`q64:blob/store`). The
+    /// world imports whichever interfaces the qube uses; the CLI embeds the
+    /// matching vendored dep(s) and runs `wasm-tools component embed`+`new`.
+    store_component: struct { core: []u8, world: []u8 },
 };
 
 /// The vendored `wasi:keyvalue@0.2.0-draft2` WIT (store + atomics) — the dep
@@ -283,10 +289,18 @@ pub const ComponentArtifact = union(enum) {
 /// (`src/codegen/wit/README.md`); embedded so emit needs no external file.
 pub const wasi_keyvalue_wit = @embedFile("wit/wasi-keyvalue.wit");
 
+/// The vendored `q64:blob/store@0.2.0-draft2` WIT — the q64-owned object-store
+/// dep `env.blob` lowers to (spec/env.md §`env.blob`; see the file header for
+/// why it is not raw wasi:blobstore).
+pub const q64_blob_wit = @embedFile("wit/q64-blob.wit");
+
 /// The component-model interface ids `env.kv` lowers to (with the version pin).
 /// Core imports use the `cm32p2|<id>` form; the world imports the bare ids.
 pub const kv_store_iface = "wasi:keyvalue/store@0.2.0-draft2";
 pub const kv_atomics_iface = "wasi:keyvalue/atomics@0.2.0-draft2";
+/// The interface id `env.blob` lowers to (q64-owned; version pin mirrors kv —
+/// wit-component's world-item resolution rejects a plain `0.1.0` here).
+pub const blob_store_iface = "q64:blob/store@0.2.0-draft2";
 
 /// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
 /// qube as a component"). A library lifts the import-free, scalar-signature
@@ -393,12 +407,12 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     // `wasi:keyvalue` import ABI (cm32p2 imports, adapter-held bucket) and hand
     // back the synthesized world for the CLI to embed + lift. The canonical ABI
     // is 32-bit (cm32p2); a wasm64 qube isn't lowerable here.
-    if (usesEnvKv(&mmod)) {
+    if (usesEnvKv(&mmod) or usesEnvBlob(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
         const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null, true);
         errdefer allocator.free(core);
-        const world = try synthKvWorld(allocator, &hmod);
-        return .{ .kv_component = .{ .core = core, .world = world } };
+        const world = try synthStoreWorld(allocator, &hmod, usesEnvKv(&mmod), usesEnvBlob(&mmod));
+        return .{ .store_component = .{ .core = core, .world = world } };
     }
 
     // Interface-export library: emit the core with `<iface>#<fn>` export names
@@ -895,10 +909,18 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // handle:i32}` at `kv_open_ret`, increment's `{disc, s64@8}` at
     // `kv_inc_ret`, 8-aligned so the host's i64 store lands clean). See
     // `test/kv-component-reference/`.
+    // Storage capabilities (`env.kv`, `env.blob`) share this component ABI: a
+    // host-opened bucket + a fixed return area. `env.blob` reuses kv's return
+    // areas (kv_open_ret/kv_inc_ret) and scratch locals — only one store op is
+    // ever in flight in a single expression — so the only per-capability state
+    // is a separate bucket handle global. `wants_store` gates the shared
+    // component scaffolding (cm32p2 memory/realloc, the reserved return area).
     const wants_kv = kv_component and usesEnvKv(m);
+    const wants_blob = kv_component and usesEnvBlob(m);
+    const wants_store = wants_kv or wants_blob;
     const kv_open_ret: u32 = @intCast((m.data.len + 7) & ~@as(usize, 7));
     const kv_inc_ret: u32 = kv_open_ret + 8;
-    const kv_scratch: usize = if (wants_kv) (kv_inc_ret + 16) - @as(u32, @intCast(m.data.len)) else 0;
+    const kv_scratch: usize = if (wants_store) (kv_inc_ret + 16) - @as(u32, @intCast(m.data.len)) else 0;
     if (wants_out) {
         switch (stdout_abi) {
             .env_out => {
@@ -967,11 +989,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // serves host-side allocations (e.g. an error variant's `other(string)`) from
     // page 1 up, so reserve room above the page-0 data/scratch/arena. fs.read and
     // env.args let the host grow guest memory, so they also need headroom.
-    const mem_min: c.BinaryenIndex = if (wants_kv) 2 else 1;
-    const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_kv) 64 else if (any_fs or any_args) 256 else 1;
+    const mem_min: c.BinaryenIndex = if (wants_store) 2 else 1;
+    const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_store) 64 else if (any_fs or any_args) 256 else 1;
     // The component model requires the canonical memory export to be named
     // `cm32p2_memory`; the raw paths keep the plain `memory`.
-    const mem_export_name = if (wants_kv) "cm32p2_memory" else "memory";
+    const mem_export_name = if (wants_store) "cm32p2_memory" else "memory";
 
     // One active data segment at offset 0 holds the whole memory image.
     if (m.data.len == 0) {
@@ -1040,7 +1062,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (sc.has_kv) needs_kv = true;
         // set/get box their `result<…>` into the scope arena (like fs_read),
         // so the qube needs the `sp` bump pointer even if nothing else uses it.
-        if (sc.has_kv_set or sc.has_kv_get) needs_arena = true;
+        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete) needs_arena = true;
         if (sc.has_chan) needs_chan = true;
         if (sc.has_take) needs_take = true;
         if (sc.has_connect) needs_connect = true;
@@ -1127,6 +1149,37 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             c.BinaryenAddFunctionImport(module, "kv_bucket_get", store_mod, "[method]bucket.get", get_params, none_type);
         }
         _ = c.BinaryenAddGlobal(module, "kv_bucket", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
+    }
+    if (wants_blob) {
+        // `env.blob` → the q64-owned `q64:blob/store` core imports (cm32p2),
+        // same shapes as kv's store bucket methods (probed identical mangling):
+        //   open(identifier_ptr, identifier_len, ret)            -> result<bucket,error>
+        //   [method]bucket.get(bucket, key_ptr, key_len, ret)    -> result<option<list<u8>>,error>
+        //   [method]bucket.put(bucket, key_ptr, key_len, val_ptr, val_len, ret) -> result<_,error>
+        //   [method]bucket.delete(bucket, key_ptr, key_len, ret) -> result<_,error>
+        // The bucket is host-opened + identity-pinned, cached in `blob_bucket`.
+        const blob_mod = "cm32p2|" ++ blob_store_iface;
+        var op = [_]c.BinaryenType{ i32_type, i32_type, i32_type };
+        const open_params = c.BinaryenTypeCreate(&op, op.len);
+        c.BinaryenAddFunctionImport(module, "blob_store_open", blob_mod, "open", open_params, none_type);
+        if (usesBlobGet(m)) {
+            var gp = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type };
+            const get_params = c.BinaryenTypeCreate(&gp, gp.len);
+            c.BinaryenAddFunctionImport(module, "blob_bucket_get", blob_mod, "[method]bucket.get", get_params, none_type);
+        }
+        if (usesBlobPut(m)) {
+            var pp = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type, i32_type, i32_type };
+            const put_params = c.BinaryenTypeCreate(&pp, pp.len);
+            c.BinaryenAddFunctionImport(module, "blob_bucket_put", blob_mod, "[method]bucket.put", put_params, none_type);
+        }
+        if (usesBlobDelete(m)) {
+            var dp = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type };
+            const del_params = c.BinaryenTypeCreate(&dp, dp.len);
+            c.BinaryenAddFunctionImport(module, "blob_bucket_delete", blob_mod, "[method]bucket.delete", del_params, none_type);
+        }
+        _ = c.BinaryenAddGlobal(module, "blob_bucket", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
+    }
+    if (wants_store) {
         // The canonical `cabi_realloc` bump allocator, exported as
         // `cm32p2_realloc`. Allocations start at page 1 (65536), above page-0
         // data/scratch/arena; `component new` requires the export to exist.
@@ -1315,6 +1368,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .stdout_abi = stdout_abi,
             .iovec_base = iovec_base,
             .kv_component = wants_kv,
+            .blob_component = wants_blob,
             .kv_open_ret = kv_open_ret,
             .kv_inc_ret = kv_inc_ret,
             .kv_hdr_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0),
@@ -1329,7 +1383,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const n_fs: u32 = if (sc.has_fs or sc.has_envvar) 2 else 0;
         // kv set/get need three address-width scratch locals (box header ptr +
         // saved key ptr/len); allocated after the fs/envvar scratch group.
-        const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get) 3 else 0;
+        const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete) 3 else 0;
         const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs + n_kv;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
@@ -1360,7 +1414,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             vts[g] = ptr_type; // fs/envvar dest
             vts[g + 1] = i64_type; // fs/envvar len
         }
-        if (sc.has_kv_set or sc.has_kv_get) {
+        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete) {
             const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
             vts[g] = ptr_type; // kv box header ptr
             vts[g + 1] = ptr_type; // kv saved key ptr
@@ -1565,6 +1619,9 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .kv_increment => |kv| bodyHasOut(kv.delta, want_int) or (kv.key != null and bodyHasOut(kv.key.?, want_int)),
         .kv_set => |kv| bodyHasOut(kv.key, want_int) or bodyHasOut(kv.value, want_int),
         .kv_get => |kv| bodyHasOut(kv.key, want_int),
+        .blob_put => |bl| bodyHasOut(bl.key, want_int) or bodyHasOut(bl.value, want_int),
+        .blob_get => |bl| bodyHasOut(bl.key, want_int),
+        .blob_delete => |bl| bodyHasOut(bl.key, want_int),
         .chan_recv => |h| bodyHasOut(h, want_int),
         .chan_take => |h| bodyHasOut(h, want_int),
         .chan_open => false,
@@ -1648,17 +1705,76 @@ fn usesKvGet(m: *const ir.mir.Module) bool {
     return false;
 }
 
+/// True if any function reaches `env.blob` (any blob op) — gates the whole
+/// `q64:blob/store` import block + the component (store) path.
+fn usesEnvBlob(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete) return true;
+    }
+    return false;
+}
+
+/// Per-op blob predicates — each gates its own `[method]bucket.*` import so a
+/// qube declares exactly the object-store methods it reaches.
+fn usesBlobPut(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_blob_put) return true;
+    }
+    return false;
+}
+fn usesBlobGet(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_blob_get) return true;
+    }
+    return false;
+}
+fn usesBlobDelete(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_blob_delete) return true;
+    }
+    return false;
+}
+
 /// Synthesize the WIT world for a kv qube: it imports `wasi:keyvalue/store` +
 /// `wasi:keyvalue/atomics` (the `env.kv` lowering) and exports each scalar `pub`
 /// function. Named `qube` (the fixed world name the CLI passes to `component
 /// embed --world`). Caller owns the slice.
-fn synthKvWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module) ![]u8 {
+fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use_kv: bool, use_blob: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "// synthesized WIT world (q64 env.kv → wasi:keyvalue)\n");
+    try out.appendSlice(allocator, "// synthesized WIT world (q64 storage capabilities → host interfaces)\n");
     try out.appendSlice(allocator, "package q64:qube;\n\nworld qube {\n");
-    try out.print(allocator, "  import {s};\n", .{kv_store_iface});
-    try out.print(allocator, "  import {s};\n", .{kv_atomics_iface});
+    if (use_kv) {
+        try out.print(allocator, "  import {s};\n", .{kv_store_iface});
+        try out.print(allocator, "  import {s};\n", .{kv_atomics_iface});
+    }
+    if (use_blob) {
+        try out.print(allocator, "  import {s};\n", .{blob_store_iface});
+    }
     for (hmod.funcs) |f| {
         if (f.visibility != .public) continue;
         var scalar = true;
@@ -1808,6 +1924,11 @@ const Scratch = struct {
     has_kv_set: bool = false,
     /// Contains an `env.kv.get` → declare the `[method]bucket.get` store import.
     has_kv_get: bool = false,
+    /// Contains an `env.blob.{put,get,delete}` → declare the matching
+    /// `q64:blob/store` bucket method import (only when reached).
+    has_blob_put: bool = false,
+    has_blob_get: bool = false,
+    has_blob_delete: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
     has_chan: bool = false,
     /// Contains a `chan_take` → declare the `env.channel_take` import.
@@ -1842,6 +1963,9 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_kv = s.has_kv or sub.has_kv;
     s.has_kv_set = s.has_kv_set or sub.has_kv_set;
     s.has_kv_get = s.has_kv_get or sub.has_kv_get;
+    s.has_blob_put = s.has_blob_put or sub.has_blob_put;
+    s.has_blob_get = s.has_blob_get or sub.has_blob_get;
+    s.has_blob_delete = s.has_blob_delete or sub.has_blob_delete;
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
     s.has_connect = s.has_connect or sub.has_connect;
@@ -2037,6 +2161,22 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.host_out = true; // key rides the pair scratch (ptr,len)
             scanScratch(kv.key, s);
         },
+        .blob_put => |bl| {
+            s.has_blob_put = true;
+            s.host_out = true; // key + value ride the pair scratch (ptr,len)
+            scanScratch(bl.key, s);
+            scanScratch(bl.value, s);
+        },
+        .blob_get => |bl| {
+            s.has_blob_get = true;
+            s.host_out = true;
+            scanScratch(bl.key, s);
+        },
+        .blob_delete => |bl| {
+            s.has_blob_delete = true;
+            s.host_out = true;
+            scanScratch(bl.key, s);
+        },
         .chan_recv => |h| {
             s.has_chan = true;
             scanScratch(h, s);
@@ -2214,6 +2354,12 @@ const Lowerer = struct {
     /// of the raw `env_kv_increment` host face. The two return areas the host
     /// writes results into are at `kv_open_ret` / `kv_inc_ret`.
     kv_component: bool = false,
+    /// blob (object-store) component lowering: `env.blob` lowers to the q64-owned
+    /// `q64:blob/store` imports (lazy `open` into `blob_bucket`, bucket methods).
+    /// Reuses kv's return areas (`kv_open_ret`/`kv_inc_ret`) and scratch locals —
+    /// only one store op is live per expression — so only the bucket handle
+    /// global differs.
+    blob_component: bool = false,
     kv_open_ret: u32 = 0,
     kv_inc_ret: u32 = 0,
     /// kv set/get scratch locals: `kv_hdr_idx` holds the boxed-Result header
@@ -2531,11 +2677,23 @@ const Lowerer = struct {
                 // the local `qube run` host face has no set/get. Trap if reached
                 // without --component (the CLI only lowers set/get for wants_kv).
                 if (!self.kv_component) return c.BinaryenUnreachable(module);
-                return try self.kvComponentSet(kv);
+                return try self.storeComponentSet(kv.key, kv.value, "kv_bucket_set", "kv_bucket", "kv_store_open");
             },
             .kv_get => |kv| {
                 if (!self.kv_component) return c.BinaryenUnreachable(module);
-                return try self.kvComponentGet(kv);
+                return try self.storeComponentGet(kv.key, "kv_bucket_get", "kv_bucket", "kv_store_open");
+            },
+            .blob_put => |bl| {
+                if (!self.blob_component) return c.BinaryenUnreachable(module);
+                return try self.storeComponentSet(bl.key, bl.value, "blob_bucket_put", "blob_bucket", "blob_store_open");
+            },
+            .blob_get => |bl| {
+                if (!self.blob_component) return c.BinaryenUnreachable(module);
+                return try self.storeComponentGet(bl.key, "blob_bucket_get", "blob_bucket", "blob_store_open");
+            },
+            .blob_delete => |bl| {
+                if (!self.blob_component) return c.BinaryenUnreachable(module);
+                return try self.storeComponentDelete(bl.key, "blob_bucket_delete", "blob_bucket", "blob_store_open");
             },
             .chan_recv => |h| {
                 // got = env.channel_recv(session) — 1 (message) or 0 (closed).
@@ -2779,7 +2937,7 @@ const Lowerer = struct {
         // The keyed form sequences the pair eval before the call reads its extracts.
         var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
         defer pre.deinit(self.allocator);
-        try pre.append(self.allocator, self.kvLazyOpen());
+        try pre.append(self.allocator, self.storeLazyOpen("kv_store_open", "kv_bucket"));
         var key_ptr: c.BinaryenExpressionRef = self.kvI32(0);
         var key_len: c.BinaryenExpressionRef = self.kvI32(0);
         if (kv.key) |key| {
@@ -2811,22 +2969,23 @@ const Lowerer = struct {
         return c.BinaryenConst(self.module, c.BinaryenLiteralInt32(v));
     }
 
-    /// The lazy `store.open` guard shared by every `env.kv` op. On first use it
-    /// opens the identity-pinned bucket (empty identifier — the host pins it to
-    /// the qube's identity) and caches the handle in `kv_bucket`; later ops
-    /// reuse it (`kv_bucket == -1` means unopened). `open` writes
-    /// `result<bucket, error>` into `kv_open_ret`; the handle is at +4.
-    fn kvLazyOpen(self: *Lowerer) c.BinaryenExpressionRef {
+    /// The lazy `store.open` guard shared by every bucket-store op (`env.kv` and
+    /// `env.blob`). On first use it opens the identity-pinned bucket (empty
+    /// identifier — the host pins it to the qube's identity) via `open_import`
+    /// and caches the handle in `bucket_global`; later ops reuse it
+    /// (`== -1` means unopened). `open` writes `result<bucket, error>` into
+    /// `kv_open_ret`; the handle is at +4.
+    fn storeLazyOpen(self: *Lowerer, open_import: [*:0]const u8, bucket_global: [*:0]const u8) c.BinaryenExpressionRef {
         const m = self.module;
         const open_ret: i32 = @intCast(self.kv_open_ret);
         var open_args = [_]c.BinaryenExpressionRef{ self.kvI32(0), self.kvI32(0), self.kvI32(open_ret) };
         var open_then = [_]c.BinaryenExpressionRef{
-            c.BinaryenCall(m, "kv_store_open", @ptrCast(&open_args), open_args.len, self.none_type),
-            c.BinaryenGlobalSet(m, "kv_bucket", c.BinaryenLoad(m, 4, false, 4, 4, self.i32_type, self.kvI32(open_ret), "0")),
+            c.BinaryenCall(m, open_import, @ptrCast(&open_args), open_args.len, self.none_type),
+            c.BinaryenGlobalSet(m, bucket_global, c.BinaryenLoad(m, 4, false, 4, 4, self.i32_type, self.kvI32(open_ret), "0")),
         };
         return c.BinaryenIf(
             m,
-            c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type), self.kvI32(-1)),
+            c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenGlobalGet(m, bucket_global, self.i32_type), self.kvI32(-1)),
             c.BinaryenBlock(m, null, @ptrCast(&open_then), open_then.len, self.none_type),
             null,
         );
@@ -2842,25 +3001,27 @@ const Lowerer = struct {
         return .{ set_hdr, bump };
     }
 
-    /// `env.kv.set(key, value)` lowered to the canonical `wasi:keyvalue` ABI:
-    /// lazy-open the bucket, call `[method]bucket.set(bucket, key, value, ret)`,
-    /// and box the host's `result<_, error>` as a `Result<(), IoError>`
-    /// (`{ #tag, #p0 }`, 2 cells): tag = the result discriminant (0 = `Ok(())`,
-    /// 1 = `Err`); the payload cell is unused. Yields the box pointer.
-    fn kvComponentSet(self: *Lowerer, kv: anytype) Error!c.BinaryenExpressionRef {
+    /// A keyed store write (`env.kv.set` / `env.blob.put`) lowered to the
+    /// canonical bucket ABI: lazy-open the bucket, call `put_import(bucket, key,
+    /// value, ret)`, and box the host's `result<_, error>` as a
+    /// `Result<(), IoError>` (`{ #tag, #p0 }`, 2 cells): tag = the result
+    /// discriminant (0 = `Ok(())`, 1 = `Err`); the payload cell is unused.
+    /// Yields the box pointer. Shared by kv + blob — only the import + bucket
+    /// global differ.
+    fn storeComponentSet(self: *Lowerer, key: *const ir.mir.Inst, value: *const ir.mir.Inst, put_import: [*:0]const u8, bucket_global: [*:0]const u8, open_import: [*:0]const u8) Error!c.BinaryenExpressionRef {
         const m = self.module;
         const set_ret: i32 = @intCast(self.kv_inc_ret); // shared op return area (16B)
 
         var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
         defer pre.deinit(self.allocator);
-        try pre.append(self.allocator, self.kvLazyOpen());
+        try pre.append(self.allocator, self.storeLazyOpen(open_import, bucket_global));
 
         // Evaluate key → stash (ptr, len) in kv_a/kv_b (one pair local can't hold
         // two live str pairs), then evaluate value into the pair local.
-        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(kv.key)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(key)));
         try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0)));
         try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1)));
-        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(kv.value)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(value)));
         const val_ptr = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0);
         const val_len = c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1);
 
@@ -2869,19 +3030,55 @@ const Lowerer = struct {
         try pre.append(self.allocator, box[0]);
         try pre.append(self.allocator, box[1]);
 
-        // set(bucket, key_ptr, key_len, val_ptr, val_len, set_ret)
+        // put(bucket, key_ptr, key_len, val_ptr, val_len, set_ret)
         var set_args = [_]c.BinaryenExpressionRef{
-            c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type),
+            c.BinaryenGlobalGet(m, bucket_global, self.i32_type),
             self.ptrGet(self.kv_a_idx),
             self.ptrGet(self.kv_b_idx),
             val_ptr,
             val_len,
             self.kvI32(set_ret),
         };
-        try pre.append(self.allocator, c.BinaryenCall(m, "kv_bucket_set", @ptrCast(&set_args), set_args.len, self.none_type));
+        try pre.append(self.allocator, c.BinaryenCall(m, put_import, @ptrCast(&set_args), set_args.len, self.none_type));
 
         // Box: #tag = (i64) result-disc (0 = Ok, 1 = Err); #p0 unused.
         const disc = c.BinaryenUnary(m, c.BinaryenExtendUInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, self.kvI32(set_ret), "0"));
+        try pre.append(self.allocator, c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_hdr_idx), disc, self.i64_type, "0"));
+        try pre.append(self.allocator, c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_hdr_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"));
+        try pre.append(self.allocator, self.ptrGet(self.kv_hdr_idx));
+        return c.BinaryenBlock(m, null, @ptrCast(pre.items.ptr), @intCast(pre.items.len), self.ptr_type);
+    }
+
+    /// A keyed store delete (`env.blob.delete`) lowered to the canonical bucket
+    /// ABI: lazy-open, call `delete_import(bucket, key, ret)`, box the host's
+    /// `result<_, error>` as `Result<(), IoError>` (tag = result disc). Yields
+    /// the box pointer. (kv has no delete op yet; the lowering is generic.)
+    fn storeComponentDelete(self: *Lowerer, key: *const ir.mir.Inst, delete_import: [*:0]const u8, bucket_global: [*:0]const u8, open_import: [*:0]const u8) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const del_ret: i32 = @intCast(self.kv_inc_ret);
+
+        var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer pre.deinit(self.allocator);
+        try pre.append(self.allocator, self.storeLazyOpen(open_import, bucket_global));
+
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(key)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1)));
+
+        const box = self.kvBoxAlloc(2);
+        try pre.append(self.allocator, box[0]);
+        try pre.append(self.allocator, box[1]);
+
+        // delete(bucket, key_ptr, key_len, del_ret)
+        var del_args = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, bucket_global, self.i32_type),
+            self.ptrGet(self.kv_a_idx),
+            self.ptrGet(self.kv_b_idx),
+            self.kvI32(del_ret),
+        };
+        try pre.append(self.allocator, c.BinaryenCall(m, delete_import, @ptrCast(&del_args), del_args.len, self.none_type));
+
+        const disc = c.BinaryenUnary(m, c.BinaryenExtendUInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, self.kvI32(del_ret), "0"));
         try pre.append(self.allocator, c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_hdr_idx), disc, self.i64_type, "0"));
         try pre.append(self.allocator, c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_hdr_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"));
         try pre.append(self.allocator, self.ptrGet(self.kv_hdr_idx));
@@ -2897,28 +3094,28 @@ const Lowerer = struct {
     /// tag 1 = `Err`. Inner box (Option<Bytes>, `{ #tag, #p0, #p1 }`): tag 0 =
     /// `Some`, #p0/#p1 = the value (ptr, len); tag 1 = `None`. Yields the outer
     /// box pointer. (Consumed by nested `Ok(Some(v))` / `Ok(None)` matching.)
-    fn kvComponentGet(self: *Lowerer, kv: anytype) Error!c.BinaryenExpressionRef {
+    fn storeComponentGet(self: *Lowerer, key: *const ir.mir.Inst, get_import: [*:0]const u8, bucket_global: [*:0]const u8, open_import: [*:0]const u8) Error!c.BinaryenExpressionRef {
         const m = self.module;
         const get_ret: i32 = @intCast(self.kv_inc_ret);
 
         var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
         defer pre.deinit(self.allocator);
-        try pre.append(self.allocator, self.kvLazyOpen());
+        try pre.append(self.allocator, self.storeLazyOpen(open_import, bucket_global));
 
         // key → pair; stash (ptr,len) in kv_a/kv_b so the arena bump for the two
         // boxes below can't clobber a pair-local read.
-        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(kv.key)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(key)));
         try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0)));
         try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1)));
 
         // get(bucket, key_ptr, key_len, get_ret)
         var get_args = [_]c.BinaryenExpressionRef{
-            c.BinaryenGlobalGet(m, "kv_bucket", self.i32_type),
+            c.BinaryenGlobalGet(m, bucket_global, self.i32_type),
             self.ptrGet(self.kv_a_idx),
             self.ptrGet(self.kv_b_idx),
             self.kvI32(get_ret),
         };
-        try pre.append(self.allocator, c.BinaryenCall(m, "kv_bucket_get", @ptrCast(&get_args), get_args.len, self.none_type));
+        try pre.append(self.allocator, c.BinaryenCall(m, get_import, @ptrCast(&get_args), get_args.len, self.none_type));
 
         // Inner Option box (3 cells) at kv_hdr; stash its address in kv_a.
         const inner = self.kvBoxAlloc(3);
@@ -4897,7 +5094,7 @@ test "emitComponent: env.kv lowers to a wasi:keyvalue component core + world" {
     ;
     const artifact = try emitComponent(testing.allocator, src, "kv.q", &.{}, .wasm32, &.{}, null);
     switch (artifact) {
-        .kv_component => |kvc| {
+        .store_component => |kvc| {
             defer testing.allocator.free(kvc.core);
             defer testing.allocator.free(kvc.world);
             // Core (env-out path bytes) imports the canonical cm32p2 wasi:keyvalue
@@ -4927,7 +5124,7 @@ test "emitComponent: env.kv.set imports the store `[method]bucket.set`" {
     ;
     const artifact = try emitComponent(testing.allocator, src, "kv.q", &.{}, .wasm32, &.{}, null);
     switch (artifact) {
-        .kv_component => |kvc| {
+        .store_component => |kvc| {
             defer testing.allocator.free(kvc.core);
             defer testing.allocator.free(kvc.world);
             try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:keyvalue/store@0.2.0-draft2") != null);
@@ -4948,13 +5145,68 @@ test "emitComponent: env.kv.get imports the store `[method]bucket.get`" {
     ;
     const artifact = try emitComponent(testing.allocator, src, "kv.q", &.{}, .wasm32, &.{}, null);
     switch (artifact) {
-        .kv_component => |kvc| {
+        .store_component => |kvc| {
             defer testing.allocator.free(kvc.core);
             defer testing.allocator.free(kvc.world);
             try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:keyvalue/store@0.2.0-draft2") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.get") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.set") == null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "export read: func() -> s64;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.blob lowers to a q64:blob/store component" {
+    const src =
+        \\pub fn save() -> i64 {
+        \\    match env.blob.put("k", "v") { Ok(()) -> 1, Err(_) -> 0 }
+        \\}
+        \\pub fn read() -> i64 {
+        \\    match env.blob.get("k") { Ok(Some(v)) -> v.len, Ok(None) -> 0, Err(_) -> 0 }
+        \\}
+        \\pub fn drop() -> i64 {
+        \\    match env.blob.delete("k") { Ok(()) -> 1, Err(_) -> 0 }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "blob.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|q64:blob/store@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.get") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.put") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]bucket.delete") != null);
+            // A blob-only qube imports no wasi:keyvalue.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "wasi:keyvalue") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import q64:blob/store@0.2.0-draft2;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export save: func() -> s64;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.kv + env.blob in one qube imports both interfaces" {
+    // Multiple storage capabilities compose: the world imports wasi:keyvalue
+    // AND q64:blob, and the core imports both interfaces' methods.
+    const src =
+        \\pub fn hits() -> i64 {
+        \\    match env.kv.increment("hits", 1) { Ok(n) -> n, Err(_) -> 0 }
+        \\}
+        \\pub fn stash() -> i64 {
+        \\    match env.blob.put("k", "v") { Ok(()) -> 1, Err(_) -> 0 }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "both.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:keyvalue/atomics@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|q64:blob/store@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:keyvalue/store@0.2.0-draft2;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import q64:blob/store@0.2.0-draft2;") != null);
         },
         else => return error.TestUnexpectedResult,
     }

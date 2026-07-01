@@ -729,10 +729,10 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
                 defer gpa.free(lib.world);
                 try embedAndNewComponent(gpa, io, env, lib.core, lib.world, export_interface.?, comp_path);
             },
-            .kv_component => |kvc| {
+            .store_component => |kvc| {
                 defer gpa.free(kvc.core);
                 defer gpa.free(kvc.world);
-                try embedKvComponent(gpa, io, env, kvc.core, kvc.world, comp_path);
+                try embedStoreComponent(gpa, io, env, kvc.core, kvc.world, comp_path);
             },
         }
 
@@ -966,7 +966,7 @@ fn embedAndNewComponent(
 /// synthesized world + the vendored `wasi:keyvalue` dep package, then
 /// `wasm-tools component embed <dir> --world qube <core>` + `component new`. The
 /// result imports `wasi:keyvalue/{store,atomics}` for the host to supply.
-fn embedKvComponent(
+fn embedStoreComponent(
     gpa: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
@@ -990,19 +990,29 @@ fn embedKvComponent(
         }
     }.f;
 
-    // WIT dir: <comp>.kvwit/world.wit + <comp>.kvwit/deps/wasi-keyvalue/keyvalue.wit.
+    // WIT dir: <comp>.kvwit/world.wit + a deps/ package per storage capability.
+    // Both store deps (wasi-keyvalue + q64-blob) are written unconditionally;
+    // wasm-tools resolves only the packages the synthesized world imports, so an
+    // unused dep is harmless. This one path serves kv-only, blob-only, and mixed
+    // qubes.
     const wit_dir = try std.fmt.allocPrint(gpa, "{s}.kvwit", .{comp_path});
     defer gpa.free(wit_dir);
-    const deps_dir = try std.fmt.allocPrint(gpa, "{s}/deps/wasi-keyvalue", .{wit_dir});
-    defer gpa.free(deps_dir);
-    std.Io.Dir.cwd().createDirPath(io, deps_dir) catch fail(io, "could not create temp WIT dir for the kv lift");
+    const kv_deps_dir = try std.fmt.allocPrint(gpa, "{s}/deps/wasi-keyvalue", .{wit_dir});
+    defer gpa.free(kv_deps_dir);
+    const blob_deps_dir = try std.fmt.allocPrint(gpa, "{s}/deps/q64-blob", .{wit_dir});
+    defer gpa.free(blob_deps_dir);
+    std.Io.Dir.cwd().createDirPath(io, kv_deps_dir) catch fail(io, "could not create temp WIT dir for the store lift");
+    std.Io.Dir.cwd().createDirPath(io, blob_deps_dir) catch fail(io, "could not create temp WIT dir for the store lift");
     defer std.Io.Dir.cwd().deleteTree(io, wit_dir) catch {};
     const world_path = try std.fmt.allocPrint(gpa, "{s}/world.wit", .{wit_dir});
     defer gpa.free(world_path);
-    const dep_path = try std.fmt.allocPrint(gpa, "{s}/keyvalue.wit", .{deps_dir});
-    defer gpa.free(dep_path);
+    const kv_dep_path = try std.fmt.allocPrint(gpa, "{s}/keyvalue.wit", .{kv_deps_dir});
+    defer gpa.free(kv_dep_path);
+    const blob_dep_path = try std.fmt.allocPrint(gpa, "{s}/blob.wit", .{blob_deps_dir});
+    defer gpa.free(blob_dep_path);
     try writeFile(io, world_path, world_wit);
-    try writeFile(io, dep_path, emit.wasi_keyvalue_wit);
+    try writeFile(io, kv_dep_path, emit.wasi_keyvalue_wit);
+    try writeFile(io, blob_dep_path, emit.q64_blob_wit);
 
     const tmp_core = try std.fmt.allocPrint(gpa, "{s}.kvcore.wasm", .{comp_path});
     defer gpa.free(tmp_core);

@@ -1,0 +1,48 @@
+// q64-owned object-store interface for `env.blob` (spec/env.md §`env.blob`).
+//
+// NOT raw wasi:blobstore: that proposal's write path is stream-only
+// (container.write-data takes borrow<outgoing-value>, filled via a
+// wasi:io/streams output-stream), which q64 codegen does not yet emit. This
+// narrow interface keeps put/get/delete on the flat list<u8> canonical-ABI
+// path — byte-for-byte the shape wasi:keyvalue's `store` uses — and the
+// qubepods host does any real blobstore streaming internally. The bucket is
+// host-opened and identity-pinned (empty identifier) exactly like env.kv, so
+// user code never names a container and a qube can't reach another tenant's
+// objects. Revisit binding raw wasi:blobstore once wasi:io stream emission
+// lands.
+//
+// The 0.2.0-draft2 version tag mirrors wasi:keyvalue: wit-component's
+// world-item resolution rejects a plain `0.1.0` here (a semver-match quirk),
+// so the pin matches the store face q64 already vendors.
+
+package q64:blob@0.2.0-draft2;
+
+interface store {
+    /// The set of errors a blob-store operation may raise.
+    variant error {
+        /// The host does not recognize the store for this qube's identity.
+        no-such-store,
+        /// The qube may not access the requested store.
+        access-denied,
+        /// An implementation-specific error (e.g. backend I/O).
+        other(string)
+    }
+
+    /// An object store scoped to the qube's identity. The host opens it via
+    /// `open` (empty identifier) and pins it, so keys never name a tenant.
+    resource bucket {
+        /// Read the object at `key`. `Ok(some(bytes))` when present,
+        /// `Ok(none)` when absent, `Err` on a store error.
+        get: func(key: string) -> result<option<list<u8>>, error>;
+
+        /// Create or replace the object at `key` with `value`.
+        put: func(key: string, value: list<u8>) -> result<_, error>;
+
+        /// Remove the object at `key` (idempotent — no error if absent).
+        delete: func(key: string) -> result<_, error>;
+    }
+
+    /// Open the identity-pinned bucket. The host ignores `identifier` (the
+    /// qube passes an empty string) and binds the bucket to org/project/app.
+    open: func(identifier: string) -> result<bucket, error>;
+}

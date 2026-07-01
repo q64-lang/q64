@@ -203,6 +203,23 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, kv.key);
             try app(gpa, out, ")", .{});
         },
+        .blob_put => |bl| {
+            try app(gpa, out, "blob_put(", .{});
+            try hirExpr(gpa, out, bl.key);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, bl.value);
+            try app(gpa, out, ")", .{});
+        },
+        .blob_get => |bl| {
+            try app(gpa, out, "blob_get(", .{});
+            try hirExpr(gpa, out, bl.key);
+            try app(gpa, out, ")", .{});
+        },
+        .blob_delete => |bl| {
+            try app(gpa, out, "blob_delete(", .{});
+            try hirExpr(gpa, out, bl.key);
+            try app(gpa, out, ")", .{});
+        },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv(", .{});
             try hirExpr(gpa, out, h);
@@ -453,6 +470,19 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .kv_get => |kv| {
             try app(gpa, out, "kv_get\n", .{});
             try mirInst(gpa, out, kv.key, depth + 1);
+        },
+        .blob_put => |bl| {
+            try app(gpa, out, "blob_put\n", .{});
+            try mirInst(gpa, out, bl.key, depth + 1);
+            try mirInst(gpa, out, bl.value, depth + 1);
+        },
+        .blob_get => |bl| {
+            try app(gpa, out, "blob_get\n", .{});
+            try mirInst(gpa, out, bl.key, depth + 1);
+        },
+        .blob_delete => |bl| {
+            try app(gpa, out, "blob_delete\n", .{});
+            try mirInst(gpa, out, bl.key, depth + 1);
         },
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv\n", .{});

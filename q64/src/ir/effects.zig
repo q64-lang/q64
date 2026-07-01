@@ -221,6 +221,19 @@ fn collectExpr(
             d.insert(.kv);
             try collectExpr(a, kv.key, d, e);
         },
+        .blob_put => |bl| {
+            d.insert(.blob);
+            try collectExpr(a, bl.key, d, e);
+            try collectExpr(a, bl.value, d, e);
+        },
+        .blob_get => |bl| {
+            d.insert(.blob);
+            try collectExpr(a, bl.key, d, e);
+        },
+        .blob_delete => |bl| {
+            d.insert(.blob);
+            try collectExpr(a, bl.key, d, e);
+        },
         .chan_recv => |h| {
             d.insert(.wire); // a remote channel receive crosses the wire
             try collectExpr(a, h, d, e);

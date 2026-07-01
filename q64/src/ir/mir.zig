@@ -270,6 +270,14 @@ pub const Op = union(enum) {
     /// `result<option<list<u8>>, error>` into a boxed `Result<Option<Bytes>,
     /// IoError>` (`.ptr`). `key` is a str inst.
     kv_get: struct { key: *Inst },
+    /// `env.blob.put(key, value)` (spec/env.md §`env.blob`): lazy
+    /// `q64:blob/store.open` + `[method]bucket.put`, boxed `Result<(), IoError>`.
+    blob_put: struct { key: *Inst, value: *Inst },
+    /// `env.blob.get(key)`: `[method]bucket.get`, boxed
+    /// `Result<Option<Bytes>, IoError>` (`.ptr`).
+    blob_get: struct { key: *Inst },
+    /// `env.blob.delete(key)`: `[method]bucket.delete`, boxed `Result<(), IoError>`.
+    blob_delete: struct { key: *Inst },
     /// `chan_recv(session)` — receive the next inbound channel message (the
     /// `env.channel_recv` host import). Operand is the session handle (i64);
     /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.

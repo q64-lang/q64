@@ -403,6 +403,12 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             .value = try lowerStrExpr(ctx, kv.value),
         } }),
         .kv_get => |kv| return mk(ctx.a, .ptr, .{ .kv_get = .{ .key = try lowerStrExpr(ctx, kv.key) } }),
+        .blob_put => |bl| return mk(ctx.a, .ptr, .{ .blob_put = .{
+            .key = try lowerStrExpr(ctx, bl.key),
+            .value = try lowerStrExpr(ctx, bl.value),
+        } }),
+        .blob_get => |bl| return mk(ctx.a, .ptr, .{ .blob_get = .{ .key = try lowerStrExpr(ctx, bl.key) } }),
+        .blob_delete => |bl| return mk(ctx.a, .ptr, .{ .blob_delete = .{ .key = try lowerStrExpr(ctx, bl.key) } }),
         .chan_recv => |h| return mk(ctx.a, .i64, .{ .chan_recv = try lowerExpr(ctx, h) }),
         .chan_take => |h| return mk(ctx.a, .i64, .{ .chan_take = try lowerExpr(ctx, h) }),
         .chan_open => |name| return mk(ctx.a, .i64, .{ .chan_open = name }),

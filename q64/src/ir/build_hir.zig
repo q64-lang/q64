@@ -5388,6 +5388,25 @@ fn kvGetResultEnum(b: *Builder) BuildError!?*const EnumInfo {
     return info;
 }
 
+/// The `Result<Option<Bytes>, IoError>` enum that `env.blob.get` yields — the
+/// same nested-Ok shape as `kvGetResultEnum` (env.blob mirrors env.kv's store
+/// face), cached under its own key so its type identity is distinct.
+fn blobGetResultEnum(b: *Builder) BuildError!?*const EnumInfo {
+    if (b.enum_insts.get("Result\x00blobget")) |inst| return inst;
+    const opt_base = b.enums.get("Option") orelse return null;
+    if (opt_base.si == null) return null;
+    const opt_bytes = try instantiateEnum(b, opt_base, &.{ "s", "i", "i", "i" });
+    const res_base = b.enums.get("Result") orelse return null;
+    const res_si = res_base.si orelse return null;
+    const vars = try b.a.alloc(EnumVariant, 2);
+    vars[0] = .{ .name = "Ok", .arity = 1, .kind = .ints, .pidx = 0, .nested = opt_bytes };
+    vars[1] = .{ .name = "Err", .arity = 1, .kind = .ints, .pidx = 1 };
+    const info = try b.a.create(EnumInfo);
+    info.* = .{ .name = "Result", .variants = vars, .si = res_si };
+    try b.enum_insts.put(b.a, "Result\x00blobget", info);
+    return info;
+}
+
 /// Flatten a variant's non-trivia tokens (past the name) into `buf`.
 /// `top` skips the leading variant-name token (an IDENT, or `KW_NONE`
 /// — the prelude `Option.None`); a `{` (record payload) or overflow
@@ -5523,6 +5542,14 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             if (std.mem.eql(u8, txt, "env.kv.get")) {
                 // Result<Option<Bytes>, IoError> — the nested-Ok box shape.
                 return try kvGetResultEnum(b);
+            }
+            if (std.mem.eql(u8, txt, "env.blob.put") or std.mem.eql(u8, txt, "env.blob.delete")) {
+                // Result<(), IoError> — the default Result box (spec/env.md §`env.blob`).
+                return b.enums.get("Result");
+            }
+            if (std.mem.eql(u8, txt, "env.blob.get")) {
+                // Result<Option<Bytes>, IoError> — the nested-Ok box shape.
+                return try blobGetResultEnum(b);
             }
             if (std.mem.indexOfScalar(u8, txt, '.') == null) {
                 if (resolveFn(b, txt)) |fd| return enumOfRet(b, fd);
@@ -7054,6 +7081,42 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                     const esi = info.si orelse return error.Unsupported;
                     const node = try b.a.create(hir.Expr);
                     node.* = .{ .kv_get = .{ .key = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
+                }
+                // `env.blob.put/get/delete` — the object store, same boxed shapes
+                // as env.kv's store face (spec/env.md §`env.blob`).
+                if (std.mem.eql(u8, fsname, "env.blob.put")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    const a1 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const res = b.enums.get("Result") orelse return error.Unsupported;
+                    const esi = res.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .blob_put = .{
+                        .key = try buildStrExpr(b, a0, scope, null),
+                        .value = try buildStrExpr(b, a1, scope, null),
+                    } };
+                    return .{ .e = node, .si = esi };
+                }
+                if (std.mem.eql(u8, fsname, "env.blob.get")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const info = (try blobGetResultEnum(b)) orelse return error.Unsupported;
+                    const esi = info.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .blob_get = .{ .key = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
+                }
+                if (std.mem.eql(u8, fsname, "env.blob.delete")) {
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const res = b.enums.get("Result") orelse return error.Unsupported;
+                    const esi = res.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .blob_delete = .{ .key = try buildStrExpr(b, a0, scope, null) } };
                     return .{ .e = node, .si = esi };
                 }
             }
@@ -14496,6 +14559,31 @@ test "env.kv.get: `Ok(Some)` without `Ok(None)` is non-exhaustive (Unsupported)"
     defer tr.deinit();
     try tr.addLib(src);
     try testing.expect((try buildFromSource(testing.allocator, src, tr.resolver())) == null);
+}
+
+test "env.blob: put/get/delete are @blob faces mirroring env.kv's store shapes" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn save() -> i64 {
+        \\    match env.blob.put("k", "v") { Ok(()) -> 1, Err(_) -> 0 }
+        \\}
+        \\fn load(k: str) -> i64 {
+        \\    match env.blob.get(k) { Ok(Some(v)) -> v.len, Ok(None) -> 0, Err(_) -> 0 - 1 }
+        \\}
+        \\fn drop() -> i64 {
+        \\    match env.blob.delete("k") { Ok(()) -> 1, Err(_) -> 0 }
+        \\}
+        \\fn main { env.out(save() + load("k") + drop()) }
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "blob_put") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "blob_get") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "blob_delete") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@blob") != null);
 }
 
 test "str enum payloads: Result<str, i64>, Msg.Text(str), Option<str>, try" {

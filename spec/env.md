@@ -215,6 +215,23 @@ identity; user code never names a database or bucket). Both map to separate WASI
 proposals — `wasi:sql`/`wasi:rdbms` and `wasi:blobstore` — versioned
 independently of the pinned `wasip3` core snapshot, like `wasi:keyvalue`.
 
+> **Implementation status (env.blob).** `env.blob`'s `get`/`put`/`delete` are
+> implemented, but they lower to a **q64-owned `q64:blob/store`** interface (flat
+> `list<u8>` in/out, host-opened + identity-pinned exactly like `env.kv`), *not*
+> to raw `wasi:blobstore`. `wasi:blobstore`'s write path is stream-only
+> (`container.write-data` takes a `borrow<outgoing-value>` filled through a
+> `wasi:io/streams` output-stream), and q64 codegen does not yet emit `wasi:io`
+> stream plumbing. The qubepods host performs any real streaming to a blobstore
+> backend internally. Binding raw `wasi:blobstore` is a follow-up, gated on
+> `wasi:io` stream emission. (`list` is not yet implemented.) See
+> `q64/src/codegen/wit/q64-blob.wit` and `test/blob-component-reference/`.
+>
+> **Implementation status (env.db).** Not yet implemented. Note also that
+> `wasi:rdbms` is not a real WASI package — only `wasi:sql` exists (Phase 1,
+> `0.2.0-draft`), and its `row = { field-name, value }` single-cell model and
+> lack of a `batch` do not map 1:1 to the `Database` face below; `env.db` will
+> need a translation layer or a q64-owned interface like `env.blob`.
+
 ```q64
 pub face Database {
     fn query   (self, sql: str, params: [Value]) -> Result<Rows, IoError>  @db

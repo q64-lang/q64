@@ -1,0 +1,19 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "blob-store",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "blob.q",
+
+  // Emit a component in addition to the core module. The qube reaches `env.blob`,
+  // so the component imports q64:blob/store (spec/env.md §env.blob); the host
+  // supplies it, pinning the bucket to the qube's identity. It is a q64-owned
+  // interface (flat list<u8>), not raw wasi:blobstore — see the qube's blob.q
+  // header and src/codegen/wit/q64-blob.wit for why.
+  "component": {
+    "emit": true,
+    "world": "blob-store",
+    "worlds": ["q64:blob/store"],
+  },
+}

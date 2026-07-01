@@ -129,6 +129,7 @@ pub const Effect = enum {
     network,
     fs,
     kv,
+    blob,
     audio,
     midi,
     ui,
@@ -148,6 +149,7 @@ pub const Effect = enum {
             .network => "@network",
             .fs => "@fs",
             .kv => "@kv",
+            .blob => "@blob",
             .audio => "@audio",
             .midi => "@midi",
             .ui => "@ui",
@@ -167,7 +169,7 @@ pub const Effect = enum {
     /// not imply `@io` — they target dedicated host surfaces.
     pub fn implies(self: Effect) ?Effect {
         return switch (self) {
-            .stdout, .stderr, .network, .fs, .kv, .wire => .io,
+            .stdout, .stderr, .network, .fs, .kv, .blob, .wire => .io,
             else => null,
         };
     }
@@ -194,6 +196,13 @@ pub const Effect = enum {
             .network => &.{ "wasi:sockets/tcp", "wasi:sockets/udp", "wasi:sockets/instance-network", "wasi:sockets/ip-name-lookup", "wasi:http/handler" },
             .fs => &.{ "wasi:filesystem/types", "wasi:filesystem/preopens" },
             .kv => &.{ "wasi:keyvalue/store", "wasi:keyvalue/atomics" },
+            // `env.blob` targets a q64-owned interface (our host supplies it),
+            // NOT raw wasi:blobstore: blobstore's write path is stream-only
+            // (outgoing-value → wasi:io/streams), which q64 codegen does not yet
+            // emit. The narrow store shape keeps put/get/delete on the flat
+            // list<u8> path (spec/env.md §`env.blob`). Revisit once wasi:io
+            // stream emission lands.
+            .blob => &.{"q64:blob/store"},
             .time => &.{ "wasi:clocks/wall-clock", "wasi:clocks/monotonic-clock" },
             .random => &.{"wasi:random/random"},
             .envvars => &.{"wasi:cli/environment"},
@@ -434,6 +443,21 @@ pub const Expr = union(enum) {
     /// (`Ok(Some(v))` when present, `Ok(None)` when absent, `Err` on a store
     /// error). Marks the fn `@kv`.
     kv_get: struct { key: *Expr },
+    /// `env.blob.put(key, value)` — store `value` (a `Bytes`/`str`) at `key` in
+    /// the project's object store (spec/env.md §`env.blob`). Lowers to a lazy
+    /// `q64:blob/store.open` + `[method]bucket.put`, yielding a boxed
+    /// `Result<(), IoError>`. Marks the fn `@blob`. The q64-owned store interface
+    /// keeps bytes flat (host does any blobstore streaming). Same shape as
+    /// `kv_set` — a different bucket + import.
+    blob_put: struct { key: *Expr, value: *Expr },
+    /// `env.blob.get(key)` — read the object at `key` (spec/env.md §`env.blob`,
+    /// `q64:blob/store.bucket.get`). Boxed `Result<Option<Bytes>, IoError>`
+    /// (`Ok(Some(v))`/`Ok(None)`/`Err`). Marks the fn `@blob`. Same shape as
+    /// `kv_get`.
+    blob_get: struct { key: *Expr },
+    /// `env.blob.delete(key)` — remove the object at `key` (idempotent;
+    /// `q64:blob/store.bucket.delete`). Boxed `Result<(), IoError>`. Marks `@blob`.
+    blob_delete: struct { key: *Expr },
     /// `chan_recv(session)` — receive the next inbound message on a remote
     /// channel session (`@channel_handler`'s `for _ in session`). Lowers to the
     /// `env.channel_recv` host import: returns 1 when a message arrived (run the
