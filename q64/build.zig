@@ -126,6 +126,17 @@ pub fn build(b: *std.Build) void {
     const doc_tests = b.addTest(.{ .root_module = doc_tests_mod });
     test_step.dependOn(&b.addRunArtifact(doc_tests).step);
 
+    // `fmt` (q64 fmt) is parser-only — no Binaryen link — but needs the
+    // `parser` import, so it gets its own test module like the doc tests.
+    const fmt_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/fmt/fmt.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fmt_tests_mod.addImport("parser", parser_mod);
+    const fmt_tests = b.addTest(.{ .root_module = fmt_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(fmt_tests).step);
+
     const codegen_mod = b.createModule(.{
         .root_source_file = b.path("src/codegen/emit.zig"),
         .target = target,

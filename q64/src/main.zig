@@ -13,6 +13,7 @@ const emit = @import("codegen/emit.zig");
 const sema = @import("sema");
 const doc = @import("doc.zig");
 const wit = @import("wit");
+const fmt = @import("fmt/fmt.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -47,6 +48,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "check")) {
         try cmdCheck(gpa, io, &args_it);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "fmt")) {
+        try cmdFmt(gpa, io, &args_it);
         return;
     }
 
@@ -117,6 +123,10 @@ fn usage(io: std.Io) !void {
         \\
         \\Commands:
         \\  check <file> [--diagnostics json]  Parse a single file and emit diagnostics.
+        \\  fmt [path] [--stdout] [--check] [--lint]
+        \\                                     Format source in place (file or directory, recursive).
+        \\                                     --stdout: read stdin (or path) and print to stdout.
+        \\                                     --check: exit 64 if any file would change. --lint: report.
         \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--component] [--module name=file ...]
         \\                                     Compile a q64 source file to wasm via codegen.
         \\                                     --addr selects the linear-memory address space
@@ -267,6 +277,238 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Itera
     try w.interface.flush();
 
     if (has_error) std.process.exit(1);
+}
+
+/// `q64 fmt` — the formatter (spec/q64-cli.md §"q64 fmt"). Default mode
+/// rewrites files in place (atomically); `--stdout` prints to stdout and
+/// reads stdin when no path is given; `--check` exits 64 if anything would
+/// change; `--lint` reports without modifying. A file with syntax errors is
+/// left untouched and reported as FMT001.
+const FmtMode = enum { write, stdout, check, lint };
+
+fn cmdFmt(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {
+    var path: ?[]const u8 = null;
+    var mode: FmtMode = .write;
+    var json = false;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--stdout")) {
+            mode = .stdout;
+        } else if (std.mem.eql(u8, a, "--check")) {
+            mode = .check;
+        } else if (std.mem.eql(u8, a, "--lint")) {
+            mode = .lint;
+        } else if (std.mem.eql(u8, a, "--diagnostics")) {
+            // Next arg is "json"; flag-style, mirroring `check`.
+        } else if (std.mem.eql(u8, a, "json")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            // Tolerate (and ignore) flags this subcommand doesn't consume.
+        } else if (path == null) {
+            path = a;
+        }
+    }
+
+    // No path: format stdin → stdout. Only meaningful in `--stdout` mode
+    // (spec: "read from stdin when path is omitted"); the file-mutating
+    // modes need a path to act on.
+    if (path == null) {
+        if (mode != .stdout) {
+            var ebuf: [256]u8 = undefined;
+            var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+            try ew.interface.writeAll("q64: fmt: no path given (use --stdout to format stdin)\n");
+            try ew.interface.flush();
+            std.process.exit(2);
+        }
+        var rbuf: [4096]u8 = undefined;
+        var sr = std.Io.File.stdin().reader(io, &rbuf);
+        const source = sr.interface.allocRemaining(gpa, .limited(16 * 1024 * 1024)) catch |err| {
+            var ebuf: [256]u8 = undefined;
+            var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+            try ew.interface.print("q64: fmt: cannot read stdin: {s}\n", .{@errorName(err)});
+            try ew.interface.flush();
+            std.process.exit(2);
+        };
+        defer gpa.free(source);
+
+        const outcome = try fmt.format(gpa, source);
+        defer outcome.deinit(gpa);
+        switch (outcome) {
+            .formatted => |text| {
+                var obuf: [4096]u8 = undefined;
+                var ow = std.Io.File.stdout().writerStreaming(io, &obuf);
+                try ow.interface.writeAll(text);
+                try ow.interface.flush();
+            },
+            .unparseable => {
+                try emitFmtUnparseable(gpa, io, "<stdin>", source, json);
+                std.process.exit(1);
+            },
+        }
+        return;
+    }
+
+    const p = path.?;
+    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch |err| {
+        var ebuf: [512]u8 = undefined;
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+        try ew.interface.print("q64: fmt: cannot read {s}: {s}\n", .{ p, @errorName(err) });
+        try ew.interface.flush();
+        std.process.exit(2);
+    };
+
+    if (st.kind == .directory) {
+        if (mode == .stdout) {
+            var ebuf: [256]u8 = undefined;
+            var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+            try ew.interface.writeAll("q64: fmt: --stdout takes a single file or stdin, not a directory\n");
+            try ew.interface.flush();
+            std.process.exit(2);
+        }
+        var acc: FmtAcc = .{};
+        try fmtDir(gpa, io, p, mode, json, &acc);
+        fmtFinish(mode, acc);
+        return;
+    }
+
+    var acc: FmtAcc = .{};
+    try fmtOneFile(gpa, io, p, mode, json, &acc);
+    fmtFinish(mode, acc);
+}
+
+/// Running tally across one `fmt` invocation.
+const FmtAcc = struct {
+    /// Files that would change (or did, in write mode).
+    changed: usize = 0,
+    /// Files that could not be parsed (reported as FMT001).
+    unparseable: usize = 0,
+};
+
+/// Exit-code policy, applied once after all files are processed.
+fn fmtFinish(mode: FmtMode, acc: FmtAcc) void {
+    if (acc.unparseable > 0) std.process.exit(1);
+    // `--check` signals "would reformat" with the conventional 64.
+    if (mode == .check and acc.changed > 0) std.process.exit(64);
+}
+
+/// Recursively format every `.q` file under `dir`.
+fn fmtDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, mode: FmtMode, json: bool, acc: *FmtAcc) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
+        var ebuf: [512]u8 = undefined;
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+        try ew.interface.print("q64: fmt: cannot open {s}: {s}\n", .{ dir_path, @errorName(err) });
+        try ew.interface.flush();
+        std.process.exit(2);
+    };
+    defer dir.close(io);
+
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".q")) continue;
+        const full = try std.fs.path.join(gpa, &.{ dir_path, entry.path });
+        defer gpa.free(full);
+        try fmtOneFile(gpa, io, full, mode, json, acc);
+    }
+}
+
+/// Format a single file according to `mode`, updating `acc`.
+fn fmtOneFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, mode: FmtMode, json: bool, acc: *FmtAcc) !void {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
+        var ebuf: [512]u8 = undefined;
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+        try ew.interface.print("q64: fmt: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+        try ew.interface.flush();
+        std.process.exit(2);
+    };
+    defer gpa.free(source);
+
+    const outcome = try fmt.format(gpa, source);
+    defer outcome.deinit(gpa);
+
+    const text = switch (outcome) {
+        .formatted => |t| t,
+        .unparseable => {
+            try emitFmtUnparseable(gpa, io, path, source, json);
+            acc.unparseable += 1;
+            return;
+        },
+    };
+
+    const changed = !std.mem.eql(u8, text, source);
+    if (changed) acc.changed += 1;
+
+    switch (mode) {
+        .stdout => {
+            var obuf: [4096]u8 = undefined;
+            var ow = std.Io.File.stdout().writerStreaming(io, &obuf);
+            try ow.interface.writeAll(text);
+            try ow.interface.flush();
+        },
+        .write => if (changed) {
+            try atomicWrite(gpa, io, path, text);
+            var obuf: [512]u8 = undefined;
+            var ow = std.Io.File.stdout().writerStreaming(io, &obuf);
+            try ow.interface.print("{s}\n", .{path});
+            try ow.interface.flush();
+        },
+        .check => if (changed) {
+            var ebuf: [512]u8 = undefined;
+            var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+            try ew.interface.print("{s}: would reformat\n", .{path});
+            try ew.interface.flush();
+        },
+        .lint => if (changed) {
+            var ebuf: [512]u8 = undefined;
+            var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+            try ew.interface.print("{s}:1:1: note: file is not formatted (run q64 fmt) [FMT002]\n", .{path});
+            try ew.interface.flush();
+        },
+    }
+}
+
+/// Write `bytes` to `path` atomically: to a sibling temp file, then rename
+/// over the target. A crash mid-write can't leave a truncated `.q` on disk
+/// (fmt/README.md §"atomic write-on-success").
+fn atomicWrite(gpa: std.mem.Allocator, io: std.Io, path: []const u8, bytes: []const u8) !void {
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.q64fmt.tmp", .{path});
+    defer gpa.free(tmp);
+    const cwd = std.Io.Dir.cwd();
+    cwd.writeFile(io, .{ .sub_path = tmp, .data = bytes, .flags = .{ .truncate = true } }) catch |err| {
+        var ebuf: [512]u8 = undefined;
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+        try ew.interface.print("q64: fmt: cannot write {s}: {s}\n", .{ path, @errorName(err) });
+        try ew.interface.flush();
+        std.process.exit(2);
+    };
+    cwd.rename(tmp, cwd, path, io) catch |err| {
+        cwd.deleteFile(io, tmp) catch {};
+        var ebuf: [512]u8 = undefined;
+        var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
+        try ew.interface.print("q64: fmt: cannot replace {s}: {s}\n", .{ path, @errorName(err) });
+        try ew.interface.flush();
+        std.process.exit(2);
+    };
+}
+
+/// Emit the FMT001 "cannot format: source has syntax errors" diagnostic,
+/// in text or JSON per `--diagnostics`. The file is left untouched.
+fn emitFmtUnparseable(gpa: std.mem.Allocator, io: std.Io, path: []const u8, source: []const u8, json: bool) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
+    const d: diag.Diagnostic = .{
+        .code = "FMT001",
+        .severity = .err,
+        .message = diag.messageFor("FMT001"),
+        .file = path,
+        .offset = 0,
+    };
+    if (json) {
+        try diag.emitJson(&w.interface, source, &.{d}, gpa);
+    } else {
+        try w.interface.print("{s}:1:1: error: {s} [FMT001]\n", .{ path, d.message });
+    }
+    try w.interface.flush();
 }
 
 fn cmdEmitHello(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args.Iterator) !void {

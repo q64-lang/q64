@@ -115,6 +115,22 @@ package-level wrapper.
 | `--lint`    | Report formatting issues as diagnostics on stderr; do not modify files.          |
 | `--check`   | Exit `64` if any file would be reformatted; do not modify files.                 |
 
+A file with lexical or parse errors is **left untouched** and reported as
+`FMT001` (formatting an unparseable buffer would risk mangling it) — run
+`q64 check` to see the underlying errors. `--lint` reports an unformatted file
+as an `FMT002` note. In-place rewrites are atomic (temp file + rename), so a
+crash mid-write never leaves a truncated `.q` on disk.
+
+> **v0 coverage.** The formatter is a *structural reindenter*: it recomputes
+> indentation from bracket nesting, collapses each interior whitespace run to a
+> single space (`fn   main` → `fn main`), collapses blank-line runs, strips
+> trailing whitespace, and normalizes the trailing newline — while preserving
+> every significant token and every comment. Full re-spacing (inserting/removing
+> spaces around operators and inside brackets), trailing-comma normalization, and
+> continuation-line indentation are later slices. The v0 invariant is that only
+> trivia changes, so a format can never alter a program's meaning. See
+> [`q64/src/fmt/README.md`](../q64/src/fmt/README.md).
+
 ## Global options
 
 | Flag                              | Meaning                                                                   |

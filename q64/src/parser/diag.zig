@@ -124,6 +124,7 @@ pub fn subsystemFor(code: []const u8) []const u8 {
     if (std.mem.startsWith(u8, code, "REG")) return "Regions";
     if (std.mem.startsWith(u8, code, "STR")) return "Streams";
     if (std.mem.startsWith(u8, code, "CONC")) return "Concurrency";
+    if (std.mem.startsWith(u8, code, "FMT")) return "Formatter";
     if (std.mem.startsWith(u8, code, "Q9")) return "Internal";
     return "Other";
 }
@@ -188,6 +189,9 @@ pub const codes = [_]CodeInfo{
     .{ .code = "STR051", .subsystem = "Streams", .severity = .err, .message = "`pre()` on `Event<T>`", .summary = "`Event<T>` is pointwise and has no previous-tick value, so `.pre()` (the one-tick feedback delay) doesn't apply. `pre()` is for `Signal<T>` feedback cycles. See spec/streams.md §\"`pre()` for feedback cycles\"." },
     .{ .code = "REG040", .subsystem = "Regions", .severity = .err, .message = "region exited with live allocations", .summary = "A `FreeList` region reached the end of its block with allocations that were never freed. Free them explicitly before the region exits, `transfer(to: …)` them out, or use an `Arena` (bulk-freed on exit). See spec/memory.md §\"Region literal syntax\"." },
     .{ .code = "REG050", .subsystem = "Regions", .severity = .err, .message = "unknown transfer verb", .summary = "The only cross-region/cross-heap move is `transfer(to: …)`. `copy_to`, `pin_to`, and `intern` are not in the language — rewrite the call as `value.transfer(to: <region>)`. See spec/memory.md §\"Cross-region transfers\"." },
+    // Formatter (q64 fmt)
+    .{ .code = "FMT001", .subsystem = "Formatter", .severity = .err, .message = "cannot format: source has syntax errors", .summary = "`q64 fmt` only reformats source that parses cleanly — reformatting a file with lexical or parse errors would risk mangling it. Fix the reported syntax errors (run `q64 check <file>` to see them) and format again. The file is left untouched." },
+    .{ .code = "FMT002", .subsystem = "Formatter", .severity = .warning, .message = "file is not formatted", .summary = "`q64 fmt --lint` found a file whose layout differs from the canonical format. Run `q64 fmt <file>` to reformat it in place (or `--stdout` to preview). Reported as a note; no files are modified in `--lint` mode." },
 };
 
 /// Emit a JSON envelope per spec/diagnostics.md §"Envelope shape"
