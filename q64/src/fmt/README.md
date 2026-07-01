@@ -2,8 +2,8 @@
 
 The `q64 fmt` formatter.
 
-> **Status: v0 implemented — a structural reindenter.** The engine is
-> `fmt.zig`; the CLI wiring (`q64 fmt [path] [--stdout|--check|--lint]`)
+> **Status: v0 implemented — reindent + canonical spacing.** The engine
+> is `fmt.zig`; the CLI wiring (`q64 fmt [path] [--stdout|--check|--lint]`)
 > is in `../main.zig`. See [`spec/q64-cli.md`](../../../spec/q64-cli.md)
 > §"`q64 fmt`".
 
@@ -16,11 +16,13 @@ token stream the parser produces:
   Tabs and off-width indents are rewritten. Brackets *hug*:
   `print_all([` indents its children by one level, not two, and the
   matching `])` dedents once (see the indentation model in `fmt.zig`).
-- **Interior whitespace** — each run of spaces/tabs between two tokens on
-  a line collapses to a single space (`fn   main` → `fn main`). This only
-  ever turns a run of ≥1 spaces into exactly one; it never inserts a
-  space where there was none, nor removes a lone one, so `a+b` stays
-  `a+b` and no operator disambiguation is needed.
+- **Spacing** — a canonical single-space style is applied *between*
+  tokens: one space around binary operators and after `,`/`:`; tight
+  `foo(x)`, `a.b.c`, `xs[0]`, `Vec<T>`, `|x|`, `-x`, `@stage`; spaces
+  around a genuine `a < b`. The three tokens context alone can't resolve
+  — `< >` (generic vs comparison), a leading sigil (`-x` vs `a - b`), and
+  `|` (lambda vs bit-or) — are disambiguated from the **CST**, not from
+  fragile token heuristics.
 - **Vertical whitespace** — runs of blank lines collapse to one; leading
   blank lines are dropped; the file ends with exactly one newline.
 - **Trailing whitespace** — stripped from every line (including inside a
@@ -32,28 +34,31 @@ token stream the parser produces:
   can never leave a truncated `.q` on disk (relevant to the ICE
   convention; see [`spec/diagnostics.md`](../../../spec/diagnostics.md)).
 
-**Safety invariant.** The multiset of *significant* (non-trivia) tokens
-is identical between input and output — v0 only ever rewrites the trivia
-between tokens. So formatting cannot change a program's meaning, and
-`format` is idempotent. Both properties are covered by the tests at the
-bottom of `fmt.zig`, and were checked across every `.q` file in the repo.
+**Safety invariant.** The formatter only ever rewrites the trivia
+*between* tokens, so the significant-token sequence is identical in and
+out and `format` is idempotent. This is **enforced at runtime**: the
+output is re-lexed and, if its token sequence differs from the input's (a
+dropped space that would merge `let x` into `letx`), the original source
+is returned untouched — the formatter can never corrupt code. Both
+properties are covered by the tests in `fmt.zig` and were verified across
+every `.q` file in the repo (0 token mismatches, 0 non-idempotent).
 
-## Deferred (not in v0)
+## Deferred / known limits
 
-These are owned by `fmt` but not yet implemented — each is a future
-slice that stays inside the safety invariant:
+Future slices, each still inside the safety invariant:
 
-- Full re-spacing: *inserting* a canonical single space around operators
-  and after commas/colons, and *removing* spaces just inside brackets
-  (`( x )` → `(x)`). v0 only collapses existing runs; it never adds or
-  removes a space at a zero/single-space boundary.
-- Alignment: v0 has no tabwriter, so hand-aligned columns are collapsed
-  to single spaces rather than reproduced.
-- Trailing-comma normalization.
-- Continuation-line indentation for bracket-free wrapped lines (e.g. a
-  `-> ReturnType` on its own line under a `fn` signature — v0 leaves it
+- **Alignment** — no tabwriter, so hand-aligned columns are collapsed to
+  single spaces rather than reproduced.
+- **Trailing-comma normalization.**
+- **Continuation-line indentation** for bracket-free wrapped lines (e.g.
+  a `-> ReturnType` on its own line under a `fn` signature — v0 leaves it
   at the declaration's indent).
-- Line reflow / wrapping long lines.
+- **Line reflow / wrapping** long lines.
+- **Generic call in expression position.** `Point<f32>(0.0)` (no
+  turbofish) is parsed as comparisons (`<` / `>`) — the PAR040 ambiguity —
+  so the formatter spaces it as `Point < f32 > (0.0)`. It faithfully
+  reflects the parse; disambiguation is a parser concern, not the
+  formatter's.
 
 ## Does not own
 

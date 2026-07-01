@@ -121,14 +121,17 @@ A file with lexical or parse errors is **left untouched** and reported as
 as an `FMT002` note. In-place rewrites are atomic (temp file + rename), so a
 crash mid-write never leaves a truncated `.q` on disk.
 
-> **v0 coverage.** The formatter is a *structural reindenter*: it recomputes
-> indentation from bracket nesting, collapses each interior whitespace run to a
-> single space (`fn   main` → `fn main`), collapses blank-line runs, strips
-> trailing whitespace, and normalizes the trailing newline — while preserving
-> every significant token and every comment. Full re-spacing (inserting/removing
-> spaces around operators and inside brackets), trailing-comma normalization, and
-> continuation-line indentation are later slices. The v0 invariant is that only
-> trivia changes, so a format can never alter a program's meaning. See
+> **v0 coverage.** The formatter recomputes indentation from bracket nesting
+> and applies a canonical single-space style between tokens (spaces around binary
+> operators and after `,`/`:`; tight `foo(x)`, `a.b`, `xs[0]`, `Vec<T>`, `|x|`,
+> `-x`; spaces around a genuine `a < b`), disambiguating `< >`, prefix sigils,
+> and lambda `|` from the CST. It also collapses blank-line runs, strips trailing
+> whitespace, and normalizes the trailing newline — preserving every significant
+> token and every comment. The invariant that only trivia changes is enforced at
+> runtime (the output is re-lexed; on any token-sequence mismatch the source is
+> returned untouched), so a format can never alter a program's meaning. Alignment
+> (tabwriter), trailing-comma normalization, line reflow, and continuation-line
+> indentation are later slices. See
 > [`q64/src/fmt/README.md`](../q64/src/fmt/README.md).
 
 ## Global options

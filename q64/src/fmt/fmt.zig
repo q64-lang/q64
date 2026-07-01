@@ -1,20 +1,29 @@
 //! The `q64 fmt` formatter engine (v0).
 //!
-//! v0 is a **structural reindenter** over the lossless token stream:
-//! it recomputes leading indentation from bracket nesting, collapses
-//! each interior run of whitespace to a single space, normalizes
+//! The formatter reprints the lossless token stream the parser emits:
+//! it recomputes leading indentation from bracket nesting, applies a
+//! canonical single-space style *between* tokens (spaces around binary
+//! operators, after `,`/`:`, tight `foo(x)`/`a.b`/`Vec<T>`), normalizes
 //! vertical whitespace (blank lines, trailing newline), and strips
 //! trailing whitespace — while preserving every significant token and
 //! every comment.
 //!
-//! What it deliberately does NOT do yet: insert or remove spaces around
-//! operators/commas (it only *collapses* existing runs, so `a+b` stays
-//! `a+b` and `( x )` stays `( x )`), reflow long lines, or normalize
-//! trailing commas. Those are the next slices (see `README.md` §Scope).
-//! Keeping v0 to indentation + whitespace normalization makes it *safe*:
-//! the multiset of significant tokens is identical between input and
-//! output, so formatting can never change a program's meaning — only
-//! its layout.
+//! Spacing decisions come from token kinds plus three CST-resolved
+//! `Role`s that disambiguate the tokens context alone can't: `< >`
+//! (generic delimiter vs comparison), a leading sigil in a `UNARY_EXPR`
+//! (`-x` vs `a - b`), and `|` (lambda-param delimiter vs bit-or).
+//!
+//! Safety. Formatting only ever rewrites the trivia between tokens, so
+//! the significant-token sequence is identical in and out and `format`
+//! is idempotent. This is enforced at runtime by a fail-safe: the output
+//! is re-lexed and, if its token sequence differs from the input's (a
+//! dropped space that merged two tokens), the original source is
+//! returned untouched — the formatter can never corrupt code.
+//!
+//! What it deliberately does NOT do yet: reflow/wrap long lines,
+//! normalize trailing commas, or reproduce hand-aligned columns (there
+//! is no tabwriter — aligned runs collapse to single spaces). Those are
+//! later slices (see `README.md` §Deferred).
 //!
 //! Safety invariant: `stripInsignificant(format(src)) ==
 //! stripInsignificant(src)` for any parseable `src`, and `format` is
@@ -79,10 +88,52 @@ pub fn format(gpa: std.mem.Allocator, source: []const u8) !Outcome {
     defer toks.deinit(gpa);
     try collectTokens(gpa, result.root, &toks);
 
-    var f: Formatter = .{ .toks = toks.items, .gpa = gpa };
+    // Resolve the context-dependent token roles once, up front.
+    var roles: RoleMap = .empty;
+    defer roles.deinit(gpa);
+    try buildRoles(gpa, result.root, false, &roles);
+
+    var f: Formatter = .{ .toks = toks.items, .gpa = gpa, .roles = &roles };
     defer f.deinit();
     try f.run();
-    return .{ .formatted = try f.out.toOwnedSlice(gpa) };
+    const out = try f.out.toOwnedSlice(gpa);
+
+    // Fail-safe: re-lex the output and require its significant-token
+    // sequence to be byte-identical to the input's. Formatting only ever
+    // rewrites trivia, so this must hold — but a spacing bug that dropped
+    // a needed space (`let x` → `letx`) would merge two tokens and be
+    // caught here. If it ever fires, return the source untouched rather
+    // than emit corrupted code; the exact-output unit tests catch the bug
+    // instead.
+    if (!try tokensPreserved(gpa, source, out)) {
+        gpa.free(out);
+        return .{ .formatted = try gpa.dupe(u8, source) };
+    }
+    return .{ .formatted = out };
+}
+
+/// True iff `a` and `b` lex to the same sequence of significant (non-trivia)
+/// token texts. The formatter's core safety invariant.
+fn tokensPreserved(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
+    const lex = parser.lex;
+    const ra = try lex.tokenize(gpa, a);
+    defer ra.deinit(gpa);
+    const rb = try lex.tokenize(gpa, b);
+    defer rb.deinit(gpa);
+
+    var ia: usize = 0;
+    var ib: usize = 0;
+    while (true) {
+        while (ia < ra.tokens.len and (ra.tokens[ia].kind.isTrivia() or ra.tokens[ia].kind == .EOF)) ia += 1;
+        while (ib < rb.tokens.len and (rb.tokens[ib].kind.isTrivia() or rb.tokens[ib].kind == .EOF)) ib += 1;
+        const a_done = ia >= ra.tokens.len;
+        const b_done = ib >= rb.tokens.len;
+        if (a_done or b_done) return a_done and b_done;
+        if (ra.tokens[ia].kind != rb.tokens[ib].kind) return false;
+        if (!std.mem.eql(u8, ra.tokens[ia].text, rb.tokens[ib].text)) return false;
+        ia += 1;
+        ib += 1;
+    }
 }
 
 /// True iff formatting `source` would leave it unchanged. Used by
@@ -109,6 +160,95 @@ fn collectTokens(gpa: std.mem.Allocator, node: *const cst.Node, out: *std.ArrayL
     };
 }
 
+/// The context-dependent role of a token, resolved from the CST so the
+/// spacing pass doesn't have to guess at the three genuinely ambiguous
+/// tokens: `< >` (generic delimiter vs comparison), a leading sigil in a
+/// `UNARY_EXPR` (prefix `-x` vs binary `a - b`), and `|` (lambda-param
+/// delimiter vs bit-or). Keyed by a token's byte offset (unique per token).
+const Role = enum { none, generic, unary, lambda_open, lambda_close, postfix };
+
+const RoleMap = std.AutoHashMapUnmanaged(u32, Role);
+
+/// Walk the CST and record the role of every token that needs one. Any
+/// token not in the map is `.none` and uses the default kind-based rules.
+fn buildRoles(gpa: std.mem.Allocator, node: *const cst.Node, in_generic: bool, map: *RoleMap) !void {
+    const gen = in_generic or switch (node.kind) {
+        .GENERIC_ARGS, .GENERIC_PARAMS, .FN_TYPE_PARAMS => true,
+        else => false,
+    };
+
+    switch (node.kind) {
+        // The leading operator of a unary expression is its first
+        // non-trivia child token.
+        .UNARY_EXPR => for (node.children) |c| switch (c) {
+            .token => |t| {
+                if (t.kind.isTrivia()) continue;
+                try map.put(gpa, t.offset, .unary);
+                break;
+            },
+            .node => break,
+        },
+        // The two `|` delimiters are direct token children of the lambda:
+        // first is the opener, the next is the closer. (`||` is one token.)
+        .LAMBDA_EXPR => {
+            var seen_open = false;
+            for (node.children) |c| switch (c) {
+                .token => |t| {
+                    if (t.kind != .PIPE) continue;
+                    if (!seen_open) {
+                        try map.put(gpa, t.offset, .lambda_open);
+                        seen_open = true;
+                    } else {
+                        try map.put(gpa, t.offset, .lambda_close);
+                        break;
+                    }
+                },
+                .node => {},
+            };
+        },
+        // The opening `(` of a call's argument list and the `[` of an
+        // index expression are *postfix* — they hug the callee/receiver
+        // (`foo(x)`, `a[0]`), unlike a grouping paren or an array literal.
+        // Marking them here handles keyword-named receivers (`env.out(…)`,
+        // where `out` is `KW_OUT`) that a token heuristic would miss.
+        .CALL_ARGS, .PARAMS => for (node.children) |c| switch (c) {
+            .token => |t| if (t.kind == .L_PAREN) {
+                try map.put(gpa, t.offset, .postfix);
+                break;
+            },
+            .node => {},
+        },
+        .INDEX_EXPR => for (node.children) |c| switch (c) {
+            .token => |t| if (t.kind == .L_BRACK) {
+                try map.put(gpa, t.offset, .postfix);
+                break;
+            },
+            .node => {},
+        },
+        // A keyword-named function (`fn from(…)` — `from` is `KW_FROM`)
+        // isn't structured into a PARAMS node by the parser; its params
+        // `(` lands as a direct token child of the declaration. Mark the
+        // first one so the name still hugs its parameter list.
+        .FN_DECL, .METHOD_SIG => for (node.children) |c| switch (c) {
+            .token => |t| if (t.kind == .L_PAREN) {
+                try map.put(gpa, t.offset, .postfix);
+                break;
+            },
+            .node => {},
+        },
+        else => {},
+    }
+
+    for (node.children) |c| switch (c) {
+        .token => |t| {
+            if (gen and (t.kind == .L_ANGLE or t.kind == .R_ANGLE or t.kind == .SHR)) {
+                try map.put(gpa, t.offset, .generic);
+            }
+        },
+        .node => |n| try buildRoles(gpa, n, gen, map),
+    };
+}
+
 fn isOpener(k: cst.SyntaxKind) bool {
     return switch (k) {
         .L_PAREN, .L_BRACE, .L_BRACK => true,
@@ -126,6 +266,7 @@ fn isCloser(k: cst.SyntaxKind) bool {
 const Formatter = struct {
     toks: []const cst.Token,
     gpa: std.mem.Allocator,
+    roles: *const RoleMap,
     i: usize = 0,
     out: std.ArrayList(u8) = .empty,
     /// One entry per currently-open bracket: the indent level of the
@@ -214,27 +355,24 @@ const Formatter = struct {
         }
         self.pending_blanks = 0;
 
-        // Build the line body from the first non-whitespace token
-        // onward. Leading whitespace is replaced by computed indentation;
-        // each interior run of whitespace collapses to a single space;
-        // comments are kept as content. Collapsing only ever turns a run
-        // of ≥1 spaces into exactly one — it never inserts a space where
-        // there was none nor removes a lone space, so it needs no
-        // operator disambiguation (`a+b` stays `a+b`) and can't change
-        // meaning.
+        // Build the line body from the significant/comment tokens,
+        // inserting canonical spacing between each adjacent pair (leading
+        // whitespace is replaced by computed indentation). Original
+        // whitespace tokens are dropped — spacing is decided from token
+        // kinds and CST-resolved roles, so it is uniform regardless of
+        // how the author spaced the input.
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.gpa);
-        var pending_space = false;
+        var prev: ?cst.Token = null;
         for (line) |t| {
-            if (t.kind == .WHITESPACE) {
-                if (body.items.len > 0) pending_space = true; // drop leading
-                continue;
-            }
-            if (pending_space) {
-                try body.append(self.gpa, ' ');
-                pending_space = false;
+            if (t.kind == .WHITESPACE) continue; // spacing is recomputed
+            if (prev) |p| {
+                if (wantSpace(p.kind, self.roleOf(p), t.kind, self.roleOf(t))) {
+                    try body.append(self.gpa, ' ');
+                }
             }
             try body.appendSlice(self.gpa, t.text);
+            prev = t;
         }
         // Strip trailing spaces/tabs inside a trailing line comment's own
         // text (interior bytes are never touched, so multi-line raw-string
@@ -269,7 +407,63 @@ const Formatter = struct {
         var n = level * indent_width;
         while (n > 0) : (n -= 1) try self.out.append(self.gpa, ' ');
     }
+
+    fn roleOf(self: *Formatter, t: cst.Token) Role {
+        return self.roles.get(t.offset) orelse .none;
+    }
 };
+
+/// Whether a token ends a complete operand — used to tell a postfix
+/// `(`/`[` (call/index, tight) from a grouping paren / list literal
+/// (spaced), and a binary `-` from a prefix one.
+fn endsOperand(kind: cst.SyntaxKind, role: Role) bool {
+    return switch (kind) {
+        .IDENT, .INT_LIT, .FLOAT_LIT, .STR_PLAIN, .STR_RAW, .NUM_SUFFIX, .R_PAREN, .R_BRACK, .QUESTION, .KW_TRUE, .KW_FALSE => true,
+        .R_ANGLE, .SHR => role == .generic, // `Vec<T>(` — a type used as a value
+        else => false,
+    };
+}
+
+/// Canonical spacing decision for an adjacent token pair on one line:
+/// `true` = exactly one space between them, `false` = none. The three
+/// context-sensitive tokens (`< >`, prefix sigils, lambda `|`) are
+/// resolved via `Role`, so the rest is a pure kind-based table. Default
+/// is one space; the switches carve out the tight cases.
+fn wantSpace(pk: cst.SyntaxKind, pr: Role, ck: cst.SyntaxKind, cr: Role) bool {
+    // Tight just inside `(` and `[` (but not `{ … }` — record/block
+    // braces keep inner spaces: `Color { r: 0 }`, `{ 42 }`).
+    if (pk == .L_PAREN or pk == .L_BRACK) return false;
+    if (ck == .R_PAREN or ck == .R_BRACK) return false;
+
+    // No space before these.
+    switch (ck) {
+        .COMMA, .SEMICOLON, .COLON, .QUESTION, .DOT, .QUESTION_DOT, .COLON_COLON, .DOT_DOT, .DOT_DOT_EQ, .NUM_SUFFIX => return false,
+        else => {},
+    }
+    // No space after these.
+    switch (pk) {
+        .DOT, .QUESTION_DOT, .COLON_COLON, .DOT_DOT, .DOT_DOT_EQ, .AT, .STR_PREFIX => return false,
+        else => {},
+    }
+
+    // Prefix sigil: `-x`, `!x`, `~x` (but `ref x` / `move x` keep a space).
+    if (pr == .unary and (pk == .MINUS or pk == .BANG or pk == .TILDE)) return false;
+
+    // Generic angle delimiters hug the type: `Vec<T>`, `Map<K, V>>`.
+    if (pr == .generic and pk == .L_ANGLE) return false; // `<T`
+    if (cr == .generic and (ck == .L_ANGLE or ck == .R_ANGLE or ck == .SHR)) return false; // `Vec<`, `T>`, `V>>`
+
+    // Lambda parameter delimiters hug the params: `|x|`.
+    if (pr == .lambda_open) return false; // `|x`
+    if (cr == .lambda_close) return false; // `x|`
+
+    // Postfix call / index (`foo(`, `a[`) — from the CST role — or a
+    // declaration's parameter/tuple list, where the bracket hugs a
+    // name/operand (`fn f(`, `Id(i64)`).
+    if ((ck == .L_PAREN or ck == .L_BRACK) and (cr == .postfix or endsOperand(pk, pr))) return false;
+
+    return true;
+}
 
 // ===================================================================
 // Tests
@@ -350,14 +544,49 @@ test "strips trailing whitespace and adds a final newline" {
     );
 }
 
-test "collapses interior whitespace runs to a single space" {
+test "re-spaces to a canonical single style" {
+    // Extra spaces collapse; tight `foo(x)`; binary operators get spaces.
     try expectFmt(
         "fn   main {\n    env.out(   \"x\"   )\n}\n",
-        "fn main {\n    env.out( \"x\" )\n}\n",
+        "fn main {\n    env.out(\"x\")\n}\n",
     );
-    // Zero- and single-space boundaries are left alone (no operator
-    // disambiguation needed): `x=1+2` and `foo(` keep their adjacency.
-    try expectFmt("fn f {\n    let x=1+2\n}\n", "fn f {\n    let x=1+2\n}\n");
+    try expectFmt("fn f {\n    let x=1+2*3\n}\n", "fn f {\n    let x = 1 + 2 * 3\n}\n");
+}
+
+test "spacing: calls, indexing, member access, annotations" {
+    try expectFmt(
+        "@stage\nfn f {\n    let y = a . b . c ( xs [ 0 ] , 1 )\n}\n",
+        "@stage\nfn f {\n    let y = a.b.c(xs[0], 1)\n}\n",
+    );
+}
+
+test "spacing: generics stay tight, comparisons get spaces" {
+    // `<` inside a generic hugs; `<` as less-than is spaced.
+    try expectFmt(
+        "pub fn f<T: Display>(xs: [T]) -> Vec<T> {\n    xs\n}\n",
+        "pub fn f<T: Display>(xs: [T]) -> Vec<T> {\n    xs\n}\n",
+    );
+    try expectFmt("fn f {\n    let b = a<c\n}\n", "fn f {\n    let b = a < c\n}\n");
+}
+
+test "spacing: prefix minus vs binary minus" {
+    try expectFmt("fn f {\n    let a = -x\n}\n", "fn f {\n    let a = -x\n}\n");
+    try expectFmt("fn f {\n    let a = x - y\n}\n", "fn f {\n    let a = x - y\n}\n");
+    try expectFmt("fn f {\n    let a = x*-y\n}\n", "fn f {\n    let a = x * -y\n}\n");
+}
+
+test "spacing: colon and type annotation" {
+    try expectFmt(
+        "pub struct P { x:i64,y:i64 }\n",
+        "pub struct P { x: i64, y: i64 }\n",
+    );
+}
+
+test "spacing: lambda pipes hug their params" {
+    try expectFmt(
+        "fn f {\n    xs.map(| v | v + 1)\n}\n",
+        "fn f {\n    xs.map(|v| v + 1)\n}\n",
+    );
 }
 
 test "preserves comments (line, doc, trailing)" {
