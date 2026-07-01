@@ -6229,7 +6229,24 @@ fn buildArrayLit(b: *Builder, ae: ast.ArrayExpr, scope: *Scope) BuildError!struc
     defer elems.deinit(b.a);
     var it = ae.elements();
     while (it.next()) |el| try elems.append(b.a, el);
-    if (elems.items.len == 0) return error.Unsupported;
+    if (elems.items.len == 0) {
+        // Empty literal (`[]`): no elements to infer from. Emit a well-formed
+        // zero-length array — with no data the element type/stride are inert, so
+        // default to i64/8B for a valid header. This is what an empty params
+        // array (`env.db.query(sql, [])`, `env.db.execute(sql, [])`) lowers to; a
+        // typed empty literal from a param/annotation can refine the elem type
+        // later. (Was: `error.Unsupported` — a hard Q9002 on any `[]`.)
+        var empty_inits: std.ArrayList(*hir.Expr) = .empty;
+        const out = try b.a.create(hir.Expr);
+        out.* = .{ .array_lit = .{
+            .stride = 8,
+            .alignment = 8,
+            .elem_ty = .i64,
+            .copy_bytes = null,
+            .inits = try empty_inits.toOwnedSlice(b.a),
+        } };
+        return .{ .e = out, .count = 0, .stride = 8, .elem = .{ .scalar = .i64 } };
+    }
 
     var inits: std.ArrayList(*hir.Expr) = .empty;
     // Record elements?
