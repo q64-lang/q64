@@ -249,6 +249,21 @@ fn buildRoles(gpa: std.mem.Allocator, node: *const cst.Node, in_generic: bool, m
     };
 }
 
+/// A row's alignment tab-stops in ascending order (`eq` before `cmt`),
+/// written into `buf` and returned as a slice.
+fn rowStops(r: Row, buf: *[2]usize) []usize {
+    var n: usize = 0;
+    if (r.eq) |e| {
+        buf[n] = e;
+        n += 1;
+    }
+    if (r.cmt) |c| {
+        buf[n] = c;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 fn isOpener(k: cst.SyntaxKind) bool {
     return switch (k) {
         .L_PAREN, .L_BRACE, .L_BRACK => true,
@@ -263,12 +278,26 @@ fn isCloser(k: cst.SyntaxKind) bool {
     };
 }
 
+/// One formatted line, held until the alignment pass can look across a
+/// block of them. `text` is the canonically-spaced content (no leading
+/// indent, no trailing newline). `eq`/`cmt` are byte offsets of the
+/// alignment tab-stops within `text`: a depth-0 assignment `=` and the
+/// start of a trailing line comment. A `blank` row separates blocks.
+const Row = struct {
+    blank: bool = false,
+    indent: usize = 0,
+    text: []u8 = &.{},
+    eq: ?usize = null,
+    cmt: ?usize = null,
+};
+
 const Formatter = struct {
     toks: []const cst.Token,
     gpa: std.mem.Allocator,
     roles: *const RoleMap,
     i: usize = 0,
     out: std.ArrayList(u8) = .empty,
+    rows: std.ArrayList(Row) = .empty,
     /// One entry per currently-open bracket: the indent level of the
     /// line that opened it. The innermost entry (top) drives the indent
     /// of the lines inside it.
@@ -281,11 +310,79 @@ const Formatter = struct {
 
     fn deinit(self: *Formatter) void {
         self.out.deinit(self.gpa);
+        for (self.rows.items) |r| self.gpa.free(r.text);
+        self.rows.deinit(self.gpa);
         self.stack.deinit(self.gpa);
     }
 
     fn run(self: *Formatter) !void {
         while (self.i < self.toks.len) try self.formatLine();
+        try self.alignRows();
+        try self.serialize();
+    }
+
+    /// Tabwriter pass. Aligns the tab-stops (`=`, trailing comments) of
+    /// each maximal run of consecutive content rows that share the same
+    /// indent *and* the same shape (same set of tab-stops). Rows with no
+    /// tab-stop, blank rows, and indent changes all break a run, so an
+    /// assignment column never spills across an unrelated line.
+    fn alignRows(self: *Formatter) !void {
+        var i: usize = 0;
+        while (i < self.rows.items.len) {
+            const r = self.rows.items[i];
+            if (r.blank or (r.eq == null and r.cmt == null)) {
+                i += 1;
+                continue;
+            }
+            var j = i + 1;
+            while (j < self.rows.items.len) : (j += 1) {
+                const s = self.rows.items[j];
+                if (s.blank or s.indent != r.indent) break;
+                if ((s.eq != null) != (r.eq != null)) break;
+                if ((s.cmt != null) != (r.cmt != null)) break;
+            }
+            if (j - i > 1) try self.alignBlock(self.rows.items[i..j]);
+            i = j;
+        }
+    }
+
+    /// Align one block of same-shape rows. For each tab-stop column, the
+    /// cell before it is padded to the widest such cell in the block, plus
+    /// the single canonical space. The final cell (after the last stop) is
+    /// free. A one-row block is a no-op (width == its own cell), so the gap
+    /// is exactly the canonical single space.
+    fn alignBlock(self: *Formatter, block: []Row) !void {
+        var stops: [2]usize = undefined;
+
+        // Column widths = max trimmed-prefix width across the block.
+        var widths = [2]usize{ 0, 0 };
+        for (block) |r| {
+            const s = rowStops(r, &stops);
+            var start: usize = 0;
+            for (s, 0..) |off, k| {
+                const w = std.mem.trimEnd(u8, r.text[start..off], " ").len;
+                if (w > widths[k]) widths[k] = w;
+                start = off;
+            }
+        }
+
+        // Rebuild each row's text with padded columns.
+        for (block) |*r| {
+            const s = rowStops(r.*, &stops);
+            var rebuilt: std.ArrayList(u8) = .empty;
+            errdefer rebuilt.deinit(self.gpa);
+            var start: usize = 0;
+            for (s, 0..) |off, k| {
+                const cell = std.mem.trimEnd(u8, r.text[start..off], " ");
+                try rebuilt.appendSlice(self.gpa, cell);
+                try rebuilt.appendNTimes(self.gpa, ' ', widths[k] - cell.len + 1);
+                start = off;
+            }
+            try rebuilt.appendSlice(self.gpa, r.text[start..]); // free final cell
+            const owned = try rebuilt.toOwnedSlice(self.gpa);
+            self.gpa.free(r.text);
+            r.text = owned;
+        }
     }
 
     /// Consume one logical line (tokens up to and including the next
@@ -341,29 +438,25 @@ const Formatter = struct {
         else
             0;
 
-        try self.emitLine(disp, line);
+        try self.recordLine(disp, line);
         self.updateNesting(disp, line);
     }
 
-    /// Emit one content line: collapsed blank(s), indentation, the
-    /// line's content (interior spacing preserved, trailing stripped),
-    /// and a single `\n`.
-    fn emitLine(self: *Formatter, disp: usize, line: []const cst.Token) !void {
-        if (self.wrote_content and self.pending_blanks > 0) {
-            // Collapse any run of blank lines to exactly one.
-            try self.out.append(self.gpa, '\n');
-        }
-        self.pending_blanks = 0;
-
-        // Build the line body from the significant/comment tokens,
-        // inserting canonical spacing between each adjacent pair (leading
-        // whitespace is replaced by computed indentation). Original
-        // whitespace tokens are dropped — spacing is decided from token
-        // kinds and CST-resolved roles, so it is uniform regardless of
-        // how the author spaced the input.
+    /// Build the canonically-spaced text for one content line and push it
+    /// as a `Row` (deferring output until the alignment pass). Records the
+    /// alignment tab-stops — a depth-0 assignment `=` and a trailing line
+    /// comment — as byte offsets into the text.
+    fn recordLine(self: *Formatter, disp: usize, line: []const cst.Token) !void {
+        // Build the body from the significant/comment tokens, inserting
+        // canonical spacing between each adjacent pair (leading whitespace
+        // is replaced by the computed indent). Original whitespace tokens
+        // are dropped — spacing is decided from token kinds and CST roles.
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(self.gpa);
         var prev: ?cst.Token = null;
+        var depth: usize = 0;
+        var eq: ?usize = null;
+        var cmt: ?usize = null;
         for (line) |t| {
             if (t.kind == .WHITESPACE) continue; // spacing is recomputed
             if (prev) |p| {
@@ -371,19 +464,52 @@ const Formatter = struct {
                     try body.append(self.gpa, ' ');
                 }
             }
+            // Tab-stops (recorded before the token's own text is appended,
+            // so the offset points at `=` / `//`).
+            if (t.kind == .EQ and depth == 0 and eq == null) eq = body.items.len;
+            if ((t.kind == .LINE_COMMENT or t.kind == .DOC_COMMENT) and prev != null and cmt == null) {
+                cmt = body.items.len;
+            }
             try body.appendSlice(self.gpa, t.text);
+            if (isOpener(t.kind)) {
+                depth += 1;
+            } else if (isCloser(t.kind) and depth > 0) {
+                depth -= 1;
+            }
             prev = t;
         }
-        // Strip trailing spaces/tabs inside a trailing line comment's own
-        // text (interior bytes are never touched, so multi-line raw-string
-        // contents are preserved exactly).
+        // Strip trailing spaces/tabs (also trims inside a trailing line
+        // comment; interior bytes are never touched, so raw-string
+        // contents survive exactly).
         const trimmed = std.mem.trimEnd(u8, body.items, " \t");
         if (trimmed.len == 0) return; // nothing but whitespace after all
 
-        try self.appendIndent(disp);
-        try self.out.appendSlice(self.gpa, trimmed);
-        try self.out.append(self.gpa, '\n');
+        // Collapse deferred blank lines to one (never at file start).
+        if (self.wrote_content and self.pending_blanks > 0) {
+            try self.rows.append(self.gpa, .{ .blank = true });
+        }
+        self.pending_blanks = 0;
+
+        try self.rows.append(self.gpa, .{
+            .indent = disp,
+            .text = try self.gpa.dupe(u8, trimmed),
+            .eq = eq,
+            .cmt = cmt,
+        });
         self.wrote_content = true;
+    }
+
+    /// Emit the collected rows: indentation + text + newline.
+    fn serialize(self: *Formatter) !void {
+        for (self.rows.items) |r| {
+            if (r.blank) {
+                try self.out.append(self.gpa, '\n');
+                continue;
+            }
+            try self.appendIndent(r.indent);
+            try self.out.appendSlice(self.gpa, r.text);
+            try self.out.append(self.gpa, '\n');
+        }
     }
 
     /// Update the bracket stack from this line's brackets. Every opener
@@ -528,6 +654,40 @@ test "adjacent closers that match non-adjacent openers stay balanced" {
         "fn f {\nx.map(|v| if v { g(0) } else { v })\n}\n",
         "fn f {\n    x.map(|v| if v { g(0) } else { v })\n}\n",
     );
+}
+
+test "aligns consecutive assignments" {
+    try expectFmt(
+        "fn f {\n    let x = 1\n    let yyy = 2\n    let zz = 3\n}\n",
+        "fn f {\n    let x   = 1\n    let yyy = 2\n    let zz  = 3\n}\n",
+    );
+}
+
+test "alignment blocks break at a blank line, a non-assignment, and indent" {
+    // The `foo()` line breaks the `=` column; the two groups align
+    // independently.
+    try expectFmt(
+        "fn f {\n    let a = 1\n    let bbb = 2\n    foo()\n    let c = 3\n}\n",
+        "fn f {\n    let a   = 1\n    let bbb = 2\n    foo()\n    let c = 3\n}\n",
+    );
+}
+
+test "aligns trailing comments" {
+    try expectFmt(
+        "fn f {\n    foo() // a\n    barbar() // b\n}\n",
+        "fn f {\n    foo()    // a\n    barbar() // b\n}\n",
+    );
+}
+
+test "aligns `=` and trailing comments together" {
+    try expectFmt(
+        "fn f {\n    let x = 1 // one\n    let yyy = 22 // two\n}\n",
+        "fn f {\n    let x   = 1  // one\n    let yyy = 22 // two\n}\n",
+    );
+}
+
+test "a single assignment is left with one space (no spurious gap)" {
+    try expectFmt("fn f {\n    let x = 1\n}\n", "fn f {\n    let x = 1\n}\n");
 }
 
 test "collapses blank lines and strips leading/trailing ones" {

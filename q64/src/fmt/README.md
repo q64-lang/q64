@@ -2,10 +2,10 @@
 
 The `q64 fmt` formatter.
 
-> **Status: v0 implemented — reindent + canonical spacing.** The engine
-> is `fmt.zig`; the CLI wiring (`q64 fmt [path] [--stdout|--check|--lint]`)
-> is in `../main.zig`. See [`spec/q64-cli.md`](../../../spec/q64-cli.md)
-> §"`q64 fmt`".
+> **Status: v0 implemented — reindent + canonical spacing + column
+> alignment.** The engine is `fmt.zig`; the CLI wiring
+> (`q64 fmt [path] [--stdout|--check|--lint]`) is in `../main.zig`. See
+> [`spec/q64-cli.md`](../../../spec/q64-cli.md) §"`q64 fmt`".
 
 ## What v0 does
 
@@ -23,6 +23,13 @@ token stream the parser produces:
   — `< >` (generic vs comparison), a leading sigil (`-x` vs `a - b`), and
   `|` (lambda vs bit-or) — are disambiguated from the **CST**, not from
   fragile token heuristics.
+- **Column alignment** (tabwriter) — a maximal run of consecutive lines
+  at the same indent that share a *shape* has its columns aligned:
+  consecutive assignments align their `=`, and trailing `//` comments
+  align. A blank line, an indent change, or a differently-shaped line
+  breaks the run, so a column never spills across unrelated code. Runs
+  operate on the canonically-spaced text, so alignment is idempotent (a
+  re-format collapses the padding to single spaces, then re-adds it).
 - **Vertical whitespace** — runs of blank lines collapse to one; leading
   blank lines are dropped; the file ends with exactly one newline.
 - **Trailing whitespace** — stripped from every line (including inside a
@@ -47,8 +54,10 @@ every `.q` file in the repo (0 token mismatches, 0 non-idempotent).
 
 Future slices, each still inside the safety invariant:
 
-- **Alignment** — no tabwriter, so hand-aligned columns are collapsed to
-  single spaces rather than reproduced.
+- **Grid alignment of comma-separated rows** — consecutive record/array
+  rows (`Color { r: 255, g: 0, b: 0 },` …) don't yet have their per-field
+  columns aligned; only `=` and trailing comments do. (The single-column
+  tabwriter is in place; this is the multi-column extension.)
 - **Trailing-comma normalization.**
 - **Continuation-line indentation** for bracket-free wrapped lines (e.g.
   a `-> ReturnType` on its own line under a `fn` signature — v0 leaves it
