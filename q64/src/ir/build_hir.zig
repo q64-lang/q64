@@ -827,11 +827,11 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
             // A scalar element loads into `x`; a record element binds `x`
             // to the element's inline address (B2b's record-ptr ABI), so
             // `x.fmt()` dispatches and `x.field` reads work in the body.
-            const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            const pat_txt = (try forLoopVarName(b, fs, scope)) orelse return error.Unsupported;
             const iter = fs.iterable() orelse return error.Unsupported;
             // `for i in lo..hi { … }` — a counted range loop.
             if (iter == .range) {
-                try buildForRange(b, fs, iter.range, pat.text, scope, rt, out);
+                try buildForRange(b, fs, iter.range, pat_txt, scope, rt, out);
                 return;
             }
             // `for _press in presses() { … }` — a host event stream (HOST SEAM
@@ -852,14 +852,14 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 return;
             }
             if (scope.vecs.contains(iname)) {
-                try buildForVec(b, fs, iname, pat.text, scope, rt, out);
+                try buildForVec(b, fs, iname, pat_txt, scope, rt, out);
                 return;
             }
             const ai = scope.arrs.get(iname) orelse return error.Unsupported;
 
             // i (hidden) and x occupy fresh main locals.
             scope.next_idx = @intCast(b.cur_locals.items.len);
-            const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{pat.text});
+            const hidden = try std.fmt.allocPrint(b.a, "{s}#idx", .{pat_txt});
             const i_idx = try scope.declare(hidden, true, .i64);
             try b.cur_locals.append(b.a, .i64);
             const x_ty: hir.Type = switch (ai.elem) {
@@ -867,9 +867,9 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 .rec => .ptr,
             };
             scope.next_idx = @intCast(b.cur_locals.items.len);
-            const x_idx = try scope.declare(pat.text, false, x_ty);
+            const x_idx = try scope.declare(pat_txt, false, x_ty);
             try b.cur_locals.append(b.a, x_ty);
-            if (ai.elem == .rec) try scope.recs.put(b.a, pat.text, ai.elem.rec);
+            if (ai.elem == .rec) try scope.recs.put(b.a, pat_txt, ai.elem.rec);
 
             // let i = 0
             {
@@ -1734,6 +1734,18 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
     return ntasks >= 2 and needs;
 }
 
+/// The counted-for loop variable's name: an ident binding's text, or a fresh
+/// hidden name for the `_` wildcard (which binds nothing — the loop still
+/// needs its counter local, the body just can't reference it). `null` for
+/// structured patterns.
+fn forLoopVarName(b: *Builder, fs: ast.ForStmt, scope: *const Scope) BuildError!?[]const u8 {
+    const pat = fs.pattern() orelse return null;
+    if (pat.bindingName()) |t| return t.text;
+    if (pat.kind() == .WILD_PATTERN)
+        return try std.fmt.allocPrint(b.a, "#wild{d}", .{scope.locals.items.len});
+    return null;
+}
+
 fn mkLocalE(b: *Builder, idx: u32, ty: hir.Type) BuildError!*hir.Expr {
     const e = try b.a.create(hir.Expr);
     e.* = .{ .local = .{ .idx = idx, .ty = ty } };
@@ -1928,12 +1940,11 @@ const ItemSpan = struct { entry: usize, exit_id: usize, exit_alt: bool, fixed: b
 fn lowerForLoop(ctx: *SchedCtx, fs: ast.ForStmt) BuildError!struct { head: usize, exit: usize } {
     const b = ctx.b;
     const range = (fs.iterable() orelse return error.Unsupported).range;
-    const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
     const lo_e = try buildIntExpr(b, range.lo() orelse return error.Unsupported, ctx.scope);
     const hi_e = try buildIntExpr(b, range.hi() orelse return error.Unsupported, ctx.scope);
     // The counter binds the source name (so the body's uses resolve); a `_`
-    // loop gets a fresh hidden name.
-    const iname = if (std.mem.eql(u8, pat.text, "_")) try std.fmt.allocPrint(b.a, "#schi{d}", .{ctx.blocks.items.len}) else pat.text;
+    // wildcard gets a fresh hidden name from forLoopVarName.
+    const iname = (try forLoopVarName(b, fs, ctx.scope)) orelse return error.Unsupported;
     const hi_name = try std.fmt.allocPrint(b.a, "{s}#schi_hi{d}", .{ iname, ctx.blocks.items.len });
     const hi_idx = try declareBodyLocal(b, ctx.scope, hi_name, false, .i64);
     const i_idx = try declareBodyLocal(b, ctx.scope, iname, true, .i64);
@@ -9394,14 +9405,14 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         },
         .loop_stmt => |lp| out.* = .{ .loop_ = try buildIntBlock(b, lp.body() orelse return error.Unsupported, scope) },
         .for_stmt => |fs| {
-            const pat = (fs.pattern() orelse return error.Unsupported).bindingName() orelse return error.Unsupported;
+            const pat_txt = (try forLoopVarName(b, fs, scope)) orelse return error.Unsupported;
             const iter = fs.iterable() orelse return error.Unsupported;
-            if (iter == .range) return buildIntForRange(b, fs, iter.range, pat.text, scope);
+            if (iter == .range) return buildIntForRange(b, fs, iter.range, pat_txt, scope);
             // `for x in xs` over a vec parameter/binding.
             if (iter == .path) {
                 const nm = try iter.path.text(b.a);
                 defer b.a.free(nm);
-                if (scope.vecs.contains(nm)) return buildIntForVec(b, fs, nm, pat.text, scope);
+                if (scope.vecs.contains(nm)) return buildIntForVec(b, fs, nm, pat_txt, scope);
             }
             return error.Unsupported; // array `for` in a callee body: a follow-on
         },
@@ -11899,6 +11910,30 @@ test "scope scheduling: a consumer spawned before its producer is deferred to th
     const push2 = std.mem.indexOf(u8, dump2, "vec_push") orelse return error.TestUnexpectedResult;
     const get2 = std.mem.indexOf(u8, dump2, "vec_get") orelse return error.TestUnexpectedResult;
     try testing.expect(push2 < get2);
+}
+
+test "for _ in lo..hi: the wildcard loop variable binds a hidden counter" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // In main position, in a task body under the scheduler, and with the
+    // destructured channel form — the shape that first surfaced the gap.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    for _ in 1..3 { env.out("x") }
+        \\    scope {
+        \\        let (tx, rx) = channel<i64>(2)
+        \\        spawn { for i in 1..4 { env.time.sleep_ns(1000) tx.send(i * 10) } }
+        \\        spawn { for _ in 1..4 { let v = rx.recv() env.out(v) } }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null); // the sends
+    try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns()") != null); // the sleep arm
 }
 
 test "scope scheduling: a sleeping task is a timewait suspend point (tasks interleave)" {
