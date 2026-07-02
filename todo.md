@@ -317,8 +317,28 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
             (100ms→1, 300ms→2) awaited and summed print `3` after ~301ms
             (parallel, not 400), and a channel-fed handle task's tail reads
             its prefix locals (`sum = 42`).
-          - [~] **Rung 3 — the async-lifted component export: PROTOCOL
-            PINNED (`test/async-export-reference/`), codegen remaining.**
+          - [x] **Rung 3 — the async-lifted component export: LANDED.**
+            Codegen (`emitAsyncCore`): a SUSPENDING export lifts async — a
+            single pub fn whose body sleeps compiles to the pinned protocol
+            (`[async-lift]`/callback exports, `task.return`, the sleep an
+            async-lowered `wait-for` SUBTASK parked in a waitable-set; all
+            q64 locals in a memory frame at `frame_base + idx*8` so state
+            survives re-entry; segments dispatched on a `state` global in a
+            retry loop, eager-RETURNED short-circuits). Verified end-to-end:
+            `pub fn nap(ns) { t0=now; sleep(ns); now-t0 }` emits a 2.3 KB
+            component whose world is `export nap: async func(ns: s64) ->
+            s64` and measures 200ms→200.7ms under `wasmtime -W
+            component-model-async -S p3 --invoke` — host never blocked.
+            The fixture verify.sh now also drives the q64-compiled path.
+            **v0 boundaries** (fall through to the blocking path, never
+            error): exactly one pub fn; all-i64 params/locals; sleeps at
+            top level only; tail-value form. **Known limits:** one
+            outstanding call per instance (single frame — emit
+            backpressure when concurrent calls matter); runtime needs
+            `-W component-model-async`; `q64 show world` still prints the
+            coarse 0.2 mapping for @time.
+          - _(protocol reference below, kept for the codegen's provenance)_
+            **PROTOCOL PINNED (`test/async-export-reference/`).**
             Two hand-authored cores round-trip the Component Model async
             ABI under `wasmtime -W component-model-async -S p3`: a YIELD
             core proving lift/callback/task.return with zero imports, and

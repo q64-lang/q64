@@ -312,6 +312,12 @@ pub const wasi_clocks_wit = @embedFile("wit/wasi-clocks.wit");
 /// blocking `env.time.sleep_ns` chain needs (see the file header).
 pub const wasi_io_wit = @embedFile("wit/wasi-io.wit");
 
+/// The vendored WASIp3 clocks WIT — wasmtime 45's own file, verbatim (the
+/// p3 interfaces are rc-versioned; importing a bare `@0.3.0` fails
+/// instantiation). Used only by the ASYNC-lifted export path (Slice B
+/// rung 3, `test/async-export-reference/`).
+pub const wasi_clocks_p3_wit = @embedFile("wit/wasi-clocks-p3.wit");
+
 /// The component-model interface ids `env.kv` lowers to (with the version pin).
 /// Core imports use the `cm32p2|<id>` form; the world imports the bare ids.
 pub const kv_store_iface = "wasi:keyvalue/store@0.2.0-draft2";
@@ -338,6 +344,11 @@ pub const clocks_wall_core_mod = "cm32p2|wasi:clocks/wall-clock@0.2";
 /// wasi:io/poll — the pollable `env.time.sleep_ns` blocks on.
 pub const io_poll_iface = "wasi:io/poll@0.2.0";
 pub const io_poll_core_mod = "cm32p2|wasi:io/poll@0.2";
+/// The WASIp3 monotonic clock (async `wait-for`) — rc-pinned to what the
+/// vendored wasmtime provides. The async path uses LEGACY manglings (the
+/// module name is the bare interface id, no cm32p2 prefix): wasm-tools'
+/// standard mangling has no async support yet (see the rung-3 reference).
+pub const clocks_p3_iface = "wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15";
 
 /// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
 /// qube as a component"). A library lifts the import-free, scalar-signature
@@ -438,6 +449,20 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     if (usesEnvOut(&mmod) or usesEnvExit(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
         return .{ .preview1_app = try lowerToWasm(allocator, &mmod, addr, .wasi_preview1, null, false) };
+    }
+
+    // A SUSPENDING export lifts async (Slice B rung 3): a single pub fn whose
+    // body sleeps compiles to the Component Model async ABI — an
+    // `[async-lift]` export + callback, state in a memory frame, the sleep an
+    // async-lowered `wait-for` subtask parked in a waitable-set. The host is
+    // never blocked. Must gate BEFORE the store path (which would grab the
+    // @time use and emit the blocking 0.2 chain instead).
+    if (asyncExportIndex(&mmod)) |afi| {
+        if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
+        const core = try emitAsyncCore(allocator, &mmod, afi);
+        errdefer allocator.free(core);
+        const world = try synthAsyncWorld(allocator, &hmod);
+        return .{ .store_component = .{ .core = core, .world = world } };
     }
 
     // A qube that reaches `env.kv`: lower the core with the canonical
@@ -2077,6 +2102,260 @@ fn usesDbQueryText(m: *const ir.mir.Module) bool {
     return false;
 }
 
+/// Slice B rung 3 — the async-export gate. Non-null when the module is a
+/// single suspending pub fn eligible for the async lift: no entry, exactly
+/// one exported i64 fn (all params/locals i64 — the memory frame is 8-byte
+/// slots), at least one TOP-LEVEL sleep, no nested sleeps, no other
+/// capability faces, tail-value form (no explicit `ret`). Everything the v0
+/// slice can't lift falls through to the ordinary (blocking) store path.
+fn asyncExportIndex(m: *const ir.mir.Module) ?usize {
+    if (m.funcs.len != 1) return null;
+    const f = m.funcs[0];
+    if (!f.exported or f.ret != .i64) return null;
+    for (f.params) |p| if (p != .i64) return null;
+    for (f.locals) |l| if (l != .i64) return null;
+    const root = switch (f.body) {
+        .structured => |x| x,
+        .cfg => return null,
+    };
+    const items = switch (root.op) {
+        .block => |xs| xs,
+        else => return null,
+    };
+    if (items.len == 0) return null;
+    var top_sleeps: usize = 0;
+    for (items) |it| {
+        if (it.op == .time_sleep_ns) {
+            top_sleeps += 1;
+            continue;
+        }
+        if (it.op == .ret) return null; // tail-value form only (v0)
+        var sc = Scratch{};
+        scanScratch(it, &sc);
+        if (sc.has_time_sleep) return null; // a suspend nested in control flow: not v0
+        // Only the monotonic clock read may ride along; any other face (or
+        // byte I/O) exits to the blocking path.
+        if (sc.host_out or sc.has_kv or sc.has_kv_set or sc.has_kv_get or
+            sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or
+            sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or
+            sc.has_config_get or sc.has_time_res or sc.has_time_wall or
+            sc.has_fs or sc.has_args or sc.has_envvar or sc.has_vec or
+            sc.has_chan or sc.has_take or sc.has_connect or sc.has_presses) return null;
+    }
+    if (top_sleeps == 0) return null;
+    if (items[items.len - 1].ty != .i64) return null; // the tail is the value
+    return 0;
+}
+
+/// Emit the async-lifted core module for the suspending export. The
+/// pinned protocol (test/async-export-reference/): the body splits into
+/// SEGMENTS at its top-level sleeps; a driver dispatches on a `state`
+/// global inside a retry loop; each non-final segment ends by starting
+/// `wait-for(ns)` as an async-lowered SUBTASK — completed-eagerly retries
+/// the loop, otherwise the subtask joins the waitable-set and the driver
+/// returns WAIT(set); the final segment `task.return`s the tail value and
+/// EXITs. All q64 locals live in a memory frame (`frame_base + idx*8`) so
+/// state survives the host's callback re-entries. LEGACY manglings
+/// throughout (standard cm32p2 has no async yet).
+fn emitAsyncCore(allocator: std.mem.Allocator, m: *const ir.mir.Module, fi: usize) ![]u8 {
+    const f = m.funcs[fi];
+    const module = c.BinaryenModuleCreate() orelse return Error.ModuleCreate;
+    defer c.BinaryenModuleDispose(module);
+    const i64_type = c.BinaryenTypeInt64();
+    const i32_type = c.BinaryenTypeInt32();
+    const none_type = c.BinaryenTypeNone();
+    c.BinaryenSetMemory(module, 1, 1, "memory", null, null, null, null, null, 0, false, false, "0");
+
+    // Imports — legacy manglings, per the pinned reference.
+    c.BinaryenAddFunctionImport(module, "p3_now", clocks_p3_iface, "now", none_type, i64_type);
+    c.BinaryenAddFunctionImport(module, "p3_wait_for", clocks_p3_iface, "[async-lower]wait-for", i64_type, i32_type);
+    c.BinaryenAddFunctionImport(module, "ws_new", "$root", "[waitable-set-new]", none_type, i32_type);
+    var jp = [_]c.BinaryenType{ i32_type, i32_type };
+    c.BinaryenAddFunctionImport(module, "w_join", "$root", "[waitable-join]", c.BinaryenTypeCreate(&jp, jp.len), none_type);
+    c.BinaryenAddFunctionImport(module, "subtask_drop", "$root", "[subtask-drop]", i32_type, none_type);
+    const tr_name = try std.fmt.allocPrintSentinel(allocator, "[task-return]{s}", .{f.name}, 0);
+    defer allocator.free(tr_name);
+    c.BinaryenAddFunctionImport(module, "task_return", "[export]$root", tr_name.ptr, i64_type, none_type);
+
+    // State that must survive re-entry: the segment index, the parked
+    // subtask, the (lazily created) waitable-set.
+    _ = c.BinaryenAddGlobal(module, "state", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(0)));
+    _ = c.BinaryenAddGlobal(module, "subtask", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(0)));
+    _ = c.BinaryenAddGlobal(module, "ws", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
+
+    // Split the body into segments at the top-level sleeps.
+    const root_items = f.body.structured.op.block;
+    const Seg = struct { items: []const *ir.mir.Inst, sleep: ?*ir.mir.Inst };
+    var segs: std.ArrayList(Seg) = .empty;
+    defer segs.deinit(allocator);
+    var start: usize = 0;
+    for (root_items, 0..) |it, i| {
+        if (it.op == .time_sleep_ns) {
+            try segs.append(allocator, .{ .items = root_items[start..i], .sleep = it.op.time_sleep_ns.ns });
+            start = i + 1;
+        }
+    }
+    try segs.append(allocator, .{ .items = root_items[start..], .sleep = null });
+
+    var host_imports: std.StringHashMapUnmanaged([*:0]const u8) = .empty;
+    defer host_imports.deinit(allocator);
+    var foreign_imports: std.StringHashMapUnmanaged([*:0]const u8) = .empty;
+    defer foreign_imports.deinit(allocator);
+    var lw = Lowerer{
+        .allocator = allocator,
+        .module = module,
+        .funcs = m.funcs,
+        .i64_type = i64_type,
+        .i32_type = i32_type,
+        .ptr_type = i32_type,
+        .none_type = none_type,
+        .pair_type = none_type, // unused: the gate admits i64-only bodies
+        .pair_idx = 0,
+        .host_imports = &host_imports,
+        .foreign_imports = &foreign_imports,
+        .global_names = &.{},
+        .frame_base = 0, // locals at memory 0.. (params first, then locals)
+        .time_p3 = true,
+    };
+    defer lw.deinit();
+
+    const i32c = struct {
+        fn v(mod: c.BinaryenModuleRef, x: i32) c.BinaryenExpressionRef {
+            return c.BinaryenConst(mod, c.BinaryenLiteralInt32(x));
+        }
+    }.v;
+
+    // The driver: dispatch on `state` in a retry loop. Every arm terminates
+    // (br to retry, or return), so the trailing unreachable never runs.
+    var arms: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+    defer arms.deinit(allocator);
+    for (segs.items, 0..) |seg, k| {
+        var body: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer body.deinit(allocator);
+        const is_last = (k == segs.items.len - 1);
+        const stmt_count = if (is_last) seg.items.len - 1 else seg.items.len;
+        for (seg.items[0..stmt_count]) |it| {
+            const e = try lw.inst(it);
+            body.append(allocator, if (it.ty == .void) e else c.BinaryenDrop(module, e)) catch return Error.OutOfMemory;
+        }
+        if (seg.sleep) |ns_inst| {
+            // st = wait-for(ns); state = k+1;
+            // eager RETURNED (2) → retry the dispatch loop;
+            // else park: subtask = st>>4; ws ||= new; join; return WAIT|ws<<4.
+            var wf_args = [_]c.BinaryenExpressionRef{try lw.inst(ns_inst)};
+            try body.append(allocator, c.BinaryenLocalSet(module, 0, c.BinaryenCall(module, "p3_wait_for", @ptrCast(&wf_args), wf_args.len, i32_type)));
+            try body.append(allocator, c.BinaryenGlobalSet(module, "state", i32c(module, @intCast(k + 1))));
+            try body.append(allocator, c.BinaryenIf(
+                module,
+                c.BinaryenBinary(module, c.BinaryenEqInt32(), c.BinaryenBinary(module, c.BinaryenAndInt32(), c.BinaryenLocalGet(module, 0, i32_type), i32c(module, 0xf)), i32c(module, 2)),
+                c.BinaryenBreak(module, "again", null, null),
+                null,
+            ));
+            try body.append(allocator, c.BinaryenGlobalSet(module, "subtask", c.BinaryenBinary(module, c.BinaryenShrUInt32(), c.BinaryenLocalGet(module, 0, i32_type), i32c(module, 4))));
+            try body.append(allocator, c.BinaryenIf(
+                module,
+                c.BinaryenBinary(module, c.BinaryenLtSInt32(), c.BinaryenGlobalGet(module, "ws", i32_type), i32c(module, 0)),
+                c.BinaryenGlobalSet(module, "ws", c.BinaryenCall(module, "ws_new", null, 0, i32_type)),
+                null,
+            ));
+            var join_args = [_]c.BinaryenExpressionRef{ c.BinaryenGlobalGet(module, "subtask", i32_type), c.BinaryenGlobalGet(module, "ws", i32_type) };
+            try body.append(allocator, c.BinaryenCall(module, "w_join", @ptrCast(&join_args), join_args.len, none_type));
+            try body.append(allocator, c.BinaryenReturn(module, c.BinaryenBinary(module, c.BinaryenOrInt32(), i32c(module, 2), c.BinaryenBinary(module, c.BinaryenShlInt32(), c.BinaryenGlobalGet(module, "ws", i32_type), i32c(module, 4)))));
+        } else {
+            // The final segment: deliver the tail value, EXIT.
+            var tr_args = [_]c.BinaryenExpressionRef{try lw.inst(seg.items[seg.items.len - 1])};
+            try body.append(allocator, c.BinaryenCall(module, "task_return", @ptrCast(&tr_args), tr_args.len, none_type));
+            try body.append(allocator, c.BinaryenReturn(module, i32c(module, 0)));
+        }
+        const arm_body = c.BinaryenBlock(module, null, @ptrCast(body.items.ptr), @intCast(body.items.len), c.BinaryenTypeAuto());
+        try arms.append(allocator, c.BinaryenIf(
+            module,
+            c.BinaryenBinary(module, c.BinaryenEqInt32(), c.BinaryenGlobalGet(module, "state", i32_type), i32c(module, @intCast(k))),
+            arm_body,
+            null,
+        ));
+    }
+    try arms.append(allocator, c.BinaryenUnreachable(module));
+    const dispatch = c.BinaryenBlock(module, null, @ptrCast(arms.items.ptr), @intCast(arms.items.len), c.BinaryenTypeAuto());
+    const drive_body = c.BinaryenLoop(module, "again", dispatch);
+    var drive_vars = [_]c.BinaryenType{i32_type}; // local 0: the packed wait-for status
+    _ = c.BinaryenAddFunction(module, "drive", none_type, i32_type, @ptrCast(&drive_vars), drive_vars.len, drive_body);
+
+    // The lift: spill params into the frame, reset the re-entry state, drive.
+    {
+        var items: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer items.deinit(allocator);
+        for (0..f.params.len) |pi| {
+            try items.append(allocator, c.BinaryenStore(module, 8, @intCast(pi * 8), 0, i32c(module, 0), c.BinaryenLocalGet(module, @intCast(pi), i64_type), i64_type, "0"));
+        }
+        try items.append(allocator, c.BinaryenGlobalSet(module, "state", i32c(module, 0)));
+        try items.append(allocator, c.BinaryenGlobalSet(module, "ws", i32c(module, -1)));
+        try items.append(allocator, c.BinaryenReturn(module, c.BinaryenCall(module, "drive", null, 0, i32_type)));
+        const lift_body = c.BinaryenBlock(module, null, @ptrCast(items.items.ptr), @intCast(items.items.len), c.BinaryenTypeAuto());
+        const ptypes = try allocator.alloc(c.BinaryenType, f.params.len);
+        defer allocator.free(ptypes);
+        for (ptypes) |*t| t.* = i64_type;
+        const ptype = if (f.params.len > 0) c.BinaryenTypeCreate(ptypes.ptr, @intCast(ptypes.len)) else none_type;
+        _ = c.BinaryenAddFunction(module, "lift", ptype, i32_type, null, 0, lift_body);
+        const lift_export = try std.fmt.allocPrintSentinel(allocator, "[async-lift]{s}", .{f.name}, 0);
+        defer allocator.free(lift_export);
+        _ = c.BinaryenAddFunctionExport(module, "lift", lift_export.ptr);
+    }
+
+    // The callback: the parked subtask completed — drop it, drive on.
+    {
+        var items: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer items.deinit(allocator);
+        var drop_args = [_]c.BinaryenExpressionRef{c.BinaryenGlobalGet(module, "subtask", i32_type)};
+        try items.append(allocator, c.BinaryenCall(module, "subtask_drop", @ptrCast(&drop_args), drop_args.len, none_type));
+        try items.append(allocator, c.BinaryenReturn(module, c.BinaryenCall(module, "drive", null, 0, i32_type)));
+        const cb_body = c.BinaryenBlock(module, null, @ptrCast(items.items.ptr), @intCast(items.items.len), c.BinaryenTypeAuto());
+        var cbp = [_]c.BinaryenType{ i32_type, i32_type, i32_type };
+        _ = c.BinaryenAddFunction(module, "callback", c.BinaryenTypeCreate(&cbp, cbp.len), i32_type, null, 0, cb_body);
+        const cb_export = try std.fmt.allocPrintSentinel(allocator, "[callback][async-lift]{s}", .{f.name}, 0);
+        defer allocator.free(cb_export);
+        _ = c.BinaryenAddFunctionExport(module, "callback", cb_export.ptr);
+    }
+
+    if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
+    const result = c.BinaryenModuleAllocateAndWrite(module, null);
+    defer if (result.binary) |bin| std.c.free(bin);
+    defer if (result.sourceMap) |s| std.c.free(s);
+    const binary_ptr = result.binary orelse return Error.ModuleInvalid;
+    if (result.binaryBytes == 0) return Error.ModuleInvalid;
+    const src: [*]const u8 = @ptrCast(binary_ptr);
+    const out = try allocator.alloc(u8, result.binaryBytes);
+    @memcpy(out, src[0..result.binaryBytes]);
+    return out;
+}
+
+/// The synthesized world for an async-lifted export: the p3 clock import +
+/// the one `async func` export. Caller owns the slice.
+fn synthAsyncWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "// synthesized WIT world (async-lifted export — Slice B rung 3)\n");
+    try out.appendSlice(allocator, "package q64:qube;\n\nworld qube {\n");
+    try out.print(allocator, "  import {s};\n", .{clocks_p3_iface});
+    for (hmod.funcs) |f| {
+        if (f.visibility != .public) continue;
+        try out.appendSlice(allocator, "  export ");
+        try appendKebab(allocator, &out, f.name);
+        try out.appendSlice(allocator, ": async func(");
+        for (f.params, 0..) |p, i| {
+            if (i > 0) try out.appendSlice(allocator, ", ");
+            try appendKebab(allocator, &out, p.name);
+            try out.appendSlice(allocator, ": ");
+            try out.appendSlice(allocator, witType(p.ty));
+        }
+        try out.appendSlice(allocator, ")");
+        if (f.ret != .void) try out.print(allocator, " -> {s}", .{witType(f.ret)});
+        try out.appendSlice(allocator, ";\n");
+    }
+    try out.appendSlice(allocator, "}\n");
+    return out.toOwnedSlice(allocator);
+}
+
 /// Synthesize the WIT world for a kv qube: it imports `wasi:keyvalue/store` +
 /// `wasi:keyvalue/atomics` (the `env.kv` lowering) and exports each scalar `pub`
 /// function. Named `qube` (the fixed world name the CLI passes to `component
@@ -2786,6 +3065,14 @@ const Lowerer = struct {
     /// `datetime {u64 seconds @0, u32 nanoseconds @8}` record here; the
     /// emitted code folds it to i64 ns since the epoch.
     time_ret: u32 = 0,
+    /// ASYNC-export frame mode (Slice B rung 3): when set, every q64 local
+    /// is an 8-byte slot in linear memory at `frame_base + idx*8` instead of
+    /// a wasm local — so state survives across callback re-entries. Only
+    /// all-i64 bodies enter this mode (the async gate enforces it).
+    frame_base: ?u32 = null,
+    /// async-export clock: `env.time.monotonic_ns` calls the WASIp3 `now`
+    /// import (`p3_now`) instead of the 0.2 cm32p2 one.
+    time_p3: bool = false,
     kv_open_ret: u32 = 0,
     kv_inc_ret: u32 = 0,
     /// kv set/get scratch locals: `kv_hdr_idx` holds the boxed-Result header
@@ -2866,8 +3153,20 @@ const Lowerer = struct {
                 return c.BinaryenUnary(module, op, x);
             },
             .const_i32 => |v| return c.BinaryenConst(module, c.BinaryenLiteralInt32(v)),
-            .local_get => |idx| return c.BinaryenLocalGet(module, idx, self.wty(n.ty)),
-            .local_set => |ls| return c.BinaryenLocalSet(module, ls.idx, try self.inst(ls.value)),
+            .local_get => |idx| {
+                if (self.frame_base) |fb| {
+                    if (n.ty != .i64) return Error.UnsupportedCall; // async frame: i64 only
+                    return c.BinaryenLoad(module, 8, false, fb + idx * 8, 0, self.i64_type, c.BinaryenConst(module, c.BinaryenLiteralInt32(0)), "0");
+                }
+                return c.BinaryenLocalGet(module, idx, self.wty(n.ty));
+            },
+            .local_set => |ls| {
+                if (self.frame_base) |fb| {
+                    if (ls.value.ty != .i64) return Error.UnsupportedCall;
+                    return c.BinaryenStore(module, 8, fb + ls.idx * 8, 0, c.BinaryenConst(module, c.BinaryenLiteralInt32(0)), try self.inst(ls.value), self.i64_type, "0");
+                }
+                return c.BinaryenLocalSet(module, ls.idx, try self.inst(ls.value));
+            },
             .bin => |b| {
                 // Operand type picks the instruction family; the builder
                 // guarantees both sides agree (no implicit conversion).
@@ -3148,7 +3447,7 @@ const Lowerer = struct {
                 // through the reserved cell, loaded back); local mode calls
                 // the raw `env.monotonic_ns` host face. No Result box ever.
                 if (self.time_preview1) return self.p1ClockTime(1);
-                const name: [*:0]const u8 = if (self.time_component) "clocks_monotonic_now" else "env_monotonic_ns";
+                const name: [*:0]const u8 = if (self.time_p3) "p3_now" else if (self.time_component) "clocks_monotonic_now" else "env_monotonic_ns";
                 return c.BinaryenCall(module, name, null, 0, self.i64_type);
             },
             .time_resolution_ns => {
@@ -6076,11 +6375,15 @@ test "emitComponent: env.time lowers to a wasi:clocks component (bare scalar now
 }
 
 test "emitComponent: env.time.sleep_ns lowers to the subscribe/block/drop chain (component) with wasi:io/poll in the world" {
+    // TWO exports keep this out of the async gate (a single suspending pub fn
+    // lifts async instead — see the async test below), so the sleep takes the
+    // sync-blocking 0.2 chain here.
     const src =
         \\pub fn nap(ns: i64) -> i64 {
         \\    env.time.sleep_ns(ns)
         \\    1
         \\}
+        \\pub fn probe() -> i64 { 7 }
     ;
     const artifact = try emitComponent(testing.allocator, src, "nap.q", &.{}, .wasm32, &.{}, null);
     switch (artifact) {
@@ -6115,6 +6418,50 @@ test "emitComponent: a printing main that sleeps lowers to preview1 poll_oneoff"
             try testing.expect(std.mem.indexOf(u8, core, "poll_oneoff") != null);
             try testing.expect(std.mem.indexOf(u8, core, "wasi_snapshot_preview1") != null);
             try testing.expect(std.mem.indexOf(u8, core, "cm32p2") == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: a suspending pub fn lifts ASYNC (callback + task.return, legacy manglings)" {
+    const src =
+        \\pub fn nap(ns: i64) -> i64 {
+        \\    let t0 = env.time.monotonic_ns()
+        \\    env.time.sleep_ns(ns)
+        \\    env.time.monotonic_ns() - t0
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "nap.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[async-lift]nap") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[callback][async-lift]nap") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[task-return]nap") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[async-lower]wait-for") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[waitable-set-new]") != null);
+            // Legacy manglings throughout — no cm32p2, no blocking 0.2 chain.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "pollable") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export nap: async func(ns: s64) -> s64;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, clocks_p3_iface) != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: a NON-suspending clock fn still takes the sync 0.2 path (async gate is narrow)" {
+    const src =
+        \\pub fn mono2() -> i64 { env.time.monotonic_ns() }
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "m2.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:clocks/monotonic-clock@0.2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[async-lift]") == null);
         },
         else => return error.TestUnexpectedResult,
     }

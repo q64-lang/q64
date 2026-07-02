@@ -55,4 +55,23 @@ span="$("$WASMTIME" run -W component-model-async -S p3 --invoke 'nap(250000000)'
   echo "FAIL: nap(250ms) measured $span ns" >&2; exit 1; }
 echo "   nap(250ms) -> measured $span ns, delivered via task.return ✓"
 
+echo "3. q64 codegen: a suspending pub fn compiles to the same protocol"
+Q64="${Q64_BIN:-$repo/q64/zig-out/bin/q64}"
+if [[ -x "$Q64" ]]; then
+  cat > "$work/nap.q" <<'EOF'
+pub fn nap(ns: i64) -> i64 {
+    let t0 = env.time.monotonic_ns()
+    env.time.sleep_ns(ns)
+    env.time.monotonic_ns() - t0
+}
+EOF
+  Q64_WASM_TOOLS="$WT" "$Q64" emit "$work/nap.q" "$work/qnap.wasm" --addr wasm32 --component
+  qspan="$("$WASMTIME" run -W component-model-async -S p3 --invoke 'nap(200000000)' "$work/qnap.component.wasm")"
+  [[ "$qspan" -ge 200000000 && "$qspan" -lt 5000000000 ]] || {
+    echo "FAIL: q64-compiled nap(200ms) measured $qspan ns" >&2; exit 1; }
+  echo "   q64 nap(200ms) -> measured $qspan ns via the async lift ✓"
+else
+  echo "   SKIPPED (q64 not built at $Q64)"
+fi
+
 echo "OK — the async-lifted export protocol round-trips under wasmtime -S p3."
