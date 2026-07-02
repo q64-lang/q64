@@ -13,7 +13,7 @@ world plus these dep packages to a temp dir and shells out to
 | `q64-blob.wit` | `q64:blob@0.2.0-draft2` | `env.blob` | `store` (`open`, bucket methods) |
 | `q64-db.wit` | `q64:db@0.2.0-draft2` | `env.db` | `sql` (`open`, connection methods) |
 | `wasi-config.wit` | `wasi:config@0.2.0-draft` | `env.config` | `store` (`get`) |
-| `wasi-clocks.wit` | `wasi:clocks@0.2.0` | `env.time` | `monotonic-clock` (`now`) |
+| `wasi-clocks.wit` | `wasi:clocks@0.2.0` | `env.time` | `monotonic-clock` (`now`, `resolution`), `wall-clock` (`now`) |
 
 ## Provenance
 
