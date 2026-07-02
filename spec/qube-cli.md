@@ -187,7 +187,10 @@ exchange. With `--token <t>` it stores that token; with no flag it reads one
 | `qube pod logout` | Delete `~/.qube/pods.toml`. |
 
 `qube deploy` resolves its token in order: `--token` → `$QUBEPODS_TOKEN` →
-the saved `qube pod login` credentials.
+the saved `qube pod login` credentials. It resolves the API origin in order:
+`--url` → the origin saved by `qube pod login` → the default
+(`https://api.qubepods.com`) — so after a `qube pod login --url <origin>`,
+a bare `qube deploy` targets that origin.
 
 ### `qube deploy`
 
@@ -212,7 +215,7 @@ at the archive root (no wrapping folder).
 | Flag             | Default                          | Meaning                              |
 |------------------|----------------------------------|--------------------------------------|
 | `--env <name>`   | `production`                     | Target environment.                  |
-| `--url <origin>` | `https://api-stage.qubepods.com` | API origin.                          |
+| `--url <origin>` | login-saved origin, else `https://api.qubepods.com` | API origin.       |
 | `--token <t>`    | `$QUBEPODS_TOKEN`, then `qube pod login` | Bearer token for the deploy API. |
 
 ## `qube web` (v0)

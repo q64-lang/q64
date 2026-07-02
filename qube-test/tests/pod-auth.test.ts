@@ -35,16 +35,23 @@ describe.skipIf(!binaryAvailable())("qube pod auth (login / info / logout)", () 
 
     const podsToml = readFileSync(join(home, "pods.toml"), "utf8");
     expect(podsToml).toContain('token = "qube_test_tok"');
-    expect(podsToml).toContain('[pods."api-stage.qubepods.com"]');
+    expect(podsToml).toContain('[pods."api.qubepods.com"]');
 
     const info = runCli(["pod", "info"], { env: env() });
     expect(info.stdout).toMatch(/Authenticated:\s+yes/);
   });
 
   test("login --url keys the token under the given host", () => {
-    runCli(["pod", "login", "--token", "t", "--url", "https://api.qubepods.com"], { env: env() });
+    runCli(["pod", "login", "--token", "t", "--url", "https://api-stage.qubepods.com"], { env: env() });
     const podsToml = readFileSync(join(home, "pods.toml"), "utf8");
-    expect(podsToml).toContain('[pods."api.qubepods.com"]');
+    expect(podsToml).toContain('[pods."api-stage.qubepods.com"]');
+  });
+
+  test("info reports the login-saved origin as the API", () => {
+    runCli(["pod", "login", "--token", "t", "--url", "https://api-stage.qubepods.com"], { env: env() });
+    const info = runCli(["pod", "info"], { env: env() });
+    expect(info.stdout).toContain("https://api-stage.qubepods.com");
+    expect(info.stdout).toContain("saved by `qube pod login`");
   });
 
   test("logout removes the saved token", () => {
@@ -61,12 +68,12 @@ describe.skipIf(!binaryAvailable())("qube pod auth (login / info / logout)", () 
     const proj = mkdtempSync(join(tmpdir(), "qube-pod-deploy-"));
     try {
       // A minimal manifest so the token check (which runs after manifest
-      // discovery) is reached.
+      // discovery) is reached. `qube deploy` reads the qube's own qube.json5.
       Bun.write(
-        join(proj, "qubepod.jsonc"),
-        '{"name":"x","component":{"wasm":"./x.wasm"}}',
+        join(proj, "qube.json5"),
+        '{"name":"x","project":"p","component":{"wasm":"./x.wasm"}}',
       );
-      const r = runCli(["pod", "deploy"], { env: env(), cwd: proj });
+      const r = runCli(["deploy", "--no-build"], { env: env(), cwd: proj });
       expect(r.exitCode).not.toBe(0);
       expect(r.stderr).toContain("qube pod login");
     } finally {

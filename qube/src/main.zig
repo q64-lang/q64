@@ -3817,6 +3817,9 @@ fn podHelp(io: std.Io) !void {
         \\                         console mints the token; with no --token it is
         \\                         read (pasted) from stdin. Stored in
         \\                         ~/.qube/pods.toml (separate from `qube login`).
+        \\                         The saved --url origin (default
+        \\                         https://api.qubepods.com) becomes the default
+        \\                         API for deploy / hostname / info.
         \\  qube pod info [--url <origin>]
         \\                         Show the provider, API origin, and auth status.
         \\  qube pod logout        Remove the saved qubepods token.
@@ -4093,6 +4096,26 @@ fn readPodToken(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Ma
     return gpa.dupe(u8, text[start..end]);
 }
 
+/// The API origin `qube pod login --url …` saved into pods.toml (the host is
+/// the `[pods."<host>"]` table name; login strips the scheme, so https is
+/// reconstructed here), or null when not logged in. Commands resolve the
+/// origin as: `--url` flag > saved login host > `default_pods_api` — so a
+/// bare `qube deploy` after `qube pod login --url <origin>` targets that
+/// origin (previously the saved host was write-only and the default always
+/// won, silently sending post-login deploys to the default API).
+fn readPodUrl(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) ?[]u8 {
+    const path = podsCredPath(gpa, env) catch return null;
+    defer gpa.free(path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch return null;
+    defer gpa.free(text);
+    const key = "[pods.\"";
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    const start = i + key.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return null;
+    if (end == start) return null;
+    return std.fmt.allocPrint(gpa, "https://{s}", .{text[start..end]}) catch null;
+}
+
 fn cmdPodLogin(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -4182,12 +4205,23 @@ fn cmdPodInfo(
     args_it: *std.process.Args.Iterator,
 ) !void {
     var api_url: []const u8 = default_pods_api;
+    var api_src: []const u8 = "default";
     while (args_it.next()) |a| {
         if (std.mem.eql(u8, a, "--url")) {
             api_url = try flagValue(io, args_it, "--url");
+            api_src = "--url";
         } else {
             try printStderr(io, "qube pod info: unknown flag: {s}\n", .{a});
             std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+    var saved_url: ?[]u8 = null;
+    defer if (saved_url) |u| gpa.free(u);
+    if (std.mem.eql(u8, api_src, "default")) {
+        if (readPodUrl(gpa, io, env)) |u| {
+            saved_url = u;
+            api_url = u;
+            api_src = "saved by `qube pod login`";
         }
     }
 
@@ -4199,12 +4233,13 @@ fn cmdPodInfo(
 
     try printStdout(io,
         \\Provider:       {s}
-        \\API:            {s}
+        \\API:            {s}  ({s})
         \\Authenticated:  {s}
         \\
     , .{
         QubepodsProvider,
         api_url,
+        api_src,
         if (authed) "yes  (token in pods.toml; run `qube pod logout` to clear)" else "no   (run `qube pod login`)",
     });
 }
@@ -4212,7 +4247,7 @@ fn cmdPodInfo(
 // qube deploy  (pack the bundle zip and upload it to qubepods)
 // ---------------------------------------------------------------------------
 
-const default_pods_api = "https://api-stage.qubepods.com";
+const default_pods_api = "https://api.qubepods.com";
 
 /// Strip a leading "./" from a manifest-relative path.
 fn stripDotSlash(s: []const u8) []const u8 {
@@ -4301,7 +4336,8 @@ fn deployHelp(io: std.Io) !void {
         \\
         \\Flags:
         \\  --env <name>     Target environment (default: production).
-        \\  --url <origin>   API origin (default: https://api-stage.qubepods.com).
+        \\  --url <origin>   API origin (default: the origin saved by `qube pod
+        \\                   login`, else https://api.qubepods.com).
         \\  --token <jwt>    Bearer token (or set QUBEPODS_TOKEN).
         \\  --no-build       Skip the manifest `build` command; pack on-disk bytes.
         \\
@@ -4315,6 +4351,7 @@ fn cmdDeploy(
     args_it: *std.process.Args.Iterator,
 ) !void {
     var api_url: []const u8 = default_pods_api;
+    var url_flagged = false;
     var environment_name: []const u8 = "production";
     var token_flag: ?[]const u8 = null;
     var skip_build = false;
@@ -4324,6 +4361,7 @@ fn cmdDeploy(
             return;
         } else if (std.mem.eql(u8, a, "--url")) {
             api_url = try flagValue(io, args_it, "--url");
+            url_flagged = true;
         } else if (std.mem.eql(u8, a, "--env")) {
             environment_name = try flagValue(io, args_it, "--env");
         } else if (std.mem.eql(u8, a, "--token")) {
@@ -4333,6 +4371,16 @@ fn cmdDeploy(
         } else {
             try printStderr(io, "qube deploy: unknown flag: {s}\n", .{a});
             std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    }
+
+    // --url wins; else the origin saved by `qube pod login`; else the default.
+    var saved_url: ?[]u8 = null;
+    defer if (saved_url) |u| gpa.free(u);
+    if (!url_flagged) {
+        if (readPodUrl(gpa, io, env)) |u| {
+            saved_url = u;
+            api_url = u;
         }
     }
 
@@ -4465,7 +4513,7 @@ fn cmdDeploy(
             try writeStderr(io, "qube deploy: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
             std.process.exit(@intFromEnum(ExitCode.registry));
         };
-        token_source = "saved login (~/.qube/pod-token)";
+        token_source = "saved login (~/.qube/pods.toml)";
         saved_token = t;
         break :blk0 t;
     };
@@ -4560,6 +4608,7 @@ fn cmdPodHostname(
     args_it: *std.process.Args.Iterator,
 ) !void {
     var api_url: []const u8 = default_pods_api;
+    var url_flagged = false;
     var token_flag: ?[]const u8 = null;
     var root: []const u8 = "qubepod.app";
     var name_arg: ?[]const u8 = null;
@@ -4576,13 +4625,15 @@ fn cmdPodHostname(
                 \\  <name>           Set the subdomain label (3–63 chars, [a-z0-9-]).
                 \\  --root <root>    qubepod.app (default) or etiamo.app.
                 \\  --clear          Release the current hostname.
-                \\  --url <origin>   API origin (default: api-stage.qubepods.com).
+                \\  --url <origin>   API origin (default: the origin saved by
+                \\                   `qube pod login`, else api.qubepods.com).
                 \\  --token <jwt>    Bearer token (or QUBEPODS_TOKEN / qube pod login).
                 \\
             );
             return;
         } else if (std.mem.eql(u8, a, "--url")) {
             api_url = try flagValue(io, args_it, "--url");
+            url_flagged = true;
         } else if (std.mem.eql(u8, a, "--token")) {
             token_flag = try flagValue(io, args_it, "--token");
         } else if (std.mem.eql(u8, a, "--root")) {
@@ -4594,6 +4645,16 @@ fn cmdPodHostname(
             std.process.exit(@intFromEnum(ExitCode.usage));
         } else {
             name_arg = a;
+        }
+    }
+
+    // --url wins; else the origin saved by `qube pod login`; else the default.
+    var saved_url: ?[]u8 = null;
+    defer if (saved_url) |u| gpa.free(u);
+    if (!url_flagged) {
+        if (readPodUrl(gpa, io, env)) |u| {
+            saved_url = u;
+            api_url = u;
         }
     }
 
@@ -4630,7 +4691,7 @@ fn cmdPodHostname(
             try writeStderr(io, "qube pod hostname: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
             std.process.exit(@intFromEnum(ExitCode.registry));
         };
-        token_source = "saved login (~/.qube/pod-token)";
+        token_source = "saved login (~/.qube/pods.toml)";
         saved_token = t;
         break :blk0 t;
     };
