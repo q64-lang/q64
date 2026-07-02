@@ -252,6 +252,10 @@ pub const Op = union(enum) {
     /// import (raw face) or `wasi_snapshot_preview1.proc_exit` (preview1 path)
     /// with the i64 `code`. Void — the host terminates the instance.
     host_exit: struct { code: *Inst },
+    /// `env.time.sleep_ns(ns)`: a blocking wait — subscribe-duration +
+    /// pollable.block (component), poll_oneoff (preview1), env.sleep_ns
+    /// (local). Void.
+    time_sleep_ns: struct { ns: *Inst },
     /// `env.fs.read(path)` (spec/env.md §"Wire ABI: fs.read"): call the
     /// `env.fs_read` import with (dest=sp, path ptr, path len), trap on a
     /// negative length, bump `sp`, yield the (dest, len) str value.

@@ -304,9 +304,13 @@ pub const q64_db_wit = @embedFile("wit/q64-db.wit");
 pub const wasi_config_wit = @embedFile("wit/wasi-config.wit");
 
 /// The vendored `wasi:clocks@0.2.0` WIT — the `env.time` capability target
-/// (monotonic clock; spec/env.md §`env.time`). Trimmed to the functions q64
-/// emits — see the file header for why the `subscribe-*`/pollable half is out.
+/// (monotonic + wall clocks; spec/env.md §`env.time`). Trimmed to the
+/// functions q64 emits.
 pub const wasi_clocks_wit = @embedFile("wit/wasi-clocks.wit");
+
+/// The vendored `wasi:io@0.2.0` WIT — just the `pollable` resource the
+/// blocking `env.time.sleep_ns` chain needs (see the file header).
+pub const wasi_io_wit = @embedFile("wit/wasi-io.wit");
 
 /// The component-model interface ids `env.kv` lowers to (with the version pin).
 /// Core imports use the `cm32p2|<id>` form; the world imports the bare ids.
@@ -331,6 +335,9 @@ pub const clocks_monotonic_core_mod = "cm32p2|wasi:clocks/monotonic-clock@0.2";
 /// The wall clock — `env.time.unix_ns` folds its `datetime` record to i64 ns.
 pub const clocks_wall_iface = "wasi:clocks/wall-clock@0.2.0";
 pub const clocks_wall_core_mod = "cm32p2|wasi:clocks/wall-clock@0.2";
+/// wasi:io/poll — the pollable `env.time.sleep_ns` blocks on.
+pub const io_poll_iface = "wasi:io/poll@0.2.0";
+pub const io_poll_core_mod = "cm32p2|wasi:io/poll@0.2";
 
 /// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
 /// qube as a component"). A library lifts the import-free, scalar-signature
@@ -441,7 +448,7 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
         const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null, true);
         errdefer allocator.free(core);
-        const world = try synthStoreWorld(allocator, &hmod, usesEnvKv(&mmod), usesEnvBlob(&mmod), usesEnvDb(&mmod), usesEnvConfig(&mmod), usesEnvTimeMono(&mmod), usesEnvTimeWall(&mmod));
+        const world = try synthStoreWorld(allocator, &hmod, usesEnvKv(&mmod), usesEnvBlob(&mmod), usesEnvDb(&mmod), usesEnvConfig(&mmod), usesEnvTimeMono(&mmod), usesEnvTimeWall(&mmod), usesEnvTimeSleep(&mmod));
         return .{ .store_component = .{ .core = core, .world = world } };
     }
 
@@ -934,11 +941,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // which writes its u64 timestamp through a pointer — reserve an 8-aligned
     // cell for it just past the iovec block.
     const preview1_time = (stdout_abi == .wasi_preview1) and usesEnvTime(m);
+    const preview1_sleep = (stdout_abi == .wasi_preview1) and usesEnvTimeSleep(m);
     const iovec_base: u32 = @intCast(m.data.len);
     const p1_ts_base: u32 = (iovec_base + 16 + 7) & ~@as(u32, 7);
     // iovec (8 bytes: i32 buf, i32 len) + nwritten (4 bytes), padded to 16
-    // (+ the 8-byte timestamp cell when the clock is read).
-    const iovec_scratch: usize = if (preview1_time) (p1_ts_base + 8 - iovec_base) else if (preview1) 16 else 0;
+    // (+ the 8-byte timestamp cell when the clock is read; a sleep grows the
+    // cell to poll_oneoff's buffers — subscription 48 + event 32 + nevents 8
+    // at the same 8-aligned base, since no two clock ops are ever in flight).
+    const iovec_scratch: usize = if (preview1_sleep) (p1_ts_base + 88 - iovec_base) else if (preview1_time) (p1_ts_base + 8 - iovec_base) else if (preview1) 16 else 0;
 
     // env.kv → wasi:keyvalue component lowering. The core imports the canonical
     // `cm32p2|…` ABI; the host writes each call's `result<…>` into a fixed
@@ -1082,6 +1092,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_time = false;
     var needs_time_res = false;
     var needs_time_wall = false;
+    var needs_time_sleep = false;
     var needs_chan = false;
     var needs_take = false;
     var needs_connect = false;
@@ -1123,6 +1134,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (sc.has_time) needs_time = true; // scalar-only: no arena
         if (sc.has_time_res) needs_time_res = true;
         if (sc.has_time_wall) needs_time_wall = true;
+        if (sc.has_time_sleep) needs_time_sleep = true;
         // set/get box their `result<…>` into the scope arena (like fs_read),
         // so the qube needs the `sp` bump pointer even if nothing else uses it.
         if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) needs_arena = true;
@@ -1286,12 +1298,21 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             const cr_params = c.BinaryenTypeCreate(&crp, crp.len);
             c.BinaryenAddFunctionImport(module, "clock_res_get", "wasi_snapshot_preview1", "clock_res_get", cr_params, i32_type);
         }
+        if (needs_time_sleep) {
+            // poll_oneoff(in: *subscription, out: *event, nsubscriptions,
+            // nevents_ptr) -> errno — one monotonic-clock subscription,
+            // blocking until its relative timeout elapses.
+            var pop = [_]c.BinaryenType{ i32_type, i32_type, i32_type, i32_type };
+            const po_params = c.BinaryenTypeCreate(&pop, pop.len);
+            c.BinaryenAddFunctionImport(module, "poll_oneoff", "wasi_snapshot_preview1", "poll_oneoff", po_params, i32_type);
+        }
     } else if (!wants_time) {
-        // Local `qube run` ABI — one nullary `env.*` face per op, each a
-        // bare i64 on every address width (spec/env.md §`env.time`).
+        // Local `qube run` ABI — one `env.*` face per op (spec/env.md
+        // §`env.time`), each scalar on every address width.
         if (needs_time) c.BinaryenAddFunctionImport(module, "env_monotonic_ns", "env", "monotonic_ns", none_type, i64_type);
         if (needs_time_res) c.BinaryenAddFunctionImport(module, "env_resolution_ns", "env", "resolution_ns", none_type, i64_type);
         if (needs_time_wall) c.BinaryenAddFunctionImport(module, "env_unix_ns", "env", "unix_ns", none_type, i64_type);
+        if (needs_time_sleep) c.BinaryenAddFunctionImport(module, "env_sleep_ns", "env", "sleep_ns", i64_type, none_type);
     }
     if (wants_time) {
         // Component ABI — the canonical `wasi:clocks` core imports (cm32p2),
@@ -1304,6 +1325,18 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (needs_time) c.BinaryenAddFunctionImport(module, "clocks_monotonic_now", clocks_monotonic_core_mod, "now", none_type, i64_type);
         if (needs_time_res) c.BinaryenAddFunctionImport(module, "clocks_monotonic_resolution", clocks_monotonic_core_mod, "resolution", none_type, i64_type);
         if (needs_time_wall) c.BinaryenAddFunctionImport(module, "clocks_wall_now", clocks_wall_core_mod, "now", i32_type, none_type);
+        if (needs_time_sleep) {
+            // The blocking chain: subscribe-duration(ns) -> pollable handle,
+            // [method]pollable.block(handle), pollable_drop(handle) — the
+            // drop intrinsic mangles as `<resource>_drop`, NOT the
+            // `[resource-drop]` canon syntax (probed via `component embed
+            // --dummy`). The handle parks in the `sleep_pollable` global
+            // between the three calls (sleeps never nest — no local plumbing).
+            c.BinaryenAddFunctionImport(module, "clocks_subscribe_duration", clocks_monotonic_core_mod, "subscribe-duration", i64_type, i32_type);
+            c.BinaryenAddFunctionImport(module, "io_pollable_block", io_poll_core_mod, "[method]pollable.block", i32_type, none_type);
+            c.BinaryenAddFunctionImport(module, "io_pollable_drop", io_poll_core_mod, "pollable_drop", i32_type, none_type);
+            _ = c.BinaryenAddGlobal(module, "sleep_pollable", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
+        }
     }
     if (wants_store) {
         // The canonical `cabi_realloc` bump allocator, exported as
@@ -1774,6 +1807,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .db_query_text => |db| bodyHasOut(db.sql, want_int),
         .config_get => |cf| bodyHasOut(cf.key, want_int),
         .time_monotonic_ns, .time_resolution_ns, .time_unix_ns => false,
+        .time_sleep_ns => |ts| bodyHasOut(ts.ns, want_int),
         .chan_recv => |h| bodyHasOut(h, want_int),
         .chan_take => |h| bodyHasOut(h, want_int),
         .chan_open => false,
@@ -1960,7 +1994,8 @@ fn usesEnvTime(m: *const ir.mir.Module) bool {
 }
 
 /// True if any function reaches the MONOTONIC clock (`monotonic_ns` /
-/// `resolution_ns`) — gates the `wasi:clocks/monotonic-clock` world import.
+/// `resolution_ns` / `sleep_ns` — the sleep subscribes on it) — gates the
+/// `wasi:clocks/monotonic-clock` world import.
 fn usesEnvTimeMono(m: *const ir.mir.Module) bool {
     for (m.funcs) |f| {
         const root = switch (f.body) {
@@ -1969,7 +2004,22 @@ fn usesEnvTimeMono(m: *const ir.mir.Module) bool {
         };
         var sc = Scratch{};
         scanScratch(root, &sc);
-        if (sc.has_time or sc.has_time_res) return true;
+        if (sc.has_time or sc.has_time_res or sc.has_time_sleep) return true;
+    }
+    return false;
+}
+
+/// True if any function reaches `env.time.sleep_ns` — gates the
+/// `wasi:io/poll` world import + the poll_oneoff subscription scratch.
+fn usesEnvTimeSleep(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_time_sleep) return true;
     }
     return false;
 }
@@ -2031,7 +2081,7 @@ fn usesDbQueryText(m: *const ir.mir.Module) bool {
 /// `wasi:keyvalue/atomics` (the `env.kv` lowering) and exports each scalar `pub`
 /// function. Named `qube` (the fixed world name the CLI passes to `component
 /// embed --world`). Caller owns the slice.
-fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use_kv: bool, use_blob: bool, use_db: bool, use_config: bool, use_time_mono: bool, use_time_wall: bool) ![]u8 {
+fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use_kv: bool, use_blob: bool, use_db: bool, use_config: bool, use_time_mono: bool, use_time_wall: bool, use_time_sleep: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "// synthesized WIT world (q64 storage capabilities → host interfaces)\n");
@@ -2054,6 +2104,12 @@ fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use
     }
     if (use_time_wall) {
         try out.print(allocator, "  import {s};\n", .{clocks_wall_iface});
+    }
+    if (use_time_sleep) {
+        // The blocking sleep chain crosses two interfaces: the subscription
+        // lives on monotonic-clock (already imported via use_time_mono), the
+        // pollable it returns on wasi:io/poll.
+        try out.print(allocator, "  import {s};\n", .{io_poll_iface});
     }
     for (hmod.funcs) |f| {
         if (f.visibility != .public) continue;
@@ -2237,6 +2293,11 @@ const Scratch = struct {
     /// via the small time return area) / clock_time_get with the realtime
     /// clockid (preview1) / env.unix_ns (local).
     has_time_wall: bool = false,
+    /// Contains an `env.time.sleep_ns` → declare the blocking chain:
+    /// subscribe-duration + pollable.block + resource-drop (component) /
+    /// poll_oneoff + its 88-byte subscription scratch (preview1) /
+    /// env.sleep_ns (local).
+    has_time_sleep: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
     has_chan: bool = false,
     /// Contains a `chan_take` → declare the `env.channel_take` import.
@@ -2281,6 +2342,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_time = s.has_time or sub.has_time;
     s.has_time_res = s.has_time_res or sub.has_time_res;
     s.has_time_wall = s.has_time_wall or sub.has_time_wall;
+    s.has_time_sleep = s.has_time_sleep or sub.has_time_sleep;
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
     s.has_connect = s.has_connect or sub.has_connect;
@@ -2515,6 +2577,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         .time_monotonic_ns => s.has_time = true,
         .time_resolution_ns => s.has_time_res = true,
         .time_unix_ns => s.has_time_wall = true,
+        .time_sleep_ns => |ts| {
+            s.has_time_sleep = true;
+            scanScratch(ts.ns, s);
+        },
         .chan_recv => |h| {
             s.has_chan = true;
             scanScratch(h, s);
@@ -3131,6 +3197,65 @@ const Lowerer = struct {
                     return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.i64_type);
                 }
                 return c.BinaryenCall(module, "env_unix_ns", null, 0, self.i64_type);
+            },
+            .time_sleep_ns => |ts| {
+                // env.time.sleep_ns(ns) — the BLOCKING wait, void. Three
+                // lowerings like the read faces:
+                //   component: h = subscribe-duration(ns); pollable.block(h);
+                //              resource-drop(h) — h parks in `sleep_pollable`
+                //              (sleeps never nest; no local plumbing).
+                //   preview1:  poll_oneoff with ONE monotonic-clock
+                //              subscription written at the shared cell.
+                //   local:     the raw env.sleep_ns(ns) host face.
+                const ns_val = try self.inst(ts.ns);
+                const i32c = struct {
+                    fn f(mod: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+                        return c.BinaryenConst(mod, c.BinaryenLiteralInt32(v));
+                    }
+                }.f;
+                const i64c = struct {
+                    fn f(mod: c.BinaryenModuleRef, v: i64) c.BinaryenExpressionRef {
+                        return c.BinaryenConst(mod, c.BinaryenLiteralInt64(v));
+                    }
+                }.f;
+                if (self.time_preview1) {
+                    const base: i32 = @intCast(self.p1_ts_base);
+                    // subscription (48 bytes): userdata u64 @0; tag u8 @8
+                    // (0 = clock; the wide zero store covers its padding);
+                    // clockid u32 @16 (1 = monotonic); timeout u64 @24
+                    // (relative — flags stay 0); precision u64 @32; flags
+                    // u16 @40 (zero store covers padding). Event out @48,
+                    // nevents @80.
+                    var po_args = [_]c.BinaryenExpressionRef{
+                        i32c(module, base),
+                        i32c(module, base + 48),
+                        i32c(module, 1),
+                        i32c(module, base + 80),
+                    };
+                    var seq = [_]c.BinaryenExpressionRef{
+                        c.BinaryenStore(module, 8, 0, 0, i32c(module, base), i64c(module, 0), self.i64_type, "0"),
+                        c.BinaryenStore(module, 8, 8, 0, i32c(module, base), i64c(module, 0), self.i64_type, "0"),
+                        c.BinaryenStore(module, 4, 16, 0, i32c(module, base), i32c(module, 1), self.i32_type, "0"),
+                        c.BinaryenStore(module, 8, 24, 0, i32c(module, base), ns_val, self.i64_type, "0"),
+                        c.BinaryenStore(module, 8, 32, 0, i32c(module, base), i64c(module, 1), self.i64_type, "0"),
+                        c.BinaryenStore(module, 8, 40, 0, i32c(module, base), i64c(module, 0), self.i64_type, "0"),
+                        c.BinaryenDrop(module, c.BinaryenCall(module, "poll_oneoff", @ptrCast(&po_args), po_args.len, self.i32_type)),
+                    };
+                    return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
+                }
+                if (self.time_component) {
+                    var sub_args = [_]c.BinaryenExpressionRef{ns_val};
+                    var blk_args = [_]c.BinaryenExpressionRef{c.BinaryenGlobalGet(module, "sleep_pollable", self.i32_type)};
+                    var drop_args = [_]c.BinaryenExpressionRef{c.BinaryenGlobalGet(module, "sleep_pollable", self.i32_type)};
+                    var seq = [_]c.BinaryenExpressionRef{
+                        c.BinaryenGlobalSet(module, "sleep_pollable", c.BinaryenCall(module, "clocks_subscribe_duration", @ptrCast(&sub_args), sub_args.len, self.i32_type)),
+                        c.BinaryenCall(module, "io_pollable_block", @ptrCast(&blk_args), blk_args.len, self.none_type),
+                        c.BinaryenCall(module, "io_pollable_drop", @ptrCast(&drop_args), drop_args.len, self.none_type),
+                    };
+                    return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
+                }
+                var call_args = [_]c.BinaryenExpressionRef{ns_val};
+                return c.BinaryenCall(module, "env_sleep_ns", @ptrCast(&call_args), call_args.len, self.none_type);
             },
             .chan_recv => |h| {
                 // got = env.channel_recv(session) — 1 (message) or 0 (closed).
@@ -5945,6 +6070,51 @@ test "emitComponent: env.time lowers to a wasi:clocks component (bare scalar now
             try testing.expect(std.mem.indexOf(u8, kvc.world, "export res: func() -> s64;") != null);
             // A monotonic-only qube imports NO wall clock — per-interface gating.
             try testing.expect(std.mem.indexOf(u8, kvc.world, "wall-clock") == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.time.sleep_ns lowers to the subscribe/block/drop chain (component) with wasi:io/poll in the world" {
+    const src =
+        \\pub fn nap(ns: i64) -> i64 {
+        \\    env.time.sleep_ns(ns)
+        \\    1
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "nap.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "subscribe-duration") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]pollable.block") != null);
+            // The drop intrinsic mangles as `pollable_drop` (probed via
+            // `component embed --dummy`), NOT `[resource-drop]pollable`.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "pollable_drop") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:io/poll@0.2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:io/poll@0.2.0;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:clocks/monotonic-clock@0.2.0;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: a printing main that sleeps lowers to preview1 poll_oneoff" {
+    const app =
+        \\fn main {
+        \\    env.time.sleep_ns(1000)
+        \\    env.out("done")
+        \\}
+        \\
+    ;
+    const artifact = try emitComponent(testing.allocator, app, "slp.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .preview1_app => |core| {
+            defer testing.allocator.free(core);
+            try testing.expect(std.mem.indexOf(u8, core, "poll_oneoff") != null);
+            try testing.expect(std.mem.indexOf(u8, core, "wasi_snapshot_preview1") != null);
+            try testing.expect(std.mem.indexOf(u8, core, "cm32p2") == null);
         },
         else => return error.TestUnexpectedResult,
     }

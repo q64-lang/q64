@@ -12,6 +12,8 @@ package wasi:clocks@0.2.0;
 /// measuring elapsed time: its `instant`s only ever increase, and carry
 /// nanosecond resolution at best-effort.
 interface monotonic-clock {
+    use wasi:io/poll@0.2.0.{pollable};
+
     /// An instant in time, in nanoseconds. An instant is relative to an
     /// unspecified initial value, and can only be compared to instances from
     /// the same monotonic-clock.
@@ -29,6 +31,10 @@ interface monotonic-clock {
     /// Query the resolution of the clock. Returns the duration of time
     /// corresponding to a clock tick.
     resolution: func() -> duration;
+
+    /// Return a pollable that becomes ready after the given duration has
+    /// elapsed (the blocking half of `env.time.sleep_ns`).
+    subscribe-duration: func(when: duration) -> pollable;
 }
 
 /// WASI Wall Clock — a clock aiming to hit the actual time of day. It is

@@ -341,6 +341,12 @@ pub const Stmt = union(enum) {
     /// preview1/component path, `wasi_snapshot_preview1.proc_exit` (which the
     /// WASI adapter lifts to `wasi:cli/exit`). Marks `@exit`.
     host_exit: *Expr,
+    /// `env.time.sleep_ns(ns)` — BLOCKING sleep for `ns` nanoseconds
+    /// (spec/env.md §"Face method ↔ WIT function mapping"). A synchronously-
+    /// lowered wait per the component-model async ABI — the host parks the
+    /// task; the suspending `sleep -> future<()>` arrives with the CPS
+    /// milestone (todo.md §"Futures ladder"). Marks `@time`.
+    time_sleep_ns: *Expr,
     /// A call to a host import face (`qview.text(…)`): `name` is the dotted
     /// source name; `args` are i64 expressions. Lowers to a wasm import call.
     host_call: struct { name: []const u8, args: []const *Expr },

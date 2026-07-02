@@ -437,6 +437,7 @@ user code never sees:
 | `Clock.monotonic_ns(self) -> i64`                      | `wasi:clocks/monotonic-clock.now` (bare scalar — no box, no handle) |
 | `Clock.resolution_ns(self) -> i64`                     | `wasi:clocks/monotonic-clock.resolution` (bare scalar) |
 | `Clock.unix_ns(self) -> i64`                           | `wasi:clocks/wall-clock.now` (the `datetime {seconds, nanoseconds}` record folded to ns since the Unix epoch; i64 carries that to year 2262) |
+| `Clock.sleep_ns(self, ns: i64)`                        | **blocking** — `wasi:clocks/monotonic-clock.subscribe-duration` + `wasi:io/poll.pollable.block` (component), `poll_oneoff` (preview1). A synchronously-lowered wait per the component-model async ABI: the host parks the task. The suspending `sleep -> future<()>` form arrives with the CPS/futures milestone and does not replace this. |
 
 Under WASIp3, byte I/O is the native canonical-ABI `stream<u8>`: stdout/stderr
 hand back a `stream<u8>` directly, and there is no `wasi:io/streams`

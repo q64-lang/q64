@@ -3044,6 +3044,16 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 try out.append(b.a, st);
                 return;
             }
+            // `env.time.sleep_ns(ns)` — the blocking sleep face. `ns` is an
+            // i64 expression. Marks `@time` via the effect pass.
+            if (isEnvTimeSleep(b.a, call)) {
+                const arg = firstArg(call) orelse return error.Unsupported;
+                const e = try buildIntExpr(b, arg, scope);
+                const st = try b.a.create(hir.Stmt);
+                st.* = .{ .time_sleep_ns = e };
+                try out.append(b.a, st);
+                return;
+            }
             // `env.err(expr)` — same value-classification as `env.out`, but the
             // write targets stderr (`@stderr` → `wasi:cli/stderr`).
             if (isEnvErr(b.a, call)) {
@@ -4013,6 +4023,14 @@ fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.Array
         const e = try buildIntExpr(b, arg, scope);
         const st = try b.a.create(hir.Stmt);
         st.* = .{ .host_exit = e };
+        try out.append(b.a, st);
+        return;
+    }
+    if (isEnvTimeSleep(b.a, call)) {
+        const arg = firstArg(call) orelse return error.Unsupported;
+        const e = try buildIntExpr(b, arg, scope);
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .time_sleep_ns = e };
         try out.append(b.a, st);
         return;
     }
@@ -9140,6 +9158,13 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
                 if (try tryActorTell(b, e.call, scope)) |st| return st;
                 if (try tryVecPush(b, e.call, scope)) |st| return st;
                 if (try tryChannelSend(b, e.call, scope)) |st| return st;
+                // `env.time.sleep_ns(ns)` at statement position in a value
+                // body — void, so it can't ride the i64-expr path.
+                if (isEnvTimeSleep(b.a, e.call)) {
+                    const arg = firstArg(e.call) orelse return error.Unsupported;
+                    out.* = .{ .time_sleep_ns = try buildIntExpr(b, arg, scope) };
+                    return out;
+                }
             }
             out.* = .{ .expr = try buildIntExpr(b, e, scope) };
         },
@@ -10275,6 +10300,17 @@ fn isEnvExit(a: std.mem.Allocator, call: ast.CallExpr) bool {
     const txt = path.text(a) catch return false;
     defer a.free(txt);
     return std.mem.eql(u8, txt, "env.exit");
+}
+
+fn isEnvTimeSleep(a: std.mem.Allocator, call: ast.CallExpr) bool {
+    const callee = call.callee() orelse return false;
+    const path = switch (callee) {
+        .path => |p| p,
+        else => return false,
+    };
+    const txt = path.text(a) catch return false;
+    defer a.free(txt);
+    return std.mem.eql(u8, txt, "env.time.sleep_ns");
 }
 
 fn isEnvErr(a: std.mem.Allocator, call: ast.CallExpr) bool {
@@ -14827,6 +14863,23 @@ test "env.time.monotonic_ns: a plain-i64 face (no box) that marks @time" {
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@time") != null);
+}
+
+test "env.time.sleep_ns: a void blocking face that marks @time" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    env.time.sleep_ns(1000000)
+        \\    env.out("awake")
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "time_sleep_ns") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "@time") != null);
 }
 

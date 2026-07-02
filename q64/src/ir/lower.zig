@@ -139,6 +139,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
             } });
         },
         .host_exit => |e| return mk(ctx.a, .void, .{ .host_exit = .{ .code = try lowerExpr(ctx, e) } }),
+        .time_sleep_ns => |e| return mk(ctx.a, .void, .{ .time_sleep_ns = .{ .ns = try lowerExpr(ctx, e) } }),
         .panic => |maybe| {
             // Write the message (if any) to stderr, then trap. The host
             // surfaces the trap as exit 1.

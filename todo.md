@@ -273,6 +273,30 @@ LatestValue/RingBuffer/Unbounded), and `actor` `tell`/`ask` dispatch. Then
 the runtime effect checks the front end can't do statically (EFF110 assert/
 operation violations, `@cancel` propagation). Specs: `concurrency.md`,
 `concurrency-model.md`.
+  - [ ] **Futures ladder (component-model async ABI, Bytecode Alliance spec).**
+        The plan, in dependency order — each rung is spec-conformant on its own:
+        - **Slice A — blocking waits, no CPS (IN PROGRESS).** The async ABI
+          lets a *synchronously-lowered* caller of an async operation block
+          (the host parks the task), so blocking faces need no language
+          change. First face: `env.time.sleep_ns(ns)` — void, blocking —
+          three lowerings like the other clock faces: local `env.sleep_ns`;
+          preview1 `poll_oneoff` with one monotonic-clock subscription (the
+          adapter lifts it to `wasi:io/poll`); component-mode
+          `monotonic-clock.subscribe-duration` → `pollable.block` →
+          `[resource-drop]pollable` (the minimal 0.2 blocking chain — three
+          imports, contained in one emit arm, replaced wholesale by the P3
+          async lower when Slice B lands). Spec rows in env.md; the async
+          `sleep -> future<()>` form stays reserved for Slice B.
+        - **Slice B — the CPS transform (the futures milestone proper).**
+          Selective CPS at statically-known suspend points per the Phase 2
+          decision (NOT asyncify); q64 exports lift `async` with the callback
+          re-entry protocol + `task.return`; `sleep`/`await` become real
+          suspension under the one cooperative scheduler. Runner: `wasmtime
+          -S p3` (already the vendored runner).
+        - **Slice C — `future<T>`/`stream<T>` as q64 values.** Maps the
+          `Signal`/`Event`/`Stream` family (streams.md) onto the ABI's
+          `{future,stream}.{new,read,write,cancel,close}` built-ins;
+          clocks' `subscribe-*` and async `wasi:io@0.3` stdout ride this.
   - [x] **`scope` + statement `spawn` execution (cooperative v0).**
         `buildScopeStmt` lowers `scope { … }` on the cooperative floor with
         **eager-at-spawn** scheduling: each task runs to completion at its spawn

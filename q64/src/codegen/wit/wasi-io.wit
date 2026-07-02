@@ -1,0 +1,22 @@
+/// Vendored slice of `wasi:io@0.2.0` — just the `pollable` resource that
+/// `env.time.sleep_ns` blocks on (`monotonic-clock.subscribe-duration` →
+/// `pollable.block` → resource drop). Trimmed to what q64 emits: the
+/// upstream interface also carries the top-level `poll(list<borrow<
+/// pollable>>)` multiplexer and the streams/error interfaces — q64 does not
+/// emit those (this is the one, contained piece of Preview 2 poll ceremony
+/// q64 carries; it is retired wholesale by the P3 async lower when the CPS
+/// milestone lands — see q64 todo.md §"Futures ladder"). A full host
+/// implementation still satisfies this narrower import.
+package wasi:io@0.2.0;
+
+interface poll {
+    /// A single point of readiness: block until the host says the thing
+    /// subscribed to (here: a clock duration) has elapsed.
+    resource pollable {
+        /// Return whether the pollable is ready without blocking.
+        ready: func() -> bool;
+
+        /// Block the current task until the pollable is ready.
+        block: func();
+    }
+}
