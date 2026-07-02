@@ -1554,7 +1554,7 @@ fn matchHasChannelOp(b: *Builder, ms: ast.MatchStmt, chans: *const std.StringHas
 /// whether any `recv` sits **inside control flow** (a loop or `if`). The static
 /// path only detects top-level recvs, so a recv-in-control task must go to the
 /// scheduler even when it isn't part of a mutual cycle.
-const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl: bool = false, send_bounded: bool = false };
+const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl: bool = false, send_bounded: bool = false, sleeps: bool = false };
 
 /// Recursively check a task body is schedulable, filling `scan`. Schedulable
 /// forms: `let v = ch.recv()`, `ch.send(e)`, `env.out(e)`, a non-call `let`, an
@@ -1590,6 +1590,10 @@ fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMap
                     .call => |x| x,
                     else => return false,
                 };
+                if (isEnvTimeSleep(b.a, cc)) {
+                    scan.sleeps = true; // a suspension point — forces the scheduler
+                    continue;
+                }
                 if (!isEnvOut(b.a, cc)) return false; // other calls aren't v0
             },
             .let_stmt => |ls| {
@@ -1722,7 +1726,7 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
             ntasks += 1;
             var scan: TaskScan = .{};
             if (!taskSchedulable(b, body, &chans, &bounded, &actors, &scan, 0, false)) return false;
-            if ((scan.sends and scan.recvs) or scan.recv_in_ctrl or scan.send_bounded) needs = true;
+            if ((scan.sends and scan.recvs) or scan.recv_in_ctrl or scan.send_bounded or scan.sleeps) needs = true;
         } else if (channelDeclName(b, stmt) == null and actorBindingOf(b, stmt) == null) {
             return false; // a non-spawn, non-channel-decl, non-actor statement: stay static
         }
@@ -1834,12 +1838,16 @@ fn scalarChanType(tname: []const u8) ?hir.Type {
 // patched to the terminal id (one past the last block) after all blocks exist.
 const DONE_PC: usize = std.math.maxInt(usize);
 const SchedBlock = struct {
-    kind: enum { plain, recv, branch },
+    kind: enum { plain, recv, branch, timewait },
     stmts: []const *hir.Stmt = &.{},
-    ready: ?*hir.Expr = null, // recv readiness test
+    ready: ?*hir.Expr = null, // recv/timewait readiness test
     cond: ?*hir.Expr = null, // branch (loop-head) test
     next: usize, // plain/recv successor, or branch then-target
     alt: usize = 0, // branch else-target
+    /// timewait only: the local holding this wait's absolute deadline (ns,
+    /// monotonic clock). A parked timewait folds it into the round's
+    /// `#sched_wake` minimum so the idle path knows when to wake.
+    dl_idx: u32 = 0,
 };
 
 /// One source item of a task body: a maximal run of straight-line statements,
@@ -1849,7 +1857,23 @@ const SchedBlock = struct {
 /// are `break`/`continue` inside a task loop — they jump to the loop's exit /
 /// continue target as pc assignments (not HIR `break`, which would break the
 /// scheduler's own `while`).
-const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, send: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt, sel: ast.SelectStmt, brk: void, cont: void };
+const SchedItem = union(enum) { plain: []const ast.Stmt, recv: ast.Stmt, send: ast.Stmt, slp: ast.Stmt, forl: ast.ForStmt, whilel: ast.WhileStmt, iff: ast.IfStmt, sel: ast.SelectStmt, brk: void, cont: void };
+
+/// The `env.time.sleep_ns(…)` statement form — a task-body SUSPENSION point
+/// under the scheduler (an arm block + a deadline-gated timewait block),
+/// unlike its blocking main-position lowering.
+fn sleepStmtOf(b: *Builder, stmt: ast.Stmt) bool {
+    const es = switch (stmt) {
+        .expr_stmt => |x| x,
+        else => return false,
+    };
+    const e = es.expression() orelse return false;
+    const cc = switch (e) {
+        .call => |x| x,
+        else => return false,
+    };
+    return isEnvTimeSleep(b.a, cc);
+}
 
 /// Context threaded through the per-task CFG lowering.
 const SchedCtx = struct {
@@ -2005,6 +2029,34 @@ fn lowerSchedItem(ctx: *SchedCtx, item: SchedItem) BuildError!ItemSpan {
             const id = try addBlock(ctx, .{ .kind = .recv, .stmts = try list.toOwnedSlice(b.a), .ready = ready, .next = 0 });
             return .{ .entry = id, .exit_id = id, .exit_alt = false };
         },
+        .slp => |s| {
+            // `env.time.sleep_ns(ns)` inside a task — a real SUSPENSION point:
+            // the arm block computes the absolute deadline (one clock read),
+            // the timewait block parks the task until the clock passes it.
+            // Only the round loop's idle path ever blocks the module.
+            const es = switch (s) {
+                .expr_stmt => |x| x,
+                else => return error.Unsupported,
+            };
+            const cc = switch (es.expression() orelse return error.Unsupported) {
+                .call => |x| x,
+                else => return error.Unsupported,
+            };
+            const arg = firstArg(cc) orelse return error.Unsupported;
+            const ns_e = try buildIntExpr(b, arg, ctx.scope);
+            const nm = try std.fmt.allocPrint(b.a, "#sched_dl{d}", .{ctx.blocks.items.len});
+            const dl_idx = try declareBodyLocal(b, ctx.scope, nm, true, .i64);
+            const now_arm = try b.a.create(hir.Expr);
+            now_arm.* = .time_monotonic_ns;
+            const arm_stmt = try mkAssignS(b, dl_idx, try mkBinE(b, .add, now_arm, ns_e));
+            const arm = try addBlock(ctx, .{ .kind = .plain, .stmts = try b.a.dupe(*hir.Stmt, &.{arm_stmt}), .next = 0 });
+            const now_gate = try b.a.create(hir.Expr);
+            now_gate.* = .time_monotonic_ns;
+            const ready = try mkBinE(b, .ge, now_gate, try mkLocalE(b, dl_idx, .i64));
+            const wid = try addBlock(ctx, .{ .kind = .timewait, .ready = ready, .next = 0, .dl_idx = dl_idx });
+            ctx.blocks.items[arm].next = wid;
+            return .{ .entry = arm, .exit_id = wid, .exit_alt = false };
+        },
         .send => |s| {
             // A bounded-channel `send`: a suspend block gated on the buffer
             // having room (`vec_len - cursor < capacity`), so it parks when full
@@ -2081,6 +2133,7 @@ fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError
             if (sendStepChan(b, s, ctx.chans)) |ch| {
                 if (ctx.scope.chan_caps.contains(ch)) break :blk .{ .send = s };
             }
+            if (sleepStmtOf(b, s)) break :blk .{ .slp = s };
             break :blk switch (s) {
                 .for_stmt => |x| .{ .forl = x },
                 .while_stmt => |x| .{ .whilel = x },
@@ -2117,11 +2170,40 @@ fn lowerTaskSeq(ctx: *SchedCtx, stmts: []const ast.Stmt, succ: usize) BuildError
 
 /// Emit one block as a pc-gated `if`. plain/recv: `if (pc == id [and ready]) {
 /// stmts; pc = next; prog = 1 }`. branch: `if (pc == id) { if (cond) pc = next
-/// else pc = alt; prog = 1 }`.
-fn emitBlockGate(b: *Builder, body: *std.ArrayList(*hir.Stmt), pc_idx: u32, id: usize, prog_idx: u32, blk: SchedBlock) BuildError!void {
+/// else pc = alt; prog = 1 }`. timewait: `if (pc == id) { if (ready) { pc =
+/// next; prog = 1 } else if (dl < wake) wake = dl }` — a parked time wait
+/// makes NO progress but publishes its deadline for the idle path.
+fn emitBlockGate(b: *Builder, body: *std.ArrayList(*hir.Stmt), pc_idx: u32, id: usize, prog_idx: u32, wake_idx: u32, blk: SchedBlock) BuildError!void {
     const at = try mkBinE(b, .eq, try mkLocalE(b, pc_idx, .i64), try mkIntE(b, @intCast(id)));
+    if (blk.kind == .timewait) {
+        var adv: std.ArrayList(*hir.Stmt) = .empty;
+        try adv.append(b.a, try mkAssignS(b, pc_idx, try mkIntE(b, @intCast(blk.next))));
+        try adv.append(b.a, try mkAssignS(b, prog_idx, try mkIntE(b, 1)));
+        const then_adv = try b.a.create(hir.Stmt);
+        then_adv.* = .{ .block = try adv.toOwnedSlice(b.a) };
+        // else: wake = min(wake, dl)
+        const fold_then = try b.a.create(hir.Stmt);
+        fold_then.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{try mkAssignS(b, wake_idx, try mkLocalE(b, blk.dl_idx, .i64))}) };
+        const fold = try b.a.create(hir.Stmt);
+        fold.* = .{ .if_ = .{
+            .cond = try mkBinE(b, .lt, try mkLocalE(b, blk.dl_idx, .i64), try mkLocalE(b, wake_idx, .i64)),
+            .then_ = fold_then,
+            .else_ = null,
+        } };
+        const else_blk = try b.a.create(hir.Stmt);
+        else_blk.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{fold}) };
+        const inner = try b.a.create(hir.Stmt);
+        inner.* = .{ .if_ = .{ .cond = blk.ready.?, .then_ = then_adv, .else_ = else_blk } };
+        const outer_then = try b.a.create(hir.Stmt);
+        outer_then.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{inner}) };
+        const outer = try b.a.create(hir.Stmt);
+        outer.* = .{ .if_ = .{ .cond = at, .then_ = outer_then, .else_ = null } };
+        try body.append(b.a, outer);
+        return;
+    }
     var items: std.ArrayList(*hir.Stmt) = .empty;
     switch (blk.kind) {
+        .timewait => unreachable, // handled above
         .plain, .recv => {
             try items.appendSlice(b.a, blk.stmts);
             try items.append(b.a, try mkAssignS(b, pc_idx, try mkIntE(b, @intCast(blk.next))));
@@ -2185,8 +2267,11 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
     const pc_idx = try b.a.alloc(u32, ntasks);
     const entry = try b.a.alloc(usize, ntasks);
     const terminal = try b.a.alloc(usize, ntasks);
-    // The progress flag (declared first: the per-task gates reference it).
+    // The progress flag (declared first: the per-task gates reference it) and
+    // the round's earliest pending deadline (i64 max = "no task is waiting on
+    // time"), folded by parked timewait gates and consumed by the idle path.
     const prog_idx = try declareBodyLocal(b, scope, "#sched_prog", true, .i64);
+    const wake_idx = try declareBodyLocal(b, scope, "#sched_wake", true, .i64);
     var gates: std.ArrayList(*hir.Stmt) = .empty; // per-task block gates (the loop body)
     defer gates.deinit(b.a);
     for (tasks.items, 0..) |task, t| {
@@ -2201,7 +2286,7 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
             if (bl.next == DONE_PC) bl.next = terminal[t];
             if (bl.alt == DONE_PC) bl.alt = terminal[t];
         }
-        for (blocks.items, 0..) |bl, id| try emitBlockGate(b, &gates, pc_idx[t], id, prog_idx, bl);
+        for (blocks.items, 0..) |bl, id| try emitBlockGate(b, &gates, pc_idx[t], id, prog_idx, wake_idx, bl);
     }
     // Setup runs once before the loop: pc = entry, prog = 1. (Loop counters now
     // reset in their per-entry INIT blocks, so nothing rides ahead of the loop.)
@@ -2215,11 +2300,48 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
         st.* = .{ .let = .{ .idx = prog_idx, .value = try mkIntE(b, 1) } };
         try out.append(b.a, st);
     }
-    // Loop body: `prog = 0`, then every task's block gates.
+    {
+        const st = try b.a.create(hir.Stmt);
+        st.* = .{ .let = .{ .idx = wake_idx, .value = try mkIntE(b, std.math.maxInt(i64)) } };
+        try out.append(b.a, st);
+    }
+    // Loop body: `prog = 0`, `wake = MAX`, then every task's block gates.
     var body: std.ArrayList(*hir.Stmt) = .empty;
     defer body.deinit(b.a);
     try body.append(b.a, try mkAssignS(b, prog_idx, try mkIntE(b, 0)));
+    try body.append(b.a, try mkAssignS(b, wake_idx, try mkIntE(b, std.math.maxInt(i64))));
     try body.appendSlice(b.a, gates.items);
+    // The idle path: a round with NO runnable task but at least one pending
+    // deadline blocks the whole module until the earliest one (the Slice A
+    // blocking sleep — the only place the scheduler itself blocks), then
+    // retries. A round with neither progress nor deadlines is the existing
+    // deadlock exit (prog stays 0, the while condition ends the loop).
+    {
+        const now_a = try b.a.create(hir.Expr);
+        now_a.* = .time_monotonic_ns;
+        const now_b_ = try b.a.create(hir.Expr);
+        now_b_.* = .time_monotonic_ns;
+        const slp = try b.a.create(hir.Stmt);
+        slp.* = .{ .time_sleep_ns = try mkBinE(b, .sub, try mkLocalE(b, wake_idx, .i64), now_b_) };
+        const slp_then = try b.a.create(hir.Stmt);
+        slp_then.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{slp}) };
+        const guarded = try b.a.create(hir.Stmt);
+        guarded.* = .{ .if_ = .{
+            .cond = try mkBinE(b, .gt, try mkLocalE(b, wake_idx, .i64), now_a),
+            .then_ = slp_then,
+            .else_ = null,
+        } };
+        var idle: std.ArrayList(*hir.Stmt) = .empty;
+        try idle.append(b.a, guarded);
+        try idle.append(b.a, try mkAssignS(b, prog_idx, try mkIntE(b, 1)));
+        const idle_then = try b.a.create(hir.Stmt);
+        idle_then.* = .{ .block = try idle.toOwnedSlice(b.a) };
+        const no_prog = try mkBinE(b, .eq, try mkLocalE(b, prog_idx, .i64), try mkIntE(b, 0));
+        const has_dl = try mkBinE(b, .lt, try mkLocalE(b, wake_idx, .i64), try mkIntE(b, std.math.maxInt(i64)));
+        const idle_if = try b.a.create(hir.Stmt);
+        idle_if.* = .{ .if_ = .{ .cond = try mkLogicalE(b, .and_, no_prog, has_dl), .then_ = idle_then, .else_ = null } };
+        try body.append(b.a, idle_if);
+    }
     // `while ((pc0 < N0 or pc1 < N1 or …) and prog == 1) { body }`.
     var any: ?*hir.Expr = null;
     for (0..ntasks) |t| {
@@ -11777,6 +11899,70 @@ test "scope scheduling: a consumer spawned before its producer is deferred to th
     const push2 = std.mem.indexOf(u8, dump2, "vec_push") orelse return error.TestUnexpectedResult;
     const get2 = std.mem.indexOf(u8, dump2, "vec_get") orelse return error.TestUnexpectedResult;
     try testing.expect(push2 < get2);
+}
+
+test "scope scheduling: a sleeping task is a timewait suspend point (tasks interleave)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // Task 1 sleeps then prints; task 2 just prints. The sleep must route the
+    // scope to the scheduler (not eager-at-spawn, which would block task 2
+    // behind the sleep) and lower to an arm block (deadline = now + ns) plus
+    // a clock-gated wait — with the idle path's whole-module sleep guarded
+    // behind "no task runnable".
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        spawn {
+        \\            env.time.sleep_ns(200000000)
+        \\            env.out("B")
+        \\        }
+        \\        spawn {
+        \\            env.out("A")
+        \\        }
+        \\    }
+        \\    env.out("done")
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The scheduler while loop; the deadline arm reads the clock; the idle
+    // path carries the (blocking) module sleep.
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns()") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "time_sleep_ns") != null);
+}
+
+test "scope scheduling: sleeps on both sides of a ping-pong interleave with the channel waits" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let a = channel()
+        \\        let b = channel()
+        \\        spawn {
+        \\            env.time.sleep_ns(100000000)
+        \\            a.send(1)
+        \\            let r = b.recv()
+        \\            env.out(r)
+        \\        }
+        \\        spawn {
+        \\            let x = a.recv()
+        \\            env.time.sleep_ns(50000000)
+        \\            b.send(x + 10)
+        \\        }
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // channel waits
+    try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns()") != null); // clock waits
 }
 
 test "scope scheduling: cyclic ping-pong tasks lower to a round-robin scheduler loop" {

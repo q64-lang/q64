@@ -293,6 +293,20 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
           re-entry protocol + `task.return`; `sleep`/`await` become real
           suspension under the one cooperative scheduler. Runner: `wasmtime
           -S p3` (already the vendored runner).
+          - [x] **Rung 1 — `sleep_ns` as a real suspension point in `scope`
+            tasks (LANDED).** A `spawn` body containing `env.time.sleep_ns`
+            routes the scope to the round-robin scheduler; the sleep lowers
+            to an arm block (deadline = clock + ns into a `#sched_dl` local)
+            plus a `timewait` block gated on the clock passing it. A parked
+            wait folds its deadline into the round's `#sched_wake` minimum;
+            the idle path blocks the whole module (the Slice A sleep) only
+            when NO task is runnable, then retries — so parallel sleeps cost
+            max not sum, and a pure-channel deadlock still exits as before.
+            Verified under `wasmtime -S p3` and the local Node ABI: tasks
+            interleave (`A` before the sleeper's `B`), two parallel sleeps
+            of 300+100ms finish in ~301ms, and sleeps compose with channel
+            ping-pong waits. Remaining rungs: `await`/handle suspension, the
+            async-lifted component export (callback + task.return).
         - **Slice C — `future<T>`/`stream<T>` as q64 values.** Maps the
           `Signal`/`Event`/`Stream` family (streams.md) onto the ABI's
           `{future,stream}.{new,read,write,cancel,close}` built-ins;
