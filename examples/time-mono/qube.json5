@@ -1,0 +1,19 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "time-mono",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "application",
+  "entry": "time.q",
+
+  // Emit a component in addition to the core module. The qube reaches
+  // `env.time`, so the component imports wasi:clocks/monotonic-clock
+  // (spec/env.md §env.time); the host supplies the clock. This is the stable
+  // wasi:clocks release (`now` is a top-level function returning a bare u64 —
+  // the simplest capability import there is).
+  "component": {
+    "emit": true,
+    "world": "time-mono",
+    "worlds": ["wasi:clocks/monotonic-clock"],
+  },
+}

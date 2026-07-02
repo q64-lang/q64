@@ -215,7 +215,11 @@ pub const Effect = enum {
             // `env.config` maps to the real `wasi:config/store` proposal
             // (read-only config/secrets; spec/env.md §`env.config`).
             .config => &.{"wasi:config/store"},
-            .time => &.{ "wasi:clocks/wall-clock", "wasi:clocks/monotonic-clock" },
+            // v0 implements `env.time.monotonic_ns()` only, so the derived
+            // import set is just the monotonic clock; `wasi:clocks/wall-clock`
+            // joins when `env.time.now()` lands (spec/env.md §`env.time` still
+            // documents the full Clock face).
+            .time => &.{"wasi:clocks/monotonic-clock"},
             .random => &.{"wasi:random/random"},
             .envvars => &.{"wasi:cli/environment"},
             .exit => &.{"wasi:cli/exit"},
@@ -490,6 +494,12 @@ pub const Expr = union(enum) {
     /// a direct `get(key, ret)` — no lazy `open`. Boxed `Result<Option<Bytes>,
     /// IoError>` (`Ok(Some(v))`/`Ok(None)`/`Err`). Marks the fn `@config`.
     config_get: struct { key: *Expr },
+    /// `env.time.monotonic_ns()` — the monotonic clock reading in nanoseconds,
+    /// i64 (spec/env.md §`env.time`, `wasi:clocks/monotonic-clock.now`). Nullary
+    /// and scalar: no key, no handle, no Result box — the one face that crosses
+    /// the boundary in registers alone (which is why it is `@realtime`-safe,
+    /// spec/env.md §"realtime"). Marks the fn `@time`.
+    time_monotonic_ns,
     /// `chan_recv(session)` — receive the next inbound message on a remote
     /// channel session (`@channel_handler`'s `for _ in session`). Lowers to the
     /// `env.channel_recv` host import: returns 1 when a message arrived (run the

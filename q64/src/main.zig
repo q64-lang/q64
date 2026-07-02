@@ -1005,10 +1005,13 @@ fn embedStoreComponent(
     defer gpa.free(db_deps_dir);
     const config_deps_dir = try std.fmt.allocPrint(gpa, "{s}/deps/wasi-config", .{wit_dir});
     defer gpa.free(config_deps_dir);
+    const clocks_deps_dir = try std.fmt.allocPrint(gpa, "{s}/deps/wasi-clocks", .{wit_dir});
+    defer gpa.free(clocks_deps_dir);
     std.Io.Dir.cwd().createDirPath(io, kv_deps_dir) catch fail(io, "could not create temp WIT dir for the store lift");
     std.Io.Dir.cwd().createDirPath(io, blob_deps_dir) catch fail(io, "could not create temp WIT dir for the store lift");
     std.Io.Dir.cwd().createDirPath(io, db_deps_dir) catch fail(io, "could not create temp WIT dir for the store lift");
     std.Io.Dir.cwd().createDirPath(io, config_deps_dir) catch fail(io, "could not create temp WIT dir for the store lift");
+    std.Io.Dir.cwd().createDirPath(io, clocks_deps_dir) catch fail(io, "could not create temp WIT dir for the store lift");
     defer std.Io.Dir.cwd().deleteTree(io, wit_dir) catch {};
     const world_path = try std.fmt.allocPrint(gpa, "{s}/world.wit", .{wit_dir});
     defer gpa.free(world_path);
@@ -1020,11 +1023,14 @@ fn embedStoreComponent(
     defer gpa.free(db_dep_path);
     const config_dep_path = try std.fmt.allocPrint(gpa, "{s}/config.wit", .{config_deps_dir});
     defer gpa.free(config_dep_path);
+    const clocks_dep_path = try std.fmt.allocPrint(gpa, "{s}/clocks.wit", .{clocks_deps_dir});
+    defer gpa.free(clocks_dep_path);
     try writeFile(io, world_path, world_wit);
     try writeFile(io, kv_dep_path, emit.wasi_keyvalue_wit);
     try writeFile(io, blob_dep_path, emit.q64_blob_wit);
     try writeFile(io, db_dep_path, emit.q64_db_wit);
     try writeFile(io, config_dep_path, emit.wasi_config_wit);
+    try writeFile(io, clocks_dep_path, emit.wasi_clocks_wit);
 
     const tmp_core = try std.fmt.allocPrint(gpa, "{s}.kvcore.wasm", .{comp_path});
     defer gpa.free(tmp_core);

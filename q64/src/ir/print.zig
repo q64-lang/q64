@@ -240,6 +240,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, cf.key);
             try app(gpa, out, ")", .{});
         },
+        .time_monotonic_ns => try app(gpa, out, "time_monotonic_ns()", .{}),
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv(", .{});
             try hirExpr(gpa, out, h);
@@ -520,6 +521,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "config_get\n", .{});
             try mirInst(gpa, out, cf.key, depth + 1);
         },
+        .time_monotonic_ns => try app(gpa, out, "time_monotonic_ns\n", .{}),
         .chan_recv => |h| {
             try app(gpa, out, "chan_recv\n", .{});
             try mirInst(gpa, out, h, depth + 1);

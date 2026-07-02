@@ -9847,6 +9847,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     }
                 }
             }
+            // `env.time.monotonic_ns()` — the monotonic clock in ns, a plain
+            // i64 (no Result box, spec/env.md §`env.time`). Nullary; any
+            // argument is a malformed call.
+            if (std.mem.eql(u8, cname, "env.time.monotonic_ns")) {
+                var ta = cc.args();
+                if (ta.next() != null) return reject(b, .unsupported_call);
+                out.* = .time_monotonic_ns;
+                return out;
+            }
             // `c.ask(Msg)` — a value-returning actor handler dispatched by the
             // message name (the value half of message-style actors).
             if (try tryActorAsk(b, cc, scope)) |ae| return ae;
@@ -14791,6 +14800,23 @@ test "env.kv.increment: keyed form (key, delta) marks @kv and carries the key" {
     // The str key is lowered into the node (printed before the delta).
     try testing.expect(std.mem.indexOf(u8, dump, "count") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "@kv") != null);
+}
+
+test "env.time.monotonic_ns: a plain-i64 face (no box) that marks @time" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    let t0 = env.time.monotonic_ns()
+        \\    env.out(t0)
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "@time") != null);
 }
 
 test "env.kv.increment: a Result<i64, i64> @kv capability face" {

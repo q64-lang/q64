@@ -303,6 +303,11 @@ pub const q64_db_wit = @embedFile("wit/q64-db.wit");
 /// target (read-only config/secrets; spec/env.md §`env.config`).
 pub const wasi_config_wit = @embedFile("wit/wasi-config.wit");
 
+/// The vendored `wasi:clocks@0.2.0` WIT — the `env.time` capability target
+/// (monotonic clock; spec/env.md §`env.time`). Trimmed to the functions q64
+/// emits — see the file header for why the `subscribe-*`/pollable half is out.
+pub const wasi_clocks_wit = @embedFile("wit/wasi-clocks.wit");
+
 /// The component-model interface ids `env.kv` lowers to (with the version pin).
 /// Core imports use the `cm32p2|<id>` form; the world imports the bare ids.
 pub const kv_store_iface = "wasi:keyvalue/store@0.2.0-draft2";
@@ -314,6 +319,15 @@ pub const blob_store_iface = "q64:blob/store@0.2.0-draft2";
 pub const db_sql_iface = "q64:db/sql@0.2.0-draft2";
 /// The interface id `env.config` lowers to — the real `wasi:config` proposal.
 pub const config_store_iface = "wasi:config/store@0.2.0-draft";
+/// The interface id `env.time` lowers to — the stable `wasi:clocks` release
+/// (the pin matches the vendored wit/wasi-clocks.wit package version).
+pub const clocks_monotonic_iface = "wasi:clocks/monotonic-clock@0.2.0";
+/// The cm32p2 core-import mangling for clocks. A STABLE (non-prerelease)
+/// interface version mangles as the semver-compatible major.minor form —
+/// `@0.2`, not `@0.2.0` — or `component new` fails to map the import to the
+/// world item. The kv/config/blob/db mangles carry their full version only
+/// because pre-release pins (`0.2.0-draft…`) are matched verbatim.
+pub const clocks_monotonic_core_mod = "cm32p2|wasi:clocks/monotonic-clock@0.2";
 
 /// Emit the component artifact for `q64 emit --component` (spec/modules.md §"The
 /// qube as a component"). A library lifts the import-free, scalar-signature
@@ -420,11 +434,11 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     // `wasi:keyvalue` import ABI (cm32p2 imports, adapter-held bucket) and hand
     // back the synthesized world for the CLI to embed + lift. The canonical ABI
     // is 32-bit (cm32p2); a wasm64 qube isn't lowerable here.
-    if (usesEnvKv(&mmod) or usesEnvBlob(&mmod) or usesEnvDb(&mmod) or usesEnvConfig(&mmod) or usesStrExport(&mmod)) {
+    if (usesEnvKv(&mmod) or usesEnvBlob(&mmod) or usesEnvDb(&mmod) or usesEnvConfig(&mmod) or usesEnvTime(&mmod) or usesStrExport(&mmod)) {
         if (addr != .wasm32) return Error.ComponentNeedsImportLowering;
         const core = try lowerToWasm(allocator, &mmod, addr, .env_out, null, true);
         errdefer allocator.free(core);
-        const world = try synthStoreWorld(allocator, &hmod, usesEnvKv(&mmod), usesEnvBlob(&mmod), usesEnvDb(&mmod), usesEnvConfig(&mmod));
+        const world = try synthStoreWorld(allocator, &hmod, usesEnvKv(&mmod), usesEnvBlob(&mmod), usesEnvDb(&mmod), usesEnvConfig(&mmod), usesEnvTime(&mmod));
         return .{ .store_component = .{ .core = core, .world = world } };
     }
 
@@ -932,6 +946,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     const wants_blob = kv_component and usesEnvBlob(m);
     const wants_db = kv_component and usesEnvDb(m);
     const wants_config = kv_component and usesEnvConfig(m);
+    // The clock face is scalar-only (nullary → i64): it rides the component
+    // import ABI but needs none of the store scaffolding below (no return
+    // area, no realloc), so it does NOT fold into `wants_store`.
+    const wants_time = kv_component and usesEnvTime(m);
     // A str-returning export needs the component scaffolding (cm32p2 memory +
     // realloc for the return-area wrapper) even with no storage capability.
     const wants_str_export = kv_component and usesStrExport(m);
@@ -1043,6 +1061,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var needs_args = false;
     var needs_envvar = false;
     var needs_kv = false;
+    var needs_time = false;
     var needs_chan = false;
     var needs_take = false;
     var needs_connect = false;
@@ -1081,6 +1100,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             needs_arena = true; // the value rides the scope arena
         }
         if (sc.has_kv) needs_kv = true;
+        if (sc.has_time) needs_time = true; // scalar-only: no arena
         // set/get box their `result<…>` into the scope arena (like fs_read),
         // so the qube needs the `sp` bump pointer even if nothing else uses it.
         if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) needs_arena = true;
@@ -1227,6 +1247,19 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         var gp = [_]c.BinaryenType{ i32_type, i32_type, i32_type };
         const get_params = c.BinaryenTypeCreate(&gp, gp.len);
         c.BinaryenAddFunctionImport(module, "config_store_get", cfg_mod, "get", get_params, none_type);
+    }
+    if (needs_time and !wants_time) {
+        // Local `qube run` ABI — env.monotonic_ns : () -> i64 nanoseconds
+        // (spec/env.md §`env.time`). Nullary and scalar on every address width.
+        c.BinaryenAddFunctionImport(module, "env_monotonic_ns", "env", "monotonic_ns", none_type, i64_type);
+    }
+    if (wants_time) {
+        // Component ABI — the canonical `wasi:clocks/monotonic-clock.now`
+        // core import (cm32p2): () -> instant (u64, lowered to a bare i64).
+        // A direct scalar result — no return-area pointer, no realloc, no
+        // handle global; the simplest capability import there is. Note the
+        // major.minor mangle (see `clocks_monotonic_core_mod`).
+        c.BinaryenAddFunctionImport(module, "clocks_monotonic_now", clocks_monotonic_core_mod, "now", none_type, i64_type);
     }
     if (wants_store) {
         // The canonical `cabi_realloc` bump allocator, exported as
@@ -1420,6 +1453,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .blob_component = wants_blob,
             .db_component = wants_db,
             .config_component = wants_config,
+            .time_component = wants_time,
             .kv_open_ret = kv_open_ret,
             .kv_inc_ret = kv_inc_ret,
             .kv_hdr_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0),
@@ -1690,6 +1724,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .db_query_value => |db| bodyHasOut(db.sql, want_int),
         .db_query_text => |db| bodyHasOut(db.sql, want_int),
         .config_get => |cf| bodyHasOut(cf.key, want_int),
+        .time_monotonic_ns => false,
         .chan_recv => |h| bodyHasOut(h, want_int),
         .chan_take => |h| bodyHasOut(h, want_int),
         .chan_open => false,
@@ -1869,6 +1904,21 @@ fn usesEnvConfig(m: *const ir.mir.Module) bool {
     return false;
 }
 
+/// True if any function reaches `env.time` (a `time_monotonic_ns` node) —
+/// gates the `wasi:clocks/monotonic-clock` import + the component path.
+fn usesEnvTime(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_time) return true;
+    }
+    return false;
+}
+
 /// Per-op db predicates — each gates its own `[method]connection.*` import.
 fn usesDbExec(m: *const ir.mir.Module) bool {
     for (m.funcs) |f| {
@@ -1911,7 +1961,7 @@ fn usesDbQueryText(m: *const ir.mir.Module) bool {
 /// `wasi:keyvalue/atomics` (the `env.kv` lowering) and exports each scalar `pub`
 /// function. Named `qube` (the fixed world name the CLI passes to `component
 /// embed --world`). Caller owns the slice.
-fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use_kv: bool, use_blob: bool, use_db: bool, use_config: bool) ![]u8 {
+fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use_kv: bool, use_blob: bool, use_db: bool, use_config: bool, use_time: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "// synthesized WIT world (q64 storage capabilities → host interfaces)\n");
@@ -1928,6 +1978,9 @@ fn synthStoreWorld(allocator: std.mem.Allocator, hmod: *const ir.hir.Module, use
     }
     if (use_config) {
         try out.print(allocator, "  import {s};\n", .{config_store_iface});
+    }
+    if (use_time) {
+        try out.print(allocator, "  import {s};\n", .{clocks_monotonic_iface});
     }
     for (hmod.funcs) |f| {
         if (f.visibility != .public) continue;
@@ -2100,6 +2153,10 @@ const Scratch = struct {
     has_db_query_text: bool = false,
     /// Contains an `env.config.get` → declare the `wasi:config/store.get` import.
     has_config_get: bool = false,
+    /// Contains an `env.time.monotonic_ns` → declare the clock import (the
+    /// canonical `wasi:clocks` one in component mode, the raw `env.monotonic_ns`
+    /// face locally). Scalar-only: needs neither the pair scratch nor the arena.
+    has_time: bool = false,
     /// Contains a `chan_recv` → declare the `env.channel_recv` import.
     has_chan: bool = false,
     /// Contains a `chan_take` → declare the `env.channel_take` import.
@@ -2141,6 +2198,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_db_query_value = s.has_db_query_value or sub.has_db_query_value;
     s.has_db_query_text = s.has_db_query_text or sub.has_db_query_text;
     s.has_config_get = s.has_config_get or sub.has_config_get;
+    s.has_time = s.has_time or sub.has_time;
     s.has_chan = s.has_chan or sub.has_chan;
     s.has_take = s.has_take or sub.has_take;
     s.has_connect = s.has_connect or sub.has_connect;
@@ -2372,6 +2430,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.host_out = true; // key rides the pair scratch (ptr,len)
             scanScratch(cf.key, s);
         },
+        .time_monotonic_ns => s.has_time = true,
         .chan_recv => |h| {
             s.has_chan = true;
             scanScratch(h, s);
@@ -2563,6 +2622,11 @@ const Lowerer = struct {
     /// top-level `wasi:config/store.get` — no handle, no lazy-open. Reuses the
     /// shared store return area + box helpers.
     config_component: bool = false,
+    /// time (wasi:clocks) component lowering: `env.time.monotonic_ns` lowers to
+    /// the top-level `monotonic-clock.now` — a bare scalar call, no return
+    /// area at all. When false, the raw local `env.monotonic_ns` face is used
+    /// instead (unlike the storage faces, the local path is real, not a trap).
+    time_component: bool = false,
     kv_open_ret: u32 = 0,
     kv_inc_ret: u32 = 0,
     /// kv set/get scratch locals: `kv_hdr_idx` holds the boxed-Result header
@@ -2917,6 +2981,13 @@ const Lowerer = struct {
                 // wasi:config/store.get is a top-level function — no handle,
                 // no lazy-open; reuse the get-decode with null handle/open.
                 return try self.storeComponentGet(cf.key, "config_store_get", null, null);
+            },
+            .time_monotonic_ns => {
+                // env.time.monotonic_ns() — a bare scalar call either way:
+                // the canonical wasi:clocks import in component mode, the raw
+                // `env.monotonic_ns` host face locally. No return area, no box.
+                const name: [*:0]const u8 = if (self.time_component) "clocks_monotonic_now" else "env_monotonic_ns";
+                return c.BinaryenCall(module, name, null, 0, self.i64_type);
             },
             .chan_recv => |h| {
                 // got = env.channel_recv(session) — 1 (message) or 0 (closed).
@@ -5654,6 +5725,30 @@ test "emitComponent: env.config lowers to a wasi:config/store component (handle-
             try testing.expect(std.mem.indexOf(u8, kvc.core, "wasi:keyvalue") == null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:config/store@0.2.0-draft;") != null);
             try testing.expect(std.mem.indexOf(u8, kvc.world, "export read: func() -> s64;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.time lowers to a wasi:clocks component (bare scalar now)" {
+    const src =
+        \\pub fn mono() -> i64 { env.time.monotonic_ns() }
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "time.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            // The core imports the monotonic clock module under the STABLE
+            // major.minor mangle (`@0.2`, not `@0.2.0` — see
+            // `clocks_monotonic_core_mod`), while the world pins the full id.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|wasi:clocks/monotonic-clock@0.2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "monotonic-clock@0.2.0") == null);
+            // Scalar-only: no store scaffolding rides along.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2_realloc") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "wasi:keyvalue") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import wasi:clocks/monotonic-clock@0.2.0;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export mono: func() -> s64;") != null);
         },
         else => return error.TestUnexpectedResult,
     }

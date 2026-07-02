@@ -290,6 +290,10 @@ pub const Op = union(enum) {
     /// `env.config.get(key)`: the top-level `wasi:config/store.get` (no handle),
     /// boxed `Result<Option<Bytes>, IoError>` (`.ptr`).
     config_get: struct { key: *Inst },
+    /// `env.time.monotonic_ns()`: the top-level
+    /// `wasi:clocks/monotonic-clock.now` (no handle, no args), a bare i64 —
+    /// the scalar-only face, no Result box and no return area.
+    time_monotonic_ns,
     /// `chan_recv(session)` — receive the next inbound channel message (the
     /// `env.channel_recv` host import). Operand is the session handle (i64);
     /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.
