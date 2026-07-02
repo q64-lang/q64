@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, sub, "--version")) {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writerStreaming(io, &buf);
-        try w.interface.writeAll("q64 0.0.1 (pre-alpha)\n");
+        try w.interface.writeAll("q64 0.0.5 (pre-alpha)\n");
         try w.interface.flush();
         return;
     }
