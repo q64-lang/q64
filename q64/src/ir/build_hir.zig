@@ -1159,6 +1159,22 @@ fn buildSpawnLet(b: *Builder, sp: ast.SpawnExpr, nm: parser.cst.Token, is_var: b
     try out.append(b.a, st);
 }
 
+/// If `stmt` is a handle spawn (`let h = spawn { … }`), its spawn expression
+/// and binding token. Under the scheduler the binding becomes the task's
+/// RESULT local (assigned at the task's terminal block), so a post-join
+/// `h.await()` reads it through the ordinary await lowering.
+fn letSpawnOf(stmt: ast.Stmt) ?struct { sp: ast.SpawnExpr, nm: parser.cst.Token } {
+    const ls = switch (stmt) {
+        .let_stmt => |x| x,
+        else => return null,
+    };
+    const init = ls.initializer() orelse return null;
+    if (init != .spawn) return null;
+    const pat = ls.pattern() orelse return null;
+    const nm = pat.bindingName() orelse return null;
+    return .{ .sp = init.spawn, .nm = nm };
+}
+
 /// If `stmt` is a statement-position `spawn …`, its spawn expression (the
 /// fire-and-forget task). Covers both `spawn { block }` and the `spawn scope
 /// { … }` sugar.
@@ -1565,8 +1581,27 @@ const TaskScan = struct { sends: bool = false, recvs: bool = false, recv_in_ctrl
 /// loop. `in_ctrl` marks that we're inside a loop/`if` body. Any other statement
 /// → not schedulable (fall back to the static path).
 fn taskSchedulable(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), actors: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool) bool {
-    var it = body.statements();
-    while (it.next()) |stmt| {
+    return taskSchedulableTail(b, body, chans, bounded, actors, scan, loop_depth, in_ctrl, false);
+}
+
+/// As `taskSchedulable`, but `skip_tail` exempts the body's LAST statement
+/// from the checks — a handle spawn's tail is its value expression (any i64
+/// expr), which the scheduler assigns to the result local at the terminal
+/// block. Only the top-level body skips; nested control-flow bodies don't.
+fn taskSchedulableTail(b: *Builder, body: ast.Block, chans: *const std.StringHashMapUnmanaged(void), bounded: *const std.StringHashMapUnmanaged(void), actors: *const std.StringHashMapUnmanaged(void), scan: *TaskScan, loop_depth: usize, in_ctrl: bool, skip_tail: bool) bool {
+    var list: std.ArrayList(ast.Stmt) = .empty;
+    defer list.deinit(b.a);
+    {
+        var cit = body.statements();
+        while (cit.next()) |s| list.append(b.a, s) catch return false;
+    }
+    if (skip_tail) {
+        if (list.items.len == 0) return false; // `spawn {}` isn't a value
+        const tail = list.items[list.items.len - 1];
+        if (tail != .expr_stmt) return false; // the tail must be the value
+        _ = list.pop();
+    }
+    for (list.items) |stmt| {
         if (recvStepOf(b, stmt, chans) != null) {
             scan.recvs = true;
             if (in_ctrl) scan.recv_in_ctrl = true;
@@ -1719,16 +1754,31 @@ fn scopeNeedsScheduler(b: *Builder, blk: ast.Block, scope: *Scope) bool {
     }
     var ntasks: usize = 0;
     var needs = false;
+    var seen_spawn = false;
     it = blk.statements();
     while (it.next()) |stmt| {
         if (spawnExprOf(stmt)) |sp| {
             const body = sp.block() orelse return false; // `spawn scope`: not v0-schedulable
             ntasks += 1;
+            seen_spawn = true;
             var scan: TaskScan = .{};
             if (!taskSchedulable(b, body, &chans, &bounded, &actors, &scan, 0, false)) return false;
             if ((scan.sends and scan.recvs) or scan.recv_in_ctrl or scan.send_bounded or scan.sleeps) needs = true;
+        } else if (letSpawnOf(stmt)) |lsp| {
+            // A handle spawn: the prefix must be schedulable; the tail is the
+            // task's value (assigned at the terminal result block).
+            const body = lsp.sp.block() orelse return false;
+            ntasks += 1;
+            seen_spawn = true;
+            var scan: TaskScan = .{};
+            if (!taskSchedulableTail(b, body, &chans, &bounded, &actors, &scan, 0, false, true)) return false;
+            if ((scan.sends and scan.recvs) or scan.recv_in_ctrl or scan.send_bounded or scan.sleeps) needs = true;
         } else if (channelDeclName(b, stmt) == null and actorBindingOf(b, stmt) == null) {
-            return false; // a non-spawn, non-channel-decl, non-actor statement: stay static
+            // Pre-spawn, only channel/actor setup keeps the scope schedulable.
+            // POST-spawn trailing statements (awaits, prints, folds over the
+            // results) run at the join — the scheduled path emits them after
+            // the loop, so they don't block scheduling.
+            if (!seen_spawn) return false;
         }
     }
     return ntasks >= 2 and needs;
@@ -2253,19 +2303,31 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
             }
         }
     }
-    // Emit the setup (channel decls) in order; collect the spawned task bodies.
-    var tasks: std.ArrayList(ast.Block) = .empty;
+    // Emit the setup (channel decls) in order; collect the spawned task bodies
+    // (statement spawns and handle spawns — the latter carry a result binding)
+    // and the post-join trailing statements (awaits, prints over the results).
+    const SchedTask = struct { body: ast.Block, res_nm: ?[]const u8 };
+    var tasks: std.ArrayList(SchedTask) = .empty;
     defer tasks.deinit(b.a);
+    var post: std.ArrayList(ast.Stmt) = .empty;
+    defer post.deinit(b.a);
     {
         var it = blk.statements();
         while (it.next()) |stmt| {
             if (spawnExprOf(stmt)) |sp| {
-                try tasks.append(b.a, sp.block() orelse return error.Unsupported);
+                try tasks.append(b.a, .{ .body = sp.block() orelse return error.Unsupported, .res_nm = null });
+            } else if (letSpawnOf(stmt)) |lsp| {
+                try tasks.append(b.a, .{ .body = lsp.sp.block() orelse return error.Unsupported, .res_nm = lsp.nm.text });
             } else if (try buildChannelDecl(b, stmt, scope, out)) {
                 // A channel decl (single `let ch = …` or split `let (tx, rx) = …`),
                 // built directly so the scheduler is builder-agnostic — it runs in
                 // `main` and in callee (void) bodies alike (the main/void statement
                 // builders differ).
+            } else if (tasks.items.len > 0) {
+                // Post-join statements: everything after the first spawn runs at
+                // the closing brace (the scope's join), where every task has
+                // completed — which is exactly what an `h.await()` needs.
+                try post.append(b.a, stmt);
             } else {
                 // An actor-instance construct (`let acc = Actor {}`): build the
                 // state record via the full statement builder (records are
@@ -2291,7 +2353,25 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
         var blocks: std.ArrayList(SchedBlock) = .empty;
         defer blocks.deinit(b.a);
         var ctx: SchedCtx = .{ .b = b, .scope = scope, .rt = rt, .chans = &chans, .blocks = &blocks };
-        entry[t] = try lowerTaskSeq(&ctx, try collectStmts(b, task), DONE_PC);
+        if (task.res_nm) |res_nm| {
+            // A handle spawn: the tail statement is the task's value. Reserve
+            // the result block FIRST (so the prefix's succ can target it),
+            // lower the prefix, then fill it — the tail expression may read
+            // locals the prefix declares, so it must build after them.
+            const all = try collectStmts(b, task.body);
+            if (all.len == 0) return error.Unsupported;
+            const tail_e = switch (all[all.len - 1]) {
+                .expr_stmt => |es| es.expression() orelse return error.Unsupported,
+                else => return error.Unsupported,
+            };
+            const res_id = try addBlock(&ctx, .{ .kind = .plain, .next = DONE_PC });
+            entry[t] = try lowerTaskSeq(&ctx, all[0 .. all.len - 1], res_id);
+            const res_idx = try declareBodyLocal(b, scope, res_nm, true, .i64);
+            const res_assign = try mkAssignS(b, res_idx, try buildIntExpr(b, tail_e, scope));
+            blocks.items[res_id].stmts = try b.a.dupe(*hir.Stmt, &.{res_assign});
+        } else {
+            entry[t] = try lowerTaskSeq(&ctx, try collectStmts(b, task.body), DONE_PC);
+        }
         terminal[t] = blocks.items.len; // pc == terminal ⇒ task complete
         for (blocks.items) |*bl| {
             if (bl.next == DONE_PC) bl.next = terminal[t];
@@ -2366,6 +2446,12 @@ fn buildScopeScheduled(b: *Builder, blk: ast.Block, scope: *Scope, rt: *RtMap, o
     const wst = try b.a.create(hir.Stmt);
     wst.* = .{ .while_ = .{ .cond = cond, .body = body_blk } };
     try out.append(b.a, wst);
+    // Post-join statements: every task has completed (the scope's structured
+    // join), so `h.await()` here is a plain read of the task's result local
+    // (declared under the handle's name — the ordinary await lowering finds it).
+    for (post.items) |s| {
+        if (scope.callee) try buildVoidStmt(b, s, scope, out) else try buildMainStmt(b, s, scope, rt, out);
+    }
 }
 
 /// `scope { … }` on the v0 cooperative floor (spec/memory.md §"Concurrency
@@ -11934,6 +12020,71 @@ test "for _ in lo..hi: the wildcard loop variable binds a hidden counter" {
     try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the channel readiness tests
     try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns()") != null); // the sleep arm
+}
+
+test "scope scheduling: handle spawns carry results; post-join awaits read them" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    // Two sleeping tasks with values, awaited after the scope's structured
+    // join — the awaits are plain reads of the result locals (declared under
+    // the handle names), and the sleeps run in parallel under the scheduler.
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let fast = spawn {
+        \\            env.time.sleep_ns(100000000)
+        \\            1
+        \\        }
+        \\        let slow = spawn {
+        \\            env.time.sleep_ns(300000000)
+        \\            2
+        \\        }
+        \\        let a = fast.await()
+        \\        let b = slow.await()
+        \\        env.out(a + b)
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null); // the scheduler
+    try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns()") != null); // deadline arms
+    try testing.expect(std.mem.indexOf(u8, dump, "time_sleep_ns") != null); // the idle path
+    // The post-join fold over the two result locals (`a + b` printed).
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null);
+}
+
+test "scope scheduling: a channel-fed handle spawn's tail reads its prefix locals" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    scope {
+        \\        let ch = channel()
+        \\        let sum = spawn {
+        \\            let x = ch.recv()
+        \\            let y = ch.recv()
+        \\            env.time.sleep_ns(1000)
+        \\            x + y
+        \\        }
+        \\        spawn {
+        \\            ch.send(40)
+        \\            ch.send(2)
+        \\        }
+        \\        let r = sum.await()
+        \\        env.out(r)
+        \\    }
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // channel readiness
+    try testing.expect(std.mem.indexOf(u8, dump, "host_out_int") != null); // r printed post-join
 }
 
 test "scope scheduling: a sleeping task is a timewait suspend point (tasks interleave)" {

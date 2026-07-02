@@ -305,8 +305,20 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
             Verified under `wasmtime -S p3` and the local Node ABI: tasks
             interleave (`A` before the sleeper's `B`), two parallel sleeps
             of 300+100ms finish in ~301ms, and sleeps compose with channel
-            ping-pong waits. Remaining rungs: `await`/handle suspension, the
-            async-lifted component export (callback + task.return).
+            ping-pong waits.
+          - [x] **Rung 2 — handle spawns + `await` under the scheduler
+            (LANDED).** `let h = spawn { …; value }` in a scheduled scope
+            lowers the body through the same pc machinery with a terminal
+            RESULT block assigning the tail expression into a local declared
+            under the handle's name; post-spawn trailing statements run at
+            the scope's structured join, where `h.await()` is a plain read
+            of that local (the ordinary await lowering finds it by name).
+            Verified under `wasmtime -S p3`: two sleeping value tasks
+            (100ms→1, 300ms→2) awaited and summed print `3` after ~301ms
+            (parallel, not 400), and a channel-fed handle task's tail reads
+            its prefix locals (`sum = 42`). Remaining rung: the async-lifted
+            component export (callback + task.return) — awaits that suspend
+            MID-scope (not at the join) ride the same milestone.
         - **Slice C — `future<T>`/`stream<T>` as q64 values.** Maps the
           `Signal`/`Event`/`Stream` family (streams.md) onto the ABI's
           `{future,stream}.{new,read,write,cancel,close}` built-ins;
