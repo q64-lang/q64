@@ -26,3 +26,11 @@ pub fn delta() -> i64 {
     let b = env.time.monotonic_ns()
     b - a
 }
+
+// The monotonic clock's tick size, in nanoseconds
+// (wasi:clocks/monotonic-clock.resolution).
+pub fn resolution() -> i64 { env.time.resolution_ns() }
+
+// Wall-clock time as nanoseconds since the Unix epoch
+// (wasi:clocks/wall-clock.now, its datetime record folded to one i64).
+pub fn unix() -> i64 { env.time.unix_ns() }

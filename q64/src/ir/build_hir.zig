@@ -9847,14 +9847,25 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     }
                 }
             }
-            // `env.time.monotonic_ns()` — the monotonic clock in ns, a plain
-            // i64 (no Result box, spec/env.md §`env.time`). Nullary; any
+            // The `env.time` faces — each nullary, each a plain i64 (no
+            // Result box, spec/env.md §`env.time` face-mapping rows). Any
             // argument is a malformed call.
-            if (std.mem.eql(u8, cname, "env.time.monotonic_ns")) {
-                var ta = cc.args();
-                if (ta.next() != null) return reject(b, .unsupported_call);
-                out.* = .time_monotonic_ns;
-                return out;
+            if (std.mem.startsWith(u8, cname, "env.time.")) {
+                const method = cname["env.time.".len..];
+                const node: ?hir.Expr = if (std.mem.eql(u8, method, "monotonic_ns"))
+                    .time_monotonic_ns
+                else if (std.mem.eql(u8, method, "resolution_ns"))
+                    .time_resolution_ns
+                else if (std.mem.eql(u8, method, "unix_ns"))
+                    .time_unix_ns
+                else
+                    null;
+                if (node) |n| {
+                    var ta = cc.args();
+                    if (ta.next() != null) return reject(b, .unsupported_call);
+                    out.* = n;
+                    return out;
+                }
             }
             // `c.ask(Msg)` — a value-returning actor handler dispatched by the
             // message name (the value half of message-style actors).

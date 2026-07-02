@@ -27,12 +27,15 @@ echo "1. q64 emit --component on examples/time-mono"
 echo "2. validate the emitted component"
 "$WT" validate --features all "$work/timeout.component.wasm"
 
-echo "3. assert it imports wasi:clocks/monotonic-clock + exports mono/delta"
+echo "3. assert it imports both clocks + exports mono/delta/resolution/unix"
 wit="$("$WT" component wit "$work/timeout.component.wasm")"
 for needle in \
   "import wasi:clocks/monotonic-clock@0.2.0;" \
+  "import wasi:clocks/wall-clock@0.2.0;" \
   "export mono: func() -> s64;" \
-  "export delta: func() -> s64;"; do
+  "export delta: func() -> s64;" \
+  "export resolution: func() -> s64;" \
+  "export unix: func() -> s64;"; do
   grep -qF "$needle" <<<"$wit" || { echo "FAIL: missing $needle" >&2; exit 1; }
 done
 

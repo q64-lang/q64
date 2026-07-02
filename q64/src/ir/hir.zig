@@ -215,11 +215,10 @@ pub const Effect = enum {
             // `env.config` maps to the real `wasi:config/store` proposal
             // (read-only config/secrets; spec/env.md §`env.config`).
             .config => &.{"wasi:config/store"},
-            // v0 implements `env.time.monotonic_ns()` only, so the derived
-            // import set is just the monotonic clock; `wasi:clocks/wall-clock`
-            // joins when `env.time.now()` lands (spec/env.md §`env.time` still
-            // documents the full Clock face).
-            .time => &.{"wasi:clocks/monotonic-clock"},
+            // Coarse per-effect mapping (like kv's store+atomics pair): the
+            // emitted world is finer — it imports only the clock interfaces
+            // the qube actually reaches (see `synthStoreWorld`).
+            .time => &.{ "wasi:clocks/monotonic-clock", "wasi:clocks/wall-clock" },
             .random => &.{"wasi:random/random"},
             .envvars => &.{"wasi:cli/environment"},
             .exit => &.{"wasi:cli/exit"},
@@ -500,6 +499,16 @@ pub const Expr = union(enum) {
     /// the boundary in registers alone (which is why it is `@realtime`-safe,
     /// spec/env.md §"realtime"). Marks the fn `@time`.
     time_monotonic_ns,
+    /// `env.time.resolution_ns()` — the monotonic clock's tick size in
+    /// nanoseconds, i64 (`wasi:clocks/monotonic-clock.resolution`). Same
+    /// bare-scalar shape as `monotonic_ns`. Marks the fn `@time`.
+    time_resolution_ns,
+    /// `env.time.unix_ns()` — wall-clock time as nanoseconds since the Unix
+    /// epoch, i64 (`wasi:clocks/wall-clock.now`; the `datetime {seconds,
+    /// nanoseconds}` record is folded to one i64 — good to year 2262). Unlike
+    /// the monotonic pair, the record result crosses via a small return area
+    /// in component mode. Marks the fn `@time`.
+    time_unix_ns,
     /// `chan_recv(session)` — receive the next inbound message on a remote
     /// channel session (`@channel_handler`'s `for _ in session`). Lowers to the
     /// `env.channel_recv` host import: returns 1 when a message arrived (run the

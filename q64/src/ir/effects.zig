@@ -250,7 +250,7 @@ fn collectExpr(
             d.insert(.config);
             try collectExpr(a, cf.key, d, e);
         },
-        .time_monotonic_ns => d.insert(.time),
+        .time_monotonic_ns, .time_resolution_ns, .time_unix_ns => d.insert(.time),
         .chan_recv => |h| {
             d.insert(.wire); // a remote channel receive crosses the wire
             try collectExpr(a, h, d, e);
@@ -323,10 +323,11 @@ test "Effect.marker / witImports" {
     try testing.expectEqualStrings("wasi:keyvalue/atomics", hir.Effect.kv.witImports()[1]);
     try testing.expectEqual(@as(usize, 0), hir.Effect.io.witImports().len); // umbrella: no single import
     try testing.expectEqual(@as(usize, 0), hir.Effect.wire.witImports().len); // import is the remote world
-    // `env.time` v0 derives only the monotonic clock (wall-clock joins when
-    // `env.time.now()` lands).
-    try testing.expectEqual(@as(usize, 1), hir.Effect.time.witImports().len);
+    // `env.time` maps to the clocks pair (coarse, like kv's store+atomics);
+    // the emitted world gates each interface on actual use.
+    try testing.expectEqual(@as(usize, 2), hir.Effect.time.witImports().len);
     try testing.expectEqualStrings("wasi:clocks/monotonic-clock", hir.Effect.time.witImports()[0]);
+    try testing.expectEqualStrings("wasi:clocks/wall-clock", hir.Effect.time.witImports()[1]);
 }
 
 test "close: @stdout pulls in @io transitively" {

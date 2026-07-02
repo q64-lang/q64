@@ -20,6 +20,15 @@ const imports = {
     // as a BigInt (the `n` suffix on its values) because ns counts overflow
     // a JS Number's exact-integer range (2^53-1 ns is only ~104 days).
     now: () => hrtime.bigint(),
+    // duration (u64): this host's tick size — 1ns, hrtime's unit.
+    resolution: () => 1n,
+  },
+  'wasi:clocks/wall-clock': {
+    // datetime record: seconds (u64) + nanoseconds (u32) since the epoch.
+    now: () => {
+      const ms = Date.now();
+      return { seconds: BigInt(Math.floor(ms / 1000)), nanoseconds: (ms % 1000) * 1_000_000 };
+    },
   },
 };
 
@@ -46,4 +55,22 @@ if (typeof d !== 'bigint' || d < 0n) {
   process.exit(1);
 }
 console.log(`  delta() -> ${d} ns between two in-qube readings`);
+
+const r = inst.resolution();
+if (r !== 1n) {
+  console.error(`FAIL: resolution() = ${r}, host advertised 1n`);
+  process.exit(1);
+}
+console.log(`  resolution() -> ${r} ns per tick`);
+
+// unix() folds the datetime record to epoch-ns in-qube; compare against the
+// host's own clock with a generous minute of slack.
+const u = inst.unix();
+const nowNs = BigInt(Date.now()) * 1_000_000n;
+const diff = u > nowNs ? u - nowNs : nowNs - u;
+if (typeof u !== 'bigint' || diff > 60_000_000_000n) {
+  console.error(`FAIL: unix() = ${u}, host says ~${nowNs}`);
+  process.exit(1);
+}
+console.log(`  unix() -> ${u} ns since the epoch (host agrees ±${diff} ns)`);
 console.log('OK — the q64 time component runs on a generic wasi:clocks host.');

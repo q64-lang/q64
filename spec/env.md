@@ -434,6 +434,9 @@ user code never sees:
 | `KeyValue.get(self, key: str) -> Result<Option<Bytes>, IoError>` | `wasi:keyvalue/store.bucket.get` (bucket handle held by the adapter) |
 | `KeyValue.set(self, key: str, value: Bytes) -> Result<(), IoError>` | `wasi:keyvalue/store.bucket.set` |
 | `KeyValue.increment(self, key: str, delta: i64) -> Result<i64, IoError>` | `wasi:keyvalue/atomics.increment` |
+| `Clock.monotonic_ns(self) -> i64`                      | `wasi:clocks/monotonic-clock.now` (bare scalar — no box, no handle) |
+| `Clock.resolution_ns(self) -> i64`                     | `wasi:clocks/monotonic-clock.resolution` (bare scalar) |
+| `Clock.unix_ns(self) -> i64`                           | `wasi:clocks/wall-clock.now` (the `datetime {seconds, nanoseconds}` record folded to ns since the Unix epoch; i64 carries that to year 2262) |
 
 Under WASIp3, byte I/O is the native canonical-ABI `stream<u8>`: stdout/stderr
 hand back a `stream<u8>` directly, and there is no `wasi:io/streams`

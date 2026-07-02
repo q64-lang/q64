@@ -294,6 +294,13 @@ pub const Op = union(enum) {
     /// `wasi:clocks/monotonic-clock.now` (no handle, no args), a bare i64 —
     /// the scalar-only face, no Result box and no return area.
     time_monotonic_ns,
+    /// `env.time.resolution_ns()`: `wasi:clocks/monotonic-clock.resolution`,
+    /// the same bare-scalar shape as `time_monotonic_ns`.
+    time_resolution_ns,
+    /// `env.time.unix_ns()`: `wasi:clocks/wall-clock.now`, its `datetime`
+    /// record folded to i64 ns since the Unix epoch (component mode reads
+    /// the record back from a small reserved return area).
+    time_unix_ns,
     /// `chan_recv(session)` — receive the next inbound channel message (the
     /// `env.channel_recv` host import). Operand is the session handle (i64);
     /// yields 1 (message available) or 0 (closed). Drives `for _ in session`.
