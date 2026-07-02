@@ -1,0 +1,6 @@
+package q64:qube;
+
+world qube {
+  import wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15;
+  export nap: async func(ns: s64) -> s64;
+}

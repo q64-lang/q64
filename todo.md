@@ -316,9 +316,26 @@ operation violations, `@cancel` propagation). Specs: `concurrency.md`,
             Verified under `wasmtime -S p3`: two sleeping value tasks
             (100ms→1, 300ms→2) awaited and summed print `3` after ~301ms
             (parallel, not 400), and a channel-fed handle task's tail reads
-            its prefix locals (`sum = 42`). Remaining rung: the async-lifted
-            component export (callback + task.return) — awaits that suspend
-            MID-scope (not at the join) ride the same milestone.
+            its prefix locals (`sum = 42`).
+          - [~] **Rung 3 — the async-lifted component export: PROTOCOL
+            PINNED (`test/async-export-reference/`), codegen remaining.**
+            Two hand-authored cores round-trip the Component Model async
+            ABI under `wasmtime -W component-model-async -S p3`: a YIELD
+            core proving lift/callback/task.return with zero imports, and
+            the real one — `nap(ns)` starts `wait-for` as an async-lowered
+            SUBTASK, joins a waitable-set, returns `WAIT(set)`; the callback
+            fires on completion and `task.return`s the measured span
+            (250ms → 251.7ms measured, host thread never blocked). Verified
+            findings in the fixture README: legacy manglings only (standard
+            cm32p2 has no async yet), `(subtask<<4)|state` packing with
+            RETURNED=2, callback codes EXIT=0/YIELD=1/WAIT=2|set<<4, and
+            wasmtime's p3 WASI is rc-versioned
+            (`wasi:clocks@0.3.0-rc-2026-03-15`, `instant`→`mark`).
+            Remaining codegen work (the mapping table is in the README):
+            spill scheduler state (pc/deadlines/task locals) from function
+            locals to globals or a memory frame so `main` is re-entrant,
+            emit the legacy-mangled async imports/exports, and route the
+            idle path to `wait-for`+WAIT instead of the blocking sleep.
         - **Slice C — `future<T>`/`stream<T>` as q64 values.** Maps the
           `Signal`/`Event`/`Stream` family (streams.md) onto the ABI's
           `{future,stream}.{new,read,write,cancel,close}` built-ins;
