@@ -16,7 +16,9 @@ const { instantiate } = await import(new URL(outDir + '/timeout.component.js', i
 
 const imports = {
   'wasi:clocks/monotonic-clock': {
-    // instant (u64): nanoseconds from an arbitrary, fixed origin.
+    // instant (u64): nanoseconds from an arbitrary, fixed origin — carried
+    // as a BigInt (the `n` suffix on its values) because ns counts overflow
+    // a JS Number's exact-integer range (2^53-1 ns is only ~104 days).
     now: () => hrtime.bigint(),
   },
 };
