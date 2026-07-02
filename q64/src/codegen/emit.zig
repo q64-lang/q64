@@ -926,9 +926,16 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     const writes_stdout = usesHostStream(m, .out);
     const writes_stderr = usesHostStream(m, .err);
     const preview1 = (stdout_abi == .wasi_preview1) and wants_out;
-    // iovec (8 bytes: i32 buf, i32 len) + nwritten (4 bytes), padded to 16.
-    const iovec_scratch: usize = if (preview1) 16 else 0;
+    // A preview1 app that reads the clock lowers `env.time.monotonic_ns` to the
+    // preview1 syscall `clock_time_get` (the adapter lifts it to `wasi:clocks`),
+    // which writes its u64 timestamp through a pointer — reserve an 8-aligned
+    // cell for it just past the iovec block.
+    const preview1_time = (stdout_abi == .wasi_preview1) and usesEnvTime(m);
     const iovec_base: u32 = @intCast(m.data.len);
+    const p1_ts_base: u32 = (iovec_base + 16 + 7) & ~@as(u32, 7);
+    // iovec (8 bytes: i32 buf, i32 len) + nwritten (4 bytes), padded to 16
+    // (+ the 8-byte timestamp cell when the clock is read).
+    const iovec_scratch: usize = if (preview1_time) (p1_ts_base + 8 - iovec_base) else if (preview1) 16 else 0;
 
     // env.kv → wasi:keyvalue component lowering. The core imports the canonical
     // `cm32p2|…` ABI; the host writes each call's `result<…>` into a fixed
@@ -1248,7 +1255,14 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const get_params = c.BinaryenTypeCreate(&gp, gp.len);
         c.BinaryenAddFunctionImport(module, "config_store_get", cfg_mod, "get", get_params, none_type);
     }
-    if (needs_time and !wants_time) {
+    if (preview1_time) {
+        // Preview1 app ABI — clock_time_get(clockid: i32, precision: i64,
+        // timestamp_ptr: i32) -> errno: i32. The adapter lifts it to
+        // `wasi:clocks/monotonic-clock` (clockid 1 = monotonic).
+        var ctp = [_]c.BinaryenType{ i32_type, i64_type, i32_type };
+        const ct_params = c.BinaryenTypeCreate(&ctp, ctp.len);
+        c.BinaryenAddFunctionImport(module, "clock_time_get", "wasi_snapshot_preview1", "clock_time_get", ct_params, i32_type);
+    } else if (needs_time and !wants_time) {
         // Local `qube run` ABI — env.monotonic_ns : () -> i64 nanoseconds
         // (spec/env.md §`env.time`). Nullary and scalar on every address width.
         c.BinaryenAddFunctionImport(module, "env_monotonic_ns", "env", "monotonic_ns", none_type, i64_type);
@@ -1454,6 +1468,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .db_component = wants_db,
             .config_component = wants_config,
             .time_component = wants_time,
+            .time_preview1 = preview1_time,
+            .p1_ts_base = p1_ts_base,
             .kv_open_ret = kv_open_ret,
             .kv_inc_ret = kv_inc_ret,
             .kv_hdr_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0),
@@ -2627,6 +2643,11 @@ const Lowerer = struct {
     /// area at all. When false, the raw local `env.monotonic_ns` face is used
     /// instead (unlike the storage faces, the local path is real, not a trap).
     time_component: bool = false,
+    /// time preview1 lowering (an app that prints AND times): the clock rides
+    /// the preview1 syscall `clock_time_get(1, precision, ts_ptr)`, its u64
+    /// written into the reserved cell at `p1_ts_base` and loaded back.
+    time_preview1: bool = false,
+    p1_ts_base: u32 = 0,
     kv_open_ret: u32 = 0,
     kv_inc_ret: u32 = 0,
     /// kv set/get scratch locals: `kv_hdr_idx` holds the boxed-Result header
@@ -2983,9 +3004,28 @@ const Lowerer = struct {
                 return try self.storeComponentGet(cf.key, "config_store_get", null, null);
             },
             .time_monotonic_ns => {
-                // env.time.monotonic_ns() — a bare scalar call either way:
-                // the canonical wasi:clocks import in component mode, the raw
-                // `env.monotonic_ns` host face locally. No return area, no box.
+                // env.time.monotonic_ns() — three lowerings, one face:
+                // component mode calls the canonical wasi:clocks import;
+                // preview1 apps call the clock_time_get syscall (u64 written
+                // through the reserved cell, loaded back); local mode calls
+                // the raw `env.monotonic_ns` host face. No Result box ever.
+                if (self.time_preview1) {
+                    const i32c = struct {
+                        fn f(mod: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+                            return c.BinaryenConst(mod, c.BinaryenLiteralInt32(v));
+                        }
+                    }.f;
+                    var call_args = [_]c.BinaryenExpressionRef{
+                        i32c(module, 1), // clockid 1 = monotonic
+                        c.BinaryenConst(module, c.BinaryenLiteralInt64(1)), // precision hint: 1 ns
+                        i32c(module, @intCast(self.p1_ts_base)),
+                    };
+                    var seq = [_]c.BinaryenExpressionRef{
+                        c.BinaryenDrop(module, c.BinaryenCall(module, "clock_time_get", @ptrCast(&call_args), call_args.len, self.i32_type)),
+                        c.BinaryenLoad(module, 8, false, 0, 0, self.i64_type, i32c(module, @intCast(self.p1_ts_base)), "0"),
+                    };
+                    return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.i64_type);
+                }
                 const name: [*:0]const u8 = if (self.time_component) "clocks_monotonic_now" else "env_monotonic_ns";
                 return c.BinaryenCall(module, name, null, 0, self.i64_type);
             },
@@ -5548,6 +5588,32 @@ test "emitComponent: env.exit lowers to a preview1 proc_exit app (→ wasi:cli/e
             try testing.expect(std.mem.indexOf(u8, core, "wasi_snapshot_preview1") != null);
             // No raw env.exit face leaks into the preview1 core.
             try testing.expect(std.mem.indexOf(u8, core, "env_exit") == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: a printing main that reads the clock lowers time to preview1 clock_time_get" {
+    // An app that both prints (`env.out` → fd_write) and times routes down the
+    // preview1 path; the clock rides the `clock_time_get` syscall (the adapter
+    // lifts it to wasi:clocks/monotonic-clock), not the cm32p2 import and not
+    // the raw local face.
+    const app =
+        \\fn main {
+        \\    let t0 = env.time.monotonic_ns()
+        \\    let t1 = env.time.monotonic_ns()
+        \\    env.out(t1 - t0)
+        \\}
+        \\
+    ;
+    const artifact = try emitComponent(testing.allocator, app, "sw.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .preview1_app => |core| {
+            defer testing.allocator.free(core);
+            try testing.expect(std.mem.indexOf(u8, core, "clock_time_get") != null);
+            try testing.expect(std.mem.indexOf(u8, core, "wasi_snapshot_preview1") != null);
+            try testing.expect(std.mem.indexOf(u8, core, "cm32p2") == null);
+            try testing.expect(std.mem.indexOf(u8, core, "monotonic_ns") == null);
         },
         else => return error.TestUnexpectedResult,
     }
