@@ -11932,7 +11932,7 @@ test "for _ in lo..hi: the wildcard loop variable binds a hidden counter" {
     const dump = try print.hirToString(testing.allocator, &mod);
     defer testing.allocator.free(dump);
     try testing.expect(std.mem.indexOf(u8, dump, "while") != null);
-    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null); // the sends
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null); // the channel readiness tests
     try testing.expect(std.mem.indexOf(u8, dump, "time_monotonic_ns()") != null); // the sleep arm
 }
 
