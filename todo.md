@@ -3456,6 +3456,40 @@ visible at a glance whether it's been picked up.
       artifact size + compose speed on realistic qubes; and where it slots
       into the linking ladder / `q64 emit --component` output vs doing our
       own composition in-compiler.
+      **The framing:** the real decision is *wac-as-wasm vs in-compiler
+      composition*, and it hinges on how much composition qube needs. If the
+      only operation is plugging one qube's exports into another's imports
+      (the `wac plug` shape), a minimal Zig implementation over the component
+      binary format is conceivable; the moment we want shared instances,
+      virtualization, or multi-way composition graphs, that's reimplementing
+      wac and the wasm-embedding route wins. Reusing `wac-graph` inherits
+      upstream spec conformance as the Component Model evolves — component
+      composition (merging type sections, resolving import/export shapes,
+      instantiation order) is a different layer from our Binaryen core-module
+      linking, and a large ongoing commitment to own. The wasm route also fits
+      the architecture: both hosts already exist (the browser shell
+      instantiates wasm next to `qube-resolve.wasm`; the native CLI runs it in
+      the vendored wasmtime), whereas shelling out to a native `wac` binary
+      kills the browser story and adds per-platform distribution.
+      **PoC (do this FIRST — ~an hour, answers feasibility, feature skew, and
+      size in one shot):**
+      1. Compile `wac-graph` + a ~20-line Rust cdylib wrapper exporting
+         `compose(component_bytes[]) -> component_bytes` (in-memory bytes, no
+         WASI fs, no WAC-language parser) to `wasm32-wasip1`.
+      2. Feed it two REAL `q64 emit --component` outputs — one of them the
+         **async-lifted** export (legacy `[async-lift]`/`task.return`
+         manglings, see the futures ladder) — under the vendored wasmtime.
+         Async is the likely failure point: wac may reject async-lifted
+         components outright, and if so the whole plan is gated on upstream.
+         Do NOT PoC on a hello-world component; it proves nothing.
+      3. Record: does it build; does it accept/compose our components; wasm
+         artifact size (expect 2–5 MB); compose wall-time on realistic qubes.
+      **If the PoC passes**, the design follow-ons: drive composition from
+      qube manifests/deps via `wac-graph`'s `CompositionGraph` API (no WAC DSL
+      for users); build `wac.wasm` once in CI and ship it as a prebuilt
+      artifact like `q64-emit.wasm` (no cargo in anyone's qube build); later,
+      maybe publish it as a qube on the Continuum (composing components with a
+      component — self-hosting tooling).
 - [x] Parser-emitted syntactic NAM diagnostics: `NAM003` (wildcard import),
       `NAM004` (selective+alias), `NAM009` (block `pub`), `NAM011` (dash in
       bare path). Conformance 6→10. The semantic NAM codes (`NAM001/002/005…`,
