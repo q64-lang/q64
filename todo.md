@@ -3444,6 +3444,18 @@ interop.
 This section grows as we go. Each item should have a checkbox so it's
 visible at a glance whether it's been picked up.
 
+- [ ] **Analyse: compile `wac` to wasm so `qube` can glue components together.**
+      The Bytecode Alliance's `wac` tool (WAC language, `wac plug` /
+      `wac compose`) composes Component Model components into one component —
+      exactly the "glue several qubes' components" step. Investigate whether
+      `wac` (Rust) can be compiled to wasm and called *from* `qube`, so
+      composition needs no separate native binary and stays portable (CLI,
+      web shell, qubepods builder). Questions to answer: does the
+      `wac-graph`/`wac-parser` library surface build for a wasm target (vs
+      wrapping the CLI); how inputs/outputs flow (in-memory bytes vs WASI fs);
+      artifact size + compose speed on realistic qubes; and where it slots
+      into the linking ladder / `q64 emit --component` output vs doing our
+      own composition in-compiler.
 - [x] Parser-emitted syntactic NAM diagnostics: `NAM003` (wildcard import),
       `NAM004` (selective+alias), `NAM009` (block `pub`), `NAM011` (dash in
       bare path). Conformance 6→10. The semantic NAM codes (`NAM001/002/005…`,
