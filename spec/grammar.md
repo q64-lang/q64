@@ -62,7 +62,10 @@ Indentation is **not** syntactically significant. A `NEWLINE` outside
 any `(` `[` `{` group and outside a continuation-yielding token (binary
 operator, comma, open-bracket) terminates the current statement. An
 explicit `;` may always be used as a statement separator and is never
-required.
+required. Two statements written on one line with neither a `;` nor a
+newline between them (e.g. `a = 1  b = 2`) are diagnosed as `PAR050`:
+the trailing statement would otherwise be dropped from the AST, so it is
+rejected rather than silently miscompiled.
 
 ### Comments
 
@@ -785,6 +788,7 @@ The codes already defined in other specs are:
 | `LEX021` | types.md    | unexpected character `&` in type position                        |
 | `LEX022` | types.md    | ambiguous string-literal prefix                                  |
 | `PAR040` | generics.md | generic vs less-than ambiguity                                   |
+| `PAR050` | grammar.md  | statements must be separated by a newline or `;`                 |
 
 `LEX010` is reserved by this spec for "stray carriage return"
 (§"Source encoding and whitespace"). Future lexical and parser codes
