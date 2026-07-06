@@ -767,6 +767,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // binding takes one slot too — its value is an i32 0/1.
                 const init_sc = try exprScalar(b, init_expr, scope);
                 if (init_sc == .narrow_int) return error.Unsupported;
+                // A `Simd<…>` annotation must agree with the initializer's
+                // lane shape (`let v: Simd<f32, 4> = Simd.splat(7)` is a
+                // shape mismatch — no implicit conversion between shapes).
+                if (try simdShapeOfAnnot(b, ls.type_())) |want| {
+                    if (init_sc != simdScTy(want)) return error.Unsupported;
+                }
                 const lty: hir.Type = scalarBindTy(init_sc);
                 // Build the initializer first so it can't see its own name,
                 // then allocate a single local and register in scope so later
@@ -1970,6 +1976,28 @@ fn vecElemType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?hir.Type {
     defer b.a.free(raw);
     // genericArgsText yields the list *with* its angle brackets (`<f64>`).
     return scalarChanType(std.mem.trim(u8, raw, "<> \t"));
+}
+
+/// The lane shape named by a `Simd<elem, lanes>` type annotation
+/// (`Simd<f32, 4>` → f32x4, `Simd<i32, 4>` → i32x4), or null when `te`
+/// isn't a `Simd<…>` path or names a shape outside the v0 slice.
+fn simdShapeOfAnnot(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?ops.LaneShape {
+    const te = te_opt orelse return null;
+    if (te != .path) return null;
+    const nm = try te.path.name(b.a);
+    defer b.a.free(nm);
+    if (!std.mem.eql(u8, nm, "Simd")) return null;
+    const raw = (try te.path.genericArgsText(b.a)) orelse return null;
+    defer b.a.free(raw);
+    // The raw span is `<f32, 4>`: split on the comma, trim each side.
+    const inner = std.mem.trim(u8, raw, "<> \t");
+    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return null;
+    const elem = std.mem.trim(u8, inner[0..comma], " \t");
+    const lanes = std.mem.trim(u8, inner[comma + 1 ..], " \t");
+    if (!std.mem.eql(u8, lanes, "4")) return null;
+    if (std.mem.eql(u8, elem, "f32")) return .f32x4;
+    if (std.mem.eql(u8, elem, "i32")) return .i32x4;
+    return null;
 }
 
 // A task lowers to a tiny CFG of pc-numbered blocks. A `plain`/`recv` block
@@ -3423,6 +3451,10 @@ fn buildHostWrite(b: *Builder, call: ast.CallExpr, scope: *Scope, rt: *RtMap, st
             fv = w;
         }
         st.* = .{ .host_out_float = .{ .value = fv, .stream = stream } };
+    } else if (simdShapeOfSc(try exprScalar(b, arg, scope)) != null) {
+        // A bare SIMD value has no print form (and must not fall through to
+        // the i64 formatter) — extract a lane and print the scalar.
+        return reject(b, .unsupported_call);
     } else {
         // Otherwise an i64 expression (a call to an i64 function).
         const e = try buildIntExpr(b, arg, scope);
@@ -4513,6 +4545,10 @@ fn buildVoidEnvOut(b: *Builder, call: ast.CallExpr, scope: *Scope, stream: hir.S
             fv = w;
         }
         st.* = .{ .host_out_float = .{ .value = fv, .stream = stream } };
+    } else if (simdShapeOfSc(try exprScalar(b, arg, scope)) != null) {
+        // Same rule as the main-body ladder: no print form for a bare SIMD
+        // value — it must not reach the i64 formatter.
+        return reject(b, .unsupported_call);
     } else {
         st.* = .{ .host_out_int = .{ .value = try buildIntExpr(b, arg, scope), .stream = stream } };
     }
@@ -8880,6 +8916,8 @@ fn scalarBindTy(sc: sema.exprtype.ScalarType) hir.Type {
         .bool => .bool,
         .f64 => .f64,
         .f32 => .f32,
+        .f32x4 => .f32x4,
+        .i32x4 => .i32x4,
         else => .i64,
     };
 }
@@ -8888,6 +8926,77 @@ fn scalarBindTy(sc: sema.exprtype.ScalarType) hir.Type {
 /// other or with integers — spec/types.md §Arithmetic.
 fn isFloatSc(sc: sema.exprtype.ScalarType) bool {
     return sc == .f64 or sc == .f32;
+}
+
+/// The SIMD lane shape of a binding's HIR type, or null when not SIMD.
+fn simdShapeOfHir(t: hir.Type) ?ops.LaneShape {
+    return switch (t) {
+        .f32x4 => .f32x4,
+        .i32x4 => .i32x4,
+        else => null,
+    };
+}
+
+/// The lane shape of a SIMD scalar-floor type, or null when not SIMD.
+fn simdShapeOfSc(sc: sema.exprtype.ScalarType) ?ops.LaneShape {
+    return switch (sc) {
+        .f32x4 => .f32x4,
+        .i32x4 => .i32x4,
+        else => null,
+    };
+}
+
+/// The scalar-floor type of a lane shape (the type of a SIMD binding).
+fn simdScTy(shape: ops.LaneShape) sema.exprtype.ScalarType {
+    return switch (shape) {
+        .f32x4 => .f32x4,
+        .i32x4 => .i32x4,
+    };
+}
+
+/// The lane shape `Simd.splat(x)` produces for an operand scalar: an `f32`
+/// broadcasts to `f32x4`, an `i64` to `i32x4` (the i64 compute floor wraps
+/// to the i32 lane at codegen). Anything else is not splattable in v0 —
+/// notably a bare float literal is `f64`; write `Simd.splat(f32(1.5))`.
+fn simdSplatShape(sc: sema.exprtype.ScalarType) ?ops.LaneShape {
+    return switch (sc) {
+        .f32 => .f32x4,
+        .i64 => .i32x4,
+        else => null,
+    };
+}
+
+/// The scalar one extracted lane yields: `f32` for `f32x4`; `i64` for
+/// `i32x4` (the i32 lane sign-extends to the i64 compute floor).
+fn simdLaneScalar(shape: ops.LaneShape) sema.exprtype.ScalarType {
+    return switch (shape) {
+        .f32x4 => .f32,
+        .i32x4 => .i64,
+    };
+}
+
+/// The lane-wise SIMD binary op named by a method, or null. One list,
+/// shared by the typing bridge and the lowering recognizer — keep it the
+/// single source so the two can't skew.
+fn simdBinKind(method: []const u8) ?ops.BinKind {
+    if (std.mem.eql(u8, method, "add")) return .add;
+    if (std.mem.eql(u8, method, "mul")) return .mul;
+    return null;
+}
+
+/// The compile-time lane index of a `v.extract(n)` argument: an integer
+/// literal 0–3. A runtime index is not extractable (the wasm instruction
+/// takes an immediate), so anything else returns null.
+fn simdLaneIndex(arg: ast.Expr) ?u8 {
+    const n = switch (arg) {
+        .num_lit => |x| x,
+        else => return null,
+    };
+    const tok = n.token() orelse return null;
+    if (tok.kind == .FLOAT_LIT) return null;
+    const v = consteval.parseIntLit(tok.text) catch return null;
+    if (v < 0 or v > 3) return null;
+    return @intCast(v);
 }
 
 /// The native float-math builtin named by a method (`sqrt`/`abs`/`floor`/
@@ -9186,6 +9295,8 @@ const ExprTypeBridge = struct {
             .i64 => .i64,
             .f64 => .f64,
             .f32 => .f32,
+            .f32x4 => .f32x4,
+            .i32x4 => .i32x4,
             .str => .str,
             else => .unknown,
         };
@@ -9295,6 +9406,30 @@ const ExprTypeBridge = struct {
                 if (self.scope.find(name[0..dot])) |head| {
                     if (head.ty == .f64) return .f64;
                     if (head.ty == .f32) return .f32;
+                }
+            }
+            // SIMD: `Simd.splat(x)` types by its operand's scalar (f32 →
+            // f32x4, i64 → i32x4); on a SIMD binding, `add`/`mul` keep the
+            // receiver's shape and `extract` yields the lane scalar.
+            if (std.mem.eql(u8, name[0..dot], "Simd") and std.mem.eql(u8, mname, "splat")) {
+                var sit = call.args();
+                const a0 = sit.next() orelse return null;
+                var bridge = ExprTypeBridge{ .b = self.b, .scope = self.scope };
+                const sc = try sema.exprtype.scalarOf(self.b.a, a0, .{
+                    .ctx = @ptrCast(&bridge),
+                    .localType = ExprTypeBridge.localType,
+                    .callRet = ExprTypeBridge.callRet,
+                    .fieldType = ExprTypeBridge.fieldType,
+                    .fnRet = ExprTypeBridge.fnRet,
+                    .indexElem = ExprTypeBridge.indexElem,
+                });
+                const shape = simdSplatShape(sc) orelse return null;
+                return simdScTy(shape);
+            }
+            if (self.scope.find(name[0..dot])) |head| {
+                if (simdShapeOfHir(head.ty)) |shape| {
+                    if (simdBinKind(mname) != null) return simdScTy(shape);
+                    if (std.mem.eql(u8, mname, "extract")) return simdLaneScalar(shape);
                 }
             }
             if (self.scope.find(name[0..dot])) |head| {
@@ -10195,7 +10330,8 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 // i64, f64, and bool (i32 0/1) locals are readable here; a
                 // `str` local belongs in the str path — and a bare record
                 // binding (`.ptr`) is a whole-value use, not a scalar.
-                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32) return error.Unsupported;
+                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32 and
+                    loc.ty != .f32x4 and loc.ty != .i32x4) return error.Unsupported;
                 out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (try findRecField(scope, txt)) |rf| {
                 // `p.x` on a materialized record: a load at (base ptr, offset).
@@ -10458,6 +10594,52 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                                 out.* = .{ .bin = .{ .kind = bk, .lhs = lhs, .rhs = rhs } };
                                 return out;
                             }
+                        }
+                    }
+                    // `Simd.splat(x)` — construct a lane-shaped v128 from a
+                    // scalar. The shape comes from the operand's type (f32 →
+                    // f32x4, i64 → i32x4); a `Simd<…>` let-annotation is
+                    // cross-checked at the binding site.
+                    if (std.mem.eql(u8, head, "Simd") and std.mem.eql(u8, cname[dot + 1 ..], "splat")) {
+                        var sit = cc.args();
+                        const a0 = sit.next() orelse return reject(b, .unsupported_call);
+                        if (sit.next() != null) return reject(b, .unsupported_call); // exactly one
+                        const shape = simdSplatShape(try exprScalar(b, a0, scope)) orelse
+                            return reject(b, .unsupported_call);
+                        out.* = .{ .simd_splat = .{ .shape = shape, .operand = try buildIntExpr(b, a0, scope) } };
+                        return out;
+                    }
+                    // SIMD methods on a lane-shaped binding: lane-wise
+                    // `v.add(w)` / `v.mul(w)` (same shape both sides — no
+                    // mixing), and `v.extract(n)` with a literal lane 0–3
+                    // (the wasm instruction takes an immediate).
+                    if (scope.find(head)) |loc| {
+                        if (simdShapeOfHir(loc.ty)) |shape| {
+                            const method = cname[dot + 1 ..];
+                            if (simdBinKind(method)) |sk| {
+                                var bit = cc.args();
+                                const a0 = bit.next() orelse return reject(b, .unsupported_call);
+                                if (bit.next() != null) return reject(b, .unsupported_call); // exactly one
+                                if ((try exprScalar(b, a0, scope)) != simdScTy(shape)) return error.Unsupported;
+                                const lhs = try b.a.create(hir.Expr);
+                                lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                                out.* = .{ .simd_bin = .{ .kind = sk, .shape = shape, .lhs = lhs, .rhs = try buildIntExpr(b, a0, scope) } };
+                                return out;
+                            }
+                            if (std.mem.eql(u8, method, "extract")) {
+                                var eit = cc.args();
+                                const a0 = eit.next() orelse return reject(b, .unsupported_call);
+                                if (eit.next() != null) return reject(b, .unsupported_call); // exactly one
+                                const lane = simdLaneIndex(a0) orelse return reject(b, .unsupported_call);
+                                const vec = try b.a.create(hir.Expr);
+                                vec.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                                out.* = .{ .simd_extract = .{ .shape = shape, .vec = vec, .lane = lane } };
+                                return out;
+                            }
+                            // Any other method on a SIMD binding has no
+                            // resolution path — reject rather than fall
+                            // through to function lookup on a dotted name.
+                            return reject(b, .unsupported_call);
                         }
                     }
                 }
@@ -11202,6 +11384,39 @@ test "float-math builtins: x.sqrt()/x.abs() lower to the float un ops; non-float
     try tr2.addLib("pub fn bad(n: i64) -> i64 { n.sqrt() }\n");
     const m2 = try buildFromSource(testing.allocator, "fn main {\n env.out(bad(4))\n}\n", tr2.resolver());
     try testing.expect(m2 == null);
+}
+
+test "simd: splat/add/mul/extract lower to lane-tagged ops; misuse rejected" {
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n let s = f32(1.5)\n let v: Simd<f32, 4> = Simd.splat(s)\n let w = v.add(v)\n let x = w.extract(0)\n env.out(\"{x}\")\n let a: Simd<i32, 4> = Simd.splat(7)\n let sq = a.mul(a)\n let y = sq.extract(3)\n env.out(\"{y}\")\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // Every SIMD op prints with its lane tag — the shape rides the op, so
+    // the dump is the proof instruction selection can never guess.
+    try testing.expect(std.mem.indexOf(u8, dump, "simd_splat.f32x4") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "simd_add.f32x4") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "simd_extract.f32x4[0]") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "simd_splat.i32x4") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "simd_mul.i32x4") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "simd_extract.i32x4[3]") != null);
+
+    // A lane outside the wasm immediate range (0–3) rejects.
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let a: Simd<i32, 4> = Simd.splat(7)\n let y = a.extract(5)\n env.out(\"{y}\")\n}\n", noLib)) == null);
+    // Mixing lane shapes rejects — no implicit conversion between shapes.
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: Simd<f32, 4> = Simd.splat(f32(1.0))\n let a: Simd<i32, 4> = Simd.splat(7)\n let w = v.add(a)\n let x = w.extract(0)\n env.out(\"{x}\")\n}\n", noLib)) == null);
+    // A bare SIMD value has no print form (must never reach __fmt_i64).
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: Simd<i32, 4> = Simd.splat(7)\n env.out(v)\n}\n", noLib)) == null);
+    // A `Simd<…>` annotation must agree with the initializer's shape.
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: Simd<f32, 4> = Simd.splat(7)\n let x = v.extract(0)\n env.out(\"{x}\")\n}\n", noLib)) == null);
+    // A bare float literal is f64 — not splattable (write f32(1.5)).
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: Simd<f32, 4> = Simd.splat(1.5)\n let x = v.extract(0)\n env.out(\"{x}\")\n}\n", noLib)) == null);
 }
 
 test "closures: a higher-order fn specializes per lambda (inlined call)" {

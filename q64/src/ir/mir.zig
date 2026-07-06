@@ -37,7 +37,11 @@ pub const StrFieldInit = struct { offset: u32, value: *Inst };
 /// `ptr` is an address-space-width pointer/length (i32 on wasm32, i64 on
 /// wasm64), used for the locals backing a `str` binding's `(ptr, len)`. The
 /// backend realizes it as `i32`/`i64`; integer *values* use `i64` regardless.
-pub const ValueType = enum { i64, i32, f32, f64, str, ptr, void };
+/// `v128` is the single wasm SIMD storage type; the lane interpretation
+/// (f32x4 vs i32x4) is NOT recoverable from it — every SIMD instruction
+/// carries an `ops.LaneShape` instead. Keep `v128` out of any dispatch
+/// that picks an instruction family from the value type alone.
+pub const ValueType = enum { i64, i32, f32, f64, v128, str, ptr, void };
 
 pub const Linkage = enum { entry, local, imported_resolved };
 
@@ -173,6 +177,15 @@ pub const Op = union(enum) {
     local_set: struct { idx: u32, value: *Inst },
     bin: struct { kind: ops.BinKind, lhs: *Inst, rhs: *Inst },
     un: struct { kind: ops.UnKind, operand: *Inst },
+    /// Splat a scalar into every lane of a `v128` (shape picks the wasm op;
+    /// `.i32x4` wraps the i64 operand to the i32 lane first). Result `v128`.
+    simd_splat: struct { shape: ops.LaneShape, operand: *Inst },
+    /// Extract one lane of a `v128` as a scalar. Result `f32` for `.f32x4`;
+    /// `i64` for `.i32x4` (the i32 lane is sign-extended). `lane` immediate.
+    simd_extract: struct { shape: ops.LaneShape, vec: *Inst, lane: u8 },
+    /// Lane-wise add/mul on two same-shape `v128`s. Result `v128`. The shape
+    /// on the op (not the operand type) selects the instruction family.
+    simd_bin: struct { kind: ops.BinKind, shape: ops.LaneShape, lhs: *Inst, rhs: *Inst },
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
     host_out_int: struct { value: *Inst, nl_off: u32, stream: Stream },

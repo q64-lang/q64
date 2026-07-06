@@ -834,6 +834,10 @@ fn witType(t: ir.hir.Type) []const u8 {
         .u8 => "u8",
         .f32 => "f32",
         .f64 => "f64",
+        // v128 has no canonical-ABI lowering; SIMD values are process-local
+        // (a `pub` signature carrying one is rejected upstream by the
+        // param/return allow-lists, so this arm is unreachable in practice).
+        .f32x4, .i32x4 => "u64",
         .bool => "bool",
         .str => "string",
         .ptr => "u64", // internal pointer width; not a canonical-ABI export type
@@ -919,10 +923,12 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
 
     // Wasm 3.0 feature set. Memory64 is included only for wasm64; wasm32 omits
     // it so the emitted module is a genuine 32-bit module (the WebKit/iPad
-    // baseline). Multivalue + BulkMemory are address-space-independent.
+    // baseline). Multivalue + BulkMemory + SIMD128 are address-space-independent
+    // (SIMD128 is universal on the target hosts, incl. WebKit).
     var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
         c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
-        c.BinaryenFeatureNontrappingFPToInt(); // i64.trunc_sat_f64_* (__fmt_f64) — universal, incl. WebKit
+        c.BinaryenFeatureNontrappingFPToInt() | // i64.trunc_sat_f64_* (__fmt_f64) — universal, incl. WebKit
+        c.BinaryenFeatureSIMD128(); // v128 + lane ops (Simd<f32,4> / Simd<i32,4>)
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
     c.BinaryenModuleSetFeatures(module, features);
 
@@ -1732,7 +1738,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
 pub fn asyncifyWasm(allocator: std.mem.Allocator, wasm: []const u8, suspend_imports: []const u8, addr: AddressSpace) ![]u8 {
     var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
         c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
-        c.BinaryenFeatureNontrappingFPToInt();
+        c.BinaryenFeatureNontrappingFPToInt() |
+        c.BinaryenFeatureSIMD128(); // keep in sync with lowerToWasm — a re-read module must not drop v128
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
 
     const buf = try allocator.dupe(u8, wasm); // ModuleRead takes a mutable buffer
@@ -1766,6 +1773,7 @@ fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenT
         .i32 => i32_type,
         .f32 => c.BinaryenTypeFloat32(),
         .f64 => c.BinaryenTypeFloat64(),
+        .v128 => c.BinaryenTypeVec128(),
         .str => pair_type, // a (ptr, len) multivalue
         .ptr => ptr_type, // an address-width pointer/length local
         .void => none_type,
@@ -1789,6 +1797,9 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .local_set => |ls| bodyHasOut(ls.value, want_int),
         .bin => |b| bodyHasOut(b.lhs, want_int) or bodyHasOut(b.rhs, want_int),
         .un => |u| bodyHasOut(u.operand, want_int),
+        .simd_splat => |s| bodyHasOut(s.operand, want_int),
+        .simd_extract => |s| bodyHasOut(s.vec, want_int),
+        .simd_bin => |s| bodyHasOut(s.lhs, want_int) or bodyHasOut(s.rhs, want_int),
         .call => |cl| blk: {
             for (cl.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
             break :blk false;
@@ -2751,6 +2762,12 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(b.rhs, s);
         },
         .un => |u| scanScratch(u.operand, s),
+        .simd_splat => |sp| scanScratch(sp.operand, s),
+        .simd_extract => |se| scanScratch(se.vec, s),
+        .simd_bin => |sb2| {
+            scanScratch(sb2.lhs, s);
+            scanScratch(sb2.rhs, s);
+        },
         .call => |cl| {
             // The call wraps in a reclamation region around its args.
             var sub = Scratch{};
@@ -3242,6 +3259,39 @@ const Lowerer = struct {
                     .ftrunc => c.BinaryenUnary(module, if (is32) c.BinaryenTruncFloat32() else c.BinaryenTruncFloat64(), x),
                     .fnearest => c.BinaryenUnary(module, if (is32) c.BinaryenNearestFloat32() else c.BinaryenNearestFloat64(), x),
                 };
+            },
+            // SIMD ops: the lane shape on the op (never the operand's `v128`
+            // type, which cannot recover it) selects the instruction family.
+            .simd_splat => |s| {
+                const x = try self.inst(s.operand);
+                return switch (s.shape) {
+                    .f32x4 => c.BinaryenUnary(module, c.BinaryenSplatVecF32x4(), x),
+                    // The i64 compute-floor operand wraps to the i32 lane.
+                    .i32x4 => c.BinaryenUnary(module, c.BinaryenSplatVecI32x4(), c.BinaryenUnary(module, c.BinaryenWrapInt64(), x)),
+                };
+            },
+            .simd_extract => |s| {
+                const v = try self.inst(s.vec);
+                return switch (s.shape) {
+                    .f32x4 => c.BinaryenSIMDExtract(module, c.BinaryenExtractLaneVecF32x4(), v, s.lane),
+                    // The i32 lane sign-extends back to the i64 compute floor.
+                    .i32x4 => c.BinaryenUnary(module, c.BinaryenExtendSInt32(), c.BinaryenSIMDExtract(module, c.BinaryenExtractLaneVecI32x4(), v, s.lane)),
+                };
+            },
+            .simd_bin => |s| {
+                const op = switch (s.shape) {
+                    .f32x4 => switch (s.kind) {
+                        .add => c.BinaryenAddVecF32x4(),
+                        .mul => c.BinaryenMulVecF32x4(),
+                        else => return Error.UnsupportedCall,
+                    },
+                    .i32x4 => switch (s.kind) {
+                        .add => c.BinaryenAddVecI32x4(),
+                        .mul => c.BinaryenMulVecI32x4(),
+                        else => return Error.UnsupportedCall,
+                    },
+                };
+                return c.BinaryenBinary(module, op, try self.inst(s.lhs), try self.inst(s.rhs));
             },
             .call => |cl| {
                 // Frame reclamation (spec/memory.md §"Frame reclamation"):
@@ -4331,6 +4381,11 @@ const Lowerer = struct {
             .f32 => 4,
             .str => 5,
             .ptr => 6,
+            // No v128 stash slot: SIMD values cannot appear in function
+            // signatures in v0 (the param/return allow-lists reject them),
+            // so no call result of type v128 ever crosses a reclamation
+            // region. Revisit when SIMD-returning callees land.
+            .v128 => unreachable,
             .void => unreachable,
         };
         return self.region_base + d * 7 + off;

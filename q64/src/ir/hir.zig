@@ -84,7 +84,11 @@ pub const ForeignIface = struct {
 // truncate to the field width), formattable, and explicit-cast sources.
 // Arithmetic on them is deliberately unsupported until the spec pins
 // narrow-overflow semantics (wrap vs trap).
-pub const Type = enum { i64, i32, u32, i16, u16, i8, u8, f32, f64, str, bool, ptr, void };
+// The SIMD types (`f32x4`, `i32x4`) are the lane-shaped views of the single
+// wasm `v128` storage type. They stay distinct at the HIR tier — like `f32`
+// vs `f64` — so a binding's type alone determines the instruction family;
+// MIR collapses both to `v128` and the lane shape rides on each SIMD op.
+pub const Type = enum { i64, i32, u32, i16, u16, i8, u8, f32, f64, f32x4, i32x4, str, bool, ptr, void };
 
 /// A definite semantic error the AST→HIR builder detected — distinct from
 /// "construct not yet supported" (which signals a fall-back). The codegen
@@ -409,6 +413,20 @@ pub const Expr = union(enum) {
     global_get: u32,
     bin: struct { kind: ops.BinKind, lhs: *Expr, rhs: *Expr },
     un: struct { kind: ops.UnKind, operand: *Expr },
+    /// `Simd.splat(x)` — broadcast a scalar into every lane of a `v128`.
+    /// The operand is `f32`-typed for `.f32x4` and `i64`-typed for `.i32x4`
+    /// (codegen wraps to the i32 lane). Kept off the generic `un` because
+    /// the lane shape must ride the op: `v128` alone cannot recover it.
+    simd_splat: struct { shape: ops.LaneShape, operand: *Expr },
+    /// `v.extract(lane)` — read one lane of a `v128` as a scalar. `lane` is
+    /// a compile-time immediate (0–3). Yields `f32` for `.f32x4`; `i64` for
+    /// `.i32x4` (codegen sign-extends the i32 lane to the i64 compute floor).
+    simd_extract: struct { shape: ops.LaneShape, vec: *Expr, lane: u8 },
+    /// Lane-wise `v.add(w)` / `v.mul(w)` on two same-shape `v128` values.
+    /// `kind` is restricted to `.add`/`.mul` by construction. A dedicated op
+    /// (not `bin`) because instruction selection needs the lane shape, which
+    /// the operands' `v128` value type alone cannot provide.
+    simd_bin: struct { kind: ops.BinKind, shape: ops.LaneShape, lhs: *Expr, rhs: *Expr },
     /// Short-circuit `&&` / `||`. Kept distinct from `bin` because it lowers
     /// to control flow (a value `if_`), not a backend binary op. Yields a
     /// boolean (i32 0/1); both operands are truthiness-tested.

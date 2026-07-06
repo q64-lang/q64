@@ -438,6 +438,26 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .vec_len => |vl| return mk(ctx.a, .i64, .{ .vec_len = .{ .vec = try lowerExpr(ctx, vl.vec) } }),
         .vec_ptr => |vp| return mk(ctx.a, .i64, .{ .vec_ptr = .{ .vec = try lowerExpr(ctx, vp.vec) } }),
         .vec_get => |vg| return mk(ctx.a, if (vg.cell4) .f32 else .i64, .{ .vec_get = .{ .vec = try lowerExpr(ctx, vg.vec), .idx = try lowerExpr(ctx, vg.idx), .cell4 = vg.cell4 } }),
+        .simd_splat => |s| return mk(ctx.a, .v128, .{ .simd_splat = .{
+            .shape = s.shape,
+            .operand = try lowerExpr(ctx, s.operand),
+        } }),
+        // Extract yields the lane scalar: f32 for f32x4; i64 for i32x4 (the
+        // backend sign-extends the i32 lane to the i64 compute floor).
+        .simd_extract => |s| return mk(ctx.a, switch (s.shape) {
+            .f32x4 => mir.ValueType.f32,
+            .i32x4 => mir.ValueType.i64,
+        }, .{ .simd_extract = .{
+            .shape = s.shape,
+            .vec = try lowerExpr(ctx, s.vec),
+            .lane = s.lane,
+        } }),
+        .simd_bin => |s| return mk(ctx.a, .v128, .{ .simd_bin = .{
+            .kind = s.kind,
+            .shape = s.shape,
+            .lhs = try lowerExpr(ctx, s.lhs),
+            .rhs = try lowerExpr(ctx, s.rhs),
+        } }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg` preserves the
             // operand's numeric type (f64 stays f64); `bit_not` is i64.
@@ -555,6 +575,7 @@ fn mapType(t: hir.Type) mir.ValueType {
         .i32, .u32, .i16, .u16, .i8, .u8 => .i64, // narrow ints compute as i64 (storage width is a field concern)
         .f32 => .f32,
         .f64 => .f64,
+        .f32x4, .i32x4 => .v128, // both lane shapes share the one wasm SIMD type
         .str => .str,
         .bool => .i32, // a boolean is an i32 0/1 at the executable tier
         .ptr => .ptr,
@@ -576,6 +597,8 @@ fn storageOf(t: hir.Type) struct { width: u8, signed: bool } {
         .i8 => .{ .width = 1, .signed = true },
         .u8 => .{ .width = 1, .signed = false },
         .bool => .{ .width = 1, .signed = false },
+        // SIMD values are not v0 field types (no record/array storage yet).
+        .f32x4, .i32x4 => .{ .width = 16, .signed = false },
         .str, .ptr, .void => .{ .width = 8, .signed = true }, // not field types; unreachable in practice
     };
 }

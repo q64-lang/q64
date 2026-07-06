@@ -54,3 +54,10 @@ pub const UnKind = enum {
 /// lhs). They lower to a value-producing `if_`, never to a backend binary
 /// op, and yield a boolean (an `i32` 0/1).
 pub const LogicalKind = enum { and_, or_ };
+
+/// SIMD lane interpretation of a `v128` value. A `v128` is one wasm storage
+/// type but the instruction families differ per lane shape, and the wasm
+/// type alone cannot recover the shape — so every SIMD op carries it
+/// explicitly (the `Simd<f32, 4>` vs `Simd<i32, 4>` distinction, kept on
+/// the op so instruction selection never has to guess).
+pub const LaneShape = enum { f32x4, i32x4 };

@@ -3365,4 +3365,31 @@ tr32_out="$("$HOST_BIN" "$tmp/txrx32.wasm")"
 [[ "$tr32_out" == "$tr_expected" ]] || { echo "FAIL: (tx, rx) split wasm32 (got: $tr32_out)" >&2; exit 1; }
 echo "    ok: (tx, rx) split -> 1/2/3/4 (wasm64 + wasm32; shared bounded buffer, backpressure across the split)"
 
+echo "==> simd first slice: Simd.splat + lane-wise add/mul + extract (f32x4 + i32x4, native v128 ops)"
+sd_app="$tmp/simd.q"
+cat > "$sd_app" <<'Q64'
+fn main {
+    let s = f32(1.5)
+    let v: Simd<f32, 4> = Simd.splat(s)
+    let w = v.add(v)
+    let x = w.extract(0)
+    env.out("{x}")
+    let a: Simd<i32, 4> = Simd.splat(7)
+    let sq = a.mul(a)
+    let y = sq.extract(3)
+    env.out("{y}")
+    let sum = v.add(w)
+    let z = sum.extract(2)
+    env.out("{z}")
+}
+Q64
+sd_expected=$'3.0\n49\n4.5'
+"$Q64_BIN" emit "$sd_app" "$tmp/simd.wasm"
+sd_out="$("$HOST_BIN" "$tmp/simd.wasm")"
+[[ "$sd_out" == "$sd_expected" ]] || { echo "FAIL: simd slice (got: $sd_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$sd_app" "$tmp/simd32.wasm" --addr wasm32
+sd32_out="$("$HOST_BIN" "$tmp/simd32.wasm")"
+[[ "$sd32_out" == "$sd_expected" ]] || { echo "FAIL: simd slice wasm32 (got: $sd32_out)" >&2; exit 1; }
+echo "    ok: simd slice -> 3.0 / 49 / 4.5 (wasm64 + wasm32; v128 splat/add/mul/extract, SIMD128 feature on)"
+
 echo "PASS: $qube_out"

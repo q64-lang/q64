@@ -314,6 +314,23 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, b.rhs);
             try app(gpa, out, ")", .{});
         },
+        .simd_splat => |s| {
+            try app(gpa, out, "simd_splat.{s}(", .{@tagName(s.shape)});
+            try hirExpr(gpa, out, s.operand);
+            try app(gpa, out, ")", .{});
+        },
+        .simd_extract => |s| {
+            try app(gpa, out, "simd_extract.{s}[{d}](", .{ @tagName(s.shape), s.lane });
+            try hirExpr(gpa, out, s.vec);
+            try app(gpa, out, ")", .{});
+        },
+        .simd_bin => |s| {
+            try app(gpa, out, "simd_{s}.{s}(", .{ @tagName(s.kind), @tagName(s.shape) });
+            try hirExpr(gpa, out, s.lhs);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, s.rhs);
+            try app(gpa, out, ")", .{});
+        },
         .logical => |lg| {
             try app(gpa, out, "(", .{});
             try hirExpr(gpa, out, lg.lhs);
@@ -618,6 +635,19 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .un => |u| {
             try app(gpa, out, "un {s}\n", .{@tagName(u.kind)});
             try mirInst(gpa, out, u.operand, depth + 1);
+        },
+        .simd_splat => |s| {
+            try app(gpa, out, "simd_splat {s}\n", .{@tagName(s.shape)});
+            try mirInst(gpa, out, s.operand, depth + 1);
+        },
+        .simd_extract => |s| {
+            try app(gpa, out, "simd_extract {s} lane {d}\n", .{ @tagName(s.shape), s.lane });
+            try mirInst(gpa, out, s.vec, depth + 1);
+        },
+        .simd_bin => |s| {
+            try app(gpa, out, "simd_bin {s} {s}\n", .{ @tagName(s.kind), @tagName(s.shape) });
+            try mirInst(gpa, out, s.lhs, depth + 1);
+            try mirInst(gpa, out, s.rhs, depth + 1);
         },
         .call => |cl| {
             try app(gpa, out, "call #{d}\n", .{cl.func});

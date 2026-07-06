@@ -25,6 +25,12 @@ pub const ScalarType = enum {
     i64,
     f32,
     f64,
+    /// SIMD lane-shaped `v128` values (`Simd<f32, 4>` / `Simd<i32, 4>`).
+    /// Not scalars in the arithmetic sense — the generic operator and print
+    /// paths reject them — but they ride this floor so `let` inference and
+    /// the SIMD method recognizers can type a binding.
+    f32x4,
+    i32x4,
     bool,
     str,
     /// A provably sub-i64 integer (a `u8`…`i32` field read): storage-only
