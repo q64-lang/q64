@@ -2121,18 +2121,32 @@ const Parser = struct {
             try children.append(self.arena, .{ .token = self.advance() }); // assign op
             try self.eatTrivia(&children);
             try children.append(self.arena, .{ .node = try self.parseExpr() });
-            try self.sweepToStmtEnd(&children);
+            // After a complete assignment, any non-trivia token still on this
+            // line is a second statement with no `;` between them. It would be
+            // swept into the CST but *dropped* from the AST — the silent
+            // footgun `a = 1  b = 2` (runs only `a = 1`). Flag it (PAR050).
+            try self.sweepToStmtEnd(&children, true);
             return try cst.makeNode(self.arena, .ASSIGN_STMT, children.items);
         }
         self.pos = save;
-        try self.sweepToStmtEnd(&children);
+        // The expression-statement path deliberately does *not* flag trailing
+        // tokens: a line that begins with a continuation lead (`.bar()`, `|> f`)
+        // parses as a bare expr here and its remainder is swept for the
+        // formatter to re-indent (the structured method-chain/pipe AST is a
+        // later rung). Flagging it would break those continuations.
+        try self.sweepToStmtEnd(&children, false);
         return try cst.makeNode(self.arena, .EXPR_STMT, children.items);
     }
 
-    fn sweepToStmtEnd(self: *Parser, children: *std.ArrayList(cst.Element)) !void {
+    fn sweepToStmtEnd(self: *Parser, children: *std.ArrayList(cst.Element), flag_dropped: bool) !void {
+        var flagged = false;
         while (!self.isEof()) {
             const k = self.peek();
             if (k == .NEWLINE or k == .SEMICOLON or k == .R_BRACE) break;
+            if (flag_dropped and !flagged and !k.isTrivia()) {
+                try self.emitDiag("PAR050", self.offsetHere());
+                flagged = true;
+            }
             try children.append(self.arena, .{ .token = self.advance() });
         }
     }
@@ -3243,6 +3257,30 @@ fn expectDiagAndLossless(src: []const u8, code: []const u8) !void {
 
 test "NAM003 — wildcard import is forbidden" {
     try expectDiagAndLossless("import q64.math.*\n\nfn main { env.out(\"hi\") }\n", "NAM003");
+}
+
+test "PAR050 — two statements on one line with no separator" {
+    // The footgun: after an assignment, a second statement on the same line is
+    // swept into the CST but dropped from the AST. It must be flagged (and the
+    // CST stays lossless).
+    try expectDiagAndLossless("fn f {\n    a = 1  b = 2\n}\n", "PAR050");
+}
+
+fn expectNoDiag(src: []const u8, code: []const u8) !void {
+    const r = try parse(testing.allocator, src, "t.q");
+    defer r.deinit(testing.allocator);
+    try testing.expect(!hasDiag(r, code));
+}
+
+test "PAR050 — a `;` separator is accepted" {
+    try expectNoDiag("fn f {\n    a = 1; b = 2\n}\n", "PAR050");
+}
+
+test "PAR050 — leading-dot / pipe continuations are not flagged" {
+    // A line beginning with a continuation lead parses as a bare expr statement
+    // whose remainder is swept for the formatter; it must NOT trip PAR050.
+    try expectNoDiag("fn f {\n    thing\n.bar()\n.baz()\n}\n", "PAR050");
+    try expectNoDiag("fn f {\n    clean\n|> denoise()\n|> play\n}\n", "PAR050");
 }
 
 test "NAM004 — selective import combined with alias" {
