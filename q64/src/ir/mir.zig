@@ -320,20 +320,21 @@ pub const Op = union(enum) {
     /// a 3-slot {data, len, cap} header in the scope arena, yielding
     /// its base pointer. Lowers to the `__vec_new` helper.
     vec_new,
-    /// `v.push(x)` — append an i64 element, copy-on-grow. `vec` is the
-    /// header pointer (`.ptr`), `value` i64. `__vec_push`.
-    vec_push: struct { vec: *Inst, value: *Inst },
+    /// `v.push(x)` — append an element, copy-on-grow. `vec` is the header
+    /// pointer (`.ptr`), `value` i64. `cell4` picks the packed 4-byte cell
+    /// (`__vec_push_f32`) over the 8-byte `__vec_push`.
+    vec_push: struct { vec: *Inst, value: *Inst, cell4: bool = false },
     /// `v.len` -> i64 (a live header read).
     vec_len: struct { vec: *Inst },
     /// `v.ptr` -> i64: the vec's element-data address (header data field),
     /// widened to i64. `__vec_ptr`.
     vec_ptr: struct { vec: *Inst },
     /// `v[i]` -> i64, bounds-checked against the live len (a trap on
-    /// out-of-range, like arrays). `__vec_get`.
-    vec_get: struct { vec: *Inst, idx: *Inst },
-    /// `v[i] = x` — store i64 `value` at index `idx`, bounds-checked against the
-    /// live len (traps out-of-range, like `vec_get`). `__vec_set`.
-    vec_set: struct { vec: *Inst, idx: *Inst, value: *Inst },
+    /// out-of-range, like arrays). `cell4` → `__vec_get_f32` (4-byte cell).
+    vec_get: struct { vec: *Inst, idx: *Inst, cell4: bool = false },
+    /// `v[i] = x` — store `value` at index `idx`, bounds-checked against the
+    /// live len (traps out-of-range, like `vec_get`). `cell4` → `__vec_set_f32`.
+    vec_set: struct { vec: *Inst, idx: *Inst, value: *Inst, cell4: bool = false },
     /// `s.slice(start, end)` -> str (ptr+start, end-start). `str` is str-typed;
     /// `start`/`end` are i64. Lowers inline to a (ptr, len) pair.
     str_slice: struct { str: *Inst, start: *Inst, end: *Inst },

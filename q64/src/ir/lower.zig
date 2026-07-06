@@ -175,8 +175,8 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .ret => |e| return mk(ctx.a, .void, .{ .ret = if (e) |val| try lowerExpr(ctx, val) else null }),
         .brk => return mk(ctx.a, .void, .br),
         .cont => return mk(ctx.a, .void, .br_cont),
-        .vec_push => |vp| return mk(ctx.a, .void, .{ .vec_push = .{ .vec = try lowerExpr(ctx, vp.vec), .value = try lowerExpr(ctx, vp.value) } }),
-        .vec_set => |vs| return mk(ctx.a, .void, .{ .vec_set = .{ .vec = try lowerExpr(ctx, vs.vec), .idx = try lowerExpr(ctx, vs.idx), .value = try lowerExpr(ctx, vs.value) } }),
+        .vec_push => |vp| return mk(ctx.a, .void, .{ .vec_push = .{ .vec = try lowerExpr(ctx, vp.vec), .value = try lowerExpr(ctx, vp.value), .cell4 = vp.cell4 } }),
+        .vec_set => |vs| return mk(ctx.a, .void, .{ .vec_set = .{ .vec = try lowerExpr(ctx, vs.vec), .idx = try lowerExpr(ctx, vs.idx), .value = try lowerExpr(ctx, vs.value), .cell4 = vs.cell4 } }),
         // A statement-position block (an `if let` desugar: the hidden
         // scrutinee set + the tag test ride together).
         .block => |items| {
@@ -437,7 +437,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .vec_new => return mk(ctx.a, .ptr, .vec_new),
         .vec_len => |vl| return mk(ctx.a, .i64, .{ .vec_len = .{ .vec = try lowerExpr(ctx, vl.vec) } }),
         .vec_ptr => |vp| return mk(ctx.a, .i64, .{ .vec_ptr = .{ .vec = try lowerExpr(ctx, vp.vec) } }),
-        .vec_get => |vg| return mk(ctx.a, .i64, .{ .vec_get = .{ .vec = try lowerExpr(ctx, vg.vec), .idx = try lowerExpr(ctx, vg.idx) } }),
+        .vec_get => |vg| return mk(ctx.a, if (vg.cell4) .f32 else .i64, .{ .vec_get = .{ .vec = try lowerExpr(ctx, vg.vec), .idx = try lowerExpr(ctx, vg.idx), .cell4 = vg.cell4 } }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg` preserves the
             // operand's numeric type (f64 stays f64); `bit_not` is i64.

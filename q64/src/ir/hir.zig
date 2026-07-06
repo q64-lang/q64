@@ -320,11 +320,14 @@ pub const HostWrite = struct { value: *Expr, stream: Stream };
 
 pub const Stmt = union(enum) {
     block: []const *Stmt,
-    /// `v.push(x)` — append an i64 element to a vec (copy-on-grow).
-    vec_push: struct { vec: *Expr, value: *Expr },
-    /// `v[i] = x` — store i64 `value` at index `idx` of a vec (bounds-checked,
-    /// traps out-of-range like `vec_get`). The write counterpart of `vec_get`.
-    vec_set: struct { vec: *Expr, idx: *Expr, value: *Expr },
+    /// `v.push(x)` — append an element to a vec (copy-on-grow). `cell4` selects a
+    /// packed 4-byte cell (a `Vec<f32>`, value carried in the low 32 bits) over
+    /// the default 8-byte i64 cell.
+    vec_push: struct { vec: *Expr, value: *Expr, cell4: bool = false },
+    /// `v[i] = x` — store `value` at index `idx` of a vec (bounds-checked, traps
+    /// out-of-range like `vec_get`). The write counterpart of `vec_get`. `cell4`
+    /// selects the packed 4-byte cell.
+    vec_set: struct { vec: *Expr, idx: *Expr, value: *Expr, cell4: bool = false },
     /// `env.out/err(expr)` — `expr` is `str`-typed. The trailing newline is the
     /// capability ABI's, materialized during lowering.
     host_out: HostWrite,
@@ -544,8 +547,9 @@ pub const Expr = union(enum) {
     /// i64. Lets a qube hand a buffer to the host (`new Float32Array(mem, ptr,
     /// n)`); the address is only stable while the vec isn't grown/reallocated.
     vec_ptr: struct { vec: *Expr },
-    /// `v[i]` — a bounds-checked i64 element load.
-    vec_get: struct { vec: *Expr, idx: *Expr },
+    /// `v[i]` — a bounds-checked element load. `cell4` selects the packed 4-byte
+    /// cell (a `Vec<f32>`, value zero-extended from 32 bits) over the 8-byte cell.
+    vec_get: struct { vec: *Expr, idx: *Expr, cell4: bool = false },
     /// `s.slice(start, end)` — a str sub-view (ptr+start, end-start). No bounds
     /// check; caller guards with `s.len`. `start`/`end` are i64. str-valued.
     str_slice: struct { str: *Expr, start: *Expr, end: *Expr },

@@ -3148,18 +3148,27 @@ const Lowerer = struct {
                         .i32 => c.BinaryenExtendUInt32(),
                         else => return Error.UnsupportedCall,
                     },
+                    // Narrow an i64 to i32 (the low 32 bits) — reading a packed
+                    // 4-byte `Vec<f32>` cell before reinterpreting to f32.
+                    .i32 => switch (from) {
+                        .i64 => c.BinaryenWrapInt64(),
+                        else => return Error.UnsupportedCall,
+                    },
                     else => return Error.UnsupportedCall,
                 };
                 return c.BinaryenUnary(module, op, x);
             },
             .bitcast => |src| {
-                // f64 ↔ i64 bit reinterpretation (raw bits kept) — an f64 channel
-                // cell. Same width both ways, so only these two directions exist.
+                // Bit reinterpretation (raw bits kept), same width both ways:
+                // f64↔i64 (an f64 channel/`Vec<f64>` cell) and f32↔i32 (a packed
+                // `Vec<f32>` cell). The target type picks the direction.
                 const x = try self.inst(src);
                 if (src.ty == n.ty) return x;
                 const op: c.BinaryenOp = switch (n.ty) {
                     .i64 => c.BinaryenReinterpretFloat64(),
                     .f64 => c.BinaryenReinterpretInt64(),
+                    .i32 => c.BinaryenReinterpretFloat32(),
+                    .f32 => c.BinaryenReinterpretInt32(),
                     else => return Error.UnsupportedCall,
                 };
                 return c.BinaryenUnary(module, op, x);
@@ -3587,7 +3596,7 @@ const Lowerer = struct {
             .vec_new => return c.BinaryenCall(module, "__vec_new", null, 0, self.ptr_type),
             .vec_push => |vp| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vp.vec), try self.inst(vp.value) };
-                return c.BinaryenCall(module, "__vec_push", @ptrCast(&args), args.len, self.none_type);
+                return c.BinaryenCall(module, if (vp.cell4) "__vec_push_f32" else "__vec_push", @ptrCast(&args), args.len, self.none_type);
             },
             .vec_len => |vl| {
                 var args = [_]c.BinaryenExpressionRef{try self.inst(vl.vec)};
@@ -3599,11 +3608,11 @@ const Lowerer = struct {
             },
             .vec_get => |vg| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vg.vec), try self.inst(vg.idx) };
-                return c.BinaryenCall(module, "__vec_get", @ptrCast(&args), args.len, self.i64_type);
+                return c.BinaryenCall(module, if (vg.cell4) "__vec_get_f32" else "__vec_get", @ptrCast(&args), args.len, if (vg.cell4) c.BinaryenTypeFloat32() else self.i64_type);
             },
             .vec_set => |vs| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vs.vec), try self.inst(vs.idx), try self.inst(vs.value) };
-                return c.BinaryenCall(module, "__vec_set", @ptrCast(&args), args.len, self.none_type);
+                return c.BinaryenCall(module, if (vs.cell4) "__vec_set_f32" else "__vec_set", @ptrCast(&args), args.len, self.none_type);
             },
             .global_set => |gs| return c.BinaryenGlobalSet(module, self.global_names[gs.idx], try self.inst(gs.value)),
             .fmt_int_to_str => |inner| {
@@ -6709,6 +6718,76 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         var params = [_]c.BinaryenType{ ptr_type, i64_type, i64_type };
         const ptype = c.BinaryenTypeCreate(&params, params.len);
         _ = c.BinaryenAddFunction(module, "__vec_set", ptype, none, null, 0, body);
+    }
+
+    // The 4-byte (`Vec<f32>`) cell variants: identical to the i64-cell helpers
+    // but with an element stride of 4 (`idx << 2`) and native f32 stores/loads,
+    // so the buffer is packed f32 — a host reads it as `new Float32Array(mem,
+    // ptr, n)`. The value crosses as a native f32.
+    const f32_type = c.BinaryenTypeFloat32();
+
+    // __vec_push_f32(hdr, v: f32): copy-on-grow at stride 4, then f32.store + len++.
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const V: c.BinaryenIndex = 1;
+        const LEN: c.BinaryenIndex = 2;
+        const CAP: c.BinaryenIndex = 3;
+        const ND: c.BinaryenIndex = 4;
+        var stmts: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer stmts.deinit(allocator);
+        try stmts.append(allocator, c.BinaryenLocalSet(module, LEN, h.loadW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        try stmts.append(allocator, c.BinaryenLocalSet(module, CAP, h.loadW(module, @intCast(2 * W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        var grow: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer grow.deinit(allocator);
+        try grow.append(allocator, c.BinaryenLocalSet(module, CAP, c.BinaryenIf(module, eqz_p_wrap(module, eqz_p, K.get(module, CAP, ptr_type)), K.ptrc(module, mem64, 4), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 1)))));
+        try grow.append(allocator, c.BinaryenLocalSet(module, ND, h.align8(module, mem64, ptr_type, add_p, and_p)));
+        try grow.append(allocator, c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(module, add_p, K.get(module, ND, ptr_type), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 2)))));
+        try grow.append(allocator, c.BinaryenMemoryCopy(module, K.get(module, ND, ptr_type), h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 2)), "0", "0"));
+        try grow.append(allocator, h.storeW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type), K.get(module, ND, ptr_type)));
+        try grow.append(allocator, h.storeW(module, @intCast(2 * W), wbytes, ptr_type, K.get(module, HDR, ptr_type), K.get(module, CAP, ptr_type)));
+        const grow_blk = c.BinaryenBlock(module, null, @ptrCast(grow.items.ptr), @intCast(grow.items.len), none);
+        try stmts.append(allocator, c.BinaryenIf(module, c.BinaryenBinary(module, eq_p, K.get(module, LEN, ptr_type), K.get(module, CAP, ptr_type)), grow_blk, null));
+        const slot = c.BinaryenBinary(module, add_p, h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 2)));
+        try stmts.append(allocator, c.BinaryenStore(module, 4, 0, 0, slot, K.get(module, V, f32_type), f32_type, "0"));
+        try stmts.append(allocator, h.storeW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type), c.BinaryenBinary(module, add_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 1))));
+        const body = c.BinaryenBlock(module, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), none);
+        var params = [_]c.BinaryenType{ ptr_type, f32_type };
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        var var_types = [_]c.BinaryenType{ ptr_type, ptr_type, ptr_type };
+        _ = c.BinaryenAddFunction(module, "__vec_push_f32", ptype, none, @ptrCast(&var_types), var_types.len, body);
+    }
+
+    // __vec_get_f32(hdr, idx: i64) -> f32: bounds-check, then f32.load data[idx].
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const IDX: c.BinaryenIndex = 1;
+        const oob = c.BinaryenBinary(module, c.BinaryenGeUInt64(), K.get(module, IDX, i64_type), h.toI64(module, mem64, h.loadW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        const slot = c.BinaryenBinary(module, add_p, h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, h.toW(module, mem64, K.get(module, IDX, i64_type)), K.ptrc(module, mem64, 2)));
+        var stmts = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(module, oob, c.BinaryenUnreachable(module), null),
+            c.BinaryenLoad(module, 4, false, 0, 0, f32_type, slot, "0"),
+        };
+        const body = c.BinaryenBlock(module, null, @ptrCast(&stmts), stmts.len, f32_type);
+        var params = [_]c.BinaryenType{ ptr_type, i64_type };
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        _ = c.BinaryenAddFunction(module, "__vec_get_f32", ptype, f32_type, null, 0, body);
+    }
+
+    // __vec_set_f32(hdr, idx: i64, v: f32): bounds-check, then f32.store data[idx].
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const IDX: c.BinaryenIndex = 1;
+        const V: c.BinaryenIndex = 2;
+        const oob = c.BinaryenBinary(module, c.BinaryenGeUInt64(), K.get(module, IDX, i64_type), h.toI64(module, mem64, h.loadW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        const slot = c.BinaryenBinary(module, add_p, h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, h.toW(module, mem64, K.get(module, IDX, i64_type)), K.ptrc(module, mem64, 2)));
+        var stmts = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(module, oob, c.BinaryenUnreachable(module), null),
+            c.BinaryenStore(module, 4, 0, 0, slot, K.get(module, V, f32_type), f32_type, "0"),
+        };
+        const body = c.BinaryenBlock(module, null, @ptrCast(&stmts), stmts.len, none);
+        var params = [_]c.BinaryenType{ ptr_type, i64_type, f32_type };
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        _ = c.BinaryenAddFunction(module, "__vec_set_f32", ptype, none, null, 0, body);
     }
 }
 

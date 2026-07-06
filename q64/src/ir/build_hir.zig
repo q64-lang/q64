@@ -7783,6 +7783,13 @@ fn castToCell(b: *Builder, value: *hir.Expr, elem: ?hir.Type) BuildError!*hir.Ex
         bc.* = .{ .bitcast = .{ .to = .i64, .value = value } };
         return bc;
     }
+    if (et == .f32) {
+        // A packed 4-byte cell stores a native f32 (the helper does f32.store).
+        // Demote an f64 value to f32; an already-f32 value passes unchanged.
+        const dem = try b.a.create(hir.Expr);
+        dem.* = .{ .num_cast = .{ .to = .f32, .value = value } };
+        return dem;
+    }
     if (et == .bool) {
         const cast = try b.a.create(hir.Expr);
         cast.* = .{ .num_cast = .{ .to = .i64, .value = value } };
@@ -7800,6 +7807,8 @@ fn castFromCell(b: *Builder, cell: *hir.Expr, elem: ?hir.Type) BuildError!*hir.E
         bc.* = .{ .bitcast = .{ .to = .f64, .value = cell } };
         return bc;
     }
+    // An f32 cell load (`__vec_get_f32`) already yields a native f32 — the
+    // `vec_get` node is typed f32 when `cell4`, so no decode is needed.
     return cell;
 }
 
@@ -7848,14 +7857,14 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
         else => return error.Unsupported, // Vec.from takes a slice literal
     };
 
-    // one vec_push per element (f64 elements bit-cast into the i64 cell)
+    // one vec_push per element (f64/f32 elements packed into the cell)
     var eit = arr.elements();
     while (eit.next()) |el| {
         const vref = try b.a.create(hir.Expr);
         vref.* = .{ .local = .{ .idx = v_idx, .ty = .ptr } };
         const value = try castToCell(b, try buildIntExpr(b, el, scope), elem);
         const st = try b.a.create(hir.Stmt);
-        st.* = .{ .vec_push = .{ .vec = vref, .value = value } };
+        st.* = .{ .vec_push = .{ .vec = vref, .value = value, .cell4 = elem == .f32 } };
         try out.append(b.a, st);
     }
     return true;
@@ -8710,11 +8719,12 @@ fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.S
     var ait = call.args();
     const arg = ait.next() orelse return error.Unsupported;
     if (ait.next() != null) return error.Unsupported;
-    // An f64-element vec bit-casts the pushed value into the i64 cell (works on a
-    // local vec or a `Vec<f64>` state field).
-    const value = try castToCell(b, try buildIntExpr(b, arg, scope), try vecElemByName(b, scope, head));
+    // An f64/f32-element vec packs the pushed value into the cell (works on a
+    // local vec or a `Vec<…>` state field); f32 uses a 4-byte cell.
+    const et = try vecElemByName(b, scope, head);
+    const value = try castToCell(b, try buildIntExpr(b, arg, scope), et);
     const st = try b.a.create(hir.Stmt);
-    st.* = .{ .vec_push = .{ .vec = vref, .value = value } };
+    st.* = .{ .vec_push = .{ .vec = vref, .value = value, .cell4 = et == .f32 } };
     return st;
 }
 
@@ -10095,13 +10105,16 @@ fn buildVecSet(b: *Builder, ix: ast.IndexExpr, as: ast.AssignStmt, scope: *Scope
         if (!loc.mutable) return reject(b, .immutable_assign);
     }
     const rhs_ast = as.value() orelse return error.Unsupported;
-    // The stored value must match the element type (i64 default, or the `Vec<f64>`
-    // element); an f64 is bit-cast into the i64 cell.
+    // The stored value must match the element type (i64 default, or a `Vec<f64>`
+    // / `Vec<f32>` element). An f32 cell also accepts an f64 value (demoted in
+    // castToCell) — the audio use computes f64 and stores f32.
     const elem = (try vecElemByName(b, scope, bn)) orelse .i64;
-    if (scalarBindTy(try exprScalar(b, rhs_ast, scope)) != elem) return error.Unsupported;
+    const rhs_sc = scalarBindTy(try exprScalar(b, rhs_ast, scope));
+    const ok = rhs_sc == elem or (elem == .f32 and rhs_sc == .f64);
+    if (!ok) return error.Unsupported;
     const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
     const value = try castToCell(b, try buildIntExpr(b, rhs_ast, scope), elem);
-    return .{ .vec_set = .{ .vec = vref, .idx = idx, .value = value } };
+    return .{ .vec_set = .{ .vec = vref, .idx = idx, .value = value, .cell4 = elem == .f32 } };
 }
 
 fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
@@ -10583,10 +10596,11 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 // `v[i]` on a vec binding or a `Vec` state field: bounds-checked
                 // in __vec_get. An f64-element vec bit-casts the i64 cell to f64.
                 if (try vecRefByName(b, scope, bn)) |vref| {
+                    const et = try vecElemByName(b, scope, bn);
                     const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
                     const get = try b.a.create(hir.Expr);
-                    get.* = .{ .vec_get = .{ .vec = vref, .idx = idx } };
-                    return try castFromCell(b, get, try vecElemByName(b, scope, bn));
+                    get.* = .{ .vec_get = .{ .vec = vref, .idx = idx, .cell4 = et == .f32 } };
+                    return try castFromCell(b, get, et);
                 }
                 if (scope.arrs.get(bn)) |ai| {
                     const ety = switch (ai.elem) {
@@ -15293,6 +15307,32 @@ test "persistent buffer: an actor holds a `Vec<f64>`, void pub fns push, a value
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_ptr") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "bitcast<i64>") != null);
+}
+
+test "f32 vec elements: `Vec<f32>` packs a 4-byte cell (push/get/set via the _f32 helpers)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn probe() -> f64 {
+        \\    var v: Vec<f32> = Vec.new()
+        \\    v.push(0.5)
+        \\    v.push(3.0)
+        \\    v[0] = 2.5
+        \\    f64(v[0] + v[1])
+        \\}
+        \\fn main {
+        \\    env.out(probe())
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // A `Vec<f32>` push/get/set carries a native f32 through the packed 4-byte
+    // cell; the emit picks the `__vec_*_f32` helpers off each node's `cell4`.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "f32") != null);
 }
 
 test "vec data pointer: `v.ptr` reads the element-data address (for handing a buffer to the host)" {
