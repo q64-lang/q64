@@ -436,6 +436,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .global_get => |idx| return mk(ctx.a, .i64, .{ .global_get = idx }),
         .vec_new => return mk(ctx.a, .ptr, .vec_new),
         .vec_len => |vl| return mk(ctx.a, .i64, .{ .vec_len = .{ .vec = try lowerExpr(ctx, vl.vec) } }),
+        .vec_ptr => |vp| return mk(ctx.a, .i64, .{ .vec_ptr = .{ .vec = try lowerExpr(ctx, vp.vec) } }),
         .vec_get => |vg| return mk(ctx.a, .i64, .{ .vec_get = .{ .vec = try lowerExpr(ctx, vg.vec), .idx = try lowerExpr(ctx, vg.idx) } }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg` preserves the

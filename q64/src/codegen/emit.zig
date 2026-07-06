@@ -1839,6 +1839,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .vec_new => false,
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
+        .vec_ptr => |vp| bodyHasOut(vp.vec, want_int),
         .vec_get => |vg| bodyHasOut(vg.vec, want_int) or bodyHasOut(vg.idx, want_int),
         .vec_set => |vs| bodyHasOut(vs.vec, want_int) or bodyHasOut(vs.idx, want_int) or bodyHasOut(vs.value, want_int),
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
@@ -2882,6 +2883,10 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             s.has_vec = true;
             scanScratch(vl.vec, s);
         },
+        .vec_ptr => |vp| {
+            s.has_vec = true;
+            scanScratch(vp.vec, s);
+        },
         .vec_get => |vg| {
             s.has_vec = true;
             scanScratch(vg.vec, s);
@@ -3587,6 +3592,10 @@ const Lowerer = struct {
             .vec_len => |vl| {
                 var args = [_]c.BinaryenExpressionRef{try self.inst(vl.vec)};
                 return c.BinaryenCall(module, "__vec_len", @ptrCast(&args), args.len, self.i64_type);
+            },
+            .vec_ptr => |vp| {
+                var args = [_]c.BinaryenExpressionRef{try self.inst(vp.vec)};
+                return c.BinaryenCall(module, "__vec_ptr", @ptrCast(&args), args.len, self.i64_type);
             },
             .vec_get => |vg| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vg.vec), try self.inst(vg.idx) };
@@ -6655,6 +6664,16 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         var params = [_]c.BinaryenType{ptr_type};
         const ptype = c.BinaryenTypeCreate(&params, params.len);
         _ = c.BinaryenAddFunction(module, "__vec_len", ptype, i64_type, null, 0, body);
+    }
+
+    // __vec_ptr(hdr) -> i64: the element-data address (header data field at
+    // offset 0), widened to i64 so a qube can hand the buffer to the host.
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const body = h.toI64(module, mem64, h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)));
+        var params = [_]c.BinaryenType{ptr_type};
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        _ = c.BinaryenAddFunction(module, "__vec_ptr", ptype, i64_type, null, 0, body);
     }
 
     // __vec_get(hdr, idx: i64) -> i64: trap on out-of-range (unsigned, so

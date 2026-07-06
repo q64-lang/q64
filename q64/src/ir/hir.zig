@@ -540,6 +540,10 @@ pub const Expr = union(enum) {
     vec_new,
     /// `v.len` — a live read of the vec's length, i64.
     vec_len: struct { vec: *Expr },
+    /// `v.ptr` — the linear-memory address of the vec's element data, widened to
+    /// i64. Lets a qube hand a buffer to the host (`new Float32Array(mem, ptr,
+    /// n)`); the address is only stable while the vec isn't grown/reallocated.
+    vec_ptr: struct { vec: *Expr },
     /// `v[i]` — a bounds-checked i64 element load.
     vec_get: struct { vec: *Expr, idx: *Expr },
     /// `s.slice(start, end)` — a str sub-view (ptr+start, end-start). No bounds

@@ -274,6 +274,11 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, vl.vec);
             try app(gpa, out, ")", .{});
         },
+        .vec_ptr => |vp| {
+            try app(gpa, out, "vec_ptr(", .{});
+            try hirExpr(gpa, out, vp.vec);
+            try app(gpa, out, ")", .{});
+        },
         .vec_get => |vg| {
             try app(gpa, out, "vec_get(", .{});
             try hirExpr(gpa, out, vg.vec);
@@ -558,6 +563,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .vec_len => |vl| {
             try app(gpa, out, "vec_len\n", .{});
             try mirInst(gpa, out, vl.vec, depth + 1);
+        },
+        .vec_ptr => |vp| {
+            try app(gpa, out, "vec_ptr\n", .{});
+            try mirInst(gpa, out, vp.vec, depth + 1);
         },
         .vec_get => |vg| {
             try app(gpa, out, "vec_get\n", .{});

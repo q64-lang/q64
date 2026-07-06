@@ -325,6 +325,9 @@ pub const Op = union(enum) {
     vec_push: struct { vec: *Inst, value: *Inst },
     /// `v.len` -> i64 (a live header read).
     vec_len: struct { vec: *Inst },
+    /// `v.ptr` -> i64: the vec's element-data address (header data field),
+    /// widened to i64. `__vec_ptr`.
+    vec_ptr: struct { vec: *Inst },
     /// `v[i]` -> i64, bounds-checked against the live len (a trap on
     /// out-of-range, like arrays). `__vec_get`.
     vec_get: struct { vec: *Inst, idx: *Inst },

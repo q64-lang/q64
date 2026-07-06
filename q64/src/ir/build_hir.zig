@@ -10140,6 +10140,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         return out;
                     }
                 }
+                // `v.ptr` of a vec — the element-data address (i64), for handing
+                // the buffer to the host.
+                if (std.mem.eql(u8, txt[dotl + 1 ..], "ptr") and scope.vecs.contains(txt[0..dotl])) {
+                    const loc = scope.find(txt[0..dotl]) orelse return error.Unsupported;
+                    const vref = try b.a.create(hir.Expr);
+                    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                    out.* = .{ .vec_ptr = .{ .vec = vref } };
+                    return out;
+                }
             }
             if (scope.find(txt)) |loc| {
                 // i64, f64, and bool (i32 0/1) locals are readable here; a
@@ -15232,6 +15241,27 @@ test "vec index store: `v[i] = x` builds a vec_set (the write counterpart of vec
     // nests a vec_get inside a vec_set.
     try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "vec data pointer: `v.ptr` reads the element-data address (for handing a buffer to the host)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn addr() -> i64 {
+        \\    var v: Vec<f64> = Vec.new()
+        \\    v.push(1.5)
+        \\    v.ptr
+        \\}
+        \\fn main {
+        \\    env.out(addr())
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `v.ptr` is a header read of the data address, i64 (lowers to __vec_ptr).
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_ptr") != null);
 }
 
 test "vecs in a callee function: `Vec.new()` + push + index read/write resolve in a plain fn" {
