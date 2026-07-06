@@ -9555,6 +9555,17 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             // same desugar as `main`'s C2 — a hidden result local assigned per
             // arm, then the name reads it. The whole thing rides in one block.
             if (init_expr == .match) return buildIntMatchLet(b, ls, init_expr.match, nm, scope);
+            // `let v = Vec.new()` / `Vec.from([…])` in a callee body: register the
+            // vec (+ its element type) and emit the fresh header + any pushes as
+            // one block. Reads/pushes/`v[i] = x`/`.len` already resolve against
+            // `scope.vecs` in this builder — only the registration was missing.
+            {
+                var items: std.ArrayList(*hir.Stmt) = .empty;
+                if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), try vecElemType(b, ls.type_()), scope, &items)) {
+                    out.* = .{ .block = try items.toOwnedSlice(b.a) };
+                    return out;
+                }
+            }
             // A `bool` binding (`let even = n % 2 == 0`) gets a bool local; any
             // other value expression is i64. (str lets in a value body aren't
             // reached here — those functions take the str path.)
@@ -15221,6 +15232,32 @@ test "vec index store: `v[i] = x` builds a vec_set (the write counterpart of vec
     // nests a vec_get inside a vec_set.
     try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "vecs in a callee function: `Vec.new()` + push + index read/write resolve in a plain fn" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn work(n: i64) -> i64 {
+        \\    var xs = Vec.new()
+        \\    xs.push(n)
+        \\    xs.push(0)
+        \\    xs[1] = xs[0] + 1
+        \\    xs[1]
+        \\}
+        \\fn main {
+        \\    env.out(work(41))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The vec lives in the callee `work`: its header, a push, and a vec_set all
+    // resolve there (previously a callee `Vec.new()` was NameNotFound).
+    try testing.expect(std.mem.indexOf(u8, dump, "fn work") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
 }
 
 test "f64 vec elements: `Vec<f64>` bit-casts through the i64 cell on push/get/set" {
