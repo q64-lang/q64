@@ -24,7 +24,7 @@ test {
     _ = dispatch;
 }
 
-const version_string = "qube 0.0.5 (pre-alpha)";
+const version_string = "qube 0.0.6 (pre-alpha)";
 
 // Emitted by the QUBE_FORCE_ICE test seam (see main). A single-line diagnostic
 // envelope matching spec/diagnostics.md §"ICE convention".
@@ -35,7 +35,7 @@ const ice_envelope =
 // Kept in sync with q64/src/main.zig's `--version` output. The `qube web`
 // debug page surfaces it; a future revision will capture it dynamically
 // via `q64 --version`.
-const q64_version_string = "q64 0.0.5 (pre-alpha)";
+const q64_version_string = "q64 0.0.6 (pre-alpha)";
 
 const Sub = struct { needle: []const u8, value: []const u8 };
 

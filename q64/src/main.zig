@@ -106,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, sub, "--version")) {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writerStreaming(io, &buf);
-        try w.interface.writeAll("q64 0.0.5 (pre-alpha)\n");
+        try w.interface.writeAll("q64 0.0.6 (pre-alpha)\n");
         try w.interface.flush();
         return;
     }
@@ -649,6 +649,33 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
         std.process.exit(2);
     };
     defer gpa.free(source);
+
+    // Gate codegen on parse-time errors. Codegen builds the HIR from the CST
+    // and silently ignores anything the parser flagged — so a malformed
+    // statement (e.g. two statements on one line with no `;`, PAR050) would be
+    // dropped and an *incorrect* wasm emitted. Refuse to emit when the parser
+    // reported an error, rendering each one with its location (same format as
+    // `q64 check`), so the failure is legible instead of a silent miscompile.
+    {
+        const pre = try parse.parse(gpa, source, src);
+        defer pre.deinit(gpa);
+        var had_error = false;
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.File.stderr().writerStreaming(io, &buf);
+        for (pre.diagnostics) |d| if (d.severity == .err) {
+            had_error = true;
+            const idx = try diag.LineIndex.build(gpa, source);
+            defer idx.deinit();
+            const loc = idx.locate(d.offset);
+            try w.interface.print("{s}:{d}:{d}: {s}: {s} [{s}]\n", .{
+                d.file, loc.line, loc.col, d.severity.toString(), d.message, d.code,
+            });
+        };
+        if (had_error) {
+            try w.interface.flush();
+            std.process.exit(1);
+        }
+    }
 
     // Read each dependency module's entry file (`<dir>/lib.q`); freed below.
     var module_sources = try readModuleSources(gpa, io, module_args.items);
