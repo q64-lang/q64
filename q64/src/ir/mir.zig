@@ -328,6 +328,9 @@ pub const Op = union(enum) {
     /// `v[i]` -> i64, bounds-checked against the live len (a trap on
     /// out-of-range, like arrays). `__vec_get`.
     vec_get: struct { vec: *Inst, idx: *Inst },
+    /// `v[i] = x` — store i64 `value` at index `idx`, bounds-checked against the
+    /// live len (traps out-of-range, like `vec_get`). `__vec_set`.
+    vec_set: struct { vec: *Inst, idx: *Inst, value: *Inst },
     /// `s.slice(start, end)` -> str (ptr+start, end-start). `str` is str-typed;
     /// `start`/`end` are i64. Lowers inline to a (ptr, len) pair.
     str_slice: struct { str: *Inst, start: *Inst, end: *Inst },

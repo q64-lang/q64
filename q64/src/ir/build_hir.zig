@@ -795,6 +795,13 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
         .match_stmt => |ms| try buildMainMatch(b, ms, scope, rt, out),
         .assign_stmt => |as| {
             const tgt = as.target() orelse return error.Unsupported;
+            // `v[i] = x` on a vec binding: a bounds-checked element store.
+            if (tgt == .index) {
+                const vst = try b.a.create(hir.Stmt);
+                vst.* = try buildVecSet(b, tgt.index, as, scope);
+                try out.append(b.a, vst);
+                return;
+            }
             const tpath = switch (tgt) {
                 .path => |p| p,
                 else => return error.Unsupported,
@@ -9486,6 +9493,12 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
         },
         .assign_stmt => |as| {
             const tgt = as.target() orelse return error.Unsupported;
+            // `v[i] = x` on a vec binding: a bounds-checked element store (the
+            // write counterpart of the `v[i]` read). Only `=` (no compound `+=`).
+            if (tgt == .index) {
+                out.* = try buildVecSet(b, tgt.index, as, scope);
+                return out;
+            }
             const tpath = switch (tgt) {
                 .path => |p| p,
                 else => return error.Unsupported,
@@ -9946,6 +9959,28 @@ fn buildIfStmtNode(b: *Builder, is: ast.IfStmt, scope: *Scope) BuildError!*hir.S
     const out = try b.a.create(hir.Stmt);
     out.* = .{ .if_ = .{ .cond = cond, .then_ = then_, .else_ = else_ } };
     return out;
+}
+
+/// `v[i] = x` — a bounds-checked i64 element store into a vec binding (the write
+/// counterpart of the `v[i]` read in buildIntExpr). Plain `=` only; a vec's
+/// element cell is i64, so the value must be i64.
+fn buildVecSet(b: *Builder, ix: ast.IndexExpr, as: ast.AssignStmt, scope: *Scope) BuildError!hir.Stmt {
+    const op = as.op() orelse return error.Unsupported;
+    if (op.kind != .EQ) return error.Unsupported; // no compound element store (`v[i] += x`) yet
+    const base = ix.base() orelse return error.Unsupported;
+    if (base != .path) return error.Unsupported;
+    const bn = try base.path.text(b.a);
+    defer b.a.free(bn);
+    if (!scope.vecs.contains(bn)) return error.Unsupported; // only vec bindings are index-writable
+    const loc = scope.find(bn) orelse return error.Unsupported;
+    if (!loc.mutable) return reject(b, .immutable_assign);
+    const rhs_ast = as.value() orelse return error.Unsupported;
+    if ((try exprScalar(b, rhs_ast, scope)) != .i64) return error.Unsupported; // the element cell is i64
+    const vref = try b.a.create(hir.Expr);
+    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
+    const value = try buildIntExpr(b, rhs_ast, scope);
+    return .{ .vec_set = .{ .vec = vref, .idx = idx, .value = value } };
 }
 
 fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
@@ -15082,6 +15117,29 @@ test "Vec.new: an empty growable filled at runtime, then iterated" {
     try testing.expect(std.mem.indexOf(u8, dump, "vec_new") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "vec index store: `v[i] = x` builds a vec_set (the write counterpart of vec_get)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    var xs = Vec.new()
+        \\    xs.push(0)
+        \\    xs.push(0)
+        \\    xs[1] = 42
+        \\    xs[0] = xs[1] + 1
+        \\    env.out(xs[0])
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // `xs[1] = 42` is a vec_set; the read-modify-write `xs[0] = xs[1] + 1`
+    // nests a vec_get inside a vec_set.
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
 }
 

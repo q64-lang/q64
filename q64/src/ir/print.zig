@@ -168,6 +168,15 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, vp.value);
             try app(gpa, out, "\n", .{});
         },
+        .vec_set => |vs| {
+            try app(gpa, out, "vec_set ", .{});
+            try hirExpr(gpa, out, vs.vec);
+            try app(gpa, out, "[", .{});
+            try hirExpr(gpa, out, vs.idx);
+            try app(gpa, out, "] <- ", .{});
+            try hirExpr(gpa, out, vs.value);
+            try app(gpa, out, "\n", .{});
+        },
         .cont => try app(gpa, out, "continue\n", .{}),
         .panic => |maybe| {
             try app(gpa, out, "panic", .{});
@@ -554,6 +563,12 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "vec_get\n", .{});
             try mirInst(gpa, out, vg.vec, depth + 1);
             try mirInst(gpa, out, vg.idx, depth + 1);
+        },
+        .vec_set => |vs| {
+            try app(gpa, out, "vec_set\n", .{});
+            try mirInst(gpa, out, vs.vec, depth + 1);
+            try mirInst(gpa, out, vs.idx, depth + 1);
+            try mirInst(gpa, out, vs.value, depth + 1);
         },
         .block => |items| {
             try app(gpa, out, "block : {s}\n", .{@tagName(inst.ty)});

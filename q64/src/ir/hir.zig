@@ -322,6 +322,9 @@ pub const Stmt = union(enum) {
     block: []const *Stmt,
     /// `v.push(x)` — append an i64 element to a vec (copy-on-grow).
     vec_push: struct { vec: *Expr, value: *Expr },
+    /// `v[i] = x` — store i64 `value` at index `idx` of a vec (bounds-checked,
+    /// traps out-of-range like `vec_get`). The write counterpart of `vec_get`.
+    vec_set: struct { vec: *Expr, idx: *Expr, value: *Expr },
     /// `env.out/err(expr)` — `expr` is `str`-typed. The trailing newline is the
     /// capability ABI's, materialized during lowering.
     host_out: HostWrite,

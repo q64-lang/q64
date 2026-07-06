@@ -1840,6 +1840,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .vec_push => |vp| bodyHasOut(vp.vec, want_int) or bodyHasOut(vp.value, want_int),
         .vec_len => |vl| bodyHasOut(vl.vec, want_int),
         .vec_get => |vg| bodyHasOut(vg.vec, want_int) or bodyHasOut(vg.idx, want_int),
+        .vec_set => |vs| bodyHasOut(vs.vec, want_int) or bodyHasOut(vs.idx, want_int) or bodyHasOut(vs.value, want_int),
         .host_out_const, .const_i64, .const_i32, .const_f64, .local_get, .global_get, .str_const_val, .str_param, .str_binding, .br, .br_cont, .@"unreachable" => false,
     };
 }
@@ -2886,6 +2887,12 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(vg.vec, s);
             scanScratch(vg.idx, s);
         },
+        .vec_set => |vs| {
+            s.has_vec = true;
+            scanScratch(vs.vec, s);
+            scanScratch(vs.idx, s);
+            scanScratch(vs.value, s);
+        },
         .host_exit => |he| scanScratch(he.code, s),
         .strlist_make => |inits| {
             // Like array_make: a base-ptr scratch (rec level) holds the block
@@ -3584,6 +3591,10 @@ const Lowerer = struct {
             .vec_get => |vg| {
                 var args = [_]c.BinaryenExpressionRef{ try self.inst(vg.vec), try self.inst(vg.idx) };
                 return c.BinaryenCall(module, "__vec_get", @ptrCast(&args), args.len, self.i64_type);
+            },
+            .vec_set => |vs| {
+                var args = [_]c.BinaryenExpressionRef{ try self.inst(vs.vec), try self.inst(vs.idx), try self.inst(vs.value) };
+                return c.BinaryenCall(module, "__vec_set", @ptrCast(&args), args.len, self.none_type);
             },
             .global_set => |gs| return c.BinaryenGlobalSet(module, self.global_names[gs.idx], try self.inst(gs.value)),
             .fmt_int_to_str => |inner| {
@@ -6661,6 +6672,24 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         var params = [_]c.BinaryenType{ ptr_type, i64_type };
         const ptype = c.BinaryenTypeCreate(&params, params.len);
         _ = c.BinaryenAddFunction(module, "__vec_get", ptype, i64_type, null, 0, body);
+    }
+
+    // __vec_set(hdr, idx: i64, v: i64): trap on out-of-range (unsigned, so a
+    // negative index also traps), then store data[idx] = v. Mirrors __vec_get.
+    {
+        const HDR: c.BinaryenIndex = 0;
+        const IDX: c.BinaryenIndex = 1;
+        const V: c.BinaryenIndex = 2;
+        const oob = c.BinaryenBinary(module, c.BinaryenGeUInt64(), K.get(module, IDX, i64_type), h.toI64(module, mem64, h.loadW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type))));
+        const slot = c.BinaryenBinary(module, add_p, h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, h.toW(module, mem64, K.get(module, IDX, i64_type)), K.ptrc(module, mem64, 3)));
+        var stmts = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(module, oob, c.BinaryenUnreachable(module), null),
+            c.BinaryenStore(module, 8, 0, 0, slot, K.get(module, V, i64_type), i64_type, "0"),
+        };
+        const body = c.BinaryenBlock(module, null, @ptrCast(&stmts), stmts.len, none);
+        var params = [_]c.BinaryenType{ ptr_type, i64_type, i64_type };
+        const ptype = c.BinaryenTypeCreate(&params, params.len);
+        _ = c.BinaryenAddFunction(module, "__vec_set", ptype, none, null, 0, body);
     }
 }
 

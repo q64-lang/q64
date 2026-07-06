@@ -144,6 +144,11 @@ fn collectStmt(
             try collectExpr(a, vp.vec, d, e);
             try collectExpr(a, vp.value, d, e);
         },
+        .vec_set => |vs| {
+            try collectExpr(a, vs.vec, d, e);
+            try collectExpr(a, vs.idx, d, e);
+            try collectExpr(a, vs.value, d, e);
+        },
         .if_ => |iff| {
             try collectExpr(a, iff.cond, d, e);
             try collectStmt(a, iff.then_, d, e);

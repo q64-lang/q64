@@ -176,6 +176,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .brk => return mk(ctx.a, .void, .br),
         .cont => return mk(ctx.a, .void, .br_cont),
         .vec_push => |vp| return mk(ctx.a, .void, .{ .vec_push = .{ .vec = try lowerExpr(ctx, vp.vec), .value = try lowerExpr(ctx, vp.value) } }),
+        .vec_set => |vs| return mk(ctx.a, .void, .{ .vec_set = .{ .vec = try lowerExpr(ctx, vs.vec), .idx = try lowerExpr(ctx, vs.idx), .value = try lowerExpr(ctx, vs.value) } }),
         // A statement-position block (an `if let` desugar: the hidden
         // scrutinee set + the tag test ride together).
         .block => |items| {
