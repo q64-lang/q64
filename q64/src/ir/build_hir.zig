@@ -3602,7 +3602,7 @@ fn buildScreenFunc(b: *Builder, fd: ast.FnDecl) BuildError!void {
             const pn = (p.name() orelse return error.Unsupported).text;
             const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
             const pty: hir.Type = switch (psc) {
-                .str, .bool, .i64 => psc,
+                .str, .bool, .i64, .f64, .f32 => psc,
                 else => return error.Unsupported,
             };
             _ = try scope.declare(pn, false, pty);
@@ -8661,6 +8661,35 @@ fn vecStateRef(b: *Builder, rf: RecField) BuildError!*hir.Expr {
     return ptr;
 }
 
+/// The header-pointer expression for a vec named `name` — a local vec binding
+/// (`scope.vecs`) or a `Vec` actor-state field — or null when `name` isn't a
+/// vec. Unifies the two so `v.len` / `v.ptr` / `v[i]` / `v[i] = x` work the same
+/// on a local vec and on state (a handler reading its own `Vec` state).
+fn vecRefByName(b: *Builder, scope: *Scope, name: []const u8) BuildError!?*hir.Expr {
+    if (scope.vecs.contains(name)) {
+        const loc = scope.find(name) orelse return null;
+        const r = try b.a.create(hir.Expr);
+        r.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+        return r;
+    }
+    if (try vecStateField(b, scope, name)) |rf| return try vecStateRef(b, rf);
+    return null;
+}
+
+/// The element type of the vec named `name` (i64 default), whether it's a local
+/// `Vec<f64>` binding or a `Vec<f64>` actor-state field. Null when not a vec.
+fn vecElemByName(b: *Builder, scope: *const Scope, name: []const u8) BuildError!?hir.Type {
+    if (scope.vecs.contains(name)) return scope.vec_elem.get(name) orelse .i64;
+    const si = scope.self_actor orelse return null;
+    const ad = b.actor_decls.get(si.name) orelse return null;
+    var sit = ad.states();
+    while (sit.next()) |s| {
+        const sn = (s.name() orelse continue).text;
+        if (std.mem.eql(u8, sn, name)) return (try vecElemType(b, s.type_())) orelse .i64;
+    }
+    return null;
+}
+
 fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
     const cname = (callPathName(b, call)) orelse return null;
     defer b.a.free(cname);
@@ -8681,8 +8710,9 @@ fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.S
     var ait = call.args();
     const arg = ait.next() orelse return error.Unsupported;
     if (ait.next() != null) return error.Unsupported;
-    // An f64-element vec bit-casts the pushed value into the i64 cell.
-    const value = try castToCell(b, try buildIntExpr(b, arg, scope), scope.vec_elem.get(head));
+    // An f64-element vec bit-casts the pushed value into the i64 cell (works on a
+    // local vec or a `Vec<f64>` state field).
+    const value = try castToCell(b, try buildIntExpr(b, arg, scope), try vecElemByName(b, scope, head));
     const st = try b.a.create(hir.Stmt);
     st.* = .{ .vec_push = .{ .vec = vref, .value = value } };
     return st;
@@ -9200,8 +9230,8 @@ const ExprTypeBridge = struct {
         if (base != .path) return null;
         const nm = base.path.text(self.b.a) catch return null;
         defer self.b.a.free(nm);
-        if (!self.scope.vecs.contains(nm)) return null;
-        return switch (self.scope.vec_elem.get(nm) orelse .i64) {
+        const et = (vecElemByName(self.b, self.scope, nm) catch return null) orelse return null;
+        return switch (et) {
             .f64 => .f64,
             .f32 => .f32,
             .bool => .bool,
@@ -10057,18 +10087,20 @@ fn buildVecSet(b: *Builder, ix: ast.IndexExpr, as: ast.AssignStmt, scope: *Scope
     if (base != .path) return error.Unsupported;
     const bn = try base.path.text(b.a);
     defer b.a.free(bn);
-    if (!scope.vecs.contains(bn)) return error.Unsupported; // only vec bindings are index-writable
-    const loc = scope.find(bn) orelse return error.Unsupported;
-    if (!loc.mutable) return reject(b, .immutable_assign);
+    // A local vec binding or a `Vec` state field is index-writable; a local
+    // binding must be mutable (`var`). State fields are mutable within a handler.
+    const vref = (try vecRefByName(b, scope, bn)) orelse return error.Unsupported;
+    if (scope.vecs.contains(bn)) {
+        const loc = scope.find(bn) orelse return error.Unsupported;
+        if (!loc.mutable) return reject(b, .immutable_assign);
+    }
     const rhs_ast = as.value() orelse return error.Unsupported;
     // The stored value must match the element type (i64 default, or the `Vec<f64>`
     // element); an f64 is bit-cast into the i64 cell.
-    const elem = scope.vec_elem.get(bn) orelse .i64;
+    const elem = (try vecElemByName(b, scope, bn)) orelse .i64;
     if (scalarBindTy(try exprScalar(b, rhs_ast, scope)) != elem) return error.Unsupported;
-    const vref = try b.a.create(hir.Expr);
-    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
     const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
-    const value = try castToCell(b, try buildIntExpr(b, rhs_ast, scope), scope.vec_elem.get(bn));
+    const value = try castToCell(b, try buildIntExpr(b, rhs_ast, scope), elem);
     return .{ .vec_set = .{ .vec = vref, .idx = idx, .value = value } };
 }
 
@@ -10132,22 +10164,18 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                     if (scope.arrs.get(txt[0..dotl])) |ai| {
                         return countExpr(b, ai.count);
                     }
-                    if (scope.vecs.contains(txt[0..dotl])) {
-                        const loc = scope.find(txt[0..dotl]) orelse return error.Unsupported;
-                        const vref = try b.a.create(hir.Expr);
-                        vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                    if (try vecRefByName(b, scope, txt[0..dotl])) |vref| {
                         out.* = .{ .vec_len = .{ .vec = vref } };
                         return out;
                     }
                 }
                 // `v.ptr` of a vec — the element-data address (i64), for handing
-                // the buffer to the host.
-                if (std.mem.eql(u8, txt[dotl + 1 ..], "ptr") and scope.vecs.contains(txt[0..dotl])) {
-                    const loc = scope.find(txt[0..dotl]) orelse return error.Unsupported;
-                    const vref = try b.a.create(hir.Expr);
-                    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
-                    out.* = .{ .vec_ptr = .{ .vec = vref } };
-                    return out;
+                // the buffer to the host (works on a local vec or vec state).
+                if (std.mem.eql(u8, txt[dotl + 1 ..], "ptr")) {
+                    if (try vecRefByName(b, scope, txt[0..dotl])) |vref| {
+                        out.* = .{ .vec_ptr = .{ .vec = vref } };
+                        return out;
+                    }
                 }
             }
             if (scope.find(txt)) |loc| {
@@ -10552,16 +10580,13 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             if (base == .path) {
                 const bn = try base.path.text(b.a);
                 defer b.a.free(bn);
-                // `v[i]` on a vec binding: bounds-checked in __vec_get. An
-                // f64-element vec bit-casts the i64 cell back to f64.
-                if (scope.vecs.contains(bn)) {
-                    const loc = scope.find(bn) orelse return error.Unsupported;
-                    const vref = try b.a.create(hir.Expr);
-                    vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+                // `v[i]` on a vec binding or a `Vec` state field: bounds-checked
+                // in __vec_get. An f64-element vec bit-casts the i64 cell to f64.
+                if (try vecRefByName(b, scope, bn)) |vref| {
                     const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
                     const get = try b.a.create(hir.Expr);
                     get.* = .{ .vec_get = .{ .vec = vref, .idx = idx } };
-                    return try castFromCell(b, get, scope.vec_elem.get(bn));
+                    return try castFromCell(b, get, try vecElemByName(b, scope, bn));
                 }
                 if (scope.arrs.get(bn)) |ai| {
                     const ety = switch (ai.elem) {
@@ -15241,6 +15266,33 @@ test "vec index store: `v[i] = x` builds a vec_set (the write counterpart of vec
     // nests a vec_get inside a vec_set.
     try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "persistent buffer: an actor holds a `Vec<f64>`, void pub fns push, a value pub fn returns `v.ptr`" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor Buf {
+        \\    state v: Vec<f64> = Vec.new()
+        \\    handle Push(x: f64) { v.push(x) }
+        \\    handle Ptr -> i64 { v.ptr }
+        \\    handle Len -> i64 { v.len }
+        \\}
+        \\let buf = Buf.spawn()
+        \\pub fn push(x: f64) { buf.tell(Push(x)) }
+        \\pub fn ptr() -> i64 { buf.ask(Ptr) }
+        \\pub fn len() -> i64 { buf.ask(Len) }
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The whole export ABI in one shape: a `Vec<f64>` state field (bit-cast push
+    // via vec_push), `v.ptr` in a value handler, and a void `pub fn push(x: f64)`
+    // wrapper (a float param on a void export — the piece that was rejected).
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_ptr") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "bitcast<i64>") != null);
 }
 
 test "vec data pointer: `v.ptr` reads the element-data address (for handing a buffer to the host)" {
