@@ -44,6 +44,10 @@ const RtMap = std.StringHashMapUnmanaged(StrBinding);
 /// alignment, no reordering).
 const StructField = struct { name: []const u8, ty: hir.Type, offset: u32 };
 
+/// A module-level scalar constant's value + type. Only `.f64` / `.i64` / `.bool`
+/// occur (the kinds a literal initializer produces on the v0 scalar floor).
+const ModuleConst = struct { ty: hir.Type, fval: f64 = 0, ival: i64 = 0, bval: bool = false };
+
 /// A struct declaration on the v0 layout floor (i64 / bool fields only).
 /// Structs with fields outside the floor aren't registered, so uses stay the
 /// honest `Unsupported`. Size is rounded up to the struct alignment.
@@ -132,6 +136,13 @@ const Builder = struct {
     globals: std.StringHashMapUnmanaged(u32) = .empty,
     global_inits: std.ArrayList(i64) = .empty,
     global_names: std.ArrayList([]const u8) = .empty,
+    /// Module-level scalar constants (`let PI = 3.14159`, `let N = 7`,
+    /// `let ON = true`). A literal-initialized immutable top-level binding. Unlike
+    /// a `state` global these carry no storage — a reference inlines the literal
+    /// at the use site (the same `float_const`/`int_const`/`bool_const` node the
+    /// literal itself would build), so an f64 constant works without the
+    /// integer-only const evaluator and without wasm-global plumbing.
+    module_consts: std.StringHashMapUnmanaged(ModuleConst) = .empty,
     /// This file's struct declarations on the layout floor, laid out per
     /// spec/memory.md §"Linear struct layout". Struct-typed signatures resolve
     /// against this table (v0: the compiling file's structs only).
@@ -300,6 +311,12 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
         };
     }
 
+    // Pass 0.4: register module-level scalar constants (`let PI = 3.14159`).
+    // A non-`var` top-level `let` with a numeric/bool *literal* initializer is a
+    // constant; a reference inlines the literal (see buildIntExpr's `.path`).
+    // Non-literal initializers (an actor `spawn()`) fall through to Pass 0.7.
+    try registerModuleConsts(b, sf);
+
     // Pass 0.5: lay out this file's struct declarations (B2b). Structs with
     // fields outside the v0 floor (i64 / bool) are skipped, not rejected —
     // a *use* of one surfaces the honest Unsupported.
@@ -360,14 +377,52 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     try buildScreenFuncs(b, sf);
 }
 
+/// Pass 0.4 — register module-level scalar constants. A top-level `let NAME =
+/// <literal>` (numeric or bool, not `var`) is an inlined constant: its value is
+/// stored so a reference materializes the literal (buildIntExpr `.path`) and its
+/// type is known to the scalar typer (ExprTypeBridge.localType). A `let` with a
+/// non-literal initializer (`Counter.spawn()`) is left for Pass 0.7.
+fn registerModuleConsts(b: *Builder, sf: ast.SourceFile) BuildError!void {
+    var it = sf.items();
+    while (it.next()) |item| switch (item) {
+        .let_decl => |ls| {
+            if (ls.isVar()) continue; // a constant is immutable
+            const pat = ls.pattern() orelse continue;
+            const nm = pat.bindingName() orelse continue; // plain binding only
+            const init_expr = ls.initializer() orelse continue;
+            const mc: ModuleConst = switch (init_expr) {
+                .num_lit => |n| blk: {
+                    const tok = n.token() orelse continue;
+                    if (tok.kind == .FLOAT_LIT) {
+                        break :blk .{ .ty = .f64, .fval = std.fmt.parseFloat(f64, tok.text) catch continue };
+                    }
+                    break :blk .{ .ty = .i64, .ival = consteval.parseIntLit(tok.text) catch continue };
+                },
+                .literal => |lit| blk: {
+                    const tok = lit.token() orelse continue;
+                    break :blk switch (tok.kind) {
+                        .KW_TRUE => .{ .ty = .bool, .bval = true },
+                        .KW_FALSE => .{ .ty = .bool, .bval = false },
+                        else => continue, // not a scalar literal (e.g. `none`)
+                    };
+                },
+                else => continue, // non-literal init (spawn / call): Pass 0.7's job
+            };
+            try b.module_consts.put(b.a, nm.text, mc);
+        },
+        else => {},
+    };
+}
+
 /// Pass 0.7 — register module-level actor singletons. A top-level
 /// `let twin = Counter.spawn()` is a module-lifetime instance: its heap state
 /// record is allocated once at instantiation (by the module-init function) and
 /// its self-pointer kept in a reserved global. Each `twin.tell/ask` in a body
 /// reads the pointer back from that global, so all functions share one instance.
 ///
-/// v0 module-level lets are actor spawns only — any other initializer is an
-/// honest `Unsupported` (rather than a silently-dropped binding).
+/// v0 module-level lets are actor spawns or scalar constants (Pass 0.4) — any
+/// other initializer is an honest `Unsupported` (rather than a silently-dropped
+/// binding).
 fn registerSingletons(b: *Builder, sf: ast.SourceFile) BuildError!void {
     var scratch = Scope{ .a = b.a };
     var it = sf.items();
@@ -376,6 +431,8 @@ fn registerSingletons(b: *Builder, sf: ast.SourceFile) BuildError!void {
             if (ls.isVar()) return error.Unsupported; // a singleton is an immutable binding
             const pat = ls.pattern() orelse return error.Unsupported;
             const nm = pat.bindingName() orelse return error.Unsupported; // v0: plain binding
+            // A scalar constant (Pass 0.4) was already consumed — skip it here.
+            if (b.module_consts.contains(nm.text)) continue;
             const init_expr = ls.initializer() orelse return error.Unsupported;
             const cc = switch (init_expr) {
                 .call => |x| x,
@@ -9004,6 +9061,12 @@ const ExprTypeBridge = struct {
                     }
                 }
             }
+            // A module-level scalar constant (`let PI = 3.14159`): its literal type.
+            if (self.b.module_consts.get(name)) |mc| return switch (mc.ty) {
+                .f64 => .f64,
+                .bool => .bool,
+                else => .i64,
+            };
             // `p.x` on a materialized record, or a bare actor-state field
             // (`n` in a handler → `self.n`): the field's declared type.
             const rf = (findRecField(self.scope, name) catch return null) orelse
@@ -9968,6 +10031,14 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 return recFieldExpr(b, rf);
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
+            } else if (b.module_consts.get(txt)) |mc| {
+                // A module-level scalar constant (`let PI = 3.14159`): inline the
+                // literal — no storage, and f64 needs no const evaluator.
+                out.* = switch (mc.ty) {
+                    .f64 => .{ .float_const = mc.fval },
+                    .bool => .{ .bool_const = mc.bval },
+                    else => .{ .int_const = mc.ival },
+                };
             } else if (enumVariantTag(b, txt)) |ev| {
                 if (ev.info.si != null) return error.Unsupported; // boxed: a record value, not an int
                 out.* = .{ .int_const = ev.tag };    // `Color.Red` → its tag
@@ -15012,6 +15083,26 @@ test "Vec.new: an empty growable filled at runtime, then iterated" {
     try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_len") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "module-level scalar constant: a literal `let` inlines at use sites (no global)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\let TAU = 6.283185307179586
+        \\fn scale(x: f64) -> f64 { x * TAU }
+        \\fn main {
+        \\    env.out(scale(2.0))
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The constant materializes as the inlined float literal in `scale`'s body,
+    // not a `global_get` — it carries no storage (unlike a `state` global).
+    try testing.expect(std.mem.indexOf(u8, dump, "6.283185307179586f") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "global_get") == null);
 }
 
 test "Vec v0 floor: from/push/len/index/for, growth, honest boundaries" {

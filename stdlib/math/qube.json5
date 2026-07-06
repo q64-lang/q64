@@ -1,0 +1,21 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "q64.math",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "Scalar floating-point math: hardware primitives (abs, sqrt, floor, …) re-exported, plus pure-q64 transcendentals (exp, sin, cos, tanh).",
+  "type": "library",
+  "entry": "src/lib.q",
+
+  // Every export is a scalar f64 -> f64, so it lifts through the canonical ABI
+  // with no capability imports — the slice `q64 emit --component` handles today.
+  "component": {
+    "emit": true,
+  },
+
+  "wit": {
+    "package": "q64:math",
+    "world": "math",
+    "path": "synthesized",
+  },
+}
