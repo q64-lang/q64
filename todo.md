@@ -888,6 +888,72 @@ gate. The single hard ordering constraint in the whole plan is
 **audit-before-scheduler**; the single hard *product* constraint is
 **WIT-before-SDK** (Phase 6 lands the contract the SDK generates against).
 
+## Language-analysis follow-ups (2026-07) — NEW
+
+Source: [`docs/language-analysis-2026-07.md`](./docs/language-analysis-2026-07.md)
+— the assessment against the Julia/Mojo bar plus the domain plan (AI, robotics,
+world models & digital twins, crypto, quantum, drug research). The items below
+are the actionable deltas **not already tracked elsewhere in this file** — the
+analysis's Tier-0 core (semantic pass, effect-assert enforcement, const
+generics, memory reclamation, `spec/ffi.md`) is the existing §"Semantic pass…"
+ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here.
+
+- [ ] **Operator-overloading mechanism — decide + spec.** Compiler-blessed
+      `Add`/`Mul`/`Neg`/`Div` faces with laws attached (the property-test
+      machinery in `spec/faces.md` already covers laws); currently an open
+      item in `spec/grammar.md`. Prerequisite to every ergonomic numeric
+      library — `Tensor`, units arithmetic, `Complex` all meet here.
+      (Analysis §3, Tier 0.)
+- [ ] **`Simd<T, N>` first slice + turn on SIMD128 in the emitted feature
+      set.** The prelude registers the name only (`sema/prelude.zig`) and
+      `codegen/emit.zig` emits no SIMD feature today; Binaryen already
+      supports v128. Start with splat/extract + lane-wise f32x4/i32x4
+      add/mul, verified wasm64 + wasm32 like every other rung. The biggest
+      in-substrate performance lever available. (Analysis §3, item 6.)
+- [ ] **Static-shape `Tensor` first slice** (behind const generics, §B5):
+      `Tensor<T, [A, B]>` as a monomorphized struct over `Simd` kernels;
+      milestone = `matmul<T, const A, B, C>` with shape mismatch as a
+      compile error (TYP070). `DynTensor` follows later. (Analysis §3, item 7.)
+- [ ] **`q64.math` scope growth**: the transcendental set already decided
+      above (`sin`/`cos`/`exp`/`log` — software, deterministic), plus
+      `ln`/`log2`/`log10`/`pow`/`atan2`, `Complex<T>` (prerequisite for FFT,
+      quantum-state simulation, DSP), and a seeded splittable RNG surfaced
+      through `env.random` so determinism stays capability-visible.
+      (Analysis §3, item 8.)
+- [ ] **`spec/autodiff.md` — design note.** Source-transform reverse-mode AD
+      over HIR: a `@differentiable` marker, `@pure` delimiting differentiable
+      regions, arenas as the tape, a `Differentiable` face with laws.
+      Design-only for now; implementation queues behind the Tensor slice.
+      Without it, "AI support" means inference only. (Analysis §3, item 13.)
+- [ ] **SI base dimensions in `spec/units.md`.** Extend the closed
+      six-dimension set with Length/Mass/Temperature/Current/Amount(mol)/
+      Luminosity + derived composites (N, Pa, J, V) — still a closed,
+      compiler-known list; the phantom-type machinery is unchanged. Robotics
+      (m/s², N·m), chemistry (mol/L, kDa), and twins all need it.
+      (Analysis §3, item 17.)
+- [ ] **`@deterministic` build profile + arena `snapshot()`/`restore()` —
+      design note.** All nondeterminism already enters through capabilities
+      (`env.time`, `env.random`), so a seeded/virtualized profile gives
+      record-replay simulation as a compiler property; arena snapshot is the
+      rollback primitive under twins/world-model "what-if" queries.
+      (Analysis §4.)
+- [ ] **WGSL compute-kernel emission — design note.** Generalize the gfx
+      "shaders written in q64 → WGSL" plan to compute: a `@gpu`/`@kernel`
+      marked fn compiled from MIR (structured form maps cleanly onto WGSL).
+      The portable GPU story that fits the WebKit/iPad floor; native quality
+      via wgpu/Dawn on the wasmtime host. (Analysis §3, item 11.)
+- [ ] **Host-inference capability face** (`env.ai.infer`, `@inference`):
+      WebNN (browser) / ONNX-runtime-or-GGML (native) behind one face, making
+      `stdlib/ai`'s `Model<InVocab, OutVocab>` surface executable and feeding
+      token streams into `Stream<Token<V>, R>` — the voice-agent flagship
+      becomes buildable end-to-end. (Analysis §3, item 12.)
+- [ ] **Crypto notes**: the codegen story for wide ints (i128/u128 are
+      already in the sema TypeStore tower; u256 for contract targets), and a
+      `@const_time` effect assert (no secret-dependent branches or memory
+      indexing — checkable on MIR, same family as `@no_alloc`). Primitives
+      themselves arrive via wasm-compiled verified libraries (HACL*/libsodium)
+      through the `ffi.md` path above, not reimplementation. (Analysis §4.)
+
 ## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
 
 The registry and the package up/download loop are **done and live**. The

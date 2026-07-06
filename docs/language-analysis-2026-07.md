@@ -62,8 +62,9 @@ Grounded in the spec (`spec/`), the compiler as implemented (`q64/src/`,
    `DynTensor` exist only as prelude identifiers (`sema/prelude.zig:38-40`).
    The emitted Wasm feature set contains **no SIMD** (`codegen/emit.zig:920`),
    no GC, no threads. `q64.math` is 8 scalar f64 functions; there is no `ln`,
-   no `pow`, no RNG, no complex numbers, no unary minus (`0 - 1` idiom
-   throughout the examples), no int↔float conversion.
+   no `pow`, no RNG, no complex numbers. (Unary minus and the
+   `f64(i)`/`i64(f)` casts *do* work — verified against `q64 0.0.7`; the
+   `0 - 1` idioms in older examples predate them.)
 
 3. **No FFI and no autodiff — not even as designs.** `ffi.md` is unwritten;
    gradients appear nowhere in spec, stdlib, or todo. Every domain on the
@@ -130,9 +131,11 @@ later.
    ergonomic numeric library, period. Resolve it now, in the faces framework,
    with laws attached (`law associative`, `law distributive` — the property
    -test machinery is already specced).
-5. **Numeric ergonomics debt**: unary minus, int↔float conversion
-   (`f64(i)` / `i64.from(f)`), f32 math builtins, division/modulo semantics
-   documented. These are small, embarrassing, and visible in every example.
+5. **Numeric ergonomics tail.** Unary minus, the `f64(i)`/`i64(f)` casts,
+   and the f32 builtin set have already landed; what remains is
+   receiver-expression / record-field float receivers for the math builtins
+   and the transcendentals gated on loadable stdlib qubes (both already
+   tracked in `todo.md` §"Numeric tower").
 
 ### Tier 1 — the numeric core (the Julia/Mojo table stakes)
 
