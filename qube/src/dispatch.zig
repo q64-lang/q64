@@ -15,7 +15,7 @@ const std = @import("std");
 
 /// The canonical version line. One string, native + on-device — a front-end may
 /// add its own context note, but the version itself is shared.
-pub const version_text = "qube 0.0.6 (pre-alpha)";
+pub const version_text = "qube 0.0.7 (pre-alpha)";
 
 /// Usage for the on-device command surface (the subset a browser shell runs;
 /// the native CLI additionally does packaging/registry work that needs a real
