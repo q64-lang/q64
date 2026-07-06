@@ -733,7 +733,7 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 const st = try b.a.create(hir.Stmt);
                 st.* = .{ .let = .{ .idx = idx, .value = arr.e } };
                 try out.append(b.a, st);
-            } else if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+            } else if (try tryVecFrom(b, init_expr, nm.text, ls.isVar(), try vecElemType(b, ls.type_()), scope, out)) {
                 // `let v = Vec.from([…])` — handled (vec_new + pushes).
             } else if (try tryActorSpawn(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let c = Actor.spawn()` — an actor instance (default state record).
@@ -1955,6 +1955,21 @@ fn scalarChanType(tname: []const u8) ?hir.Type {
     if (std.mem.eql(u8, tname, "i64")) return .i64;
     if (std.mem.eql(u8, tname, "str")) return .str;
     return null;
+}
+
+/// The element `hir.Type` of a `Vec<T>` type annotation (`let m: Vec<f64> =
+/// Vec.new()`), or null if `te` isn't a `Vec<scalar>`. Only scalar elements
+/// (`f64`/`i64`/`bool`) — a record/generic element is out of the v0 floor.
+fn vecElemType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?hir.Type {
+    const te = te_opt orelse return null;
+    if (te != .path) return null;
+    const nm = try te.path.name(b.a);
+    defer b.a.free(nm);
+    if (!std.mem.eql(u8, nm, "Vec")) return null;
+    const raw = (try te.path.genericArgsText(b.a)) orelse return null;
+    defer b.a.free(raw);
+    // genericArgsText yields the list *with* its angle brackets (`<f64>`).
+    return scalarChanType(std.mem.trim(u8, raw, "<> \t"));
 }
 
 // A task lowers to a tiny CFG of pc-numbered blocks. A `plain`/`recv` block
@@ -7758,13 +7773,43 @@ fn buildActorDefaultRecord(b: *Builder, ad: ast.ActorDecl, si: *const StructInfo
     return rec;
 }
 
+/// Encode a scalar value into a vec's i64 cell: an f64 is bit-reinterpreted to
+/// i64 (raw bits kept), a bool widens to i64(0/1), an i64 is unchanged. Mirrors
+/// the channel-send cell packing.
+fn castToCell(b: *Builder, value: *hir.Expr, elem: ?hir.Type) BuildError!*hir.Expr {
+    const et = elem orelse return value;
+    if (et == .f64) {
+        const bc = try b.a.create(hir.Expr);
+        bc.* = .{ .bitcast = .{ .to = .i64, .value = value } };
+        return bc;
+    }
+    if (et == .bool) {
+        const cast = try b.a.create(hir.Expr);
+        cast.* = .{ .num_cast = .{ .to = .i64, .value = value } };
+        return cast;
+    }
+    return value;
+}
+
+/// Decode an i64 cell back to the vec element type: an f64 is bit-reinterpreted
+/// from the raw bits; any other element rides the i64 cell as-is.
+fn castFromCell(b: *Builder, cell: *hir.Expr, elem: ?hir.Type) BuildError!*hir.Expr {
+    const et = elem orelse return cell;
+    if (et == .f64) {
+        const bc = try b.a.create(hir.Expr);
+        bc.* = .{ .bitcast = .{ .to = .f64, .value = cell } };
+        return bc;
+    }
+    return cell;
+}
+
 /// `Vec.from([…])` / `Vec.new()` as a `let`/`var` initializer (the v0 Vec
 /// floor, spec/types.md §Growable): bind a fresh header, and for `Vec.from`
 /// push each literal element (i64 expressions). `Vec.new()` is the empty
 /// growable — the header with no pushes, for a set filled at runtime via
 /// `.push`. Returns false when the initializer isn't either form; growth /
 /// representation live in the `__vec_*` helpers.
-fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool, elem: ?hir.Type, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
     const cc = switch (init_expr) {
         .call => |x| x,
         else => return false,
@@ -7777,6 +7822,11 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
     // let v = vec_new()  (the fresh empty header, both forms share it)
     const v_idx = try declareBodyLocal(b, scope, name, mutable, .ptr);
     try scope.vecs.put(b.a, name, {});
+    // A `Vec<f64>` annotation pins the element type (an f64 rides the i64 cell
+    // as raw bits); default (absent / i64) keeps the plain i64 cell.
+    if (elem) |et| {
+        if (et != .i64) try scope.vec_elem.put(b.a, name, et);
+    }
     const nv = try b.a.create(hir.Expr);
     nv.* = .vec_new;
     const bind = try b.a.create(hir.Stmt);
@@ -7798,13 +7848,14 @@ fn tryVecFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bool,
         else => return error.Unsupported, // Vec.from takes a slice literal
     };
 
-    // one vec_push per element
+    // one vec_push per element (f64 elements bit-cast into the i64 cell)
     var eit = arr.elements();
     while (eit.next()) |el| {
         const vref = try b.a.create(hir.Expr);
         vref.* = .{ .local = .{ .idx = v_idx, .ty = .ptr } };
+        const value = try castToCell(b, try buildIntExpr(b, el, scope), elem);
         const st = try b.a.create(hir.Stmt);
-        st.* = .{ .vec_push = .{ .vec = vref, .value = try buildIntExpr(b, el, scope) } };
+        st.* = .{ .vec_push = .{ .vec = vref, .value = value } };
         try out.append(b.a, st);
     }
     return true;
@@ -8630,8 +8681,10 @@ fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.S
     var ait = call.args();
     const arg = ait.next() orelse return error.Unsupported;
     if (ait.next() != null) return error.Unsupported;
+    // An f64-element vec bit-casts the pushed value into the i64 cell.
+    const value = try castToCell(b, try buildIntExpr(b, arg, scope), scope.vec_elem.get(head));
     const st = try b.a.create(hir.Stmt);
-    st.* = .{ .vec_push = .{ .vec = vref, .value = try buildIntExpr(b, arg, scope) } };
+    st.* = .{ .vec_push = .{ .vec = vref, .value = value } };
     return st;
 }
 
@@ -8750,6 +8803,7 @@ fn exprScalar(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!sema.e
         .callRet = ExprTypeBridge.callRet,
         .fieldType = ExprTypeBridge.fieldType,
         .fnRet = ExprTypeBridge.fnRet,
+        .indexElem = ExprTypeBridge.indexElem,
     });
 }
 
@@ -9139,6 +9193,22 @@ const ExprTypeBridge = struct {
         };
     }
 
+    /// `v[i]` on a vec binding: the vec's element type (an f64 for a `Vec<f64>`,
+    /// the i64 default otherwise). Null when `base` isn't a bare vec binding.
+    fn indexElem(ctx: *anyopaque, base: ast.Expr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
+        const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
+        if (base != .path) return null;
+        const nm = base.path.text(self.b.a) catch return null;
+        defer self.b.a.free(nm);
+        if (!self.scope.vecs.contains(nm)) return null;
+        return switch (self.scope.vec_elem.get(nm) orelse .i64) {
+            .f64 => .f64,
+            .f32 => .f32,
+            .bool => .bool,
+            else => .i64,
+        };
+    }
+
     fn callRet(ctx: *anyopaque, name: []const u8, call: ast.CallExpr) std.mem.Allocator.Error!?sema.exprtype.ScalarType {
         const self: *ExprTypeBridge = @ptrCast(@alignCast(ctx));
         // A `graph` call (`pipeline(...)`) types as the graph's declared output.
@@ -9311,8 +9381,13 @@ const Scope = struct {
     enum_binds: std.StringHashMapUnmanaged(*const EnumInfo) = .empty,
     /// Vec bindings (the v0 floor, spec/types.md §Growable): name →
     /// present. The header base pointer lives in `locals` under the
-    /// same name (a `.ptr`); elements are i64.
+    /// same name (a `.ptr`); elements are i64 by default.
     vecs: std.StringHashMapUnmanaged(void) = .empty,
+    /// Vec element type when it isn't the i64 default — set from a `Vec<f64>`
+    /// annotation (`let m: Vec<f64> = Vec.new()`). An f64 element rides the i64
+    /// cell as raw bits: `push`/`v[i] = x` bit-cast f64→i64, a `v[i]` read
+    /// bit-casts i64→f64. Mirrors `chan_elem`; absent means i64.
+    vec_elem: std.StringHashMapUnmanaged(hir.Type) = .empty,
     /// `[str]` (str-list) bindings: name → the two address-width locals
     /// holding the `(data_ptr, count)` pair (the same shape a `str` binding
     /// uses). Indexing reads them as a list; `.len()` reads the count via
@@ -9975,11 +10050,14 @@ fn buildVecSet(b: *Builder, ix: ast.IndexExpr, as: ast.AssignStmt, scope: *Scope
     const loc = scope.find(bn) orelse return error.Unsupported;
     if (!loc.mutable) return reject(b, .immutable_assign);
     const rhs_ast = as.value() orelse return error.Unsupported;
-    if ((try exprScalar(b, rhs_ast, scope)) != .i64) return error.Unsupported; // the element cell is i64
+    // The stored value must match the element type (i64 default, or the `Vec<f64>`
+    // element); an f64 is bit-cast into the i64 cell.
+    const elem = scope.vec_elem.get(bn) orelse .i64;
+    if (scalarBindTy(try exprScalar(b, rhs_ast, scope)) != elem) return error.Unsupported;
     const vref = try b.a.create(hir.Expr);
     vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
     const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
-    const value = try buildIntExpr(b, rhs_ast, scope);
+    const value = try castToCell(b, try buildIntExpr(b, rhs_ast, scope), scope.vec_elem.get(bn));
     return .{ .vec_set = .{ .vec = vref, .idx = idx, .value = value } };
 }
 
@@ -10454,14 +10532,16 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             if (base == .path) {
                 const bn = try base.path.text(b.a);
                 defer b.a.free(bn);
-                // `v[i]` on a vec binding: bounds-checked in __vec_get.
+                // `v[i]` on a vec binding: bounds-checked in __vec_get. An
+                // f64-element vec bit-casts the i64 cell back to f64.
                 if (scope.vecs.contains(bn)) {
                     const loc = scope.find(bn) orelse return error.Unsupported;
                     const vref = try b.a.create(hir.Expr);
                     vref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
                     const idx = try buildIntExpr(b, ix.index() orelse return error.Unsupported, scope);
-                    out.* = .{ .vec_get = .{ .vec = vref, .idx = idx } };
-                    return out;
+                    const get = try b.a.create(hir.Expr);
+                    get.* = .{ .vec_get = .{ .vec = vref, .idx = idx } };
+                    return try castFromCell(b, get, scope.vec_elem.get(bn));
                 }
                 if (scope.arrs.get(bn)) |ai| {
                     const ety = switch (ai.elem) {
@@ -15141,6 +15221,30 @@ test "vec index store: `v[i] = x` builds a vec_set (the write counterpart of vec
     // nests a vec_get inside a vec_set.
     try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
+}
+
+test "f64 vec elements: `Vec<f64>` bit-casts through the i64 cell on push/get/set" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\fn main {
+        \\    var m: Vec<f64> = Vec.new()
+        \\    m.push(1.5)
+        \\    m.push(0.0)
+        \\    m[1] = m[0] * 2.0
+        \\    env.out(m[1])
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // An f64 element rides the i64 cell as raw bits: push/set encode f64->i64,
+    // a read decodes i64->f64, and `m[0] * 2.0` types as an f64 multiply.
+    try testing.expect(std.mem.indexOf(u8, dump, "bitcast<i64>") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "bitcast<f64>") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_set") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "mul") != null);
 }
 
 test "module-level scalar constant: a literal `let` inlines at use sites (no global)" {

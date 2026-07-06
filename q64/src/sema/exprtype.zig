@@ -54,6 +54,10 @@ pub const Env = struct {
     /// type a bare-path pipe stage (`x |> f`). `null` when not a known scalar
     /// function.
     fnRet: *const fn (ctx: *anyopaque, name: []const u8) std.mem.Allocator.Error!?ScalarType,
+    /// Element type of `base[i]` when `base` is an indexable collection the
+    /// caller tracks (e.g. a `Vec<f64>` binding). `null` when `base` isn't one,
+    /// or the element isn't a scalar. Optional — absent leaves `v[i]` unknown.
+    indexElem: ?*const fn (ctx: *anyopaque, base: ast.Expr) std.mem.Allocator.Error!?ScalarType = null,
 };
 
 /// Scalar type of `expr` under `env`. Total: anything outside the floor
@@ -139,6 +143,8 @@ pub fn scalarOf(gpa: std.mem.Allocator, expr: ast.Expr, env: Env) std.mem.Alloca
             // typing lives with the caller's slot scope (its bridge).
             const base = ix.base() orelse return .unknown;
             if ((try scalarOf(gpa, base, env)) == .str) return .i64;
+            // `v[i]` on a caller-tracked collection (a `Vec<f64>` binding).
+            if (env.indexElem) |f| if (try f(env.ctx, base)) |t| return t;
             return .unknown;
         },
         .method => |me| {
