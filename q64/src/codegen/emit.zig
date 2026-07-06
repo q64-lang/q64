@@ -1067,6 +1067,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // §"Wire ABI: fs.read"), so the max must allow it.
     var any_fs = false;
     var any_args = false;
+    var any_vec = false;
     for (m.funcs) |*f2| {
         const st2 = switch (f2.body) {
             .structured => |inst| inst,
@@ -1076,13 +1077,21 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         scanScratch(st2, &sc2);
         if (sc2.has_fs) any_fs = true;
         if (sc2.has_args or sc2.has_envvar) any_args = true;
+        if (sc2.has_vec) any_vec = true;
     }
+    // Vecs allocate their headers + data from a PERSISTENT heap (`hp`), separate
+    // from the per-call stack arena (`sp`) which is restored on every call — a
+    // vec that outlives the call (actor `state Vec`) would otherwise share the
+    // reset `sp` base with the next call's vec. The heap lives above a 1 MiB
+    // stack region; reserve enough pages to hold it.
+    const vec_hp_base: u32 = 1024 * 1024; // `hp` start — stack is [arena, 1 MiB)
+    const vec_mem_pages: c.BinaryenIndex = 64; // 4 MiB: 1 MiB stack + 3 MiB heap
     // The kv path keeps memory bounded but growable: the canonical `cabi_realloc`
     // serves host-side allocations (e.g. an error variant's `other(string)`) from
     // page 1 up, so reserve room above the page-0 data/scratch/arena. fs.read and
     // env.args let the host grow guest memory, so they also need headroom.
-    const mem_min: c.BinaryenIndex = if (wants_store) 2 else 1;
-    const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_store) 64 else if (any_fs or any_args) 256 else 1;
+    const mem_min: c.BinaryenIndex = if (any_vec and !wants_store) vec_mem_pages else if (wants_store) 2 else 1;
+    const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_store) 64 else if (any_vec) vec_mem_pages else if (any_fs or any_args) 256 else 1;
     // The component model requires the canonical memory export to be named
     // `cm32p2_memory`; the raw paths keep the plain `memory`.
     const mem_export_name = if (wants_store) "cm32p2_memory" else "memory";
@@ -1185,6 +1194,17 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         else
             c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(arena_start)));
         _ = c.BinaryenAddGlobal(module, "sp", ptr_type, true, sp_init);
+    }
+    if (needs_vec) {
+        // The persistent vec heap: bumps up from `vec_hp_base` and is NEVER
+        // restored (unlike `sp`), so a `state Vec`'s data survives across calls
+        // and distinct vecs never collide. Leaks (no free) — fine for the
+        // bounded workloads vecs serve today.
+        const hp_init = if (mem64)
+            c.BinaryenConst(module, c.BinaryenLiteralInt64(@intCast(vec_hp_base)))
+        else
+            c.BinaryenConst(module, c.BinaryenLiteralInt32(@intCast(vec_hp_base)));
+        _ = c.BinaryenAddGlobal(module, "hp", ptr_type, true, hp_init);
     }
     if (needs_fs) {
         // env.fs_read : (dest, path_ptr, path_len) -> i64 (spec/env.md).
@@ -6600,7 +6620,8 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         }
         /// (sp + 7) & ~7 — an 8-aligned allocation base.
         fn align8(m: c.BinaryenModuleRef, m64: bool, pt: c.BinaryenType, addp: c.BinaryenOp, andp: c.BinaryenOp) c.BinaryenExpressionRef {
-            return c.BinaryenBinary(m, andp, c.BinaryenBinary(m, addp, c.BinaryenGlobalGet(m, "sp", pt), K.ptrc(m, m64, 7)), K.ptrc(m, m64, -8));
+            // Allocate from the persistent vec heap `hp`, not the per-call `sp`.
+            return c.BinaryenBinary(m, andp, c.BinaryenBinary(m, addp, c.BinaryenGlobalGet(m, "hp", pt), K.ptrc(m, m64, 7)), K.ptrc(m, m64, -8));
         }
         /// Widen an address-width value to i64 (identity on wasm64).
         fn toI64(m: c.BinaryenModuleRef, m64: bool, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
@@ -6612,12 +6633,12 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         }
     };
 
-    // __vec_new() -> ptr: hdr = align8(sp); sp = hdr + 3W; zero the slots.
+    // __vec_new() -> ptr: hdr = align8(hp); hp = hdr + 3W; zero the slots.
     {
         const HDR: c.BinaryenIndex = 0; // local
         var stmts = [_]c.BinaryenExpressionRef{
             c.BinaryenLocalSet(module, HDR, h.align8(module, mem64, ptr_type, add_p, and_p)),
-            c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(module, add_p, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 3 * W))),
+            c.BinaryenGlobalSet(module, "hp", c.BinaryenBinary(module, add_p, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 3 * W))),
             h.storeW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 0)),
             h.storeW(module, @intCast(W), wbytes, ptr_type, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 0)),
             h.storeW(module, @intCast(2 * W), wbytes, ptr_type, K.get(module, HDR, ptr_type), K.ptrc(module, mem64, 0)),
@@ -6644,9 +6665,9 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         defer grow.deinit(allocator);
         // cap = cap == 0 ? 4 : cap << 1
         try grow.append(allocator, c.BinaryenLocalSet(module, CAP, c.BinaryenIf(module, eqz_p_wrap(module, eqz_p, K.get(module, CAP, ptr_type)), K.ptrc(module, mem64, 4), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 1)))));
-        // nd = align8(sp); sp = nd + cap*8
+        // nd = align8(hp); hp = nd + cap*8
         try grow.append(allocator, c.BinaryenLocalSet(module, ND, h.align8(module, mem64, ptr_type, add_p, and_p)));
-        try grow.append(allocator, c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(module, add_p, K.get(module, ND, ptr_type), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 3)))));
+        try grow.append(allocator, c.BinaryenGlobalSet(module, "hp", c.BinaryenBinary(module, add_p, K.get(module, ND, ptr_type), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 3)))));
         // memory.copy(nd, data, len*8)
         try grow.append(allocator, c.BinaryenMemoryCopy(module, K.get(module, ND, ptr_type), h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 3)), "0", "0"));
         // hdr.data = nd; hdr.cap = cap
@@ -6741,7 +6762,7 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         defer grow.deinit(allocator);
         try grow.append(allocator, c.BinaryenLocalSet(module, CAP, c.BinaryenIf(module, eqz_p_wrap(module, eqz_p, K.get(module, CAP, ptr_type)), K.ptrc(module, mem64, 4), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 1)))));
         try grow.append(allocator, c.BinaryenLocalSet(module, ND, h.align8(module, mem64, ptr_type, add_p, and_p)));
-        try grow.append(allocator, c.BinaryenGlobalSet(module, "sp", c.BinaryenBinary(module, add_p, K.get(module, ND, ptr_type), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 2)))));
+        try grow.append(allocator, c.BinaryenGlobalSet(module, "hp", c.BinaryenBinary(module, add_p, K.get(module, ND, ptr_type), c.BinaryenBinary(module, shl_p, K.get(module, CAP, ptr_type), K.ptrc(module, mem64, 2)))));
         try grow.append(allocator, c.BinaryenMemoryCopy(module, K.get(module, ND, ptr_type), h.loadW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type)), c.BinaryenBinary(module, shl_p, K.get(module, LEN, ptr_type), K.ptrc(module, mem64, 2)), "0", "0"));
         try grow.append(allocator, h.storeW(module, 0, wbytes, ptr_type, K.get(module, HDR, ptr_type), K.get(module, ND, ptr_type)));
         try grow.append(allocator, h.storeW(module, @intCast(2 * W), wbytes, ptr_type, K.get(module, HDR, ptr_type), K.get(module, CAP, ptr_type)));

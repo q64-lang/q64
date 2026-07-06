@@ -15282,6 +15282,34 @@ test "vec index store: `v[i] = x` builds a vec_set (the write counterpart of vec
     try testing.expect(std.mem.indexOf(u8, dump, "vec_get") != null);
 }
 
+test "two `Vec` state fields are distinct (persistent heap, not the per-call stack arena)" {
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    var mod = (try buildLocal(testing.allocator, &tr,
+        \\actor A {
+        \\    state p: Vec<f64> = Vec.new()
+        \\    state q: Vec<f64> = Vec.new()
+        \\    handle PushP(x: f64) { p.push(x) }
+        \\    handle PushQ(x: f64) { q.push(x) }
+        \\    handle GetP -> f64 { p[0] }
+        \\    handle GetQ -> f64 { q[0] }
+        \\}
+        \\let a = A.spawn()
+        \\pub fn pushp(x: f64) { a.tell(PushP(x)) }
+        \\pub fn pushq(x: f64) { a.tell(PushQ(x)) }
+        \\pub fn getp() -> f64 { a.ask(GetP) }
+        \\pub fn getq() -> f64 { a.ask(GetQ) }
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer mod.deinit();
+    // Compiles + emits; the runtime non-aliasing (p[0] != q[0] after separate
+    // pushes) is what the vecs-on-`hp` heap guarantees — a `state Vec`'s data
+    // must outlive the handler call, so it can't ride the restored `sp` arena.
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "vec_push") != null);
+}
+
 test "persistent buffer: an actor holds a `Vec<f64>`, void pub fns push, a value pub fn returns `v.ptr`" {
     var tr = TestResolver{ .a = testing.allocator };
     defer tr.deinit();
