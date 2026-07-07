@@ -3418,6 +3418,49 @@ cx32_out="$("$HOST_BIN" "$tmp/cxuse32.wasm")"
 [[ "$cx32_out" == "$cx_expected" ]] || { echo "FAIL: q64.math Complex wasm32 (got: $cx32_out)" >&2; exit 1; }
 echo "    ok: q64.math Complex -> cmul/cdiv roundtrip + cabs 5 + carg pi:2 + cis(pi).re -1 (wasm64 + wasm32; imported structs)"
 
+echo "==> operator fits: a + b / a * b on records dispatch through Add/Mul fits (spec/operators.md)"
+op_app="$tmp/ops.q"
+cat > "$op_app" <<'Q64'
+struct Vec2 {
+    x: f64,
+    y: f64,
+}
+
+fit Vec2 : Add {
+    fn add(self, rhs: Vec2) -> Vec2 {
+        Vec2 { x: self.x + rhs.x, y: self.y + rhs.y }
+    }
+}
+
+fit Vec2 : Mul {
+    fn mul(self, rhs: Vec2) -> Vec2 {
+        Vec2 { x: self.x * rhs.x, y: self.y * rhs.y }
+    }
+}
+
+fn main {
+    let a = Vec2 { x: 1.0, y: 2.0 }
+    let b = Vec2 { x: 3.0, y: 4.0 }
+    let s = a + b
+    env.out(s.x)
+    env.out(s.y)
+    let p = a * b
+    env.out(p.x)
+    env.out(p.y)
+    let t = s + p
+    env.out(t.x)
+    env.out(t.y)
+}
+Q64
+op_expected=$'4.0\n6.0\n3.0\n8.0\n7.0\n14.0'
+"$Q64_BIN" emit "$op_app" "$tmp/ops.wasm"
+op_out="$("$HOST_BIN" "$tmp/ops.wasm")"
+[[ "$op_out" == "$op_expected" ]] || { echo "FAIL: operator fits (got: $op_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$op_app" "$tmp/ops32.wasm" --addr wasm32
+op32_out="$("$HOST_BIN" "$tmp/ops32.wasm")"
+[[ "$op32_out" == "$op_expected" ]] || { echo "FAIL: operator fits wasm32 (got: $op32_out)" >&2; exit 1; }
+echo "    ok: operator fits -> (4,6) / (3,8) / (7,14) (wasm64 + wasm32; record params + returns through fit dispatch)"
+
 echo "==> simd first slice: Simd.splat + lane-wise add/mul + extract (f32x4 + i32x4, native v128 ops)"
 sd_app="$tmp/simd.q"
 cat > "$sd_app" <<'Q64'

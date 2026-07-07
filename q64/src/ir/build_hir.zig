@@ -765,6 +765,9 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // `let d = xs.map|filter(|x| …)` — handled (vec_new + pushes).
             } else if (try tryVecReduce(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let r = xs.reduce(init, |acc, x| …)` — handled (scalar fold).
+            } else if (try tryRecOperator(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let c = a + b` on record operands — an operator fit
+                // (spec/operators.md), dispatched through the fit registry.
             } else if (if (init_expr == .call or init_expr == .tuple or isBoxedVariantPath(b, init_expr)) try buildRecExpr(b, init_expr, scope) else null) |rv| {
                 // `let p = make(3, 4)` / `let c = first([...])` — a
                 // record-returning call (incl. a generic whose `-> T`
@@ -6259,6 +6262,52 @@ fn enumOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const EnumInfo {
 
 /// If `expr` is a call to a record-returning function (resolvable, bare
 /// name), the struct it returns. Used to detect `let p = make(3, 4)`.
+/// The operator-fit method named by a binary operator token
+/// (spec/operators.md): `+` → add, `-` → sub, `*` → mul, `/` → div.
+fn operatorMethodName(kind: parser.cst.SyntaxKind) ?[]const u8 {
+    return switch (kind) {
+        .PLUS => "add",
+        .MINUS => "sub",
+        .STAR => "mul",
+        .SLASH => "div",
+        else => null,
+    };
+}
+
+/// `let c = a + b` where both operands are same-struct record bindings —
+/// an operator fit (spec/operators.md): desugar to the fit-method call
+/// `a.add(b)` through the B4 static-dispatch machinery and bind the
+/// returned record. False when the initializer isn't that shape; a shape
+/// that IS an operator on records but has no fit rejects honestly.
+fn tryRecOperator(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const bx = switch (init_expr) {
+        .bin => |x| x,
+        else => return false,
+    };
+    const op = bx.op() orelse return false;
+    const mname = operatorMethodName(op.kind) orelse return false;
+    const le = bx.lhs() orelse return false;
+    const re = bx.rhs() orelse return false;
+    if (le != .path or re != .path) return false;
+    const ln = try pathText(b, le.path);
+    const rn = try pathText(b, re.path);
+    const lsi = scope.recs.get(ln) orelse return false;
+    const rsi = scope.recs.get(rn) orelse return false;
+    // Homogeneous in v0 (spec/operators.md): both operands the same struct.
+    if (lsi != rsi) return error.Unsupported;
+    const id = (try registerFitMethod(b, lsi, mname)) orelse return error.Unsupported;
+    const lloc = scope.find(ln) orelse return false;
+    const rloc = scope.find(rn) orelse return false;
+    const lref = try b.a.create(hir.Expr);
+    lref.* = .{ .local = .{ .idx = lloc.idx, .ty = .ptr } };
+    const rref = try b.a.create(hir.Expr);
+    rref.* = .{ .local = .{ .idx = rloc.idx, .ty = .ptr } };
+    const call = try b.a.create(hir.Expr);
+    call.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{ lref, rref }) } };
+    try bindMainRecord(b, scope, name, is_var, call, lsi, out);
+    return true;
+}
+
 fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
     const call = switch (expr) {
         .call => |cc| cc,
@@ -6527,10 +6576,16 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     const m = findFitMethod(b, si.name, mname) orelse return null;
     const body_blk = m.body() orelse return error.Unsupported; // a bodyless sig can't be called
     const rt = m.returnType() orelse return error.Unsupported;
-    const rs = (try semaScalar(b, rt.type_())) orelse return error.Unsupported;
-    const ret_ty: hir.Type = switch (rs) {
-        .bool, .i64, .f64, .f32, .str => rs,
-        else => return error.Unsupported, // record-valued methods: later
+    // A record-valued method (`fn add(self, rhs: Complex) -> Complex`) —
+    // the operator-fit shape (spec/operators.md) — returns its record as a
+    // base pointer, like any record-returning function.
+    const ret_si: ?*const StructInfo = try structOfType(b, rt.type_());
+    const ret_ty: hir.Type = if (ret_si != null) .ptr else blk: {
+        const rs = (try semaScalar(b, rt.type_())) orelse return error.Unsupported;
+        break :blk switch (rs) {
+            .bool, .i64, .f64, .f32, .str => rs,
+            else => return error.Unsupported,
+        };
     };
 
     var scope = Scope{ .a = b.a, .callee = true };
@@ -6545,6 +6600,16 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     try params.append(b.a, .{ .name = "self", .ty = .ptr });
     try rec_params.append(b.a, si);
     while (pit.next()) |p| {
+        // A record parameter (`rhs: Complex`) rides as a base pointer,
+        // registered in the body scope like the receiver.
+        if (try structOfType(b, p.type_())) |psi| {
+            const pn = (p.name() orelse return error.Unsupported).text;
+            _ = try scope.declare(pn, false, .ptr);
+            try scope.recs.put(b.a, pn, psi);
+            try params.append(b.a, .{ .name = pn, .ty = .ptr });
+            try rec_params.append(b.a, psi);
+            continue;
+        }
         const psc = (try paramScalar(b, p)) orelse return error.Unsupported;
         const pty: hir.Type = switch (psc) {
             .bool, .i64, .f64, .f32 => psc,
@@ -6565,7 +6630,22 @@ fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) Buil
     const dummy = try b.a.create(hir.Stmt);
     dummy.* = .{ .block = &.{} };
     try b.funcs.append(b.a, .{ .name = key, .params = param_slice, .ret = ret_ty, .body = dummy });
-    try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = null });
+    try b.fn_recs.put(b.a, id, .{ .params = try rec_params.toOwnedSlice(b.a), .ret = ret_si });
+
+    // A record-returning method (`fn add(self, rhs) -> Complex { … }`): the
+    // body builds through the shared record-body builder, same as a
+    // record-returning free function.
+    if (ret_si) |want| {
+        const block = try buildRecBody(b, body_blk, &scope, want);
+        const rec_extra = scope.extra();
+        const rec_locals = try b.a.alloc(hir.Type, rec_extra);
+        for (rec_locals, 0..) |*t, j| {
+            const ty = scope.locals.items[scope.n_params + j].ty;
+            t.* = if (ty == .str) .ptr else ty;
+        }
+        b.funcs.items[id] = .{ .name = key, .params = param_slice, .ret = .ptr, .locals = rec_locals, .body = block, .ret_size = want.size, .ret_ptr_bearing = enumHasStrPayload(b, want) };
+        return id;
+    }
 
     // A str-returning method (`fn fmt(self) -> str { "..." }`): a single
     // tail str expression, like registerStrFunc — interpolation resolves
@@ -11503,6 +11583,32 @@ test "simd: splat/add/mul/extract lower to lane-tagged ops; misuse rejected" {
     // A bare float literal is f64 — not splattable (write f32(1.5)).
     try testing.expect((try buildFromSource(testing.allocator,
         "fn main {\n let v: Simd<f32, 4> = Simd.splat(1.5)\n let x = v.extract(0)\n env.out(\"{x}\")\n}\n", noLib)) == null);
+}
+
+test "operators: `a + b` on record bindings dispatches through the Add fit (spec/operators.md)" {
+    var mod = (try buildFromSource(testing.allocator,
+        "struct V { x: f64, y: f64 }\n" ++
+            "fit V : Add {\n fn add(self, rhs: V) -> V { V { x: self.x + rhs.x, y: self.y + rhs.y } }\n}\n" ++
+            "fn main {\n let a = V { x: 1.0, y: 2.0 }\n let b = V { x: 3.0, y: 4.0 }\n let s = a + b\n env.out(s.x)\n}\n", noLib)) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    // The operator desugared to the fit method: a registered `V.add`
+    // function and a call to it in main.
+    try testing.expect(std.mem.indexOf(u8, dump, "fn V.add") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "call#") != null);
+
+    // No fit for the operator's face rejects (TYP360's builder-level floor).
+    try testing.expect((try buildFromSource(testing.allocator,
+        "struct V { x: f64 }\n" ++
+            "fit V : Add {\n fn add(self, rhs: V) -> V { V { x: self.x + rhs.x } }\n}\n" ++
+            "fn main {\n let a = V { x: 1.0 }\n let b = V { x: 2.0 }\n let d = a - b\n env.out(d.x)\n}\n", noLib)) == null);
+    // Mixed operand structs reject — homogeneous in v0 (TYP361's floor).
+    try testing.expect((try buildFromSource(testing.allocator,
+        "struct A { x: f64 }\nstruct B { x: f64 }\n" ++
+            "fit A : Add {\n fn add(self, rhs: A) -> A { A { x: self.x + rhs.x } }\n}\n" ++
+            "fn main {\n let a = A { x: 1.0 }\n let b = B { x: 2.0 }\n let c = a + b\n env.out(c.x)\n}\n", noLib)) == null);
 }
 
 test "simd: review-hardening — interpolation/comparison/annotation misuse rejects everywhere" {

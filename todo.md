@@ -898,12 +898,21 @@ analysis's Tier-0 core (semantic pass, effect-assert enforcement, const
 generics, memory reclamation, `spec/ffi.md`) is the existing §"Semantic pass…"
 ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here.
 
-- [ ] **Operator-overloading mechanism — decide + spec.** Compiler-blessed
-      `Add`/`Mul`/`Neg`/`Div` faces with laws attached (the property-test
-      machinery in `spec/faces.md` already covers laws); currently an open
-      item in `spec/grammar.md`. Prerequisite to every ergonomic numeric
-      library — `Tensor`, units arithmetic, `Complex` all meet here.
-      (Analysis §3, Tier 0.)
+- [x] **Operator-overloading mechanism — DECIDED + SPEC'D + first slice
+      LANDED.** `spec/operators.md`: compiler-blessed prelude faces
+      (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg`), operator expressions desugar to
+      fit-method calls, homogeneous `Self × Self → Self` in v0, NO laws on
+      the arithmetic faces (floats aren't associative, concat-Adds aren't
+      commutative), `==`/ordering stay `Eq`/`Ord`, bitwise stays
+      integer-only. First compiler slice: `+ - * /` on same-struct record
+      bindings in let position desugar through the B4 fit-dispatch machinery
+      (`tryRecOperator` → `registerFitMethod`), with fit methods extended to
+      **record parameters and record returns** (previously scalar-only).
+      Roundtrip: Vec2 Add/Mul fits → (4,6)/(3,8)/(7,14) on wasm64 + wasm32;
+      no-fit and mixed-struct operands reject honestly. **Boundaries
+      (follow-ons):** `%`, unary `-` → `neg`, operators in
+      nested/argument/statement positions, fits on imported types (fitreg is
+      root-scope-only), TYP360/361 from `q64 check`. (Analysis §3, Tier 0.)
 - [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
       LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
       `v.add(w)`/`v.mul(w)`, `v.extract(0..3)`; `Simd<f32, 4>`/`Simd<i32, 4>`
