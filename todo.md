@@ -920,13 +920,14 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       bodies with leading `let`s prove out). **Nested positions LANDED**
       (`recOperand`: paths / parens / nested operator trees via hidden
       `#op<n>` temps, incl. through unary neg — `(a+b)*(a-b)` on imported
-      Complex verified). **Boundaries (follow-ons):** ARGUMENT/statement
-      positions — design note: `buildCallArgs` has six expression-context
-      callers and no statement sink, so don't thread `out` through it;
-      instead pre-hoist operator-shaped args to `#op<n>` temps at the
-      statement-level builders (let/expr-stmt, where `out` exists) before
-      the call builds, reusing `recOperand`. Plus TYP360/361 from
-      `q64 check`. (Analysis §3, Tier 0.)
+      Complex verified). **ARGUMENT position LANDED** —
+      better than the hoisting design note: operator trees build as PURE
+      nested fit-call expressions (`recOperatorExpr`, no temps, no
+      statement sink needed), routed through `buildCallArgs`'s `.rec` arm —
+      `cabs(a + b)`, `cmul(a + b, a - b)` verified on imported Complex,
+      wasm64 + wasm32. **Boundaries (follow-ons):** statement position
+      (an operator expr as a bare statement — pointless but should reject
+      cleanly), TYP360/361 from `q64 check`. (Analysis §3, Tier 0.)
 - [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
       LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
       `v.add(w)`/`v.mul(w)`, `v.extract(0..3)`; `Simd<f32, 4>`/`Simd<i32, 4>`

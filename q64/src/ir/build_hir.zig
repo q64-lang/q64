@@ -6287,74 +6287,57 @@ fn operatorMethodName(kind: parser.cst.SyntaxKind) ?[]const u8 {
     };
 }
 
-/// `let c = a + b` where both operands are same-struct record bindings —
-/// an operator fit (spec/operators.md): desugar to the fit-method call
-/// `a.add(b)` through the B4 static-dispatch machinery and bind the
-/// returned record. False when the initializer isn't that shape; a shape
-/// that IS an operator on records but has no fit rejects honestly.
-fn tryRecOperator(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
-    // Unary `-a` on a record binding → the Neg fit's `a.neg()`.
-    if (init_expr == .unary) {
-        const ux = init_expr.unary;
-        const uop = ux.op() orelse return false;
-        if (uop.kind != .MINUS) return false;
-        const oe = ux.operand() orelse return false;
-        const op0 = (try recOperand(b, oe, scope, out)) orelse return false;
-        const osi = op0.si;
-        const id = (try registerFitMethod(b, osi, "neg")) orelse return error.Unsupported;
-        const oref = try b.a.create(hir.Expr);
-        oref.* = .{ .local = .{ .idx = op0.idx, .ty = .ptr } };
-        const ncall = try b.a.create(hir.Expr);
-        ncall.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{oref}) } };
-        try bindMainRecord(b, scope, name, is_var, ncall, osi, out);
-        return true;
-    }
-    const bx = switch (init_expr) {
-        .bin => |x| x,
-        else => return false,
-    };
-    const op = bx.op() orelse return false;
-    const mname = operatorMethodName(op.kind) orelse return false;
-    const le = bx.lhs() orelse return false;
-    const re = bx.rhs() orelse return false;
-    const lop = (try recOperand(b, le, scope, out)) orelse return false;
-    const rop = (try recOperand(b, re, scope, out)) orelse return false;
-    const lsi = lop.si;
-    // Homogeneous in v0 (spec/operators.md): both operands the same struct.
-    if (lsi != rop.si) return error.Unsupported;
-    const id = (try registerFitMethod(b, lsi, mname)) orelse return error.Unsupported;
-    const lref = try b.a.create(hir.Expr);
-    lref.* = .{ .local = .{ .idx = lop.idx, .ty = .ptr } };
-    const rref = try b.a.create(hir.Expr);
-    rref.* = .{ .local = .{ .idx = rop.idx, .ty = .ptr } };
-    const call = try b.a.create(hir.Expr);
-    call.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{ lref, rref }) } };
-    try bindMainRecord(b, scope, name, is_var, call, lsi, out);
-    return true;
-}
+/// A record-valued operator operand/tree, built as a pure EXPRESSION —
+/// nested fit-method calls, no temps (a record call already flows as a
+/// `.ptr` argument). Paths resolve to bindings; parens unwrap; `-x` is the
+/// Neg fit; binary ops map per spec/operators.md. Null when not an
+/// operator-on-records shape; a real operator shape with no fit or with
+/// mixed operand structs rejects honestly.
+const RecOperand = struct { e: *hir.Expr, si: *const StructInfo };
 
-/// Resolve an operator operand to a record binding: a bare path resolves
-/// directly; a nested operator expression (`(a + b) * c`) materializes
-/// into a hidden `#op<n>` temp first (the `#chain<n>` precedent), so
-/// operator trees compose without a general expression-temp system.
-fn recOperand(b: *Builder, e0: ast.Expr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!?struct { idx: u32, si: *const StructInfo } {
-    // `(a + b)` parses as a paren node — unwrap to the inner expression.
+fn recOperatorExpr(b: *Builder, e0: ast.Expr, scope: *Scope) BuildError!?RecOperand {
     var e = e0;
     while (e == .paren) e = e.paren.inner() orelse return null;
     if (e == .path) {
         const n = try pathText(b, e.path);
         const si = scope.recs.get(n) orelse return null;
         const loc = scope.find(n) orelse return null;
-        return .{ .idx = loc.idx, .si = si };
+        const ref = try b.a.create(hir.Expr);
+        ref.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+        return .{ .e = ref, .si = si };
     }
-    if (e == .bin or e == .unary) {
-        const tmp = try std.fmt.allocPrint(b.a, "#op{d}", .{scope.next_idx});
-        if (!(try tryRecOperator(b, e, tmp, false, scope, out))) return null;
-        const si = scope.recs.get(tmp) orelse return null;
-        const loc = scope.find(tmp) orelse return null;
-        return .{ .idx = loc.idx, .si = si };
+    if (e == .unary) {
+        const uop = e.unary.op() orelse return null;
+        if (uop.kind != .MINUS) return null;
+        const inner = (try recOperatorExpr(b, e.unary.operand() orelse return null, scope)) orelse return null;
+        const id = (try registerFitMethod(b, inner.si, "neg")) orelse return error.Unsupported;
+        const c = try b.a.create(hir.Expr);
+        c.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{inner.e}) } };
+        return .{ .e = c, .si = inner.si };
+    }
+    if (e == .bin) {
+        const op = e.bin.op() orelse return null;
+        const mname = operatorMethodName(op.kind) orelse return null;
+        const l = (try recOperatorExpr(b, e.bin.lhs() orelse return null, scope)) orelse return null;
+        const r = (try recOperatorExpr(b, e.bin.rhs() orelse return null, scope)) orelse return null;
+        // Homogeneous in v0 (spec/operators.md): both sides the same struct.
+        if (l.si != r.si) return error.Unsupported;
+        const id = (try registerFitMethod(b, l.si, mname)) orelse return error.Unsupported;
+        const c = try b.a.create(hir.Expr);
+        c.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{ l.e, r.e }) } };
+        return .{ .e = c, .si = l.si };
     }
     return null;
+}
+
+/// `let c = a + b` / `let n = -(a * b)` — an operator tree in let position
+/// binds the resulting record. Bare-path inits are NOT handled here (a
+/// whole-record copy stays the documented rejection).
+fn tryRecOperator(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    if (init_expr != .bin and init_expr != .unary) return false;
+    const rv = (try recOperatorExpr(b, init_expr, scope)) orelse return false;
+    try bindMainRecord(b, scope, name, is_var, rv.e, rv.si, out);
+    return true;
 }
 
 fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
@@ -9001,6 +8984,14 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
         if (ai >= np) return reject(b, .unsupported_call);
         switch (kinds[ai]) {
             .rec => |want| {
+                if (a == .bin or a == .unary or a == .paren) {
+                    // An operator tree as a record argument (spec/operators.md):
+                    // builds as nested fit-method calls, no temp binding.
+                    const ro = (try recOperatorExpr(b, a, scope)) orelse return reject(b, .unsupported_call);
+                    if (ro.si != want and !enumCompatible(b, ro.si, want)) return reject(b, .unsupported_call);
+                    try args.append(b.a, ro.e);
+                    continue;
+                }
                 const rv = (try buildRecExpr(b, a, scope)) orelse return reject(b, .unsupported_call);
                 if (rv.si != want and !enumCompatible(b, rv.si, want)) return reject(b, .unsupported_call); // a different struct
                 try args.append(b.a, rv.e);
