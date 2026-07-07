@@ -934,10 +934,16 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       (`ModuleResolver.sourceFileFn` → `Linker.sourceFile`; consts keyed by
       `scopedKey`), so `import q64.math.{exp, ln, …}` compiles, links, and
       runs (roundtrip pins e/sin/ln/log2/√2/π⁄4/3π⁄4 on wasm64 + wasm32).
-      Remaining: `Complex<T>` (prerequisite for FFT, quantum-state
-      simulation, DSP) and a seeded splittable RNG surfaced through
-      `env.random` so determinism stays capability-visible.
-      (Analysis §3, item 8.)
+      **Complex LANDED** (f64 pair — `complex`/`cadd`/`csub`/`cmul`/`cdiv`/
+      `conj`/`cabs`/`carg`/`cis`/`cexp`; free functions, operator fits are a
+      later rung; generic `Complex<T>` waits on generic structs) — which
+      opened the second gate: **imported structs**. Struct layouts are now
+      collected per module scope like consts (`registerStructs` scoped,
+      `structByName`, `structOfCalleeRet` resolving a callee's record return
+      in ITS scope), so records cross the qube boundary — roundtrip pins the
+      cmul/cdiv round-trip + cabs/carg/cis on wasm64 + wasm32. Remaining: a
+      seeded splittable RNG surfaced through `env.random` so determinism
+      stays capability-visible. (Analysis §3, item 8.)
 - [ ] **`spec/autodiff.md` — design note.** Source-transform reverse-mode AD
       over HIR: a `@differentiable` marker, `@pure` delimiting differentiable
       regions, arenas as the tape, a `Differentiable` face with laws.

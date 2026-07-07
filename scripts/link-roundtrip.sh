@@ -3389,6 +3389,35 @@ mm32_out="$("$HOST_BIN" "$tmp/mathuse32.wasm")"
 [[ "$mm32_out" == "$mm_expected" ]] || { echo "FAIL: q64.math import wasm32 (got: $mm32_out)" >&2; exit 1; }
 echo "    ok: q64.math import -> e / sin / ln / log2 / sqrt2 / pi:4 / 3pi:4 (wasm64 + wasm32; the stdlib qube is loadable)"
 
+echo "==> stdlib q64.math Complex: a RECORD type crossing the module boundary"
+cx_app="$tmp/cxuse.q"
+cat > "$cx_app" <<'Q64'
+import q64.math.{complex, cmul, cdiv, cabs, carg, cis}
+
+fn main {
+    let a = complex(1.0, 2.0)
+    let b = complex(3.0, 4.0)
+    let p = cmul(a, b)
+    env.out(p.re)
+    env.out(p.im)
+    let q = cdiv(p, b)
+    env.out(q.re)
+    env.out(q.im)
+    env.out(cabs(b))
+    env.out(carg(complex(0.0, 1.0)))
+    let t = cis(3.141592653589793)
+    env.out(t.re)
+}
+Q64
+cx_expected=$'-5.0\n10.0\n1.0\n2.0\n5.0\n1.570796\n-1.0'
+"$Q64_BIN" emit "$cx_app" "$tmp/cxuse.wasm" --module q64.math="$REPO_ROOT/stdlib/math/src/lib.q"
+cx_out="$("$HOST_BIN" "$tmp/cxuse.wasm")"
+[[ "$cx_out" == "$cx_expected" ]] || { echo "FAIL: q64.math Complex (got: $cx_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$cx_app" "$tmp/cxuse32.wasm" --addr wasm32 --module q64.math="$REPO_ROOT/stdlib/math/src/lib.q"
+cx32_out="$("$HOST_BIN" "$tmp/cxuse32.wasm")"
+[[ "$cx32_out" == "$cx_expected" ]] || { echo "FAIL: q64.math Complex wasm32 (got: $cx32_out)" >&2; exit 1; }
+echo "    ok: q64.math Complex -> cmul/cdiv roundtrip + cabs 5 + carg pi:2 + cis(pi).re -1 (wasm64 + wasm32; imported structs)"
+
 echo "==> simd first slice: Simd.splat + lane-wise add/mul + extract (f32x4 + i32x4, native v128 ops)"
 sd_app="$tmp/simd.q"
 cat > "$sd_app" <<'Q64'

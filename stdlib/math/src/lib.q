@@ -199,3 +199,62 @@ pub fn atan2(y: f64, x: f64) -> f64 {
     if y < 0.0 { return 0.0 - HALF_PI }
     0.0
 }
+
+// --- Complex -----------------------------------------------------------------
+
+// A complex number over f64 — the element type FFT, quantum-state
+// simulation, and analytic DSP all need first. v0 surface is free functions
+// (operator fits are a later rung), and the element type is fixed at f64:
+// the spec's `Complex<T>` generalizes this the day generic structs land.
+pub struct Complex {
+    re: f64,
+    im: f64,
+}
+
+pub fn complex(re: f64, im: f64) -> Complex {
+    Complex { re: re, im: im }
+}
+
+pub fn cadd(a: Complex, b: Complex) -> Complex {
+    Complex { re: a.re + b.re, im: a.im + b.im }
+}
+
+pub fn csub(a: Complex, b: Complex) -> Complex {
+    Complex { re: a.re - b.re, im: a.im - b.im }
+}
+
+pub fn cmul(a: Complex, b: Complex) -> Complex {
+    Complex { re: a.re * b.re - a.im * b.im, im: a.re * b.im + a.im * b.re }
+}
+
+pub fn cdiv(a: Complex, b: Complex) -> Complex {
+    let d = b.re * b.re + b.im * b.im
+    Complex { re: (a.re * b.re + a.im * b.im) / d, im: (a.im * b.re - a.re * b.im) / d }
+}
+
+pub fn conj(a: Complex) -> Complex {
+    Complex { re: a.re, im: 0.0 - a.im }
+}
+
+// |a| — the modulus. (A future refinement is the overflow-safe hypot form;
+// audio/DSP magnitudes live far from f64's edges.)
+pub fn cabs(a: Complex) -> f64 {
+    let m = a.re * a.re + a.im * a.im
+    m.sqrt()
+}
+
+// arg(a) — the phase angle, in (−π, π].
+pub fn carg(a: Complex) -> f64 {
+    atan2(a.im, a.re)
+}
+
+// e^{iθ} — the unit-circle constructor (the FFT twiddle factor).
+pub fn cis(theta: f64) -> Complex {
+    Complex { re: cos(theta), im: sin(theta) }
+}
+
+// e^{a} for complex a: e^{re}·(cos im + i·sin im).
+pub fn cexp(a: Complex) -> Complex {
+    let r = exp(a.re)
+    Complex { re: r * cos(a.im), im: r * sin(a.im) }
+}

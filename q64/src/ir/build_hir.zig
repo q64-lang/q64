@@ -325,7 +325,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // Pass 0.5: lay out this file's struct declarations (B2b). Structs with
     // fields outside the v0 floor (i64 / bool) are skipped, not rejected —
     // a *use* of one surfaces the honest Unsupported.
-    try registerStructs(b, sf);
+    try registerStructs(b, sf, 0);
     // Pass 0.55: register this file's all-unit enum declarations (C1) —
     // a variant value is its declaration-order tag. Enums with payload
     // variants are skipped (a *use* surfaces the honest Unsupported).
@@ -420,14 +420,16 @@ fn registerModuleConsts(b: *Builder, sf: ast.SourceFile, scope: u32) BuildError!
     };
 }
 
-/// Collect an imported module's module-level constants the first time a body
-/// is compiled in its scope (the root's are Pass 0.4). Without a
-/// source-file-capable resolver this is a no-op — bodies referencing module
-/// consts then keep the pre-existing honest Unsupported fallback.
+/// Collect an imported module's module-level declarations — scalar constants
+/// (Pass 0.4) and struct layouts (Pass 0.5) — the first time a body is
+/// compiled in its scope (the root's run in `buildModule`). Without a
+/// source-file-capable resolver this is a no-op — imported bodies then keep
+/// the pre-existing honest Unsupported fallback for consts/records.
 fn ensureModuleConsts(b: *Builder, scope: u32) BuildError!void {
     if (b.consts_scopes.contains(scope)) return;
     const sf = b.resolver.sourceFile(scope) orelse return;
     try registerModuleConsts(b, sf, scope);
+    try registerStructs(b, sf, scope);
 }
 
 /// Pass 0.7 — register module-level actor singletons. A top-level
@@ -459,7 +461,7 @@ fn registerSingletons(b: *Builder, sf: ast.SourceFile) BuildError!void {
             const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return error.Unsupported;
             if (!std.mem.eql(u8, cname[dot + 1 ..], "spawn")) return error.Unsupported;
             const ad = b.actor_decls.get(cname[0..dot]) orelse return error.Unsupported;
-            const si = b.structs.get(cname[0..dot]) orelse return error.Unsupported;
+            const si = structByName(b, cname[0..dot]) orelse return error.Unsupported;
             {
                 var a0 = cc.args();
                 if (a0.next() != null) return error.Unsupported; // spawn() takes no args
@@ -4821,7 +4823,7 @@ fn recvStructQuiet(b: *Builder, scope: *const Scope, e: ast.Expr) ?*const Struct
             const pth = re.path() orelse return null;
             const nm = pth.text(b.a) catch return null;
             defer b.a.free(nm);
-            return b.structs.get(nm);
+            return structByName(b, nm);
         },
         else => return null,
     }
@@ -5638,7 +5640,7 @@ fn variantSlots(b: *Builder, v: ast.Variant, sig: ?sema.fits.GenericSig) ?Varian
             }
         }
         // A registered struct: the cell holds the record's base pointer.
-        if (b.structs.get(t1)) |rsi| return .{ .arity = 1, .kind = .rec, .pidx = 0, .rec_si = rsi };
+        if (structByName(b, t1)) |rsi| return .{ .arity = 1, .kind = .rec, .pidx = 0, .rec_si = rsi };
     }
     // N i64 cells; a type-param name in a MULTI-slot payload stays at
     // the i64 floor (`Full(T, T)` — per-slot str instantiation is a
@@ -5683,7 +5685,7 @@ fn instFromGenericArgs(b: *Builder, info: *const EnumInfo, pt: ast.PathType) Bui
             const trimmed = std.mem.trim(u8, part, " \t");
             if (std.mem.eql(u8, trimmed, "str")) {
                 descs[i] = "s";
-            } else if (b.structs.contains(trimmed)) {
+            } else if (structByName(b, trimmed) != null) {
                 descs[i] = try std.fmt.allocPrint(b.a, "r:{s}", .{trimmed});
             }
         }
@@ -5700,7 +5702,7 @@ fn instFromOptionalInner(b: *Builder, info: *const EnumInfo, ot: ast.OptionalTyp
             defer b.a.free(nm);
             if (std.mem.eql(u8, nm, "str")) {
                 descs[0] = "s";
-            } else if (b.structs.contains(nm)) {
+            } else if (structByName(b, nm) != null) {
                 descs[0] = try std.fmt.allocPrint(b.a, "r:{s}", .{nm});
             }
         }
@@ -5729,7 +5731,7 @@ fn instantiateEnum(b: *Builder, info: *const EnumInfo, descs: []const []const u8
             v.arity = 2;
         } else if (d.len > 2 and d[0] == 'r') {
             // "r:Name" — a record slot holding the struct's base ptr.
-            v.rec_si = b.structs.get(d[2..]);
+            v.rec_si = structByName(b, d[2..]);
             if (v.rec_si != null) {
                 v.kind = .rec;
                 v.arity = 1;
@@ -6042,7 +6044,16 @@ fn enumOfRet(b: *Builder, fd: ast.FnDecl) BuildError!?*const EnumInfo {
     return try instFromGenericArgs(b, info, pt);
 }
 
-fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
+/// Look up a struct by name in the CURRENT module scope — each module's
+/// struct declarations are its own, same discipline as module consts. A
+/// record crossing the boundary keeps working because callers hold the
+/// callee module's `*const StructInfo` (layout identity is the pointer).
+fn structByName(b: *Builder, name: []const u8) ?*const StructInfo {
+    const key = scopedKey(b, b.cur_scope, name) catch return null;
+    return b.structs.get(key);
+}
+
+fn registerStructs(b: *Builder, sf: ast.SourceFile, scope: u32) BuildError!void {
     var it = sf.items();
     while (it.next()) |item| switch (item) {
         .struct_decl => |sd| {
@@ -6078,7 +6089,7 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 .size = std.mem.alignForward(u32, off, max_align),
                 .alignment = max_align,
             };
-            try b.structs.put(b.a, nm.text, si);
+            try b.structs.put(b.a, try scopedKey(b, scope, nm.text), si);
         },
         .actor_decl => |ad| {
             // An actor is a struct of its `state` fields, plus its decl kept
@@ -6119,11 +6130,13 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 .size = std.mem.alignForward(u32, off, max_align),
                 .alignment = max_align,
             };
-            try b.structs.put(b.a, nm.text, si);
-            try b.actor_decls.put(b.a, nm.text, ad);
+            try b.structs.put(b.a, try scopedKey(b, scope, nm.text), si);
+            // Actor/graph registries stay root-scope-only in v0 (imported
+            // actors/graphs are a later rung; their structs still lay out).
+            if (scope == 0) try b.actor_decls.put(b.a, nm.text, ad);
         },
         .graph_decl => |gd| {
-            if (gd.name()) |nm| try b.graph_decls.put(b.a, nm.text, gd);
+            if (scope == 0) if (gd.name()) |nm| try b.graph_decls.put(b.a, nm.text, gd);
         },
         else => {},
     };
@@ -6193,7 +6206,7 @@ fn structOfType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?*const StructInf
                 return inst.si;
             }
             if (pt.hasGenericArgs()) return null;
-            return b.structs.get(nm);
+            return structByName(b, nm);
         },
         .optional => |ot| {
             // `T?` ≡ `Option<T>` (errors.md §"Result and Option").
@@ -6259,8 +6272,21 @@ fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
     const cname = try cpath.text(b.a);
     defer b.a.free(cname);
     if (std.mem.indexOfScalar(u8, cname, '.') != null) return null; // host/method calls aren't record-valued
-    const fd = resolveFn(b, cname) orelse return null;
-    return structOfRet(b, fd);
+    return structOfCalleeRet(b, cname);
+}
+
+/// Resolve a callee and its record return type in the callee's OWN module
+/// scope — its struct declarations live there, not in the caller's (same
+/// discipline as bodies compiling in their own scope). Collects that
+/// scope's module declarations first, so a caller-side "is this call
+/// record-valued?" probe sees an imported module's structs.
+fn structOfCalleeRet(b: *Builder, name: []const u8) BuildError!?*const StructInfo {
+    const resolved = b.resolver.lookup(b.cur_scope, name) orelse return null;
+    const saved = b.cur_scope;
+    b.cur_scope = resolved.scope;
+    defer b.cur_scope = saved;
+    try ensureModuleConsts(b, resolved.scope);
+    return structOfRet(b, resolved.fd);
 }
 
 /// Resolve `<binding>.<field>` against the scope's materialized record
@@ -6314,7 +6340,7 @@ fn recFieldExpr(b: *Builder, rf: RecField) BuildError!*hir.Expr {
 fn recordHasNarrow(b: *Builder, re: ast.RecordExpr) BuildError!bool {
     const pname = try (re.path() orelse return false).text(b.a);
     defer b.a.free(pname);
-    const si = b.structs.get(pname) orelse return false;
+    const si = structByName(b, pname) orelse return false;
     for (si.fields) |f| if (narrowRange(f.ty) != null) return true;
     return false;
 }
@@ -6467,7 +6493,7 @@ fn recordLitStruct(b: *Builder, e: ast.Expr) BuildError!?*const StructInfo {
     };
     const pname = try (re.path() orelse return null).text(b.a);
     defer b.a.free(pname);
-    return b.structs.get(pname);
+    return structByName(b, pname);
 }
 
 /// The fit method `<struct>.<name>` from the registry: every fit whose
@@ -7363,7 +7389,7 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
         .record => |re| {
             const pname = try (re.path() orelse return error.Unsupported).text(b.a);
             defer b.a.free(pname);
-            const si = b.structs.get(pname) orelse return error.Unsupported; // a literal of an unregistered struct
+            const si = structByName(b, pname) orelse return error.Unsupported; // a literal of an unregistered struct
             var inits: std.ArrayList(hir.FieldInit) = .empty;
             var seen: usize = 0;
             var iit = re.inits();
@@ -7802,7 +7828,7 @@ fn tryActorSpawn(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: boo
     const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
     if (!std.mem.eql(u8, cname[dot + 1 ..], "spawn")) return false;
     const ad = b.actor_decls.get(cname[0..dot]) orelse return false; // not an actor → not this form
-    const si = b.structs.get(cname[0..dot]) orelse return error.Unsupported;
+    const si = structByName(b, cname[0..dot]) orelse return error.Unsupported;
     {
         var a0 = cc.args();
         if (a0.next() != null) return error.Unsupported; // v0: spawn() takes no args
@@ -7988,7 +8014,7 @@ fn tryChannelNew(b: *Builder, init_expr: ast.Expr, name: []const u8, mutable: bo
             if (et != .i64) try scope.chan_elem.put(b.a, name, et);
         } else if (b.enums.get(tname)) |info| {
             try scope.chan_enum.put(b.a, name, info);
-        } else if (b.structs.get(tname)) |si| {
+        } else if (structByName(b, tname)) |si| {
             try scope.chan_rec.put(b.a, name, si);
         }
     }
