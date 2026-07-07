@@ -904,12 +904,23 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       item in `spec/grammar.md`. Prerequisite to every ergonomic numeric
       library — `Tensor`, units arithmetic, `Complex` all meet here.
       (Analysis §3, Tier 0.)
-- [ ] **`Simd<T, N>` first slice + turn on SIMD128 in the emitted feature
-      set.** The prelude registers the name only (`sema/prelude.zig`) and
-      `codegen/emit.zig` emits no SIMD feature today; Binaryen already
-      supports v128. Start with splat/extract + lane-wise f32x4/i32x4
-      add/mul, verified wasm64 + wasm32 like every other rung. The biggest
-      in-substrate performance lever available. (Analysis §3, item 6.)
+- [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
+      LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
+      `v.add(w)`/`v.mul(w)`, `v.extract(0..3)`; `Simd<f32, 4>`/`Simd<i32, 4>`
+      annotations cross-checked (main + callee lets). Lane shape lives on the
+      TYPE at HIR (`hir.Type.f32x4/.i32x4`) and on the OP at MIR (dedicated
+      `simd_splat`/`simd_extract`/`simd_bin` carrying `ops.LaneShape`) — never
+      inferred from the single `v128` wasm type; the generic bin/un machinery
+      is untouched. Native v128 instructions, `BinaryenFeatureSIMD128` at both
+      feature-mask sites. Honest rejects hardened by an adversarial review
+      pass: bare-SIMD print (direct + interpolation), SIMD in comparisons/
+      conditions, shape mixing, unsupported/mismatched annotations (incl.
+      `Simd<f64, 2>`), non-literal lanes; plus a fmt fix (generic-args commas
+      no longer grow a trailing comma). Verified wasm64 + wasm32 (roundtrip
+      `3.0/49/4.5`), 623 unit tests, conformance 51/51. **Boundary
+      (follow-ons):** main/callee value positions only — no SIMD params/
+      returns/fields/Vec elements, no lane replace, no loads/stores, no
+      shapes beyond f32x4/i32x4, no `let w = v` copies.
 - [ ] **Static-shape `Tensor` first slice** (behind const generics, §B5):
       `Tensor<T, [A, B]>` as a monomorphized struct over `Simd` kernels;
       milestone = `matmul<T, const A, B, C>` with shape mismatch as a
