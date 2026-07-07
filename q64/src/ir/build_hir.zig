@@ -10693,6 +10693,14 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             // The `env.time` faces — each nullary, each a plain i64 (no
             // Result box, spec/env.md §`env.time` face-mapping rows). Any
             // argument is a malformed call.
+            // env.random.u64() — one i64 of host randomness (`@random`).
+            // Zero args; the host decides entropy vs a seeded stream.
+            if (std.mem.eql(u8, cname, "env.random.u64")) {
+                var rit = cc.args();
+                if (rit.next() != null) return reject(b, .unsupported_call);
+                out.* = .random_u64;
+                return out;
+            }
             if (std.mem.startsWith(u8, cname, "env.time.")) {
                 const method = cname["env.time.".len..];
                 const node: ?hir.Expr = if (std.mem.eql(u8, method, "monotonic_ns"))

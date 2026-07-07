@@ -266,6 +266,7 @@ fn collectExpr(
             try collectExpr(a, cf.key, d, e);
         },
         .time_monotonic_ns, .time_resolution_ns, .time_unix_ns => d.insert(.time),
+        .random_u64 => d.insert(.random),
         .chan_recv => |h| {
             d.insert(.wire); // a remote channel receive crosses the wire
             try collectExpr(a, h, d, e);

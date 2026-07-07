@@ -977,6 +977,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // which writes its u64 timestamp through a pointer — reserve an 8-aligned
     // cell for it just past the iovec block.
     const preview1_time = (stdout_abi == .wasi_preview1) and usesEnvTime(m);
+    // Randomness rides the same reserved 8-byte cell: preview1 random_get
+    // writes bytes through a pointer, loaded back as one i64.
+    const preview1_rand = (stdout_abi == .wasi_preview1) and usesEnvRandom(m);
     const preview1_sleep = (stdout_abi == .wasi_preview1) and usesEnvTimeSleep(m);
     const iovec_base: u32 = @intCast(m.data.len);
     const p1_ts_base: u32 = (iovec_base + 16 + 7) & ~@as(u32, 7);
@@ -984,7 +987,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // (+ the 8-byte timestamp cell when the clock is read; a sleep grows the
     // cell to poll_oneoff's buffers — subscription 48 + event 32 + nevents 8
     // at the same 8-aligned base, since no two clock ops are ever in flight).
-    const iovec_scratch: usize = if (preview1_sleep) (p1_ts_base + 88 - iovec_base) else if (preview1_time) (p1_ts_base + 8 - iovec_base) else if (preview1) 16 else 0;
+    const iovec_scratch: usize = if (preview1_sleep) (p1_ts_base + 88 - iovec_base) else if (preview1_time or preview1_rand) (p1_ts_base + 8 - iovec_base) else if (preview1) 16 else 0;
 
     // env.kv → wasi:keyvalue component lowering. The core imports the canonical
     // `cm32p2|…` ABI; the host writes each call's `result<…>` into a fixed
@@ -1338,6 +1341,16 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const get_params = c.BinaryenTypeCreate(&gp, gp.len);
         c.BinaryenAddFunctionImport(module, "config_store_get", cfg_mod, "get", get_params, none_type);
     }
+    if (preview1_rand) {
+        // random_get(buf: i32, buf_len: i32) -> errno — the adapter lifts it
+        // to `wasi:random/random`; 8 bytes through the reserved cell.
+        var rgp = [_]c.BinaryenType{ i32_type, i32_type };
+        const rg_params = c.BinaryenTypeCreate(&rgp, rgp.len);
+        c.BinaryenAddFunctionImport(module, "random_get", "wasi_snapshot_preview1", "random_get", rg_params, i32_type);
+    } else if (usesEnvRandom(m)) {
+        // Local ABI: one raw face, a bare i64 (spec/env.md `env.random`).
+        c.BinaryenAddFunctionImport(module, "env_random_u64", "env", "random_u64", none_type, i64_type);
+    }
     if (preview1_time) {
         // Preview1 app ABI. The adapter lifts these to `wasi:clocks/*`:
         //   clock_time_get(clockid: i32, precision: i64, ts_ptr: i32) -> errno
@@ -1588,6 +1601,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .config_component = wants_config,
             .time_component = wants_time,
             .time_preview1 = preview1_time,
+            .rand_preview1 = preview1_rand,
             .p1_ts_base = p1_ts_base,
             .time_ret = time_ret,
             .kv_open_ret = kv_open_ret,
@@ -1867,7 +1881,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .db_query_value => |db| bodyHasOut(db.sql, want_int),
         .db_query_text => |db| bodyHasOut(db.sql, want_int),
         .config_get => |cf| bodyHasOut(cf.key, want_int),
-        .time_monotonic_ns, .time_resolution_ns, .time_unix_ns => false,
+        .time_monotonic_ns, .time_resolution_ns, .time_unix_ns, .random_u64 => false,
         .time_sleep_ns => |ts| bodyHasOut(ts.ns, want_int),
         .chan_recv => |h| bodyHasOut(h, want_int),
         .chan_take => |h| bodyHasOut(h, want_int),
@@ -2054,6 +2068,20 @@ fn usesEnvConfig(m: *const ir.mir.Module) bool {
 /// (store) path + the preview1 timestamp cell.
 fn usesEnvTime(m: *const ir.mir.Module) bool {
     return usesEnvTimeMono(m) or usesEnvTimeWall(m);
+}
+
+/// True if any function reaches `env.random.u64` — gates the preview1
+/// `random_get` import and its 8-byte result cell.
+fn usesEnvRandom(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        var sc = Scratch{};
+        switch (f.body) {
+            .structured => |inst| scanScratch(inst, &sc),
+            .cfg => {},
+        }
+        if (sc.has_random) return true;
+    }
+    return false;
 }
 
 /// True if any function reaches the MONOTONIC clock (`monotonic_ns` /
@@ -2603,6 +2631,7 @@ const Scratch = struct {
     /// canonical `wasi:clocks` one in component mode, the raw `env.monotonic_ns`
     /// face locally). Scalar-only: needs neither the pair scratch nor the arena.
     has_time: bool = false,
+    has_random: bool = false,
     /// Contains an `env.time.resolution_ns` → declare monotonic-clock.resolution
     /// (component) / clock_res_get (preview1) / env.resolution_ns (local).
     has_time_res: bool = false,
@@ -2657,6 +2686,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_db_query_text = s.has_db_query_text or sub.has_db_query_text;
     s.has_config_get = s.has_config_get or sub.has_config_get;
     s.has_time = s.has_time or sub.has_time;
+    s.has_random = s.has_random or sub.has_random;
     s.has_time_res = s.has_time_res or sub.has_time_res;
     s.has_time_wall = s.has_time_wall or sub.has_time_wall;
     s.has_time_sleep = s.has_time_sleep or sub.has_time_sleep;
@@ -2898,6 +2928,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(cf.key, s);
         },
         .time_monotonic_ns => s.has_time = true,
+        .random_u64 => s.has_random = true,
         .time_resolution_ns => s.has_time_res = true,
         .time_unix_ns => s.has_time_wall = true,
         .time_sleep_ns => |ts| {
@@ -3114,6 +3145,7 @@ const Lowerer = struct {
     /// the preview1 syscalls `clock_time_get` / `clock_res_get`, their u64
     /// written into the reserved cell at `p1_ts_base` and loaded back.
     time_preview1: bool = false,
+    rand_preview1: bool = false,
     p1_ts_base: u32 = 0,
     /// component-mode wall clock: `clocks_wall_now(time_ret)` writes the
     /// `datetime {u64 seconds @0, u32 nanoseconds @8}` record here; the
@@ -3535,6 +3567,28 @@ const Lowerer = struct {
                 // wasi:config/store.get is a top-level function — no handle,
                 // no lazy-open; reuse the get-decode with null handle/open.
                 return try self.storeComponentGet(cf.key, "config_store_get", null, null);
+            },
+            .random_u64 => {
+                // env.random.u64() — preview1 apps call random_get(cell, 8)
+                // and load the i64 back; local mode calls the raw face. The
+                // host owns the entropy-vs-seeded policy.
+                if (self.rand_preview1) {
+                    const i32c = struct {
+                        fn f(mod: c.BinaryenModuleRef, v: i32) c.BinaryenExpressionRef {
+                            return c.BinaryenConst(mod, c.BinaryenLiteralInt32(v));
+                        }
+                    }.f;
+                    var call_args = [_]c.BinaryenExpressionRef{
+                        i32c(module, @intCast(self.p1_ts_base)),
+                        i32c(module, 8),
+                    };
+                    var seq = [_]c.BinaryenExpressionRef{
+                        c.BinaryenDrop(module, c.BinaryenCall(module, "random_get", @ptrCast(&call_args), call_args.len, self.i32_type)),
+                        c.BinaryenLoad(module, 8, false, 0, 0, self.i64_type, i32c(module, @intCast(self.p1_ts_base)), "0"),
+                    };
+                    return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.i64_type);
+                }
+                return c.BinaryenCall(module, "env_random_u64", null, 0, self.i64_type);
             },
             .time_monotonic_ns => {
                 // env.time.monotonic_ns() — three lowerings, one face:

@@ -311,6 +311,8 @@ pub const Op = union(enum) {
     /// `wasi:clocks/monotonic-clock.now` (no handle, no args), a bare i64 —
     /// the scalar-only face, no Result box and no return area.
     time_monotonic_ns,
+    /// One i64 of host randomness — bare-scalar, like the clock reads.
+    random_u64,
     /// `env.time.resolution_ns()`: `wasi:clocks/monotonic-clock.resolution`,
     /// the same bare-scalar shape as `time_monotonic_ns`.
     time_resolution_ns,

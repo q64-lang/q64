@@ -255,6 +255,7 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try app(gpa, out, ")", .{});
         },
         .time_monotonic_ns => try app(gpa, out, "time_monotonic_ns()", .{}),
+        .random_u64 => try app(gpa, out, "random_u64()", .{}),
         .time_resolution_ns => try app(gpa, out, "time_resolution_ns()", .{}),
         .time_unix_ns => try app(gpa, out, "time_unix_ns()", .{}),
         .chan_recv => |h| {
@@ -560,6 +561,7 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try mirInst(gpa, out, cf.key, depth + 1);
         },
         .time_monotonic_ns => try app(gpa, out, "time_monotonic_ns\n", .{}),
+        .random_u64 => try app(gpa, out, "random_u64\n", .{}),
         .time_resolution_ns => try app(gpa, out, "time_resolution_ns\n", .{}),
         .time_unix_ns => try app(gpa, out, "time_unix_ns\n", .{}),
         .chan_recv => |h| {

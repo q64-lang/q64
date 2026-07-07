@@ -422,6 +422,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .db_query_text => |db| return mk(ctx.a, .ptr, .{ .db_query_text = .{ .sql = try lowerStrExpr(ctx, db.sql) } }),
         .config_get => |cf| return mk(ctx.a, .ptr, .{ .config_get = .{ .key = try lowerStrExpr(ctx, cf.key) } }),
         .time_monotonic_ns => return mk(ctx.a, .i64, .{ .time_monotonic_ns = {} }),
+        .random_u64 => return mk(ctx.a, .i64, .{ .random_u64 = {} }),
         .time_resolution_ns => return mk(ctx.a, .i64, .{ .time_resolution_ns = {} }),
         .time_unix_ns => return mk(ctx.a, .i64, .{ .time_unix_ns = {} }),
         .chan_recv => |h| return mk(ctx.a, .i64, .{ .chan_recv = try lowerExpr(ctx, h) }),

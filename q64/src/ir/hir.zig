@@ -539,6 +539,10 @@ pub const Expr = union(enum) {
     /// the boundary in registers alone (which is why it is `@realtime`-safe,
     /// spec/env.md §"realtime"). Marks the fn `@time`.
     time_monotonic_ns,
+    /// `env.random.u64()` — one i64 of host randomness (`@random`). The
+    /// host decides real entropy vs a seeded stream — determinism is a
+    /// host policy the capability makes visible, never a language rule.
+    random_u64,
     /// `env.time.resolution_ns()` — the monotonic clock's tick size in
     /// nanoseconds, i64 (`wasi:clocks/monotonic-clock.resolution`). Same
     /// bare-scalar shape as `monotonic_ns`. Marks the fn `@time`.

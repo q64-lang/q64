@@ -314,6 +314,37 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // env.random_u64 :: () -> i64 — one word of host randomness
+    // (spec/env.md `env.random`, `@random`). The HOST owns the policy:
+    // Q64_SEED=<n> makes the stream a deterministic SplitMix64 sequence
+    // (reproducible runs, capability-visible determinism); unset, the
+    // stream seeds from OS entropy once per run.
+    {
+        var rnd_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new_empty(&rnd_params_vec);
+        var rnd_result_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var rnd_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&rnd_results_vec, rnd_result_types.len, @ptrCast(&rnd_result_types));
+        const rnd_type = c.wasm_functype_new(&rnd_params_vec, &rnd_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(rnd_type);
+        const link_err = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "random_u64",
+            "random_u64".len,
+            rnd_type,
+            envRandomU64Callback,
+            null,
+            null,
+        );
+        if (link_err) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.random_u64");
+            std.process.exit(1);
+        }
+    }
+
     // -------------------------------------------------------------
     // env.exit :: (code: i64) -> () (spec/env.md §`env.exit`,
     // `wasi:cli/exit`). The host terminates the process with the low byte of
@@ -591,6 +622,45 @@ pub fn main(init: std.process.Init) !void {
 // Called from C, so we can't accept an `Io` parameter. Reach for the
 // process-wide single-threaded Io. Fine for v0 since the host is
 // strictly single-threaded; revisit when we add concurrency.
+
+// SplitMix64 state for `env.random_u64`. Seeded once per run: from
+// Q64_SEED when set (deterministic, reproducible runs), else from the wall
+// clock + ASLR. The local face is NOT crypto-grade — spec/env.md's secure
+// randomness is the preview1/component `wasi:random` route, which wasmtime
+// itself provides; this face exists for the local `qube run` ABI.
+extern "c" fn time(tloc: ?*i64) i64;
+var g_rng_state: u64 = 0;
+var g_rng_seeded: bool = false;
+
+fn envRandomU64Callback(
+    env_: ?*anyopaque,
+    caller: ?*c.wasmtime_caller_t,
+    args: [*c]const c.wasmtime_val_t,
+    nargs: usize,
+    results: [*c]c.wasmtime_val_t,
+    nresults: usize,
+) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = caller;
+    _ = args;
+    if (nargs != 0 or nresults != 1) return trap("env.random_u64: expected () -> i64");
+    if (!g_rng_seeded) {
+        g_rng_seeded = true;
+        if (std.c.getenv("Q64_SEED")) |sv| {
+            g_rng_state = std.fmt.parseInt(u64, std.mem.span(sv), 10) catch 0;
+        } else {
+            g_rng_state = @as(u64, @bitCast(time(null))) ^ (@intFromPtr(&g_rng_seeded) *% 0x9E3779B97F4A7C15);
+        }
+    }
+    g_rng_state +%= 0x9E3779B97F4A7C15;
+    var z = g_rng_state;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    z ^= z >> 31;
+    results[0].kind = c.WASMTIME_I64;
+    results[0].of.i64 = @bitCast(z);
+    return null;
+}
 
 fn envKvIncrementCallback(
     env_: ?*anyopaque,

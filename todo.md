@@ -966,19 +966,16 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       collected per module scope like consts (`registerStructs` scoped,
       `structByName`, `structOfCalleeRet` resolving a callee's record return
       in ITS scope), so records cross the qube boundary — roundtrip pins the
-      cmul/cdiv round-trip + cabs/carg/cis on wasm64 + wasm32. Remaining: the
-      seeded RNG through `env.random`. **Recon recorded:** spec surface is
-      `env.random` / `Rng` / `@random` → `wasi:random/random` (env.md rows
-      153/393/867/951; v0 method `u64()` before `fill_bytes` — buffers).
-      Mirror the `env.time.` recognizer at build_hir ~10699 (+ hir/mir/
-      lower/effects `@random` insert + print arms). Lowering: ride preview1
-      `random_get(buf, 8)` + i64 load like `monotonic_ns` rides
-      `clock_time_get` (emit ~975/1344; the local `env.random_u64` import
-      form only for the local-ABI mode) — NOT a bare env import (the
-      wasmtime host provides preview1 natively, zero host code).
-      Determinism is HOST policy: a host `--seed`/`Q64_SEED` (SplitMix64)
-      makes runs reproducible without language changes — that's the
-      capability-visible determinism story. (Analysis §3, item 8.)
+      cmul/cdiv round-trip + cabs/carg/cis on wasm64 + wasm32. **RNG LANDED — the math
+      item is COMPLETE.** `env.random.u64()` — the `@random` capability
+      face, inferred into the qube's capability set. Two lowerings:
+      preview1 apps ride `random_get(cell, 8)` + i64 load (wasmtime
+      provides it natively — the crypto-grade route); the local `qube run`
+      ABI calls the host's `env.random_u64` face, where **determinism is
+      host policy**: `Q64_SEED=<n>` makes the stream a reproducible
+      SplitMix64 sequence (verified: identical output across runs), unset
+      seeds from wall clock + ASLR (documented non-crypto). Verified
+      wasm64 + wasm32. (Analysis §3, item 8.)
 - [ ] **`spec/autodiff.md` — design note.** Source-transform reverse-mode AD
       over HIR: a `@differentiable` marker, `@pure` delimiting differentiable
       regions, arenas as the tape, a `Differentiable` face with laws.
