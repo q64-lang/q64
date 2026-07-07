@@ -925,9 +925,10 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       nested fit-call expressions (`recOperatorExpr`, no temps, no
       statement sink needed), routed through `buildCallArgs`'s `.rec` arm —
       `cabs(a + b)`, `cmul(a + b, a - b)` verified on imported Complex,
-      wasm64 + wasm32. **Boundaries (follow-ons):** statement position
-      (an operator expr as a bare statement — pointless but should reject
-      cleanly), TYP360/361 from `q64 check`. (Analysis §3, Tier 0.)
+      wasm64 + wasm32. **Statement position verified** —
+      a bare `a + a` statement already rejects honestly (UnsupportedExpression),
+      no change needed. **Remaining:** TYP360/361 from `q64 check`.
+      (Analysis §3, Tier 0.)
 - [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
       LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
       `v.add(w)`/`v.mul(w)`, `v.extract(0..3)`; `Simd<f32, 4>`/`Simd<i32, 4>`
@@ -965,9 +966,19 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       collected per module scope like consts (`registerStructs` scoped,
       `structByName`, `structOfCalleeRet` resolving a callee's record return
       in ITS scope), so records cross the qube boundary — roundtrip pins the
-      cmul/cdiv round-trip + cabs/carg/cis on wasm64 + wasm32. Remaining: a
-      seeded splittable RNG surfaced through `env.random` so determinism
-      stays capability-visible. (Analysis §3, item 8.)
+      cmul/cdiv round-trip + cabs/carg/cis on wasm64 + wasm32. Remaining: the
+      seeded RNG through `env.random`. **Recon recorded:** spec surface is
+      `env.random` / `Rng` / `@random` → `wasi:random/random` (env.md rows
+      153/393/867/951; v0 method `u64()` before `fill_bytes` — buffers).
+      Mirror the `env.time.` recognizer at build_hir ~10699 (+ hir/mir/
+      lower/effects `@random` insert + print arms). Lowering: ride preview1
+      `random_get(buf, 8)` + i64 load like `monotonic_ns` rides
+      `clock_time_get` (emit ~975/1344; the local `env.random_u64` import
+      form only for the local-ABI mode) — NOT a bare env import (the
+      wasmtime host provides preview1 natively, zero host code).
+      Determinism is HOST policy: a host `--seed`/`Q64_SEED` (SplitMix64)
+      makes runs reproducible without language changes — that's the
+      capability-visible determinism story. (Analysis §3, item 8.)
 - [ ] **`spec/autodiff.md` — design note.** Source-transform reverse-mode AD
       over HIR: a `@differentiable` marker, `@pure` delimiting differentiable
       regions, arenas as the tape, a `Differentiable` face with laws.
