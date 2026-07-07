@@ -990,12 +990,13 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       aliases not new dimensions, composite literals spelled by arithmetic
       (no lexical composite suffixes). Sequenced to land WITH the units
       evaluation rung, not before. (Analysis §3, item 17.)
-- [ ] **`@deterministic` build profile + arena `snapshot()`/`restore()` —
-      design note.** All nondeterminism already enters through capabilities
-      (`env.time`, `env.random`), so a seeded/virtualized profile gives
-      record-replay simulation as a compiler property; arena snapshot is the
-      rollback primitive under twins/world-model "what-if" queries.
-      (Analysis §4.)
+- [x] **`@deterministic` profile — design note WRITTEN**
+      (`docs/deterministic-profile.md`), and its first piece SHIPPED
+      (`Q64_SEED` on the wasmtime host). The note pins: determinism as
+      host policy over the capability boundary the effect pass already
+      proves (seeded random ✓, virtual clock, record/replay per capability
+      with trap-on-divergence), and arena snapshot/rollback as a bounded
+      memcpy (sequenced after named regions). (Analysis §4.)
 - [ ] **WGSL compute-kernel emission — design note.** Generalize the gfx
       "shaders written in q64 → WGSL" plan to compute: a `@gpu`/`@kernel`
       marked fn compiled from MIR (structured form maps cleanly onto WGSL).
