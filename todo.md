@@ -909,10 +909,15 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       (`tryRecOperator` → `registerFitMethod`), with fit methods extended to
       **record parameters and record returns** (previously scalar-only).
       Roundtrip: Vec2 Add/Mul fits → (4,6)/(3,8)/(7,14) on wasm64 + wasm32;
-      no-fit and mixed-struct operands reject honestly. **Boundaries
-      (follow-ons):** `%`, unary `-` → `neg`, operators in
-      nested/argument/statement positions, fits on imported types (fitreg is
-      root-scope-only), TYP360/361 from `q64 check`. (Analysis §3, Tier 0.)
+      no-fit and mixed-struct operands reject honestly. **Fits on imported
+      types LANDED next rung:** the fit registry is per-scope (a fit lives
+      with its type's module; `StructInfo.scope` picks the registry, and
+      `registerFitMethod` compiles the method body in the struct's own
+      scope), `q64.math` declares Add/Sub/Mul/Div fits on Complex, and the
+      roundtrip pins `a + b` / `a * b` / `p / b` / `|p*p|` = 125 on the
+      IMPORTED type, wasm64 + wasm32. **Boundaries (follow-ons):** `%`,
+      unary `-` → `neg`, operators in nested/argument/statement positions,
+      TYP360/361 from `q64 check`. (Analysis §3, Tier 0.)
 - [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
       LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
       `v.add(w)`/`v.mul(w)`, `v.extract(0..3)`; `Simd<f32, 4>`/`Simd<i32, 4>`

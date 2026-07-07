@@ -3418,6 +3418,36 @@ cx32_out="$("$HOST_BIN" "$tmp/cxuse32.wasm")"
 [[ "$cx32_out" == "$cx_expected" ]] || { echo "FAIL: q64.math Complex wasm32 (got: $cx32_out)" >&2; exit 1; }
 echo "    ok: q64.math Complex -> cmul/cdiv roundtrip + cabs 5 + carg pi:2 + cis(pi).re -1 (wasm64 + wasm32; imported structs)"
 
+echo "==> operator fits on an IMPORTED type: a + b / a * b / p / b on q64.math Complex"
+co_app="$tmp/cxops.q"
+cat > "$co_app" <<'Q64'
+import q64.math.{complex, cabs}
+
+fn main {
+    let a = complex(1.0, 2.0)
+    let b = complex(3.0, 4.0)
+    let s = a + b
+    env.out(s.re)
+    env.out(s.im)
+    let p = a * b
+    env.out(p.re)
+    env.out(p.im)
+    let q = p / b
+    env.out(q.re)
+    env.out(q.im)
+    let m = p * p
+    env.out(cabs(m))
+}
+Q64
+co_expected=$'4.0\n6.0\n-5.0\n10.0\n1.0\n2.0\n125.0'
+"$Q64_BIN" emit "$co_app" "$tmp/cxops.wasm" --module q64.math="$REPO_ROOT/stdlib/math/src/lib.q"
+co_out="$("$HOST_BIN" "$tmp/cxops.wasm")"
+[[ "$co_out" == "$co_expected" ]] || { echo "FAIL: Complex operator fits (got: $co_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$co_app" "$tmp/cxops32.wasm" --addr wasm32 --module q64.math="$REPO_ROOT/stdlib/math/src/lib.q"
+co32_out="$("$HOST_BIN" "$tmp/cxops32.wasm")"
+[[ "$co32_out" == "$co_expected" ]] || { echo "FAIL: Complex operator fits wasm32 (got: $co32_out)" >&2; exit 1; }
+echo "    ok: Complex operator fits -> (4,6) / (-5,10) / div roundtrip (1,2) / |p*p| 125 (wasm64 + wasm32; per-scope fit registry)"
+
 echo "==> operator fits: a + b / a * b on records dispatch through Add/Mul fits (spec/operators.md)"
 op_app="$tmp/ops.q"
 cat > "$op_app" <<'Q64'

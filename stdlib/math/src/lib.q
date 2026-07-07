@@ -215,6 +215,34 @@ pub fn complex(re: f64, im: f64) -> Complex {
     Complex { re: re, im: im }
 }
 
+// Operator fits (spec/operators.md): `a + b`, `a - b`, `a * b`, `a / b`
+// on Complex values dispatch here. The free functions below remain the
+// pipe-friendly surface; both spell the same arithmetic.
+pub fit Complex : Add {
+    fn add(self, rhs: Complex) -> Complex {
+        Complex { re: self.re + rhs.re, im: self.im + rhs.im }
+    }
+}
+
+pub fit Complex : Sub {
+    fn sub(self, rhs: Complex) -> Complex {
+        Complex { re: self.re - rhs.re, im: self.im - rhs.im }
+    }
+}
+
+pub fit Complex : Mul {
+    fn mul(self, rhs: Complex) -> Complex {
+        Complex { re: self.re * rhs.re - self.im * rhs.im, im: self.re * rhs.im + self.im * rhs.re }
+    }
+}
+
+pub fit Complex : Div {
+    fn div(self, rhs: Complex) -> Complex {
+        let d = rhs.re * rhs.re + rhs.im * rhs.im
+        Complex { re: (self.re * rhs.re + self.im * rhs.im) / d, im: (self.im * rhs.re - self.re * rhs.im) / d }
+    }
+}
+
 pub fn cadd(a: Complex, b: Complex) -> Complex {
     Complex { re: a.re + b.re, im: a.im + b.im }
 }

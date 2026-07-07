@@ -56,6 +56,10 @@ const StructInfo = struct {
     fields: []const StructField,
     size: u32,
     alignment: u32,
+    /// The module scope that declared this struct (0 = root, incl. the
+    /// synthesized tuple layouts). Fit dispatch consults the registry of
+    /// the struct's OWN scope — a fit lives with its type.
+    scope: u32 = 0,
 
     fn field(self: *const StructInfo, name: []const u8) ?StructField {
         for (self.fields) |f| if (std.mem.eql(u8, f.name, name)) return f;
@@ -188,7 +192,12 @@ const Builder = struct {
     /// The fit registry (sema/fits.zig) over this file — B4 static
     /// dispatch resolves `p.area()` through it. Arena-backed (never
     /// deinit'd separately).
-    fitreg: ?sema.fits.Registry = null,
+    /// Per-scope fit registries — a fit lives with its module, so a
+    /// method on an imported struct dispatches through the registry of
+    /// the struct's OWN scope (coherence: fits are declared where the
+    /// type or the face is local). Scope 0 built in `buildModule`;
+    /// imported scopes lazily in `ensureModuleConsts`.
+    fitregs: std.AutoHashMapUnmanaged(u32, sema.fits.Registry) = .empty,
     /// FuncId → its record params/return, for functions with a record surface.
     fn_recs: std.AutoHashMapUnmanaged(hir.FuncId, FnRec) = .empty,
     /// Which of a function's parameters are `Vec<…>` (passed as a `.ptr`,
@@ -332,7 +341,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     try registerEnums(b, sf);
     // Pass 0.6: the fit registry (B4) — `p.area()` dispatches through it.
     // Its form diagnostics (TYP201/202) belong to `q64 check`, not emit.
-    b.fitreg = try sema.fits.build(b.a, sf);
+    try b.fitregs.put(b.a, 0, try sema.fits.build(b.a, sf));
     // Pass 0.7: module-level actor singletons (`let twin = Counter.spawn()`).
     // Each reserves a global for its heap self-pointer and contributes one
     // allocation to the module-init function; `twin.tell/ask` resolve against it.
@@ -430,6 +439,7 @@ fn ensureModuleConsts(b: *Builder, scope: u32) BuildError!void {
     const sf = b.resolver.sourceFile(scope) orelse return;
     try registerModuleConsts(b, sf, scope);
     try registerStructs(b, sf, scope);
+    try b.fitregs.put(b.a, scope, try sema.fits.build(b.a, sf));
 }
 
 /// Pass 0.7 — register module-level actor singletons. A top-level
@@ -5348,7 +5358,7 @@ fn isStrCall(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
         const me = arg.method;
         const mname = (me.method() orelse return false).text;
         const si = (try recvStruct(b, scope, me.receiver() orelse return false)) orelse return false;
-        const m = findFitMethod(b, si.name, mname) orelse return false;
+        const m = findFitMethod(b, si, mname) orelse return false;
         const rt = m.returnType() orelse return false;
         const rs = (try semaScalar(b, rt.type_())) orelse return false;
         return rs == .str;
@@ -5368,7 +5378,7 @@ fn isStrCall(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
         const mname = cname[dot + 1 ..];
         if (std.mem.indexOfScalar(u8, mname, '.') != null) return false;
         const si = scope.recs.get(cname[0..dot]) orelse return false;
-        const m = findFitMethod(b, si.name, mname) orelse return false;
+        const m = findFitMethod(b, si, mname) orelse return false;
         const rt = m.returnType() orelse return false;
         const rs = (try semaScalar(b, rt.type_())) orelse return false;
         return rs == .str;
@@ -6091,6 +6101,7 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile, scope: u32) BuildError!void 
                 .fields = try fields.toOwnedSlice(b.a),
                 .size = std.mem.alignForward(u32, off, max_align),
                 .alignment = max_align,
+                .scope = scope,
             };
             try b.structs.put(b.a, try scopedKey(b, scope, nm.text), si);
         },
@@ -6132,6 +6143,7 @@ fn registerStructs(b: *Builder, sf: ast.SourceFile, scope: u32) BuildError!void 
                 .fields = try fields.toOwnedSlice(b.a),
                 .size = std.mem.alignForward(u32, off, max_align),
                 .alignment = max_align,
+                .scope = scope,
             };
             try b.structs.put(b.a, try scopedKey(b, scope, nm.text), si);
             // Actor/graph registries stay root-scope-only in v0 (imported
@@ -6549,12 +6561,11 @@ fn recordLitStruct(b: *Builder, e: ast.Expr) BuildError!?*const StructInfo {
 /// target is the struct (any face) is searched for a method signature
 /// with the name. v0 dispatch keys on (concrete type, method name) —
 /// unambiguous until two fits collide, which is a later TYP check.
-fn findFitMethod(b: *Builder, struct_name: []const u8, mname: []const u8) ?ast.MethodSig {
-    if (b.fitreg == null) return null;
-    const reg = &b.fitreg.?;
+fn findFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) ?ast.MethodSig {
+    const reg = b.fitregs.getPtr(si.scope) orelse return null;
     for (reg.fits.items) |f| {
         const t = f.target orelse continue;
-        if (!std.mem.eql(u8, t, struct_name)) continue;
+        if (!std.mem.eql(u8, t, si.name)) continue;
         var ms = f.decl.methods();
         while (ms.next()) |m| {
             const nm = m.name() orelse continue;
@@ -6571,9 +6582,21 @@ fn findFitMethod(b: *Builder, struct_name: []const u8, mname: []const u8) ?ast.M
 /// remaining params and the return stay on the scalar floor (i64/bool).
 /// Null when no fit for the struct declares the method.
 fn registerFitMethod(b: *Builder, si: *const StructInfo, mname: []const u8) BuildError!?hir.FuncId {
-    const key = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ si.name, mname });
+    // Keyed by the struct's scope: `Complex.mul` in two modules are two
+    // functions. The body also COMPILES in the struct's scope, so struct
+    // literals and helpers inside the method resolve in its own module.
+    const base = try std.fmt.allocPrint(b.a, "{s}.{s}", .{ si.name, mname });
+    const key = try scopedKey(b, si.scope, base);
     if (b.ids.get(key)) |id| return id;
-    const m = findFitMethod(b, si.name, mname) orelse return null;
+    const saved_scope = b.cur_scope;
+    b.cur_scope = si.scope;
+    b.eval.scope = si.scope;
+    defer {
+        b.cur_scope = saved_scope;
+        b.eval.scope = saved_scope;
+    }
+    try ensureModuleConsts(b, si.scope);
+    const m = findFitMethod(b, si, mname) orelse return null;
     const body_blk = m.body() orelse return error.Unsupported; // a bodyless sig can't be called
     const rt = m.returnType() orelse return error.Unsupported;
     // A record-valued method (`fn add(self, rhs: Complex) -> Complex`) —
@@ -7190,7 +7213,8 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
             .rec => |r| r,
             .scalar => return reject(b, .unsupported_call),
         };
-        if (b.fitreg == null or b.fitreg.?.find(si.name, face) == null)
+        const sreg = b.fitregs.getPtr(si.scope) orelse return reject(b, .unsupported_call);
+        if (sreg.find(si.name, face) == null)
             return reject(b, .unsupported_call);
     }
 
@@ -9593,7 +9617,7 @@ const ExprTypeBridge = struct {
                 if (head.ty == .str) return sema.exprtype.strMethodType(mname);
             }
             const si = self.scope.recs.get(name[0..dot]) orelse return null;
-            const m = findFitMethod(self.b, si.name, mname) orelse return null;
+            const m = findFitMethod(self.b, si, mname) orelse return null;
             const rt = m.returnType() orelse return null;
             const rs = (try semaScalar(self.b, rt.type_())) orelse return null;
             return switch (rs) {
