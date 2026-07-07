@@ -93,7 +93,13 @@ pub const Registry = struct {
 pub const max_generic_params = 4;
 
 /// One type parameter: `T` / `T: Face`.
-pub const GenericParam = struct { tname: []const u8, bound: ?[]const u8 };
+pub const GenericParam = struct {
+    tname: []const u8,
+    bound: ?[]const u8,
+    /// A `const N: i64` value parameter — inferred from compile-time
+    /// counts (an array argument's length), stamped per value.
+    is_const: bool = false,
+};
 
 /// The parsed `<T: Display, U>` span (the B5 floor: plain type params
 /// with optional single-face bounds; effect params, defaults, and
@@ -122,8 +128,16 @@ pub fn parseGenericSig(gp: *const cst.Node) ?GenericSig {
     var out = GenericSig{ .params = undefined, .n = 0 };
     var i: usize = 1;
     while (i < n - 1) {
-        if (toks[i].kind != .IDENT or out.n == max_generic_params) return null;
-        var p = GenericParam{ .tname = toks[i].text, .bound = null };
+        if (out.n == max_generic_params) return null;
+        // `const N: i64` — a const generic parameter (spec/generics.md).
+        var is_const = false;
+        if (toks[i].kind == .KW_CONST) {
+            is_const = true;
+            i += 1;
+            if (i >= n - 1) return null;
+        }
+        if (toks[i].kind != .IDENT) return null;
+        var p = GenericParam{ .tname = toks[i].text, .bound = null, .is_const = is_const };
         i += 1;
         if (i < n - 1 and toks[i].kind == .COLON) {
             if (i + 1 >= n - 1 or toks[i + 1].kind != .IDENT) return null;
@@ -139,6 +153,59 @@ pub fn parseGenericSig(gp: *const cst.Node) ?GenericSig {
     }
     if (out.n == 0) return null;
     return out;
+}
+
+/// The dimension identifier of an `[T; N]` array type, if the dimension
+/// is a bare identifier (a const-generic name). Scans the ARRAY_TYPE
+/// node's tokens past the `;`. Null for literal or absent dims.
+pub fn arrayDimIdent(te: ast.TypeExpr) ?[]const u8 {
+    if (te != .array) return null;
+    // The dimension is everything after the `;` — as tokens or nested
+    // expression nodes. Accept exactly ONE significant token, an IDENT
+    // (a const-param name); anything more is a shape expression for a
+    // later slice, and a literal dim is a concrete array (not const-generic).
+    var past_semi = false;
+    var ident: ?[]const u8 = null;
+    for (te.array.cst.children) |ch| switch (ch) {
+        .token => |t| {
+            if (t.kind == .SEMICOLON) {
+                past_semi = true;
+                continue;
+            }
+            if (!past_semi or t.kind.isTrivia() or t.kind == .R_BRACK) continue;
+            if (t.kind == .IDENT and ident == null) ident = t.text else return null;
+        },
+        .node => |nd| if (past_semi) {
+            if (!collectLoneIdent(nd, &ident)) return null;
+        },
+    };
+    return ident;
+}
+
+/// Walk a subtree collecting significant tokens; true iff it holds at
+/// most one, an IDENT (accumulated into `ident`).
+fn collectLoneIdent(nd: *const cst.Node, ident: *?[]const u8) bool {
+    for (nd.children) |ch| switch (ch) {
+        .token => |t| {
+            if (t.kind.isTrivia()) continue;
+            if (t.kind == .IDENT and ident.* == null) ident.* = t.text else return false;
+        },
+        .node => |sub| if (!collectLoneIdent(sub, ident)) return false,
+    };
+    return true;
+}
+
+/// Which of the signature's CONST params this fn param's `[T; N]`
+/// dimension names, if any. The element type rides along for the
+/// caller's stride/kind check.
+pub fn arrayConstOfWhich(p: ast.Param, sig: GenericSig) ?struct { which: usize, elem: ?ast.TypeExpr } {
+    const te = p.type_() orelse return null;
+    const dim = arrayDimIdent(te) orelse return null;
+    for (sig.params[0..sig.n], 0..) |gp, i| {
+        if (gp.is_const and std.mem.eql(u8, gp.tname, dim))
+            return .{ .which = i, .elem = te.array.element() };
+    }
+    return null;
 }
 
 /// Which of the signature's type params this fn param is a `[T]`

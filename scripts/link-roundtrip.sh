@@ -3494,6 +3494,39 @@ op32_out="$("$HOST_BIN" "$tmp/ops32.wasm")"
 [[ "$op32_out" == "$op_expected" ]] || { echo "FAIL: operator fits wasm32 (got: $op32_out)" >&2; exit 1; }
 echo "    ok: operator fits -> (4,6) / (3,8) / (7,14) (wasm64 + wasm32; record params + returns through fit dispatch)"
 
+echo "==> const generics: [T; N] params, N inferred from compile-time counts, stamped per value"
+kg_app="$tmp/cg.q"
+cat > "$kg_app" <<'Q64'
+fn total<const N: i64>(xs: [f64; N]) -> f64 {
+    var s = 0.0
+    for i in 0..N {
+        s = s + xs[i]
+    }
+    s
+}
+
+fn count_of<const N: i64>(xs: [i64; N]) -> i64 {
+    N
+}
+
+fn main {
+    let a = [1.5, 2.5, 3.0]
+    env.out(total(a))
+    let b4 = [1.0, 2.0, 3.0, 4.0]
+    env.out(total(b4))
+    let k = [10, 20]
+    env.out(count_of(k))
+}
+Q64
+kg_expected=$'7.0\n10.0\n2'
+"$Q64_BIN" emit "$kg_app" "$tmp/cg.wasm"
+kg_out="$("$HOST_BIN" "$tmp/cg.wasm")"
+[[ "$kg_out" == "$kg_expected" ]] || { echo "FAIL: const generics (got: $kg_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$kg_app" "$tmp/cg32.wasm" --addr wasm32
+kg32_out="$("$HOST_BIN" "$tmp/cg32.wasm")"
+[[ "$kg32_out" == "$kg_expected" ]] || { echo "FAIL: const generics wasm32 (got: $kg32_out)" >&2; exit 1; }
+echo "    ok: const generics -> 7.0 / 10.0 / 2 (wasm64 + wasm32; two stamps of one generic, N in the body)"
+
 echo "==> simd first slice: Simd.splat + lane-wise add/mul + extract (f32x4 + i32x4, native v128 ops)"
 sd_app="$tmp/simd.q"
 cat > "$sd_app" <<'Q64'

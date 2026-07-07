@@ -7172,11 +7172,35 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
     // Walk params and args together: each type param infers at its
     // first `[T]` / bare `T` arg (and must stay consistent at later ones).
     var slots: [sema.fits.max_generic_params]?TSlot = @splat(null);
+    var kslots: [sema.fits.max_generic_params]?i64 = @splat(null);
     var args: std.ArrayList(*hir.Expr) = .empty;
     var pit = ps.iter();
     var ait = call.args();
     while (pit.next()) |p| {
         const a0 = ait.next() orelse return reject(b, .unsupported_call);
+        if (sema.fits.arrayConstOfWhich(p, sig)) |ak| {
+            // `[T; N]` with a const-generic dim: the argument must carry a
+            // COMPILE-TIME count (an array literal, or a binding whose
+            // count is konst) — that count IS the inference source for N.
+            const aa = (try buildArrArg(b, a0, scope)) orelse return reject(b, .unsupported_call);
+            const cnt: i64 = switch (aa.count.*) {
+                .int_const => |v| v,
+                else => return reject(b, .unsupported_call), // runtime-sized arg can't bind a const param
+            };
+            if (kslots[ak.which]) |prev| {
+                if (prev != cnt) return reject(b, .unsupported_call); // N must infer consistently
+            } else kslots[ak.which] = cnt;
+            // v0: the element type is concrete (f64/i64/…) — check kind agreement.
+            if (ak.elem) |ete| if (try semaScalar(b, ete)) |want| {
+                const got: hir.Type = switch (aa.elem) {
+                    .scalar => |t| t,
+                    else => return reject(b, .unsupported_call),
+                };
+                if (got != want) return reject(b, .unsupported_call);
+            };
+            try args.append(b.a, aa.ptr); // base pointer only — the count is static
+            continue;
+        }
         if (sliceOfWhich(p, sig, b.a)) |which| {
             const aa = (try buildArrArg(b, a0, scope)) orelse return reject(b, .unsupported_call);
             if (slots[which]) |prev| {
@@ -7221,13 +7245,18 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
     if (ait.next() != null) return reject(b, .unsupported_call);
     // Every type param must have an inference source (a `[T]` or bare
     // `T` param).
-    for (slots[0..sig.n]) |s| if (s == null) return error.Unsupported;
+    for (slots[0..sig.n], 0..) |sl, i| {
+        if (sig.params[i].is_const) {
+            if (kslots[i] == null) return error.Unsupported; // const param never inferred
+        } else if (sl == null) return error.Unsupported;
+    }
 
     // The bounds: each T must fit its face (TYP200 — `q64 check` emits
     // it; the emit path rejects honestly). Scalars have no fits yet, so
     // a *bounded* param takes record elements only; an unbounded one
     // stamps per scalar type as well.
     for (sig.params[0..sig.n], 0..) |gp, i| {
+        if (gp.is_const) continue; // a const param's "bound" is its value type, not a face
         const face = gp.bound orelse continue;
         const si = switch (slots[i].?.elem) {
             .rec => |r| r,
@@ -7238,7 +7267,7 @@ fn buildGenericCall(b: *Builder, gname: []const u8, fd: ast.FnDecl, call: ast.Ca
             return reject(b, .unsupported_call);
     }
 
-    const fid = try stampGeneric(b, gname, fd, sig, slots[0..sig.n]);
+    const fid = try stampGeneric(b, gname, fd, sig, slots[0..sig.n], kslots[0..sig.n]);
     const e = try b.a.create(hir.Expr);
     e.* = .{ .call = .{ .func = fid, .args = try args.toOwnedSlice(b.a) } };
     return e;
@@ -7270,12 +7299,17 @@ fn elemEql(x: ElemKind, y: ElemKind) bool {
 /// declaration makes a *value-returning* instance: the body's last
 /// statement is its value tail (a tail expression or `return expr`);
 /// `-> T` and str/record returns are a later slice.
-fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, slots: []const ?TSlot) BuildError!hir.FuncId {
+fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig, slots: []const ?TSlot, kslots: []const ?i64) BuildError!hir.FuncId {
     var keybuf: std.ArrayList(u8) = .empty;
     try keybuf.appendSlice(b.a, gname);
     try keybuf.append(b.a, '<');
     for (slots, 0..) |s, i| {
         if (i > 0) try keybuf.appendSlice(b.a, ", ");
+        if (kslots[i]) |kv| {
+            const kt = try std.fmt.allocPrint(b.a, "{d}", .{kv});
+            try keybuf.appendSlice(b.a, kt);
+            continue;
+        }
         try keybuf.appendSlice(b.a, switch (s.?.elem) {
             .rec => |r| r.name,
             .scalar => |t| @tagName(t),
@@ -7313,6 +7347,28 @@ fn stampGeneric(b: *Builder, gname: []const u8, fd: ast.FnDecl, sig: GenericSig,
     var pit = ps.iter();
     while (pit.next()) |p| {
         const pn = (p.name() orelse return error.Unsupported).text;
+        if (sema.fits.arrayConstOfWhich(p, sig)) |ak| {
+            // `[T; N]` param: one ptr wasm param; the count is the stamped
+            // const value — registered konst so `xs[i]`/`for` bounds-check
+            // statically, and N itself reads as a named constant.
+            const kv = kslots[ak.which] orelse return error.Unsupported;
+            const elem_ty: hir.Type = if (ak.elem) |ete|
+                (try semaScalar(b, ete)) orelse return error.Unsupported
+            else
+                .i64;
+            const ptr_idx = try scope.declare(pn, false, .ptr);
+            try params.append(b.a, .{ .name = pn, .ty = .ptr });
+            try rec_params.append(b.a, null);
+            const w = fieldWidth(elem_ty) orelse return error.Unsupported;
+            try scope.arrs.put(b.a, pn, .{
+                .ptr_idx = ptr_idx,
+                .count = .{ .konst = @intCast(kv) },
+                .stride = w.size,
+                .elem = .{ .scalar = elem_ty },
+            });
+            try scope.kconsts.put(b.a, sig.params[ak.which].tname, kv);
+            continue;
+        }
         if (sliceOfWhich(p, sig, b.a)) |which| {
             const slot = slots[which].?;
             // (ptr, count): two wasm params, the arr registered on the name.
@@ -9477,6 +9533,8 @@ const ExprTypeBridge = struct {
                     }
                 }
             }
+            // A stamped const-generic value is an i64.
+            if (self.scope.kconsts.get(name)) |_| return .i64;
             // A module-level scalar constant (`let PI = 3.14159`): its literal
             // type — looked up in the CURRENT module's scope (each module's
             // constants are its own).
@@ -9560,6 +9618,18 @@ const ExprTypeBridge = struct {
         if (base != .path) return null;
         const nm = base.path.text(self.b.a) catch return null;
         defer self.b.a.free(nm);
+        // An array binding/param (`xs[i]` on `[f64; N]`): its element kind.
+        if (self.scope.arrs.get(nm)) |ai| {
+            return switch (ai.elem) {
+                .scalar => |t| switch (t) {
+                    .f64 => .f64,
+                    .f32 => .f32,
+                    .bool => .bool,
+                    else => .i64,
+                },
+                else => null,
+            };
+        }
         const et = (vecElemByName(self.b, self.scope, nm) catch return null) orelse return null;
         return switch (et) {
             .f64 => .f64,
@@ -9767,6 +9837,10 @@ const Scope = struct {
     /// present. The header base pointer lives in `locals` under the
     /// same name (a `.ptr`); elements are i64 by default.
     vecs: std.StringHashMapUnmanaged(void) = .empty,
+    /// Stamped const-generic values visible in this body (`N` in
+    /// `fn total<const N: i64>(xs: [f64; N])`): name → the i64 value,
+    /// inlined at every read like a module const.
+    kconsts: std.StringHashMapUnmanaged(i64) = .empty,
     /// Vec element type when it isn't the i64 default — set from a `Vec<f64>`
     /// annotation (`let m: Vec<f64> = Vec.new()`). An f64 element rides the i64
     /// cell as raw bits: `push`/`v[i] = x` bit-cast f64→i64, a `v[i]` read
@@ -10558,6 +10632,9 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 return recFieldExpr(b, rf);
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
+            } else if (scope.kconsts.get(txt)) |kv| {
+                // A stamped const-generic value (`N`): inline the integer.
+                out.* = .{ .int_const = kv };
             } else if (b.module_consts.get(try scopedKey(b, b.cur_scope, txt))) |mc| {
                 // A module-level scalar constant (`let PI = 3.14159`): inline the
                 // literal — no storage, and f64 needs no const evaluator. Keyed

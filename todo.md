@@ -946,7 +946,14 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       (follow-ons):** main/callee value positions only — no SIMD params/
       returns/fields/Vec elements, no lane replace, no loads/stores, no
       shapes beyond f32x4/i32x4, no `let w = v` copies.
-- [ ] **Static-shape `Tensor` first slice** (behind const generics, §B5):
+- [ ] **Static-shape `Tensor` first slice** — UNBLOCKED: const generics v0
+      LANDED (`fn total<const N: i64>(xs: [f64; N])` — `const` params in
+      parseGenericSig, N inferred from a compile-time array count via the
+      new `[T; N]` array params (base-pointer ABI, konst count in callee
+      `scope.arrs`), stamped per value with N readable in the body as a
+      named constant; mismatched counts reject; wasm64 + wasm32 roundtrip
+      7.0/10.0/2). Boundaries: concrete elem types only, dim = lone ident,
+      one inference source (array args). Next (§B5):
       `Tensor<T, [A, B]>` as a monomorphized struct over `Simd` kernels;
       milestone = `matmul<T, const A, B, C>` with shape mismatch as a
       compile error (TYP070). `DynTensor` follows later. (Analysis §3, item 7.)
