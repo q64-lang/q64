@@ -229,7 +229,17 @@ const Checker = struct {
                 const op = u.op() orelse return .unknown;
                 return switch (op.kind) {
                     .BANG => try c.boolInfo(),
-                    .MINUS, .TILDE => inner,
+                    // `-a` on a record dispatches through the `Neg` fit
+                    // (spec/operators.md); `~` stays integer-only.
+                    .MINUS => if (c.recordName(inner)) |name| blk: {
+                        const reg = c.fitreg orelse break :blk .unknown;
+                        if (reg.find(name, "Neg") == null) {
+                            try c.diags.append(c.gpa, .{ .code = "TYP360", .offset = op.offset });
+                            break :blk .unknown;
+                        }
+                        break :blk .{ .record = name };
+                    } else inner,
+                    .TILDE => if (c.recordName(inner) != null) .unknown else inner,
                     else => .unknown,
                 };
             },
@@ -239,6 +249,9 @@ const Checker = struct {
                 const op = bx.op() orelse return .unknown;
                 if (exprtype.boolOp(op.kind)) return try c.boolInfo();
                 if (exprtype.intOp(op.kind)) {
+                    // A record operand dispatches through the operator
+                    // faces (spec/operators.md) — TYP360/361 land there.
+                    if (try c.checkRecOperator(lhs, rhs, op)) |res| return res;
                     // TYP042: both sides provably numeric and different.
                     if (c.builtinOf(lhs)) |lb| if (c.builtinOf(rhs)) |rb| {
                         if (isNumeric(lb) and isNumeric(rb) and lb != rb) {
@@ -466,6 +479,89 @@ const Checker = struct {
                 .offset = firstTokenOffset(exprNode(arg)),
             });
         }
+    }
+
+    /// The local struct a record-valued Info carries, if any — a
+    /// `.record` (an inferred literal / operator result) or an `.id`
+    /// naming a locally-declared struct (a lowered param or callee
+    /// return). Generic structs (`args != null`) and imported names
+    /// stay null — their fits live in another scope, not judgeable here.
+    fn recordName(c: *Checker, info: Info) ?[]const u8 {
+        return switch (info) {
+            .record => |n| n,
+            .id => |id| switch (c.store.get(id)) {
+                .named => |nm| if (nm.kind == .struct_ and nm.args == null) nm.name else null,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// The prelude face a binary operator dispatches through
+    /// (spec/operators.md): `+` → `Add`, … Null for operators with no
+    /// face (bitwise/shifts are integer-only by design).
+    fn operatorFace(k: cst.SyntaxKind) ?[]const u8 {
+        return switch (k) {
+            .PLUS => "Add",
+            .MINUS => "Sub",
+            .STAR => "Mul",
+            .SLASH => "Div",
+            .PERCENT => "Rem",
+            else => null,
+        };
+    }
+
+    /// Is `info` provably NOT a value of the struct `name`? A different
+    /// record, a known builtin, a bare integer literal (a record can't
+    /// absorb one — no implicit conversion, spec/operators.md
+    /// §homogeneous), an enum value, or a record array. Unknowns and
+    /// unresolved named types (an alias could BE the struct) stay false.
+    fn provablyDifferent(c: *Checker, info: Info, name: []const u8) bool {
+        if (c.recordName(info)) |n| return !std.mem.eql(u8, n, name);
+        return switch (info) {
+            .int_literal, .rec_array, .enum_value => true,
+            .id => c.builtinOf(info) != null,
+            else => false,
+        };
+    }
+
+    /// TYP360/361 — an arithmetic operator with a record operand
+    /// dispatches through the operator faces (spec/operators.md:
+    /// `a + b` ≡ `a.add(b)`, homogeneous `Self × Self → Self` in v0).
+    /// Judged only on provable shapes — a record of a locally-declared
+    /// struct; everything else falls through (null) or stays silent:
+    /// - **TYP360** — the struct has no fit for the operator's face.
+    /// - **TYP361** — the other operand provably isn't the same struct.
+    /// Returns null when neither operand is a record (the numeric path
+    /// judges), an Info otherwise — the struct itself on a successful
+    /// dispatch, so chained operator trees type through.
+    fn checkRecOperator(c: *Checker, lhs: Info, rhs: Info, op: cst.Token) !?Info {
+        const lname = c.recordName(lhs);
+        const rname = c.recordName(rhs);
+        if (lname == null and rname == null) return null;
+        // A record under a face-less operator (`p & q`): the emit path
+        // rejects; no face to judge against here.
+        const face = operatorFace(op.kind) orelse return .unknown;
+        const name = lname orelse {
+            // Record only on the right (`1 + p`): homogeneity judged
+            // from the provable left side.
+            if (c.provablyDifferent(lhs, rname.?)) {
+                try c.diags.append(c.gpa, .{ .code = "TYP361", .offset = op.offset });
+            }
+            return .unknown;
+        };
+        if (rname != null and std.mem.eql(u8, name, rname.?)) {
+            const reg = c.fitreg orelse return .unknown;
+            if (reg.find(name, face) == null) {
+                try c.diags.append(c.gpa, .{ .code = "TYP360", .offset = op.offset });
+                return .unknown;
+            }
+            return .{ .record = name }; // Self × Self → Self
+        }
+        if (c.provablyDifferent(rhs, name)) {
+            try c.diags.append(c.gpa, .{ .code = "TYP361", .offset = op.offset });
+        }
+        return .unknown;
     }
 
     /// TYP060: `f(ref: x)` / `f(in: x)` — a parameter-mode keyword in
@@ -3203,6 +3299,109 @@ test "check: TYP350 / TYP351 — lambda needs an expected fn type / arity" {
     try expectCodes("fn main { let f: fn() -> i64 = |x| x\n env.out(\"ok\") }\n", &.{"TYP351"});
     // A lambda in call-argument position is left alone (callee may expect fn).
     try expectCodes("fn main { let r = run(|x| x)\n env.out(\"ok\") }\n", &.{});
+}
+
+test "check: TYP360 — operator on a record with no fit for the face" {
+    // `+` needs an Add fit; Vec2 declares none.
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fn main {
+        \\    let a = Vec2 { x: 1, y: 2 }
+        \\    let b = Vec2 { x: 3, y: 4 }
+        \\    let c = a + b
+        \\    env.out("ok")
+        \\}
+        \\
+    , &.{"TYP360"});
+    // With the fit declared, the same expression is clean — and the
+    // result types as the struct, so a chained tree stays judged.
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fit Vec2 : Add {
+        \\    fn add(self, rhs: Vec2) -> Vec2 { Vec2 { x: self.x + rhs.x, y: self.y + rhs.y } }
+        \\}
+        \\fn main {
+        \\    let a = Vec2 { x: 1, y: 2 }
+        \\    let b = Vec2 { x: 3, y: 4 }
+        \\    let c = a + b
+        \\    env.out("ok")
+        \\}
+        \\
+    , &.{});
+    // An Add fit does not license `*` — each operator has its own face.
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fit Vec2 : Add {
+        \\    fn add(self, rhs: Vec2) -> Vec2 { Vec2 { x: self.x + rhs.x, y: self.y + rhs.y } }
+        \\}
+        \\fn main {
+        \\    let a = Vec2 { x: 1, y: 2 }
+        \\    let c = a * a
+        \\    env.out("ok")
+        \\}
+        \\
+    , &.{"TYP360"});
+    // Unary `-` dispatches through Neg; record params (lowered named
+    // struct types) are judged too.
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fn flip(a: Vec2) -> Vec2 { -a }
+        \\
+    , &.{"TYP360"});
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fit Vec2 : Neg {
+        \\    fn neg(self) -> Vec2 { Vec2 { x: 0 - self.x, y: 0 - self.y } }
+        \\}
+        \\fn flip(a: Vec2) -> Vec2 { -a }
+        \\
+    , &.{});
+}
+
+test "check: TYP361 — operand mismatch in an operator expression" {
+    // Two different structs — homogeneous Self × Self → Self in v0.
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\struct Color { r: i64, g: i64 }
+        \\fn main {
+        \\    let a = Vec2 { x: 1, y: 2 }
+        \\    let q = Color { r: 3, g: 4 }
+        \\    let c = a + q
+        \\    env.out("ok")
+        \\}
+        \\
+    , &.{"TYP361"});
+    // A record can't absorb an integer literal (no implicit conversion) —
+    // on either side.
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fn main {
+        \\    let a = Vec2 { x: 1, y: 2 }
+        \\    let c = a + 1
+        \\    env.out("ok")
+        \\}
+        \\
+    , &.{"TYP361"});
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fn main {
+        \\    let a = Vec2 { x: 1, y: 2 }
+        \\    let c = 1 + a
+        \\    env.out("ok")
+        \\}
+        \\
+    , &.{"TYP361"});
+    // An unknown operand stays silent (honesty rule) — the emit path
+    // still rejects.
+    try expectCodes(
+        \\struct Vec2 { x: i64, y: i64 }
+        \\fn main {
+        \\    let a = Vec2 { x: 1, y: 2 }
+        \\    let c = a + mystery()
+        \\    env.out("ok")
+        \\}
+        \\
+    , &.{});
 }
 
 test "check: PAR040 — chained relational comparison on value bindings" {

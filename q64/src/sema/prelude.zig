@@ -68,6 +68,14 @@ const entries = [_]Entry{
     .{ .name = "Arbitrary", .kind = .face },
     .{ .name = "Error", .kind = .face },
     .{ .name = "Panic", .kind = .face },
+    // Operator faces (spec/operators.md — compiler-blessed; an operator
+    // expression on a user type desugars to a fit-method call).
+    .{ .name = "Add", .kind = .face },
+    .{ .name = "Sub", .kind = .face },
+    .{ .name = "Mul", .kind = .face },
+    .{ .name = "Div", .kind = .face },
+    .{ .name = "Rem", .kind = .face },
+    .{ .name = "Neg", .kind = .face },
     // Collections.
     .{ .name = "Vec", .kind = .type_ },
     .{ .name = "Map", .kind = .type_ },

@@ -133,6 +133,13 @@ no test.
 | `TYP306` | errors.md       | `panic` payload does not fit `Panic`              | `errors/panic-payload-not-panic-fitting.q`               |
 | `TYP307` | errors.md       | `catch` type is not `Panic`-fitting               | —                                                        |
 
+## Operators — `TYP360`–`TYP369`
+
+| Code     | Owner           | Short message                                     | Test                                                     |
+|----------|-----------------|---------------------------------------------------|----------------------------------------------------------|
+| `TYP360` | operators.md    | no operator fit for this type                     | `faces/operator-no-fit.q`                                |
+| `TYP361` | operators.md    | operand type mismatch in operator expression      | `faces/operator-operand-mismatch.q`                      |
+
 ## Memory / regions — `REG*`
 
 | Code     | Owner           | Short message                                     | Test                                                     |

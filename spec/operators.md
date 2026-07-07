@@ -81,11 +81,11 @@ let c = a + b        // ≡ a.add(b)
 
 ## v0 implementation status
 
-The first slice desugars `+ - * /` on same-struct record bindings in
-`let`-initializer position, dispatching through the fit registry (the B4
-static-dispatch machinery), with fit methods extended to record parameters
-and record returns. Boundaries (follow-ons): `%`, unary `-`, operators in
-nested-expression/argument/statement positions, fits on imported types
-(the fit registry is root-scope-only today), and the TYP360/361 codes
-surfacing from `q64 check` (the builder currently rejects honestly as
-Unsupported).
+All of v0 is implemented: `+ - * / %` and unary `-` desugar through the
+fit registry (the B4 static-dispatch machinery) on same-struct records —
+in `let`-initializer, nested-expression, and argument positions — with
+fit methods extended to record parameters and record returns, and fits
+resolving on imported types (the registry is per-scope; a fit lives with
+its type's module). `q64 check` surfaces **TYP360/361** on provable
+shapes (a record of a locally-declared struct under `+ - * / %` or unary
+`-`); the emit path keeps rejecting the rest honestly.

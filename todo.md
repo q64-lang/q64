@@ -927,8 +927,14 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       `cabs(a + b)`, `cmul(a + b, a - b)` verified on imported Complex,
       wasm64 + wasm32. **Statement position verified** —
       a bare `a + a` statement already rejects honestly (UnsupportedExpression),
-      no change needed. **Remaining:** TYP360/361 from `q64 check`.
-      (Analysis §3, Tier 0.)
+      no change needed. **TYP360/361 LANDED — the item is COMPLETE:**
+      `q64 check` surfaces TYP360 (no fit for the operator's face) and
+      TYP361 (operand mismatch — homogeneous `Self × Self → Self`) on
+      provable shapes (records of locally-declared structs, incl.
+      named-struct params/callee returns; unary `-` via Neg), the six
+      operator faces joined the auto-prelude table (so TYP201 fit-form
+      checks cover them too), explain entries + 2 conformance cases
+      (53/53). (Analysis §3, Tier 0.)
 - [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
       LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
       `v.add(w)`/`v.mul(w)`, `v.extract(0..3)`; `Simd<f32, 4>`/`Simd<i32, 4>`
