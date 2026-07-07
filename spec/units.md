@@ -69,6 +69,36 @@ introducible by user code; the set is closed for v0.
 related by `Hz * Seconds → dimensionless` — see §"Dimensional
 algebra".
 
+### v1 extension: the SI base set (decision recorded)
+
+The six-dimension v0 set is right for audio but stops at the studio
+door: robotics needs kinematics (`m/s²`, `N·m`), chemistry needs
+concentrations (`mol/L`, `kDa`), simulation needs the full mechanical
+chain. **v1 extends the lattice with the SI base dimensions — still a
+closed, compiler-known list** (user code still introduces no base
+dimensions; `@unit` still declares nominal aliases only):
+
+| Dimension           | Symbol | Base unit | Backing scalar |
+|---------------------|--------|-----------|----------------|
+| Length              | L      | `m`       | `f64`          |
+| Mass                | M      | `kg`      | `f64`          |
+| Temperature         | Θ      | `K`       | `f64`          |
+| Electric current    | J      | `A`       | `f64`          |
+| Amount of substance | S      | `mol`     | `f64`          |
+| Luminous intensity  | C      | `cd`      | `f64`          |
+
+Derived composites spell through the existing algebra (§"Dimensional
+algebra") and the `per` chain — `m/s`, `m/s²`, `kg*m/s²` — with the
+usual blessed names as type aliases (`N`, `Pa`, `J`, `W`, `V`) rather
+than new dimensions. The literal-suffix table grows the matching rows
+(`1.5.m`, `9.81.mps2` is NOT added — composite literals stay spelled
+by arithmetic, e.g. `9.81.m.per.s.per.s`; only base and blessed-alias
+suffixes are lexical). The phantom-type machinery, prefix rules, and
+UNI diagnostics are unchanged — this is a table extension, not a
+mechanism change. Sequencing: lands with (not before) the units
+*evaluation* rung — the lattice is data, and growing it before any of
+it type-checks would just widen the unimplemented surface.
+
 ## Blessed unit types
 
 Every unit-tagged value at runtime has one of the following

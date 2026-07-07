@@ -976,17 +976,20 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       SplitMix64 sequence (verified: identical output across runs), unset
       seeds from wall clock + ASLR (documented non-crypto). Verified
       wasm64 + wasm32. (Analysis §3, item 8.)
-- [ ] **`spec/autodiff.md` — design note.** Source-transform reverse-mode AD
-      over HIR: a `@differentiable` marker, `@pure` delimiting differentiable
-      regions, arenas as the tape, a `Differentiable` face with laws.
-      Design-only for now; implementation queues behind the Tensor slice.
-      Without it, "AI support" means inference only. (Analysis §3, item 13.)
-- [ ] **SI base dimensions in `spec/units.md`.** Extend the closed
-      six-dimension set with Length/Mass/Temperature/Current/Amount(mol)/
-      Luminosity + derived composites (N, Pa, J, V) — still a closed,
-      compiler-known list; the phantom-type machinery is unchanged. Robotics
-      (m/s², N·m), chemistry (mol/L, kDa), and twins all need it.
-      (Analysis §3, item 17.)
+- [x] **`spec/autodiff.md` — design note WRITTEN.** Source-transform
+      reverse-mode AD as an HIR→HIR pass: `@differentiable` (checked,
+      `@pure`-compatible — the effect lattice delimits the region),
+      comptime `grad(f)` stamping like monomorphization, regions as the
+      tape, `@adjoint` for custom/host-boundary derivatives, ADF001-003
+      reserved. Implementation queues behind Tensor + const generics; the
+      first slice (scalar-only grad vs finite differences) is spelled out.
+      (Analysis §3, item 13.)
+- [x] **SI base dimensions — spec'd.** `spec/units.md` §"v1 extension:
+      the SI base set" records the decision: the six SI base dimensions
+      join the closed lattice, derived names (N, Pa, J, W, V) as blessed
+      aliases not new dimensions, composite literals spelled by arithmetic
+      (no lexical composite suffixes). Sequenced to land WITH the units
+      evaluation rung, not before. (Analysis §3, item 17.)
 - [ ] **`@deterministic` build profile + arena `snapshot()`/`restore()` —
       design note.** All nondeterminism already enters through capabilities
       (`env.time`, `env.random`), so a seeded/virtualized profile gives
