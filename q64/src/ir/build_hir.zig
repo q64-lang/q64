@@ -6299,13 +6299,11 @@ fn tryRecOperator(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bo
         const uop = ux.op() orelse return false;
         if (uop.kind != .MINUS) return false;
         const oe = ux.operand() orelse return false;
-        if (oe != .path) return false;
-        const on = try pathText(b, oe.path);
-        const osi = scope.recs.get(on) orelse return false;
+        const op0 = (try recOperand(b, oe, scope, out)) orelse return false;
+        const osi = op0.si;
         const id = (try registerFitMethod(b, osi, "neg")) orelse return error.Unsupported;
-        const oloc = scope.find(on) orelse return false;
         const oref = try b.a.create(hir.Expr);
-        oref.* = .{ .local = .{ .idx = oloc.idx, .ty = .ptr } };
+        oref.* = .{ .local = .{ .idx = op0.idx, .ty = .ptr } };
         const ncall = try b.a.create(hir.Expr);
         ncall.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{oref}) } };
         try bindMainRecord(b, scope, name, is_var, ncall, osi, out);
@@ -6319,24 +6317,44 @@ fn tryRecOperator(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bo
     const mname = operatorMethodName(op.kind) orelse return false;
     const le = bx.lhs() orelse return false;
     const re = bx.rhs() orelse return false;
-    if (le != .path or re != .path) return false;
-    const ln = try pathText(b, le.path);
-    const rn = try pathText(b, re.path);
-    const lsi = scope.recs.get(ln) orelse return false;
-    const rsi = scope.recs.get(rn) orelse return false;
+    const lop = (try recOperand(b, le, scope, out)) orelse return false;
+    const rop = (try recOperand(b, re, scope, out)) orelse return false;
+    const lsi = lop.si;
     // Homogeneous in v0 (spec/operators.md): both operands the same struct.
-    if (lsi != rsi) return error.Unsupported;
+    if (lsi != rop.si) return error.Unsupported;
     const id = (try registerFitMethod(b, lsi, mname)) orelse return error.Unsupported;
-    const lloc = scope.find(ln) orelse return false;
-    const rloc = scope.find(rn) orelse return false;
     const lref = try b.a.create(hir.Expr);
-    lref.* = .{ .local = .{ .idx = lloc.idx, .ty = .ptr } };
+    lref.* = .{ .local = .{ .idx = lop.idx, .ty = .ptr } };
     const rref = try b.a.create(hir.Expr);
-    rref.* = .{ .local = .{ .idx = rloc.idx, .ty = .ptr } };
+    rref.* = .{ .local = .{ .idx = rop.idx, .ty = .ptr } };
     const call = try b.a.create(hir.Expr);
     call.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{ lref, rref }) } };
     try bindMainRecord(b, scope, name, is_var, call, lsi, out);
     return true;
+}
+
+/// Resolve an operator operand to a record binding: a bare path resolves
+/// directly; a nested operator expression (`(a + b) * c`) materializes
+/// into a hidden `#op<n>` temp first (the `#chain<n>` precedent), so
+/// operator trees compose without a general expression-temp system.
+fn recOperand(b: *Builder, e0: ast.Expr, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!?struct { idx: u32, si: *const StructInfo } {
+    // `(a + b)` parses as a paren node — unwrap to the inner expression.
+    var e = e0;
+    while (e == .paren) e = e.paren.inner() orelse return null;
+    if (e == .path) {
+        const n = try pathText(b, e.path);
+        const si = scope.recs.get(n) orelse return null;
+        const loc = scope.find(n) orelse return null;
+        return .{ .idx = loc.idx, .si = si };
+    }
+    if (e == .bin or e == .unary) {
+        const tmp = try std.fmt.allocPrint(b.a, "#op{d}", .{scope.next_idx});
+        if (!(try tryRecOperator(b, e, tmp, false, scope, out))) return null;
+        const si = scope.recs.get(tmp) orelse return null;
+        const loc = scope.find(tmp) orelse return null;
+        return .{ .idx = loc.idx, .si = si };
+    }
+    return null;
 }
 
 fn recCallStruct(b: *Builder, expr: ast.Expr) BuildError!?*const StructInfo {
