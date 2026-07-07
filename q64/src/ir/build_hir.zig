@@ -142,7 +142,12 @@ const Builder = struct {
     /// at the use site (the same `float_const`/`int_const`/`bool_const` node the
     /// literal itself would build), so an f64 constant works without the
     /// integer-only const evaluator and without wasm-global plumbing.
+    /// Keys are scoped (`scopedKey`) — each module's constants live in its
+    /// own scope, collected lazily on the first body built in that scope.
     module_consts: std.StringHashMapUnmanaged(ModuleConst) = .empty,
+    /// Scopes whose module-level constants have been collected (0 = root,
+    /// via Pass 0.4; imported scopes on first entry in `registerFunc`).
+    consts_scopes: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// This file's struct declarations on the layout floor, laid out per
     /// spec/memory.md §"Linear struct layout". Struct-typed signatures resolve
     /// against this table (v0: the compiling file's structs only).
@@ -315,7 +320,7 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
     // A non-`var` top-level `let` with a numeric/bool *literal* initializer is a
     // constant; a reference inlines the literal (see buildIntExpr's `.path`).
     // Non-literal initializers (an actor `spawn()`) fall through to Pass 0.7.
-    try registerModuleConsts(b, sf);
+    try registerModuleConsts(b, sf, 0);
 
     // Pass 0.5: lay out this file's struct declarations (B2b). Structs with
     // fields outside the v0 floor (i64 / bool) are skipped, not rejected —
@@ -382,7 +387,8 @@ fn buildModule(b: *Builder, sf: ast.SourceFile) BuildError!void {
 /// stored so a reference materializes the literal (buildIntExpr `.path`) and its
 /// type is known to the scalar typer (ExprTypeBridge.localType). A `let` with a
 /// non-literal initializer (`Counter.spawn()`) is left for Pass 0.7.
-fn registerModuleConsts(b: *Builder, sf: ast.SourceFile) BuildError!void {
+fn registerModuleConsts(b: *Builder, sf: ast.SourceFile, scope: u32) BuildError!void {
+    try b.consts_scopes.put(b.a, scope, {});
     var it = sf.items();
     while (it.next()) |item| switch (item) {
         .let_decl => |ls| {
@@ -408,10 +414,20 @@ fn registerModuleConsts(b: *Builder, sf: ast.SourceFile) BuildError!void {
                 },
                 else => continue, // non-literal init (spawn / call): Pass 0.7's job
             };
-            try b.module_consts.put(b.a, nm.text, mc);
+            try b.module_consts.put(b.a, try scopedKey(b, scope, nm.text), mc);
         },
         else => {},
     };
+}
+
+/// Collect an imported module's module-level constants the first time a body
+/// is compiled in its scope (the root's are Pass 0.4). Without a
+/// source-file-capable resolver this is a no-op — bodies referencing module
+/// consts then keep the pre-existing honest Unsupported fallback.
+fn ensureModuleConsts(b: *Builder, scope: u32) BuildError!void {
+    if (b.consts_scopes.contains(scope)) return;
+    const sf = b.resolver.sourceFile(scope) orelse return;
+    try registerModuleConsts(b, sf, scope);
 }
 
 /// Pass 0.7 — register module-level actor singletons. A top-level
@@ -3962,6 +3978,9 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         b.cur_scope = saved_scope;
         b.eval.scope = saved_scope;
     }
+    // First body in this module's scope? Pull in ITS module-level constants
+    // so `let PI = …` references in the imported bodies resolve.
+    try ensureModuleConsts(b, resolved.scope);
 
     const owned = try scopedKey(b, resolved.scope, name);
     if (b.ids.get(owned)) |id| return id;
@@ -9300,8 +9319,11 @@ const ExprTypeBridge = struct {
                     }
                 }
             }
-            // A module-level scalar constant (`let PI = 3.14159`): its literal type.
-            if (self.b.module_consts.get(name)) |mc| return switch (mc.ty) {
+            // A module-level scalar constant (`let PI = 3.14159`): its literal
+            // type — looked up in the CURRENT module's scope (each module's
+            // constants are its own).
+            const ckey = scopedKey(self.b, self.b.cur_scope, name) catch return null;
+            if (self.b.module_consts.get(ckey)) |mc| return switch (mc.ty) {
                 .f64 => .f64,
                 .bool => .bool,
                 else => .i64,
@@ -10378,9 +10400,10 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 return recFieldExpr(b, rf);
             } else if (b.globals.get(txt)) |gi| {
                 out.* = .{ .global_get = gi };       // module-level `state`
-            } else if (b.module_consts.get(txt)) |mc| {
+            } else if (b.module_consts.get(try scopedKey(b, b.cur_scope, txt))) |mc| {
                 // A module-level scalar constant (`let PI = 3.14159`): inline the
-                // literal — no storage, and f64 needs no const evaluator.
+                // literal — no storage, and f64 needs no const evaluator. Keyed
+                // by the current module scope (imported bodies read their own).
                 out.* = switch (mc.ty) {
                     .f64 => .{ .float_const = mc.fval },
                     .bool => .{ .bool_const = mc.bval },

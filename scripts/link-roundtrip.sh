@@ -3365,6 +3365,30 @@ tr32_out="$("$HOST_BIN" "$tmp/txrx32.wasm")"
 [[ "$tr32_out" == "$tr_expected" ]] || { echo "FAIL: (tx, rx) split wasm32 (got: $tr32_out)" >&2; exit 1; }
 echo "    ok: (tx, rx) split -> 1/2/3/4 (wasm64 + wasm32; shared bounded buffer, backpressure across the split)"
 
+echo "==> stdlib q64.math: import the REAL stdlib qube (module consts + transcendentals)"
+mm_app="$tmp/mathuse.q"
+cat > "$mm_app" <<'Q64'
+import q64.math.{exp, sin, ln, log2, pow, atan, atan2}
+
+fn main {
+    env.out(exp(1.0))
+    env.out(sin(0.5))
+    env.out(ln(2.0))
+    env.out(log2(8.0))
+    env.out(pow(2.0, 0.5))
+    env.out(atan(1.0))
+    env.out(atan2(1.0, 0.0 - 1.0))
+}
+Q64
+mm_expected=$'2.718282\n0.479426\n0.693147\n3.0\n1.414214\n0.785398\n2.356194'
+"$Q64_BIN" emit "$mm_app" "$tmp/mathuse.wasm" --module q64.math="$REPO_ROOT/stdlib/math/src/lib.q"
+mm_out="$("$HOST_BIN" "$tmp/mathuse.wasm")"
+[[ "$mm_out" == "$mm_expected" ]] || { echo "FAIL: q64.math import (got: $mm_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$mm_app" "$tmp/mathuse32.wasm" --addr wasm32 --module q64.math="$REPO_ROOT/stdlib/math/src/lib.q"
+mm32_out="$("$HOST_BIN" "$tmp/mathuse32.wasm")"
+[[ "$mm32_out" == "$mm_expected" ]] || { echo "FAIL: q64.math import wasm32 (got: $mm32_out)" >&2; exit 1; }
+echo "    ok: q64.math import -> e / sin / ln / log2 / sqrt2 / pi:4 / 3pi:4 (wasm64 + wasm32; the stdlib qube is loadable)"
+
 echo "==> simd first slice: Simd.splat + lane-wise add/mul + extract (f32x4 + i32x4, native v128 ops)"
 sd_app="$tmp/simd.q"
 cat > "$sd_app" <<'Q64'

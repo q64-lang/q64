@@ -3,7 +3,7 @@
   "name": "q64.math",
   "version": "0.1.0",
   "license": "MIT OR Apache-2.0",
-  "description": "Scalar floating-point math: hardware primitives (abs, sqrt, floor, …) re-exported, plus pure-q64 transcendentals (exp, sin, cos, tanh).",
+  "description": "Scalar floating-point math: hardware primitives (abs, sqrt, floor, …) re-exported, plus pure-q64 transcendentals (exp, sin, cos, tanh, ln, log2, log10, pow, atan, atan2).",
   "type": "library",
   "entry": "src/lib.q",
 

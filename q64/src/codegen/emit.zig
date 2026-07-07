@@ -871,6 +871,11 @@ fn linkerLookupShim(ctx: *anyopaque, scope: u32, name: []const u8) ?ir.hir.Resol
     return .{ .fd = r.fd, .scope = r.scope };
 }
 
+fn linkerSourceFileShim(ctx: *anyopaque, scope: u32) ?ast.SourceFile {
+    const l: *sema.link.Linker = @ptrCast(@alignCast(ctx));
+    return l.sourceFile(scope);
+}
+
 /// Parse `source`, resolve its imports against `modules`, and build the HIR —
 /// the shared front of `emitFromSource` and `q64 show hir|mir`. Returns the
 /// arena-owned HIR module (caller `deinit`s). A construct the IR can't yet
@@ -897,7 +902,7 @@ fn buildHir(allocator: std.mem.Allocator, source: []const u8, file: []const u8, 
         error.OutOfMemory => error.OutOfMemory,
     };
 
-    const mres = ir.hir.ModuleResolver{ .ctx = &linker, .lookupFn = linkerLookupShim };
+    const mres = ir.hir.ModuleResolver{ .ctx = &linker, .lookupFn = linkerLookupShim, .sourceFileFn = linkerSourceFileShim };
     return switch (try ir.build_hir.tryBuild(allocator, sf, mres, foreign)) {
         .unsupported => Error.UnsupportedExpression,
         .rejected => |r| mapReject(r),

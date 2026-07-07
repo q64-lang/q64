@@ -925,11 +925,18 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       `Tensor<T, [A, B]>` as a monomorphized struct over `Simd` kernels;
       milestone = `matmul<T, const A, B, C>` with shape mismatch as a
       compile error (TYP070). `DynTensor` follows later. (Analysis §3, item 7.)
-- [ ] **`q64.math` scope growth**: the transcendental set already decided
-      above (`sin`/`cos`/`exp`/`log` — software, deterministic), plus
-      `ln`/`log2`/`log10`/`pow`/`atan2`, `Complex<T>` (prerequisite for FFT,
-      quantum-state simulation, DSP), and a seeded splittable RNG surfaced
-      through `env.random` so determinism stays capability-visible.
+- [ ] **`q64.math` scope growth — transcendentals LANDED, Complex/RNG remain.**
+      `ln`/`log2`/`log10`/`pow`/`atan`/`atan2` shipped in pure q64
+      (atanh-series ln with doubling/halving range reduction; pow = exp·ln;
+      atan by four half-angle reductions + odd Taylor; NaN out-of-domain, no
+      trap). **The gate this opened: stdlib qubes are now loadable** — the
+      builder collects an imported module's `let` consts lazily per scope
+      (`ModuleResolver.sourceFileFn` → `Linker.sourceFile`; consts keyed by
+      `scopedKey`), so `import q64.math.{exp, ln, …}` compiles, links, and
+      runs (roundtrip pins e/sin/ln/log2/√2/π⁄4/3π⁄4 on wasm64 + wasm32).
+      Remaining: `Complex<T>` (prerequisite for FFT, quantum-state
+      simulation, DSP) and a seeded splittable RNG surfaced through
+      `env.random` so determinism stays capability-visible.
       (Analysis §3, item 8.)
 - [ ] **`spec/autodiff.md` — design note.** Source-transform reverse-mode AD
       over HIR: a `@differentiable` marker, `@pure` delimiting differentiable

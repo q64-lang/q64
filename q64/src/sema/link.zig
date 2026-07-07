@@ -81,6 +81,13 @@ pub const Linker = struct {
         try self.resolveImportsInto(sf, 0);
     }
 
+    /// The source file backing a scope (0 = the root file; imported modules
+    /// get theirs when their scope is built). Null for an unknown index.
+    pub fn sourceFile(self: *const Linker, scope: u32) ?ast.SourceFile {
+        if (scope >= self.scopes.items.len) return null;
+        return self.scopes.items[scope].sf;
+    }
+
     /// Index every top-level function of `sf` into scope `scope_idx`, each
     /// mapped to that same scope (a module's own functions resolve in it).
     fn indexLocals(self: *Linker, sf: ast.SourceFile, scope_idx: u32) std.mem.Allocator.Error!void {
@@ -245,6 +252,30 @@ test "link: transitive — a library imports another library" {
     try std.testing.expect(b.scope != a.scope and b.scope != 0);
     // `b` is not visible from the root scope (only libA imports it).
     try std.testing.expect(l.linker.lookup(0, "b") == null);
+}
+
+test "link: sourceFile exposes each scope's file (for imported module consts)" {
+    const lib = "let K = 3.5\npub fn a() -> f64 { K }\n";
+    var l = try linkSource(
+        "import test.a.{a}\nfn main { env.out(a()) }\n",
+        &.{.{ .name = "test.a", .source = lib }},
+    );
+    defer l.deinit();
+
+    const a = l.linker.lookup(0, "a").?;
+    // The imported module's scope hands back ITS source file — the builder
+    // collects `let K = …` module consts from it on first entry.
+    const dep_sf = l.linker.sourceFile(a.scope) orelse return error.TestUnexpectedResult;
+    var found_let = false;
+    var it = dep_sf.items();
+    while (it.next()) |item| switch (item) {
+        .let_decl => found_let = true,
+        else => {},
+    };
+    try std.testing.expect(found_let);
+    // Root's file is scope 0; an unknown scope is null, never a panic.
+    try std.testing.expect(l.linker.sourceFile(0) != null);
+    try std.testing.expect(l.linker.sourceFile(99) == null);
 }
 
 test "link: unknown module / missing name / private name / relative import error honestly" {

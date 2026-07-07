@@ -40,9 +40,19 @@ pub const Resolved = struct {
 pub const ModuleResolver = struct {
     ctx: *anyopaque,
     lookupFn: *const fn (*anyopaque, scope: u32, name: []const u8) ?Resolved,
+    /// The source file of a module scope — the builder uses it to collect an
+    /// imported module's own module-level constants the first time it
+    /// compiles a body in that scope. Optional: a resolver without it limits
+    /// imported modules to const-free bodies (the pre-existing behavior).
+    sourceFileFn: ?*const fn (*anyopaque, scope: u32) ?ast.SourceFile = null,
 
     pub fn lookup(self: ModuleResolver, scope: u32, name: []const u8) ?Resolved {
         return self.lookupFn(self.ctx, scope, name);
+    }
+
+    pub fn sourceFile(self: ModuleResolver, scope: u32) ?ast.SourceFile {
+        const f = self.sourceFileFn orelse return null;
+        return f(self.ctx, scope);
     }
 };
 
