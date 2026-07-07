@@ -769,9 +769,12 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 if (init_sc == .narrow_int) return error.Unsupported;
                 // A `Simd<…>` annotation must agree with the initializer's
                 // lane shape (`let v: Simd<f32, 4> = Simd.splat(7)` is a
-                // shape mismatch — no implicit conversion between shapes).
+                // shape mismatch), and a SIMD initializer under a non-Simd
+                // annotation is a shape error too — no implicit conversion.
                 if (try simdShapeOfAnnot(b, ls.type_())) |want| {
                     if (init_sc != simdScTy(want)) return error.Unsupported;
+                } else if (ls.type_() != null and simdShapeOfSc(init_sc) != null) {
+                    return error.Unsupported;
                 }
                 const lty: hir.Type = scalarBindTy(init_sc);
                 // Build the initializer first so it can't see its own name,
@@ -1979,25 +1982,27 @@ fn vecElemType(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?hir.Type {
 }
 
 /// The lane shape named by a `Simd<elem, lanes>` type annotation
-/// (`Simd<f32, 4>` → f32x4, `Simd<i32, 4>` → i32x4), or null when `te`
-/// isn't a `Simd<…>` path or names a shape outside the v0 slice.
+/// (`Simd<f32, 4>` → f32x4, `Simd<i32, 4>` → i32x4). Null only when `te`
+/// isn't a `Simd` path at all; a `Simd` annotation naming a shape outside
+/// the v0 slice (`Simd<f64, 2>`, missing args) is an honest reject — a
+/// recognized-but-unsupported annotation must never be silently ignored.
 fn simdShapeOfAnnot(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?ops.LaneShape {
     const te = te_opt orelse return null;
     if (te != .path) return null;
     const nm = try te.path.name(b.a);
     defer b.a.free(nm);
     if (!std.mem.eql(u8, nm, "Simd")) return null;
-    const raw = (try te.path.genericArgsText(b.a)) orelse return null;
+    const raw = (try te.path.genericArgsText(b.a)) orelse return error.Unsupported;
     defer b.a.free(raw);
     // The raw span is `<f32, 4>`: split on the comma, trim each side.
     const inner = std.mem.trim(u8, raw, "<> \t");
-    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return null;
+    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return error.Unsupported;
     const elem = std.mem.trim(u8, inner[0..comma], " \t");
     const lanes = std.mem.trim(u8, inner[comma + 1 ..], " \t");
-    if (!std.mem.eql(u8, lanes, "4")) return null;
+    if (!std.mem.eql(u8, lanes, "4")) return error.Unsupported;
     if (std.mem.eql(u8, elem, "f32")) return .f32x4;
     if (std.mem.eql(u8, elem, "i32")) return .i32x4;
-    return null;
+    return error.Unsupported;
 }
 
 // A task lowers to a tiny CFG of pc-numbered blocks. A `plain`/`recv` block
@@ -5212,6 +5217,10 @@ fn buildConcat(b: *Builder, sl: ast.StringLit, scope: *Scope, in_callee: bool, r
                                     w.* = .{ .num_cast = .{ .to = .f64, .value = lref } };
                                     break :blkf .{ .fmt_float = w };
                                 },
+                                // A SIMD value has no text form — it must
+                                // never reach __fmt_i64 (extract a lane and
+                                // interpolate the scalar instead).
+                                .f32x4, .i32x4 => return reject(b, .unsupported_call),
                                 else => .{ .fmt_int = lref },
                             };
                         }
@@ -8984,6 +8993,26 @@ fn simdBinKind(method: []const u8) ?ops.BinKind {
     return null;
 }
 
+/// Build a SIMD-valued operand of a SIMD method. A bare path naming a
+/// SIMD binding reads as its local here — and ONLY here: the generic
+/// bare-path read rejects SIMD bindings so a v128 can never reach the
+/// scalar comparison/condition/arithmetic machinery (whose i64 arms would
+/// leak a Binaryen validator error). Anything else (a nested SIMD method
+/// call like `v.add(w)`) builds through the ordinary call recognizer.
+fn buildSimdOperand(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!*hir.Expr {
+    if (arg == .path) {
+        const txt = try pathText(b, arg.path);
+        if (scope.find(txt)) |loc| {
+            if (simdShapeOfHir(loc.ty) != null) {
+                const e = try b.a.create(hir.Expr);
+                e.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                return e;
+            }
+        }
+    }
+    return buildIntExpr(b, arg, scope);
+}
+
 /// The compile-time lane index of a `v.extract(n)` argument: an integer
 /// literal 0–3. A runtime index is not extractable (the wasm instruction
 /// takes an immediate), so anything else returns null.
@@ -9746,6 +9775,15 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
             // reached here — those functions take the str path.)
             const init_sc = try exprScalar(b, init_expr, scope);
             if (init_sc == .narrow_int) return error.Unsupported; // widen explicitly: i64(c.r)
+            // Same SIMD annotation discipline as `main`'s let path: a
+            // `Simd<…>` annotation must agree with the initializer's lane
+            // shape, and a SIMD initializer under a non-Simd annotation is
+            // a shape error (no implicit conversion either way).
+            if (try simdShapeOfAnnot(b, ls.type_())) |want| {
+                if (init_sc != simdScTy(want)) return error.Unsupported;
+            } else if (ls.type_() != null and simdShapeOfSc(init_sc) != null) {
+                return error.Unsupported;
+            }
             const ty: hir.Type = scalarBindTy(init_sc);
             // Build the initializer before declaring, so it can't see itself.
             const value = try buildIntExpr(b, init_expr, scope);
@@ -10330,8 +10368,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 // i64, f64, and bool (i32 0/1) locals are readable here; a
                 // `str` local belongs in the str path — and a bare record
                 // binding (`.ptr`) is a whole-value use, not a scalar.
-                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32 and
-                    loc.ty != .f32x4 and loc.ty != .i32x4) return error.Unsupported;
+                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32) return error.Unsupported;
                 out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (try findRecField(scope, txt)) |rf| {
                 // `p.x` on a materialized record: a load at (base ptr, offset).
@@ -10623,7 +10660,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                                 if ((try exprScalar(b, a0, scope)) != simdScTy(shape)) return error.Unsupported;
                                 const lhs = try b.a.create(hir.Expr);
                                 lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
-                                out.* = .{ .simd_bin = .{ .kind = sk, .shape = shape, .lhs = lhs, .rhs = try buildIntExpr(b, a0, scope) } };
+                                out.* = .{ .simd_bin = .{ .kind = sk, .shape = shape, .lhs = lhs, .rhs = try buildSimdOperand(b, a0, scope) } };
                                 return out;
                             }
                             if (std.mem.eql(u8, method, "extract")) {
@@ -11417,6 +11454,44 @@ test "simd: splat/add/mul/extract lower to lane-tagged ops; misuse rejected" {
     // A bare float literal is f64 — not splattable (write f32(1.5)).
     try testing.expect((try buildFromSource(testing.allocator,
         "fn main {\n let v: Simd<f32, 4> = Simd.splat(1.5)\n let x = v.extract(0)\n env.out(\"{x}\")\n}\n", noLib)) == null);
+}
+
+test "simd: review-hardening — interpolation/comparison/annotation misuse rejects everywhere" {
+    // Interpolating a SIMD binding must reject like the direct env.out form
+    // (the concat path must never hand a v128 to __fmt_i64).
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let a: Simd<i32, 4> = Simd.splat(7)\n env.out(\"val={a}\")\n}\n", noLib)) == null);
+    // A bare SIMD binding in generic value contexts (comparison, condition)
+    // must reject — the scalar machinery's i64 arms cannot take a v128.
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: Simd<f32, 4> = Simd.splat(f32(1.0))\n let w: Simd<f32, 4> = Simd.splat(f32(2.0))\n if v == w { env.out(\"eq\") }\n}\n", noLib)) == null);
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: Simd<f32, 4> = Simd.splat(f32(1.0))\n if v { env.out(\"t\") }\n}\n", noLib)) == null);
+    // A recognized-but-unsupported Simd annotation shape is a reject, never
+    // silently ignored; same for a SIMD initializer under a scalar annotation.
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: Simd<f64, 2> = Simd.splat(1.0)\n env.out(\"x\")\n}\n", noLib)) == null);
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n let v: i64 = Simd.splat(7)\n env.out(\"x\")\n}\n", noLib)) == null);
+    // The annotation cross-check holds in CALLEE bodies too (it was
+    // main-only at first — a shape mismatch must not silently bind the
+    // initializer's shape).
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn work() -> i64 {\n let v: Simd<i32, 4> = Simd.splat(f32(2.5))\n let s = v.add(v)\n i64(s.extract(0))\n}\n");
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n env.out(work())\n}\n", tr.resolver())) == null);
+    // ...while a shape-consistent callee SIMD let still builds.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try tr2.addLib("pub fn work() -> i64 {\n let v: Simd<i32, 4> = Simd.splat(6)\n let s = v.mul(v)\n s.extract(1)\n}\n");
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n env.out(work())\n}\n", tr2.resolver())) orelse
+        return error.TestUnexpectedResult;
+    defer mod.deinit();
+    const dump = try print.hirToString(testing.allocator, &mod);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "simd_mul.i32x4") != null);
 }
 
 test "closures: a higher-order fn specializes per lambda (inlined call)" {

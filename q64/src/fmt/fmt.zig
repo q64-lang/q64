@@ -630,13 +630,27 @@ const Formatter = struct {
     /// hug falls out of every bracket on a line sharing that line's
     /// `disp`. `< >` are not indentation brackets.
     fn updateNesting(self: *Formatter, disp: usize, line: []const cst.Token) void {
+        // Line-local angle depth for generic-argument spans: a `<` glued
+        // directly to an identifier (no trivia between — `Simd<f32, 4>`,
+        // `Vec<i64>`) opens a type-argument list whose commas belong to IT,
+        // not to the innermost ()/[]/{} group — attributing them there made
+        // the enclosing block a comma-list and grew a spurious trailing
+        // comma. A spaced `<` is a comparison and never enters here.
+        var angle: usize = 0;
+        var prev: ?cst.SyntaxKind = null; // previous token INCLUDING trivia
         for (line) |t| {
+            const p = prev;
+            prev = t.kind;
             if (t.kind.isTrivia()) continue;
-            if (isOpener(t.kind)) {
+            if (t.kind == .L_ANGLE and p == .IDENT) {
+                angle += 1;
+            } else if (t.kind == .R_ANGLE and angle > 0) {
+                angle -= 1;
+            } else if (isOpener(t.kind)) {
                 self.stack.append(self.gpa, .{ .indent = disp }) catch {};
             } else if (isCloser(t.kind)) {
                 if (self.stack.items.len > 0) _ = self.stack.pop();
-            } else if (t.kind == .COMMA and self.stack.items.len > 0) {
+            } else if (t.kind == .COMMA and angle == 0 and self.stack.items.len > 0) {
                 // A comma at the innermost open group's level marks it a
                 // comma-list (persists across lines until the group closes).
                 self.stack.items[self.stack.items.len - 1].had_comma = true;
@@ -1021,6 +1035,23 @@ test "unparseable input is reported, not reformatted" {
 test "empty and whitespace-only input format to empty" {
     try expectFmt("", "");
     try expectFmt("   \n\n  \n", "");
+}
+
+test "a comma inside generic type args does not grow a trailing comma" {
+    // `Simd<f32, 4>` was the first statement-position annotation carrying a
+    // comma; attributing it to the enclosing `{}` block marked the block a
+    // comma-list and appended a spurious trailing comma to its last stmt.
+    const src = "fn main {\n    let v: Simd<f32, 4> = Simd.splat(s)\n    env.out(\"{v}\")\n}\n";
+    const got = try fmtOk(src);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "env.out(\"{v}\"),") == null);
+    // A real comma-list inside the block still gets its trailing comma
+    // treatment via its own () group — the comparison `a < b` (spaced)
+    // must not open an angle span and swallow the call's comma.
+    const src2 = "fn main {\n    foo(\n        a < b,\n        c,\n    )\n}\n";
+    const got2 = try fmtOk(src2);
+    defer testing.allocator.free(got2);
+    try testing.expect(std.mem.indexOf(u8, got2, "c,") != null);
 }
 
 test "significant tokens are preserved (safety invariant)" {
