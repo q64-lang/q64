@@ -345,6 +345,69 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // env.time faces (spec/env.md `env.time`) — the local `qube run` ABI's
+    // clock: monotonic_ns/resolution_ns/unix_ns are niladic i64 reads,
+    // sleep_ns blocks the calling thread. Backed by libc clock_gettime/
+    // clock_getres/nanosleep. (These were the missing imports that kept the
+    // scheduler sections of link-roundtrip.sh from running on this host.)
+    {
+        var t_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new_empty(&t_params_vec);
+        var t_result_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var t_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&t_results_vec, t_result_types.len, @ptrCast(&t_result_types));
+        const t_type = c.wasm_functype_new(&t_params_vec, &t_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(t_type);
+        const clock_faces = [_]struct { name: []const u8, cb: c.wasmtime_func_callback_t }{
+            .{ .name = "monotonic_ns", .cb = envMonotonicNsCallback },
+            .{ .name = "resolution_ns", .cb = envResolutionNsCallback },
+            .{ .name = "unix_ns", .cb = envUnixNsCallback },
+        };
+        for (clock_faces) |f| {
+            const link_err2 = c.wasmtime_linker_define_func(
+                linker,
+                "env",
+                "env".len,
+                f.name.ptr,
+                f.name.len,
+                t_type,
+                f.cb,
+                null,
+                null,
+            );
+            if (link_err2) |e| {
+                try printErrorAndDelete(io, e, "linker_define_func env.time face");
+                std.process.exit(1);
+            }
+        }
+    }
+    {
+        var sl_param_types = [_]?*c.wasm_valtype_t{c.wasm_valtype_new(c.WASM_I64)};
+        var sl_params_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new(&sl_params_vec, sl_param_types.len, @ptrCast(&sl_param_types));
+        var sl_results_vec: c.wasm_valtype_vec_t = undefined;
+        c.wasm_valtype_vec_new_empty(&sl_results_vec);
+        const sl_type = c.wasm_functype_new(&sl_params_vec, &sl_results_vec) orelse
+            return error.FuncTypeNewFailed;
+        defer c.wasm_functype_delete(sl_type);
+        const link_err2 = c.wasmtime_linker_define_func(
+            linker,
+            "env",
+            "env".len,
+            "sleep_ns",
+            "sleep_ns".len,
+            sl_type,
+            envSleepNsCallback,
+            null,
+            null,
+        );
+        if (link_err2) |e| {
+            try printErrorAndDelete(io, e, "linker_define_func env.sleep_ns");
+            std.process.exit(1);
+        }
+    }
+
     // -------------------------------------------------------------
     // env.exit :: (code: i64) -> () (spec/env.md §`env.exit`,
     // `wasi:cli/exit`). The host terminates the process with the low byte of
@@ -622,6 +685,63 @@ pub fn main(init: std.process.Init) !void {
 // Called from C, so we can't accept an `Io` parameter. Reach for the
 // process-wide single-threaded Io. Fine for v0 since the host is
 // strictly single-threaded; revisit when we add concurrency.
+
+const Timespec = extern struct { sec: i64, nsec: i64 };
+extern "c" fn clock_gettime(clk: i32, tp: *Timespec) i32;
+extern "c" fn clock_getres(clk: i32, tp: *Timespec) i32;
+extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) i32;
+
+fn clockNs(clk: i32, results: [*c]c.wasmtime_val_t) void {
+    var ts = Timespec{ .sec = 0, .nsec = 0 };
+    _ = clock_gettime(clk, &ts);
+    results[0].kind = c.WASMTIME_I64;
+    results[0].of.i64 = ts.sec *% 1_000_000_000 +% ts.nsec;
+}
+
+fn envMonotonicNsCallback(env_: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, nargs: usize, results: [*c]c.wasmtime_val_t, nresults: usize) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = caller;
+    _ = args;
+    if (nargs != 0 or nresults != 1) return trap("env.monotonic_ns: expected () -> i64");
+    clockNs(1, results); // CLOCK_MONOTONIC
+    return null;
+}
+
+fn envUnixNsCallback(env_: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, nargs: usize, results: [*c]c.wasmtime_val_t, nresults: usize) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = caller;
+    _ = args;
+    if (nargs != 0 or nresults != 1) return trap("env.unix_ns: expected () -> i64");
+    clockNs(0, results); // CLOCK_REALTIME
+    return null;
+}
+
+fn envResolutionNsCallback(env_: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, nargs: usize, results: [*c]c.wasmtime_val_t, nresults: usize) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = caller;
+    _ = args;
+    if (nargs != 0 or nresults != 1) return trap("env.resolution_ns: expected () -> i64");
+    var ts = Timespec{ .sec = 0, .nsec = 1 };
+    _ = clock_getres(1, &ts);
+    results[0].kind = c.WASMTIME_I64;
+    results[0].of.i64 = if (ts.sec == 0 and ts.nsec > 0) ts.nsec else 1;
+    return null;
+}
+
+fn envSleepNsCallback(env_: ?*anyopaque, caller: ?*c.wasmtime_caller_t, args: [*c]const c.wasmtime_val_t, nargs: usize, results: [*c]c.wasmtime_val_t, nresults: usize) callconv(.c) ?*c.wasm_trap_t {
+    _ = env_;
+    _ = caller;
+    _ = results;
+    if (nargs != 1 or nresults != 0) return trap("env.sleep_ns: expected (ns) -> ()");
+    const ns = args[0].of.i64;
+    if (ns > 0) {
+        var req = Timespec{ .sec = @divTrunc(ns, 1_000_000_000), .nsec = @mod(ns, 1_000_000_000) };
+        var rem = Timespec{ .sec = 0, .nsec = 0 };
+        // Retry on EINTR so a signal doesn't shorten the parked wait.
+        while (nanosleep(&req, &rem) != 0) req = rem;
+    }
+    return null;
+}
 
 // SplitMix64 state for `env.random_u64`. Seeded once per run: from
 // Q64_SEED when set (deterministic, reproducible runs), else from the wall
