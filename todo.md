@@ -946,14 +946,17 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       (follow-ons):** main/callee value positions only — no SIMD params/
       returns/fields/Vec elements, no lane replace, no loads/stores, no
       shapes beyond f32x4/i32x4, no `let w = v` copies.
-- [ ] **Static-shape `Tensor` first slice** — UNBLOCKED: const generics v0
-      LANDED (`fn total<const N: i64>(xs: [f64; N])` — `const` params in
-      parseGenericSig, N inferred from a compile-time array count via the
-      new `[T; N]` array params (base-pointer ABI, konst count in callee
-      `scope.arrs`), stamped per value with N readable in the body as a
-      named constant; mismatched counts reject; wasm64 + wasm32 roundtrip
-      7.0/10.0/2). Boundaries: concrete elem types only, dim = lone ident,
-      one inference source (array args). Next (§B5):
+- [x] **Static-shape `Tensor` first slice — LANDED, THE MILESTONE MET.**
+      `Tensor<f64, [R, C]>` (annotation-parsed shape, flat row-major storage
+      riding the array machinery), `Tensor.from([…])` (count = R*C checked),
+      `m.get(i, j)` (bounds-checked f64 load at i*C+j), and **shape-checked
+      `a.matmul(b)`** — [A,B]×[B,C]→[A,C] verified [58 64; 139 154] on
+      wasm64 + wasm32; mismatched shapes/counts/elements reject at compile
+      time. The i/j/k loops build directly in HIR from the array primitives
+      (elem_ptr/field_get/field_set — array WRITES exist now as a
+      byproduct). Boundaries: f64 2-D only, literal data, get/matmul only
+      (elementwise ops + Simd-vectorized kernels + Tensor-typed const
+      generics are the follow-ons). Next (§B5):
       `Tensor<T, [A, B]>` as a monomorphized struct over `Simd` kernels;
       milestone = `matmul<T, const A, B, C>` with shape mismatch as a
       compile error (TYP070). `DynTensor` follows later. (Analysis §3, item 7.)

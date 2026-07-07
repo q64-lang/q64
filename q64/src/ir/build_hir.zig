@@ -775,6 +775,10 @@ fn buildMainStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, rt: *RtMap, out: *s
                 // `let d = xs.map|filter(|x| …)` — handled (vec_new + pushes).
             } else if (try tryVecReduce(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let r = xs.reduce(init, |acc, x| …)` — handled (scalar fold).
+            } else if (try tryTensorFrom(b, init_expr, nm.text, ls.isVar(), try tensorShapeOfAnnot(b, ls.type_()), scope, out)) {
+                // `let m: Tensor<f64, [R, C]> = Tensor.from([…])` — bound.
+            } else if (try tryTensorMatmul(b, init_expr, nm.text, ls.isVar(), scope, out)) {
+                // `let c = a.matmul(b)` — shape-checked, loops built in HIR.
             } else if (try tryRecOperator(b, init_expr, nm.text, ls.isVar(), scope, out)) {
                 // `let c = a + b` on record operands — an operator fit
                 // (spec/operators.md), dispatched through the fit registry.
@@ -6293,6 +6297,182 @@ fn operatorMethodName(kind: parser.cst.SyntaxKind) ?[]const u8 {
 /// Neg fit; binary ops map per spec/operators.md. Null when not an
 /// operator-on-records shape; a real operator shape with no fit or with
 /// mixed operand structs rejects honestly.
+/// `let m: Tensor<f64, [R, C]> = Tensor.from([…])` — flat row-major
+/// storage registered as an array (loads reuse the array machinery) plus
+/// the shape in `scope.tensors`. The literal count must equal R*C.
+fn tryTensorFrom(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, shape_opt: ?TensorShape, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const shape = shape_opt orelse return false;
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return error.Unsupported, // a Tensor annotation needs Tensor.from
+    };
+    const cname = (callPathName(b, cc)) orelse return error.Unsupported;
+    if (!std.mem.eql(u8, cname, "Tensor.from")) return error.Unsupported;
+    var ait = cc.args();
+    const a0 = ait.next() orelse return reject(b, .unsupported_call);
+    if (ait.next() != null) return reject(b, .unsupported_call);
+    if (a0 != .array) return reject(b, .unsupported_call); // v0: literal data
+    const arr = try buildArrayLit(b, a0.array, scope);
+    if (arr.count != shape.rows * shape.cols) return error.Unsupported; // count ≠ R*C
+    switch (arr.elem) {
+        .scalar => |t| if (t != .f64) return error.Unsupported,
+        else => return error.Unsupported,
+    }
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const idx = try scope.declare(name, is_var, .ptr);
+    try b.cur_locals.append(b.a, .ptr);
+    try scope.arrs.put(b.a, name, .{ .ptr_idx = idx, .count = .{ .konst = arr.count }, .stride = 8, .elem = .{ .scalar = .f64 } });
+    try scope.tensors.put(b.a, name, shape);
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .let = .{ .idx = idx, .value = arr.e } };
+    try out.append(b.a, st);
+    return true;
+}
+
+/// `let c = a.matmul(b)` on tensor bindings: shapes [A,B] × [B,C] → [A,C],
+/// checked at compile time; the result allocates as a zero array and the
+/// classic i/j/k loops build directly in HIR (field_get/field_set over
+/// elem_ptr — the same primitives array reads compose from).
+fn tryTensorMatmul(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    const cc = switch (init_expr) {
+        .call => |x| x,
+        else => return false,
+    };
+    const cname = (callPathName(b, cc)) orelse return false;
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return false;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "matmul")) return false;
+    const lsh = scope.tensors.get(cname[0..dot]) orelse return false;
+    const lloc = scope.find(cname[0..dot]) orelse return false;
+    var ait = cc.args();
+    const a0 = ait.next() orelse return reject(b, .unsupported_call);
+    if (ait.next() != null) return reject(b, .unsupported_call);
+    if (a0 != .path) return reject(b, .unsupported_call);
+    const rn = try pathText(b, a0.path);
+    const rsh = scope.tensors.get(rn) orelse return reject(b, .unsupported_call);
+    const rloc = scope.find(rn) orelse return reject(b, .unsupported_call);
+    if (lsh.cols != rsh.rows) return error.Unsupported; // shape mismatch [A,B]×[B,C]
+    const A = lsh.rows;
+    const B = lsh.cols;
+    const C = rsh.cols;
+
+    // Result: [A*C] zeros, bound like a Tensor.from.
+    const n: usize = @intCast(A * C);
+    const inits = try b.a.alloc(*hir.Expr, n);
+    for (inits) |*e| {
+        const z = try b.a.create(hir.Expr);
+        z.* = .{ .float_const = 0.0 };
+        e.* = z;
+    }
+    const alloc_e = try b.a.create(hir.Expr);
+    alloc_e.* = .{ .array_lit = .{ .stride = 8, .alignment = 8, .elem_ty = .f64, .copy_bytes = null, .inits = inits } };
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const cptr = try scope.declare(name, is_var, .ptr);
+    try b.cur_locals.append(b.a, .ptr);
+    try scope.arrs.put(b.a, name, .{ .ptr_idx = cptr, .count = .{ .konst = @intCast(n) }, .stride = 8, .elem = .{ .scalar = .f64 } });
+    try scope.tensors.put(b.a, name, .{ .rows = A, .cols = C });
+    const bind = try b.a.create(hir.Stmt);
+    bind.* = .{ .let = .{ .idx = cptr, .value = alloc_e } };
+    try out.append(b.a, bind);
+
+    // Hidden loop locals: i, j, k, acc.
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const iv = try scope.declare(try std.fmt.allocPrint(b.a, "{s}#i", .{name}), true, .i64);
+    try b.cur_locals.append(b.a, .i64);
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const jv = try scope.declare(try std.fmt.allocPrint(b.a, "{s}#j", .{name}), true, .i64);
+    try b.cur_locals.append(b.a, .i64);
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const kv = try scope.declare(try std.fmt.allocPrint(b.a, "{s}#k", .{name}), true, .i64);
+    try b.cur_locals.append(b.a, .i64);
+    scope.next_idx = @intCast(b.cur_locals.items.len);
+    const av = try scope.declare(try std.fmt.allocPrint(b.a, "{s}#acc", .{name}), true, .f64);
+    try b.cur_locals.append(b.a, .f64);
+
+    const ic = struct {
+        fn f(bb: *Builder, v: i64) BuildError!*hir.Expr {
+            const e = try bb.a.create(hir.Expr);
+            e.* = .{ .int_const = v };
+            return e;
+        }
+    }.f;
+    const lref = struct {
+        fn f(bb: *Builder, idx: u32, ty: hir.Type) BuildError!*hir.Expr {
+            const e = try bb.a.create(hir.Expr);
+            e.* = .{ .local = .{ .idx = idx, .ty = ty } };
+            return e;
+        }
+    }.f;
+    const setl = struct {
+        fn f(bb: *Builder, idx: u32, v: *hir.Expr) BuildError!*hir.Stmt {
+            const st = try bb.a.create(hir.Stmt);
+            st.* = .{ .assign = .{ .idx = idx, .value = v } };
+            return st;
+        }
+    }.f;
+    const lt = struct {
+        fn f(bb: *Builder, l: *hir.Expr, r: *hir.Expr) BuildError!*hir.Expr {
+            const e = try bb.a.create(hir.Expr);
+            e.* = .{ .bin = .{ .kind = .lt, .lhs = l, .rhs = r } };
+            return e;
+        }
+    }.f;
+    const addi = struct {
+        fn f(bb: *Builder, l: *hir.Expr, r: *hir.Expr, kind: ops.BinKind) BuildError!*hir.Expr {
+            const e = try bb.a.create(hir.Expr);
+            e.* = .{ .bin = .{ .kind = kind, .lhs = l, .rhs = r } };
+            return e;
+        }
+    }.f;
+
+    // innermost: acc = acc + a[i*B+k] * b[k*C+j]; k = k + 1
+    const a_elem = try tensorLoad(b, lloc.idx, try tensorFlatIndex(b, try lref(b, iv, .i64), B, try lref(b, kv, .i64)), A * B);
+    const b_elem = try tensorLoad(b, rloc.idx, try tensorFlatIndex(b, try lref(b, kv, .i64), C, try lref(b, jv, .i64)), B * C);
+    const prod = try addi(b, a_elem, b_elem, .mul);
+    const acc_new = try addi(b, try lref(b, av, .f64), prod, .add);
+    const k_body = try b.a.create(hir.Stmt);
+    k_body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{
+        try setl(b, av, acc_new),
+        try setl(b, kv, try addi(b, try lref(b, kv, .i64), try ic(b, 1), .add)),
+    }) };
+    const k_loop = try b.a.create(hir.Stmt);
+    k_loop.* = .{ .while_ = .{ .cond = try lt(b, try lref(b, kv, .i64), try ic(b, B)), .body = k_body } };
+
+    // j body: acc = 0; k = 0; k_loop; c[i*C+j] = acc; j = j + 1
+    const cbase = try lref(b, cptr, .ptr);
+    const cidx = try tensorFlatIndex(b, try lref(b, iv, .i64), C, try lref(b, jv, .i64));
+    const ccnt = try ic(b, A * C);
+    const cchk = try b.a.create(hir.Expr);
+    cchk.* = .{ .bounds_check = .{ .index = cidx, .count = ccnt } };
+    const ceptr = try b.a.create(hir.Expr);
+    ceptr.* = .{ .elem_ptr = .{ .base = cbase, .index = cchk, .stride = 8 } };
+    const store = try b.a.create(hir.Stmt);
+    store.* = .{ .field_set = .{ .base = ceptr, .offset = 0, .ty = .f64, .value = try lref(b, av, .f64) } };
+    const zf = try b.a.create(hir.Expr);
+    zf.* = .{ .float_const = 0.0 };
+    const j_body = try b.a.create(hir.Stmt);
+    j_body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{
+        try setl(b, av, zf),
+        try setl(b, kv, try ic(b, 0)),
+        k_loop,
+        store,
+        try setl(b, jv, try addi(b, try lref(b, jv, .i64), try ic(b, 1), .add)),
+    }) };
+    const j_loop = try b.a.create(hir.Stmt);
+    j_loop.* = .{ .while_ = .{ .cond = try lt(b, try lref(b, jv, .i64), try ic(b, C)), .body = j_body } };
+
+    const i_body = try b.a.create(hir.Stmt);
+    i_body.* = .{ .block = try b.a.dupe(*hir.Stmt, &.{
+        try setl(b, jv, try ic(b, 0)),
+        j_loop,
+        try setl(b, iv, try addi(b, try lref(b, iv, .i64), try ic(b, 1), .add)),
+    }) };
+    const i_loop = try b.a.create(hir.Stmt);
+    i_loop.* = .{ .while_ = .{ .cond = try lt(b, try lref(b, iv, .i64), try ic(b, A)), .body = i_body } };
+    try out.append(b.a, try setl(b, iv, try ic(b, 0)));
+    try out.append(b.a, i_loop);
+    return true;
+}
+
 const RecOperand = struct { e: *hir.Expr, si: *const StructInfo };
 
 fn recOperatorExpr(b: *Builder, e0: ast.Expr, scope: *Scope) BuildError!?RecOperand {
@@ -9226,6 +9406,61 @@ fn simdBinKind(method: []const u8) ?ops.BinKind {
     return null;
 }
 
+const TensorShape = struct { rows: i64, cols: i64 };
+
+/// The shape named by a `Tensor<f64, [R, C]>` annotation. Null when not a
+/// Tensor path; a recognized-but-unsupported Tensor annotation (non-f64
+/// element, not 2-D, non-literal dims) is an honest reject — same
+/// discipline as `Simd<…>`.
+fn tensorShapeOfAnnot(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?TensorShape {
+    const te = te_opt orelse return null;
+    if (te != .path) return null;
+    const nm = try te.path.name(b.a);
+    defer b.a.free(nm);
+    if (!std.mem.eql(u8, nm, "Tensor")) return null;
+    const raw = (try te.path.genericArgsText(b.a)) orelse return error.Unsupported;
+    defer b.a.free(raw);
+    // `<f64, [R, C]>`: element type, then the bracketed shape.
+    const inner = std.mem.trim(u8, raw, "<> \t");
+    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return error.Unsupported;
+    if (!std.mem.eql(u8, std.mem.trim(u8, inner[0..comma], " \t"), "f64")) return error.Unsupported;
+    const shape_txt = std.mem.trim(u8, inner[comma + 1 ..], " \t");
+    if (shape_txt.len < 5 or shape_txt[0] != '[' or shape_txt[shape_txt.len - 1] != ']') return error.Unsupported;
+    const dims = shape_txt[1 .. shape_txt.len - 1];
+    const dcomma = std.mem.indexOfScalar(u8, dims, ',') orelse return error.Unsupported;
+    const rows = std.fmt.parseInt(i64, std.mem.trim(u8, dims[0..dcomma], " \t"), 10) catch return error.Unsupported;
+    const cols = std.fmt.parseInt(i64, std.mem.trim(u8, dims[dcomma + 1 ..], " \t"), 10) catch return error.Unsupported;
+    if (rows <= 0 or cols <= 0) return error.Unsupported;
+    return .{ .rows = rows, .cols = cols };
+}
+
+/// A bounds-checked f64 element load of a tensor's flat storage at a
+/// computed index expression.
+fn tensorLoad(b: *Builder, ptr_idx: u32, index: *hir.Expr, count: i64) BuildError!*hir.Expr {
+    const base = try b.a.create(hir.Expr);
+    base.* = .{ .local = .{ .idx = ptr_idx, .ty = .ptr } };
+    const cnt = try b.a.create(hir.Expr);
+    cnt.* = .{ .int_const = count };
+    const checked = try b.a.create(hir.Expr);
+    checked.* = .{ .bounds_check = .{ .index = index, .count = cnt } };
+    const eptr = try b.a.create(hir.Expr);
+    eptr.* = .{ .elem_ptr = .{ .base = base, .index = checked, .stride = 8 } };
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .field_get = .{ .base = eptr, .offset = 0, .ty = .f64 } };
+    return out;
+}
+
+/// `row * COLS + col` as a HIR index expression.
+fn tensorFlatIndex(b: *Builder, row: *hir.Expr, cols: i64, col: *hir.Expr) BuildError!*hir.Expr {
+    const c = try b.a.create(hir.Expr);
+    c.* = .{ .int_const = cols };
+    const mulv = try b.a.create(hir.Expr);
+    mulv.* = .{ .bin = .{ .kind = .mul, .lhs = row, .rhs = c } };
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .bin = .{ .kind = .add, .lhs = mulv, .rhs = col } };
+    return out;
+}
+
 /// Build a SIMD-valued operand of a SIMD method. A bare path naming a
 /// SIMD binding reads as its local here — and ONLY here: the generic
 /// bare-path read rejects SIMD bindings so a v128 can never reach the
@@ -9687,6 +9922,10 @@ const ExprTypeBridge = struct {
                     if (head.ty == .f32) return .f32;
                 }
             }
+            // A tensor element load (`m.get(i, j)`) is f64 (v0 tensors).
+            if (std.mem.eql(u8, mname, "get")) {
+                if (self.scope.tensors.get(name[0..dot]) != null) return .f64;
+            }
             // SIMD: `Simd.splat(x)` types by its operand's scalar (f32 →
             // f32x4, i64 → i32x4); on a SIMD binding, `add`/`mul` keep the
             // receiver's shape and `extract` yields the lane scalar.
@@ -9837,6 +10076,10 @@ const Scope = struct {
     /// present. The header base pointer lives in `locals` under the
     /// same name (a `.ptr`); elements are i64 by default.
     vecs: std.StringHashMapUnmanaged(void) = .empty,
+    /// 2D tensor bindings: name → compile-time shape. The data rides the
+    /// same registration in `arrs` (flat row-major storage), so element
+    /// loads reuse the array machinery; this table adds the shape.
+    tensors: std.StringHashMapUnmanaged(TensorShape) = .empty,
     /// Stamped const-generic values visible in this body (`N` in
     /// `fn total<const N: i64>(xs: [f64; N])`): name → the i64 value,
     /// inlined at every read like a module const.
@@ -10897,6 +11140,21 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                                 out.* = .{ .bin = .{ .kind = bk, .lhs = lhs, .rhs = rhs } };
                                 return out;
                             }
+                        }
+                    }
+                    // `m.get(i, j)` on a tensor binding: a bounds-checked
+                    // f64 load at the flat row-major index i*C + j.
+                    if (std.mem.eql(u8, cname[dot + 1 ..], "get")) {
+                        if (scope.tensors.get(head)) |tsh| {
+                            const tloc = scope.find(head) orelse return reject(b, .unsupported_call);
+                            var git = cc.args();
+                            const ga = git.next() orelse return reject(b, .unsupported_call);
+                            const gb = git.next() orelse return reject(b, .unsupported_call);
+                            if (git.next() != null) return reject(b, .unsupported_call);
+                            const ri = try buildIntExpr(b, ga, scope);
+                            const ci = try buildIntExpr(b, gb, scope);
+                            const flat = try tensorFlatIndex(b, ri, tsh.cols, ci);
+                            return try tensorLoad(b, tloc.idx, flat, tsh.rows * tsh.cols);
                         }
                     }
                     // `Simd.splat(x)` — construct a lane-shaped v128 from a

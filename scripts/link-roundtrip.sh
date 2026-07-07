@@ -3527,6 +3527,29 @@ kg32_out="$("$HOST_BIN" "$tmp/cg32.wasm")"
 [[ "$kg32_out" == "$kg_expected" ]] || { echo "FAIL: const generics wasm32 (got: $kg32_out)" >&2; exit 1; }
 echo "    ok: const generics -> 7.0 / 10.0 / 2 (wasm64 + wasm32; two stamps of one generic, N in the body)"
 
+echo "==> tensor first slice: Tensor<f64, [R, C]> + shape-checked matmul (THE analysis milestone)"
+tn_app="$tmp/tensor.q"
+cat > "$tn_app" <<'Q64'
+fn main {
+    let a: Tensor<f64, [2, 3]> = Tensor.from([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let b: Tensor<f64, [3, 2]> = Tensor.from([7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    let c = a.matmul(b)
+    env.out(c.get(0, 0))
+    env.out(c.get(0, 1))
+    env.out(c.get(1, 0))
+    env.out(c.get(1, 1))
+    env.out(a.get(1, 2))
+}
+Q64
+tn_expected=$'58.0\n64.0\n139.0\n154.0\n6.0'
+"$Q64_BIN" emit "$tn_app" "$tmp/tensor.wasm"
+tn_out="$("$HOST_BIN" "$tmp/tensor.wasm")"
+[[ "$tn_out" == "$tn_expected" ]] || { echo "FAIL: tensor matmul (got: $tn_out)" >&2; exit 1; }
+"$Q64_BIN" emit "$tn_app" "$tmp/tensor32.wasm" --addr wasm32
+tn32_out="$("$HOST_BIN" "$tmp/tensor32.wasm")"
+[[ "$tn32_out" == "$tn_expected" ]] || { echo "FAIL: tensor matmul wasm32 (got: $tn32_out)" >&2; exit 1; }
+echo "    ok: tensor matmul -> [58 64; 139 154] + get (wasm64 + wasm32; compile-time shape check)"
+
 echo "==> simd first slice: Simd.splat + lane-wise add/mul + extract (f32x4 + i32x4, native v128 ops)"
 sd_app="$tmp/simd.q"
 cat > "$sd_app" <<'Q64'
