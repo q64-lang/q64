@@ -1007,22 +1007,23 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       proves (seeded random ✓, virtual clock, record/replay per capability
       with trap-on-divergence), and arena snapshot/rollback as a bounded
       memcpy (sequenced after named regions). (Analysis §4.)
-- [ ] **WGSL compute-kernel emission — design note.** Generalize the gfx
-      "shaders written in q64 → WGSL" plan to compute: a `@gpu`/`@kernel`
-      marked fn compiled from MIR (structured form maps cleanly onto WGSL).
-      The portable GPU story that fits the WebKit/iPad floor; native quality
-      via wgpu/Dawn on the wasmtime host. (Analysis §3, item 11.)
+- [x] **WGSL compute kernels — design note WRITTEN**
+      (`docs/wgsl-kernels.md`): `@kernel` fns as a fourth MIR consumer
+      (structured MIR → WGSL 1:1, no relooper), Tensor params as storage
+      buffers, dispatch as the `@gpu` capability, CPU fallback for free
+      (a kernel is still an ordinary fn). Sequenced behind Tensor<f32>.
+      (Analysis §3, item 11.)
 - [ ] **Host-inference capability face** (`env.ai.infer`, `@inference`):
       WebNN (browser) / ONNX-runtime-or-GGML (native) behind one face, making
       `stdlib/ai`'s `Model<InVocab, OutVocab>` surface executable and feeding
       token streams into `Stream<Token<V>, R>` — the voice-agent flagship
       becomes buildable end-to-end. (Analysis §3, item 12.)
-- [ ] **Crypto notes**: the codegen story for wide ints (i128/u128 are
-      already in the sema TypeStore tower; u256 for contract targets), and a
-      `@const_time` effect assert (no secret-dependent branches or memory
-      indexing — checkable on MIR, same family as `@no_alloc`). Primitives
-      themselves arrive via wasm-compiled verified libraries (HACL*/libsodium)
-      through the `ffi.md` path above, not reimplementation. (Analysis §4.)
+- [x] **Crypto notes — design note WRITTEN** (`docs/crypto-notes.md`):
+      i128/u128 codegen as the one rung; U256 as a stdlib type over u128
+      limbs with operator fits (not a builtin); `@const_time` as a checked
+      MIR-walk assert with a `Secret<T>` taint kind + explicit
+      `declassify()`; verified primitives via the FFI path declared
+      `@const_time` at the boundary. (Analysis §4.)
 
 ## Compiler + linking — ACTIVE FOCUS (resuming after the weekend)
 
