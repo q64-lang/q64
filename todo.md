@@ -917,8 +917,15 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       roundtrip pins `a + b` / `a * b` / `p / b` / `|p*p|` = 125 on the
       IMPORTED type, wasm64 + wasm32. **`%` → `rem` and unary `-` → `neg` LANDED**
       (roundtrip: `-a` on imported Complex, `x % y` via a root Rem fit; fit
-      bodies with leading `let`s prove out). **Boundaries (follow-ons):**
-      operators in nested/argument/statement positions, TYP360/361 from
+      bodies with leading `let`s prove out). **Nested positions LANDED**
+      (`recOperand`: paths / parens / nested operator trees via hidden
+      `#op<n>` temps, incl. through unary neg — `(a+b)*(a-b)` on imported
+      Complex verified). **Boundaries (follow-ons):** ARGUMENT/statement
+      positions — design note: `buildCallArgs` has six expression-context
+      callers and no statement sink, so don't thread `out` through it;
+      instead pre-hoist operator-shaped args to `#op<n>` temps at the
+      statement-level builders (let/expr-stmt, where `out` exists) before
+      the call builds, reusing `recOperand`. Plus TYP360/361 from
       `q64 check`. (Analysis §3, Tier 0.)
 - [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
       LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
