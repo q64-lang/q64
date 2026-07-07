@@ -3437,9 +3437,12 @@ fn main {
     env.out(q.im)
     let m = p * p
     env.out(cabs(m))
+    let n = -a
+    env.out(n.re)
+    env.out(n.im)
 }
 Q64
-co_expected=$'4.0\n6.0\n-5.0\n10.0\n1.0\n2.0\n125.0'
+co_expected=$'4.0\n6.0\n-5.0\n10.0\n1.0\n2.0\n125.0\n-1.0\n-2.0'
 "$Q64_BIN" emit "$co_app" "$tmp/cxops.wasm" --module q64.math="$REPO_ROOT/stdlib/math/src/lib.q"
 co_out="$("$HOST_BIN" "$tmp/cxops.wasm")"
 [[ "$co_out" == "$co_expected" ]] || { echo "FAIL: Complex operator fits (got: $co_out)" >&2; exit 1; }

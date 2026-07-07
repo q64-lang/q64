@@ -236,6 +236,12 @@ pub fit Complex : Mul {
     }
 }
 
+pub fit Complex : Neg {
+    fn neg(self) -> Complex {
+        Complex { re: 0.0 - self.re, im: 0.0 - self.im }
+    }
+}
+
 pub fit Complex : Div {
     fn div(self, rhs: Complex) -> Complex {
         let d = rhs.re * rhs.re + rhs.im * rhs.im

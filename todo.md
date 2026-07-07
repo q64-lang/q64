@@ -915,9 +915,11 @@ ladder, §"C bindings", and the roadmap phases, deliberately not duplicated here
       `registerFitMethod` compiles the method body in the struct's own
       scope), `q64.math` declares Add/Sub/Mul/Div fits on Complex, and the
       roundtrip pins `a + b` / `a * b` / `p / b` / `|p*p|` = 125 on the
-      IMPORTED type, wasm64 + wasm32. **Boundaries (follow-ons):** `%`,
-      unary `-` → `neg`, operators in nested/argument/statement positions,
-      TYP360/361 from `q64 check`. (Analysis §3, Tier 0.)
+      IMPORTED type, wasm64 + wasm32. **`%` → `rem` and unary `-` → `neg` LANDED**
+      (roundtrip: `-a` on imported Complex, `x % y` via a root Rem fit; fit
+      bodies with leading `let`s prove out). **Boundaries (follow-ons):**
+      operators in nested/argument/statement positions, TYP360/361 from
+      `q64 check`. (Analysis §3, Tier 0.)
 - [x] **`Simd<T, N>` first slice + SIMD128 in the emitted feature set —
       LANDED.** `Simd.splat(x)` (f32 → f32x4, i64 → i32x4), lane-wise
       `v.add(w)`/`v.mul(w)`, `v.extract(0..3)`; `Simd<f32, 4>`/`Simd<i32, 4>`

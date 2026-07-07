@@ -6282,6 +6282,7 @@ fn operatorMethodName(kind: parser.cst.SyntaxKind) ?[]const u8 {
         .MINUS => "sub",
         .STAR => "mul",
         .SLASH => "div",
+        .PERCENT => "rem",
         else => null,
     };
 }
@@ -6292,6 +6293,24 @@ fn operatorMethodName(kind: parser.cst.SyntaxKind) ?[]const u8 {
 /// returned record. False when the initializer isn't that shape; a shape
 /// that IS an operator on records but has no fit rejects honestly.
 fn tryRecOperator(b: *Builder, init_expr: ast.Expr, name: []const u8, is_var: bool, scope: *Scope, out: *std.ArrayList(*hir.Stmt)) BuildError!bool {
+    // Unary `-a` on a record binding → the Neg fit's `a.neg()`.
+    if (init_expr == .unary) {
+        const ux = init_expr.unary;
+        const uop = ux.op() orelse return false;
+        if (uop.kind != .MINUS) return false;
+        const oe = ux.operand() orelse return false;
+        if (oe != .path) return false;
+        const on = try pathText(b, oe.path);
+        const osi = scope.recs.get(on) orelse return false;
+        const id = (try registerFitMethod(b, osi, "neg")) orelse return error.Unsupported;
+        const oloc = scope.find(on) orelse return false;
+        const oref = try b.a.create(hir.Expr);
+        oref.* = .{ .local = .{ .idx = oloc.idx, .ty = .ptr } };
+        const ncall = try b.a.create(hir.Expr);
+        ncall.* = .{ .call = .{ .func = id, .args = try b.a.dupe(*hir.Expr, &.{oref}) } };
+        try bindMainRecord(b, scope, name, is_var, ncall, osi, out);
+        return true;
+    }
     const bx = switch (init_expr) {
         .bin => |x| x,
         else => return false,
