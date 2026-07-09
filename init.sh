@@ -51,6 +51,13 @@ ZIG_INDEX_URL="https://ziglang.org/download/index.json"
 WASMTIME_VERSION="${WASMTIME_VERSION:-45.0.0}"
 WASMTIME_DEST="vendor/wasmtime"
 WASMTIME_RELEASE_BASE="https://github.com/bytecodealliance/wasmtime/releases/download"
+# Same fetch model as wabt / wasm-tools / the WASI adapter: a public CDN mirror
+# (cdn.q64.dev/toolchain, same upstream archive under the same name) tried first,
+# the github.com release as the fallback, both checked against the same pin. This
+# matters in sandboxed/proxied environments where github release-asset downloads
+# are blocked but the CDN is reachable — the C API download used to be the one
+# toolchain step with no mirror, so its failure aborted the whole bootstrap.
+WASMTIME_CACHE_URL="${WASMTIME_CACHE_URL-https://cdn.q64.dev/toolchain}"
 
 BINARYEN_VERSION="${BINARYEN_VERSION:-129}"
 BINARYEN_DEST="vendor/binaryen"
@@ -271,13 +278,29 @@ install_wasmtime() {
     local key="WASMTIME_KNOWN_SHA256_${arch}_${os}"
     local expected_sha="${WASMTIME_SHA256:-${!key:-}}"
     if [ -z "$expected_sha" ]; then
-        echo "init.sh: no pinned sha256 for wasmtime ${WASMTIME_VERSION} on ${arch}-${os}." >&2
-        echo "        Re-run with WASMTIME_SHA256=<sha> (or =skip to bypass verification)." >&2
-        exit 1
+        echo "init.sh: no pinned sha256 for wasmtime ${WASMTIME_VERSION} on ${arch}-${os} — skipping." >&2
+        echo "        Set WASMTIME_SHA256=<sha> (or =skip) to vendor it; the wasm/LSP targets" >&2
+        echo "        build without it, the native runtime (runtime/wasmtime/) needs it." >&2
+        return 0
     fi
 
-    echo "init.sh: downloading $url"
-    curl -fsSL "$url" -o "$tmpdir/$tarball"
+    # CDN mirror first, then the upstream release; both verified against the same
+    # pin below. A total failure is non-fatal (matches the other vendored tools):
+    # only the native runtime target needs the C API, so the bootstrap must not
+    # abort here and strand the later steps (binaryen, etc.).
+    local src=""
+    if [ -n "${WASMTIME_CACHE_URL:-}" ] && \
+       curl -fsSL "${WASMTIME_CACHE_URL%/}/$tarball" -o "$tmpdir/$tarball" 2>/dev/null && [ -s "$tmpdir/$tarball" ]; then
+        src="cache (${WASMTIME_CACHE_URL})"
+    elif curl -fsSL "$url" -o "$tmpdir/$tarball" 2>/dev/null && [ -s "$tmpdir/$tarball" ]; then
+        src="release"
+    else
+        echo "init.sh: wasmtime C API download failed (CDN mirror + $url) — skipping." >&2
+        echo "        The wasm/LSP/emit targets build without it; the native runtime" >&2
+        echo "        (runtime/wasmtime/) needs it and will error at build time if absent." >&2
+        return 0
+    fi
+    echo "init.sh: fetched wasmtime C API from $src"
 
     if [ "$expected_sha" != "skip" ]; then
         local actual_sha
@@ -331,9 +354,14 @@ install_wasmtime_cli() {
         return 0
     fi
 
-    echo "init.sh: downloading $url"
-    if ! curl -fsSL "$url" -o "$tmpdir/$tarball"; then
-        echo "init.sh: wasmtime CLI download failed — skipping (optional WASIp3 runner)" >&2
+    # CDN mirror first, then the upstream release; the same pin verifies either.
+    if [ -n "${WASMTIME_CACHE_URL:-}" ] && \
+       curl -fsSL "${WASMTIME_CACHE_URL%/}/$tarball" -o "$tmpdir/$tarball" 2>/dev/null && [ -s "$tmpdir/$tarball" ]; then
+        echo "init.sh: fetched wasmtime CLI from cache (${WASMTIME_CACHE_URL})"
+    elif curl -fsSL "$url" -o "$tmpdir/$tarball" 2>/dev/null && [ -s "$tmpdir/$tarball" ]; then
+        echo "init.sh: fetched wasmtime CLI from release"
+    else
+        echo "init.sh: wasmtime CLI download failed (CDN mirror + $url) — skipping (optional WASIp3 runner)" >&2
         return 0
     fi
 
