@@ -33,7 +33,7 @@ const ast = parser.ast;
 const parse = parser.parse;
 
 pub const schema_version = 1;
-pub const q64_version = "0.0.7";
+pub const q64_version = "0.0.8";
 
 // =====================================================================
 // Builtin / prelude types
