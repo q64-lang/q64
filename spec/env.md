@@ -227,19 +227,28 @@ independently of the pinned `wasip3` core snapshot, like `wasi:keyvalue`.
 > `wasi:io` stream emission. (`list` is not yet implemented.) See
 > `q64/src/codegen/wit/q64-blob.wit` and `test/blob-component-reference/`.
 >
-> **Implementation status (env.db).** A **v0 scalar surface** is implemented:
+> **Implementation status (env.db).** A **v0 scalar + typed-row surface** is
+> implemented:
 > `execute(sql)` (DDL / INSERT / UPDATE / DELETE → `Result<u64>` rows-affected),
 > `query_value(sql)` (first column of the first row as an integer →
-> `Result<Option<i64>>` — `COUNT(*)`, `SUM`, `MAX(id)`, `LIMIT 1`), and
-> `query_text(sql)` (first cell as text → `Result<Option<Bytes>>`). Like
-> `env.blob`, these lower to a **q64-owned `q64:db/sql`** interface, *not* raw
-> `wasi:sql`: `wasi:rdbms` is not a real WASI package, and `wasi:sql` (Phase 1,
-> `0.2.0-draft`) has a `row = { field-name, value }` single-cell model, a
-> 13-case value variant, and no `batch` — none of which map to a landed q64
-> decode. **Deferred:** the typed multi-row `query(...) -> Rows` + typed
-> `[Value]` params + `batch` in the `Database` face below need a variable-length
-> typed decode + a first-class dynamic `Value` q64 does not yet have; v0 takes
-> literal SQL only. See `q64/src/codegen/wit/q64-db.wit` and
+> `Result<Option<i64>>` — `COUNT(*)`, `SUM`, `MAX(id)`, `LIMIT 1`),
+> `query_text(sql)` (first cell as text → `Result<Option<Bytes>>`), and
+> `query_one<Row>(sql)` (the first row's **integer** columns decoded onto a
+> `struct Row` → `Result<Option<Row>>`). `query_one` maps the canonical
+> `list<s64>` the host returns onto the row **zero-copy** — N contiguous 8-byte
+> cells ARE an all-`i64` record's fields, so the record pointer is the list
+> pointer, needing no variable-length decoder and no dynamic `Value`. The
+> `struct`'s field count must equal the SELECT's column count; **v0 requires
+> every field to be `i64`**. Like `env.blob`, these lower to a **q64-owned
+> `q64:db/sql`** interface, *not* raw `wasi:sql`: `wasi:rdbms` is not a real WASI
+> package, and `wasi:sql` (Phase 1, `0.2.0-draft`) has a
+> `row = { field-name, value }` single-cell model, a 13-case value variant, and
+> no `batch` — none of which map to a landed q64 decode. **Deferred, additively:**
+> a **text** column in a `query_one` struct needs the struct layout floor lifted
+> to admit a `str` field; typed multi-row `query(...) -> Vec<Row>` needs a
+> Vec-of-records element (records live in the per-call arena, the Vec heap is
+> persistent); typed `[Value]` params + `batch` need a first-class dynamic
+> `Value`. v0 takes literal SQL only. See `q64/src/codegen/wit/q64-db.wit` and
 > `test/db-component-reference/`.
 
 ```q64

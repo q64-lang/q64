@@ -203,26 +203,32 @@ const Parser = struct {
         return self.tokens[i].kind;
     }
 
-    /// Is `base` a bare single-IDENT path whose name takes a turbofish call
-    /// (`<…>(`) rather than a comparison? Two names qualify: `channel` (the
-    /// constructor needs its element type) and `connect` (the remote-channel
-    /// opener needs the imported export — `connect<iface.fn>()`). General
-    /// `a<b>(c)` stays a comparison.
+    /// Is `base` a path whose name takes a turbofish call (`<…>(`) rather than a
+    /// comparison? Qualifying names: the single-IDENT `channel` (the constructor
+    /// needs its element type) and `connect` (the remote-channel opener needs the
+    /// imported export — `connect<iface.fn>()`), plus the dotted capability face
+    /// `env.db.query_one` (the typed-row query needs its row struct —
+    /// `env.db.query_one<Row>(sql)`). General `a<b>(c)` / `a.b<c>(d)` stays a
+    /// comparison — only these exact names turbofish.
     fn isTurbofishBase(base: *const cst.Node) bool {
         if (base.kind != .PATH_EXPR) return false;
-        var name: ?[]const u8 = null;
+        // Collect the dotted path's IDENT segments; a segment separator (DOT) is
+        // allowed, any other non-trivia token or a nested node disqualifies it.
+        var segs: [4][]const u8 = undefined;
         var n: usize = 0;
         for (base.children) |c| switch (c) {
             .token => |t| {
-                if (t.kind.isTrivia()) continue;
-                if (t.kind != .IDENT) return false;
-                name = t.text;
+                if (t.kind.isTrivia() or t.kind == .DOT) continue;
+                if (t.kind != .IDENT or n == segs.len) return false;
+                segs[n] = t.text;
                 n += 1;
             },
             .node => return false,
         };
-        return n == 1 and name != null and
-            (std.mem.eql(u8, name.?, "channel") or std.mem.eql(u8, name.?, "connect"));
+        if (n == 1) return std.mem.eql(u8, segs[0], "channel") or std.mem.eql(u8, segs[0], "connect");
+        if (n == 3) return std.mem.eql(u8, segs[0], "env") and
+            std.mem.eql(u8, segs[1], "db") and std.mem.eql(u8, segs[2], "query_one");
+        return false;
     }
 
     /// At a `<`, is there a balanced `<…>` whose closing `>` is immediately
@@ -2429,11 +2435,11 @@ const Parser = struct {
                     base = try cst.makeNode(self.arena, .CALL_EXPR, children.items);
                 },
                 .L_ANGLE => {
-                    // `channel<T>(…)` / `connect<iface.fn>()` — the turbofish call
-                    // forms q64 parses (the constructor / opener need their type
-                    // argument; general `a<b>(c)` stays a comparison). Fires only
-                    // when the base is one of those paths and a balanced `<…>` is
-                    // immediately followed by `(`.
+                    // `channel<T>(…)` / `connect<iface.fn>()` / `env.db.query_one<Row>(…)`
+                    // — the turbofish call forms q64 parses (the constructor / opener /
+                    // typed-row query need their type argument; general `a<b>(c)` stays a
+                    // comparison). Fires only when the base is one of those paths and a
+                    // balanced `<…>` is immediately followed by `(`.
                     if (base.kind != .PATH_EXPR or !isTurbofishBase(base) or !self.angleThenParen()) break;
                     var children: std.ArrayList(cst.Element) = .empty;
                     try children.append(self.arena, .{ .node = base });

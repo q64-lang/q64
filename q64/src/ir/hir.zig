@@ -527,6 +527,14 @@ pub const Expr = union(enum) {
     /// (`q64:db/sql.connection.query-text`). Boxed
     /// `Result<Option<Bytes>, IoError>` (`Ok(Some(s))`/`Ok(None)`/`Err`). Marks `@db`.
     db_query_text: struct { sql: *Expr },
+    /// `env.db.query_one<Row>(sql)` — the first row's integer columns as a typed
+    /// struct (`q64:db/sql.connection.query-one`, `result<option<list<s64>>>`).
+    /// Boxed `Result<Option<Row>, IoError>` (`Ok(Some(row))`/`Ok(None)`/`Err`);
+    /// the row struct decodes zero-copy over the canonical `list<s64>` (N
+    /// contiguous 8-byte cells = an all-`i64` record). `ncols` is Row's field
+    /// count (a decode/repro aid; the box holds the list pointer directly).
+    /// Marks `@db`.
+    db_query_one: struct { sql: *Expr, ncols: u32 },
     /// `env.config.get(key)` — read a config/secret value by key
     /// (spec/env.md §`env.config`, `wasi:config/store.get`). `key` is a `str`.
     /// `get` is a TOP-LEVEL interface function (no host handle), so it lowers to

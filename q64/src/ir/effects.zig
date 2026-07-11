@@ -261,6 +261,10 @@ fn collectExpr(
             d.insert(.db);
             try collectExpr(a, db.sql, d, e);
         },
+        .db_query_one => |db| {
+            d.insert(.db);
+            try collectExpr(a, db.sql, d, e);
+        },
         .config_get => |cf| {
             d.insert(.config);
             try collectExpr(a, cf.key, d, e);

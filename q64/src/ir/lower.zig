@@ -420,6 +420,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .db_execute => |db| return mk(ctx.a, .ptr, .{ .db_execute = .{ .sql = try lowerStrExpr(ctx, db.sql) } }),
         .db_query_value => |db| return mk(ctx.a, .ptr, .{ .db_query_value = .{ .sql = try lowerStrExpr(ctx, db.sql) } }),
         .db_query_text => |db| return mk(ctx.a, .ptr, .{ .db_query_text = .{ .sql = try lowerStrExpr(ctx, db.sql) } }),
+        .db_query_one => |db| return mk(ctx.a, .ptr, .{ .db_query_one = .{ .sql = try lowerStrExpr(ctx, db.sql), .ncols = db.ncols } }),
         .config_get => |cf| return mk(ctx.a, .ptr, .{ .config_get = .{ .key = try lowerStrExpr(ctx, cf.key) } }),
         .time_monotonic_ns => return mk(ctx.a, .i64, .{ .time_monotonic_ns = {} }),
         .random_u64 => return mk(ctx.a, .i64, .{ .random_u64 = {} }),

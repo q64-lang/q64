@@ -11,7 +11,7 @@ world plus these dep packages to a temp dir and shells out to
 |------|---------|------|-----------------|
 | `wasi-keyvalue.wit` | `wasi:keyvalue@0.2.0-draft2` | `env.kv` | `store` (`open`), `atomics` (`increment`) |
 | `q64-blob.wit` | `q64:blob@0.2.0-draft2` | `env.blob` | `store` (`open`, bucket methods) |
-| `q64-db.wit` | `q64:db@0.2.0-draft2` | `env.db` | `sql` (`open`, connection methods) |
+| `q64-db.wit` | `q64:db@0.2.0-draft2` | `env.db` | `sql` (`open`; connection `exec`, `query-value`, `query-text`, `query-one`) |
 | `wasi-config.wit` | `wasi:config@0.2.0-draft` | `env.config` | `store` (`get`) |
 | `wasi-clocks.wit` | `wasi:clocks@0.2.0` | `env.time` | `monotonic-clock` (`now`, `resolution`, `subscribe-duration`), `wall-clock` (`now`) |
 | `wasi-io.wit` | `wasi:io@0.2.0` | `env.time.sleep_ns` | `poll` (`pollable.block`, drop) |

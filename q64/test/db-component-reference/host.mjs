@@ -38,6 +38,15 @@ class Connection {
     const v = Object.values(row)[0];
     return v == null ? undefined : String(v);
   }
+  // result<option<list<s64>>, error>: the first row's INTEGER columns, in
+  // SELECT order (jco lowers the returned array as the canonical list<s64>).
+  // The guest maps them positionally onto its row struct — the qube's SELECT
+  // must return one integer per struct field. `undefined` = Ok(None).
+  queryOne(sql) {
+    const row = sqlite.prepare(sql).get();
+    if (!row) return undefined;
+    return Object.values(row).map((v) => BigInt(v));
+  }
 }
 const theConn = new Connection();
 
@@ -68,4 +77,8 @@ expect('add', inst.add(), 1n); // INSERT -> Ok(1 row affected)
 expect('add again', inst.add(), 1n);
 expect('count', inst.count(), 2n); // query_value COUNT(*) -> Ok(Some(2)) — 8-aligned option
 expect('namelen', inst.namelen(), 3n); // query_text "ada" -> Ok(Some("ada")) -> len 3
+// query_one<Row> over the first user: (id=1, LENGTH('ada')=3) decoded zero-copy
+// onto struct Row { id, namelen } -> id*100 + namelen = 103. Proves the typed
+// row's canonical list<s64> ↔ record mapping (both columns, not just the first).
+expect('firstrow', inst.firstrow(), 103n);
 console.log('OK — the q64 db component runs on a real SQLite q64:db/sql host.');

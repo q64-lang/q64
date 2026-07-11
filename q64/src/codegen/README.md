@@ -81,6 +81,21 @@ hand-written reference core + `run.sh` that builds and validates the component
 through `wasm-tools`, independent of the q64 build. `src/codegen/wit/` holds the
 vendored `wasi:keyvalue` WIT dep the emit shells out with.
 
+The same store scaffolding (`cm32p2` memory/realloc + a fixed return area + the
+2/3-cell boxed-Result decode) is shared by `env.blob` (`q64:blob/store`),
+`env.config` (`wasi:config/store`), and `env.db` (`q64:db/sql`). The db face
+lowers `execute` → `Result<u64>`, `query_value` → `Result<Option<i64>>`,
+`query_text` → `Result<Option<Bytes>>`, and **`query_one<Row>`** → the first
+row's integer columns as `result<option<list<s64>>, error>`, boxed as
+`Result<Option<Row>>`. `query_one` decodes the row **zero-copy**: a canonical
+`list<s64>` is N contiguous 8-byte cells — an all-`i64` record's exact layout —
+so the inner `Some` box holds the list pointer directly as the record base
+(`storeComponentQueryOne` in `emit.zig`), and `Ok(Some(row))` binds `row: Row`
+via the enum machinery's `.rec` payload. v0 is integer columns only; text
+columns and multi-row `Vec<Row>` are the deferred, additive widenings (see the
+`q64-db.wit` header). Round-trip proof against real SQLite:
+[`../../test/db-component-reference/`](../../test/db-component-reference/).
+
 ## External
 
 - **Binaryen** — Wasm 3.0 backend, called via its C API. Vendored

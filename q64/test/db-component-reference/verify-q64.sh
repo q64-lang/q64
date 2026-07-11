@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end check of the REAL `q64 emit --component` env.db lowering. Builds
 # the db-scalar example through the q64 binary, validates the component, asserts
-# it imports the q64-owned q64:db/sql interface + exports setup/add/count/namelen,
-# and — when jco + node:sqlite are available — transpiles it and runs
-# CREATE/INSERT/COUNT/text against a real in-memory SQLite via a generic q64:db
-# JS host (`host.mjs`), proving the canonical-ABI glue at runtime (in particular
-# query_value's 8-aligned result<option<s64>,error> layout), not just structurally.
+# it imports the q64-owned q64:db/sql interface + exports setup/add/count/namelen/
+# firstrow, and — when jco + node:sqlite are available — transpiles it and runs
+# CREATE/INSERT/COUNT/text/query_one against a real in-memory SQLite via a generic
+# q64:db JS host (`host.mjs`), proving the canonical-ABI glue at runtime (in
+# particular query_value's 8-aligned result<option<s64>,error> layout and
+# query_one's zero-copy result<option<list<s64>>,error> row), not just structurally.
 #
 # env.db targets a q64-owned interface (exec + scalar query projections), NOT
 # raw wasi:sql, whose single-cell row model + 13-case value variant + missing
@@ -40,7 +41,8 @@ for needle in \
   "export setup: func() -> s64;" \
   "export add: func() -> s64;" \
   "export count: func() -> s64;" \
-  "export namelen: func() -> s64;"; do
+  "export namelen: func() -> s64;" \
+  "export firstrow: func() -> s64;"; do
   grep -qF "$needle" <<<"$wit" || { echo "FAIL: missing $needle" >&2; exit 1; }
 done
 

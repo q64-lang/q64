@@ -1185,7 +1185,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (sc.has_time_sleep) needs_time_sleep = true;
         // set/get box their `result<…>` into the scope arena (like fs_read),
         // so the qube needs the `sp` bump pointer even if nothing else uses it.
-        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) needs_arena = true;
+        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_db_query_one or sc.has_config_get) needs_arena = true;
         if (sc.has_chan) needs_chan = true;
         if (sc.has_take) needs_take = true;
         if (sc.has_connect) needs_connect = true;
@@ -1329,6 +1329,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         if (usesDbExec(m)) c.BinaryenAddFunctionImport(module, "db_conn_exec", db_mod, "[method]connection.exec", m_params, none_type);
         if (usesDbQueryValue(m)) c.BinaryenAddFunctionImport(module, "db_conn_query_value", db_mod, "[method]connection.query-value", m_params, none_type);
         if (usesDbQueryText(m)) c.BinaryenAddFunctionImport(module, "db_conn_query_text", db_mod, "[method]connection.query-text", m_params, none_type);
+        if (usesDbQueryOne(m)) c.BinaryenAddFunctionImport(module, "db_conn_query_one", db_mod, "[method]connection.query-one", m_params, none_type);
         _ = c.BinaryenAddGlobal(module, "db_connection", i32_type, true, c.BinaryenConst(module, c.BinaryenLiteralInt32(-1)));
     }
     if (wants_config) {
@@ -1618,7 +1619,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         const n_fs: u32 = if (sc.has_fs or sc.has_envvar) 2 else 0;
         // kv set/get need three address-width scratch locals (box header ptr +
         // saved key ptr/len); allocated after the fs/envvar scratch group.
-        const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) 3 else 0;
+        const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_db_query_one or sc.has_config_get) 3 else 0;
         const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs + n_kv;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
@@ -1649,7 +1650,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             vts[g] = ptr_type; // fs/envvar dest
             vts[g + 1] = i64_type; // fs/envvar len
         }
-        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_config_get) {
+        if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_db_query_one or sc.has_config_get) {
             const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
             vts[g] = ptr_type; // kv box header ptr
             vts[g + 1] = ptr_type; // kv saved key ptr
@@ -1880,6 +1881,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .db_execute => |db| bodyHasOut(db.sql, want_int),
         .db_query_value => |db| bodyHasOut(db.sql, want_int),
         .db_query_text => |db| bodyHasOut(db.sql, want_int),
+        .db_query_one => |db| bodyHasOut(db.sql, want_int),
         .config_get => |cf| bodyHasOut(cf.key, want_int),
         .time_monotonic_ns, .time_resolution_ns, .time_unix_ns, .random_u64 => false,
         .time_sleep_ns => |ts| bodyHasOut(ts.ns, want_int),
@@ -2032,7 +2034,7 @@ fn usesEnvDb(m: *const ir.mir.Module) bool {
         };
         var sc = Scratch{};
         scanScratch(root, &sc);
-        if (sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text) return true;
+        if (sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_db_query_one) return true;
     }
     return false;
 }
@@ -2167,6 +2169,18 @@ fn usesDbQueryText(m: *const ir.mir.Module) bool {
     }
     return false;
 }
+fn usesDbQueryOne(m: *const ir.mir.Module) bool {
+    for (m.funcs) |f| {
+        const root = switch (f.body) {
+            .structured => |x| x,
+            .cfg => continue,
+        };
+        var sc = Scratch{};
+        scanScratch(root, &sc);
+        if (sc.has_db_query_one) return true;
+    }
+    return false;
+}
 
 /// Slice B rung 3 — the async-export gate. Non-null when the module is a
 /// single suspending pub fn eligible for the async lift: no entry, exactly
@@ -2203,7 +2217,7 @@ fn asyncExportIndex(m: *const ir.mir.Module) ?usize {
         // byte I/O) exits to the blocking path.
         if (sc.host_out or sc.has_kv or sc.has_kv_set or sc.has_kv_get or
             sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or
-            sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or
+            sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_db_query_one or
             sc.has_config_get or sc.has_time_res or sc.has_time_wall or
             sc.has_fs or sc.has_args or sc.has_envvar or sc.has_vec or
             sc.has_chan or sc.has_take or sc.has_connect or sc.has_presses) return null;
@@ -2620,11 +2634,12 @@ const Scratch = struct {
     has_blob_put: bool = false,
     has_blob_get: bool = false,
     has_blob_delete: bool = false,
-    /// Contains an `env.db.{execute,query_value,query_text}` → declare the
-    /// matching `q64:db/sql` connection method import (only when reached).
+    /// Contains an `env.db.{execute,query_value,query_text,query_one}` → declare
+    /// the matching `q64:db/sql` connection method import (only when reached).
     has_db_execute: bool = false,
     has_db_query_value: bool = false,
     has_db_query_text: bool = false,
+    has_db_query_one: bool = false,
     /// Contains an `env.config.get` → declare the `wasi:config/store.get` import.
     has_config_get: bool = false,
     /// Contains an `env.time.monotonic_ns` → declare the clock import (the
@@ -2684,6 +2699,7 @@ fn mergeScratch(s: *Scratch, sub: *const Scratch) void {
     s.has_db_execute = s.has_db_execute or sub.has_db_execute;
     s.has_db_query_value = s.has_db_query_value or sub.has_db_query_value;
     s.has_db_query_text = s.has_db_query_text or sub.has_db_query_text;
+    s.has_db_query_one = s.has_db_query_one or sub.has_db_query_one;
     s.has_config_get = s.has_config_get or sub.has_config_get;
     s.has_time = s.has_time or sub.has_time;
     s.has_random = s.has_random or sub.has_random;
@@ -2919,6 +2935,11 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
         },
         .db_query_text => |db| {
             s.has_db_query_text = true;
+            s.host_out = true;
+            scanScratch(db.sql, s);
+        },
+        .db_query_one => |db| {
+            s.has_db_query_one = true;
             s.host_out = true;
             scanScratch(db.sql, s);
         },
@@ -3561,6 +3582,10 @@ const Lowerer = struct {
             .db_query_value => |db| {
                 if (!self.db_component) return c.BinaryenUnreachable(module);
                 return try self.storeComponentQueryValue(db.sql, "db_conn_query_value", "db_connection", "db_conn_open");
+            },
+            .db_query_one => |db| {
+                if (!self.db_component) return c.BinaryenUnreachable(module);
+                return try self.storeComponentQueryOne(db.sql, "db_conn_query_one", "db_connection", "db_conn_open");
             },
             .config_get => |cf| {
                 if (!self.config_component) return c.BinaryenUnreachable(module);
@@ -4291,6 +4316,86 @@ const Lowerer = struct {
         try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, self.ptrGet(self.kv_hdr_idx)));
         // result disc @0 == 0 → Ok(inner ptr); else Err.
         const ok = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, self.kvI32(qv_ret), "0"), self.kvI32(0));
+        var ok_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_b_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"),
+            c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_b_idx), self.toI64(self.ptrGet(self.kv_a_idx)), self.i64_type, "0"),
+        };
+        var err_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_b_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(1)), self.i64_type, "0"),
+            c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_b_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"),
+        };
+        try pre.append(self.allocator, c.BinaryenIf(
+            m,
+            ok,
+            c.BinaryenBlock(m, null, @ptrCast(&ok_seq), ok_seq.len, self.none_type),
+            c.BinaryenBlock(m, null, @ptrCast(&err_seq), err_seq.len, self.none_type),
+        ));
+        try pre.append(self.allocator, self.ptrGet(self.kv_b_idx));
+        return c.BinaryenBlock(m, null, @ptrCast(pre.items.ptr), @intCast(pre.items.len), self.ptr_type);
+    }
+
+    /// `env.db.query_one<Row>(sql)` lowered to the q64:db ABI: lazy-open, call
+    /// `qo_import(conn, sql, ret)`, and box the host's `result<option<list<s64>>,
+    /// error>` as a nested `Result<Option<Row>, IoError>`. The canonical return
+    /// layout is result-disc @0, option-disc @4, list-ptr @8, list-len @12 —
+    /// identical to a store `bucket.get` (`list<s64>` and `list<u8>` share the
+    /// `{ptr,len}` shape). The row decodes ZERO-COPY: the inner `Some`'s single
+    /// payload cell holds the list POINTER, and the contiguous `s64`s at it ARE
+    /// the all-`i64` record's fields, so `resolveRecArm` reads `#p0` as the
+    /// record base. `list-len` (the column count) is unread — the guest trusts
+    /// the row struct's field count (the WIT contract binds the SELECT to it).
+    /// Inner Option box 2 cells (`{ #tag, #p0=record-ptr }`); outer Result box 2
+    /// cells. Consumed by nested `Ok(Some(row))` / `Ok(None)` matching.
+    fn storeComponentQueryOne(self: *Lowerer, sql: *const ir.mir.Inst, qo_import: [*:0]const u8, conn_global: [*:0]const u8, open_import: [*:0]const u8) Error!c.BinaryenExpressionRef {
+        const m = self.module;
+        const qo_ret: i32 = @intCast(self.kv_inc_ret);
+
+        var pre: std.ArrayList(c.BinaryenExpressionRef) = .empty;
+        defer pre.deinit(self.allocator);
+        try pre.append(self.allocator, self.storeLazyOpen(open_import, conn_global));
+
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.pair_idx, try self.inst(sql)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 0)));
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, c.BinaryenTupleExtract(m, c.BinaryenLocalGet(m, self.pair_idx, self.pair_type), 1)));
+
+        // query-one(conn, sql_ptr, sql_len, qo_ret)
+        var qo_args = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, conn_global, self.i32_type),
+            self.ptrGet(self.kv_a_idx),
+            self.ptrGet(self.kv_b_idx),
+            self.kvI32(qo_ret),
+        };
+        try pre.append(self.allocator, c.BinaryenCall(m, qo_import, @ptrCast(&qo_args), qo_args.len, self.none_type));
+
+        // Inner Option box (2 cells) at kv_hdr; stash its address in kv_a.
+        const inner = self.kvBoxAlloc(2);
+        try pre.append(self.allocator, inner[0]);
+        try pre.append(self.allocator, inner[1]);
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_a_idx, self.ptrGet(self.kv_hdr_idx)));
+        // option disc @4 == 1 → Some(#p0 = record ptr = list ptr @8); else None.
+        // (4-aligned option, like bucket.get — NOT query_value's 8-aligned option.)
+        const some = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 4, 1, self.i32_type, self.kvI32(qo_ret), "0"), self.kvI32(1));
+        var some_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_a_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"),
+            c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_a_idx), self.toI64(c.BinaryenLoad(m, 4, false, 8, 4, self.i32_type, self.kvI32(qo_ret), "0")), self.i64_type, "0"),
+        };
+        var none_seq = [_]c.BinaryenExpressionRef{
+            c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_a_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(1)), self.i64_type, "0"),
+        };
+        try pre.append(self.allocator, c.BinaryenIf(
+            m,
+            some,
+            c.BinaryenBlock(m, null, @ptrCast(&some_seq), some_seq.len, self.none_type),
+            c.BinaryenBlock(m, null, @ptrCast(&none_seq), none_seq.len, self.none_type),
+        ));
+
+        // Outer Result box (2 cells) at kv_hdr; stash its address in kv_b.
+        const outer = self.kvBoxAlloc(2);
+        try pre.append(self.allocator, outer[0]);
+        try pre.append(self.allocator, outer[1]);
+        try pre.append(self.allocator, c.BinaryenLocalSet(m, self.kv_b_idx, self.ptrGet(self.kv_hdr_idx)));
+        // result disc @0 == 0 → Ok(inner option ptr); else Err.
+        const ok = c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 1, false, 0, 1, self.i32_type, self.kvI32(qo_ret), "0"), self.kvI32(0));
         var ok_seq = [_]c.BinaryenExpressionRef{
             c.BinaryenStore(m, 8, 0, 0, self.ptrGet(self.kv_b_idx), c.BinaryenConst(m, c.BinaryenLiteralInt64(0)), self.i64_type, "0"),
             c.BinaryenStore(m, 8, 8, 0, self.ptrGet(self.kv_b_idx), self.toI64(self.ptrGet(self.kv_a_idx)), self.i64_type, "0"),
@@ -6381,6 +6486,57 @@ test "emitComponent: env.kv.set imports the store `[method]bucket.set`" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "emitComponent: env.db.query_one<Row> imports `[method]connection.query-one`" {
+    // The typed-row query: `Ok(Some(row))` binds a `struct Row` decoded
+    // zero-copy over the canonical `list<s64>`, and reading two of its `i64`
+    // fields proves the record binding lowers. The core imports the new
+    // query-one connection method on the same q64:db/sql interface.
+    const src =
+        \\struct Row { id: i64, n: i64 }
+        \\pub fn first() -> i64 {
+        \\    match env.db.query_one<Row>("SELECT id, n FROM t ORDER BY id LIMIT 1") {
+        \\        Ok(Some(row)) -> row.id * 100 + row.n
+        \\        Ok(None)      -> 0 - 1
+        \\        Err(_)        -> 0 - 2
+        \\    }
+        \\}
+    ;
+    const artifact = try emitComponent(testing.allocator, src, "row.q", &.{}, .wasm32, &.{}, null);
+    switch (artifact) {
+        .store_component => |kvc| {
+            defer testing.allocator.free(kvc.core);
+            defer testing.allocator.free(kvc.world);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "cm32p2|q64:db/sql@0.2.0-draft2") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]connection.query-one") != null);
+            // query-one only — no query-value/query-text/exec pulled in.
+            try testing.expect(std.mem.indexOf(u8, kvc.core, "[method]connection.query-value") == null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "import q64:db/sql@0.2.0-draft2;") != null);
+            try testing.expect(std.mem.indexOf(u8, kvc.world, "export first: func() -> s64;") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "emitComponent: env.db.query_one rejects a non-i64 row field (v0 integer-only)" {
+    // A `str` column is the deferred widening — the zero-copy `list<s64>` ↔
+    // record mapping requires every field to be an 8-byte `i64` cell, so a
+    // struct with a `str` field must not build (honest Unsupported, not a
+    // silent miscompile).
+    const src =
+        \\struct Row { id: i64, name: str }
+        \\pub fn first() -> i64 {
+        \\    match env.db.query_one<Row>("SELECT id, name FROM t LIMIT 1") {
+        \\        Ok(Some(row)) -> row.id
+        \\        Ok(None)      -> 0 - 1
+        \\        Err(_)        -> 0 - 2
+        \\    }
+        \\}
+    ;
+    // The unsupported body drops `first`, leaving no exportable surface and no
+    // `main` — the emit then has nothing to lower.
+    try testing.expectError(error.NoMainFunction, emitComponent(testing.allocator, src, "bad.q", &.{}, .wasm32, &.{}, null));
 }
 
 test "emitComponent: env.kv.get imports the store `[method]bucket.get`" {

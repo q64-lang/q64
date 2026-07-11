@@ -12,12 +12,24 @@
 //   - exec        — no-row statements (DDL / INSERT / UPDATE / DELETE), rows affected.
 //   - query-value — first column of the first row as an integer (COUNT(*), SUM, id…).
 //   - query-text  — first column of the first row as text.
+//   - query-one   — the first row's INTEGER columns as a list, decoded positionally
+//                   onto an all-`i64` struct (the "typed row" slice — see below).
 //
 // The connection is host-opened + identity-pinned (empty identifier) exactly
-// like env.kv / env.blob, so a qube never names a database. Typed multi-row
-// `query -> Rows`, positional `params`, and `batch` are deferred to a later,
-// additive extension of THIS interface (q64 needs a variable-length typed
-// decode + a dynamic Value first). v0 takes literal SQL only.
+// like env.kv / env.blob, so a qube never names a database. v0 takes literal
+// SQL only.
+//
+// Typed rows land in increments, by what q64 can decode:
+//   (1) query-one over an all-`i64` struct — DONE. A canonical `list<s64>` is N
+//       contiguous 8-byte cells, which IS an all-`i64` record's layout, so the
+//       row decodes ZERO-COPY (the record pointer is the list pointer); no
+//       variable-length decoder and no dynamic Value needed. `env.db.query_one`
+//       in spec/env.md.
+//   (2) text columns in a query-one struct — deferred: needs the struct layout
+//       floor lifted to admit a `str` field (the "variable-length typed decode").
+//   (3) multi-row `query -> Vec<Row>` — deferred: needs a Vec-of-records element
+//       (records live in the per-call arena; the Vec heap is persistent).
+// (2)/(3) are additive on THIS interface — no shape already shipped changes.
 //
 // 0.2.0-draft2 tag mirrors wasi:keyvalue / q64:blob (wit-component's world-item
 // resolution rejects a plain 0.1.0 here — a semver-match quirk).
@@ -53,6 +65,17 @@ interface sql {
         /// Run a query and return the first column of the first row as text:
         /// `Ok(some(s))` / `Ok(none)` / `Err`.
         query-text: func(sql: string) -> result<option<string>, error>;
+
+        /// Run a query and return the FIRST row as its integer columns, in
+        /// SELECT order: `Ok(some([c0, c1, …]))` when a row matched, `Ok(none)`
+        /// when the result set was empty, `Err` on a statement error. The guest
+        /// maps the column list positionally onto a `struct` whose field count
+        /// is the column count — the canonical `list<s64>` is N contiguous
+        /// 8-byte cells, exactly an all-`i64` record's layout, so the row
+        /// decodes zero-copy. v0: **integer columns only** (a text column is a
+        /// later, additive widening — see the header note); the qube's SELECT
+        /// must return one integer per struct field.
+        query-one: func(sql: string) -> result<option<list<s64>>, error>;
     }
 
     /// Open the identity-pinned connection. The host ignores `identifier` (the

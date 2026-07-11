@@ -304,6 +304,12 @@ pub const Op = union(enum) {
     /// `env.db.query_text(sql)`: `[method]connection.query-text`, boxed
     /// `Result<Option<Bytes>, IoError>` (`.ptr`).
     db_query_text: struct { sql: *Inst },
+    /// `env.db.query_one<Row>(sql)`: `[method]connection.query-one`, the first
+    /// row's integer columns as `result<option<list<s64>>, error>`, boxed as
+    /// `Result<Option<Row>, IoError>` (`.ptr`). The inner `Some` cell holds the
+    /// list pointer directly — the contiguous `s64`s ARE the record's `i64`
+    /// fields (zero-copy). `ncols` = Row's field count.
+    db_query_one: struct { sql: *Inst, ncols: u32 },
     /// `env.config.get(key)`: the top-level `wasi:config/store.get` (no handle),
     /// boxed `Result<Option<Bytes>, IoError>` (`.ptr`).
     config_get: struct { key: *Inst },

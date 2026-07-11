@@ -5874,6 +5874,37 @@ fn dbQueryValueResultEnum(b: *Builder) BuildError!?*const EnumInfo {
     return info;
 }
 
+/// The `Result<Option<Row>, IoError>` enum that `env.db.query_one<Row>` yields:
+/// the outer Result's Ok nests an `Option<Row>` whose `Some` carries the row
+/// `struct` as a **record payload** — a single cell holding the record base
+/// pointer — so `Ok(Some(row))` binds `row: Row` (`resolveRecArm`) and
+/// `row.field` reads the zero-copy row (the pointer is the query's `list<s64>`
+/// pointer; the contiguous `s64`s ARE the all-`i64` record's fields). Keyed per
+/// row-struct name so distinct rows get distinct type identities. Returns null
+/// if `row_name` isn't a registered (all-decodable) struct, so the caller can
+/// reject `query_one<NotAStruct>` legibly.
+fn dbQueryOneResultEnum(b: *Builder, row_name: []const u8) BuildError!?*const EnumInfo {
+    const key = try std.fmt.allocPrint(b.a, "Result\x00dbone\x00{s}", .{row_name});
+    if (b.enum_insts.get(key)) |inst| return inst;
+    const opt_base = b.enums.get("Option") orelse return null;
+    if (opt_base.si == null) return null;
+    const desc = try std.fmt.allocPrint(b.a, "r:{s}", .{row_name});
+    const opt_row = try instantiateEnum(b, opt_base, &.{ desc, "i", "i", "i" });
+    // instantiateEnum only sets `.rec` when the name resolves to a registered
+    // struct; otherwise the Some slot degrades to a plain int cell. Reject that
+    // here rather than bind a bogus record.
+    if (opt_row.variants[0].kind != .rec) return null;
+    const res_base = b.enums.get("Result") orelse return null;
+    const res_si = res_base.si orelse return null;
+    const vars = try b.a.alloc(EnumVariant, 2);
+    vars[0] = .{ .name = "Ok", .arity = 1, .kind = .ints, .pidx = 0, .nested = opt_row };
+    vars[1] = .{ .name = "Err", .arity = 1, .kind = .ints, .pidx = 1 };
+    const info = try b.a.create(EnumInfo);
+    info.* = .{ .name = "Result", .variants = vars, .si = res_si };
+    try b.enum_insts.put(b.a, key, info);
+    return info;
+}
+
 /// Flatten a variant's non-trivia tokens (past the name) into `buf`.
 /// `top` skips the leading variant-name token (an IDENT, or `KW_NONE`
 /// — the prelude `Option.None`); a `{` (record payload) or overflow
@@ -6027,6 +6058,13 @@ fn enumOfExpr(b: *Builder, scope: *const Scope, e: ast.Expr) BuildError!?*const 
             }
             if (std.mem.eql(u8, txt, "env.db.query_text")) {
                 return try dbQueryTextResultEnum(b);
+            }
+            if (std.mem.eql(u8, txt, "env.db.query_one")) {
+                // Result<Option<Row>, IoError> — Row from the turbofish; must
+                // match the same enum the value build produces (both key
+                // `dbQueryOneResultEnum` by row name, so identity agrees).
+                const row_name = channelGenericName(cc) orelse return null;
+                return try dbQueryOneResultEnum(b, row_name);
             }
             if (std.mem.eql(u8, txt, "env.config.get")) {
                 return try configGetResultEnum(b);
@@ -7996,6 +8034,26 @@ fn buildRecExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!?RecValue
                     const esi = info.si orelse return error.Unsupported;
                     const node = try b.a.create(hir.Expr);
                     node.* = .{ .db_query_text = .{ .sql = try buildStrExpr(b, a0, scope, null) } };
+                    return .{ .e = node, .si = esi };
+                }
+                // `env.db.query_one<Row>(sql)` — the first row's integer columns
+                // as a typed struct (`q64:db/sql.connection.query-one`). The row
+                // struct `Row` comes from the turbofish; v0 requires every field
+                // to be `i64` so the canonical `list<s64>` (contiguous 8-byte
+                // cells) maps ZERO-COPY onto the record. A str/float/bool field
+                // is the deferred text/scalar widening (q64-db.wit header).
+                if (std.mem.eql(u8, fsname, "env.db.query_one")) {
+                    const row_name = channelGenericName(cc) orelse return error.Unsupported;
+                    const rsi = structByName(b, row_name) orelse return error.Unsupported;
+                    if (rsi.fields.len == 0) return error.Unsupported;
+                    for (rsi.fields) |f| if (f.ty != .i64) return error.Unsupported;
+                    var ka = cc.args();
+                    const a0 = ka.next() orelse return error.Unsupported;
+                    if (ka.next() != null) return error.Unsupported;
+                    const info = (try dbQueryOneResultEnum(b, row_name)) orelse return error.Unsupported;
+                    const esi = info.si orelse return error.Unsupported;
+                    const node = try b.a.create(hir.Expr);
+                    node.* = .{ .db_query_one = .{ .sql = try buildStrExpr(b, a0, scope, null), .ncols = @intCast(rsi.fields.len) } };
                     return .{ .e = node, .si = esi };
                 }
                 // `env.config.get(key)` — read-only config/secret (spec/env.md
