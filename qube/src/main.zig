@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const resolve = @import("resolve.zig");
 const json5 = @import("json5.zig");
+const deploy_manifest = @import("deploy_manifest.zig");
 const dispatch = @import("dispatch.zig");
 
 test {
@@ -4096,6 +4097,15 @@ fn readPodToken(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Ma
     return gpa.dupe(u8, text[start..end]);
 }
 
+// ---------------------------------------------------------------------------
+
+const default_pods_api = "https://api.qubepods.com";
+
+/// Strip a leading "./" from a manifest-relative path.
+fn stripDotSlash(s: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, s, "./")) s[2..] else s;
+}
+
 /// The API origin `qube pod login --url …` saved into pods.toml (the host is
 /// the `[pods."<host>"]` table name; login strips the scheme, so https is
 /// reconstructed here), or null when not logged in. Commands resolve the
@@ -4245,69 +4255,6 @@ fn cmdPodInfo(
 }
 
 // qube deploy  (pack the bundle zip and upload it to qubepods)
-// ---------------------------------------------------------------------------
-
-const default_pods_api = "https://api.qubepods.com";
-
-/// Strip a leading "./" from a manifest-relative path.
-fn stripDotSlash(s: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, s, "./")) s[2..] else s;
-}
-
-/// Synthesize the qubepods deploy manifest (`qubepod.jsonc`) from the parsed
-/// `qube.json5` root. The deploy API validates a STRICT QubePod schema (unknown
-/// keys rejected; `apiVersion` + `kind` required), so inject those and copy only
-/// the allowed keys — dropping qube-only fields (`type`, `entry`, `dependencies`,
-/// `license`, `description`, `build`, …). This is the same manifest the qubepods
-/// web shell posts, so a terminal deploy and a shell deploy are byte-compatible —
-/// and the developer's repo stays a single `qube.json5`, never a checked-in
-/// `qubepod.jsonc` (the wire manifest is generated at pack time). Caller owns the
-/// returned JSON.
-fn synthesizeQubepodJson(gpa: std.mem.Allocator, root: std.json.ObjectMap) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-
-    // Stringify one std.json.Value and append it (keys below need no escaping).
-    const appendValue = struct {
-        fn f(a: std.mem.Allocator, o: *std.ArrayList(u8), v: std.json.Value) !void {
-            const s = try std.json.Stringify.valueAlloc(a, v, .{});
-            defer a.free(s);
-            try o.appendSlice(a, s);
-        }
-    }.f;
-
-    try out.appendSlice(gpa, "{\"apiVersion\":");
-    try appendValue(gpa, &out, root.get("apiVersion") orelse .{ .string = "qubepods.dev/v0.1" });
-    try out.appendSlice(gpa, ",\"kind\":\"QubePod\"");
-    // The keys the strict QubePod schema accepts (spec: qubepod-schema QubePodSchema).
-    const allowed = [_][]const u8{ "$schema", "project", "name", "version", "component", "runtime", "exports", "imports", "assets", "providers" };
-    for (allowed) |k| {
-        if (root.get(k)) |v| {
-            try out.appendSlice(gpa, ",\"");
-            try out.appendSlice(gpa, k);
-            try out.appendSlice(gpa, "\":");
-            try appendValue(gpa, &out, v);
-        }
-    }
-    // `static: { dir, notFound }` is manifest sugar for an asset-only site qube
-    // (spec qube.json5.md §Static). The strict QubePod schema doesn't carry it —
-    // translate to the wire form the deploy API accepts and the web shell has
-    // always sent: assets{directory, notFoundHandling} + a stateless runtime,
-    // no component.
-    if (root.get("assets") == null) {
-        if (manifestNestedString(root, "static", "dir")) |dir| {
-            if (root.get("runtime") == null) try out.appendSlice(gpa, ",\"runtime\":\"stateless\"");
-            try out.appendSlice(gpa, ",\"assets\":{\"directory\":");
-            try appendValue(gpa, &out, .{ .string = stripDotSlash(dir) });
-            const nf = manifestNestedString(root, "static", "notFound") orelse "single-page-application";
-            try out.appendSlice(gpa, ",\"notFoundHandling\":");
-            try appendValue(gpa, &out, .{ .string = nf });
-            try out.append(gpa, '}');
-        }
-    }
-    try out.append(gpa, '}');
-    return out.toOwnedSlice(gpa);
-}
 
 // Stage the manifest, every component wasm (each at its manifest-relative path),
 // and the asset tree, then zip them at the archive root (no wrapping folder).
@@ -4557,9 +4504,15 @@ fn cmdDeploy(
     const manifest_out = try std.fs.path.join(gpa, &.{ deploy_dir, "qubepod.jsonc" });
     defer gpa.free(manifest_out);
     {
-        const manifest_body = synthesizeQubepodJson(gpa, root) catch |err| {
-            try printStderr(io, "qube deploy: cannot build the deploy manifest: {s}\n", .{@errorName(err)});
-            std.process.exit(@intFromEnum(ExitCode.internal));
+        // The wire manifest comes from the SHARED synthesis (deploy_manifest.zig)
+        // — the same implementation the browser shell runs, so the two frontends
+        // cannot emit different QubePods for the same qube.json5.
+        const manifest_body = switch (deploy_manifest.synthesize(gpa, raw, .{})) {
+            .ok => |m| m,
+            .err => |e| {
+                try printStderr(io, "qube deploy: {s}\n", .{e});
+                std.process.exit(@intFromEnum(ExitCode.input));
+            },
         };
         defer gpa.free(manifest_body);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_out, .data = manifest_body });
@@ -4884,30 +4837,8 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
     if (owned) freePodConfig(gpa, cfg);
 }
 
-test "synthesizeQubepodJson: static sugar becomes assets + stateless runtime" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        \\{"name":"org.site","version":"0.1.0","project":"site","static":{"dir":"./web","notFound":"404-page"}}
-    , .{});
-    const out = try synthesizeQubepodJson(a, parsed.object);
-    // Wire form: no `static` key; assets carries the (dot-stripped) dir + the
-    // notFound mapping; runtime defaults to stateless.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"static\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"assets\":{\"directory\":\"web\",\"notFoundHandling\":\"404-page\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"runtime\":\"stateless\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"project\":\"site\"") != null);
-}
-
-test "synthesizeQubepodJson: explicit assets wins over static sugar" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        \\{"name":"org.app","version":"0.1.0","project":"app","runtime":"stateless","assets":{"directory":"public"},"static":{"dir":"web"}}
-    , .{});
-    const out = try synthesizeQubepodJson(a, parsed.object);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"directory\":\"public\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"directory\":\"web\"") == null);
+test {
+    // Pull the shared deploy-manifest module into the test build (its tests
+    // guard the wire contract both frontends emit).
+    _ = deploy_manifest;
 }

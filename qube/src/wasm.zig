@@ -29,6 +29,7 @@ const std = @import("std");
 const json5 = @import("json5.zig");
 const resolve = @import("resolve.zig");
 const dispatch = @import("dispatch.zig");
+const deploy_manifest = @import("deploy_manifest.zig");
 
 const gpa = std.heap.wasm_allocator;
 
@@ -87,6 +88,63 @@ fn manifestEntry(manifest: []const u8) ?[]const u8 {
 export fn qube_resolve_entry(ptr: [*]const u8, len: usize) u64 {
     const entry = manifestEntry(ptr[0..len]) orelse return 0;
     return pack(entry);
+}
+
+/// Synthesize the wire QubePod manifest (qubepod.jsonc) for `qube deploy` —
+/// the SHARED implementation (deploy_manifest.zig) the native CLI uses, so a
+/// shell deploy and a terminal deploy are byte-compatible by construction.
+///
+/// Input (ptr,len): JSON `{ "manifest": "<qube.json5 text>", "overrides": {
+///   "project"?: "...", "name"?: "...", "assetsDirectory"?: "..." } }`.
+/// Returns packed JSON `{ "ok": true, "qubepod": { … } }` or
+/// `{ "ok": false, "error": "…" }`. `(ptr<<32|len)`; 0 = malformed input.
+export fn qube_deploy_manifest(ptr: [*]const u8, len: usize) u64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, ptr[0..len], .{}) catch return 0;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return 0,
+    };
+    const manifest: []const u8 = switch (root.get("manifest") orelse return 0) {
+        .string => |m| m,
+        else => return 0,
+    };
+    var ov: deploy_manifest.Overrides = .{};
+    if (root.get("overrides")) |ovv| switch (ovv) {
+        .object => |oo| {
+            if (oo.get("project")) |v| switch (v) {
+                .string => |p| ov.project = p,
+                else => {},
+            };
+            if (oo.get("name")) |v| switch (v) {
+                .string => |n| ov.name = n,
+                else => {},
+            };
+            if (oo.get("assetsDirectory")) |v| switch (v) {
+                .string => |d| ov.assets_directory = d,
+                else => {},
+            };
+        },
+        else => {},
+    };
+    var out: std.ArrayList(u8) = .empty;
+    switch (deploy_manifest.synthesize(gpa, manifest, ov)) {
+        .ok => |wire| {
+            defer gpa.free(wire);
+            out.appendSlice(gpa, "{\"ok\":true,\"qubepod\":") catch return 0;
+            out.appendSlice(gpa, wire) catch return 0;
+            out.append(gpa, '}') catch return 0;
+        },
+        .err => |e| {
+            out.appendSlice(gpa, "{\"ok\":false,\"error\":") catch return 0;
+            const es = std.json.Stringify.valueAlloc(gpa, std.json.Value{ .string = e }, .{}) catch return 0;
+            defer gpa.free(es);
+            out.appendSlice(gpa, es) catch return 0;
+            out.append(gpa, '}') catch return 0;
+        },
+    }
+    const buf = out.toOwnedSlice(gpa) catch return 0;
+    return pack(buf);
 }
 
 /// Route a `qube` invocation. `args_json` (ptr,len) is a JSON array of the arg
