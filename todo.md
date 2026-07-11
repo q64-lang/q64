@@ -620,8 +620,11 @@ visible at a glance whether it's been picked up.
       synthesize the actual HTTP binding behind the generated imports). The
       reverse direction (WIT → OpenAPI for a deployed qube's exports) is the
       natural sibling — it gives every qube an OpenAPI doc for free, feeding
-      agent discovery (QAD/MCP). Start with the subset OpenAPI 3.x ⇄ WIT can
-      express cleanly; punt on oneOf/anyOf polymorphism until asked for.
+      agent discovery (QAD/MCP). The velocity win: spec-first API creation —
+      write (or agent-generate) the OpenAPI doc, get the typed WIT surface,
+      implement against stubs; building AND consuming APIs both get faster.
+      Start with the subset OpenAPI 3.x ⇄ WIT can express cleanly; punt on
+      oneOf/anyOf polymorphism until asked for.
 
 - [ ] **Analyse: compile `wac` to wasm so `qube` can glue components together.**
       The Bytecode Alliance's `wac` tool (WAC language, `wac plug` /
