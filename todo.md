@@ -612,6 +612,17 @@ interop.
 This section grows as we go. Each item should have a checkbox so it's
 visible at a glance whether it's been picked up.
 
+- [ ] **`qube wit from-openapi <spec>` — OpenAPI → WIT.** Generate a WIT
+      interface/world from an OpenAPI document, so a component can import an
+      external HTTP API as a TYPED surface (paths → funcs, schemas → records,
+      errors → result types) instead of hand-rolling fetch + JSON. Pairs with
+      the wrapper/composition work on the qubepods side (the shell would
+      synthesize the actual HTTP binding behind the generated imports). The
+      reverse direction (WIT → OpenAPI for a deployed qube's exports) is the
+      natural sibling — it gives every qube an OpenAPI doc for free, feeding
+      agent discovery (QAD/MCP). Start with the subset OpenAPI 3.x ⇄ WIT can
+      express cleanly; punt on oneOf/anyOf polymorphism until asked for.
+
 - [ ] **Analyse: compile `wac` to wasm so `qube` can glue components together.**
       The Bytecode Alliance's `wac` tool (WAC language, `wac plug` /
       `wac compose`) composes Component Model components into one component —
