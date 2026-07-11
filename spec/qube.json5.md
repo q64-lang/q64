@@ -412,6 +412,36 @@ component: { emit: true, world: "my-api", worlds: ["wasi:http/proxy"] }
 This makes the qube a drop-in **qubepods** endpoint runnable under generic
 Component Model HTTP lifting, with no qubepods-specific ABI.
 
+### Static (asset-only site qubes)
+
+A **static qube** ships a folder of files as-is — no q64 entry, no component,
+no server code. The gate serves the tree from the edge.
+
+```json5
+{
+  name: "org.mysite",
+  version: "0.1.0",
+  project: "mysite",     // required to deploy (the qubepods project slug)
+  static: {
+    dir: "web",          // required — the folder shipped verbatim
+    notFound: "single-page-application", // "none" | "404-page" | "single-page-application"
+  },
+}
+```
+
+| Field      | Type   | Default                   | Notes |
+|------------|--------|---------------------------|-------|
+| `dir`      | string | —                         | The directory shipped as the site root. Required. |
+| `notFound` | string | `"single-page-application"` | What a miss serves: nothing (`none`), a `404.html` (`404-page`), or the root `index.html` (SPA routing). |
+
+On the wire, `qube deploy` translates this to the QubePod `assets` block
+(`assets: { directory, notFoundHandling }`, `runtime: "stateless"`, no
+component) — the same manifest the web shell has always sent, and the shape
+the deploy API accepts. A manifest with `static` MUST NOT also declare
+`component` or `assets`; there is nothing to build, so `qube build` and
+`qube run` (native) have no work — the web shell previews the tree in its
+Preview pane.
+
 ### WIT (the published contract)
 
 A **library qube**'s published surface *is* its WIT world — the contract

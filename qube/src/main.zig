@@ -4289,6 +4289,22 @@ fn synthesizeQubepodJson(gpa: std.mem.Allocator, root: std.json.ObjectMap) ![]u8
             try appendValue(gpa, &out, v);
         }
     }
+    // `static: { dir, notFound }` is manifest sugar for an asset-only site qube
+    // (spec qube.json5.md §Static). The strict QubePod schema doesn't carry it —
+    // translate to the wire form the deploy API accepts and the web shell has
+    // always sent: assets{directory, notFoundHandling} + a stateless runtime,
+    // no component.
+    if (root.get("assets") == null) {
+        if (manifestNestedString(root, "static", "dir")) |dir| {
+            if (root.get("runtime") == null) try out.appendSlice(gpa, ",\"runtime\":\"stateless\"");
+            try out.appendSlice(gpa, ",\"assets\":{\"directory\":");
+            try appendValue(gpa, &out, .{ .string = stripDotSlash(dir) });
+            const nf = manifestNestedString(root, "static", "notFound") orelse "single-page-application";
+            try out.appendSlice(gpa, ",\"notFoundHandling\":");
+            try appendValue(gpa, &out, .{ .string = nf });
+            try out.append(gpa, '}');
+        }
+    }
     try out.append(gpa, '}');
     return out.toOwnedSlice(gpa);
 }
@@ -4490,13 +4506,21 @@ fn cmdDeploy(
             else => {},
         };
         if (wasm_norms.items.len == 0) {
-            try writeStderr(io, "qube deploy: qube.json5 has no component.module, component.wasm, or component.variants\n");
-            std.process.exit(@intFromEnum(ExitCode.input));
+            // A static qube (`static: { dir }`, spec qube.json5.md §Static) has
+            // no component by design — the deploy API accepts an assets-only
+            // bundle, and the web shell has always shipped this shape. Anything
+            // else without a component is an error.
+            if (manifestNestedString(root, "static", "dir") == null) {
+                try writeStderr(io, "qube deploy: qube.json5 has no component.module, component.wasm, component.variants, or static.dir\n");
+                std.process.exit(@intFromEnum(ExitCode.input));
+            }
         }
     }
 
-    // Optional asset tree: assets.directory.
-    const assets_dir_opt = manifestNestedString(root, "assets", "directory");
+    // Optional asset tree: assets.directory, or the static qube's `static.dir`
+    // (which becomes `assets.directory` on the wire — see synthesizeQubepodJson).
+    const assets_dir_opt = manifestNestedString(root, "assets", "directory") orelse
+        manifestNestedString(root, "static", "dir");
     const assets_norm = if (assets_dir_opt) |d| stripDotSlash(d) else "";
 
     // Token: --token wins, else QUBEPODS_TOKEN, else the saved `qube pod login`
@@ -4858,4 +4882,32 @@ fn scaffoldPodCmd(gpa: std.mem.Allocator, io: std.Io, args_it: *std.process.Args
     const dir = if (in_place) "." else (dir_arg orelse cfg.name);
     try scaffoldPod(gpa, io, dir, cfg);
     if (owned) freePodConfig(gpa, cfg);
+}
+
+test "synthesizeQubepodJson: static sugar becomes assets + stateless runtime" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"name":"org.site","version":"0.1.0","project":"site","static":{"dir":"./web","notFound":"404-page"}}
+    , .{});
+    const out = try synthesizeQubepodJson(a, parsed.object);
+    // Wire form: no `static` key; assets carries the (dot-stripped) dir + the
+    // notFound mapping; runtime defaults to stateless.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"static\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"assets\":{\"directory\":\"web\",\"notFoundHandling\":\"404-page\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"runtime\":\"stateless\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"project\":\"site\"") != null);
+}
+
+test "synthesizeQubepodJson: explicit assets wins over static sugar" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"name":"org.app","version":"0.1.0","project":"app","runtime":"stateless","assets":{"directory":"public"},"static":{"dir":"web"}}
+    , .{});
+    const out = try synthesizeQubepodJson(a, parsed.object);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"directory\":\"public\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"directory\":\"web\"") == null);
 }
