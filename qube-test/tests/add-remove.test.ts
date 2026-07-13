@@ -68,7 +68,7 @@ describe.skipIf(!binaryAvailable())("dependency mutations", () => {
 
   test("an unlocked registry dep fails the build with PKG010", () => {
     const proj = makeProject({ "qube.json5": WITH_DEP, "src/main.q": "fn main { env.out(\"x\") }\n" });
-    const r = runCli(["run"], { cwd: proj });
+    const r = runCli(["run", "--addr", "wasm64"], { cwd: proj });
     expect(r.exitCode).toBe(66);
     expect(r.stderr).toContain("PKG010");
     expect(r.stderr).toContain("dev.q64.audio");
@@ -83,7 +83,7 @@ describe.skipIf(!binaryAvailable())("dependency mutations", () => {
         qubes: [{ name: "dev.q64.audio", version: "0.4.0", source: "registry+https://qubes.q64.dev", sha256: "00ff" }],
       }),
     });
-    const r = runCli(["run"], { cwd: proj });
+    const r = runCli(["run", "--addr", "wasm64"], { cwd: proj });
     expect(r.exitCode).toBe(66);
     expect(r.stderr).toContain("PKG011");
   });
@@ -98,7 +98,7 @@ describe.skipIf(!binaryAvailable())("dependency mutations", () => {
       }),
     });
     // Point QUBE_HOME at the empty project dir so the cache is guaranteed cold.
-    const r = runCli(["run"], { cwd: proj, env: { QUBE_HOME: join(proj, ".qube-home") } });
+    const r = runCli(["run", "--addr", "wasm64"], { cwd: proj, env: { QUBE_HOME: join(proj, ".qube-home") } });
     expect(r.exitCode).toBe(66);
     expect(r.stderr).toContain("PKG012");
   });
@@ -109,7 +109,7 @@ describe.skipIf(!binaryAvailable())("dependency mutations", () => {
       "src/main.q": "fn main { env.out(\"x\") }\n",
       "qube.lock": "{ not json",
     });
-    const r = runCli(["run"], { cwd: proj });
+    const r = runCli(["run", "--addr", "wasm64"], { cwd: proj });
     expect(r.exitCode).toBe(66);
     expect(r.stderr).toContain("PKG013");
   });

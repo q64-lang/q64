@@ -57,7 +57,7 @@ describe.skipIf(!binaryAvailable())("qube.json5 validation (spec surface)", () =
       "qube.json5": '{ "name": "singlename", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q" }',
       "src/main.q": "fn main { env.out(\"x\") }\n",
     });
-    const r = runCli(["build"], { cwd: proj });
+    const r = runCli(["build", "--addr", "wasm64"], { cwd: proj });
     expect((r.envelope?.diagnostics ?? []).some((d) => d.code.startsWith("PKG"))).toBe(true);
   });
 
@@ -66,7 +66,7 @@ describe.skipIf(!binaryAvailable())("qube.json5 validation (spec surface)", () =
       "qube.json5": '{ "name": "dev.q64.nolic", "version": "0.1.0", "type": "application", "entry": "src/main.q" }',
       "src/main.q": "fn main { env.out(\"x\") }\n",
     });
-    const r = runCli(["build"], { cwd: proj });
+    const r = runCli(["build", "--addr", "wasm64"], { cwd: proj });
     expect((r.envelope?.diagnostics ?? []).some((d) => d.code.startsWith("PKG"))).toBe(true);
   });
 });

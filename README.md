@@ -76,7 +76,7 @@ From a fresh clone to `Hello, q64.` on stdout:
 ( cd runtime/wasmtime  && zig build )    # → runtime/wasmtime/zig-out/bin/q64-wasmtime-host
 
 # 4. Run the example.
-( cd examples/hello && ../../qube/zig-out/bin/qube run )
+( cd examples/hello && ../../qube/zig-out/bin/qube run --addr wasm64 )
 # → Hello, q64.
 ```
 
@@ -97,7 +97,7 @@ For convenience, add the three binaries to PATH:
 
 ```bash
 export PATH="$PWD/qube/zig-out/bin:$PWD/q64/zig-out/bin:$PWD/runtime/wasmtime/zig-out/bin:$PATH"
-cd examples/hello && qube run
+cd examples/hello && qube run --addr wasm64
 ```
 
 ## Building

@@ -1,26 +1,18 @@
 //! q64/src/codegen — AST → Wasm 3.0 via Binaryen.
 //!
-//! v0 surface: a single entry point `emitHelloWasm` that builds the
-//! hand-equivalent of `runtime/wasmtime/hello.wat` directly via the
-//! Binaryen C API. This proves the Binaryen integration and gives
-//! us a byte-level shape codegen will later produce from a typed AST.
+//! Main surface: `emitFromSource` / `emitFromSourceWithImports`, which
+//! drive the full IR pipeline — parse → HIR (`ir.build_hir`) → MIR
+//! (`ir.lower`) → Binaryen — and return a finished core module.
+//! `emitComponent` layers the Component Model output on top, and
+//! `showHir` / `showMir` share the same front end to dump an IR tier as
+//! text for `q64 show hir|mir`. A construct the IR can't represent yet
+//! is reported as an honest `Error.UnsupportedExpression` — the legacy
+//! direct-from-AST emitter is removed; there is no fallback.
 //!
-//! Module shape produced:
-//!
-//!   (module
-//!     (import "env" "out" (func (param i64 i64)))
-//!     (memory (export "memory") i64 1)
-//!     (data (i64.const 0) "Hello, q64.\n")
-//!     (func (export "_start")
-//!       i64.const 0
-//!       i64.const 12
-//!       call $env_out))
-//!
-//! The result instantiates against `runtime/wasmtime/q64-wasmtime-host`
-//! and prints `Hello, q64.\n` to stdout, matching the hand-written
-//! hello.wat byte-for-byte in behavior (the exact byte stream may
-//! differ in section ordering / type-index layout — Binaryen and
-//! wabt make different but equally valid choices).
+//! `emitHelloWasm` survives as the original v0 smoke test (`q64
+//! emit-hello`): it builds the hand-equivalent of
+//! `runtime/wasmtime/hello.wat` directly via the Binaryen C API and
+//! instantiates against `runtime/wasmtime/q64-wasmtime-host`.
 
 const std = @import("std");
 const parser = @import("parser");
@@ -405,7 +397,8 @@ fn deriveForeignTable(a: std.mem.Allocator, foreign: []const component.ImportIfa
 /// functions the lowered core actually calls (its `foreign_call` sites). The
 /// component encoder wires the core module's instantiation imports to these, so
 /// the set must match the core's real imports — a declared-but-unused interface
-/// would otherwise leave the instantiate args mismatched. Arena-allocated.
+/// must not appear in the instantiate args (it is still DECLARED in the world;
+/// `encode` takes the full table separately for that). Arena-allocated.
 fn filterUsedImports(a: std.mem.Allocator, foreign: []const component.ImportIface, mmod: *const ir.mir.Module) ![]const component.ImportIface {
     if (foreign.len == 0) return &.{};
     var used = std.StringHashMapUnmanaged(*const ir.mir.Inst){};
@@ -548,7 +541,10 @@ pub fn emitComponent(allocator: std.mem.Allocator, source: []const u8, file: []c
     };
 
     if (exports.items.len == 0) return Error.ComponentNoExports;
-    return .{ .component = try component.encode(allocator, core, exports.items, used_imports) };
+    // Declare ALL manifest imports in the world (spec/qube.json5.md §wit:
+    // `wit.imports` are declared even when unused, so `wac` can link at
+    // build); wire only the used subset into the core instantiation.
+    return .{ .component = try component.encode(allocator, core, exports.items, foreign, used_imports) };
 }
 
 /// Scan a core module for an import section (id 2). Used to gate component
@@ -5258,9 +5254,11 @@ fn emitFmtF64(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64_typ
         var loop_body: std.ArrayList(c.BinaryenExpressionRef) = .empty;
         defer loop_body.deinit(allocator);
         const digit = c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, FR, i64_type), k.i64c(module, 10));
-        const cond = c.BinaryenBinary(module, c.BinaryenOrInt32(),
-            c.BinaryenUnary(module, c.BinaryenWrapInt64(), c.BinaryenBinary(module, c.BinaryenNeInt64(), digit, k.i64c(module, 0)), ),
-            k.get(module, STARTED, i32_type));
+        const cond = c.BinaryenBinary(module, c.BinaryenOrInt32(), c.BinaryenUnary(
+            module,
+            c.BinaryenWrapInt64(),
+            c.BinaryenBinary(module, c.BinaryenNeInt64(), digit, k.i64c(module, 0)),
+        ), k.get(module, STARTED, i32_type));
         _ = cond;
         // (cond rebuilt inline below — Binaryen refs aren't shareable.)
         const digit2 = c.BinaryenBinary(module, c.BinaryenRemUInt64(), k.get(module, FR, i64_type), k.i64c(module, 10));
@@ -6348,16 +6346,21 @@ test "emitComponent: a foreign call wires the import into a valid component" {
     }
 }
 
-test "emitComponent: a declared-but-uncalled import is not wired (import what you use)" {
-    // The qube declares the import but never calls it — the core has no import,
-    // and the encoder wires nothing, so the result is the import-free lift.
+test "emitComponent: a declared-but-uncalled import is declared in the world but not wired" {
+    // The qube declares the import but never calls it. The world still
+    // imports the interface — spec/qube.json5.md §wit: `wit.imports` are
+    // declared in the emitted component's world even when unused, so `wac`
+    // can link a socket before its first call site lands — but the core has
+    // no import, so the encoder wires nothing: the id appears exactly once
+    // (the §0a import), never as a core-instantiation arg.
     const src = "pub fn compute(x: i64) -> i64 { x + 1 }\n";
     const artifact = try emitComponent(testing.allocator, src, "c.q", &.{}, .wasm32, &test_math_iface, null);
     switch (artifact) {
         .component => |bytes| {
             defer testing.allocator.free(bytes);
-            // No interface id baked in — the unused import was dropped.
-            try testing.expect(std.mem.indexOf(u8, bytes, "acme:mathlib/math") == null);
+            const id = "acme:mathlib/math";
+            const first = std.mem.indexOf(u8, bytes, id) orelse return error.TestUnexpectedResult;
+            try testing.expect(std.mem.indexOfPos(u8, bytes, first + 1, id) == null);
             try testing.expect(std.mem.indexOf(u8, bytes, "compute") != null);
         },
         else => return error.TestUnexpectedResult,

@@ -4,20 +4,20 @@
  * observable consequences of a build (artifacts, forwarded diagnostics,
  * aggregated exit code).
  *
- * Test-first: needs a working build pipeline; `test.failing` until it lands.
+ * Needs the `q64` binary (gated on `q64Available()`, `Q64_BIN` passed through).
  */
 import { describe, expect, test } from "bun:test";
-import { appManifest, binaryAvailable, makeProject, runCli } from "../../src/harness";
+import { Q64_BIN, appManifest, binaryAvailable, makeProject, q64Available, runCli } from "../../src/harness";
 
-describe.skipIf(!binaryAvailable())("q64 subprocess contract", () => {
-  test.failing("passes --module so a local-path dependency links (build exits 0)", () => {
+describe.skipIf(!binaryAvailable() || !q64Available())("q64 subprocess contract", () => {
+  test("passes --module so a local-path dependency links (build exits 0)", () => {
     const root = makeProject({
       "app/qube.json5": '{ "name": "dev.q64.app", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q", "dependencies": { "dev.q64.dep": { "path": "../dep" } } }',
       "app/src/main.q": "import dev.q64.dep.{version}\nfn main { env.out(version()) }\n",
       "dep/qube.json5": '{ "name": "dev.q64.dep", "version": "0.1.0", "license": "MIT", "type": "library" }',
       "dep/src/lib.q": "pub fn version -> str { \"0.1.0\" }\n",
     });
-    expect(runCli(["build"], { cwd: `${root}/app` }).exitCode).toBe(0);
+    expect(runCli(["build", "--addr", "wasm64"], { cwd: `${root}/app`, env: { Q64_BIN } }).exitCode).toBe(0);
   });
 
   test.failing("forwards a q64 compile error verbatim and aggregates exit 64", () => {
