@@ -79,7 +79,7 @@ describe.skipIf(!binaryAvailable() || !q64Available() || !componentToolsAvailabl
   () => {
     test("pulls the embedded world out of a built component", () => {
       const proj = calcLibProject();
-      const built = runCli(["build", "--component"], { cwd: proj, env });
+      const built = runCli(["build", "--component", "--addr", "wasm64"], { cwd: proj, env });
       expect(built.exitCode).toBe(0);
       const comp = join(proj, "target/debug/wasm64/dev.q64.calc.component.wasm");
       expect(existsSync(comp)).toBe(true);

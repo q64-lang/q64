@@ -5,10 +5,11 @@
  * `--component`, `<name>.component.wasm`).
  *
  * These really compile, so they need the `q64` binary built; gated on
- * `q64Available()` and pass `Q64_BIN` through to the spawned qube. The default
- * address space is wasm64 (q64 emit's default). End-to-end component validation
- * (wasmtime instantiating + calling the lifted exports) lives in
- * scripts/component-roundtrip.sh.
+ * `q64Available()` and pass `Q64_BIN` through to the spawned qube. There is NO
+ * default address space: a build resolves it from --addr or the selected
+ * --target's `addressSpace` and errors when neither is set (spec/qube-cli.md
+ * §"Global options"). End-to-end component validation (wasmtime instantiating
+ * + calling the lifted exports) lives in scripts/component-roundtrip.sh.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -31,18 +32,29 @@ function scalarLibProject() {
 }
 
 describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
-  test("writes target/debug/<addr>/<name>.wasm by default, exit 0", () => {
+  test("--addr wasm64 writes target/debug/wasm64/<name>.wasm, exit 0", () => {
     const proj = appProject();
-    const r = runCli(["build"], { cwd: proj, env });
+    const r = runCli(["build", "--addr", "wasm64"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
     expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.test_app.wasm"))).toBe(true);
   });
 
   test("--release writes target/release/<addr>/<name>.wasm", () => {
     const proj = appProject();
-    const r = runCli(["build", "--release"], { cwd: proj, env });
+    const r = runCli(["build", "--release", "--addr", "wasm64"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
     expect(existsSync(join(proj, "target/release/wasm64/dev.q64.test_app.wasm"))).toBe(true);
+  });
+
+  test("--target selects addr and output dir from the manifest's targets map", () => {
+    const proj = makeProject({
+      "qube.json5":
+        '{ "name": "dev.q64.test_app", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q", "targets": { "desktop": { "host": "wasmtime", "addressSpace": "wasm32" } } }',
+      "src/main.q": 'fn main { env.out("x") }\n',
+    });
+    const r = runCli(["build", "--target", "desktop"], { cwd: proj, env });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(proj, "target/desktop/wasm32/dev.q64.test_app.wasm"))).toBe(true);
   });
 
   test("--addr wasm32 selects the address-space subdir", () => {
@@ -54,7 +66,7 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
 
   test("--component on a scalar library also writes <name>.component.wasm", () => {
     const proj = scalarLibProject();
-    const r = runCli(["build", "--component"], { cwd: proj, env });
+    const r = runCli(["build", "--component", "--addr", "wasm64"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
     expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.math.wasm"))).toBe(true);
     expect(existsSync(join(proj, "target/debug/wasm64/dev.q64.math.component.wasm"))).toBe(true);
@@ -64,7 +76,7 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
     // With no wit block, the world defaults to the last segment of `name`
     // (`math`) and the package derives from it — NOT the entry filename (`lib`).
     const proj = scalarLibProject();
-    const r = runCli(["build", "--component"], { cwd: proj, env });
+    const r = runCli(["build", "--component", "--addr", "wasm64"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
     const witPath = join(proj, "target/debug/wasm64/dev.q64.math.wit");
     expect(existsSync(witPath)).toBe(true);
@@ -81,7 +93,7 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
         '{ "name": "dev.q64.math", "version": "0.1.0", "license": "MIT", "type": "library", "entry": "src/lib.q", "wit": { "package": "acme:calc", "world": "calculator" } }',
       "src/lib.q": "pub fn add(a: i64, b: i64) -> i64 { a + b }\n",
     });
-    const r = runCli(["build", "--component"], { cwd: proj, env });
+    const r = runCli(["build", "--component", "--addr", "wasm64"], { cwd: proj, env });
     expect(r.exitCode).toBe(0);
     const wit = readFileSync(join(proj, "target/debug/wasm64/dev.q64.math.wit"), "utf8");
     expect(wit).toContain("package acme:calc;");
@@ -97,7 +109,7 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
         "wit/math.wit": "package acme:mathlib@1.0.0;\ninterface math { add: func(a: s64, b: s64) -> s64; }\n",
         "src/lib.q": "pub fn compute(x: i64) -> i64 { x + 1 }\n",
       });
-      const r = runCli(["build", "--component"], { cwd: proj, env });
+      const r = runCli(["build", "--component", "--addr", "wasm64"], { cwd: proj, env });
       expect(r.exitCode).toBe(0);
       const comp = join(proj, "target/debug/wasm64/dev.q64.consumer.component.wasm");
       expect(existsSync(comp)).toBe(true);
@@ -114,7 +126,7 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
       "qube.json5": appManifest(),
       "src/main.q": "import q64.math.*\nfn main { env.out(\"x\") }\n",
     });
-    expect(runCli(["build"], { cwd: proj, env }).exitCode).toBe(64);
+    expect(runCli(["build", "--addr", "wasm64"], { cwd: proj, env }).exitCode).toBe(64);
   });
 
   // `--component` on an *application* emits a WASI preview1 core (env.out →
@@ -132,5 +144,40 @@ describe.skipIf(!binaryAvailable() || !q64Available())("qube build", () => {
   test("--component on a wasm64 app errors (import lowering is wasm32-only)", () => {
     const proj = appProject();
     expect(runCli(["build", "--component", "--addr", "wasm64"], { cwd: proj, env }).exitCode).not.toBe(0);
+  });
+});
+
+// Strict option parsing needs only the qube binary — every case errors before
+// `q64` would be spawned.
+describe.skipIf(!binaryAvailable())("qube build (option parsing)", () => {
+  test("no --addr and no --target → usage error, exit 2 (no default address space)", () => {
+    const r = runCli(["build"], { cwd: appProject() });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("no address space");
+  });
+
+  test("an unknown option → usage error, exit 2 (never warn-and-ignore)", () => {
+    const r = runCli(["build", "--frobnicate"], { cwd: appProject() });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("unknown option");
+  });
+
+  test("a spec'd-but-unimplemented global flag errors honestly, exit 2", () => {
+    const r = runCli(["build", "--frozen"], { cwd: appProject() });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("not implemented");
+  });
+
+  test("--target without addressSpace and no --addr → input error, exit 65", () => {
+    const proj = makeProject({
+      "qube.json5":
+        '{ "name": "dev.q64.test_app", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q", "targets": { "desktop": { "host": "wasmtime" } } }',
+      "src/main.q": 'fn main { env.out("x") }\n',
+    });
+    expect(runCli(["build", "--target", "desktop"], { cwd: proj }).exitCode).toBe(65);
+  });
+
+  test("--target naming no manifest target → input error, exit 65", () => {
+    expect(runCli(["build", "--target", "nope"], { cwd: appProject() }).exitCode).toBe(65);
   });
 });

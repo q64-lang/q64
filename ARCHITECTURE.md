@@ -421,14 +421,16 @@ Putting it together, from a manifest to output on stdout (see
 [`README.md`](./README.md) §Quickstart):
 
 ```bash
-cd examples/hello && qube run
+cd examples/hello && qube run --addr wasm64
 # → Hello, q64.
 ```
 
 What happens:
 
 1. **`qube run`** discovers the nearest `qube.json5` by walking up from the
-   working directory.
+   working directory. The address space is explicit — `--addr wasm32|wasm64`,
+   or a manifest target's `addressSpace` via `--target <name>`; there is no
+   default (spec/qube-cli.md §"Global options").
 2. It resolves dependencies into `--module name=<absolute-path>` flags (here,
    none beyond the built-in `q64.*` stdlib).
 3. It invokes the compiler:
@@ -454,10 +456,10 @@ fn main {
 
 | Path | What |
 |------|------|
-| `target/debug/<name>.wasm` | the core module (default `qube build`) |
-| `target/debug/<name>.component.wasm` | component wrapper (with `--component`) |
-| `target/debug/<name>.effects.json` | effect index emitted by `q64` |
-| `target/debug/<name>.graph.json` | stream-graph topology (if any stages) |
+| `target/debug/<addr>/<name>.wasm` | the core module (`<addr>` = wasm32 \| wasm64) |
+| `target/debug/<addr>/<name>.component.wasm` | component wrapper (with `--component`) |
+| `target/debug/<addr>/<name>.effects.json` | effect index emitted by `q64` |
+| `target/debug/<addr>/<name>.graph.json` | stream-graph topology (if any stages) |
 | `target/release/` | `--release` profile |
 | `target/web/` | `qube web`: wasm + browser adapter shell |
 

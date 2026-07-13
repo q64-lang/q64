@@ -22,7 +22,7 @@ describe.skipIf(!binaryAvailable())("diagnostic framing (spec surface)", () => {
       "qube.json5": '{ "name": "singlename", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q" }',
       "src/main.q": "fn main { env.out(\"x\") }\n",
     });
-    const r = runCli(["build", "--diagnostics", "json"], { cwd: proj });
+    const r = runCli(["build", "--diagnostics", "json", "--addr", "wasm64"], { cwd: proj });
     expect((r.envelope?.diagnostics ?? []).some((d) => d.code.startsWith("PKG"))).toBe(true);
   });
 
@@ -31,7 +31,7 @@ describe.skipIf(!binaryAvailable())("diagnostic framing (spec surface)", () => {
       "qube.json5": '{ "name": "dev.q64.x", "version": "0.1.0", "license": "MIT", "type": "application", "entry": "src/main.q" }',
       "src/main.q": "import q64.math.*\nfn main { env.out(\"x\") }\n",
     });
-    const r = runCli(["build", "--diagnostics", "json"], { cwd: proj });
+    const r = runCli(["build", "--diagnostics", "json", "--addr", "wasm64"], { cwd: proj });
     expect((r.envelope?.diagnostics ?? []).some((d) => d.code === "NAM003")).toBe(true);
   });
 });

@@ -78,7 +78,7 @@ echo "    ok: q64 emit --module -> $actual"
 # Full path: `qube run` reads the JSON5 manifest, resolves the local-path
 # dependency into a --module flag, emits, and runs the host itself.
 echo "==> (cd hello_app && qube run)"
-qube_out="$(cd "$APP_DIR" && Q64_BIN="$Q64_BIN" Q64_HOST="$HOST_BIN" "$QUBE_BIN" run)"
+qube_out="$(cd "$APP_DIR" && Q64_BIN="$Q64_BIN" Q64_HOST="$HOST_BIN" "$QUBE_BIN" run --addr wasm64)"
 if [[ "$qube_out" != "$expected" ]]; then
     echo "FAIL: qube run output mismatch" >&2
     printf "  expected: %q\n" "$expected" >&2

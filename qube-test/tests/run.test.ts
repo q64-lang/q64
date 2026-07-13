@@ -41,6 +41,20 @@ describe.skipIf(!binaryAvailable())("qube run (manifest discovery)", () => {
     const r = runCli(["run"], { cwd: `${proj}/nested/dir` });
     expect(r.stderr).not.toContain("no qube.json5");
   });
+
+  test("an unknown option → usage error, exit 2 (never warn-and-ignore)", () => {
+    const proj = makeProject({ "qube.json5": appManifest(), "src/main.q": "fn main { env.out(\"x\") }\n" });
+    const r = runCli(["run", "--frobnicate"], { cwd: proj });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("unknown option");
+  });
+
+  test("no --addr and no --target → usage error, exit 2 (run builds; no default address space)", () => {
+    const proj = makeProject({ "qube.json5": appManifest(), "src/main.q": "fn main { env.out(\"x\") }\n" });
+    const r = runCli(["run"], { cwd: proj });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("no address space");
+  });
 });
 
 // Test-first: a full `qube run` needs q64 + a runtime host wired on PATH, which
@@ -51,7 +65,7 @@ describe.skipIf(!binaryAvailable())("qube run (full toolchain)", () => {
       "qube.json5": appManifest(),
       "src/main.q": "fn main { env.out(\"Hello from qube-test.\") }\n",
     });
-    const r = runCli(["run"], { cwd: proj });
+    const r = runCli(["run", "--addr", "wasm64"], { cwd: proj });
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("Hello from qube-test.");
   });

@@ -179,7 +179,7 @@ fi
 echo "==> qube build --component (examples/math-lib library)"
 mathlib_dir="$REPO_ROOT/examples/math-lib"
 rm -rf "$mathlib_dir/target"
-( cd "$mathlib_dir" && Q64_BIN="$Q64_BIN" "$QUBE_BIN" build --component )
+( cd "$mathlib_dir" && Q64_BIN="$Q64_BIN" "$QUBE_BIN" build --component --addr wasm64 )
 mathlib_comp="$mathlib_dir/target/debug/wasm64/dev.q64.math.component.wasm"
 test -f "$mathlib_comp" || { echo "FAIL: qube build produced no component" >&2; exit 1; }
 mathlib_wit="$mathlib_dir/target/debug/wasm64/dev.q64.math.wit"
