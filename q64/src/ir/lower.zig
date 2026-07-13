@@ -5,17 +5,18 @@
 //! model, and int→string formatting become explicit. The MIR it produces is
 //! the direct input to a backend.
 //!
-//! Migration status: lowers the literal `env.out` path and i64 functions
-//! (arithmetic + calls) with their `env.out(<i64>)` uses. Control flow and
-//! the string-concat arena ops land in later phases.
+//! Coverage: the current HIR surface — i64 arithmetic and calls, control
+//! flow (`if`/`while`/`loop`, value- and void-position), and the str ABI
+//! (constants, concat, interpolation formatting, slices) with their
+//! `env.out` uses. A shape outside that surface is `error.Unsupported`.
 
 const std = @import("std");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
 
 /// `Unsupported` means a valid-but-not-yet-lowerable shape (e.g. a function
-/// body whose tail isn't a value); the codegen router treats it as a signal
-/// to fall back to the legacy emitter.
+/// body whose tail isn't a value); codegen reports it as an honest
+/// `UnsupportedExpression` — there is no fallback emitter.
 pub const Error = error{Unsupported} || std.mem.Allocator.Error;
 
 /// Reserved internal name for the entry function in MIR. It carries a `#`

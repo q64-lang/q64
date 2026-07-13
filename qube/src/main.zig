@@ -1,10 +1,13 @@
 //! qube — the package and build tool. CLI surface specified in
 //! spec/qube-cli.md, manifest schema in spec/qube.json5.md.
 //!
-//! v0 scope: `qube run`, `qube web`, and `qube --version`. Everything
-//! else prints "not implemented yet" and exits 2. `qube run`
-//! discovers the nearest `qube.json5`, parses it as JSON5 (comments +
-//! trailing commas), resolves local-path dependencies into
+//! Implemented today: `build`, `run`, `web`, `deploy` (+ `pod
+//! init|login|info|logout`), `init`, `add`, `lock`, `install`,
+//! `publish`, `login`, `wit`, `wac`, and `--version`. The remaining
+//! spec'd subcommands (remove, test, outdated, audit, clean, explain,
+//! fix, fmt, workspace) print "not implemented yet" and exit 2.
+//! `qube run` discovers the nearest `qube.json5`, parses it as JSON5
+//! (comments + trailing commas), resolves dependencies into
 //! `q64 emit --module` flags, then shells out to `q64 emit` and
 //! `q64-wasmtime-host`.
 //! `qube web` shells out to `q64 emit`, copies the browser adapter

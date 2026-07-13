@@ -1,26 +1,18 @@
 //! q64/src/codegen — AST → Wasm 3.0 via Binaryen.
 //!
-//! v0 surface: a single entry point `emitHelloWasm` that builds the
-//! hand-equivalent of `runtime/wasmtime/hello.wat` directly via the
-//! Binaryen C API. This proves the Binaryen integration and gives
-//! us a byte-level shape codegen will later produce from a typed AST.
+//! Main surface: `emitFromSource` / `emitFromSourceWithImports`, which
+//! drive the full IR pipeline — parse → HIR (`ir.build_hir`) → MIR
+//! (`ir.lower`) → Binaryen — and return a finished core module.
+//! `emitComponent` layers the Component Model output on top, and
+//! `showHir` / `showMir` share the same front end to dump an IR tier as
+//! text for `q64 show hir|mir`. A construct the IR can't represent yet
+//! is reported as an honest `Error.UnsupportedExpression` — the legacy
+//! direct-from-AST emitter is removed; there is no fallback.
 //!
-//! Module shape produced:
-//!
-//!   (module
-//!     (import "env" "out" (func (param i64 i64)))
-//!     (memory (export "memory") i64 1)
-//!     (data (i64.const 0) "Hello, q64.\n")
-//!     (func (export "_start")
-//!       i64.const 0
-//!       i64.const 12
-//!       call $env_out))
-//!
-//! The result instantiates against `runtime/wasmtime/q64-wasmtime-host`
-//! and prints `Hello, q64.\n` to stdout, matching the hand-written
-//! hello.wat byte-for-byte in behavior (the exact byte stream may
-//! differ in section ordering / type-index layout — Binaryen and
-//! wabt make different but equally valid choices).
+//! `emitHelloWasm` survives as the original v0 smoke test (`q64
+//! emit-hello`): it builds the hand-equivalent of
+//! `runtime/wasmtime/hello.wat` directly via the Binaryen C API and
+//! instantiates against `runtime/wasmtime/q64-wasmtime-host`.
 
 const std = @import("std");
 const parser = @import("parser");
