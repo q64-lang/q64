@@ -1657,7 +1657,7 @@ fn witCheck(
     args_it: *std.process.Args.Iterator,
 ) !void {
     while (args_it.next()) |a| {
-        try printStderr(io, "qube wit check: ignoring unrecognised arg: {s}\n", .{a});
+        try rejectOption(io, "wit check", a);
     }
     var m = try loadManifest(gpa, io, null);
     defer m.deinit(gpa);
@@ -1883,7 +1883,7 @@ fn cmdWeb(
     args_it: *std.process.Args.Iterator,
 ) !void {
     while (args_it.next()) |a| {
-        try printStderr(io, "qube web: ignoring unrecognised arg in v0: {s}\n", .{a});
+        try rejectOption(io, "web", a);
     }
 
     const cwd_path = try std.process.currentPathAlloc(io, gpa);
@@ -2758,7 +2758,7 @@ fn cmdPublish(
                 std.process.exit(@intFromEnum(ExitCode.usage));
             };
         } else {
-            try printStderr(io, "qube publish: ignoring unrecognised arg in v0: {s}\n", .{a});
+            try rejectOption(io, "publish", a);
         }
     }
 

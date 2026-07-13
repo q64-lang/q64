@@ -148,18 +148,32 @@ fn encodeFuncType(s: *W, params: []const Scalar, param_names: []const []const u8
     }
 }
 
+/// The index of `wit_name` in the declared import list — the component
+/// instance index space §0a establishes. The `encode` contract guarantees a
+/// wired interface is always declared.
+fn declaredIndex(imports: []const ImportIface, wit_name: []const u8) usize {
+    for (imports, 0..) |iface, j| {
+        if (std.mem.eql(u8, iface.wit_name, wit_name)) return j;
+    }
+    unreachable; // contract: wired ⊆ imports by wit_name
+}
+
 /// Encode the component. `core` is the emitted core module; `exports` the
 /// scalar public surface to lift; `imports` the foreign WIT interfaces the
-/// component imports (WIT rung 5 — what `wac` links at build). The core's
-/// foreign call binding lowers each `<iface>.<fn>` to a core import
-/// `(import "<wit-id>" "<fn>" …)`; this encoder aliases each imported-instance
-/// export, canon-lowers it to a core func, and feeds those back as the core
-/// module's instantiation imports. **Caller guarantees the core module imports
-/// exactly the `(wit_name, fn)` pairs named here** — no more (a host face like
-/// `qview.*` needs a different lift), no fewer (the instantiate args must match
-/// the module's imports). `emitComponent` enforces this by passing only the
-/// interfaces/funcs the source actually calls.
-pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export, imports: []const ImportIface) Error![]u8 {
+/// component **declares** it imports (WIT rung 5 — the manifest's
+/// `wit.imports`, declared in the world even when unused so `wac` can link at
+/// build, per spec/qube.json5.md §wit); `wired` the subset whose functions the
+/// core module actually imports (its `foreign_call` sites). Declaration and
+/// wiring are separate: every declared interface gets an instance-type (§7a)
+/// and an import (§0a), but only wired functions are aliased out of their
+/// imported instance, canon-lowered, and fed back as the core module's
+/// instantiation imports. **Caller guarantees the core module imports exactly
+/// the `(wit_name, fn)` pairs in `wired`** — no more (a host face like
+/// `qview.*` needs a different lift), no fewer (the instantiate args must
+/// match the module's imports) — and that every wired interface also appears
+/// in `imports` under the same `wit_name`. `emitComponent` enforces this by
+/// wiring only the interfaces/funcs the source actually calls.
+pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export, imports: []const ImportIface, wired: []const ImportIface) Error![]u8 {
     var out = W{ .a = gpa };
     errdefer out.buf.deinit(gpa);
 
@@ -210,26 +224,30 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
     // §1 core module: the embedded core wasm, verbatim.
     try section(&out, 1, core);
 
-    // Total imported funcs K (across all M interfaces). The core module imports
-    // each foreign func by `(<wit-id>, <fn>)`; the component must supply them by
-    // aliasing each imported-instance export, lowering it to a core func, and
-    // feeding those back in as the core module's instantiation imports.
-    var total_imports: usize = 0;
-    for (imports) |iface| total_imports += iface.funcs.len;
-    const k = total_imports;
+    // Total wired funcs K (across the wired interfaces). The core module
+    // imports each wired func by `(<wit-id>, <fn>)`; the component supplies
+    // them by aliasing each imported-instance export, lowering it to a core
+    // func, and feeding those back in as the core module's instantiation
+    // imports. Declared-but-unwired interfaces take no part in this plumbing —
+    // they exist only as world imports (§7a/§0a above).
+    var total_wired: usize = 0;
+    for (wired) |iface| total_wired += iface.funcs.len;
+    const k = total_wired;
 
-    // §6 alias (component func): bring each imported interface function out of
-    // its imported instance into the component-func index space (0..K, in
-    // interface-then-func order).
+    // §6 alias (component func): bring each wired interface function out of
+    // its imported instance (found by `wit_name` in the DECLARED list, since
+    // that list owns the instance index space) into the component-func index
+    // space (0..K, in interface-then-func order).
     if (k > 0) {
         var s = W{ .a = gpa };
         defer s.buf.deinit(gpa);
         try s.uleb(k);
-        for (imports, 0..) |iface, j| {
+        for (wired) |iface| {
+            const j = declaredIndex(imports, iface.wit_name);
             for (iface.funcs) |f| {
                 try s.byte(0x01); // sort: component func
                 try s.byte(0x00); // target: instance export
-                try s.uleb(j); // component instance index j (the imported instance)
+                try s.uleb(j); // component instance index (the imported instance)
                 try s.label(f.name);
             }
         }
@@ -251,16 +269,18 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
         try section(&out, 8, s.buf.items);
     }
 
-    // §2 core instances: one synthetic from-exports instance per imported
+    // §2 core instances: one synthetic from-exports instance per WIRED
     // interface (exporting that interface's lowered core funcs under their field
     // names, core-func indices grouped by interface), then the main module
-    // instantiated with each interface id wired to its synthetic instance.
+    // instantiated with each wired interface id fed its synthetic instance.
+    // Declared-but-unwired interfaces get no synthetic instance and no
+    // instantiation arg — the core module doesn't import them.
     {
         var s = W{ .a = gpa };
         defer s.buf.deinit(gpa);
-        try s.uleb(m + 1); // M synthetic instances + the main module instance
+        try s.uleb(wired.len + 1); // wired synthetic instances + the main module instance
         var base: usize = 0; // running core-func index for the lowered imports
-        for (imports) |iface| {
+        for (wired) |iface| {
             try s.byte(0x01); // instance form: from exports
             try s.uleb(iface.funcs.len);
             for (iface.funcs, 0..) |f, fi| {
@@ -270,19 +290,19 @@ pub fn encode(gpa: std.mem.Allocator, core: []const u8, exports: []const Export,
             }
             base += iface.funcs.len;
         }
-        // The main module instance: instantiate module 0, wiring each foreign
+        // The main module instance: instantiate module 0, wiring each wired
         // interface id to its synthetic core instance (index j).
         try s.byte(0x00); // instantiate
         try s.uleb(0); // module index 0
-        try s.uleb(m); // M instantiation args (one per imported interface)
-        for (imports, 0..) |iface, j| {
+        try s.uleb(wired.len); // instantiation args (one per wired interface)
+        for (wired, 0..) |iface, j| {
             try s.name(iface.wit_name); // raw core import module id (carries `:`/`/`/`@`)
             try s.byte(0x12); // core sort: instance
             try s.uleb(j); // the synthetic core instance index j
         }
         try section(&out, 2, s.buf.items);
     }
-    const main_inst = m; // the main module's core instance index
+    const main_inst = wired.len; // the main module's core instance index
 
     // §6 alias (core func): bring each exported core func out of the main
     // instance into the core-func index space (indices K..K+N in order).
@@ -366,7 +386,7 @@ test "encode: component preamble + section ids for a scalar export" {
     const params = [_]Scalar{ .s64, .s64 };
     const param_names = [_][]const u8{ "a", "b" };
     const exports = [_]Export{.{ .name = "add", .core_name = "add", .params = &params, .param_names = &param_names, .ret = .s64 }};
-    const bytes = try encode(testing.allocator, &core, &exports, &.{});
+    const bytes = try encode(testing.allocator, &core, &exports, &.{}, &.{});
     defer testing.allocator.free(bytes);
 
     // Component preamble: \0asm, version 0x000d, layer 0x0001.
@@ -392,7 +412,7 @@ test "encode: component-model labels are kebab-cased from snake_case" {
     const params = [_]Scalar{.s64};
     const param_names = [_][]const u8{"min_value"};
     const exports = [_]Export{.{ .name = "get_version", .core_name = "get_version", .params = &params, .param_names = &param_names, .ret = .s64 }};
-    const bytes = try encode(testing.allocator, &core, &exports, &.{});
+    const bytes = try encode(testing.allocator, &core, &exports, &.{}, &.{});
     defer testing.allocator.free(bytes);
 
     // The kebab forms are present; the snake forms are not (except as the
@@ -411,7 +431,7 @@ test "encode: a foreign import adds the instance-type (§7) + import (§0x0a) se
     const inames = [_][]const u8{ "a", "b" };
     const ifuncs = [_]ImportFunc{.{ .name = "add", .params = &iparams, .param_names = &inames, .ret = .s64 }};
     const imports = [_]ImportIface{.{ .wit_name = "acme:mathlib/math@1.0.0", .funcs = &ifuncs }};
-    const bytes = try encode(testing.allocator, &core, &exports, &imports);
+    const bytes = try encode(testing.allocator, &core, &exports, &imports, &imports);
     defer testing.allocator.free(bytes);
 
     // The component-model interface id is present (raw, not kebab-mapped).
@@ -424,12 +444,37 @@ test "encode: a foreign import adds the instance-type (§7) + import (§0x0a) se
     try testing.expect(std.mem.indexOf(u8, bytes, "add") != null);
 }
 
+test "encode: a declared-but-unwired import is still declared (§7 + §0x0a), with no instantiate arg" {
+    // The manifest declares `wit.imports` the source never calls (WIT rung 5's
+    // consume direction before the first call site lands). The world must
+    // still import the interface — `wac` links against the declaration — while
+    // the core module, which imports nothing, gets zero instantiation args.
+    const core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const eparams = [_]Scalar{.s64};
+    const enames = [_][]const u8{"x"};
+    const exports = [_]Export{.{ .name = "compute", .core_name = "compute", .params = &eparams, .param_names = &enames, .ret = .s64 }};
+    const iparams = [_]Scalar{ .s64, .s64 };
+    const inames = [_][]const u8{ "a", "b" };
+    const ifuncs = [_]ImportFunc{.{ .name = "add", .params = &iparams, .param_names = &inames, .ret = .s64 }};
+    const imports = [_]ImportIface{.{ .wit_name = "acme:mathlib/math@1.0.0", .funcs = &ifuncs }};
+    const bytes = try encode(testing.allocator, &core, &exports, &imports, &.{});
+    defer testing.allocator.free(bytes);
+
+    // The interface id is declared (instance-type + import section carry it).
+    try testing.expect(std.mem.indexOf(u8, bytes, "acme:mathlib/math@1.0.0") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, bytes, 0x42) != null); // instancetype tag
+    // Exactly ONE occurrence of the id: the §0a import. A wired import would
+    // carry a second occurrence — the core-instance instantiation arg.
+    const first = std.mem.indexOf(u8, bytes, "acme:mathlib/math@1.0.0").?;
+    try testing.expect(std.mem.indexOfPos(u8, bytes, first + 1, "acme:mathlib/math@1.0.0") == null);
+}
+
 test "encode: no imports → byte-identical to the export-only form (M=0)" {
     const core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
     const params = [_]Scalar{ .s64, .s64 };
     const names = [_][]const u8{ "a", "b" };
     const exports = [_]Export{.{ .name = "add", .core_name = "add", .params = &params, .param_names = &names, .ret = .s64 }};
-    const with_empty = try encode(testing.allocator, &core, &exports, &.{});
+    const with_empty = try encode(testing.allocator, &core, &exports, &.{}, &.{});
     defer testing.allocator.free(with_empty);
     // The §0x0a import section is absent when there are no imports.
     // (id 0x0a only appears as a section here if imports were emitted.)
