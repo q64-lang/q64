@@ -155,8 +155,10 @@ fn synthesizeInner(
         try appendValue(gpa, out, comp);
     }
 
-    // Remaining strict-schema keys, verbatim.
-    const passthrough = [_][]const u8{ "$schema", "exports", "imports", "providers" };
+    // Remaining strict-schema keys, verbatim. `placement` is the node-fleet
+    // deployment target (placement.nodes.tags — tags select, capabilities
+    // gate); the API's reconciler turns it into node_workload rows.
+    const passthrough = [_][]const u8{ "$schema", "exports", "imports", "providers", "placement" };
     for (passthrough) |k| {
         if (root.get(k)) |v| {
             try out.appendSlice(gpa, ",\"");
@@ -233,6 +235,18 @@ test "synthesize: overrides win — project, name, re-rooted assets" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"project\":\"myproj\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"site-slug\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"assets\":{\"directory\":\".\",\"notFoundHandling\":\"single-page-application\"}") != null);
+}
+
+test "synthesize: placement passes through verbatim" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const r = synthesize(a,
+        \\{ name: "org.dev", project: "iot", component: { variants: { wasm32: { wasm: "d.wasm" } } },
+        \\  placement: { nodes: { tags: ["thermo", "milano"] } } }
+    , .{});
+    const out = r.ok;
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"placement\":{\"nodes\":{\"tags\":[\"thermo\",\"milano\"]}}") != null);
 }
 
 test "synthesize: diagnostics — missing project, nothing deployable" {
