@@ -28,6 +28,7 @@ qube --help    | -h
 | `qube pod releases`              | Release-slot state: which slot serves, what's staged, canary weight |
 | `qube pod promote`               | Flip the staged (idle) slot live — rollback = promote again      |
 | `qube pod canary <0-100>`        | Send that share of visitors to the staged slot (splittable runtimes) |
+| `qube pod sql "<stmt>"`          | Run SQL against the project database (JSON rows out)             |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |
@@ -187,6 +188,23 @@ All three read `project` + `name` from `qubepod.jsonc` in the cwd, or take
 `--project <slug>` / `--app <name>` from anywhere; `--url` / `--token` /
 `$QUBEPODS_TOKEN` / saved login resolve exactly as in `qube deploy`. The
 routes are project-token-authed (`deploy` scope).
+
+### `qube pod sql`
+
+Run one SQL statement against the **project database** — the store the
+twins' `env.db` statements land in and the console's Database page shows.
+Prints the API's JSON response (`{"rows": …, "rowsRead": …, "rowsWritten": …,
+"size": …}`) — pipe to `jq` for shaping. Project from `qubepod.jsonc` in the
+cwd or `--project <slug>`; token/origin resolution as in `qube deploy`.
+`POST /api/projects/<p>/db/sql` (project token). The debugging loop for a
+twin is one line:
+
+```console
+$ qube pod sql "SELECT * FROM thermo_readings ORDER BY at DESC LIMIT 5" --project iot
+```
+
+`qube pod hostname` drives the same project-token surface
+(`GET`/`PUT`/`DELETE /api/projects/<p>/apps/<a>/hostname`).
 
 ### `qube pod login` / `info` / `logout`
 

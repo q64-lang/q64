@@ -3938,13 +3938,16 @@ fn isSlug(s: []const u8) bool {
 
 fn podHelp(io: std.Io) !void {
     try writeStdout(io,
-        \\usage: qube pod <new [name] | init | login | logout | info | hostname | releases | promote | canary> [flags]
+        \\usage: qube pod <new [name] | init | login | logout | info | hostname | releases | promote | canary | sql> [flags]
         \\
         \\Releases (a repeat `qube deploy` stages in the idle slot at 0% traffic —
         \\test it at the deploy response's slotPreviewUrl, then finish the loop):
         \\  qube pod releases        Slot state: what serves, what's staged.
         \\  qube pod promote         Flip the staged slot live (rollback = promote again).
         \\  qube pod canary <0-100>  Send that share of visitors to the staged slot.
+        \\
+        \\Data:
+        \\  qube pod sql "<stmt>"    Run SQL against the project database (JSON out).
         \\
         \\Auth (qubepods provider):
         \\  qube pod login [--token <t>] [--url <origin>]
@@ -4174,7 +4177,7 @@ fn cmdPod(
     args_it: *std.process.Args.Iterator,
 ) !void {
     const subsub = args_it.next() orelse {
-        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|hostname|releases|promote|canary> [flags]\n");
+        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|hostname|releases|promote|canary|sql> [flags]\n");
         std.process.exit(@intFromEnum(ExitCode.usage));
     };
     if (std.mem.eql(u8, subsub, "--help") or std.mem.eql(u8, subsub, "-h")) {
@@ -4196,6 +4199,7 @@ fn cmdPod(
     if (std.mem.eql(u8, subsub, "releases")) return cmdPodRelease(gpa, io, env, args_it, .status);
     if (std.mem.eql(u8, subsub, "promote")) return cmdPodRelease(gpa, io, env, args_it, .promote);
     if (std.mem.eql(u8, subsub, "canary")) return cmdPodRelease(gpa, io, env, args_it, .canary);
+    if (std.mem.eql(u8, subsub, "sql")) return cmdPodSql(gpa, io, env, args_it);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
 }
@@ -4810,7 +4814,9 @@ fn cmdPodHostname(
         break :blk0 t;
     };
 
-    const base = try std.fmt.allocPrint(gpa, "{s}/me/projects/{s}/apps/{s}/hostname", .{ api_url, project, app_name });
+    // The project-token route (the /me/* console surface requires a session
+    // JWT — a qube_ token cannot pass it; this was the CLI's original bug).
+    const base = try std.fmt.allocPrint(gpa, "{s}/api/projects/{s}/apps/{s}/hostname", .{ api_url, project, app_name });
     defer gpa.free(base);
     const auth = try std.fmt.allocPrint(gpa, "authorization: Bearer {s}", .{token});
     defer gpa.free(auth);
@@ -4852,7 +4858,8 @@ fn cmdPodHostname(
         return;
     }
     try printStderr(io, "qube pod hostname: api returned {d}:\n{s}\n", .{ status, resp_body });
-    try printStderr(io, "  token used ({s}): QUBEPODS_TOKEN={s}\n", .{ token_source, token });
+    // Name the token's SOURCE only — never echo the credential itself.
+    try printStderr(io, "  token source: {s}\n", .{token_source});
     std.process.exit(@intFromEnum(ExitCode.registry));
 }
 
@@ -5030,6 +5037,135 @@ fn cmdPodRelease(
         return;
     }
     try printStderr(io, "qube pod {s}: api returned {d}:\n{s}\n", .{ verb_name, status, resp_body });
+    try printStderr(io, "  token source: {s}\n", .{token_source});
+    std.process.exit(@intFromEnum(ExitCode.registry));
+}
+
+// ---------------------------------------------------------------------------
+// qube pod sql — run a statement against the PROJECT DATABASE (the same
+// SQLite the twins' env.db statements land in and the console's Database
+// page shows). The token route exists for exactly this: CLI/agent DB access.
+//
+//   qube pod sql "SELECT * FROM thermo_readings ORDER BY at DESC LIMIT 5"
+//
+// Prints the API's JSON response ({rows, rowsRead, rowsWritten, size}) —
+// pipe to jq for shaping. Project from qubepod.jsonc or --project.
+// ---------------------------------------------------------------------------
+fn cmdPodSql(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+) !void {
+    var api_url: []const u8 = default_pods_api;
+    var url_flagged = false;
+    var token_flag: ?[]const u8 = null;
+    var project_flag: ?[]const u8 = null;
+    var stmt: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try writeStdout(io,
+                \\usage: qube pod sql "<statement>" [flags]
+                \\
+                \\Run one SQL statement against the project database (the store the
+                \\twins write and the console's Database page shows). Prints the JSON
+                \\response: {"rows": …, "rowsRead": …, "rowsWritten": …, "size": …}.
+                \\
+                \\  --project <slug>   Project (default: qubepod.jsonc in the cwd).
+                \\  --url <origin>     API origin (default: saved login, else api.qubepods.com).
+                \\  --token <t>        Project token (or QUBEPODS_TOKEN / qube pod login).
+                \\
+            );
+            return;
+        } else if (std.mem.eql(u8, a, "--url")) {
+            api_url = try flagValue(io, args_it, "--url");
+            url_flagged = true;
+        } else if (std.mem.eql(u8, a, "--token")) {
+            token_flag = try flagValue(io, args_it, "--token");
+        } else if (std.mem.eql(u8, a, "--project")) {
+            project_flag = try flagValue(io, args_it, "--project");
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube pod sql: unknown flag: {s}\n", .{a});
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else {
+            stmt = a;
+        }
+    }
+    const statement = stmt orelse {
+        try writeStderr(io, "qube pod sql: a SQL statement is required (quote it)\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    };
+
+    var saved_url: ?[]u8 = null;
+    defer if (saved_url) |u| gpa.free(u);
+    if (!url_flagged) {
+        if (readPodUrl(gpa, io, env)) |u| {
+            saved_url = u;
+            api_url = u;
+        }
+    }
+
+    // Project: flag wins; else qubepod.jsonc in the cwd.
+    var manifest_raw: ?[]u8 = null;
+    defer if (manifest_raw) |r| gpa.free(r);
+    const project = project_flag orelse blk: {
+        const cwd_path = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd_path);
+        const manifest_path = try std.fs.path.join(gpa, &.{ cwd_path, "qubepod.jsonc" });
+        defer gpa.free(manifest_path);
+        if (!fileExists(io, manifest_path)) {
+            try writeStderr(io, "qube pod sql: no qubepod.jsonc here — pass --project\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
+        manifest_raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
+        break :blk extractStringField(manifest_raw.?, "\"project\"") orelse {
+            try writeStderr(io, "qube pod sql: manifest has no \"project\" — pass --project\n");
+            std.process.exit(@intFromEnum(ExitCode.input));
+        };
+    };
+
+    var saved_token: ?[]u8 = null;
+    defer if (saved_token) |t| gpa.free(t);
+    var token_source: []const u8 = "--token";
+    const token: []const u8 = token_flag orelse blk0: {
+        if (env.get("QUBEPODS_TOKEN")) |t| {
+            token_source = "QUBEPODS_TOKEN";
+            break :blk0 t;
+        }
+        const t = readPodToken(gpa, io, env) catch {
+            try writeStderr(io, "qube pod sql: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n");
+            std.process.exit(@intFromEnum(ExitCode.registry));
+        };
+        token_source = "saved login (~/.qube/pods.toml)";
+        saved_token = t;
+        break :blk0 t;
+    };
+
+    const url = try std.fmt.allocPrint(gpa, "{s}/api/projects/{s}/db/sql", .{ api_url, project });
+    defer gpa.free(url);
+    const auth = try std.fmt.allocPrint(gpa, "authorization: Bearer {s}", .{token});
+    defer gpa.free(auth);
+    // JSON-escape the statement (it carries quotes as a matter of course).
+    const sql_json = try std.json.Stringify.valueAlloc(gpa, std.json.Value{ .string = statement }, .{});
+    defer gpa.free(sql_json);
+    const body_json = try std.fmt.allocPrint(gpa, "{{\"sql\":{s}}}", .{sql_json});
+    defer gpa.free(body_json);
+
+    const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", "-X", "POST", url, "-H", auth, "-H", "content-type: application/json", "-d", body_json };
+    const cap = try runCapture(gpa, io, &argv);
+    defer gpa.free(cap.stdout);
+
+    const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse cap.stdout.len;
+    const resp_body = cap.stdout[0..nl];
+    const status = if (nl < cap.stdout.len)
+        std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout[nl + 1 ..], " \r\n"), 10) catch 0
+    else
+        0;
+    if (status >= 200 and status < 300) {
+        try printStdout(io, "{s}\n", .{resp_body});
+        return;
+    }
+    try printStderr(io, "qube pod sql: api returned {d}:\n{s}\n", .{ status, resp_body });
     try printStderr(io, "  token source: {s}\n", .{token_source});
     std.process.exit(@intFromEnum(ExitCode.registry));
 }
