@@ -1100,7 +1100,11 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     // serves host-side allocations (e.g. an error variant's `other(string)`) from
     // page 1 up, so reserve room above the page-0 data/scratch/arena. fs.read and
     // env.args let the host grow guest memory, so they also need headroom.
-    const mem_min: c.BinaryenIndex = if (any_vec and !wants_store) vec_mem_pages else if (wants_store) 2 else 1;
+    // A vec needs the pages regardless of the store path: a store-component
+    // module with actor `state Vec` still allocates at `vec_hp_base` (1 MiB),
+    // so 2 initial pages would trap on the first vec write. `vec_mem_pages`
+    // equals the store max (64), so the store+vec module comes out (64, 64).
+    const mem_min: c.BinaryenIndex = if (any_vec) vec_mem_pages else if (wants_store) 2 else 1;
     const mem_max: c.BinaryenIndex = if (stdout_abi == .wasi_preview1) 0xffff_ffff else if (wants_store) 64 else if (any_vec) vec_mem_pages else if (any_fs or any_args) 256 else 1;
     // The component model requires the canonical memory export to be named
     // `cm32p2_memory`; the raw paths keep the plain `memory`.
