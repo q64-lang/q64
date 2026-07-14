@@ -3946,8 +3946,13 @@ fn podHelp(io: std.Io) !void {
         \\  qube pod promote         Flip the staged slot live (rollback = promote again).
         \\  qube pod canary <0-100>  Send that share of visitors to the staged slot.
         \\
-        \\Data:
+        \\Data & ops:
         \\  qube pod sql "<stmt>"    Run SQL against the project database (JSON out).
+        \\  qube pod versions        Deployments (slot, status), newest first.
+        \\  qube pod rollback <id>   Re-activate a retained deployment.
+        \\  qube pod kv get|put|list|delete …     Project KV.
+        \\  qube pod var list|set|delete …        Project variables.
+        \\  qube pod secret set|delete <NAME>     Secrets (value via stdin).
         \\
         \\Auth (qubepods provider):
         \\  qube pod login [--token <t>] [--url <origin>]
@@ -4200,6 +4205,11 @@ fn cmdPod(
     if (std.mem.eql(u8, subsub, "promote")) return cmdPodRelease(gpa, io, env, args_it, .promote);
     if (std.mem.eql(u8, subsub, "canary")) return cmdPodRelease(gpa, io, env, args_it, .canary);
     if (std.mem.eql(u8, subsub, "sql")) return cmdPodSql(gpa, io, env, args_it);
+    if (std.mem.eql(u8, subsub, "versions")) return cmdPodOps(gpa, io, env, args_it, .versions);
+    if (std.mem.eql(u8, subsub, "rollback")) return cmdPodOps(gpa, io, env, args_it, .rollback);
+    if (std.mem.eql(u8, subsub, "kv")) return cmdPodOps(gpa, io, env, args_it, .kv);
+    if (std.mem.eql(u8, subsub, "var")) return cmdPodOps(gpa, io, env, args_it, .variable);
+    if (std.mem.eql(u8, subsub, "secret")) return cmdPodOps(gpa, io, env, args_it, .secret);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
 }
@@ -5166,6 +5176,283 @@ fn cmdPodSql(
         return;
     }
     try printStderr(io, "qube pod sql: api returned {d}:\n{s}\n", .{ status, resp_body });
+    try printStderr(io, "  token source: {s}\n", .{token_source});
+    std.process.exit(@intFromEnum(ExitCode.registry));
+}
+
+// ---------------------------------------------------------------------------
+// qube pod versions | rollback | kv | var | secret — project ops over the
+// same token surface as deploy. One driver, five verbs:
+//
+//   qube pod versions                      deployments (slot, status), newest first
+//   qube pod rollback <deploymentId>       re-activate a retained deployment
+//   qube pod kv get <key> | put <key> <value> [--ttl <s>] | list [prefix] | delete <key>
+//   qube pod var list | set <KEY> <value> | delete <KEY>
+//   qube pod secret set <NAME> | delete <NAME>     (set reads the VALUE from
+//                                                   stdin — never argv/ps)
+// ---------------------------------------------------------------------------
+const PodOp = enum { versions, rollback, kv, variable, secret };
+
+fn cmdPodOps(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+    op: PodOp,
+) !void {
+    const op_name: []const u8 = switch (op) {
+        .versions => "versions",
+        .rollback => "rollback",
+        .kv => "kv",
+        .variable => "var",
+        .secret => "secret",
+    };
+    var api_url: []const u8 = default_pods_api;
+    var url_flagged = false;
+    var token_flag: ?[]const u8 = null;
+    var project_flag: ?[]const u8 = null;
+    var app_flag: ?[]const u8 = null;
+    var ttl_flag: ?[]const u8 = null;
+    var pos: [3]?[]const u8 = .{ null, null, null };
+    var pos_n: usize = 0;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try writeStdout(io,
+                \\usage: qube pod versions|rollback|kv|var|secret … [flags]
+                \\
+                \\  qube pod versions                 Deployments (slot, status), newest first.
+                \\  qube pod rollback <deploymentId>  Re-activate a retained deployment.
+                \\  qube pod kv get <key>             Read one key from project KV.
+                \\  qube pod kv put <key> <value> [--ttl <seconds>]
+                \\  qube pod kv list [prefix]
+                \\  qube pod kv delete <key>
+                \\  qube pod var list                 Variables (+ secret names).
+                \\  qube pod var set <KEY> <value>
+                \\  qube pod var delete <KEY>
+                \\  qube pod secret set <NAME>        Value is read from stdin.
+                \\  qube pod secret delete <NAME>
+                \\
+                \\  --project <slug> / --app <name>   Defaults: qubepod.jsonc in the cwd.
+                \\  --url <origin> / --token <t>      As in `qube deploy`.
+                \\
+            );
+            return;
+        } else if (std.mem.eql(u8, a, "--url")) {
+            api_url = try flagValue(io, args_it, "--url");
+            url_flagged = true;
+        } else if (std.mem.eql(u8, a, "--token")) {
+            token_flag = try flagValue(io, args_it, "--token");
+        } else if (std.mem.eql(u8, a, "--project")) {
+            project_flag = try flagValue(io, args_it, "--project");
+        } else if (std.mem.eql(u8, a, "--app")) {
+            app_flag = try flagValue(io, args_it, "--app");
+        } else if (std.mem.eql(u8, a, "--ttl")) {
+            ttl_flag = try flagValue(io, args_it, "--ttl");
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube pod {s}: unknown flag: {s}\n", .{ op_name, a });
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else if (pos_n < pos.len) {
+            pos[pos_n] = a;
+            pos_n += 1;
+        }
+    }
+
+    // --url wins; else the origin saved by `qube pod login`; else the default.
+    var saved_url: ?[]u8 = null;
+    defer if (saved_url) |u| gpa.free(u);
+    if (!url_flagged) {
+        if (readPodUrl(gpa, io, env)) |u| {
+            saved_url = u;
+            api_url = u;
+        }
+    }
+
+    // Project (+ app for the app-scoped verbs): flags win; else qubepod.jsonc.
+    const needs_app = op == .versions or op == .rollback;
+    var manifest_raw: ?[]u8 = null;
+    defer if (manifest_raw) |r| gpa.free(r);
+    if (project_flag == null or (needs_app and app_flag == null)) {
+        const cwd_path = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd_path);
+        const manifest_path = try std.fs.path.join(gpa, &.{ cwd_path, "qubepod.jsonc" });
+        defer gpa.free(manifest_path);
+        if (fileExists(io, manifest_path)) {
+            manifest_raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
+        }
+    }
+    const project = project_flag orelse (if (manifest_raw) |r| extractStringField(r, "\"project\"") else null) orelse {
+        try printStderr(io, "qube pod {s}: no qubepod.jsonc here — pass --project\n", .{op_name});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const app_name: ?[]const u8 = app_flag orelse (if (manifest_raw) |r| extractStringField(r, "\"name\"") else null);
+    if (needs_app and app_name == null) {
+        try printStderr(io, "qube pod {s}: no app name — pass --app\n", .{op_name});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    }
+
+    // Token: --token > QUBEPODS_TOKEN > saved login (same chain as deploy).
+    var saved_token: ?[]u8 = null;
+    defer if (saved_token) |t| gpa.free(t);
+    var token_source: []const u8 = "--token";
+    const token: []const u8 = token_flag orelse blk0: {
+        if (env.get("QUBEPODS_TOKEN")) |t| {
+            token_source = "QUBEPODS_TOKEN";
+            break :blk0 t;
+        }
+        const t = readPodToken(gpa, io, env) catch {
+            try printStderr(io, "qube pod {s}: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n", .{op_name});
+            std.process.exit(@intFromEnum(ExitCode.registry));
+        };
+        token_source = "saved login (~/.qube/pods.toml)";
+        saved_token = t;
+        break :blk0 t;
+    };
+    const auth = try std.fmt.allocPrint(gpa, "authorization: Bearer {s}", .{token});
+    defer gpa.free(auth);
+
+    // JSON string encoder (escapes quotes and control characters).
+    const J = struct {
+        fn enc(a: std.mem.Allocator, s: []const u8) ![]u8 {
+            return std.json.Stringify.valueAlloc(a, std.json.Value{ .string = s }, .{});
+        }
+    };
+
+    // Build method + url + optional body per verb.
+    var method: []const u8 = "GET";
+    var url: []u8 = undefined;
+    var body: ?[]u8 = null;
+    defer if (body) |b| gpa.free(b);
+    const base = try std.fmt.allocPrint(gpa, "{s}/api/projects/{s}", .{ api_url, project });
+    defer gpa.free(base);
+    const usage_die = struct {
+        fn die(io2: std.Io, name: []const u8, hint: []const u8) noreturn {
+            printStderr(io2, "qube pod {s}: {s}\n", .{ name, hint }) catch {};
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        }
+    };
+    switch (op) {
+        .versions => {
+            url = try std.fmt.allocPrint(gpa, "{s}/apps/{s}/versions", .{ base, app_name.? });
+        },
+        .rollback => {
+            const dep = pos[0] orelse usage_die.die(io, op_name, "a deployment id is required (see qube pod versions)");
+            method = "POST";
+            url = try std.fmt.allocPrint(gpa, "{s}/apps/{s}/deployments/{s}/activate", .{ base, app_name.?, dep });
+        },
+        .kv => {
+            const sub = pos[0] orelse usage_die.die(io, op_name, "usage: kv get|put|list|delete …");
+            if (std.mem.eql(u8, sub, "get")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "kv get <key>");
+                url = try std.fmt.allocPrint(gpa, "{s}/kv?key={s}", .{ base, k });
+            } else if (std.mem.eql(u8, sub, "list")) {
+                if (pos[1]) |p| {
+                    url = try std.fmt.allocPrint(gpa, "{s}/kv?prefix={s}", .{ base, p });
+                } else {
+                    url = try std.fmt.allocPrint(gpa, "{s}/kv", .{base});
+                }
+            } else if (std.mem.eql(u8, sub, "put")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "kv put <key> <value>");
+                const v = pos[2] orelse usage_die.die(io, op_name, "kv put <key> <value>");
+                method = "PUT";
+                url = try std.fmt.allocPrint(gpa, "{s}/kv", .{base});
+                const kj = try J.enc(gpa, k);
+                defer gpa.free(kj);
+                const vj = try J.enc(gpa, v);
+                defer gpa.free(vj);
+                body = if (ttl_flag) |ttl|
+                    try std.fmt.allocPrint(gpa, "{{\"key\":{s},\"value\":{s},\"ttl\":{s}}}", .{ kj, vj, ttl })
+                else
+                    try std.fmt.allocPrint(gpa, "{{\"key\":{s},\"value\":{s}}}", .{ kj, vj });
+            } else if (std.mem.eql(u8, sub, "delete")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "kv delete <key>");
+                method = "DELETE";
+                url = try std.fmt.allocPrint(gpa, "{s}/kv", .{base});
+                const kj = try J.enc(gpa, k);
+                defer gpa.free(kj);
+                body = try std.fmt.allocPrint(gpa, "{{\"key\":{s}}}", .{kj});
+            } else usage_die.die(io, op_name, "usage: kv get|put|list|delete …");
+        },
+        .variable => {
+            const sub = pos[0] orelse usage_die.die(io, op_name, "usage: var list|set|delete …");
+            if (std.mem.eql(u8, sub, "list")) {
+                url = try std.fmt.allocPrint(gpa, "{s}/variables", .{base});
+            } else if (std.mem.eql(u8, sub, "set")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "var set <KEY> <value>");
+                const v = pos[2] orelse usage_die.die(io, op_name, "var set <KEY> <value>");
+                method = "PUT";
+                url = try std.fmt.allocPrint(gpa, "{s}/variables", .{base});
+                const kj = try J.enc(gpa, k);
+                defer gpa.free(kj);
+                const vj = try J.enc(gpa, v);
+                defer gpa.free(vj);
+                body = try std.fmt.allocPrint(gpa, "{{\"key\":{s},\"value\":{s}}}", .{ kj, vj });
+            } else if (std.mem.eql(u8, sub, "delete")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "var delete <KEY>");
+                method = "DELETE";
+                url = try std.fmt.allocPrint(gpa, "{s}/variables/{s}", .{ base, k });
+            } else usage_die.die(io, op_name, "usage: var list|set|delete …");
+        },
+        .secret => {
+            const sub = pos[0] orelse usage_die.die(io, op_name, "usage: secret set|delete <NAME>");
+            const name = pos[1] orelse usage_die.die(io, op_name, "usage: secret set|delete <NAME>");
+            if (std.mem.eql(u8, sub, "set")) {
+                // The VALUE never rides argv (visible in ps) — read it from stdin.
+                try writeStderr(io, "value (one line, not echoed back): ");
+                const value = try readStdinLineAlloc(gpa, io);
+                defer gpa.free(value);
+                if (value.len == 0) usage_die.die(io, op_name, "empty value");
+                method = "PUT";
+                url = try std.fmt.allocPrint(gpa, "{s}/secrets", .{base});
+                const nj = try J.enc(gpa, name);
+                defer gpa.free(nj);
+                const vj = try J.enc(gpa, value);
+                defer gpa.free(vj);
+                body = try std.fmt.allocPrint(gpa, "{{\"name\":{s},\"value\":{s}}}", .{ nj, vj });
+            } else if (std.mem.eql(u8, sub, "delete")) {
+                method = "DELETE";
+                url = try std.fmt.allocPrint(gpa, "{s}/secrets/{s}", .{ base, name });
+            } else usage_die.die(io, op_name, "usage: secret set|delete <NAME>");
+        },
+    }
+    defer gpa.free(url);
+
+    var argv_buf: [16][]const u8 = undefined;
+    var argc: usize = 0;
+    const push = struct {
+        fn p(bufp: *[16][]const u8, n: *usize, s: []const u8) void {
+            bufp[n.*] = s;
+            n.* += 1;
+        }
+    }.p;
+    push(&argv_buf, &argc, "curl");
+    push(&argv_buf, &argc, "-sS");
+    push(&argv_buf, &argc, "-w");
+    push(&argv_buf, &argc, "\n%{http_code}");
+    push(&argv_buf, &argc, "-X");
+    push(&argv_buf, &argc, method);
+    push(&argv_buf, &argc, url);
+    push(&argv_buf, &argc, "-H");
+    push(&argv_buf, &argc, auth);
+    if (body) |b| {
+        push(&argv_buf, &argc, "-H");
+        push(&argv_buf, &argc, "content-type: application/json");
+        push(&argv_buf, &argc, "-d");
+        push(&argv_buf, &argc, b);
+    }
+    const cap = try runCapture(gpa, io, argv_buf[0..argc]);
+    defer gpa.free(cap.stdout);
+
+    const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse cap.stdout.len;
+    const resp_body = cap.stdout[0..nl];
+    const status = if (nl < cap.stdout.len)
+        std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout[nl + 1 ..], " \r\n"), 10) catch 0
+    else
+        0;
+    if (status >= 200 and status < 300) {
+        try printStdout(io, "{s}\n", .{resp_body});
+        return;
+    }
+    try printStderr(io, "qube pod {s}: api returned {d}:\n{s}\n", .{ op_name, status, resp_body });
     try printStderr(io, "  token source: {s}\n", .{token_source});
     std.process.exit(@intFromEnum(ExitCode.registry));
 }

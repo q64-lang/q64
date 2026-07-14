@@ -29,6 +29,11 @@ qube --help    | -h
 | `qube pod promote`               | Flip the staged (idle) slot live — rollback = promote again      |
 | `qube pod canary <0-100>`        | Send that share of visitors to the staged slot (splittable runtimes) |
 | `qube pod sql "<stmt>"`          | Run SQL against the project database (JSON rows out)             |
+| `qube pod versions`              | The app's deployments (slot, status), newest first               |
+| `qube pod rollback <id>`         | Re-activate a retained deployment by id                          |
+| `qube pod kv get\|put\|list\|delete …` | Project KV (`put` takes `--ttl <seconds>`)                 |
+| `qube pod var list\|set\|delete …`     | Project variables (list also shows secret names)           |
+| `qube pod secret set\|delete <NAME>`   | Project secrets — `set` reads the value from stdin (never argv) |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |
