@@ -34,6 +34,7 @@ qube --help    | -h
 | `qube pod kv get\|put\|list\|delete …` | Project KV (`put` takes `--ttl <seconds>`)                 |
 | `qube pod var list\|set\|delete …`     | Project variables (list also shows secret names)           |
 | `qube pod secret set\|delete <NAME>`   | Project secrets — `set` reads the value from stdin (never argv) |
+| `qube pod r2 ls\|get\|put\|rm …`       | Project objects (`get <key> <outfile>`, `put <key> <file>`)     |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |

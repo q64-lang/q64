@@ -4210,6 +4210,7 @@ fn cmdPod(
     if (std.mem.eql(u8, subsub, "kv")) return cmdPodOps(gpa, io, env, args_it, .kv);
     if (std.mem.eql(u8, subsub, "var")) return cmdPodOps(gpa, io, env, args_it, .variable);
     if (std.mem.eql(u8, subsub, "secret")) return cmdPodOps(gpa, io, env, args_it, .secret);
+    if (std.mem.eql(u8, subsub, "r2")) return cmdPodOps(gpa, io, env, args_it, .r2);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
 }
@@ -5191,7 +5192,7 @@ fn cmdPodSql(
 //   qube pod secret set <NAME> | delete <NAME>     (set reads the VALUE from
 //                                                   stdin — never argv/ps)
 // ---------------------------------------------------------------------------
-const PodOp = enum { versions, rollback, kv, variable, secret };
+const PodOp = enum { versions, rollback, kv, variable, secret, r2 };
 
 fn cmdPodOps(
     gpa: std.mem.Allocator,
@@ -5206,6 +5207,7 @@ fn cmdPodOps(
         .kv => "kv",
         .variable => "var",
         .secret => "secret",
+        .r2 => "r2",
     };
     var api_url: []const u8 = default_pods_api;
     var url_flagged = false;
@@ -5231,6 +5233,10 @@ fn cmdPodOps(
                 \\  qube pod var delete <KEY>
                 \\  qube pod secret set <NAME>        Value is read from stdin.
                 \\  qube pod secret delete <NAME>
+                \\  qube pod r2 ls [prefix]           Project objects.
+                \\  qube pod r2 get <key> <outfile>
+                \\  qube pod r2 put <key> <file>
+                \\  qube pod r2 rm <key>
                 \\
                 \\  --project <slug> / --app <name>   Defaults: qubepod.jsonc in the cwd.
                 \\  --url <origin> / --token <t>      As in `qube deploy`.
@@ -5322,6 +5328,8 @@ fn cmdPodOps(
     var url: []u8 = undefined;
     var body: ?[]u8 = null;
     defer if (body) |b| gpa.free(b);
+    var upload_file: ?[]const u8 = null; // curl -T (streamed PUT)
+    var out_file: ?[]const u8 = null; // curl -o (binary download)
     const base = try std.fmt.allocPrint(gpa, "{s}/api/projects/{s}", .{ api_url, project });
     defer gpa.free(base);
     const usage_die = struct {
@@ -5413,6 +5421,31 @@ fn cmdPodOps(
                 url = try std.fmt.allocPrint(gpa, "{s}/secrets/{s}", .{ base, name });
             } else usage_die.die(io, op_name, "usage: secret set|delete <NAME>");
         },
+        .r2 => {
+            const sub = pos[0] orelse usage_die.die(io, op_name, "usage: r2 ls|get|put|rm …");
+            if (std.mem.eql(u8, sub, "ls")) {
+                if (pos[1]) |p| {
+                    url = try std.fmt.allocPrint(gpa, "{s}/r2?prefix={s}", .{ base, p });
+                } else {
+                    url = try std.fmt.allocPrint(gpa, "{s}/r2", .{base});
+                }
+            } else if (std.mem.eql(u8, sub, "get")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "r2 get <key> <outfile>");
+                const out = pos[2] orelse usage_die.die(io, op_name, "r2 get <key> <outfile>");
+                url = try std.fmt.allocPrint(gpa, "{s}/r2/object?key={s}", .{ base, k });
+                out_file = out;
+            } else if (std.mem.eql(u8, sub, "put")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "r2 put <key> <file>");
+                const f = pos[2] orelse usage_die.die(io, op_name, "r2 put <key> <file>");
+                method = "PUT";
+                url = try std.fmt.allocPrint(gpa, "{s}/r2/object?key={s}", .{ base, k });
+                upload_file = f;
+            } else if (std.mem.eql(u8, sub, "rm")) {
+                const k = pos[1] orelse usage_die.die(io, op_name, "r2 rm <key>");
+                method = "DELETE";
+                url = try std.fmt.allocPrint(gpa, "{s}/r2/object?key={s}", .{ base, k });
+            } else usage_die.die(io, op_name, "usage: r2 ls|get|put|rm …");
+        },
     }
     defer gpa.free(url);
 
@@ -5439,6 +5472,14 @@ fn cmdPodOps(
         push(&argv_buf, &argc, "-d");
         push(&argv_buf, &argc, b);
     }
+    if (upload_file) |f| {
+        push(&argv_buf, &argc, "-T");
+        push(&argv_buf, &argc, f);
+    }
+    if (out_file) |o| {
+        push(&argv_buf, &argc, "-o");
+        push(&argv_buf, &argc, o);
+    }
     const cap = try runCapture(gpa, io, argv_buf[0..argc]);
     defer gpa.free(cap.stdout);
 
@@ -5449,7 +5490,11 @@ fn cmdPodOps(
     else
         0;
     if (status >= 200 and status < 300) {
-        try printStdout(io, "{s}\n", .{resp_body});
+        if (out_file) |o| {
+            try printStdout(io, "saved {s}\n", .{o});
+        } else {
+            try printStdout(io, "{s}\n", .{resp_body});
+        }
         return;
     }
     try printStderr(io, "qube pod {s}: api returned {d}:\n{s}\n", .{ op_name, status, resp_body });
