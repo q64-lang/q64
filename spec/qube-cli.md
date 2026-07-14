@@ -25,6 +25,9 @@ qube --help    | -h
 | `qube pod login`                 | Save a qubepods token (from the console) for deploys              |
 | `qube pod info`                  | Show the qubepods provider, API origin, and auth status          |
 | `qube pod logout`                | Remove the saved qubepods token                                  |
+| `qube pod releases`              | Release-slot state: which slot serves, what's staged, canary weight |
+| `qube pod promote`               | Flip the staged (idle) slot live — rollback = promote again      |
+| `qube pod canary <0-100>`        | Send that share of visitors to the staged slot (splittable runtimes) |
 | `qube add <dep> [@version]`      | Add a dependency to the manifest, resolve it, update the lockfile  |
 | `qube remove <dep>`              | Remove a dependency                                                |
 | `qube build [--target <name>]`   | Compile this qube to wasm                                          |
@@ -166,6 +169,24 @@ WebKit. See [`memory.md` §"The platform"](./memory.md).
 | `--http-interface <id>`| `qubepods:http/handler`   | http export interface.               |
 | `--assets <dir>`      | —                          | Add an `assets` block shipping `<dir>`. |
 | `--dir <path>`        | the name (`new` only)      | Target directory.                    |
+
+### `qube pod releases` / `promote` / `canary`
+
+The release loop. A repeat `qube deploy` parks the new version in the app's
+**idle release slot** at 0% traffic — the deploy response says
+`"served": false` and gives a `slotPreviewUrl` (the staged release at a real
+URL, against the project's real stores). These verbs finish the loop:
+
+| Subcommand                | Purpose |
+|---------------------------|---------|
+| `qube pod releases`       | Slot state: which slot serves, what's staged, the canary weight. `GET /api/projects/<p>/apps/<a>/releases`. |
+| `qube pod promote`        | Flip the staged slot live (atomic pointer flip; the previous version stays in the other slot, so rollback = promote again). `POST …/promote`. |
+| `qube pod canary <0-100>` | Send that share of visitors to the staged slot, sticky per visitor; `0` aborts the ramp. Splittable runtimes only (static / stateless wasm — a JS-module or stateful qube answers with a pointer to promote). `POST …/canary`. |
+
+All three read `project` + `name` from `qubepod.jsonc` in the cwd, or take
+`--project <slug>` / `--app <name>` from anywhere; `--url` / `--token` /
+`$QUBEPODS_TOKEN` / saved login resolve exactly as in `qube deploy`. The
+routes are project-token-authed (`deploy` scope).
 
 ### `qube pod login` / `info` / `logout`
 

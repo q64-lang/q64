@@ -3938,7 +3938,13 @@ fn isSlug(s: []const u8) bool {
 
 fn podHelp(io: std.Io) !void {
     try writeStdout(io,
-        \\usage: qube pod <new [name] | init | login | logout | info | hostname> [flags]
+        \\usage: qube pod <new [name] | init | login | logout | info | hostname | releases | promote | canary> [flags]
+        \\
+        \\Releases (a repeat `qube deploy` stages in the idle slot at 0% traffic —
+        \\test it at the deploy response's slotPreviewUrl, then finish the loop):
+        \\  qube pod releases        Slot state: what serves, what's staged.
+        \\  qube pod promote         Flip the staged slot live (rollback = promote again).
+        \\  qube pod canary <0-100>  Send that share of visitors to the staged slot.
         \\
         \\Auth (qubepods provider):
         \\  qube pod login [--token <t>] [--url <origin>]
@@ -4168,7 +4174,7 @@ fn cmdPod(
     args_it: *std.process.Args.Iterator,
 ) !void {
     const subsub = args_it.next() orelse {
-        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|hostname> [flags]\n");
+        try writeStderr(io, "usage: qube pod <new|init|login|logout|info|hostname|releases|promote|canary> [flags]\n");
         std.process.exit(@intFromEnum(ExitCode.usage));
     };
     if (std.mem.eql(u8, subsub, "--help") or std.mem.eql(u8, subsub, "-h")) {
@@ -4187,6 +4193,9 @@ fn cmdPod(
         std.process.exit(@intFromEnum(ExitCode.usage));
     }
     if (std.mem.eql(u8, subsub, "hostname")) return cmdPodHostname(gpa, io, env, args_it);
+    if (std.mem.eql(u8, subsub, "releases")) return cmdPodRelease(gpa, io, env, args_it, .status);
+    if (std.mem.eql(u8, subsub, "promote")) return cmdPodRelease(gpa, io, env, args_it, .promote);
+    if (std.mem.eql(u8, subsub, "canary")) return cmdPodRelease(gpa, io, env, args_it, .canary);
     try printStderr(io, "qube pod: unknown subcommand: {s}\n", .{subsub});
     std.process.exit(@intFromEnum(ExitCode.usage));
 }
@@ -4844,6 +4853,184 @@ fn cmdPodHostname(
     }
     try printStderr(io, "qube pod hostname: api returned {d}:\n{s}\n", .{ status, resp_body });
     try printStderr(io, "  token used ({s}): QUBEPODS_TOKEN={s}\n", .{ token_source, token });
+    std.process.exit(@intFromEnum(ExitCode.registry));
+}
+
+// ---------------------------------------------------------------------------
+// qube pod releases | promote | canary — the release loop.
+//
+// A repeat `qube deploy` parks the new version in the app's IDLE release slot
+// at 0% traffic (the deploy response says `served: false` and gives a
+// `slotPreviewUrl`). These verbs finish the loop from the same terminal:
+//
+//   qube pod releases                 slot state: what serves, what's staged
+//   qube pod promote                  flip the staged slot live (rollback =
+//                                     promote again — the old version stays
+//                                     in the other slot)
+//   qube pod canary <weight>          send <weight>% of visitors to the
+//                                     staged slot (0 aborts the ramp);
+//                                     splittable runtimes only
+//
+// Project + app come from qubepod.jsonc in the cwd, or --project/--app from
+// anywhere. Token/origin resolution is identical to deploy/hostname.
+// ---------------------------------------------------------------------------
+const ReleaseVerb = enum { status, promote, canary };
+
+fn cmdPodRelease(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    args_it: *std.process.Args.Iterator,
+    verb: ReleaseVerb,
+) !void {
+    const verb_name: []const u8 = switch (verb) {
+        .status => "releases",
+        .promote => "promote",
+        .canary => "canary",
+    };
+    var api_url: []const u8 = default_pods_api;
+    var url_flagged = false;
+    var token_flag: ?[]const u8 = null;
+    var project_flag: ?[]const u8 = null;
+    var app_flag: ?[]const u8 = null;
+    var weight_arg: ?[]const u8 = null;
+    while (args_it.next()) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try writeStdout(io,
+                \\usage: qube pod releases|promote|canary [<weight>] [flags]
+                \\
+                \\The release loop: a repeat deploy stages in the idle slot (0% traffic,
+                \\testable at the deploy response's slotPreviewUrl); these finish it.
+                \\
+                \\  qube pod releases        Show slot state: what serves, what's staged.
+                \\  qube pod promote         Flip the staged slot live (rollback = promote again).
+                \\  qube pod canary <0-100>  Send that share of visitors to the staged slot.
+                \\
+                \\  --project <slug>   Project (default: qubepod.jsonc in the cwd).
+                \\  --app <name>       App name (default: qubepod.jsonc in the cwd).
+                \\  --url <origin>     API origin (default: saved login, else api.qubepods.com).
+                \\  --token <t>        Project token (or QUBEPODS_TOKEN / qube pod login).
+                \\
+            );
+            return;
+        } else if (std.mem.eql(u8, a, "--url")) {
+            api_url = try flagValue(io, args_it, "--url");
+            url_flagged = true;
+        } else if (std.mem.eql(u8, a, "--token")) {
+            token_flag = try flagValue(io, args_it, "--token");
+        } else if (std.mem.eql(u8, a, "--project")) {
+            project_flag = try flagValue(io, args_it, "--project");
+        } else if (std.mem.eql(u8, a, "--app")) {
+            app_flag = try flagValue(io, args_it, "--app");
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            try printStderr(io, "qube pod {s}: unknown flag: {s}\n", .{ verb_name, a });
+            std.process.exit(@intFromEnum(ExitCode.usage));
+        } else {
+            weight_arg = a;
+        }
+    }
+    if (verb == .canary and weight_arg == null) {
+        try writeStderr(io, "qube pod canary: weight (0-100) required\n");
+        std.process.exit(@intFromEnum(ExitCode.usage));
+    }
+
+    // --url wins; else the origin saved by `qube pod login`; else the default.
+    var saved_url: ?[]u8 = null;
+    defer if (saved_url) |u| gpa.free(u);
+    if (!url_flagged) {
+        if (readPodUrl(gpa, io, env)) |u| {
+            saved_url = u;
+            api_url = u;
+        }
+    }
+
+    // Project + app: flags win; else qubepod.jsonc in the cwd.
+    var manifest_raw: ?[]u8 = null;
+    defer if (manifest_raw) |r| gpa.free(r);
+    if (project_flag == null or app_flag == null) {
+        const cwd_path = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd_path);
+        const manifest_path = try std.fs.path.join(gpa, &.{ cwd_path, "qubepod.jsonc" });
+        defer gpa.free(manifest_path);
+        if (!fileExists(io, manifest_path)) {
+            try printStderr(io, "qube pod {s}: no qubepod.jsonc here — pass --project and --app\n", .{verb_name});
+            std.process.exit(@intFromEnum(ExitCode.input));
+        }
+        manifest_raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, gpa, .limited(1024 * 1024));
+    }
+    const project = project_flag orelse extractStringField(manifest_raw.?, "\"project\"") orelse {
+        try printStderr(io, "qube pod {s}: manifest has no \"project\" — pass --project\n", .{verb_name});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+    const app_name = app_flag orelse extractStringField(manifest_raw.?, "\"name\"") orelse {
+        try printStderr(io, "qube pod {s}: manifest has no \"name\" — pass --app\n", .{verb_name});
+        std.process.exit(@intFromEnum(ExitCode.input));
+    };
+
+    // Token: --token > QUBEPODS_TOKEN > saved login (same chain as deploy).
+    var saved_token: ?[]u8 = null;
+    defer if (saved_token) |t| gpa.free(t);
+    var token_source: []const u8 = "--token";
+    const token: []const u8 = token_flag orelse blk0: {
+        if (env.get("QUBEPODS_TOKEN")) |t| {
+            token_source = "QUBEPODS_TOKEN";
+            break :blk0 t;
+        }
+        const t = readPodToken(gpa, io, env) catch {
+            try printStderr(io, "qube pod {s}: no token; run `qube pod login`, pass --token, or set QUBEPODS_TOKEN\n", .{verb_name});
+            std.process.exit(@intFromEnum(ExitCode.registry));
+        };
+        token_source = "saved login (~/.qube/pods.toml)";
+        saved_token = t;
+        break :blk0 t;
+    };
+
+    const url = try std.fmt.allocPrint(gpa, "{s}/api/projects/{s}/apps/{s}/{s}", .{ api_url, project, app_name, verb_name });
+    defer gpa.free(url);
+    const auth = try std.fmt.allocPrint(gpa, "authorization: Bearer {s}", .{token});
+    defer gpa.free(auth);
+
+    var cap: Captured = undefined;
+    switch (verb) {
+        .status => {
+            const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", url, "-H", auth };
+            cap = try runCapture(gpa, io, &argv);
+        },
+        .promote => {
+            const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", "-X", "POST", url, "-H", auth };
+            cap = try runCapture(gpa, io, &argv);
+        },
+        .canary => {
+            const body_json = try std.fmt.allocPrint(gpa, "{{\"weight\":{s}}}", .{weight_arg.?});
+            defer gpa.free(body_json);
+            const argv = [_][]const u8{ "curl", "-sS", "-w", "\n%{http_code}", "-X", "POST", url, "-H", auth, "-H", "content-type: application/json", "-d", body_json };
+            cap = try runCapture(gpa, io, &argv);
+        },
+    }
+    defer gpa.free(cap.stdout);
+
+    const nl = std.mem.lastIndexOfScalar(u8, cap.stdout, '\n') orelse cap.stdout.len;
+    const resp_body = cap.stdout[0..nl];
+    const status = if (nl < cap.stdout.len)
+        std.fmt.parseInt(u16, std.mem.trim(u8, cap.stdout[nl + 1 ..], " \r\n"), 10) catch 0
+    else
+        0;
+
+    if (status >= 200 and status < 300) {
+        switch (verb) {
+            .promote => {
+                if (extractStringField(resp_body, "\"activeSlot\"")) |s| {
+                    try printStdout(io, "promoted — the {s} slot now serves.\n", .{s});
+                } else {
+                    try printStdout(io, "{s}\n", .{resp_body});
+                }
+            },
+            else => try printStdout(io, "{s}\n", .{resp_body}),
+        }
+        return;
+    }
+    try printStderr(io, "qube pod {s}: api returned {d}:\n{s}\n", .{ verb_name, status, resp_body });
+    try printStderr(io, "  token source: {s}\n", .{token_source});
     std.process.exit(@intFromEnum(ExitCode.registry));
 }
 
