@@ -43,3 +43,6 @@ examples/*/target/debug/
 examples/*/target/release/
 examples/*/target/wasm32/
 examples/*/target/wasm64/
+
+# Benchmark build products
+bench/.out/

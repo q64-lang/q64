@@ -1,0 +1,4 @@
+# The baseline is "the best Rust can do on wasm32": enable simd128 so LLVM
+# both vectorizes the mac_simd4 lanes and may auto-vectorize other kernels.
+[target.wasm32-wasip1]
+rustflags = ["-C", "target-feature=+simd128"]
