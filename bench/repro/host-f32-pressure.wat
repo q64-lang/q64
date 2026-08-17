@@ -1,11 +1,14 @@
 ;; Finding-1 repro (see bench/README.md): the q64-emitted 16-chain f32
 ;; multiply loop, verbatim, wrapped in a minimal WASI _start. Identical
-;; bytes run ~0.01 s under the vendored wasmtime CLI and ~0.26 s under the
-;; embedded q64-wasmtime-host — a ~100x execution-side cliff that appears
-;; once more than 16 f32 locals are live.
+;; bytes run in ~8 ms under a ReleaseFast-built q64-wasmtime-host (or the
+;; wasmtime CLI, at any setting) and ~267 ms under a Debug-built host —
+;; same source, same libwasmtime.so. The cliff appears once more than 16
+;; f32 locals are live.
 ;;
 ;;   wat2wasm bench/repro/host-f32-pressure.wat -o /tmp/shape.wasm
-;;   time vendor/wasmtime/bin/wasmtime run /tmp/shape.wasm
+;;   (cd runtime/wasmtime && zig build)                        # Debug
+;;   time runtime/wasmtime/zig-out/bin/q64-wasmtime-host /tmp/shape.wasm
+;;   (cd runtime/wasmtime && zig build -Doptimize=ReleaseFast)
 ;;   time runtime/wasmtime/zig-out/bin/q64-wasmtime-host /tmp/shape.wasm
 (module
   (type (;0;) (func (param i64) (result f64)))

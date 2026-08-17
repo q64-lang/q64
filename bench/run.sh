@@ -29,6 +29,20 @@ mkdir -p "$OUT"
 results="$OUT/results.txt"
 : > "$results"
 
+# Calibration gate: a Debug-built q64-wasmtime-host executes guest f32
+# loops with >16 live locals ~100x slower (bench/README.md, finding 1) —
+# numbers from such a host are two orders of magnitude off. The probe's
+# 200k-iteration loop costs <1 ms on a release-built host; refuse above
+# 10 ms unless the caller insists (BENCH_ALLOW_SLOW_HOST=1).
+"$Q64" emit bench/calibrate.q "$OUT/calibrate.wasm" --addr wasm32
+cal_ns=$("$HOST" "$OUT/calibrate.wasm" | awk '{print $3}')
+if [ "$cal_ns" -gt 10000000 ] && [ "${BENCH_ALLOW_SLOW_HOST:-0}" != "1" ]; then
+    echo "bench: calibration ran ${cal_ns} ns (>10 ms) — $HOST looks like a Debug build." >&2
+    echo "bench: rebuild it: (cd runtime/wasmtime && zig build -Doptimize=ReleaseFast)" >&2
+    echo "bench: or set BENCH_ALLOW_SLOW_HOST=1 to proceed anyway." >&2
+    exit 1
+fi
+
 echo "== q64 kernels (q64 emit --addr wasm32, embedded wasmtime host)"
 for src in bench/kernels/*.q; do
     name=$(basename "$src" .q)

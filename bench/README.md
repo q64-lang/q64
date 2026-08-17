@@ -10,12 +10,16 @@ are machine-relative) but the **ratios**, and what they attribute the gap to.
 ## Run it
 
 ```sh
-./init.sh                              # vendor/ toolchain
-(cd q64 && zig build)                  # the compiler
-(cd runtime/wasmtime && zig build)     # the embedded host
-rustup target add wasm32-wasip1        # the baseline's target
+./init.sh                                                  # vendor/ toolchain
+(cd q64 && zig build)                                      # the compiler
+(cd runtime/wasmtime && zig build -Doptimize=ReleaseFast)  # the embedded host
+rustup target add wasm32-wasip1                            # the baseline's target
 ./bench/run.sh
 ```
+
+The host build mode is load-bearing — a Debug-built host executes some guest
+loops ~100× slower (finding 1), so `run.sh` starts with a calibration probe
+(`calibrate.q`) and refuses to print numbers from a slow host.
 
 Each kernel self-times with `env.time.monotonic_ns()` (q64) /
 `Instant::now()` (Rust): 7 passes, minimum reported, so process startup and
@@ -46,56 +50,78 @@ checksum is not a result.
 
 ```
 kernel            q64 ns/samp   rust ns/samp    ratio
-mac_f32                  0.93           1.04     0.9x
+mac_f32                  0.94           1.04     0.9x
 mac_simd4                0.23           0.26     0.9x
-mix04                  253.00           4.04    62.6x
-biquad4                382.02           5.12    74.5x
-fir16                 2241.37           7.30   307.0x
-softclip                27.84           2.18    12.8x
-wavetable16            134.98           2.23    60.5x
+mix04                    2.20           4.06     0.5x
+biquad4                  4.78           5.13     0.9x
+fir16                    5.65           7.19     0.8x
+softclip                 1.93           2.19     0.9x
+wavetable16              3.13           2.23     1.4x
 ```
 
 q64 = `q64 emit --addr wasm32` (debug — there is no release mode yet), run
-under the embedded `q64-wasmtime-host`. Rust = `--release` with `+simd128`,
-run under the vendored wasmtime CLI. All checksums match across languages.
+under the embedded `q64-wasmtime-host` **built ReleaseFast**. Rust =
+`--release` with `+simd128`, run under the vendored wasmtime CLI. All
+checksums match across languages.
 
-### Finding 1 — the embedded host has a ~100× f32 register-pressure cliff
+### Finding 1 — a Debug-built host executes guest f32 loops ~100× slower
 
-The 60–307× ratios are **not** primarily q64 codegen. A pure-local f32 loop
-falls off a cliff under `q64-wasmtime-host` the moment more than 16 f32
-locals are live: 15 live chains run 1M iterations in ~2.4 ms, 16 chains take
-~252 ms (~106×), and it compounds from there (`fir16`, ~38 locals, lands at
-2.2 µs/sample). f64 hits the same cliff later (17 locals fine, 25 locals
-~800×).
+The first run of this suite reported 60–307× ratios on the bigger kernels.
+None of that was q64: the host binary was a default `zig build` (Debug), and
+under a **Debug-built** `q64-wasmtime-host` a pure-local f32 guest loop falls
+off a cliff the moment more than 16 f32 locals are live — 15 live chains run
+1M iterations in ~2.4 ms, 16 chains take ~252 ms (~106×), compounding from
+there (`fir16`, ~38 locals, landed at 2.2 µs/sample). f64 hits the same
+cliff later (17 locals fine, 25 locals ~800×). Rebuilding the *host* with
+`-Doptimize=ReleaseFast` — same source, same `libwasmtime.so` — collapses
+every ratio to ~1× (the table above).
 
-It is an *execution*-side host problem, not a codegen or Cranelift-in-general
-problem, isolated by [`repro/host-f32-pressure.wat`](./repro/host-f32-pressure.wat)
-— the q64-emitted 16-chain loop verbatim, wrapped in a WASI `_start`:
+This should be impossible — the host's build mode changing the execution
+speed of JIT-compiled *guest* code — which is why the isolation is recorded
+here. With [`repro/host-f32-pressure.wat`](./repro/host-f32-pressure.wat)
+(the q64-emitted 16-chain loop verbatim, wrapped in a WASI `_start`):
 
-```sh
-wat2wasm bench/repro/host-f32-pressure.wat -o /tmp/shape.wasm
-time vendor/wasmtime/bin/wasmtime run /tmp/shape.wasm        # ~0.01 s
-time runtime/wasmtime/zig-out/bin/q64-wasmtime-host /tmp/shape.wasm  # ~0.26 s
-```
+- Debug host: ~267 ms; ReleaseSafe / ReleaseFast host: ~8 ms. Reproducible
+  A/B/A, identical module bytes, same dynamically-linked `libwasmtime.so`.
+- The vendored wasmtime CLI runs it fast at every setting (any opt level,
+  even winch); a minimal C embedding against the same `libwasmtime.so` with
+  the same config runs it in ~7 ms — the library and the wasm are fine.
+- Ruled out: Cranelift opt level (explicitly `SPEED` — no change), compile
+  time (a module containing but never calling the function runs in 16 ms),
+  memory64 on the config (off — no change), a signal storm (strace shows
+  ~400 syscalls total, no fault traffic), stack placement (shifting the
+  stack via environment padding — no change).
 
-Identical bytes, same wasmtime version: fast under the CLI (at every
-opt-level, even under winch), ~100× slow under the C-API embedding. Ruled
-out: Cranelift opt level (explicitly setting `SPEED` changes nothing),
-compile time (a module that contains but never calls the function runs in
-16 ms), the q64 code shape (the CLI runs it fast). Root cause in the
-embedding is still open — but any real DSP kernel exceeds 16 live f32
-values, so this is the top blocker for trusting q64 numbers under the
-embedded host, and it gates Phase A's "within ~1.5× of Rust" exit criterion.
+The microarchitectural mechanism is still open (something about a Debug
+host process degrades spill-heavy f32 JIT code in-CPU), but the operational
+rule is simple and now enforced: **never benchmark — or ship — a Debug
+build of the host.** `run.sh` runs `calibrate.q` (17 live f32 chains) first
+and aborts if the probe is slow. Worth an upstream wasmtime issue once the
+mechanism is understood.
 
-### Finding 2 — parity where the cliff doesn't reach, ~13× where it doesn't
+### Finding 2 — unoptimized q64 is already at parity with release Rust here
 
-Below the pressure cliff the picture is much better than expected for an
-unoptimized compiler: `mac_f32` and `mac_simd4` are at **parity** with
-release-mode Rust (both latency-bound on a serial dependency), and
-`softclip` (11 locals) shows ~13× — that number is the honest measure of
-what Phase A2 (turning on `BinaryenModuleOptimize`) plus the emitter's known
-redundancies are worth. Re-attribution of the big-kernel ratios has to wait
-until the host cliff is fixed.
+With the host fixed, debug-mode q64 codegen — no Binaryen optimization
+passes at all — lands at 0.5–1.4× of `--release` Rust across all seven
+kernels, meeting Phase A's "within ~1.5×" exit criterion on the spot. Two
+honest caveats before celebrating:
+
+- These kernels are register-resident scalar loops, exactly what a
+  straightforward expression-tree emitter is good at. The emitter's known
+  redundancies (aggregate-result copies, watermark traffic) sit on paths
+  these kernels don't exercise; memory-heavy code will show a real gap —
+  `wavetable16` (1.4×, the only kernel above parity) already hints at it:
+  its per-sample table reads carry bounds checks and arena addressing that
+  Rust's optimizer hoists.
+- Where q64 *beats* Rust (`mix04` 0.5×, `fir16` 0.8×), part of the edge is
+  structural: v0 q64 has no array writes, so its kernels keep state in
+  scalars the JIT can register-allocate, while the idiomatic Rust twins use
+  small arrays. Same math (checksums match), different memory shape.
+
+Phase A2 (a `--release` mode running `BinaryenModuleOptimize`) is still
+worth doing — for code size, for the memory-path redundancies, and for
+kernels the suite doesn't cover yet — but the headline is that the gap it
+must close is far smaller than assumed.
 
 ### Finding 3 — the v0 Simd slice works and pays
 
