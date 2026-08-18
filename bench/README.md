@@ -41,6 +41,8 @@ checksum is not a result.
 | `mac_f32` | serial multiply-accumulate, 1 chain | the floor: latency-bound, ~6 locals |
 | `mac_simd4` | the same on `Simd<f32, 4>` | measures the v0 Simd slice directly |
 | `clip_simd4` | branch-free cubic clip on `Simd<f32, 4>` | the full lane-op surface (mul/sub/min/max/add) |
+| `gain_buf` | scalar in-place gain over a 1024-sample `Vec<f32>` | the block-processing memory loop, per-element bounds checks |
+| `gain_buf_simd4` | the same via `Simd.load` / `x.store`, 4 lanes | vectorized buffer access, one bounds check per group |
 | `mix04` | 4 saw voices × gain, summed | the DAW summing loop: adds, muls, wrap branches |
 | `biquad4` | 4 cascaded DF2T biquads | the canonical IIR workload, ~22 locals |
 | `fir16` | 16-tap FIR, unrolled shift register | the convolution shape, ~38 locals |
@@ -51,14 +53,16 @@ checksum is not a result.
 
 ```
 kernel              q64-dbg      q64-rel         rust rel/rust
-mac_f32                1.44         1.41         1.46     1.0x
-mac_simd4              0.36         0.30         0.36     0.8x
-clip_simd4             0.99         1.20         3.96     0.3x
-mix04                  4.20         3.79         3.91     1.0x
-biquad4               11.78         7.56         7.68     1.0x
-fir16                 25.40        21.37        17.45     1.2x
-softclip               3.09         4.34         4.10     1.1x
-wavetable16            4.58         3.78         3.16     1.2x
+mac_f32                1.45         1.39         1.46     1.0x
+mac_simd4              0.36         0.30         0.37     0.8x
+clip_simd4             1.25         1.19         4.01     0.3x
+gain_buf               4.70         3.64         0.09    39.5x
+gain_buf_simd4         0.53         0.69         0.09     7.5x
+mix04                  4.21         3.72         3.89     1.0x
+biquad4               11.99         7.62         7.72     1.0x
+fir16                 25.29        21.28        17.58     1.2x
+softclip               3.03         4.35         3.45     1.3x
+wavetable16            4.58         4.02         3.67     1.1x
 ```
 
 ns/sample. q64 = `q64 emit --addr wasm32`, debug and `--release`, run under
@@ -159,9 +163,20 @@ now complete for f32x4 (`add`/`sub`/`mul`/`div`/`min`/`max`,
 the branch-free min/max clamp compiles straight to `f32x4` ops in q64
 (~1.0–1.2 ns/sample) while LLVM declines to vectorize the same math from
 the scalar Rust source (~4.0 ns/sample — float min/max NaN semantics block
-it) — q64 3–4× ahead on identical checksums. Still missing for DSP: slice
-load/store (SIMD can't touch a buffer), `Simd` in struct fields and across
-function boundaries, lane insert, relaxed FMA (roadmap phase A3).
+it) — q64 3–4× ahead on identical checksums.
+
+**Buffers work now too**: `Simd.load(v, i)` / `x.store(v, i)` move four
+lanes between a `Simd<f32, 4>` and a `Vec<f32>` with one bounds check per
+group, emitted inline (a first cut as `__vec`-style helper functions cost
+~2× in call overhead — the per-group call showed up directly in this
+kernel, so the emitter builds the check + address at the call site
+instead). `gain_buf_simd4` runs 8.9× faster than its scalar twin. The
+remaining 7.5× to Rust's auto-vectorized loop is bounds checks per group,
+header re-loads, and no unrolling — Rust's `iter_mut` loop pays for none
+of those; closing it means hoisting the bounds check out of the loop
+(future optimizer work), not changing the surface. Still missing for DSP:
+`Simd` in struct fields and across function boundaries, lane insert,
+relaxed FMA (roadmap phase A3).
 
 ### Finding 5 — v0 language gaps the kernels had to code around
 

@@ -177,6 +177,15 @@ fn hirStmt(gpa: std.mem.Allocator, out: *Buf, s: *const hir.Stmt, depth: usize) 
             try hirExpr(gpa, out, vs.value);
             try app(gpa, out, "\n", .{});
         },
+        .simd_store => |ss| {
+            try app(gpa, out, "simd_store ", .{});
+            try hirExpr(gpa, out, ss.vec);
+            try app(gpa, out, "[", .{});
+            try hirExpr(gpa, out, ss.idx);
+            try app(gpa, out, "..+4] <- ", .{});
+            try hirExpr(gpa, out, ss.value);
+            try app(gpa, out, "\n", .{});
+        },
         .cont => try app(gpa, out, "continue\n", .{}),
         .panic => |maybe| {
             try app(gpa, out, "panic", .{});
@@ -340,6 +349,13 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
         .simd_un => |s| {
             try app(gpa, out, "simd_{s}.{s}(", .{ @tagName(s.kind), @tagName(s.shape) });
             try hirExpr(gpa, out, s.operand);
+            try app(gpa, out, ")", .{});
+        },
+        .simd_load => |s| {
+            try app(gpa, out, "simd_load(", .{});
+            try hirExpr(gpa, out, s.vec);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, s.idx);
             try app(gpa, out, ")", .{});
         },
         .logical => |lg| {
@@ -668,6 +684,17 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
         .simd_un => |s| {
             try app(gpa, out, "simd_un {s} {s}\n", .{ @tagName(s.kind), @tagName(s.shape) });
             try mirInst(gpa, out, s.operand, depth + 1);
+        },
+        .simd_load => |s| {
+            try app(gpa, out, "simd_load\n", .{});
+            try mirInst(gpa, out, s.vec, depth + 1);
+            try mirInst(gpa, out, s.idx, depth + 1);
+        },
+        .simd_store => |s| {
+            try app(gpa, out, "simd_store\n", .{});
+            try mirInst(gpa, out, s.vec, depth + 1);
+            try mirInst(gpa, out, s.idx, depth + 1);
+            try mirInst(gpa, out, s.value, depth + 1);
         },
         .call => |cl| {
             try app(gpa, out, "call #{d}\n", .{cl.func});

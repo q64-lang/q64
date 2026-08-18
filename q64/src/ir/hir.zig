@@ -342,6 +342,10 @@ pub const Stmt = union(enum) {
     /// out-of-range like `vec_get`). The write counterpart of `vec_get`. `cell4`
     /// selects the packed 4-byte cell.
     vec_set: struct { vec: *Expr, idx: *Expr, value: *Expr, cell4: bool = false },
+    /// `x.store(v, i)` — store the four f32 lanes of a `Simd<f32, 4>` at
+    /// `v[i..i+4)` of a `Vec<f32>` (bounds-checked as one unit; traps if
+    /// `i + 4 > len`). The write half of `Simd.load`.
+    simd_store: struct { vec: *Expr, idx: *Expr, value: *Expr },
     /// `env.out/err(expr)` — `expr` is `str`-typed. The trailing newline is the
     /// capability ABI's, materialized during lowering.
     host_out: HostWrite,
@@ -438,6 +442,9 @@ pub const Expr = union(enum) {
     /// the operands' `v128` value type alone cannot provide.
     simd_bin: struct { kind: ops.BinKind, shape: ops.LaneShape, lhs: *Expr, rhs: *Expr },
     simd_un: struct { kind: ops.UnKind, shape: ops.LaneShape, operand: *Expr },
+    /// `Simd.load(v, i)` — load four f32 lanes from `v[i..i+4)` of a
+    /// `Vec<f32>` as a `Simd<f32, 4>` (bounds-checked as one unit).
+    simd_load: struct { vec: *Expr, idx: *Expr },
     /// Short-circuit `&&` / `||`. Kept distinct from `bin` because it lowers
     /// to control flow (a value `if_`), not a backend binary op. Yields a
     /// boolean (i32 0/1); both operands are truthiness-tested.

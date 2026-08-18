@@ -149,6 +149,11 @@ fn collectStmt(
             try collectExpr(a, vs.idx, d, e);
             try collectExpr(a, vs.value, d, e);
         },
+        .simd_store => |ss| {
+            try collectExpr(a, ss.vec, d, e);
+            try collectExpr(a, ss.idx, d, e);
+            try collectExpr(a, ss.value, d, e);
+        },
         .if_ => |iff| {
             try collectExpr(a, iff.cond, d, e);
             try collectStmt(a, iff.then_, d, e);
@@ -193,6 +198,10 @@ fn collectExpr(
             try collectExpr(a, s.rhs, d, e);
         },
         .simd_un => |s| try collectExpr(a, s.operand, d, e),
+        .simd_load => |s| {
+            try collectExpr(a, s.vec, d, e);
+            try collectExpr(a, s.idx, d, e);
+        },
         .logical => |l| {
             try collectExpr(a, l.lhs, d, e);
             try collectExpr(a, l.rhs, d, e);

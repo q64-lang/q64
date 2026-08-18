@@ -178,6 +178,7 @@ fn lowerEntryStmt(ctx: Ctx, s: *const hir.Stmt) Error!*mir.Inst {
         .cont => return mk(ctx.a, .void, .br_cont),
         .vec_push => |vp| return mk(ctx.a, .void, .{ .vec_push = .{ .vec = try lowerExpr(ctx, vp.vec), .value = try lowerExpr(ctx, vp.value), .cell4 = vp.cell4 } }),
         .vec_set => |vs| return mk(ctx.a, .void, .{ .vec_set = .{ .vec = try lowerExpr(ctx, vs.vec), .idx = try lowerExpr(ctx, vs.idx), .value = try lowerExpr(ctx, vs.value), .cell4 = vs.cell4 } }),
+        .simd_store => |ss| return mk(ctx.a, .void, .{ .simd_store = .{ .vec = try lowerExpr(ctx, ss.vec), .idx = try lowerExpr(ctx, ss.idx), .value = try lowerExpr(ctx, ss.value) } }),
         // A statement-position block (an `if let` desugar: the hidden
         // scrutinee set + the tag test ride together).
         .block => |items| {
@@ -465,6 +466,10 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             .kind = s.kind,
             .shape = s.shape,
             .operand = try lowerExpr(ctx, s.operand),
+        } }),
+        .simd_load => |s| return mk(ctx.a, .v128, .{ .simd_load = .{
+            .vec = try lowerExpr(ctx, s.vec),
+            .idx = try lowerExpr(ctx, s.idx),
         } }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg` preserves the

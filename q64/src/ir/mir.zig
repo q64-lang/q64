@@ -187,6 +187,10 @@ pub const Op = union(enum) {
     /// on the op (not the operand type) selects the instruction family.
     simd_bin: struct { kind: ops.BinKind, shape: ops.LaneShape, lhs: *Inst, rhs: *Inst },
     simd_un: struct { kind: ops.UnKind, shape: ops.LaneShape, operand: *Inst },
+    /// v128 load of lanes `idx..idx+4` from an f32-cell vec (`__simd_load_f32`).
+    simd_load: struct { vec: *Inst, idx: *Inst },
+    /// v128 store of lanes `idx..idx+4` into an f32-cell vec (`__simd_store_f32`).
+    simd_store: struct { vec: *Inst, idx: *Inst, value: *Inst },
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
     host_out_int: struct { value: *Inst, nl_off: u32, stream: Stream },

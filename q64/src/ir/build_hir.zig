@@ -3377,6 +3377,11 @@ fn buildMainExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, rt: *RtMap, out
                 try out.append(b.a, st);
                 return;
             }
+            // `x.store(v, i)` on a Simd binding — lanes into a `Vec<f32>`.
+            if (try trySimdStore(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
+            }
             // `ch.send(x)` on a channel binding — a vec_push onto the buffer.
             if (try tryChannelSend(b, call, scope)) |st| {
                 try out.append(b.a, st);
@@ -3783,6 +3788,10 @@ fn buildScreenStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope, out: *std.ArrayLi
                 return;
             }
             if (try tryVecPush(b, call, scope)) |st| {
+                try out.append(b.a, st);
+                return;
+            }
+            if (try trySimdStore(b, call, scope)) |st| {
                 try out.append(b.a, st);
                 return;
             }
@@ -4420,6 +4429,11 @@ fn buildVoidExprStmt(b: *Builder, expr: ast.Expr, scope: *Scope, out: *std.Array
     }
     // `v.push(x)` — a vec binding or a `Vec` actor-state field (`state.subs.push`).
     if (try tryVecPush(b, call, scope)) |st| {
+        try out.append(b.a, st);
+        return;
+    }
+    // `x.store(v, i)` on a Simd binding — lanes into a `Vec<f32>`.
+    if (try trySimdStore(b, call, scope)) |st| {
         try out.append(b.a, st);
         return;
     }
@@ -9207,6 +9221,51 @@ fn vecElemByName(b: *Builder, scope: *const Scope, name: []const u8) BuildError!
     return null;
 }
 
+/// The `Vec<f32>` binding named by an argument expression, as a `.ptr` local
+/// reference — or null when the argument isn't a named f32-element vec.
+/// Shared by `Simd.load` and `x.store(v, i)`.
+fn simdVecF32Ref(b: *Builder, arg: ast.Expr, scope: *Scope) BuildError!?*hir.Expr {
+    if (arg != .path) return null;
+    const bn = try arg.path.text(b.a);
+    defer b.a.free(bn);
+    if (!scope.vecs.contains(bn)) return null;
+    if (((try vecElemByName(b, scope, bn)) orelse .i64) != .f32) return null;
+    const loc = scope.find(bn) orelse return null;
+    const v = try b.a.create(hir.Expr);
+    v.* = .{ .local = .{ .idx = loc.idx, .ty = .ptr } };
+    return v;
+}
+
+/// `x.store(v, i)` — the statement form storing a `Simd<f32, 4>` binding's
+/// lanes into a `Vec<f32>` at `v[i..i+4)`. Returns null when the call isn't
+/// this shape (so the dispatcher can try the next statement form).
+fn trySimdStore(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
+    const cname = (callPathName(b, call)) orelse return null;
+    defer b.a.free(cname);
+    const dot = std.mem.lastIndexOfScalar(u8, cname, '.') orelse return null;
+    if (!std.mem.eql(u8, cname[dot + 1 ..], "store")) return null;
+    const head = cname[0..dot];
+    const loc = scope.find(head) orelse return null;
+    const shape = simdShapeOfHir(loc.ty) orelse return null;
+    if (shape != .f32x4) return reject(b, .unsupported_call); // i32x4 has no vec carrier
+    var ait = call.args();
+    const va = ait.next() orelse return reject(b, .unsupported_call);
+    const ia = ait.next() orelse return reject(b, .unsupported_call);
+    if (ait.next() != null) return reject(b, .unsupported_call); // exactly two
+    const vref = (try simdVecF32Ref(b, va, scope)) orelse return reject(b, .unsupported_call);
+    // The vec is written through — same mutability bar as `v[i] = x`.
+    if (va == .path) {
+        const bn = try va.path.text(b.a);
+        defer b.a.free(bn);
+        if (scope.find(bn)) |vloc| if (!vloc.mutable) return reject(b, .immutable_assign);
+    }
+    const value = try b.a.create(hir.Expr);
+    value.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+    const st = try b.a.create(hir.Stmt);
+    st.* = .{ .simd_store = .{ .vec = vref, .idx = try buildIntExpr(b, ia, scope), .value = value } };
+    return st;
+}
+
 fn tryVecPush(b: *Builder, call: ast.CallExpr, scope: *Scope) BuildError!?*hir.Stmt {
     const cname = (callPathName(b, call)) orelse return null;
     defer b.a.free(cname);
@@ -10031,6 +10090,10 @@ const ExprTypeBridge = struct {
                 });
                 const shape = simdSplatShape(sc) orelse return null;
                 return simdScTy(shape);
+            }
+            // `Simd.load(v, i)` always yields f32x4 (the only vec-backed shape).
+            if (std.mem.eql(u8, name[0..dot], "Simd") and std.mem.eql(u8, mname, "load")) {
+                return simdScTy(.f32x4);
             }
             if (self.scope.find(name[0..dot])) |head| {
                 if (simdShapeOfHir(head.ty)) |shape| {
@@ -11257,6 +11320,18 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         const shape = simdSplatShape(try exprScalar(b, a0, scope)) orelse
                             return reject(b, .unsupported_call);
                         out.* = .{ .simd_splat = .{ .shape = shape, .operand = try buildIntExpr(b, a0, scope) } };
+                        return out;
+                    }
+                    // `Simd.load(v, i)` — four f32 lanes from a `Vec<f32>`
+                    // at `v[i..i+4)`. The vec must be a named f32-element
+                    // vec binding; anything else has no lane layout.
+                    if (std.mem.eql(u8, head, "Simd") and std.mem.eql(u8, cname[dot + 1 ..], "load")) {
+                        var lit = cc.args();
+                        const va = lit.next() orelse return reject(b, .unsupported_call);
+                        const ia = lit.next() orelse return reject(b, .unsupported_call);
+                        if (lit.next() != null) return reject(b, .unsupported_call); // exactly two
+                        const vref = (try simdVecF32Ref(b, va, scope)) orelse return reject(b, .unsupported_call);
+                        out.* = .{ .simd_load = .{ .vec = vref, .idx = try buildIntExpr(b, ia, scope) } };
                         return out;
                     }
                     // SIMD methods on a lane-shaped binding: lane-wise

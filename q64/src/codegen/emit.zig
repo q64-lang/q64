@@ -1865,6 +1865,8 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .simd_extract => |s| bodyHasOut(s.vec, want_int),
         .simd_bin => |s| bodyHasOut(s.lhs, want_int) or bodyHasOut(s.rhs, want_int),
         .simd_un => |s| bodyHasOut(s.operand, want_int),
+        .simd_load => |s| bodyHasOut(s.vec, want_int) or bodyHasOut(s.idx, want_int),
+        .simd_store => |s| bodyHasOut(s.vec, want_int) or bodyHasOut(s.idx, want_int) or bodyHasOut(s.value, want_int),
         .call => |cl| blk: {
             for (cl.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
             break :blk false;
@@ -2865,6 +2867,17 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(sb2.rhs, s);
         },
         .simd_un => |su| scanScratch(su.operand, s),
+        .simd_load => |sl| {
+            s.has_bounds = true; // inline group bounds check uses bounds_idx
+            scanScratch(sl.vec, s);
+            scanScratch(sl.idx, s);
+        },
+        .simd_store => |ss| {
+            s.has_bounds = true;
+            scanScratch(ss.vec, s);
+            scanScratch(ss.idx, s);
+            scanScratch(ss.value, s);
+        },
         .call => |cl| {
             // The call wraps in a reclamation region around its args.
             var sub = Scratch{};
@@ -3417,6 +3430,32 @@ const Lowerer = struct {
                     },
                 };
                 return c.BinaryenUnary(module, op, try self.inst(s.operand));
+            },
+            .simd_load => |s| {
+                // Inline (not a __vec helper — the per-group call cost showed
+                // up in the block-processing benchmarks): one bounds check for
+                // the 4-lane group (`idx + 4 > len` traps), then an unaligned
+                // 16-byte load at data + idx*4. The vec operand is always a
+                // local, so re-reading it for the two header loads is free;
+                // the index evaluates once into bounds_idx.
+                const addr = try self.simdVecAddr(s.vec);
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(module, self.bounds_idx, try self.inst(s.idx)),
+                    addr.check,
+                    c.BinaryenLoad(module, 16, false, 0, 1, c.BinaryenTypeVec128(), addr.slot, "0"),
+                };
+                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, c.BinaryenTypeVec128());
+            },
+            .simd_store => |s| {
+                // The write half — same inline shape; the stored value is a
+                // local (the recognizer only accepts a Simd binding).
+                const addr = try self.simdVecAddr(s.vec);
+                var seq = [_]c.BinaryenExpressionRef{
+                    c.BinaryenLocalSet(module, self.bounds_idx, try self.inst(s.idx)),
+                    addr.check,
+                    c.BinaryenStore(module, 16, 0, 1, addr.slot, try self.inst(s.value), c.BinaryenTypeVec128(), "0"),
+                };
+                return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
             },
             .call => |cl| {
                 // Frame reclamation (spec/memory.md §"Frame reclamation"):
@@ -4595,6 +4634,23 @@ const Lowerer = struct {
     // wasm32) — for using an i64 index/bound in pointer arithmetic.
     fn toPtr(self: *Lowerer, v: c.BinaryenExpressionRef) c.BinaryenExpressionRef {
         return if (self.ptr_type == self.i64_type) v else c.BinaryenUnary(self.module, c.BinaryenWrapInt64(), v);
+    }
+
+    /// The group bounds check + element address for an inline v128 vec
+    /// access: `check` traps when `bounds_idx + 4 > len` (unsigned — a
+    /// negative index also traps), `slot` is `data + bounds_idx * 4`.
+    /// Caller must have stored the index into `bounds_idx` first; `vec`
+    /// must be a local (re-evaluated for the two header loads).
+    fn simdVecAddr(self: *Lowerer, vec: *const ir.mir.Inst) !struct { check: c.BinaryenExpressionRef, slot: c.BinaryenExpressionRef } {
+        const m = self.module;
+        const W: u32 = if (self.ptr_type == self.i64_type) 8 else 4;
+        const shl = if (self.ptr_type == self.i64_type) c.BinaryenShlInt64() else c.BinaryenShlInt32();
+        const len = self.toI64(c.BinaryenLoad(m, W, false, W, 0, self.ptr_type, try self.inst(vec), "0"));
+        const end = c.BinaryenBinary(m, c.BinaryenAddInt64(), c.BinaryenLocalGet(m, self.bounds_idx, self.i64_type), c.BinaryenConst(m, c.BinaryenLiteralInt64(4)));
+        const check = c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenGtUInt64(), end, len), c.BinaryenUnreachable(m), null);
+        const data = c.BinaryenLoad(m, W, false, 0, 0, self.ptr_type, try self.inst(vec), "0");
+        const slot = self.ptrAdd(data, c.BinaryenBinary(m, shl, self.toPtr(c.BinaryenLocalGet(m, self.bounds_idx, self.i64_type)), self.ptrConst(2)));
+        return .{ .check = check, .slot = slot };
     }
 
     // ---- Frame reclamation (spec/memory.md §"Frame reclamation") ----
@@ -7154,6 +7210,7 @@ fn emitVecHelpers(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i64
         const ptype = c.BinaryenTypeCreate(&params, params.len);
         _ = c.BinaryenAddFunction(module, "__vec_set_f32", ptype, none, null, 0, body);
     }
+
 }
 
 /// `eqz` as an i32 condition regardless of operand width.

@@ -81,6 +81,22 @@ fn clip_simd4(n: i64) -> f64 {
     acc.iter().map(|v| *v as f64).sum()
 }
 
+fn gain_buf(sweeps: i64) -> f64 {
+    // In-place gain over a 1024-sample buffer — LLVM auto-vectorizes this
+    // slice loop, so it doubles as the twin for gain_buf_simd4 (identical
+    // elementwise math, identical checksum).
+    let mut v = vec![1.0f32; 1024];
+    let g: f32 = black_box(0.9995);
+    let mut s: i64 = 0;
+    while s < sweeps {
+        for x in v.iter_mut() {
+            *x *= g;
+        }
+        s += 1;
+    }
+    v[0] as f64 + v[1023] as f64
+}
+
 fn mix04(n: i64) -> f64 {
     let mut p = [0.0f32, 0.25, 0.5, 0.75];
     let inc = black_box([0.010986f32, 0.014648, 0.021973, 0.032959]);
@@ -228,6 +244,8 @@ fn main() {
     timed("mac_f32", 4_000_000, 4_000_000, mac_f32);
     timed("mac_simd4", 4_000_000, 1_000_000, mac_simd4);
     timed("clip_simd4", 4_000_000, 1_000_000, clip_simd4);
+    timed("gain_buf", 2_048_000, 2_000, gain_buf);
+    timed("gain_buf_simd4", 2_048_000, 2_000, gain_buf);
     timed("mix04", 2_000_000, 2_000_000, mix04);
     timed("biquad4", 1_000_000, 1_000_000, biquad4);
     timed("fir16", 1_000_000, 1_000_000, fir16);
