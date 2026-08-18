@@ -5,7 +5,7 @@
 //! exponential swell that crosses the clipping knee mid-pass. One loop
 //! iteration is four samples, so `samples` reports 4·n.
 
-fn pass(n: i64) -> f64 {
+fn pass(n: i64) -> f64 @realtime {
     var x = Simd.splat(f32(0.5))
     let growth = Simd.splat(f32(1.0000004))
     let c15 = Simd.splat(f32(1.5))

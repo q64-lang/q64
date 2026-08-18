@@ -1277,6 +1277,319 @@ fn referencesAmbientEnv(node: *const cst.Node) bool {
 /// with purity — the reference would synthesize a capability parameter).
 /// Fires when a `@pure` function's body references `env.X` and `env`
 /// isn't shadowed by a parameter of that name.
+// ---------------------------------------------------------------------
+// Body-level effect-assert checking (spec/effects.md §"What `@no_alloc`
+// and `@no_suspend` forbid", §"Propagation through call graphs").
+// The first enforcement of the assert half of the effect lattice: a
+// declared assert (`@realtime`, `@no_alloc`, …) is checked against the
+// operations its body actually performs, and against its callees —
+// declared sets for annotated callees (the spec's subset rule), scanned
+// transitive facts for unannotated ones. Token-scan level, like the
+// other body checks here; the full HIR effect pass subsumes it later.
+// ---------------------------------------------------------------------
+
+/// A function's assert set, closed under the implication graph
+/// (spec/effects.md §"Implications between asserts"):
+/// `@pure` ⇒ all five; `@realtime` ⇒ `@no_alloc` + `@no_suspend` +
+/// `@no_panic`; `@no_alloc` ⇒ `@no_panic` (a panic payload allocates).
+const Asserts = struct {
+    pure: bool = false,
+    realtime: bool = false,
+    no_alloc: bool = false,
+    no_suspend: bool = false,
+    no_panic: bool = false,
+    no_trap: bool = false,
+
+    fn any(a: Asserts) bool {
+        return a.pure or a.realtime or a.no_alloc or a.no_suspend or a.no_panic or a.no_trap;
+    }
+    /// Does this set satisfy (include) every assert `req` requires?
+    fn covers(a: Asserts, req: Asserts) bool {
+        if (req.no_alloc and !a.no_alloc) return false;
+        if (req.no_suspend and !a.no_suspend) return false;
+        if (req.no_panic and !a.no_panic) return false;
+        if (req.no_trap and !a.no_trap) return false;
+        return true;
+    }
+};
+
+fn assertsOf(es: ast.EffectSpec) Asserts {
+    var a = Asserts{};
+    var it = es.markers();
+    while (it.next()) |m| {
+        const nt = m.name() orelse continue;
+        if (std.mem.eql(u8, nt.text, "pure")) a.pure = true;
+        if (std.mem.eql(u8, nt.text, "realtime")) a.realtime = true;
+        if (std.mem.eql(u8, nt.text, "no_alloc")) a.no_alloc = true;
+        if (std.mem.eql(u8, nt.text, "no_suspend")) a.no_suspend = true;
+        if (std.mem.eql(u8, nt.text, "no_panic")) a.no_panic = true;
+        if (std.mem.eql(u8, nt.text, "no_trap")) a.no_trap = true;
+    }
+    // Close over implications.
+    if (a.pure) {
+        a.no_alloc = true;
+        a.no_suspend = true;
+        a.no_panic = true;
+        a.no_trap = true;
+    }
+    if (a.realtime) {
+        a.no_alloc = true;
+        a.no_suspend = true;
+        a.no_panic = true;
+    }
+    if (a.no_alloc) a.no_panic = true;
+    return a;
+}
+
+/// What a body (transitively) does, as observable at the token level.
+/// `env_faces` collects the first identifier after each ambient `env.`
+/// (the capability face: `out`, `time`, `fs`, …).
+const BodyFacts = struct {
+    panics: bool = false,
+    traps: bool = false,
+    allocs: bool = false,
+    suspends: bool = false,
+    /// Bitmask over `assert_env_faces` below; bit 31 = a face outside
+    /// the table (treated as capability-bearing, never realtime-safe).
+    faces: u32 = 0,
+};
+
+/// The env faces the scan classifies. Order is the bitmask index.
+/// `sleep_ns` is deliberately absent — it's suspension, tracked apart.
+const assert_env_faces = [_][]const u8{
+    "out", "err", "exit", "fs", "kv", "db", "blob", "config", "net",
+    "envvars", "ai", "ui", "midi", // never realtime-safe
+    "time", "random", "audio", // the @realtime carve-outs
+};
+const rt_safe_face_from: usize = 13; // index of "time"
+
+fn faceBit(name: []const u8) u32 {
+    for (assert_env_faces, 0..) |f, i| {
+        if (std.mem.eql(u8, f, name)) return @as(u32, 1) << @intCast(i);
+    }
+    return @as(u32, 1) << 31; // unknown face: capability-bearing, not rt-safe
+}
+
+fn rtUnsafeFaces(faces: u32) u32 {
+    var safe: u32 = 0;
+    for (rt_safe_face_from..assert_env_faces.len) |i| safe |= @as(u32, 1) << @intCast(i);
+    return faces & ~safe;
+}
+
+/// Scan one body's tokens into `BodyFacts`, recursing into same-file
+/// callees (memoized; a cycle sees the callee's in-progress facts, which
+/// is sound for a monotone scan). Annotated callees contribute their
+/// *declared* set instead of a body scan — the spec's subset rule.
+const AssertCtx = struct {
+    gpa: std.mem.Allocator,
+    fns: std.StringHashMapUnmanaged(ast.FnDecl) = .empty,
+    memo: std.StringHashMapUnmanaged(BodyFacts) = .empty,
+    visiting: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *AssertCtx) void {
+        self.fns.deinit(self.gpa);
+        self.memo.deinit(self.gpa);
+        self.visiting.deinit(self.gpa);
+    }
+
+    fn calleeFacts(self: *AssertCtx, name: []const u8) std.mem.Allocator.Error!BodyFacts {
+        if (self.memo.get(name)) |f| return f;
+        if (self.visiting.contains(name)) return .{}; // cycle: monotone under-approx
+        const fd = self.fns.get(name) orelse return .{};
+        // An annotated callee is taken at its declaration (its own body is
+        // checked at its own site): declared capabilities become faces;
+        // declared asserts clear the corresponding facts.
+        if (fd.effectSpec()) |es| {
+            var f = BodyFacts{};
+            var it = es.markers();
+            while (it.next()) |m| {
+                const nt = m.name() orelse continue;
+                for (capability_effects) |cap| {
+                    if (std.mem.eql(u8, nt.text, cap)) {
+                        // Capability marker → the face(s) it names. The
+                        // marker names match the face names except
+                        // stdout/stderr/io/network/inference.
+                        if (std.mem.eql(u8, cap, "stdout")) {
+                            f.faces |= faceBit("out");
+                        } else if (std.mem.eql(u8, cap, "stderr")) {
+                            f.faces |= faceBit("err");
+                        } else if (std.mem.eql(u8, cap, "io")) {
+                            f.faces |= faceBit("out") | faceBit("err");
+                        } else if (std.mem.eql(u8, cap, "network")) {
+                            f.faces |= faceBit("net");
+                        } else if (std.mem.eql(u8, cap, "inference")) {
+                            f.faces |= faceBit("ai");
+                        } else {
+                            f.faces |= faceBit(cap);
+                        }
+                    }
+                }
+            }
+            const a = assertsOf(es);
+            f.panics = !a.no_panic;
+            f.traps = !a.no_trap;
+            f.allocs = !a.no_alloc;
+            f.suspends = !a.no_suspend;
+            try self.memo.put(self.gpa, name, f);
+            return f;
+        }
+        // Unannotated: infer by scanning the body, transitively.
+        try self.visiting.put(self.gpa, name, {});
+        defer _ = self.visiting.remove(name);
+        var toks: std.ArrayList(cst.Token) = .empty;
+        defer toks.deinit(self.gpa);
+        const body = fd.body() orelse return .{};
+        try collectTokens(self.gpa, body.cst, &toks);
+        var f = BodyFacts{};
+        var i: usize = 0;
+        const ts = toks.items;
+        while (i < ts.len) : (i += 1) {
+            try self.scanToken(ts, i, &f, null, null, null);
+        }
+        try self.memo.put(self.gpa, name, f);
+        return f;
+    }
+
+    /// Classify the token at `i`, folding into `f`. When `req`/`diags`
+    /// are supplied (the checking walk over an annotated body), also
+    /// emit the violation diagnostics at the token's offset.
+    fn scanToken(
+        self: *AssertCtx,
+        ts: []const cst.Token,
+        i: usize,
+        f: *BodyFacts,
+        req: ?Asserts,
+        es_off: ?u32,
+        diags: ?*std.ArrayList(Diag),
+    ) std.mem.Allocator.Error!void {
+        _ = es_off;
+        const t = ts[i];
+        const prev_dot = i > 0 and ts[i - 1].kind == .DOT;
+        switch (t.kind) {
+            .KW_PANIC => {
+                f.panics = true;
+                if (req) |r| if (r.no_panic) try diags.?.append(self.gpa, .{ .code = "EFF100", .offset = t.offset });
+            },
+            .KW_TRAP => {
+                f.traps = true;
+                if (req) |r| if (r.no_trap) try diags.?.append(self.gpa, .{ .code = "EFF101", .offset = t.offset });
+            },
+            .KW_SPAWN => {
+                // A spawned task suspends the scheduler view and its frame
+                // allocates in the scope arena.
+                f.suspends = true;
+                f.allocs = true;
+                if (req) |r| if (r.no_suspend or r.no_alloc) try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+            },
+            .STR_PLAIN => {
+                // Interpolation ("{x}") assembles in the scope arena. Raw
+                // strings (STR_RAW) never interpolate, so they pass.
+                if (std.mem.indexOfScalar(u8, t.text, '{') != null) {
+                    f.allocs = true;
+                    if (req) |r| if (r.no_alloc) try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                }
+            },
+            .IDENT => {
+                const callish = i + 1 < ts.len and ts[i + 1].kind == .L_PAREN;
+                if (std.mem.eql(u8, t.text, "env") and !prev_dot) {
+                    // The face is normally an IDENT, but `env.out` is the
+                    // exception: `out` lexes as the parameter-mode keyword.
+                    if (i + 2 < ts.len and ts[i + 1].kind == .DOT and
+                        (ts[i + 2].kind == .IDENT or ts[i + 2].kind == .KW_OUT))
+                    {
+                        const face = ts[i + 2].text;
+                        if (std.mem.eql(u8, face, "sleep_ns")) {
+                            f.suspends = true;
+                            if (req) |r| if (r.no_suspend) try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                        } else {
+                            const bit = faceBit(face);
+                            f.faces |= bit;
+                            if (req) |r| {
+                                // `@pure` bodies are ENV056's territory
+                                // (ambient env at all); `@realtime` allows
+                                // only the carve-out faces — EFF110.
+                                if (r.realtime and !r.pure and rtUnsafeFaces(bit) != 0) {
+                                    try diags.?.append(self.gpa, .{ .code = "EFF110", .offset = t.offset });
+                                }
+                            }
+                        }
+                    }
+                } else if (std.mem.eql(u8, t.text, "Vec") and i + 2 < ts.len and ts[i + 1].kind == .DOT) {
+                    // `Vec.new()` / `Vec.from([...])` allocate on the heap.
+                    if (std.mem.eql(u8, ts[i + 2].text, "new") or std.mem.eql(u8, ts[i + 2].text, "from")) {
+                        f.allocs = true;
+                        if (req) |r| if (r.no_alloc) try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                    }
+                } else if (std.mem.eql(u8, t.text, "Managed") and i + 2 < ts.len and ts[i + 1].kind == .DOT and std.mem.eql(u8, ts[i + 2].text, "box")) {
+                    // `Managed.box(v)` allocates and the GC may yield.
+                    f.allocs = true;
+                    f.suspends = true;
+                    if (req) |r| if (r.no_alloc or r.no_suspend) try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                } else if (std.mem.eql(u8, t.text, "channel") and callish and !prev_dot) {
+                    // `channel(policy: …)` allocates its buffer.
+                    f.allocs = true;
+                    if (req) |r| if (r.no_alloc) try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                } else if (std.mem.eql(u8, t.text, "push") and prev_dot and callish) {
+                    // `v.push(x)` may copy-on-grow: an allocation.
+                    f.allocs = true;
+                    if (req) |r| if (r.no_alloc) try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                } else if (callish and !prev_dot) {
+                    // A plain user call: fold in (or check) the callee.
+                    if (self.fns.get(t.text)) |callee_fd| {
+                        const cf = try self.calleeFacts(t.text);
+                        f.panics = f.panics or cf.panics;
+                        f.traps = f.traps or cf.traps;
+                        f.allocs = f.allocs or cf.allocs;
+                        f.suspends = f.suspends or cf.suspends;
+                        f.faces |= cf.faces;
+                        if (req) |r| {
+                            // Annotated callee: the spec's subset rule on
+                            // asserts; scanned/declared facts otherwise.
+                            if (callee_fd.effectSpec()) |ces| {
+                                if (!assertsOf(ces).covers(r)) {
+                                    try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                                }
+                            } else {
+                                if ((r.no_panic and cf.panics) or (r.no_alloc and cf.allocs) or
+                                    (r.no_suspend and cf.suspends) or (r.no_trap and cf.traps))
+                                {
+                                    try diags.?.append(self.gpa, .{ .code = "EFF112", .offset = t.offset });
+                                }
+                            }
+                            if (r.realtime and !r.pure and rtUnsafeFaces(cf.faces) != 0) {
+                                try diags.?.append(self.gpa, .{ .code = "EFF110", .offset = t.offset });
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+/// **EFF100 / EFF101 / EFF110 / EFF112** — check an annotated function's
+/// body against its declared asserts (closed under implications).
+fn checkAssertBody(
+    ctx: *AssertCtx,
+    fd: ast.FnDecl,
+    es: ast.EffectSpec,
+    diags: *std.ArrayList(Diag),
+) !void {
+    const req = assertsOf(es);
+    if (!req.any()) return;
+    const body = fd.body() orelse return;
+    var toks: std.ArrayList(cst.Token) = .empty;
+    defer toks.deinit(ctx.gpa);
+    try collectTokens(ctx.gpa, body.cst, &toks);
+    var f = BodyFacts{};
+    var i: usize = 0;
+    const ts = toks.items;
+    while (i < ts.len) : (i += 1) {
+        try ctx.scanToken(ts, i, &f, req, null, diags);
+    }
+}
+
 fn checkPureEnv(gpa: std.mem.Allocator, fd: ast.FnDecl, es: ast.EffectSpec, diags: *std.ArrayList(Diag)) !void {
     var pure_off: ?u32 = null;
     var it = es.markers();
@@ -2666,6 +2979,19 @@ pub fn checkFile(
     var enums = try collectEnums(gpa, sf);
     defer deinitEnums(gpa, &enums);
 
+    // Same-file function index + facts memo for the body-level effect-assert
+    // checks (annotated callers verified against callee declarations/facts).
+    var assert_ctx = AssertCtx{ .gpa = gpa };
+    defer assert_ctx.deinit();
+    {
+        var fit_ = sf.items();
+        while (fit_.next()) |item| {
+            if (item != .fn_decl) continue;
+            const nt = item.fn_decl.name() orelse continue;
+            try assert_ctx.fns.put(gpa, nt.text, item.fn_decl);
+        }
+    }
+
     // Item-level checks: TYP108 generic default-ordering (fn / struct / enum)
     // and EFF140/EFF141 on `pub effect @<name>` declarations.
     var git = sf.items();
@@ -2683,6 +3009,7 @@ pub fn checkFile(
                 try checkEffectContradiction(gpa, es, &diags);
                 try checkCancelCtx(gpa, item.fn_decl, es, &diags);
                 try checkPureEnv(gpa, item.fn_decl, es, &diags);
+                try checkAssertBody(&assert_ctx, item.fn_decl, es, &diags);
             }
             try checkEventPre(gpa, item.fn_decl, &diags);
             try checkCancelAwareFor(gpa, item.fn_decl, &diags);
@@ -3197,23 +3524,71 @@ test "check: EFF140 / EFF141 — user effect name collisions and shape" {
     try expectCodes("pub effect @audit_trail\nfn main { env.out(\"hi\") }\n", &.{});
 }
 
+test "check: EFF100/EFF101 — panic and trap under asserts" {
+    try expectCodes("pub fn f(x: i64) -> i64 @no_panic { if x < 0 { panic \"n\" }\n x }\nfn main { env.out(\"d\") }\n", &.{"EFF100"});
+    try expectCodes("pub fn f(x: i64) -> i64 @realtime { if x < 0 { panic \"n\" }\n x }\nfn main { env.out(\"d\") }\n", &.{"EFF100"});
+    // trap is permitted under @no_panic/@realtime, forbidden under @no_trap/@pure.
+    try expectCodes("pub fn f(x: i64) -> i64 @no_trap { trap()\n x }\nfn main { env.out(\"d\") }\n", &.{"EFF101"});
+    try expectCodes("pub fn f(x: i64) -> i64 @no_panic { trap()\n x }\nfn main { env.out(\"d\") }\n", &.{});
+}
+
+test "check: EFF110 — capability use under @realtime" {
+    try expectCodes("pub fn f(x: i64) -> i64 @realtime { env.out(\"log\")\n x }\nfn main { env.out(\"d\") }\n", &.{"EFF110"});
+    // The realtime-safe carve-outs pass.
+    try expectCodes("pub fn f() -> i64 @realtime { env.time.monotonic_ns() }\nfn main { env.out(\"d\") }\n", &.{});
+}
+
+test "check: EFF112 — allocation/suspension under asserts" {
+    try expectCodes("pub fn f(x: i64) -> i64 @no_alloc { var v: Vec<i64> = Vec.new()\n x }\nfn main { env.out(\"d\") }\n", &.{"EFF112"});
+    try expectCodes("pub fn f(x: i64) -> i64 @realtime { let s = \"v {x}\"\n x }\nfn main { env.out(\"d\") }\n", &.{"EFF112"});
+    // A non-interpolated string does not allocate.
+    try expectCodes("pub fn f(x: i64) -> i64 @no_alloc { x }\nfn main { env.out(\"d\") }\n", &.{});
+}
+
+test "check: EFF112 — unannotated callee facts propagate" {
+    try expectCodes(
+        "fn helper(x: i64) -> i64 { if x < 0 { panic \"b\" }\n x }\n" ++
+            "pub fn f(x: i64) -> i64 @realtime { helper(x) }\nfn main { env.out(\"d\") }\n",
+        &.{"EFF112"},
+    );
+    // An annotated callee satisfying the caller's asserts passes.
+    try expectCodes(
+        "fn helper(x: i64) -> i64 @realtime { x }\n" ++
+            "pub fn f(x: i64) -> i64 @realtime { helper(x) }\nfn main { env.out(\"d\") }\n",
+        &.{},
+    );
+    // An annotated callee missing the caller's asserts is EFF112.
+    try expectCodes(
+        "fn helper(x: i64) -> i64 @io { x }\n" ++
+            "pub fn f(x: i64) -> i64 @realtime { helper(x) }\nfn main { env.out(\"d\") }\n",
+        &.{ "EFF112", "EFF110" },
+    );
+}
+
 test "check: EFF120 — contradictory effect sets" {
-    // An assert + a forbidden capability.
-    try expectCodes("pub fn render @realtime + @io { env.out(\"x\") }\n", &.{"EFF120"});
+    // An assert + a forbidden capability. The body-level assert check also
+    // fires on the same source: `env.out` is an `@io` face inside a
+    // `@realtime` body (EFF110).
+    try expectCodes("pub fn render @realtime + @io { env.out(\"x\") }\n", &.{ "EFF120", "EFF110" });
     try expectCodes("fn f() -> i64 @pure + @network { 0 }\n", &.{"EFF120"});
     // `@wire` ⇒ `@io`, so `@realtime + @wire` is EFF120 (the capability is
     // forbidden directly here — `@wire` is itself a capability marker).
-    try expectCodes("fn g() @realtime + @wire { env.out(\"x\") }\n", &.{"EFF120"});
+    // (Bodies stay free of `env.out` — the body-level assert check would
+    // add its own EFF110 under `@realtime`; these cases pin the
+    // declaration-level check alone.)
+    try expectCodes("fn g() @realtime + @wire { trap() }\n", &.{"EFF120"});
     // Realtime-safe carve-outs stay silent.
-    try expectCodes("fn h() @realtime + @audio { env.out(\"x\") }\n", &.{});
-    try expectCodes("fn k() @realtime + @time { env.out(\"x\") }\n", &.{});
+    try expectCodes("fn h() @realtime + @audio { trap() }\n", &.{});
+    try expectCodes("fn k() @realtime + @time { trap() }\n", &.{});
     // Two asserts compose; a lone assert or lone capability is fine.
     // (`@pure` bodies stay env-free so ENV056 doesn't also fire.)
     try expectCodes("fn a() -> i64 @realtime + @pure { 0 }\n", &.{});
-    try expectCodes("fn b() @realtime { env.out(\"x\") }\n", &.{});
+    // (A lone `@realtime` with an `env.out` body is EFF110 territory now —
+    // covered by the assert-body tests — so these keep neutral bodies.)
+    try expectCodes("fn b() @realtime { trap() }\n", &.{});
     try expectCodes("fn c() @io { env.out(\"x\") }\n", &.{});
     // A user marker is neither assert nor capability — no contradiction.
-    try expectCodes("fn d() @realtime + @logging { env.out(\"x\") }\n", &.{});
+    try expectCodes("fn d() @realtime + @logging { trap() }\n", &.{});
     // `@pure` forbids every capability.
     try expectCodes("fn e() -> i64 @pure + @audio { 0 }\n", &.{"EFF120"});
 }

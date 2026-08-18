@@ -7,7 +7,7 @@
 //! the v0 emitter yet (ImmutableAssign), so a `stage(x, ref s1, ref s2)`
 //! helper can't carry the filter state.
 
-fn pass(n: i64) -> f64 {
+fn pass(n: i64) -> f64 @realtime {
     let b0 = f32(0.000944692)
     let b1 = f32(0.001889384)
     let b2 = f32(0.000944692)

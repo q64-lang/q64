@@ -9,7 +9,7 @@
 //! update into pure fused chains:  y = b0·x + s1;  s1 = na1·y + (b1·x + s2);
 //! s2 = na2·y + b2·x.
 
-fn pass(n: i64) -> f64 {
+fn pass(n: i64) -> f64 @realtime {
     let b0 = Simd.splat(f32(0.000944692))
     let b1 = Simd.splat(f32(0.001889384))
     let b2 = Simd.splat(f32(0.000944692))

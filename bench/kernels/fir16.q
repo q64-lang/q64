@@ -3,7 +3,7 @@
 //! fully-unrolled convolution shape SIMD and (later) the optimizer should
 //! collapse.
 
-fn pass(n: i64) -> f64 {
+fn pass(n: i64) -> f64 @realtime {
     var ph = f32(0.0)
     let inc = f32(0.010986)
     let one = f32(1.0)

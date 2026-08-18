@@ -226,4 +226,8 @@ bench/
 
 Adding a kernel: write `kernels/<name>.q` printing the standard bench line,
 mirror it in `baseline-rust/src/main.rs`, and keep the math
-operation-identical so the checksums stay comparable.
+operation-identical so the checksums stay comparable. Kernels with a
+`pass` helper declare it `@realtime` — `q64 check` verifies the assert
+(roadmap phase B1), so the suite doubles as proof that real DSP code
+passes the real-time checker, and the annotation is measurably free (the
+emitted wasm and timings are unchanged).

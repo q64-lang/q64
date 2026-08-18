@@ -4,7 +4,7 @@
 //! branches, no memory. The decay ratio keeps `x` well above the denormal
 //! range at the chosen sample count.
 
-fn pass(n: i64) -> f64 {
+fn pass(n: i64) -> f64 @realtime {
     var acc = f32(0.0)
     var x = f32(1.0)
     let r = f32(0.9999995)

@@ -10393,6 +10393,20 @@ fn declareBodyLocal(b: *Builder, scope: *Scope, name: []const u8, mutable: bool,
     return idx;
 }
 
+/// A bare path expression naming a lane-shaped (v128) local, as a local
+/// read — or null when `e` isn't that. Used by the tail/return positions,
+/// which may yield a Simd value directly.
+fn bareSimdLocal(b: *Builder, e: ast.Expr, scope: *Scope) BuildError!?*hir.Expr {
+    if (e != .path) return null;
+    const txt = try pathText(b, e.path);
+    defer b.a.free(txt);
+    const loc = scope.find(txt) orelse return null;
+    if (simdShapeOfHir(loc.ty) == null) return null;
+    const out = try b.a.create(hir.Expr);
+    out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+    return out;
+}
+
 fn buildIntBlock(b: *Builder, block: ast.Block, scope: *Scope) BuildError!*hir.Stmt {
     var items: std.ArrayList(*hir.Stmt) = .empty;
     var it = block.statements();
@@ -10423,10 +10437,20 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
                     return out;
                 }
             }
+            // A bare Simd binding as the tail/return value (`{ x }` in a
+            // Simd-returning fn) — legal here, while generic scalar
+            // contexts (`v == w`, `if v`, `"{v}"`) still reject.
+            if (try bareSimdLocal(b, e, scope)) |sl| {
+                out.* = .{ .expr = sl };
+                return out;
+            }
             out.* = .{ .expr = try buildIntExpr(b, e, scope) };
         },
         .return_stmt => |rs| {
-            const v: ?*hir.Expr = if (rs.value()) |e| try buildIntExpr(b, e, scope) else null;
+            const v: ?*hir.Expr = if (rs.value()) |e|
+                (try bareSimdLocal(b, e, scope)) orelse try buildIntExpr(b, e, scope)
+            else
+                null;
             out.* = .{ .ret = v };
         },
         .let_stmt => |ls| {
@@ -11054,12 +11078,14 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 }
             }
             if (scope.find(txt)) |loc| {
-                // i64, f64, bool (i32 0/1), and lane-shaped v128 locals are
-                // readable here; a `str` local belongs in the str path — and
-                // a bare record binding (`.ptr`) is a whole-value use, not a
-                // scalar.
-                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32 and
-                    simdShapeOfHir(loc.ty) == null) return error.Unsupported;
+                // i64, f64, and bool (i32 0/1) locals are readable here; a
+                // `str` local belongs in the str path — and a bare record
+                // binding (`.ptr`) is a whole-value use, not a scalar. A
+                // v128 local is deliberately NOT readable in generic scalar
+                // position (`v == w`, `if v`, `"{v}"` must reject); the SIMD
+                // consumers (method args, call args, returns) each build
+                // their operands through buildSimdOperand instead.
+                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32) return error.Unsupported;
                 out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (try findRecField(scope, txt)) |rf| {
                 // `p.x` on a materialized record: a load at (base ptr, offset).

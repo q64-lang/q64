@@ -2,7 +2,7 @@
 //! once. One loop iteration processes four samples, so `samples` reports 4·n.
 //! Directly measures the Simd speedup over mac_f32 on identical math.
 
-fn pass(n: i64) -> f64 {
+fn pass(n: i64) -> f64 @realtime {
     var acc = Simd.splat(f32(0.0))
     var x = Simd.splat(f32(1.0))
     let r = Simd.splat(f32(0.9999995))

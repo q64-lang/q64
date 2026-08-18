@@ -2,7 +2,7 @@
 //! through the knee, so both the polynomial path and the clamp branches
 //! are exercised. The waveshaping/nonlinearity workload.
 
-fn pass(n: i64) -> f64 {
+fn pass(n: i64) -> f64 @realtime {
     var ph = f32(0.0)
     let inc = f32(0.010986)
     var drive = f32(0.5)
