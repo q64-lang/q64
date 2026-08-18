@@ -929,7 +929,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
     var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
         c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
         c.BinaryenFeatureNontrappingFPToInt() | // i64.trunc_sat_f64_* (__fmt_f64) — universal, incl. WebKit
-        c.BinaryenFeatureSIMD128(); // v128 + lane ops (Simd<f32,4> / Simd<i32,4>)
+        c.BinaryenFeatureSIMD128() | c.BinaryenFeatureRelaxedSIMD(); // v128 + lane ops (Simd<f32,4> / Simd<i32,4>)
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
     c.BinaryenModuleSetFeatures(module, features);
 
@@ -1589,8 +1589,8 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .rec_base = base + n_tuples + n_concat,
             .bounds_idx = base + n_tuples + n_concat + sc.rec_depth,
             .region_base = base + n_tuples + n_concat + sc.rec_depth + n_bounds,
-            .fs_dest_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7,
-            .fs_len_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + 1,
+            .fs_dest_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8,
+            .fs_len_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8 + 1,
             .host_imports = &host_imports,
             .foreign_imports = &foreign_imports,
             .global_names = global_names,
@@ -1607,9 +1607,9 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             .time_ret = time_ret,
             .kv_open_ret = kv_open_ret,
             .kv_inc_ret = kv_inc_ret,
-            .kv_hdr_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0),
-            .kv_a_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0) + 1,
-            .kv_b_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0) + 2,
+            .kv_hdr_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0),
+            .kv_a_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0) + 1,
+            .kv_b_idx = base + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8 + (if (sc.has_fs or sc.has_envvar) @as(u32, 2) else 0) + 2,
         };
         defer lw.deinit();
 
@@ -1620,7 +1620,7 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         // kv set/get need three address-width scratch locals (box header ptr +
         // saved key ptr/len); allocated after the fs/envvar scratch group.
         const n_kv: u32 = if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_db_query_one or sc.has_config_get) 3 else 0;
-        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs + n_kv;
+        const n_extra = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8 + n_fs + n_kv;
         const vts = try allocator.alloc(c.BinaryenType, n_extra);
         defer allocator.free(vts);
         for (0..f.locals.len) |i| vts[i] = wasmType(f.locals[i], i64_type, i32_type, none_type, pair_type, ptr_type);
@@ -1634,9 +1634,10 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
         for (0..sc.rec_depth) |j| vts[f.locals.len + n_tuples + n_concat + j] = ptr_type;
         if (sc.has_bounds) vts[f.locals.len + n_tuples + n_concat + sc.rec_depth] = i64_type;
         // Frame-reclamation scratch: per region level, [wm ptr, i64, i32,
-        // f64, f32, pair, ptr] (the watermark + one stash per value type).
+        // f64, f32, pair, ptr, v128] (the watermark + one stash per value
+        // type).
         for (0..sc.region_depth) |j| {
-            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + j * 7;
+            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + j * 8;
             vts[g] = ptr_type;
             vts[g + 1] = i64_type;
             vts[g + 2] = i32_type;
@@ -1644,14 +1645,15 @@ fn lowerToWasm(allocator: std.mem.Allocator, m: *const ir.mir.Module, addr: Addr
             vts[g + 4] = c.BinaryenTypeFloat32();
             vts[g + 5] = pair_type;
             vts[g + 6] = ptr_type;
+            vts[g + 7] = c.BinaryenTypeVec128();
         }
         if (sc.has_fs or sc.has_envvar) {
-            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7;
+            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8;
             vts[g] = ptr_type; // fs/envvar dest
             vts[g + 1] = i64_type; // fs/envvar len
         }
         if (sc.has_kv_set or sc.has_kv_get or sc.has_blob_put or sc.has_blob_get or sc.has_blob_delete or sc.has_db_execute or sc.has_db_query_value or sc.has_db_query_text or sc.has_db_query_one or sc.has_config_get) {
-            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 7 + n_fs;
+            const g = f.locals.len + n_tuples + n_concat + sc.rec_depth + n_bounds + sc.region_depth * 8 + n_fs;
             vts[g] = ptr_type; // kv box header ptr
             vts[g + 1] = ptr_type; // kv saved key ptr
             vts[g + 2] = ptr_type; // kv saved key len
@@ -1759,7 +1761,7 @@ pub fn asyncifyWasm(allocator: std.mem.Allocator, wasm: []const u8, suspend_impo
     var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
         c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
         c.BinaryenFeatureNontrappingFPToInt() |
-        c.BinaryenFeatureSIMD128(); // keep in sync with lowerToWasm — a re-read module must not drop v128
+        c.BinaryenFeatureSIMD128() | c.BinaryenFeatureRelaxedSIMD(); // keep in sync with lowerToWasm — a re-read module must not drop v128
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
 
     const buf = try allocator.dupe(u8, wasm); // ModuleRead takes a mutable buffer
@@ -1797,7 +1799,7 @@ pub fn optimizeWasm(allocator: std.mem.Allocator, wasm: []const u8, addr: Addres
     var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
         c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
         c.BinaryenFeatureNontrappingFPToInt() |
-        c.BinaryenFeatureSIMD128(); // keep in sync with lowerToWasm — a re-read module must not drop v128
+        c.BinaryenFeatureSIMD128() | c.BinaryenFeatureRelaxedSIMD(); // keep in sync with lowerToWasm — a re-read module must not drop v128
     if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
 
     const buf = try allocator.dupe(u8, wasm); // ModuleRead takes a mutable buffer
@@ -1867,6 +1869,8 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .simd_un => |s| bodyHasOut(s.operand, want_int),
         .simd_load => |s| bodyHasOut(s.vec, want_int) or bodyHasOut(s.idx, want_int),
         .simd_store => |s| bodyHasOut(s.vec, want_int) or bodyHasOut(s.idx, want_int) or bodyHasOut(s.value, want_int),
+        .simd_replace => |s| bodyHasOut(s.vec, want_int) or bodyHasOut(s.value, want_int),
+        .simd_fma => |s| bodyHasOut(s.a, want_int) or bodyHasOut(s.b, want_int) or bodyHasOut(s.c, want_int),
         .call => |cl| blk: {
             for (cl.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
             break :blk false;
@@ -2878,6 +2882,15 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(ss.idx, s);
             scanScratch(ss.value, s);
         },
+        .simd_replace => |sr| {
+            scanScratch(sr.vec, s);
+            scanScratch(sr.value, s);
+        },
+        .simd_fma => |sf| {
+            scanScratch(sf.a, s);
+            scanScratch(sf.b, s);
+            scanScratch(sf.c, s);
+        },
         .call => |cl| {
             // The call wraps in a reclamation region around its args.
             var sub = Scratch{};
@@ -3171,8 +3184,8 @@ const Lowerer = struct {
     /// evaluated once, tested, then yielded).
     bounds_idx: c.BinaryenIndex = 0,
     /// Frame-reclamation scratch (spec/memory.md §"Frame reclamation"):
-    /// per region-nesting level, a 7-local group
-    /// [wm ptr, i64, i32, f64, f32, pair, ptr] — the watermark plus a
+    /// per region-nesting level, an 8-local group
+    /// [wm ptr, i64, i32, f64, f32, pair, ptr, v128] — the watermark plus a
     /// result stash of each value type. `region_lvl` tracks the current
     /// nesting depth while lowering (a nested call in an argument wraps
     /// one level deeper than its caller's wrap).
@@ -3456,6 +3469,18 @@ const Lowerer = struct {
                     c.BinaryenStore(module, 16, 0, 1, addr.slot, try self.inst(s.value), c.BinaryenTypeVec128(), "0"),
                 };
                 return c.BinaryenBlock(module, null, @ptrCast(&seq), seq.len, self.none_type);
+            },
+            .simd_replace => |s| {
+                // The value arrives at the compute width (i64 for i32x4
+                // lanes) — wrap to the 32-bit lane before the replace.
+                const raw = try self.inst(s.value);
+                return switch (s.shape) {
+                    .f32x4 => c.BinaryenSIMDReplace(module, c.BinaryenReplaceLaneVecF32x4(), try self.inst(s.vec), s.lane, raw),
+                    .i32x4 => c.BinaryenSIMDReplace(module, c.BinaryenReplaceLaneVecI32x4(), try self.inst(s.vec), s.lane, c.BinaryenUnary(module, c.BinaryenWrapInt64(), raw)),
+                };
+            },
+            .simd_fma => |s| {
+                return c.BinaryenSIMDTernary(module, c.BinaryenRelaxedMaddVecF32x4(), try self.inst(s.a), try self.inst(s.b), try self.inst(s.c));
             },
             .call => |cl| {
                 // Frame reclamation (spec/memory.md §"Frame reclamation"):
@@ -4657,7 +4682,7 @@ const Lowerer = struct {
 
     /// The watermark local for region-nesting level `d`.
     fn wmIdx(self: *const Lowerer, d: u32) c.BinaryenIndex {
-        return self.region_base + d * 7;
+        return self.region_base + d * 8;
     }
     /// The result-stash local of value type `t` at level `d`.
     fn stashIdx(self: *const Lowerer, d: u32, t: ir.mir.ValueType) c.BinaryenIndex {
@@ -4668,14 +4693,10 @@ const Lowerer = struct {
             .f32 => 4,
             .str => 5,
             .ptr => 6,
-            // No v128 stash slot: SIMD values cannot appear in function
-            // signatures in v0 (the param/return allow-lists reject them),
-            // so no call result of type v128 ever crosses a reclamation
-            // region. Revisit when SIMD-returning callees land.
-            .v128 => unreachable,
+            .v128 => 7,
             .void => unreachable,
         };
-        return self.region_base + d * 7 + off;
+        return self.region_base + d * 8 + off;
     }
 
     /// Wrap a host statement: save the watermark, run it, restore `sp` —

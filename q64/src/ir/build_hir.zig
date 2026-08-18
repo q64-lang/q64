@@ -2027,17 +2027,30 @@ fn simdShapeOfAnnot(b: *Builder, te_opt: ?ast.TypeExpr) BuildError!?ops.LaneShap
     const nm = try te.path.name(b.a);
     defer b.a.free(nm);
     if (!std.mem.eql(u8, nm, "Simd")) return null;
-    const raw = (try te.path.genericArgsText(b.a)) orelse return error.Unsupported;
+    // A `Simd<…>` naming a shape outside the v0 slice is an honest reject.
+    return (try simdShapeOfAnnotLenient(b, te_opt)) orelse error.Unsupported;
+}
+
+/// Like `simdShapeOfAnnot` but null (not an error) for a `Simd<…>` naming a
+/// shape outside the v0 slice — for callers whose error set can't carry the
+/// reject (`semaScalar`), where null already means "outside the floor".
+fn simdShapeOfAnnotLenient(b: *Builder, te_opt: ?ast.TypeExpr) std.mem.Allocator.Error!?ops.LaneShape {
+    const te = te_opt orelse return null;
+    if (te != .path) return null;
+    const nm = try te.path.name(b.a);
+    defer b.a.free(nm);
+    if (!std.mem.eql(u8, nm, "Simd")) return null;
+    const raw = (try te.path.genericArgsText(b.a)) orelse return null;
     defer b.a.free(raw);
     // The raw span is `<f32, 4>`: split on the comma, trim each side.
     const inner = std.mem.trim(u8, raw, "<> \t");
-    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return error.Unsupported;
+    const comma = std.mem.indexOfScalar(u8, inner, ',') orelse return null;
     const elem = std.mem.trim(u8, inner[0..comma], " \t");
     const lanes = std.mem.trim(u8, inner[comma + 1 ..], " \t");
-    if (!std.mem.eql(u8, lanes, "4")) return error.Unsupported;
+    if (!std.mem.eql(u8, lanes, "4")) return null;
     if (std.mem.eql(u8, elem, "f32")) return .f32x4;
     if (std.mem.eql(u8, elem, "i32")) return .i32x4;
-    return error.Unsupported;
+    return null;
 }
 
 // A task lowers to a tiny CFG of pc-numbered blocks. A `plain`/`recv` block
@@ -3941,7 +3954,7 @@ fn collectCalleeParams(
                     continue;
                 }
                 const pty: hir.Type = switch (psc) {
-                    .bool, .i64, .f64, .f32 => psc,
+                    .bool, .i64, .f64, .f32, .f32x4, .i32x4 => psc,
                     else => return error.Unsupported,
                 };
                 _ = try scope.declare(pn, false, pty);
@@ -4023,7 +4036,7 @@ fn registerFunc(b: *Builder, name: []const u8) BuildError!hir.FuncId {
         // An i64, f64, or `-> bool` (i32 0/1) value function; the value
         // body builds through `buildIntBlock` whatever the scalar.
         break :blk switch (rs) {
-            .bool, .i64, .f64, .f32 => rs,
+            .bool, .i64, .f64, .f32, .f32x4, .i32x4 => rs,
             else => return error.Unsupported,
         };
     };
@@ -5411,6 +5424,14 @@ fn isStrCall(b: *Builder, arg: ast.Expr, scope: *const Scope) BuildError!bool {
 /// compounds, the wider numeric tower (i8…u128/f16/f32) — is `null`,
 /// which callers turn into the honest `Unsupported`.
 fn semaScalar(b: *Builder, te_opt: ?ast.TypeExpr) std.mem.Allocator.Error!?hir.Type {
+    // `Simd<f32, 4>` / `Simd<i32, 4>` in a param/return annotation: the lane
+    // shapes ride the scalar floor (like `let` bindings already do).
+    if (try simdShapeOfAnnotLenient(b, te_opt)) |sh| {
+        return switch (sh) {
+            .f32x4 => .f32x4,
+            .i32x4 => .i32x4,
+        };
+    }
     const id = try sema.types.lower(&b.tstore, null, te_opt);
     return switch (b.tstore.get(id)) {
         .builtin => |bi| switch (bi) {
@@ -9305,7 +9326,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
     // Snapshot the parameter kinds before building the args — building an
     // argument may register a new callee and grow `b.funcs`, so we can't
     // hold a slice into it across the loop.
-    const ParamKind = union(enum) { int, float: hir.Type, bool_, str_, rec: *const StructInfo, vec };
+    const ParamKind = union(enum) { int, float: hir.Type, bool_, str_, rec: *const StructInfo, vec, simd: hir.Type };
     const np = b.funcs.items[id].params.len;
     const kinds = try b.a.alloc(ParamKind, np);
     const frec = b.fn_recs.get(id);
@@ -9316,6 +9337,7 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
             .i64 => .int,
             .f64 => .{ .float = .f64 },
             .f32 => .{ .float = .f32 },
+            .f32x4, .i32x4 => .{ .simd = p.ty },
             .str => .str_,
             // A `.ptr` param is a vec or a record (str callees never get here).
             .ptr => if (vflags != null and k < vflags.?.len and vflags.?[k])
@@ -9376,6 +9398,16 @@ fn buildCallArgs(b: *Builder, id: hir.FuncId, args_iter: ast.ArgIter, scope: *Sc
                 const ok = (want == .f64 and sc == .f64) or (want == .f32 and sc == .f32);
                 if (!ok) return reject(b, .unsupported_call);
                 try args.append(b.a, try buildIntExpr(b, a, scope));
+            },
+            .simd => |want| {
+                // Lane shape is part of the type: an f32x4 argument only
+                // fills an f32x4 parameter (and likewise i32x4). Built via
+                // buildSimdOperand — a bare v128 local isn't an i64-path
+                // expression.
+                const sc = try exprScalar(b, a, scope);
+                const shape = simdShapeOfHir(want) orelse return reject(b, .unsupported_call);
+                if (sc != simdScTy(shape)) return reject(b, .unsupported_call);
+                try args.append(b.a, try buildSimdOperand(b, a, scope));
             },
             .bool_ => {
                 if (!(try exprIsBool(b, a, scope))) return reject(b, .unsupported_call);
@@ -9987,6 +10019,8 @@ const ExprTypeBridge = struct {
             .i64 => .i64,
             .f64 => .f64,
             .f32 => .f32,
+            .f32x4 => .f32x4,
+            .i32x4 => .i32x4,
             .bool => .bool,
             .str => .str,
             else => null,
@@ -10100,6 +10134,8 @@ const ExprTypeBridge = struct {
                     if (simdBinKind(mname)) |sk| if (simdBinAllowed(sk, shape)) return simdScTy(shape);
                     if (simdUnKind(mname)) |uk| if (simdUnAllowed(uk, shape)) return simdScTy(shape);
                     if (std.mem.eql(u8, mname, "extract")) return simdLaneScalar(shape);
+                    if (std.mem.eql(u8, mname, "replace")) return simdScTy(shape);
+                    if (std.mem.eql(u8, mname, "mul_add") and shape == .f32x4) return simdScTy(shape);
                 }
             }
             if (self.scope.find(name[0..dot])) |head| {
@@ -10114,6 +10150,8 @@ const ExprTypeBridge = struct {
                 .i64 => .i64,
                 .f64 => .f64,
                 .f32 => .f32,
+                .f32x4 => .f32x4,
+                .i32x4 => .i32x4,
                 .str => .str,
                 else => null,
             };
@@ -10129,6 +10167,8 @@ const ExprTypeBridge = struct {
             .i64 => .i64,
             .f64 => .f64,
             .f32 => .f32,
+            .f32x4 => .f32x4,
+            .i32x4 => .i32x4,
             .str => .str,
             else => null,
         };
@@ -11014,10 +11054,12 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                 }
             }
             if (scope.find(txt)) |loc| {
-                // i64, f64, and bool (i32 0/1) locals are readable here; a
-                // `str` local belongs in the str path — and a bare record
-                // binding (`.ptr`) is a whole-value use, not a scalar.
-                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32) return error.Unsupported;
+                // i64, f64, bool (i32 0/1), and lane-shaped v128 locals are
+                // readable here; a `str` local belongs in the str path — and
+                // a bare record binding (`.ptr`) is a whole-value use, not a
+                // scalar.
+                if (loc.ty != .i64 and loc.ty != .bool and loc.ty != .f64 and loc.ty != .f32 and
+                    simdShapeOfHir(loc.ty) == null) return error.Unsupported;
                 out.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
             } else if (try findRecField(scope, txt)) |rf| {
                 // `p.x` on a materialized record: a load at (base ptr, offset).
@@ -11363,6 +11405,35 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                                 out.* = .{ .simd_un = .{ .kind = uk, .shape = shape, .operand = vec } };
                                 return out;
                             }
+                            // `v.replace(n, x)` — lane n (a literal 0–3)
+                            // replaced by scalar x (the lane scalar type).
+                            if (std.mem.eql(u8, method, "replace")) {
+                                var rit = cc.args();
+                                const a0 = rit.next() orelse return reject(b, .unsupported_call);
+                                const a1 = rit.next() orelse return reject(b, .unsupported_call);
+                                if (rit.next() != null) return reject(b, .unsupported_call); // exactly two
+                                const lane = simdLaneIndex(a0) orelse return reject(b, .unsupported_call);
+                                if ((try exprScalar(b, a1, scope)) != simdLaneScalar(shape)) return reject(b, .unsupported_call);
+                                const vec = try b.a.create(hir.Expr);
+                                vec.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                                out.* = .{ .simd_replace = .{ .shape = shape, .vec = vec, .lane = lane, .value = try buildIntExpr(b, a1, scope) } };
+                                return out;
+                            }
+                            // `a.mul_add(b, c)` — lane-wise a·b + c via the
+                            // relaxed-SIMD fused multiply-add. f32x4 only.
+                            if (std.mem.eql(u8, method, "mul_add")) {
+                                if (shape != .f32x4) return reject(b, .unsupported_call);
+                                var fit_ = cc.args();
+                                const a0 = fit_.next() orelse return reject(b, .unsupported_call);
+                                const a1 = fit_.next() orelse return reject(b, .unsupported_call);
+                                if (fit_.next() != null) return reject(b, .unsupported_call); // exactly two
+                                if ((try exprScalar(b, a0, scope)) != simdScTy(shape)) return reject(b, .unsupported_call);
+                                if ((try exprScalar(b, a1, scope)) != simdScTy(shape)) return reject(b, .unsupported_call);
+                                const av = try b.a.create(hir.Expr);
+                                av.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                                out.* = .{ .simd_fma = .{ .a = av, .b = try buildSimdOperand(b, a0, scope), .c = try buildSimdOperand(b, a1, scope) } };
+                                return out;
+                            }
                             if (std.mem.eql(u8, method, "extract")) {
                                 var eit = cc.args();
                                 const a0 = eit.next() orelse return reject(b, .unsupported_call);
@@ -11461,7 +11532,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
             // An i64 or bool (i32 0/1) callee produces a value usable here; a
             // str or record callee does not belong in an i64/bool expression.
             switch (b.funcs.items[id].ret) {
-                .i64, .bool, .f64, .f32 => {},
+                .i64, .bool, .f64, .f32, .f32x4, .i32x4 => {},
                 else => return reject(b, .unsupported_call),
             }
             out.* = .{ .call = .{ .func = id, .args = try buildCallArgs(b, id, cc.args(), scope, null) } };

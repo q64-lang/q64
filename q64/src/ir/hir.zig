@@ -445,6 +445,12 @@ pub const Expr = union(enum) {
     /// `Simd.load(v, i)` — load four f32 lanes from `v[i..i+4)` of a
     /// `Vec<f32>` as a `Simd<f32, 4>` (bounds-checked as one unit).
     simd_load: struct { vec: *Expr, idx: *Expr },
+    /// `v.replace(n, x)` — the vector with lane `n` replaced by scalar `x`.
+    simd_replace: struct { shape: ops.LaneShape, vec: *Expr, lane: u8, value: *Expr },
+    /// `a.mul_add(b, c)` — lane-wise `a·b + c` via relaxed-SIMD fused
+    /// multiply-add (f32x4 only). Relaxed: whether the intermediate product
+    /// rounds is implementation-defined — that's the price of the FMA.
+    simd_fma: struct { a: *Expr, b: *Expr, c: *Expr },
     /// Short-circuit `&&` / `||`. Kept distinct from `bin` because it lowers
     /// to control flow (a value `if_`), not a backend binary op. Yields a
     /// boolean (i32 0/1); both operands are truthiness-tested.

@@ -358,6 +358,22 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, s.idx);
             try app(gpa, out, ")", .{});
         },
+        .simd_replace => |s| {
+            try app(gpa, out, "simd_replace.{s}[{d}](", .{ @tagName(s.shape), s.lane });
+            try hirExpr(gpa, out, s.vec);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, s.value);
+            try app(gpa, out, ")", .{});
+        },
+        .simd_fma => |s| {
+            try app(gpa, out, "simd_fma(", .{});
+            try hirExpr(gpa, out, s.a);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, s.b);
+            try app(gpa, out, ", ", .{});
+            try hirExpr(gpa, out, s.c);
+            try app(gpa, out, ")", .{});
+        },
         .logical => |lg| {
             try app(gpa, out, "(", .{});
             try hirExpr(gpa, out, lg.lhs);
@@ -689,6 +705,17 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "simd_load\n", .{});
             try mirInst(gpa, out, s.vec, depth + 1);
             try mirInst(gpa, out, s.idx, depth + 1);
+        },
+        .simd_replace => |s| {
+            try app(gpa, out, "simd_replace {s} lane {d}\n", .{ @tagName(s.shape), s.lane });
+            try mirInst(gpa, out, s.vec, depth + 1);
+            try mirInst(gpa, out, s.value, depth + 1);
+        },
+        .simd_fma => |s| {
+            try app(gpa, out, "simd_fma\n", .{});
+            try mirInst(gpa, out, s.a, depth + 1);
+            try mirInst(gpa, out, s.b, depth + 1);
+            try mirInst(gpa, out, s.c, depth + 1);
         },
         .simd_store => |s| {
             try app(gpa, out, "simd_store\n", .{});

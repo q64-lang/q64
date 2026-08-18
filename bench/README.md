@@ -41,6 +41,7 @@ checksum is not a result.
 | `mac_f32` | serial multiply-accumulate, 1 chain | the floor: latency-bound, ~6 locals |
 | `mac_simd4` | the same on `Simd<f32, 4>` | measures the v0 Simd slice directly |
 | `clip_simd4` | branch-free cubic clip on `Simd<f32, 4>` | the full lane-op surface (mul/sub/min/max/add) |
+| `biquad_bank4` | one DF2T biquad × 4 channels in lanes, fused via `mul_add` | relaxed-SIMD FMA + `replace` + cross-lane state |
 | `gain_buf` | scalar in-place gain over a 1024-sample `Vec<f32>` | the block-processing memory loop, per-element bounds checks |
 | `gain_buf_simd4` | the same via `Simd.load` / `x.store`, 4 lanes | vectorized buffer access, one bounds check per group |
 | `mix04` | 4 saw voices × gain, summed | the DAW summing loop: adds, muls, wrap branches |
@@ -53,16 +54,17 @@ checksum is not a result.
 
 ```
 kernel              q64-dbg      q64-rel         rust rel/rust
-mac_f32                1.45         1.39         1.46     1.0x
+mac_f32                1.46         1.43         1.45     1.0x
 mac_simd4              0.36         0.30         0.37     0.8x
-clip_simd4             1.25         1.19         4.01     0.3x
-gain_buf               4.70         3.64         0.09    39.5x
-gain_buf_simd4         0.53         0.69         0.09     7.5x
-mix04                  4.21         3.72         3.89     1.0x
-biquad4               11.99         7.62         7.72     1.0x
-fir16                 25.29        21.28        17.58     1.2x
-softclip               3.03         4.35         3.45     1.3x
-wavetable16            4.58         4.02         3.67     1.1x
+clip_simd4             0.98         1.07         3.98     0.3x
+biquad_bank4           0.80         0.77        15.65     0.05x
+gain_buf               3.68         3.67         0.09    39.8x
+gain_buf_simd4         0.53         0.68         0.09     7.4x
+mix04                  4.14         3.71         3.89     1.0x
+biquad4               11.73         7.56         7.66     1.0x
+fir16                 25.16        21.21        17.52     1.2x
+softclip               3.11         4.33         4.05     1.1x
+wavetable16            4.55         3.76         3.02     1.2x
 ```
 
 ns/sample. q64 = `q64 emit --addr wasm32`, debug and `--release`, run under
@@ -174,9 +176,24 @@ instead). `gain_buf_simd4` runs 8.9× faster than its scalar twin. The
 remaining 7.5× to Rust's auto-vectorized loop is bounds checks per group,
 header re-loads, and no unrolling — Rust's `iter_mut` loop pays for none
 of those; closing it means hoisting the bounds check out of the loop
-(future optimizer work), not changing the surface. Still missing for DSP:
-`Simd` in struct fields and across function boundaries, lane insert,
-relaxed FMA (roadmap phase A3).
+(future optimizer work), not changing the surface.
+
+**Cross-function values, lane insert, and fused multiply-add landed as the
+third slice.** `Simd<f32, 4>` is now legal as a parameter and return type
+(the frame-reclamation stash grew a v128 slot), `v.replace(n, x)` sets one
+lane, and `a.mul_add(b, c)` emits the relaxed-SIMD fused madd. The payoff
+kernel is `biquad_bank4` — one biquad filtering four channels in lanes,
+its DF2T core written as three fused chains: **q64 runs it ~20× faster
+than the Rust twin** (0.80 vs 15.65 ns/sample) with **bit-identical
+checksums**. The reason is structural, not a compiler race: core wasm has
+no scalar FMA, so Rust's `f32::mul_add` lowers to the correctly-rounded
+`fmaf` soft-float libcall per lane, while q64's `mul_add` reaches the
+hardware FMA through relaxed SIMD — same rounding on FMA hardware, ~20×
+the speed. (Relaxed caveat: an engine without hardware FMA may execute
+madd unfused, changing low-order bits and this kernel's checksum;
+WebKit/Safari also doesn't ship relaxed SIMD yet — a kernel that must run
+there should stay with mul/add.) Still missing for DSP: `Simd` in struct
+fields, f64x2 (roadmap phase A3).
 
 ### Finding 5 — v0 language gaps the kernels had to code around
 

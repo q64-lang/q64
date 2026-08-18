@@ -202,6 +202,15 @@ fn collectExpr(
             try collectExpr(a, s.vec, d, e);
             try collectExpr(a, s.idx, d, e);
         },
+        .simd_replace => |s| {
+            try collectExpr(a, s.vec, d, e);
+            try collectExpr(a, s.value, d, e);
+        },
+        .simd_fma => |s| {
+            try collectExpr(a, s.a, d, e);
+            try collectExpr(a, s.b, d, e);
+            try collectExpr(a, s.c, d, e);
+        },
         .logical => |l| {
             try collectExpr(a, l.lhs, d, e);
             try collectExpr(a, l.rhs, d, e);

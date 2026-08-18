@@ -191,6 +191,9 @@ pub const Op = union(enum) {
     simd_load: struct { vec: *Inst, idx: *Inst },
     /// v128 store of lanes `idx..idx+4` into an f32-cell vec (`__simd_store_f32`).
     simd_store: struct { vec: *Inst, idx: *Inst, value: *Inst },
+    simd_replace: struct { shape: ops.LaneShape, vec: *Inst, lane: u8, value: *Inst },
+    /// Relaxed-SIMD fused multiply-add: lane-wise `a·b + c` (f32x4).
+    simd_fma: struct { a: *Inst, b: *Inst, c: *Inst },
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
     host_out_int: struct { value: *Inst, nl_off: u32, stream: Stream },

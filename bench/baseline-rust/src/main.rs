@@ -81,6 +81,39 @@ fn clip_simd4(n: i64) -> f64 {
     acc.iter().map(|v| *v as f64).sum()
 }
 
+fn biquad_bank4(n: i64) -> f64 {
+    // Four channels through one DF2T biquad, mirroring the q64 Simd twin's
+    // fused form exactly. f32::mul_add is a correctly-rounded fused
+    // multiply-add — on FMA hardware that matches relaxed-SIMD madd
+    // bit-for-bit, but wasm has no scalar FMA instruction, so LLVM lowers
+    // it to the soft-float `fmaf` libcall per lane. That asymmetry is the
+    // point of the benchmark: q64 can express the hardware FMA, Rust on
+    // wasm cannot.
+    let b0: f32 = black_box(0.000944692);
+    let b1: f32 = black_box(0.001889384);
+    let b2: f32 = black_box(0.000944692);
+    let na1: f32 = black_box(1.911196288);
+    let na2: f32 = black_box(-0.914975055);
+    let r: f32 = black_box(0.9999995);
+    let mut x = [1.0f32, 0.8, 0.6, 0.4];
+    let mut s1 = [0.0f32; 4];
+    let mut s2 = [0.0f32; 4];
+    let mut acc = [0.0f32; 4];
+    let mut i: i64 = 0;
+    while i < n {
+        for l in 0..4 {
+            x[l] *= r;
+            let y = b0.mul_add(x[l], s1[l]);
+            let t = b1.mul_add(x[l], s2[l]);
+            s1[l] = na1.mul_add(y, t);
+            s2[l] = na2.mul_add(y, b2 * x[l]);
+            acc[l] += y;
+        }
+        i += 1;
+    }
+    acc.iter().map(|v| *v as f64).sum()
+}
+
 fn gain_buf(sweeps: i64) -> f64 {
     // In-place gain over a 1024-sample buffer — LLVM auto-vectorizes this
     // slice loop, so it doubles as the twin for gain_buf_simd4 (identical
@@ -244,6 +277,7 @@ fn main() {
     timed("mac_f32", 4_000_000, 4_000_000, mac_f32);
     timed("mac_simd4", 4_000_000, 1_000_000, mac_simd4);
     timed("clip_simd4", 4_000_000, 1_000_000, clip_simd4);
+    timed("biquad_bank4", 4_000_000, 1_000_000, biquad_bank4);
     timed("gain_buf", 2_048_000, 2_000, gain_buf);
     timed("gain_buf_simd4", 2_048_000, 2_000, gain_buf);
     timed("mix04", 2_000_000, 2_000_000, mix04);

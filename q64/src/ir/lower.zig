@@ -471,6 +471,17 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             .vec = try lowerExpr(ctx, s.vec),
             .idx = try lowerExpr(ctx, s.idx),
         } }),
+        .simd_replace => |s| return mk(ctx.a, .v128, .{ .simd_replace = .{
+            .shape = s.shape,
+            .vec = try lowerExpr(ctx, s.vec),
+            .lane = s.lane,
+            .value = try lowerExpr(ctx, s.value),
+        } }),
+        .simd_fma => |s| return mk(ctx.a, .v128, .{ .simd_fma = .{
+            .a = try lowerExpr(ctx, s.a),
+            .b = try lowerExpr(ctx, s.b),
+            .c = try lowerExpr(ctx, s.c),
+        } }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg` preserves the
             // operand's numeric type (f64 stays f64); `bit_not` is i64.
