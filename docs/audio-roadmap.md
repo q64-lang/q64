@@ -347,8 +347,16 @@ computed in q64 with the new `q64.audio.sin2pi`/`cos2pi` (endpoint-
 constrained degree-7 polynomials, |err| < ~1e-6, no libm). audio-poly's
 check hears it: brightness 4.5× from 200 Hz to 8 kHz. This IS the
 declared surface, delivered through the flattened convention — the
-`fit X : AudioPlugin` face in sema becomes sugar over it. Native CLAP
-and AU/VST3 remain.)*
+`fit X : AudioPlugin` face in sema becomes sugar over it.
+
+Raw MIDI (event type 10) closed the event surface: the shim forwards
+the three data bytes to an optional guest `midi(ref st, b0, b1, b2)`
+export — what a byte means is entirely the guest's mapping. audio-poly
+routes CC 1 (mod wheel) through its own set_param for a full-range
+cutoff sweep; the check confirms 100→7999 Hz by readback and that
+unmapped CCs are ignored. All three CLAP core event payloads
+(param-value, note, MIDI) are now pinned and routed. Native CLAP and
+AU/VST3 remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the
 reference browser host, and processes audio inside budget; `q64 show

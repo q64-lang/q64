@@ -139,7 +139,7 @@ offset  size  field
 16      …     payload     (type-specific)
 ```
 
-v1 pins two payloads:
+v1 pins three payloads:
 
 - **param-value** (`type = 5`): `param_id: u32 @16`, `value: f64 @40`
   (8-aligned; the intervening note/port/channel/key fields are −1 =
@@ -158,8 +158,13 @@ v1 pins two payloads:
   pitch, envelopes, and polyphony itself — voice allocation is a
   guest concern by design (`examples/audio-poly`, 8 voices).
 
-Raw MIDI pass-through (`type = 10`, CC / pitch bend / aftertouch)
-is deferred; the queue and header do not change when it lands.
+- **raw MIDI** (`type = 10`): `port_index: u16 @16`,
+  `data: u8[3] @18` — 24 bytes. The catch-all for channel-voice
+  messages hosts don't translate (CC, pitch bend, aftertouch — notes
+  arrive as note events). Plugin targets forward the three bytes to
+  the guest's optional `midi` export; without one the event is
+  ignored. What a byte means is entirely the guest's mapping (e.g.
+  audio-poly routes CC 1 through its own `set_param`).
 
 In the app direction the queue lives in a guest `RingBuffer` region;
 in the plugin direction it is walked through the host's accessor
@@ -266,6 +271,7 @@ state_cells() -> i64                          // own state sizing (else 16)
 prepare(ref st, sr: f64) -> i64               // at activate; may allocate
 note_on(ref st, key: i64, vel: f32) -> i64    // @realtime
 note_off(ref st, key: i64) -> i64             // @realtime (also choke)
+midi(ref st, b0: i64, b1: i64, b2: i64) -> i64 // @realtime, raw bytes
 ```
 
 A guest exporting `note_on`/`note_off` receives note events as calls —
@@ -314,7 +320,7 @@ synthesis treating it like any other face — tracked there, not here.
 | block size per call, max at activation | — |
 | `v.head` header handle, stable addresses | shared-memory / multi-thread buffers |
 | params `id → f64`, guest smoothing, block snap | sample-offset automation |
-| CLAP-shaped event header, param-value + note on/off/choke | raw MIDI pass-through (CC, pitch bend) |
+| CLAP-shaped event header, param-value + note on/off/choke + raw MIDI | — |
 | polyphony as guest-side voice allocation (notes forwarded as calls) | — |
 | one output port, planar channels | multi-port, sidechain |
 | `f64` sample rate at activation | rate changes while active |

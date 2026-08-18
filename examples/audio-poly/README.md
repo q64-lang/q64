@@ -13,7 +13,9 @@ note_off(ref st, key: i64) -> i64             // @realtime
 ```
 
 note events are forwarded to the guest instead of driving the shim's
-mono fallback — and with the parameter extensions
+mono fallback (raw MIDI the host didn't translate arrives through
+`midi(ref st, b0, b1, b2)` — this synth maps CC 1, the mod wheel, to a
+full-range cutoff sweep) — and with the parameter extensions
 
 ```
 param_count() -> i64
@@ -63,7 +65,8 @@ silence (nothing sticks through voice stealing). The parameter table is
 read back through the shim's guest calls (names byte-by-byte), and the
 cutoff is verified **in the audio**: brightness (first-difference RMS)
 rises ~4.5× from 200 Hz to 8 kHz, with out-of-range values clamped by
-the guest.
+the guest. Raw MIDI closes the loop: a mod-wheel CC event sweeps the
+cutoff (readback confirms 100→7999 Hz) and unmapped CCs are ignored.
 
 In the reference browser host it loads and idles silent
 (`host-smoke.mjs … --expect-silent`); with a MIDI keyboard attached it

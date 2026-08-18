@@ -234,4 +234,28 @@ pendingEvents = [noteEvent(1, 57, 0.0)];
 runBlocks(60);
 console.log(`ok: cutoff is audible — brightness ${dark.toFixed(3)} @200 Hz -> ${bright.toFixed(3)} @8 kHz (${(bright / dark).toFixed(1)}x), guest clamps out-of-range`);
 
+// ---- raw MIDI (type 10): mod wheel -> cutoff -------------------------
+// The shim forwards the 3 data bytes to the guest `midi` export; the
+// guest maps CC 1 through its own set_param. Verified via the params
+// extension readback (the same value a DAW's UI would show).
+const midiEvent = (b0, b1, b2) => {
+  const ev = ex.malloc(24); // clap_event_midi
+  mem().setUint32(ev + 0, 24, true);
+  mem().setUint16(ev + 10, 10, true); // CLAP_EVENT_MIDI
+  mem().setUint16(ev + 16, 0, true); // port_index
+  new Uint8Array(ex.memory.buffer).set([b0, b1, b2], ev + 18);
+  return ev;
+};
+pendingEvents = [midiEvent(0xb0, 1, 127)]; // mod wheel full
+runBlocks(2);
+const wheelFull = getValue(0);
+if (Math.abs(wheelFull - (100 + 127 * 62.2)) > 1) throw new Error(`CC1=127 cutoff ${wheelFull}, expected ~${100 + 127 * 62.2}`);
+pendingEvents = [midiEvent(0xb0, 1, 0)]; // mod wheel zero
+runBlocks(2);
+if (getValue(0) !== 100) throw new Error(`CC1=0 cutoff ${getValue(0)}, expected 100`);
+pendingEvents = [midiEvent(0xb0, 7, 64)]; // CC 7 (volume) — must be ignored
+runBlocks(2);
+if (getValue(0) !== 100) throw new Error("unmapped CC changed the cutoff");
+console.log(`ok: raw MIDI — mod wheel sweeps cutoff (127 -> ${wheelFull.toFixed(1)} Hz, 0 -> 100 Hz), unmapped CC ignored`);
+
 console.log("poly-check: PASS");

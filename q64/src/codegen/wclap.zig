@@ -37,6 +37,7 @@
 //!   prepare(ref st, sr: f64) -> i64               // at activate
 //!   note_on(ref st, key: i64, vel: f32) -> i64    // @realtime
 //!   note_off(ref st, key: i64) -> i64             // @realtime
+//!   midi(ref st, b0: i64, b1: i64, b2: i64) -> i64 // @realtime, raw bytes
 //! — and then notes are *forwarded to the guest* (polyphony, voice
 //! stealing, envelopes all live in q64 code; the shim only routes).
 //! Otherwise the shim's mono fallback: note-on sets the pitch from a
@@ -169,6 +170,7 @@ const B = struct {
     fn_prepare: ?[*c]const u8, // prepare(ref st, sr: f64) -> i64
     fn_note_on: ?[*c]const u8, // note_on(ref st, key: i64, vel: f32) -> i64
     fn_note_off: ?[*c]const u8, // note_off(ref st, key: i64) -> i64
+    fn_midi: ?[*c]const u8, // midi(ref st, b0: i64, b1: i64, b2: i64) -> i64
     // Guest-declared parameters (all five or none — checked in wclapWrap).
     // When present the shim's clap.params serves the guest's table, param
     // events forward to set_param, and process takes the short signature
@@ -237,6 +239,7 @@ pub fn wclapWrap(allocator: std.mem.Allocator, wasm: []const u8, wasm64: bool, m
         .fn_prepare = exportedFn(m, "prepare"),
         .fn_note_on = exportedFn(m, "note_on"),
         .fn_note_off = exportedFn(m, "note_off"),
+        .fn_midi = exportedFn(m, "midi"),
         .fn_param_count = exportedFn(m, "param_count"),
         .fn_param_info = exportedFn(m, "param_info"),
         .fn_param_name = exportedFn(m, "param_name"),
@@ -657,6 +660,24 @@ fn addApplyEvents(b: B) void {
         c.BinaryenDrop(m, c.BinaryenCall(m, nf, @ptrCast(&off_args), off_args.len, b.i64t))
     else
         c.BinaryenGlobalSet(m, "__wclap_gate", c.BinaryenConst(m, c.BinaryenLiteralFloat64(0.0)));
+    // raw MIDI (type 10): forward the three data bytes to a guest `midi`
+    // export; without one the event is ignored (nothing to route to).
+    // clap_event_midi: header(16) + port_index u16 @16 + data u8[3] @18.
+    const midiByte = struct {
+        fn f(bb: B, ev_local: u32, off: u32) c.BinaryenExpressionRef {
+            return c.BinaryenUnary(bb.m, c.BinaryenExtendUInt32(), c.BinaryenLoad(bb.m, 1, false, off, 0, bb.i32t, bb.get(ev_local, bb.i32t), null));
+        }
+    }.f;
+    var midi_args = [_]c.BinaryenExpressionRef{
+        c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+        midiByte(b, EV, 18),
+        midiByte(b, EV, 19),
+        midiByte(b, EV, 20),
+    };
+    const midi_action: c.BinaryenExpressionRef = if (b.fn_midi) |mf|
+        c.BinaryenDrop(m, c.BinaryenCall(m, mf, @ptrCast(&midi_args), midi_args.len, b.i64t))
+    else
+        c.BinaryenNop(m);
     var iter_body = [_]c.BinaryenExpressionRef{
         c.BinaryenLocalSet(m, EV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(8, b.get(LIST, b.i32t)), @ptrCast(&get_args), get_args.len, c.BinaryenTypeCreate(&p2, p2.len), b.i32t)),
         c.BinaryenIf(
@@ -678,7 +699,7 @@ fn addApplyEvents(b: B) void {
                             // NOTE_OFF (1) or NOTE_CHOKE (2) both release
                             c.BinaryenBinary(m, c.BinaryenOrInt32(), typeIs(b, 1), typeIs(b, 2)),
                             off_action,
-                            null,
+                            c.BinaryenIf(m, typeIs(b, 10), midi_action, null), // CLAP_EVENT_MIDI
                         ),
                     ),
                 ),

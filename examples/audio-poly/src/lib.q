@@ -2,8 +2,8 @@
 //! handled in-guest.
 //!
 //! exports: alloc_f32, data_of, state_cells, prepare, note_on, note_off,
-//!          param_count, param_info, param_name, set_param, get_param,
-//!          process
+//!          midi, param_count, param_info, param_name, set_param,
+//!          get_param, process
 //!
 //! The full optional plugin convention (spec/audio-face.md §interim
 //! convention). The WCLAP shim forwards note events AND parameter
@@ -196,6 +196,17 @@ pub fn note_on(ref st: Vec<f32>, key: i64, vel: f32) -> i64 @realtime {
     st[base] = f32(key)
     st[base + 1] = st[key]
     st[base + 4] = vel
+    0
+}
+
+// Raw MIDI the host didn't translate (notes arrive as clap note events;
+// this gets the rest — CC, pitch bend, aftertouch). CC 1 (mod wheel) on
+// any channel sweeps the cutoff across its full range, through
+// set_param so clamping and the coefficient math are shared.
+pub fn midi(ref st: Vec<f32>, b0: i64, b1: i64, b2: i64) -> i64 @realtime {
+    if (b0 & 240) == 176 && b1 == 1 {
+        let applied = set_param(st, 0, 100.0 + f64(b2) * 62.2)
+    }
     0
 }
 
