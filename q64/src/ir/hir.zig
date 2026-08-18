@@ -601,6 +601,12 @@ pub const Expr = union(enum) {
     /// i64. Lets a qube hand a buffer to the host (`new Float32Array(mem, ptr,
     /// n)`); the address is only stable while the vec isn't grown/reallocated.
     vec_ptr: struct { vec: *Expr },
+    /// `v.head` — the vec's *header* address (i64). The re-entry handle for
+    /// hosts: a header address passed back into an exported fn's `Vec<…>`
+    /// parameter reconnects the same buffer (the header holds {data, len,
+    /// cap}), which is how a persistent host drives stateful `process`
+    /// calls across export boundaries.
+    vec_head: struct { vec: *Expr },
     /// `v[i]` — a bounds-checked element load. `cell4` selects the packed 4-byte
     /// cell (a `Vec<f32>`, value zero-extended from 32 bits) over the 8-byte cell.
     vec_get: struct { vec: *Expr, idx: *Expr, cell4: bool = false },

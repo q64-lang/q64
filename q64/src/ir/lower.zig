@@ -441,6 +441,7 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
         .vec_new => return mk(ctx.a, .ptr, .vec_new),
         .vec_len => |vl| return mk(ctx.a, .i64, .{ .vec_len = .{ .vec = try lowerExpr(ctx, vl.vec) } }),
         .vec_ptr => |vp| return mk(ctx.a, .i64, .{ .vec_ptr = .{ .vec = try lowerExpr(ctx, vp.vec) } }),
+        .vec_head => |vh| return mk(ctx.a, .i64, .{ .vec_head = .{ .vec = try lowerExpr(ctx, vh.vec) } }),
         .vec_get => |vg| return mk(ctx.a, if (vg.cell4) .f32 else .i64, .{ .vec_get = .{ .vec = try lowerExpr(ctx, vg.vec), .idx = try lowerExpr(ctx, vg.idx), .cell4 = vg.cell4 } }),
         .simd_splat => |s| return mk(ctx.a, .v128, .{ .simd_splat = .{
             .shape = s.shape,

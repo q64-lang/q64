@@ -358,6 +358,9 @@ pub const Op = union(enum) {
     /// `v.ptr` -> i64: the vec's element-data address (header data field),
     /// widened to i64. `__vec_ptr`.
     vec_ptr: struct { vec: *Inst },
+    /// The vec header address itself, widened to i64 (no helper needed —
+    /// the binding local is the header pointer).
+    vec_head: struct { vec: *Inst },
     /// `v[i]` -> i64, bounds-checked against the live len (a trap on
     /// out-of-range, like arrays). `cell4` → `__vec_get_f32` (4-byte cell).
     vec_get: struct { vec: *Inst, idx: *Inst, cell4: bool = false },

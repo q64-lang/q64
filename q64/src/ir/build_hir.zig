@@ -11133,6 +11133,15 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         return out;
                     }
                 }
+                // `v.head` — the vec header address (i64): the re-entry
+                // handle a host passes back into an exported fn's `Vec<…>`
+                // parameter to reconnect the same buffer across calls.
+                if (std.mem.eql(u8, txt[dotl + 1 ..], "head")) {
+                    if (try vecRefByName(b, scope, txt[0..dotl])) |vref| {
+                        out.* = .{ .vec_head = .{ .vec = vref } };
+                        return out;
+                    }
+                }
             }
             if (scope.find(txt)) |loc| {
                 // i64, f64, and bool (i32 0/1) locals are readable here; a

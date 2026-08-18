@@ -22,6 +22,10 @@ tests for the compiler, the stdlib, and the runtime adapters.
   `render(…) -> i64`, and a page with frequency/cutoff/drive sliders that
   re-renders through the wasm and plays via the Web Audio API. `node
   test.mjs` smokes the samples without a browser.
+- **`audio-worklet/`** — the live version: one persistent q64 instance on
+  the audio thread, an AudioWorklet calling its `process()` per 128-frame
+  quantum (~2 µs of the 2 667 µs budget), state in guest buffers held by
+  `v.head`, parameters smoothed in-guest so sliders are click-free.
 - **`3d-demo/`** — rigged character rendered with `q64.gfx` and `q64.anim`.
   Tests `Vec`/`Mat`/`Quat`, skinning, and the browser runtime adapter.
 - **`http-server/`** — minimal `q64.net` server qube targeting Wasmtime.

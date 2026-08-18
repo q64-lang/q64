@@ -1,0 +1,13 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "dev.q64.audio_worklet",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "The live half of the browser audio story: one persistent q64 instance driven block-by-block by an AudioWorklet. State lives in Vec<f32> buffers the host holds by header address (v.head) and passes back into process(); parameters are smoothed in-guest, so slider moves are click-free.",
+  "type": "library",
+  "entry": "src/lib.q",
+
+  "dependencies": {
+    "q64.audio": { "path": "../../stdlib/audio" },
+  },
+}

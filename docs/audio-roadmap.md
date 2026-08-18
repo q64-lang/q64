@@ -212,8 +212,12 @@ compiled to wasm32, called from a page through a plain `pub fn
 render(…) -> i64` export returning a `buf.ptr` address, played via the Web
 Audio API with live frequency/cutoff/drive sliders (~100 ms per 2-second
 debug render). It is the offline-render half of the browser story and
-needed no new ABI; the live AudioWorklet half is what D1–D3 below exist
-for.)*
+needed no new ABI; the live AudioWorklet half — `examples/audio-worklet` — followed: one
+persistent q64 instance on the audio thread, `process(ref st, out io, …)`
+per 128-frame quantum (~2 µs/quantum debug), state in guest `Vec<f32>`
+buffers the host re-enters by header address via the new `v.head`
+surface, parameters smoothed in-guest. That is the WCLAP shape minus the
+CLAP ABI; D1–D3 below add the ABI.)*
 
 **D1. Spec the `env.audio` wire format** — the recorded next step in
 todo.md §"Host ABI for non-trivial faces", and the first capability face

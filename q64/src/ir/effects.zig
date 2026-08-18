@@ -302,6 +302,7 @@ fn collectExpr(
         .vec_new => {},
         .vec_len => |vl| try collectExpr(a, vl.vec, d, e),
         .vec_ptr => |vp| try collectExpr(a, vp.vec, d, e),
+        .vec_head => |vh| try collectExpr(a, vh.vec, d, e),
         .vec_get => |vg| {
             try collectExpr(a, vg.vec, d, e);
             try collectExpr(a, vg.idx, d, e);
