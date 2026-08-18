@@ -1,7 +1,7 @@
 //! q64.audio — DSP building blocks (v1).
 //!
 //! exports: one_pole, biquad, saw, delay_tick, denormal_flush, clamp1,
-//!          soft_clip, tanh_fast, Tick, Gen
+//!          soft_clip, tanh_fast, sin2pi, cos2pi, Tick, Gen
 //!
 //! Everything is f32 — the canonical audio bus format — and every
 //! per-sample path is `@realtime` (free functions checked by `q64 check`;
@@ -163,4 +163,35 @@ pub fn delay_tick(out buf: Vec<f32>, idx: i64, x: f32) -> f32 @realtime {
     let old = buf[idx]
     buf[idx] = x
     old
+}
+
+// ---------------------------------------------------------------------
+// Trig on turns — for computing filter coefficients in-guest.
+// ---------------------------------------------------------------------
+
+// Degree-7 odd polynomial for sin(pi/2 * x) on [-1, 1], least-squares
+// fit constrained to p(1) = 1 exactly (so cos2pi(0) == 1 and the fold
+// seams are continuous). |error| < 1e-6 — far below f32 audio needs.
+fn sin_half_pi(x: f32) -> f32 @realtime {
+    let x2 = x * x
+    x * (f32(1.5707915139866486) + x2 * (f32(-0.6458964935396239) + x2 * (f32(0.0794401080723901) + x2 * f32(-0.004335128519414866))))
+}
+
+/// sin(2*pi*t) for t in [0, 0.5] — the audio-coefficient domain
+/// (a filter's fc/sr never exceeds Nyquist = 0.5 turns). Accurate to
+/// ~1e-6; @realtime (polynomial only).
+pub fn sin2pi(t: f32) -> f32 @realtime {
+    var v = t + t
+    if v > f32(1.0) { v = f32(1.0) }
+    if v > f32(0.5) { v = f32(1.0) - v }
+    sin_half_pi(v + v)
+}
+
+/// cos(2*pi*t) for t in [0, 0.5]. Same accuracy and discipline as
+/// `sin2pi`.
+pub fn cos2pi(t: f32) -> f32 @realtime {
+    var u = f32(1.0) - (t + t + t + t)
+    if u > f32(1.0) { u = f32(1.0) }
+    if u < f32(-1.0) { u = f32(-1.0) }
+    sin_half_pi(u)
 }

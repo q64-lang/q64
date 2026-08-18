@@ -309,8 +309,8 @@ shim work. The validator installs real trampolines (tiny compiled wasm
 shims, as `wclap-host-js` does) and asserts the *audio* moved: measured
 110.0 Hz at default, 220.0 Hz after the event. The parameters are
 shim-defined pending the declared `fit X : AudioPlugin` surface
-(D1/`spec/audio-face.md`); the filter stays fixed until then
-(coefficients need trig the shim shouldn't synthesize).
+(D1/`spec/audio-face.md`) — since superseded for capable guests: see
+the guest-declared-parameters paragraph below.
 
 Note events followed — the voice is playable: note-on sets pitch from a
 wrap-time equal-temperament table (f64[128] in scratch; the shim never
@@ -333,7 +333,21 @@ ratio-walk pitch table (no exp2 anywhere) are all q64 source; its
 check proves independence in audio — silent before the first note,
 release A4 and E5 keeps sounding at its own measured pitch, a 10-note
 cluster on 8 voices mass-releases to silence. Loads in the reference
-host (`--expect-silent` smoke); a MIDI keyboard plays it. Native CLAP
+host (`--expect-silent` smoke); a MIDI keyboard plays it.
+
+Guest-declared parameters completed the routing story: five more
+optional exports (`param_count`/`param_info`/`param_name` — names
+crossing byte-by-byte, deliberately no string ABI — plus
+`set_param`/`get_param`) move the whole parameter table into the
+guest; the shim serves clap.params by calling back into them, forwards
+param events to `set_param`, and gives such guests the short
+`process(st, io, n)` signature. The guest owns clamping and derived
+math — which unlocked the cutoff parameter: RBJ low-pass coefficients
+computed in q64 with the new `q64.audio.sin2pi`/`cos2pi` (endpoint-
+constrained degree-7 polynomials, |err| < ~1e-6, no libm). audio-poly's
+check hears it: brightness 4.5× from 200 Hz to 8 kHz. This IS the
+declared surface, delivered through the flattened convention — the
+`fit X : AudioPlugin` face in sema becomes sugar over it. Native CLAP
 and AU/VST3 remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the

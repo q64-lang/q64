@@ -58,9 +58,12 @@ WCLAP plugin can — `call_indirect` through the size/get trampolines the
 host installed into the plugin's table (the reason the table must be
 growable) — with values snapped at block boundaries and clamped to range.
 `value_to_text`/`text_to_value` return false (the host's default
-formatting is right for plain Hz/ratio values). The filter stays fixed
-(1 kHz Butterworth low-pass) until the declared `AudioPlugin` face lands
-— its coefficients need trig the shim shouldn't synthesize.
+formatting is right for plain Hz/ratio values). This mono example keeps
+the shim-defined table and its fixed 1 kHz filter; a guest can instead
+declare its own parameters — table, clamping, and derived math all in
+q64 code, including a real cutoff — via the optional `param_*` exports
+(`spec/audio-face.md` §interim convention; `examples/audio-poly` is the
+reference user).
 
 ## Notes — the voice is playable
 

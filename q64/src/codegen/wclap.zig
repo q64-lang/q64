@@ -169,6 +169,19 @@ const B = struct {
     fn_prepare: ?[*c]const u8, // prepare(ref st, sr: f64) -> i64
     fn_note_on: ?[*c]const u8, // note_on(ref st, key: i64, vel: f32) -> i64
     fn_note_off: ?[*c]const u8, // note_off(ref st, key: i64) -> i64
+    // Guest-declared parameters (all five or none — checked in wclapWrap).
+    // When present the shim's clap.params serves the guest's table, param
+    // events forward to set_param, and process takes the short signature
+    // (st, io, n) — targets live in guest state, not positional args.
+    fn_param_count: ?[*c]const u8, // param_count() -> i64
+    fn_param_info: ?[*c]const u8, // param_info(i: i64, field: i64) -> f64
+    fn_param_name: ?[*c]const u8, // param_name(i: i64, j: i64) -> i64 (byte)
+    fn_set_param: ?[*c]const u8, // set_param(ref st, id: i64, v: f64) -> i64
+    fn_get_param: ?[*c]const u8, // get_param(ref st, id: i64) -> f64
+
+    fn guestParams(self: B) bool {
+        return self.fn_param_count != null;
+    }
 
     fn ci32(self: B, v: i64) c.BinaryenExpressionRef {
         return c.BinaryenConst(self.m, c.BinaryenLiteralInt32(@intCast(v)));
@@ -224,7 +237,19 @@ pub fn wclapWrap(allocator: std.mem.Allocator, wasm: []const u8, wasm64: bool, m
         .fn_prepare = exportedFn(m, "prepare"),
         .fn_note_on = exportedFn(m, "note_on"),
         .fn_note_off = exportedFn(m, "note_off"),
+        .fn_param_count = exportedFn(m, "param_count"),
+        .fn_param_info = exportedFn(m, "param_info"),
+        .fn_param_name = exportedFn(m, "param_name"),
+        .fn_set_param = exportedFn(m, "set_param"),
+        .fn_get_param = exportedFn(m, "get_param"),
     };
+    // Guest params are all-or-nothing: a partial table would serve a mix
+    // of guest and shim parameters, which no host could make sense of.
+    if (b.fn_param_count != null) {
+        if (b.fn_param_info == null or b.fn_param_name == null or
+            b.fn_set_param == null or b.fn_get_param == null)
+            return Error.MissingExport;
+    }
 
     // ---- globals ------------------------------------------------------
     // clap_entry: the address of the entry struct — what the host reads.
@@ -464,6 +489,17 @@ fn addProcess(b: B) void {
         // the ~7 ms attack/release envelope.
         c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_gate", b.f64t)),
     };
+    // A guest with its own parameter table takes the short signature —
+    // targets live in guest state, not positional args.
+    var pargs3 = [_]c.BinaryenExpressionRef{
+        c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+        b.addr(IO_HDR),
+        c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(FRAMES, b.i32t)),
+    };
+    const process_call = if (b.guestParams())
+        c.BinaryenCall(m, b.fn_process, @ptrCast(&pargs3), pargs3.len, b.i64t)
+    else
+        c.BinaryenCall(m, b.fn_process, @ptrCast(&pargs), pargs.len, b.i64t);
     var evargs = [_]c.BinaryenExpressionRef{b.load32(32, b.get(P, b.i32t))};
     var body = [_]c.BinaryenExpressionRef{
         // param events first — targets snap at the block boundary and the
@@ -482,7 +518,7 @@ fn addProcess(b: B) void {
         b.store32(4, b.addr(IO_HDR), b.get(FRAMES, b.i32t)),
         b.store32(8, b.addr(IO_HDR), b.get(FRAMES, b.i32t)),
         // the q64 voice renders straight into host memory
-        c.BinaryenDrop(m, c.BinaryenCall(m, b.fn_process, @ptrCast(&pargs), pargs.len, b.i64t)),
+        c.BinaryenDrop(m, process_call),
         // stereo: ch1 = ch0 when a second channel exists
         c.BinaryenIf(
             m,
@@ -563,15 +599,27 @@ fn addApplyEvents(b: B) void {
     var get_args = [_]c.BinaryenExpressionRef{ b.get(LIST, b.i32t), b.get(I, b.i32t) };
     var p1 = [_]c.BinaryenType{b.i32t};
     var p2 = [_]c.BinaryenType{ b.i32t, b.i32t };
-    // param-value (type 5): route by param id, clamped.
+    // param-value (type 5): forward to the guest's set_param (it owns
+    // clamping and derived math), or route by id into the shim's
+    // built-in targets, clamped here.
+    var sp_args = [_]c.BinaryenExpressionRef{
+        c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+        c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.load32(16, b.get(EV, b.i32t))),
+        c.BinaryenLoad(m, 8, false, 40, 0, b.f64t, b.get(EV, b.i32t), null),
+    };
     var param_body = [_]c.BinaryenExpressionRef{
-        c.BinaryenLocalSet(m, PID, b.load32(16, b.get(EV, b.i32t))),
-        c.BinaryenIf(
-            m,
-            c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(PID, b.i32t)),
-            clampSet(b, "__wclap_freq", EV, FREQ_MIN, FREQ_MAX),
-            c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenEqInt32(), b.get(PID, b.i32t), b.ci32(1)), clampSet(b, "__wclap_drive", EV, DRIVE_MIN, DRIVE_MAX), null),
-        ),
+        if (b.fn_set_param) |sp|
+            c.BinaryenDrop(m, c.BinaryenCall(m, sp, @ptrCast(&sp_args), sp_args.len, b.i64t))
+        else
+            c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
+                c.BinaryenLocalSet(m, PID, b.load32(16, b.get(EV, b.i32t))),
+                c.BinaryenIf(
+                    m,
+                    c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(PID, b.i32t)),
+                    clampSet(b, "__wclap_freq", EV, FREQ_MIN, FREQ_MAX),
+                    c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenEqInt32(), b.get(PID, b.i32t), b.ci32(1)), clampSet(b, "__wclap_drive", EV, DRIVE_MIN, DRIVE_MAX), null),
+                ),
+            }), 2, b.none),
     };
     // note-on (type 0). Ignore wildcard/out-of-range keys
     // ((key & ~127) != 0). Guests that export note_on handle the note
@@ -659,7 +707,14 @@ fn addApplyEvents(b: B) void {
 /// The `clap.params` extension: count / get_info / get_value /
 /// value_to_text / text_to_value / flush. Text conversion returns false —
 /// the host's default formatting is correct for plain Hz/ratio values.
+/// When the guest declares its own parameters (`param_count` + friends),
+/// count/get_info/get_value serve the guest's table through calls;
+/// otherwise the shim's built-in Frequency/Drive pair.
 fn addParamsFns(b: B) void {
+    if (b.guestParams()) {
+        addGuestParamsFns(b);
+        return;
+    }
     const m = b.m;
     // params.count(plugin*) -> u32
     _ = c.BinaryenAddFunction(m, "__wclap_pr_count", b.i32t, b.i32t, null, 0, b.ci32(2));
@@ -739,8 +794,13 @@ fn addParamsFns(b: B) void {
         _ = c.BinaryenAddFunction(m, "__wclap_pr_get", c.BinaryenTypeCreate(&p3, p3.len), b.i32t, null, 0, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.i32t));
     }
 
-    // params.value_to_text(plugin*, id, value f64, out*, cap) -> false;
-    // params.text_to_value(plugin*, text*, out f64*) -> false.
+    addParamsTextAndFlush(b);
+}
+
+/// The mode-independent tail of clap.params: text conversion (false —
+/// host formats) and flush (the shared event walk).
+fn addParamsTextAndFlush(b: B) void {
+    const m = b.m;
     var v2t = [_]c.BinaryenType{ b.i32t, b.i32t, b.f64t, b.i32t, b.i32t };
     _ = c.BinaryenAddFunction(m, "__wclap_pr_v2t", c.BinaryenTypeCreate(&v2t, v2t.len), b.i32t, null, 0, b.ci32(0));
     var t2v = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
@@ -750,6 +810,86 @@ fn addParamsFns(b: B) void {
     var fargs = [_]c.BinaryenExpressionRef{b.get(1, b.i32t)};
     var p3 = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
     _ = c.BinaryenAddFunction(m, "__wclap_pr_flush", c.BinaryenTypeCreate(&p3, p3.len), b.none, null, 0, c.BinaryenCall(m, "__wclap_apply_events", @ptrCast(&fargs), fargs.len, b.none));
+}
+
+/// clap.params served from the guest's own table: every answer is a call
+/// through the guest's param_* exports — the shim holds no parameter
+/// knowledge at all.
+fn addGuestParamsFns(b: B) void {
+    const m = b.m;
+    const pc = b.fn_param_count.?;
+    const pi = b.fn_param_info.?;
+    const pn = b.fn_param_name.?;
+    const pg = b.fn_get_param.?;
+
+    // params.count(plugin*) -> u32
+    _ = c.BinaryenAddFunction(m, "__wclap_pr_count", b.i32t, b.i32t, null, 0, c.BinaryenUnary(m, c.BinaryenWrapInt64(), c.BinaryenCall(m, pc, null, 0, b.i64t)));
+
+    // params.get_info(plugin*, index, info*) -> bool.
+    {
+        const INDEX = 1;
+        const INFO = 2;
+        const J = 3; // local: name byte cursor
+        const CH = 4; // local: current name byte
+        const field = struct {
+            fn f(bb: B, fnname: [*c]const u8, idx_local: u32, k: i64) c.BinaryenExpressionRef {
+                const mm = bb.m;
+                var args = [_]c.BinaryenExpressionRef{
+                    c.BinaryenUnary(mm, c.BinaryenExtendUInt32(), bb.get(idx_local, bb.i32t)),
+                    c.BinaryenConst(mm, c.BinaryenLiteralInt64(k)),
+                };
+                return c.BinaryenCall(mm, fnname, @ptrCast(&args), args.len, bb.f64t);
+            }
+        }.f;
+        // name-copy loop: ch = param_name(index, j); store; stop at NUL
+        // or 255 bytes (the info name field is char[256]).
+        var name_args = [_]c.BinaryenExpressionRef{
+            c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(INDEX, b.i32t)),
+            c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(J, b.i32t)),
+        };
+        var loop_body = [_]c.BinaryenExpressionRef{
+            c.BinaryenLocalSet(m, CH, c.BinaryenUnary(m, c.BinaryenWrapInt64(), c.BinaryenCall(m, pn, @ptrCast(&name_args), name_args.len, b.i64t))),
+            c.BinaryenStore(m, 1, 12, 0, c.BinaryenBinary(m, c.BinaryenAddInt32(), b.get(INFO, b.i32t), b.get(J, b.i32t)), b.get(CH, b.i32t), b.i32t, null),
+            c.BinaryenIf(m, c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(CH, b.i32t)), c.BinaryenBreak(m, "pnd", null, null), null),
+            c.BinaryenLocalSet(m, J, c.BinaryenBinary(m, c.BinaryenAddInt32(), b.get(J, b.i32t), b.ci32(1))),
+            c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenLtUInt32(), b.get(J, b.i32t), b.ci32(255)), c.BinaryenBreak(m, "pcp", null, null), null),
+        };
+        const name_loop = c.BinaryenBlock(m, "pnd", @constCast(&[_]c.BinaryenExpressionRef{
+            c.BinaryenLoop(m, "pcp", c.BinaryenBlock(m, null, @ptrCast(&loop_body), loop_body.len, b.none)),
+        }), 1, b.none);
+        var body = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenGeUInt32(), b.get(INDEX, b.i32t), c.BinaryenUnary(m, c.BinaryenWrapInt64(), c.BinaryenCall(m, pc, null, 0, b.i64t))), c.BinaryenReturn(m, b.ci32(0)), null),
+            b.store32(0, b.get(INFO, b.i32t), c.BinaryenUnary(m, c.BinaryenTruncSatSFloat64ToInt32(), field(b, pi, INDEX, 0))), // id
+            b.store32(4, b.get(INFO, b.i32t), c.BinaryenUnary(m, c.BinaryenTruncSatSFloat64ToInt32(), field(b, pi, INDEX, 4))), // flags
+            b.store32(8, b.get(INFO, b.i32t), b.ci32(0)), // cookie
+            c.BinaryenStore(m, 1, 268, 0, b.get(INFO, b.i32t), b.ci32(0), b.i32t, null), // module = ""
+            c.BinaryenStore(m, 8, 1296, 0, b.get(INFO, b.i32t), field(b, pi, INDEX, 1), b.f64t, null), // min
+            c.BinaryenStore(m, 8, 1304, 0, b.get(INFO, b.i32t), field(b, pi, INDEX, 2), b.f64t, null), // max
+            c.BinaryenStore(m, 8, 1312, 0, b.get(INFO, b.i32t), field(b, pi, INDEX, 3), b.f64t, null), // default
+            name_loop,
+            b.ci32(1),
+        };
+        var p3t = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+        var vt = [_]c.BinaryenType{ b.i32t, b.i32t };
+        _ = c.BinaryenAddFunction(m, "__wclap_pr_info", c.BinaryenTypeCreate(&p3t, p3t.len), b.i32t, @ptrCast(&vt), vt.len, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.i32t));
+    }
+
+    // params.get_value(plugin*, id, out f64*) -> bool
+    {
+        var gargs = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+            c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(1, b.i32t)),
+        };
+        var body = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenGeUInt32(), b.get(1, b.i32t), c.BinaryenUnary(m, c.BinaryenWrapInt64(), c.BinaryenCall(m, pc, null, 0, b.i64t))), c.BinaryenReturn(m, b.ci32(0)), null),
+            c.BinaryenStore(m, 8, 0, 0, b.get(2, b.i32t), c.BinaryenCall(m, pg, @ptrCast(&gargs), gargs.len, b.f64t), b.f64t, null),
+            b.ci32(1),
+        };
+        var p3t = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+        _ = c.BinaryenAddFunction(m, "__wclap_pr_get", c.BinaryenTypeCreate(&p3t, p3t.len), b.i32t, null, 0, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.i32t));
+    }
+
+    addParamsTextAndFlush(b);
 }
 
 const DescStrings = struct {

@@ -118,8 +118,8 @@ stability is what keeps the per-block path `@realtime`-typed.
   automation (CLAP carries a `time` field; see the event header
   below) is deferred — the field is already in the layout, so
   adopting it later changes no wire bytes.
-- Out-of-range values clamp at the boundary, before the guest sees
-  them.
+- Out-of-range values clamp before they reach the DSP — by the shim
+  for shim-owned tables, by `set_param` for guest-declared ones.
 - A parameter **declaration** is setup-time data: `{id, name, min,
   max, default, flags}`. It is read once, never on the audio path.
 
@@ -273,6 +273,26 @@ polyphony, voice stealing, and envelopes are guest code, and the
 target's mono fallback (pitch table + gate) is not emitted. The
 resolution happens at wrap time from the export table, so absent
 extensions cost nothing. `examples/audio-poly` is the reference user.
+
+Five more optional exports move the **parameter table** into the guest
+(all five or none — a partial table is a wrap error):
+
+```
+param_count() -> i64
+param_info(i: i64, field: i64) -> f64     // 0=id 1=min 2=max 3=default 4=flags
+param_name(i: i64, j: i64) -> i64         // byte j of name i; 0 terminates
+set_param(ref st, id: i64, v: f64) -> i64 // @realtime; guest clamps + derives
+get_param(ref st, id: i64) -> f64
+```
+
+When present, the target's parameter extension serves the guest's table
+(names copied byte-by-byte — deliberately scalar-only, no string ABI
+crosses the boundary), parameter events forward to `set_param`, the
+guest owns clamping and derived math (a cutoff parameter computes its
+filter coefficients in-guest with `q64.audio.sin2pi`/`cos2pi`), and
+`process` takes the **short signature** —
+`process(ref st, out io, n) -> i64` — because targets live in guest
+state, not positional arguments.
 
 The convention is a strict subset of the face (state = the `self`
 struct, positional params = the declared table, the optional exports =

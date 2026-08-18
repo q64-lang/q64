@@ -41,10 +41,52 @@ const P = {
 };
 if (P.init(plugin) !== 1) throw new Error("plugin.init failed");
 if (P.getExt(plugin, putStr("clap.audio-ports")) === 0) throw new Error("no clap.audio-ports");
-if (P.getExt(plugin, putStr("clap.params")) === 0) throw new Error("no clap.params");
+const paramsExt = P.getExt(plugin, putStr("clap.params"));
+if (paramsExt === 0) throw new Error("no clap.params");
 const FRAMES = 128, SR = 48000;
 if (P.activate(plugin, SR, 32, FRAMES) !== 1) throw new Error("activate failed");
 if (P.start(plugin) !== 1) throw new Error("start failed");
+
+// ---- the GUEST-declared parameter table -------------------------------
+// The shim holds no parameter knowledge here — every answer below is the
+// shim calling back into the guest's param_* exports.
+const cstr = (a) => {
+  const b = new Uint8Array(ex.memory.buffer);
+  let e = a;
+  while (b[e] !== 0) e++;
+  return new TextDecoder().decode(b.subarray(a, e));
+};
+const PR = {
+  count: fn(u32(paramsExt)), info: fn(u32(paramsExt + 4)),
+  get: fn(u32(paramsExt + 8)),
+};
+if (PR.count(plugin) !== 2) throw new Error(`param count ${PR.count(plugin)}, expected 2`);
+const pinfo = ex.malloc(1320);
+const readInfo = (i) => {
+  if (PR.info(plugin, i, pinfo) !== 1) throw new Error(`get_info(${i}) failed`);
+  return {
+    id: u32(pinfo), flags: u32(pinfo + 4), name: cstr(pinfo + 12),
+    min: mem().getFloat64(pinfo + 1296, true), max: mem().getFloat64(pinfo + 1304, true),
+    def: mem().getFloat64(pinfo + 1312, true),
+  };
+};
+const cut = readInfo(0), drv = readInfo(1);
+for (const [p, want] of [[cut, { id: 0, name: "Cutoff", min: 100, max: 8000, def: 1000 }], [drv, { id: 1, name: "Drive", min: 1, max: 4, def: 1.8 }]]) {
+  for (const [k, v] of Object.entries(want)) {
+    if (p[k] !== v) throw new Error(`param "${p.name}": ${k}=${p[k]}, expected ${v}`);
+  }
+  if (!(p.flags & (1 << 5))) throw new Error(`param "${p.name}" not automatable`);
+}
+if (PR.info(plugin, 2, pinfo) !== 0) throw new Error("get_info(2) should fail");
+const pval = ex.malloc(8);
+const getValue = (id) => {
+  if (PR.get(plugin, id, pval) !== 1) throw new Error(`get_value(${id}) failed`);
+  return mem().getFloat64(pval, true);
+};
+if (getValue(0) !== 1000) throw new Error(`cutoff default ${getValue(0)}, expected 1000`);
+if (Math.abs(getValue(1) - 1.8) > 1e-6) throw new Error(`drive default ${getValue(1)}, expected 1.8`);
+if (PR.get(plugin, 5, pval) !== 0) throw new Error("get_value(5) should fail");
+console.log(`ok: guest params — [${cut.name} ${cut.min}..${cut.max} def ${cut.def}] [${drv.name} ${drv.min}..${drv.max} def ${drv.def.toFixed(1)}]`);
 
 // ---- host event trampolines + clap_process ---------------------------
 const trampoline = (js, nArgs) => {
@@ -157,5 +199,39 @@ runBlocks(80);
 const tail = rms(runBlocks(10));
 if (tail > 1e-3) throw new Error(`voice stuck after mass release (rms ${tail})`);
 console.log("ok: 10 notes on 8 voices, mass release -> silence (stealing works)");
+
+// ---- the cutoff parameter must change the SOUND ----------------------
+// Param events route through the guest's set_param, which computes RBJ
+// low-pass coefficients in q64 (sin2pi/cos2pi). Brightness = RMS of the
+// first difference over RMS — a high cutoff keeps the saw's edges, a low
+// one rounds them off.
+const paramEvent = (id, value) => {
+  const ev = ex.malloc(48); // clap_event_param_value
+  mem().setUint32(ev + 0, 48, true);
+  mem().setUint16(ev + 10, 5, true);
+  mem().setUint32(ev + 16, id, true);
+  mem().setFloat64(ev + 40, value, true);
+  return ev;
+};
+const brightness = (s) => {
+  let d = 0, t = 0;
+  for (let i = 1; i < s.length; i++) { d += (s[i] - s[i - 1]) ** 2; t += s[i] * s[i]; }
+  return Math.sqrt(d / t);
+};
+pendingEvents = [noteEvent(0, 57, 1.0), paramEvent(0, 8000)];
+runBlocks(60);
+if (getValue(0) !== 8000) throw new Error(`cutoff after event ${getValue(0)}, expected 8000`);
+const bright = brightness(runBlocks(40));
+pendingEvents = [paramEvent(0, 200)];
+runBlocks(60);
+if (getValue(0) !== 200) throw new Error(`cutoff after event ${getValue(0)}, expected 200`);
+const dark = brightness(runBlocks(40));
+if (bright / dark < 2) throw new Error(`cutoff sweep changed brightness only ${(bright / dark).toFixed(2)}x (want > 2x)`);
+pendingEvents = [paramEvent(0, 99999)];
+runBlocks(2);
+if (getValue(0) !== 8000) throw new Error(`out-of-range cutoff ${getValue(0)}, expected guest clamp to 8000`);
+pendingEvents = [noteEvent(1, 57, 0.0)];
+runBlocks(60);
+console.log(`ok: cutoff is audible — brightness ${dark.toFixed(3)} @200 Hz -> ${bright.toFixed(3)} @8 kHz (${(bright / dark).toFixed(1)}x), guest clamps out-of-range`);
 
 console.log("poly-check: PASS");
