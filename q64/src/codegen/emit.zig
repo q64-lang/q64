@@ -5770,9 +5770,11 @@ fn emitStrContains(module: c.BinaryenModuleRef, allocator: std.mem.Allocator, i3
 
 const testing = std.testing;
 
-// Pull the component encoder's embedded tests into the codegen test target.
+// Pull the component encoder's and wclap wrapper's embedded tests into
+// the codegen test target.
 test {
     _ = component;
+    _ = wclap;
 }
 
 test "emitHelloWasm: produces a non-empty Wasm module starting with the magic" {

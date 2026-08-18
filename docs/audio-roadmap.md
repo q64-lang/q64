@@ -282,10 +282,22 @@ synthesized shims; the process trampoline builds a `Vec<f32>` header over
 the host's channel-0 buffer (the `v.head` re-entry model, zero-copy) and
 mirrors channel 1. Validated by `check.mjs`, an honest minimal host per
 the rule below: 400 blocks, energy matches the worklet reference
-(~84.7/block), state persists, table grows. v0 fixes the voice parameters
-in the trampoline — `clap.params` is the next slice, and the declared
-`fit X : AudioPlugin` surface stays open in D1/`spec/audio-face.md`.
-Native CLAP and AU/VST3 remain.)*
+(~84.7/block), state persists, table grows.
+
+`clap.params` followed: two automatable parameters (Frequency 20–2000 Hz,
+Drive 1–4) served by the full six-function extension, param-value events
+read from `in_events` by `call_indirect` through the host-installed
+size/get trampolines — the first host→plugin callback path, and the
+concrete reason the growable table exists — values block-snapped (the
+recorded deferral) and clamped, applied via `process` and `flush` alike;
+the guest's in-state one-pole smoothing de-zippers automation with no
+shim work. The validator installs real trampolines (tiny compiled wasm
+shims, as `wclap-host-js` does) and asserts the *audio* moved: measured
+110.0 Hz at default, 220.0 Hz after the event. The parameters are
+shim-defined pending the declared `fit X : AudioPlugin` surface
+(D1/`spec/audio-face.md`); the filter stays fixed until then
+(coefficients need trig the shim shouldn't synthesize). Native CLAP and
+AU/VST3 remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the
 reference browser host, and processes audio inside budget; `q64 show

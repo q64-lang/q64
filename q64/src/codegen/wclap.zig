@@ -16,9 +16,20 @@
 //! vec at plugin.init, and at process() builds a vec *header* over the
 //! host's channel-0 buffer so the q64 code writes the host memory
 //! directly — zero copy, the `v.head` re-entry model. Channel 1 is a
-//! memcpy of channel 0 (mono voice, stereo out). Parameters are fixed in
-//! v0 (`clap.params` is the next slice); the sample rate arrives from
-//! `activate` and drives the oscillator increment.
+//! memcpy of channel 0 (mono voice, stereo out). The sample rate arrives
+//! from `activate` and drives the oscillator increment.
+//!
+//! `clap.params` exposes two automatable parameters — Frequency
+//! (20–2000 Hz, default 110) and Drive (1–4, default 1.8) — chosen
+//! because both reach the guest surface with pure arithmetic (inc =
+//! 2·f/sr; drive passes through), and the guest already one-pole-smooths
+//! every target in-state, so abrupt host automation lands click-free.
+//! Param-value events are read from `in_events` the only way a WCLAP
+//! plugin can: `call_indirect` through the host-installed size/get
+//! trampolines, snapping values at block boundaries (sample-offset
+//! accuracy is a recorded deferral). The filter stays fixed until the
+//! declared plugin surface lands (coefficients need trig the shim
+//! shouldn't synthesize).
 //!
 //! Layout: shim structs + strings live in a scratch block at SCRATCH
 //! (896 KiB — between the scope arena, which grows up from the static
@@ -67,7 +78,8 @@ const PLUGIN: u32 = 96; // clap_plugin: desc + data + 10 fn ptrs = 48
 const AUDIO_PORTS: u32 = 144; // clap_plugin_audio_ports: 2 fn ptrs = 8
 const FEATURES: u32 = 160; // const char*[3]: two features + null
 const IO_HDR: u32 = 176; // scratch Vec<f32> header {data, len, cap}
-const STRINGS: u32 = 200;
+const PARAMS_EXT: u32 = 200; // clap_plugin_params: 6 fn ptrs = 24
+const STRINGS: u32 = 224;
 
 // ---- table indices (order of `shim_funcs` below) ----------------------
 // Base 1: a host that null-checks a CLAP fn pointer must not see index 0.
@@ -91,7 +103,13 @@ const IDX_P_GET_EXT = TBL_BASE + 14;
 const IDX_P_ON_MAIN = TBL_BASE + 15;
 const IDX_PORTS_COUNT = TBL_BASE + 16;
 const IDX_PORTS_GET = TBL_BASE + 17;
-const N_SHIM_FUNCS = 18;
+const IDX_PR_COUNT = TBL_BASE + 18;
+const IDX_PR_INFO = TBL_BASE + 19;
+const IDX_PR_GET = TBL_BASE + 20;
+const IDX_PR_V2T = TBL_BASE + 21;
+const IDX_PR_T2V = TBL_BASE + 22;
+const IDX_PR_FLUSH = TBL_BASE + 23;
+const N_SHIM_FUNCS = 24;
 
 const shim_funcs = [N_SHIM_FUNCS][*:0]const u8{
     "__wclap_entry_init",   "__wclap_entry_deinit", "__wclap_get_factory",
@@ -100,7 +118,20 @@ const shim_funcs = [N_SHIM_FUNCS][*:0]const u8{
     "__wclap_p_deactivate", "__wclap_p_start",      "__wclap_p_stop",
     "__wclap_p_reset",      "__wclap_p_process",    "__wclap_p_get_ext",
     "__wclap_p_on_main",    "__wclap_ports_count",  "__wclap_ports_get",
+    "__wclap_pr_count",     "__wclap_pr_info",      "__wclap_pr_get",
+    "__wclap_pr_v2t",       "__wclap_pr_t2v",       "__wclap_pr_flush",
 };
+
+// ---- the two v1 parameters --------------------------------------------
+
+const PARAM_FREQ: u32 = 0; // Hz
+const PARAM_DRIVE: u32 = 1;
+const FREQ_MIN: f64 = 20.0;
+const FREQ_MAX: f64 = 2000.0;
+const FREQ_DEFAULT: f64 = 110.0;
+const DRIVE_MIN: f64 = 1.0;
+const DRIVE_MAX: f64 = 4.0;
+const DRIVE_DEFAULT: f64 = 1.8;
 
 /// Builder context: the module, the couple of types every shim function
 /// needs, and the resolved *internal* names of the guest exports (a
@@ -177,6 +208,9 @@ pub fn wclapWrap(allocator: std.mem.Allocator, wasm: []const u8, wasm64: bool, m
     _ = c.BinaryenAddGlobal(m, "__wclap_st", b.i32t, true, b.ci32(0));
     _ = c.BinaryenAddGlobal(m, "__wclap_sr", b.f64t, true, c.BinaryenConst(m, c.BinaryenLiteralFloat64(48000.0)));
     _ = c.BinaryenAddGlobal(m, "__wclap_hp", b.i32t, true, b.ci32(HOST_HEAP));
+    // The current parameter targets (the guest smooths them in-state).
+    _ = c.BinaryenAddGlobal(m, "__wclap_freq", b.f64t, true, c.BinaryenConst(m, c.BinaryenLiteralFloat64(FREQ_DEFAULT)));
+    _ = c.BinaryenAddGlobal(m, "__wclap_drive", b.f64t, true, c.BinaryenConst(m, c.BinaryenLiteralFloat64(DRIVE_DEFAULT)));
 
     // ---- malloc / free ------------------------------------------------
     // The host allocates id strings, event lists, and the clap_process
@@ -197,13 +231,16 @@ pub fn wclapWrap(allocator: std.mem.Allocator, wasm: []const u8, wasm64: bool, m
     const str_synth = try strings.intern(allocator, "synthesizer");
     const str_factory_id = try strings.intern(allocator, "clap.plugin-factory");
     const str_ports_id = try strings.intern(allocator, "clap.audio-ports");
+    const str_params_id = try strings.intern(allocator, "clap.params");
     const str_stereo = try strings.intern(allocator, "stereo");
 
     addStreq(b);
     addEntryFns(b, str_factory_id);
     addFactoryFns(b);
-    addPluginFns(b, str_ports_id);
+    addPluginFns(b, str_ports_id, str_params_id);
     addPortsFns(b, str_stereo);
+    addApplyEvents(b);
+    addParamsFns(b);
 
     // ---- the data-init function --------------------------------------
     // Writes every struct field and string into the scratch block; chained
@@ -316,7 +353,7 @@ fn addFactoryFns(b: B) void {
     _ = c.BinaryenAddFunction(m, "__wclap_create", c.BinaryenTypeCreate(&p3, p3.len), b.i32t, null, 0, b.addr(PLUGIN));
 }
 
-fn addPluginFns(b: B, ports_id: u32) void {
+fn addPluginFns(b: B, ports_id: u32, params_id: u32) void {
     const m = b.m;
     // plugin.init(plugin*) -> bool: allocate the 16-slot state vec through
     // the guest's own export and remember its header address.
@@ -343,7 +380,9 @@ fn addPluginFns(b: B, ports_id: u32) void {
     var p2 = [_]c.BinaryenType{ b.i32t, b.i32t };
     var eargs = [_]c.BinaryenExpressionRef{ b.get(1, b.i32t), b.ci32(ports_id) };
     const is_ports = c.BinaryenCall(m, "__wclap_streq", @ptrCast(&eargs), eargs.len, b.i32t);
-    _ = c.BinaryenAddFunction(m, "__wclap_p_get_ext", c.BinaryenTypeCreate(&p2, p2.len), b.i32t, null, 0, c.BinaryenSelect(m, is_ports, b.addr(AUDIO_PORTS), b.ci32(0)));
+    var pargs2 = [_]c.BinaryenExpressionRef{ b.get(1, b.i32t), b.ci32(params_id) };
+    const is_params = c.BinaryenCall(m, "__wclap_streq", @ptrCast(&pargs2), pargs2.len, b.i32t);
+    _ = c.BinaryenAddFunction(m, "__wclap_p_get_ext", c.BinaryenTypeCreate(&p2, p2.len), b.i32t, null, 0, c.BinaryenSelect(m, is_ports, b.addr(AUDIO_PORTS), c.BinaryenSelect(m, is_params, b.addr(PARAMS_EXT), b.ci32(0))));
 
     addProcess(b);
 }
@@ -358,15 +397,15 @@ fn addProcess(b: B) void {
     const P = 1; // param 1: clap_process*
     // locals: 2=frames(i32) 3=outs(buffer*) 4=data32 5=ch0
     const FRAMES = 2;
-    // inc = f32(220 / sr) — the fixed 110 Hz voice until clap.params
-    // (the saw increment convention is 2*f/sr).
-    const inc = c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenBinary(m, c.BinaryenDivFloat64(), c.BinaryenConst(m, c.BinaryenLiteralFloat64(220.0)), c.BinaryenGlobalGet(m, "__wclap_sr", b.f64t)));
+    // inc = f32(2·freq / sr) — the saw increment convention.
+    const inc = c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenBinary(m, c.BinaryenDivFloat64(), c.BinaryenBinary(m, c.BinaryenMulFloat64(), c.BinaryenConst(m, c.BinaryenLiteralFloat64(2.0)), c.BinaryenGlobalGet(m, "__wclap_freq", b.f64t)), c.BinaryenGlobalGet(m, "__wclap_sr", b.f64t)));
     const cf = struct {
         fn k(bb: B, v: f64) c.BinaryenExpressionRef {
             return c.BinaryenConst(bb.m, c.BinaryenLiteralFloat32(@floatCast(v)));
         }
     }.k;
-    // 1 kHz Butterworth low-pass @48k — fixed voice tone until clap.params.
+    // 1 kHz Butterworth low-pass @48k — the filter stays fixed until the
+    // declared plugin surface lands (coefficients need trig).
     var pargs = [_]c.BinaryenExpressionRef{
         c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
         b.addr(IO_HDR),
@@ -374,9 +413,13 @@ fn addProcess(b: B) void {
         inc,
         cf(b, 0.000944692), cf(b, 0.001889384), cf(b, 0.000944692),
         cf(b, -1.911196288), cf(b, 0.914975055),
-        cf(b, 1.8),
+        c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_drive", b.f64t)),
     };
+    var evargs = [_]c.BinaryenExpressionRef{b.load32(32, b.get(P, b.i32t))};
     var body = [_]c.BinaryenExpressionRef{
+        // param events first — targets snap at the block boundary and the
+        // guest's one-pole smoothing de-zippers them.
+        c.BinaryenCall(m, "__wclap_apply_events", @ptrCast(&evargs), evargs.len, b.none),
         // frames = proc.frames_count
         c.BinaryenLocalSet(m, FRAMES, b.load32(8, b.get(P, b.i32t))),
         // if (out_count == 0) return CONTINUE (nothing to fill)
@@ -433,6 +476,172 @@ fn addPortsFns(b: B, stereo: u32) void {
     _ = c.BinaryenAddFunction(m, "__wclap_ports_get", c.BinaryenTypeCreate(&p4, p4.len), b.i32t, null, 0, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.i32t));
 }
 
+/// `__wclap_apply_events(in_events*)` — walk a host `clap_input_events`
+/// list and update the parameter targets. The list's size/get members are
+/// *host* callbacks the host installed into our table (that's why the
+/// table must be growable), so the only way to reach them is
+/// `call_indirect` — the one place the shim calls back out.
+/// clap_input_events (wasm32): ctx @0, size @4, get @8.
+/// clap_event_header: size @0, time @4, space_id u16 @8, type u16 @10,
+/// flags @12. clap_event_param_value: header(16) + param_id @16,
+/// cookie @20, note_id @24, port_index @28, channel @30, key @32,
+/// value f64 @40 (8-aligned).
+fn addApplyEvents(b: B) void {
+    const m = b.m;
+    const LIST = 0; // param
+    const N = 1;
+    const I = 2;
+    const EV = 3;
+    const PID = 4;
+    const clampSet = struct {
+        fn f(bb: B, global: [*:0]const u8, ev_local: u32, lo: f64, hi: f64) c.BinaryenExpressionRef {
+            const mm = bb.m;
+            const v = c.BinaryenLoad(mm, 8, false, 40, 0, bb.f64t, bb.get(ev_local, bb.i32t), null);
+            const clamped = c.BinaryenBinary(mm, c.BinaryenMaxFloat64(), c.BinaryenBinary(mm, c.BinaryenMinFloat64(), v, c.BinaryenConst(mm, c.BinaryenLiteralFloat64(hi))), c.BinaryenConst(mm, c.BinaryenLiteralFloat64(lo)));
+            return c.BinaryenGlobalSet(mm, global, clamped);
+        }
+    }.f;
+    var size_args = [_]c.BinaryenExpressionRef{b.get(LIST, b.i32t)};
+    var get_args = [_]c.BinaryenExpressionRef{ b.get(LIST, b.i32t), b.get(I, b.i32t) };
+    var p1 = [_]c.BinaryenType{b.i32t};
+    var p2 = [_]c.BinaryenType{ b.i32t, b.i32t };
+    const is_param_value = c.BinaryenBinary(
+        m,
+        c.BinaryenAndInt32(),
+        c.BinaryenUnary(m, c.BinaryenEqZInt32(), c.BinaryenLoad(m, 2, false, 8, 0, b.i32t, b.get(EV, b.i32t), null)), // CLAP_CORE_EVENT_SPACE_ID
+        c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 2, false, 10, 0, b.i32t, b.get(EV, b.i32t), null), b.ci32(5)), // CLAP_EVENT_PARAM_VALUE
+    );
+    var iter_body = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(m, EV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(8, b.get(LIST, b.i32t)), @ptrCast(&get_args), get_args.len, c.BinaryenTypeCreate(&p2, p2.len), b.i32t)),
+        c.BinaryenIf(
+            m,
+            c.BinaryenBinary(m, c.BinaryenAndInt32(), c.BinaryenBinary(m, c.BinaryenNeInt32(), b.get(EV, b.i32t), b.ci32(0)), is_param_value),
+            c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
+                c.BinaryenLocalSet(m, PID, b.load32(16, b.get(EV, b.i32t))),
+                c.BinaryenIf(
+                    m,
+                    c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(PID, b.i32t)),
+                    clampSet(b, "__wclap_freq", EV, FREQ_MIN, FREQ_MAX),
+                    c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenEqInt32(), b.get(PID, b.i32t), b.ci32(1)), clampSet(b, "__wclap_drive", EV, DRIVE_MIN, DRIVE_MAX), null),
+                ),
+            }), 2, b.none),
+            null,
+        ),
+        c.BinaryenLocalSet(m, I, c.BinaryenBinary(m, c.BinaryenAddInt32(), b.get(I, b.i32t), b.ci32(1))),
+        c.BinaryenBreak(m, "ev", null, null),
+    };
+    const loop = c.BinaryenLoop(m, "ev", c.BinaryenIf(
+        m,
+        c.BinaryenBinary(m, c.BinaryenLtUInt32(), b.get(I, b.i32t), b.get(N, b.i32t)),
+        c.BinaryenBlock(m, null, @ptrCast(&iter_body), iter_body.len, b.none),
+        null,
+    ));
+    var body = [_]c.BinaryenExpressionRef{
+        c.BinaryenIf(m, c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(LIST, b.i32t)), c.BinaryenReturn(m, null), null),
+        c.BinaryenLocalSet(m, N, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(4, b.get(LIST, b.i32t)), @ptrCast(&size_args), size_args.len, c.BinaryenTypeCreate(&p1, p1.len), b.i32t)),
+        c.BinaryenLocalSet(m, I, b.ci32(0)),
+        loop,
+    };
+    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t, b.i32t };
+    _ = c.BinaryenAddFunction(m, "__wclap_apply_events", b.i32t, b.none, @ptrCast(&vt), vt.len, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.none));
+}
+
+/// The `clap.params` extension: count / get_info / get_value /
+/// value_to_text / text_to_value / flush. Text conversion returns false —
+/// the host's default formatting is correct for plain Hz/ratio values.
+fn addParamsFns(b: B) void {
+    const m = b.m;
+    // params.count(plugin*) -> u32
+    _ = c.BinaryenAddFunction(m, "__wclap_pr_count", b.i32t, b.i32t, null, 0, b.ci32(2));
+
+    // params.get_info(plugin*, index, info*) -> bool.
+    // clap_param_info (wasm32): id @0, flags @4, cookie @8, name[256] @12,
+    // module[1024] @268, then 4 pad bytes to 8-align: min @1296,
+    // max @1304, default @1312 — 1320 bytes.
+    {
+        const INFO = 2; // param
+        const putName = struct {
+            fn f(bb: B, info_local: u32, comptime s: []const u8) c.BinaryenExpressionRef {
+                const mm = bb.m;
+                var stores: [s.len + 1]c.BinaryenExpressionRef = undefined;
+                inline for (s, 0..) |ch, i| {
+                    stores[i] = c.BinaryenStore(mm, 1, 12 + i, 0, bb.get(info_local, bb.i32t), bb.ci32(ch), bb.i32t, null);
+                }
+                stores[s.len] = c.BinaryenStore(mm, 1, 12 + s.len, 0, bb.get(info_local, bb.i32t), bb.ci32(0), bb.i32t, null);
+                return c.BinaryenBlock(mm, null, @ptrCast(&stores), stores.len, bb.none);
+            }
+        }.f;
+        const putF64 = struct {
+            fn f(bb: B, info_local: u32, off: u32, v: f64) c.BinaryenExpressionRef {
+                return c.BinaryenStore(bb.m, 8, off, 0, bb.get(info_local, bb.i32t), c.BinaryenConst(bb.m, c.BinaryenLiteralFloat64(v)), bb.f64t, null);
+            }
+        }.f;
+        var freq_body = [_]c.BinaryenExpressionRef{
+            b.store32(0, b.get(INFO, b.i32t), b.ci32(PARAM_FREQ)),
+            putName(b, INFO, "Frequency"),
+            putF64(b, INFO, 1296, FREQ_MIN),
+            putF64(b, INFO, 1304, FREQ_MAX),
+            putF64(b, INFO, 1312, FREQ_DEFAULT),
+        };
+        var drive_body = [_]c.BinaryenExpressionRef{
+            b.store32(0, b.get(INFO, b.i32t), b.ci32(PARAM_DRIVE)),
+            putName(b, INFO, "Drive"),
+            putF64(b, INFO, 1296, DRIVE_MIN),
+            putF64(b, INFO, 1304, DRIVE_MAX),
+            putF64(b, INFO, 1312, DRIVE_DEFAULT),
+        };
+        var body = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenGeUInt32(), b.get(1, b.i32t), b.ci32(2)), c.BinaryenReturn(m, b.ci32(0)), null),
+            b.store32(4, b.get(INFO, b.i32t), b.ci32(1 << 5)), // CLAP_PARAM_IS_AUTOMATABLE
+            b.store32(8, b.get(INFO, b.i32t), b.ci32(0)), // cookie
+            c.BinaryenStore(m, 1, 268, 0, b.get(INFO, b.i32t), b.ci32(0), b.i32t, null), // module = ""
+            c.BinaryenIf(
+                m,
+                c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(1, b.i32t)),
+                c.BinaryenBlock(m, null, @ptrCast(&freq_body), freq_body.len, b.none),
+                c.BinaryenBlock(m, null, @ptrCast(&drive_body), drive_body.len, b.none),
+            ),
+            b.ci32(1),
+        };
+        var p3 = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+        _ = c.BinaryenAddFunction(m, "__wclap_pr_info", c.BinaryenTypeCreate(&p3, p3.len), b.i32t, null, 0, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.i32t));
+    }
+
+    // params.get_value(plugin*, id, out f64*) -> bool
+    {
+        const OUT = 2;
+        const putGlobal = struct {
+            fn f(bb: B, out_local: u32, global: [*:0]const u8) c.BinaryenExpressionRef {
+                const mm = bb.m;
+                var stmts = [_]c.BinaryenExpressionRef{
+                    c.BinaryenStore(mm, 8, 0, 0, bb.get(out_local, bb.i32t), c.BinaryenGlobalGet(mm, global, bb.f64t), bb.f64t, null),
+                    c.BinaryenReturn(mm, bb.ci32(1)),
+                };
+                return c.BinaryenBlock(mm, null, @ptrCast(&stmts), stmts.len, bb.none);
+            }
+        }.f;
+        var body = [_]c.BinaryenExpressionRef{
+            c.BinaryenIf(m, c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(1, b.i32t)), putGlobal(b, OUT, "__wclap_freq"), null),
+            c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenEqInt32(), b.get(1, b.i32t), b.ci32(1)), putGlobal(b, OUT, "__wclap_drive"), null),
+            b.ci32(0),
+        };
+        var p3 = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+        _ = c.BinaryenAddFunction(m, "__wclap_pr_get", c.BinaryenTypeCreate(&p3, p3.len), b.i32t, null, 0, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.i32t));
+    }
+
+    // params.value_to_text(plugin*, id, value f64, out*, cap) -> false;
+    // params.text_to_value(plugin*, text*, out f64*) -> false.
+    var v2t = [_]c.BinaryenType{ b.i32t, b.i32t, b.f64t, b.i32t, b.i32t };
+    _ = c.BinaryenAddFunction(m, "__wclap_pr_v2t", c.BinaryenTypeCreate(&v2t, v2t.len), b.i32t, null, 0, b.ci32(0));
+    var t2v = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+    _ = c.BinaryenAddFunction(m, "__wclap_pr_t2v", c.BinaryenTypeCreate(&t2v, t2v.len), b.i32t, null, 0, b.ci32(0));
+
+    // params.flush(plugin*, in*, out*) -> void: same event walk as process.
+    var fargs = [_]c.BinaryenExpressionRef{b.get(1, b.i32t)};
+    var p3 = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+    _ = c.BinaryenAddFunction(m, "__wclap_pr_flush", c.BinaryenTypeCreate(&p3, p3.len), b.none, null, 0, c.BinaryenCall(m, "__wclap_apply_events", @ptrCast(&fargs), fargs.len, b.none));
+}
+
 const DescStrings = struct {
     id: u32,
     name: u32,
@@ -478,6 +687,11 @@ fn addDataInit(allocator: std.mem.Allocator, b: B, strings: *StringTable, ds: De
         w(b, PLUGIN + 40, IDX_P_GET_EXT), w(b, PLUGIN + 44, IDX_P_ON_MAIN),
         // audio-ports extension
         w(b, AUDIO_PORTS + 0, IDX_PORTS_COUNT), w(b, AUDIO_PORTS + 4, IDX_PORTS_GET),
+        // params extension: count, get_info, get_value, value_to_text,
+        // text_to_value, flush
+        w(b, PARAMS_EXT + 0, IDX_PR_COUNT), w(b, PARAMS_EXT + 4, IDX_PR_INFO),
+        w(b, PARAMS_EXT + 8, IDX_PR_GET),   w(b, PARAMS_EXT + 12, IDX_PR_V2T),
+        w(b, PARAMS_EXT + 16, IDX_PR_T2V),  w(b, PARAMS_EXT + 20, IDX_PR_FLUSH),
         // features: ["instrument", "synthesizer", NULL]
         w(b, FEATURES + 0, ds.instrument), w(b, FEATURES + 4, ds.synth), w(b, FEATURES + 8, 0),
     });
@@ -495,4 +709,19 @@ fn addDataInit(allocator: std.mem.Allocator, b: B, strings: *StringTable, ds: De
 
     _ = c.BinaryenAddFunction(m, "__wclap_data_init", b.none, b.none, null, 0, c.BinaryenBlock(m, null, @ptrCast(stmts.items.ptr), @intCast(stmts.items.len), b.none));
     c.BinaryenSetStart(m, c.BinaryenGetFunction(m, "__wclap_data_init"));
+}
+
+// The end-to-end conformance test is examples/audio-wclap/check.mjs — an
+// honest minimal WCLAP host driving the full lifecycle. These cover only
+// the error paths that never reach a host.
+
+test "wclapWrap rejects wasm64" {
+    try std.testing.expectError(Error.Wasm64Unsupported, wclapWrap(std.testing.allocator, "", true, .{}));
+}
+
+test "wclapWrap requires the plugin-convention exports" {
+    // A valid empty module parses fine but exports neither `alloc_f32`
+    // nor `process`.
+    const empty = "\x00asm\x01\x00\x00\x00";
+    try std.testing.expectError(Error.MissingExport, wclapWrap(std.testing.allocator, empty, false, .{}));
 }
