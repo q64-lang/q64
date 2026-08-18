@@ -49,20 +49,22 @@ checksum is not a result.
 ## Results (2026-08, x86-64 Linux container, wasmtime 45)
 
 ```
-kernel            q64 ns/samp   rust ns/samp    ratio
-mac_f32                  0.94           1.04     0.9x
-mac_simd4                0.23           0.26     0.9x
-mix04                    2.20           4.06     0.5x
-biquad4                  4.78           5.13     0.9x
-fir16                    5.65           7.19     0.8x
-softclip                 1.93           2.19     0.9x
-wavetable16              3.13           2.23     1.4x
+kernel              q64-dbg      q64-rel         rust rel/rust
+mac_f32                1.45         1.44         1.46     1.0x
+mac_simd4              0.36         0.30         0.36     0.8x
+mix04                  3.56         3.12         3.95     0.8x
+biquad4                6.91         6.42         7.71     0.8x
+fir16                 12.01         9.07        17.66     0.5x
+softclip               3.01         4.35         2.99     1.5x
+wavetable16            4.57         3.79         3.35     1.1x
 ```
 
-q64 = `q64 emit --addr wasm32` (debug — there is no release mode yet), run
-under the embedded `q64-wasmtime-host` **built ReleaseFast**. Rust =
-`--release` with `+simd128`, run under the vendored wasmtime CLI. All
-checksums match across languages.
+ns/sample. q64 = `q64 emit --addr wasm32`, debug and `--release`, run under
+the embedded `q64-wasmtime-host` **built ReleaseFast**. Rust = `--release`
+with `+simd128`, run under the vendored wasmtime CLI. All checksums match
+across languages. Absolute numbers drift up to ~40% between container
+sessions (CPU frequency/noise) — compare ratios within one run, never
+numbers across runs.
 
 ### Finding 1 — a Debug-built host executes guest f32 loops ~100× slower
 
@@ -123,14 +125,36 @@ worth doing — for code size, for the memory-path redundancies, and for
 kernels the suite doesn't cover yet — but the headline is that the gap it
 must close is far smaller than assumed.
 
-### Finding 3 — the v0 Simd slice works and pays
+### Finding 3 — `--release` (phase A2): a net win, with two measured lessons
+
+`q64 emit --release` now runs Binaryen's `-O2` (speed-focused) as an
+isolated post-pass. Tuning it against this suite taught two things:
+
+- **Wasm-level inlining is disabled** (`BinaryenSet*InlineMaxSize(0)`).
+  With the default pipeline, inlining the hot `pass` function into `main`
+  merged the kernel's locals with the timing state, raised register
+  pressure in the merged frame, and made the serial kernels ~2× *slower*
+  under Cranelift. With inlining off, the rest of `-O2` keeps its wins.
+  Cranelift gains little from wasm-level inlining anyway.
+- **Branch→`select` if-conversion can pessimize branchy DSP.** `softclip`
+  is the one release regression (3.0 → 4.4 ns/sample): `-O2` turns four
+  predictable, rarely-taken branches into `select`s (5 vs 1 in the wat),
+  which forces both sides to compute every sample and lengthens the
+  dependency chain. No clean Binaryen knob exists for it today; recorded
+  as a tuning candidate rather than blocking the flag.
+
+Net: release beats or matches debug on six of seven kernels (fir16 −25%,
+wavetable16 −17%, and ~20% smaller modules), and `wavetable16` — the
+memory-path signal — drops from 1.4× to 1.1× of Rust.
+
+### Finding 4 — the v0 Simd slice works and pays
 
 `mac_simd4` runs 4.03× faster than `mac_f32` in q64 (0.23 vs 0.93
 ns/sample) — the v0 `Simd<f32, 4>` splat/add/mul/extract slice is real and
 matches LLVM-vectorized Rust. The lanes are there; what's missing for DSP is
 slice load/store and the rest of the op set (roadmap Phase A3).
 
-### Finding 4 — v0 language gaps the kernels had to code around
+### Finding 5 — v0 language gaps the kernels had to code around
 
 Hit while writing seven small DSP loops; each is a data point for the
 roadmap's language phases:

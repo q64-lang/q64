@@ -127,7 +127,7 @@ fn usage(io: std.Io) !void {
         \\                                     Format source in place (file or directory, recursive).
         \\                                     --stdout: read stdin (or path) and print to stdout.
         \\                                     --check: exit 64 if any file would change. --lint: report.
-        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--component] [--module name=file ...]
+        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--release] [--component] [--module name=file ...]
         \\                                     Compile a q64 source file to wasm via codegen.
         \\                                     --addr selects the linear-memory address space
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
@@ -547,6 +547,10 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // can suspend/resume the wasm at a blocking host read (the live
     // `@channel_handler` loop parks at `env.channel_recv` between messages).
     var want_asyncify = false;
+    // `--release`: run Binaryen's standard optimization pipeline over the
+    // emitted core (docs/audio-roadmap.md phase A2). Debug (the default)
+    // stays pass-free.
+    var want_release = false;
     // WIT rung 2: the world name + WIT package id for the synthesized `.wit`,
     // set by `qube build` from the manifest (`wit.world` / `wit.package`).
     // Null = derive from the source filename / `q64:<world>`.
@@ -569,6 +573,8 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             want_component = true;
         } else if (std.mem.eql(u8, a, "--asyncify")) {
             want_asyncify = true;
+        } else if (std.mem.eql(u8, a, "--release")) {
+            want_release = true;
         } else if (std.mem.eql(u8, a, "--export-interface")) {
             export_interface = args_it.next() orelse {
                 try usage(io);
@@ -710,7 +716,7 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // --asyncify: post-process the core so a host can park/resume it at the
     // blocking remote-channel reads (the `@channel_handler` live loop). Only
     // `env.channel_recv` / `env.presses` (the awaiting host reads) may unwind.
-    const out_bytes = if (want_asyncify) blk: {
+    const asy_bytes = if (want_asyncify) blk: {
         const a = emit.asyncifyWasm(gpa, bytes, "env.channel_recv,env.presses", addr) catch |err| {
             var buf: [4096]u8 = undefined;
             var w = std.Io.File.stderr().writerStreaming(io, &buf);
@@ -720,7 +726,20 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
         };
         break :blk a;
     } else bytes;
-    defer if (want_asyncify) gpa.free(out_bytes);
+    defer if (want_asyncify) gpa.free(asy_bytes);
+
+    // --release: optimize last, so asyncify's added plumbing is cleaned up too.
+    const out_bytes = if (want_release) blk: {
+        const o = emit.optimizeWasm(gpa, asy_bytes, addr) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
+            try w.interface.print("q64: release optimize failed: {s}\n", .{@errorName(err)});
+            try w.interface.flush();
+            std.process.exit(1);
+        };
+        break :blk o;
+    } else asy_bytes;
+    defer if (want_release) gpa.free(out_bytes);
 
     try writeFile(io, out, out_bytes);
 

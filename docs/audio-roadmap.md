@@ -47,24 +47,29 @@ The delivery budget to keep in mind: an AudioWorklet render quantum is
 
 Everything later is judged by numbers this phase creates.
 
-**A1. Benchmarks first.** A `bench/` suite of DSP microkernels — biquad
-chain, FIR, wavetable oscillator, block mix/gain, soft-clip — compiled by
-`q64 emit` and timed under the vendored wasmtime and a headless browser,
-against a Rust `wasm32-unknown-unknown` baseline of the same kernels. CI
-publishes the ratios. There are currently zero benchmarks in the repo;
-until this exists, every performance claim is folklore.
+**A1. Benchmarks first.** *(Landed 2026-08 — see `bench/`.)* A `bench/`
+suite of DSP microkernels — biquad chain, FIR, wavetable oscillator, block
+mix/gain, soft-clip — compiled by `q64 emit` and timed under the vendored
+wasmtime and a headless browser, against a Rust `wasm32-unknown-unknown`
+baseline of the same kernels. CI publishes the ratios. There are currently
+zero benchmarks in the repo; until this exists, every performance claim is
+folklore. *(First results overturned two assumptions: the 60–300× "q64 is
+slow" numbers were a Debug-built host — `bench/README.md` finding 1 — and
+debug-mode q64 codegen is already at parity with release Rust on
+register-resident kernels.)*
 
-**A2. Turn the optimizer on.** `q64/src/codegen/emit.zig` builds Binaryen
-expression trees and serializes them without ever calling
-`BinaryenModuleOptimize`. Add a `--release` mode on `q64 emit` (surfaced as
-a `qube build` profile) that sets `BinaryenSetOptimizeLevel(2)` /
-shrink level 1 and runs the standard pass pipeline. Debug builds stay
-pass-free so the byte-identical differential test in `experiments/emit-wasm`
-keeps its meaning (scope it to debug mode). The known lowering
-redundancies — unconditional aggregate-result `memory.copy` slides,
-per-call `sp` watermark save/restore — are exactly what these passes clean
-up; hand-fixing them in the lowerer is phase-C work only if the numbers say
-Binaryen didn't.
+**A2. Turn the optimizer on.** *(Landed 2026-08 — `q64 emit --release`,
+`-O2` speed-focused with wasm-level inlining disabled by measurement; see
+`bench/README.md` finding 3. Not yet surfaced as a `qube build` profile.)*
+`q64/src/codegen/emit.zig` builds Binaryen expression trees and serializes
+them without ever calling `BinaryenModuleOptimize`. Add a `--release` mode
+on `q64 emit` (surfaced as a `qube build` profile) that runs the standard
+pass pipeline. Debug builds stay pass-free so the byte-identical
+differential test in `experiments/emit-wasm` keeps its meaning (scope it to
+debug mode). The known lowering redundancies — unconditional
+aggregate-result `memory.copy` slides, per-call `sp` watermark save/restore
+— are exactly what these passes clean up; hand-fixing them in the lowerer
+is phase-C work only if the numbers say Binaryen didn't.
 
 **A3. Finish `Simd` for DSP.** In dependency order:
 - loads/stores between `Simd<f32, 4>` and `[f32]` slices — without this

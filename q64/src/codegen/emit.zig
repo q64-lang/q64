@@ -1787,6 +1787,50 @@ pub fn asyncifyWasm(allocator: std.mem.Allocator, wasm: []const u8, suspend_impo
     return out;
 }
 
+/// Run Binaryen's standard optimization pipeline over an already-emitted core
+/// module (`q64 emit … --release`). Same isolated read-back/re-serialize shape
+/// as `asyncifyWasm`: the lowerer stays simple and emits whatever redundancy
+/// is convenient (unconditional result slides, watermark save/restore), and
+/// this post-pass cleans it up. Debug emits stay pass-free so the browser
+/// codegen differential test keeps its byte-identical meaning.
+pub fn optimizeWasm(allocator: std.mem.Allocator, wasm: []const u8, addr: AddressSpace) ![]u8 {
+    var features = c.BinaryenFeatureMultivalue() | c.BinaryenFeatureBulkMemory() |
+        c.BinaryenFeatureBulkMemoryOpt() | c.BinaryenFeatureMutableGlobals() |
+        c.BinaryenFeatureNontrappingFPToInt() |
+        c.BinaryenFeatureSIMD128(); // keep in sync with lowerToWasm — a re-read module must not drop v128
+    if (addr == .wasm64) features |= c.BinaryenFeatureMemory64();
+
+    const buf = try allocator.dupe(u8, wasm); // ModuleRead takes a mutable buffer
+    defer allocator.free(buf);
+    const module = c.BinaryenModuleReadWithFeatures(buf.ptr, buf.len, features) orelse return Error.ModuleInvalid;
+    defer c.BinaryenModuleDispose(module);
+    c.BinaryenModuleSetFeatures(module, features);
+
+    // -O2, speed-focused, with wasm-level inlining disabled. All settings are
+    // process-global in the C API, so set every one explicitly per call.
+    // Inlining is off by measurement, not taste (bench/ suite): merging a hot
+    // loop into its caller raises the merged frame's register pressure and
+    // cost the serial DSP kernels ~2x under Cranelift, while the rest of the
+    // -O2 pipeline kept its wins (fir16 ~20% faster than the debug emit).
+    // Cranelift gains little from wasm-level inlining anyway.
+    c.BinaryenSetOptimizeLevel(2);
+    c.BinaryenSetShrinkLevel(0);
+    c.BinaryenSetAlwaysInlineMaxSize(0);
+    c.BinaryenSetFlexibleInlineMaxSize(0);
+    c.BinaryenSetOneCallerInlineMaxSize(0);
+    c.BinaryenModuleOptimize(module);
+
+    if (!c.BinaryenModuleValidate(module)) return Error.ModuleInvalid;
+    const result = c.BinaryenModuleAllocateAndWrite(module, null);
+    defer if (result.binary) |b| std.c.free(b);
+    defer if (result.sourceMap) |s| std.c.free(s);
+    const ptr = result.binary orelse return Error.SerializeEmpty;
+    if (result.binaryBytes == 0) return Error.SerializeEmpty;
+    const out = try allocator.alloc(u8, result.binaryBytes);
+    @memcpy(out, @as([*]const u8, @ptrCast(ptr))[0..result.binaryBytes]);
+    return out;
+}
+
 fn wasmType(t: ir.mir.ValueType, i64_type: c.BinaryenType, i32_type: c.BinaryenType, none_type: c.BinaryenType, pair_type: c.BinaryenType, ptr_type: c.BinaryenType) c.BinaryenType {
     return switch (t) {
         .i64 => i64_type,

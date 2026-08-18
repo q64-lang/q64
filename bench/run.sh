@@ -43,13 +43,17 @@ if [ "$cal_ns" -gt 10000000 ] && [ "${BENCH_ALLOW_SLOW_HOST:-0}" != "1" ]; then
     exit 1
 fi
 
-echo "== q64 kernels (q64 emit --addr wasm32, embedded wasmtime host)"
+echo "== q64 kernels (q64 emit --addr wasm32, debug + --release, embedded wasmtime host)"
 for src in bench/kernels/*.q; do
     name=$(basename "$src" .q)
     "$Q64" emit "$src" "$OUT/$name.wasm" --addr wasm32
     line=$("$HOST" "$OUT/$name.wasm")
     echo "  $line"
     echo "q64 $line" >> "$results"
+    "$Q64" emit "$src" "$OUT/$name.rel.wasm" --addr wasm32 --release
+    rline=$("$HOST" "$OUT/$name.rel.wasm")
+    echo "  $rline (release)"
+    echo "q64rel $rline" >> "$results"
 done
 
 echo "== Rust baseline (wasm32-wasip1 --release, wasmtime CLI)"
@@ -64,20 +68,23 @@ done < <("$WASMTIME" run "$OUT/rust-target/wasm32-wasip1/release/baseline.wasm")
 
 echo
 awk '
-$1 ~ /^(q64|rust)$/ && $2 == "bench" {
+$1 ~ /^(q64|q64rel|rust)$/ && $2 == "bench" {
     lane = $1; name = $3; samples = $5; ns = $7; check = $9
     per = ns / samples
     if (lane == "q64") { q[name] = per; qc[name] = check }
+    else if (lane == "q64rel") { qr[name] = per }
     else { r[name] = per; rc[name] = check; if (!(name in seen)) { order[++n] = name; seen[name] = 1 } }
 }
 END {
-    printf "%-14s %14s %14s %8s  %s\n", "kernel", "q64 ns/samp", "rust ns/samp", "ratio", "checksums (q64 | rust)"
+    printf "%-14s %12s %12s %12s %8s  %s\n", "kernel", "q64-dbg", "q64-rel", "rust", "rel/rust", "checksums (q64 | rust)"
     for (i = 1; i <= n; i++) {
         k = order[i]
-        if (k in q) {
-            printf "%-14s %14.2f %14.2f %7.1fx  %s | %s\n", k, q[k], r[k], q[k] / r[k], qc[k], rc[k]
+        if (k in q && k in qr) {
+            printf "%-14s %12.2f %12.2f %12.2f %7.1fx  %s | %s\n", k, q[k], qr[k], r[k], qr[k] / r[k], qc[k], rc[k]
+        } else if (k in q) {
+            printf "%-14s %12.2f %12s %12.2f %8s  %s | %s\n", k, q[k], "-", r[k], "-", qc[k], rc[k]
         } else {
-            printf "%-14s %14s %14.2f %8s\n", k, "-", r[k], "-"
+            printf "%-14s %12s %12s %12.2f %8s\n", k, "-", "-", r[k], "-"
         }
     }
 }' "$results"
