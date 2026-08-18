@@ -16,7 +16,7 @@ links the appropriate adapter for the target declared in `qube.json5`.
 | [`browser/`](./browser)                     | Browsers — JS + SharedArrayBuffer + Web Workers |
 | [`wasmtime/`](./wasmtime)                   | Wasmtime (server-side native)                   |
 | [`wasmer/`](./wasmer)                       | Wasmer (server-side native)                     |
-| [`audio-host/`](./audio-host)               | VST3 / AU / AAX audio plugin hosts              |
+| [`audio-host/`](./audio-host)               | Native audio plugins — CLAP implemented (wasmtime-embedding `.clap`); VST3 / AU later |
 | [`jsi/`](./jsi)                             | JSI-hosted shells — React Native and similar    |
 
 ## What each adapter does

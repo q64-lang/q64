@@ -4,8 +4,8 @@ How real-time audio crosses the guest/host boundary, in both
 directions: a q64 program as the **app** (the host provides
 `env.audio` — engines, standalone synths, offline render), and a q64
 program as the **plugin** (the host calls in — the `--wclap` target
-today, native CLAP later). One wire format serves both; the difference
-is only who owns the process loop.
+for browsers, `runtime/audio-host`'s native CLAP for desktop). One wire
+format serves both; the difference is only who owns the process loop.
 
 This is the first concrete instance of a hand-specced typed-face ABI
 (option 1 in `todo.md` §"Host ABI for non-trivial faces") — it drives

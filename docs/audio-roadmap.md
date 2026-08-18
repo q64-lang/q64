@@ -366,7 +366,18 @@ changed. audio-poly's check proves it with the sharpest possible
 boundary: a note-on carrying time=64 leaves samples [0,64) of its block
 exactly zero and [64,128) sounding; time=0 degenerates to the old
 apply-then-render path bit-for-bit (every prior check unchanged).
-Native CLAP and AU/VST3 remain.)*
+
+Native CLAP landed (`runtime/audio-host`): a `.clap` shared library
+embedding wasmtime that runs the SAME q64 wasm in a desktop DAW — the
+native sibling of the WCLAP shim, consuming the same guest convention
+(never emulating the browser table ABI), with the CLAP C ABI
+hand-declared in Zig, guest-served params, note/MIDI forwarding, and
+the same sample-offset segment walk. Validated by `q64-clap-check`, an
+honest native host that dlopens the plugin like a DAW and asserts the
+same behaviors in the rendered audio (439.9 Hz measured, exact-zero
+offset boundary). One artifact story: `--wclap` for browsers, the
+`.clap` + `q64.wasm` pair for desktop — the guest module is identical.
+AU/VST3 wrappers remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the
 reference browser host, and processes audio inside budget; `q64 show
