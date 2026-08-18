@@ -31,12 +31,20 @@
 //! declared plugin surface lands (coefficients need trig the shim
 //! shouldn't synthesize).
 //!
-//! Note events make the voice playable: note-on sets the pitch from a
+//! Note events make the voice playable, at two levels. A guest may
+//! export the optional convention extensions —
+//!   state_cells() -> i64                          // own state sizing
+//!   prepare(ref st, sr: f64) -> i64               // at activate
+//!   note_on(ref st, key: i64, vel: f32) -> i64    // @realtime
+//!   note_off(ref st, key: i64) -> i64             // @realtime
+//! — and then notes are *forwarded to the guest* (polyphony, voice
+//! stealing, envelopes all live in q64 code; the shim only routes).
+//! Otherwise the shim's mono fallback: note-on sets the pitch from a
 //! wrap-time equal-temperament table (f64[128] in scratch — the shim
-//! never computes exp2) and opens the gate at the note velocity;
+//! never computes exp2) and opens a gate at the note velocity;
 //! note-off/choke close it. The gate rides the guest `gain` target, so
 //! the guest's one-pole smoothing IS the ~7 ms attack/release envelope.
-//! The gate starts at 1: the voice free-runs until the first note.
+//! The gate starts at 1: the mono voice free-runs until the first note.
 //!
 //! Layout: shim structs + strings live in a scratch block at SCRATCH
 //! (896 KiB — between the scope arena, which grows up from the static
@@ -154,6 +162,13 @@ const B = struct {
     none: c.BinaryenType,
     fn_alloc_f32: [*c]const u8,
     fn_process: [*c]const u8,
+    // Optional plugin-convention exports (null when absent). A guest that
+    // exports note_on/note_off handles notes itself — polyphony lives in
+    // the guest; the shim just forwards events.
+    fn_state_cells: ?[*c]const u8, // state_cells() -> i64
+    fn_prepare: ?[*c]const u8, // prepare(ref st, sr: f64) -> i64
+    fn_note_on: ?[*c]const u8, // note_on(ref st, key: i64, vel: f32) -> i64
+    fn_note_off: ?[*c]const u8, // note_off(ref st, key: i64) -> i64
 
     fn ci32(self: B, v: i64) c.BinaryenExpressionRef {
         return c.BinaryenConst(self.m, c.BinaryenLiteralInt32(@intCast(v)));
@@ -205,6 +220,10 @@ pub fn wclapWrap(allocator: std.mem.Allocator, wasm: []const u8, wasm64: bool, m
         .none = c.BinaryenTypeNone(),
         .fn_alloc_f32 = exportedFn(m, "alloc_f32") orelse return Error.MissingExport,
         .fn_process = exportedFn(m, "process") orelse return Error.MissingExport,
+        .fn_state_cells = exportedFn(m, "state_cells"),
+        .fn_prepare = exportedFn(m, "prepare"),
+        .fn_note_on = exportedFn(m, "note_on"),
+        .fn_note_off = exportedFn(m, "note_off"),
     };
 
     // ---- globals ------------------------------------------------------
@@ -367,19 +386,33 @@ fn addFactoryFns(b: B) void {
 
 fn addPluginFns(b: B, ports_id: u32, params_id: u32) void {
     const m = b.m;
-    // plugin.init(plugin*) -> bool: allocate the 16-slot state vec through
-    // the guest's own export and remember its header address.
-    var ainit = [_]c.BinaryenExpressionRef{c.BinaryenConst(m, c.BinaryenLiteralInt64(16))};
+    // plugin.init(plugin*) -> bool: allocate the state vec through the
+    // guest's own export and remember its header address. The guest sizes
+    // its own state via `state_cells` when it exports one (a poly synth
+    // wants a note table + voice pool); 16 cells otherwise.
+    const cells = if (b.fn_state_cells) |sc|
+        c.BinaryenCall(m, sc, null, 0, b.i64t)
+    else
+        c.BinaryenConst(m, c.BinaryenLiteralInt64(16));
+    var ainit = [_]c.BinaryenExpressionRef{cells};
     var init_body = [_]c.BinaryenExpressionRef{
         c.BinaryenGlobalSet(m, "__wclap_st", c.BinaryenUnary(m, c.BinaryenWrapInt64(), c.BinaryenCall(m, b.fn_alloc_f32, @ptrCast(&ainit), ainit.len, b.i64t))),
         b.ci32(1),
     };
     _ = c.BinaryenAddFunction(m, "__wclap_p_init", b.i32t, b.i32t, null, 0, c.BinaryenBlock(m, null, @ptrCast(&init_body), init_body.len, b.i32t));
     _ = c.BinaryenAddFunction(m, "__wclap_p_destroy", b.i32t, b.none, null, 0, c.BinaryenNop(m));
-    // plugin.activate(plugin*, sample_rate f64, min u32, max u32) -> bool
+    // plugin.activate(plugin*, sample_rate f64, min u32, max u32) -> bool.
+    // A guest `prepare(ref st, sr)` runs here — activation is where the
+    // rate is first known, and allocation is still allowed.
     var pact = [_]c.BinaryenType{ b.i32t, b.f64t, b.i32t, b.i32t };
+    var prep_args = [_]c.BinaryenExpressionRef{ c.BinaryenGlobalGet(m, "__wclap_st", b.i32t), b.get(1, b.f64t) };
+    const prep: c.BinaryenExpressionRef = if (b.fn_prepare) |pf|
+        c.BinaryenDrop(m, c.BinaryenCall(m, pf, @ptrCast(&prep_args), prep_args.len, b.i64t))
+    else
+        c.BinaryenNop(m);
     var act_body = [_]c.BinaryenExpressionRef{
         c.BinaryenGlobalSet(m, "__wclap_sr", b.get(1, b.f64t)),
+        prep,
         b.ci32(1),
     };
     _ = c.BinaryenAddFunction(m, "__wclap_p_activate", c.BinaryenTypeCreate(&pact, pact.len), b.i32t, null, 0, c.BinaryenBlock(m, null, @ptrCast(&act_body), act_body.len, b.i32t));
@@ -540,20 +573,42 @@ fn addApplyEvents(b: B) void {
             c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenEqInt32(), b.get(PID, b.i32t), b.ci32(1)), clampSet(b, "__wclap_drive", EV, DRIVE_MIN, DRIVE_MAX), null),
         ),
     };
-    // note-on (type 0): pitch from the equal-temperament table, gate from
-    // the velocity. Ignore wildcard/out-of-range keys ((key & ~127) != 0).
+    // note-on (type 0). Ignore wildcard/out-of-range keys
+    // ((key & ~127) != 0). Guests that export note_on handle the note
+    // themselves (voice pool, own pitch table); otherwise the shim's
+    // mono fallback: pitch from the equal-temperament table, gate from
+    // the velocity.
+    const clamped_vel = c.BinaryenBinary(m, c.BinaryenMaxFloat64(), c.BinaryenBinary(m, c.BinaryenMinFloat64(), c.BinaryenLoad(m, 8, false, 32, 0, b.f64t, b.get(EV, b.i32t), null), c.BinaryenConst(m, c.BinaryenLiteralFloat64(1.0))), c.BinaryenConst(m, c.BinaryenLiteralFloat64(0.0)));
+    var on_args = [_]c.BinaryenExpressionRef{
+        c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+        c.BinaryenUnary(m, c.BinaryenExtendSInt32(), b.get(KEY, b.i32t)),
+        c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), clamped_vel),
+    };
+    const on_action: c.BinaryenExpressionRef = if (b.fn_note_on) |nf|
+        c.BinaryenDrop(m, c.BinaryenCall(m, nf, @ptrCast(&on_args), on_args.len, b.i64t))
+    else
+        c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalSet(m, "__wclap_freq", c.BinaryenLoad(m, 8, false, SCRATCH + NOTE_TABLE, 0, b.f64t, c.BinaryenBinary(m, c.BinaryenShlInt32(), b.get(KEY, b.i32t), b.ci32(3)), null)),
+            c.BinaryenGlobalSet(m, "__wclap_gate", clamped_vel),
+        }), 2, b.none);
     var note_on_body = [_]c.BinaryenExpressionRef{
         c.BinaryenLocalSet(m, KEY, c.BinaryenLoad(m, 2, true, 24, 0, b.i32t, b.get(EV, b.i32t), null)),
         c.BinaryenIf(
             m,
             c.BinaryenUnary(m, c.BinaryenEqZInt32(), c.BinaryenBinary(m, c.BinaryenAndInt32(), b.get(KEY, b.i32t), b.ci32(~@as(i64, 127)))),
-            c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
-                c.BinaryenGlobalSet(m, "__wclap_freq", c.BinaryenLoad(m, 8, false, SCRATCH + NOTE_TABLE, 0, b.f64t, c.BinaryenBinary(m, c.BinaryenShlInt32(), b.get(KEY, b.i32t), b.ci32(3)), null)),
-                c.BinaryenGlobalSet(m, "__wclap_gate", c.BinaryenBinary(m, c.BinaryenMaxFloat64(), c.BinaryenBinary(m, c.BinaryenMinFloat64(), c.BinaryenLoad(m, 8, false, 32, 0, b.f64t, b.get(EV, b.i32t), null), c.BinaryenConst(m, c.BinaryenLiteralFloat64(1.0))), c.BinaryenConst(m, c.BinaryenLiteralFloat64(0.0)))),
-            }), 2, b.none),
+            on_action,
             null,
         ),
     };
+    // note-off / choke: forward to the guest (by key) or close the gate.
+    var off_args = [_]c.BinaryenExpressionRef{
+        c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+        c.BinaryenUnary(m, c.BinaryenExtendSInt32(), c.BinaryenLoad(m, 2, true, 24, 0, b.i32t, b.get(EV, b.i32t), null)),
+    };
+    const off_action: c.BinaryenExpressionRef = if (b.fn_note_off) |nf|
+        c.BinaryenDrop(m, c.BinaryenCall(m, nf, @ptrCast(&off_args), off_args.len, b.i64t))
+    else
+        c.BinaryenGlobalSet(m, "__wclap_gate", c.BinaryenConst(m, c.BinaryenLiteralFloat64(0.0)));
     var iter_body = [_]c.BinaryenExpressionRef{
         c.BinaryenLocalSet(m, EV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(8, b.get(LIST, b.i32t)), @ptrCast(&get_args), get_args.len, c.BinaryenTypeCreate(&p2, p2.len), b.i32t)),
         c.BinaryenIf(
@@ -572,9 +627,9 @@ fn addApplyEvents(b: B) void {
                         c.BinaryenBlock(m, null, @ptrCast(&note_on_body), note_on_body.len, b.none),
                         c.BinaryenIf(
                             m,
-                            // NOTE_OFF (1) or NOTE_CHOKE (2) both close the gate
+                            // NOTE_OFF (1) or NOTE_CHOKE (2) both release
                             c.BinaryenBinary(m, c.BinaryenOrInt32(), typeIs(b, 1), typeIs(b, 2)),
-                            c.BinaryenGlobalSet(m, "__wclap_gate", c.BinaryenConst(m, c.BinaryenLiteralFloat64(0.0))),
+                            off_action,
                             null,
                         ),
                     ),

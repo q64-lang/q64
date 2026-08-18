@@ -10,8 +10,13 @@
 // meters move. Requires a running wclap-host dev server (see README) and
 // Playwright with Chromium.
 //
-//   node host-smoke.mjs [host-url] [bundle-url]
+//   node host-smoke.mjs [host-url] [bundle-url] [--expect-silent]
 //   node host-smoke.mjs http://localhost:5199/ /samples/q64-voice.wclap.tar.gz
+//
+// --expect-silent: for note-driven instruments (examples/audio-poly),
+// which render silence until a note event arrives — headless Chromium
+// has no Web MIDI source, so the check stops at loaded-with-no-errors
+// and the audible half stays with the plugin's own check.mjs.
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -23,10 +28,12 @@ try {
   process.exit(2);
 }
 
-const hostUrl = process.argv[2] ?? "http://localhost:5199/";
+const args = process.argv.slice(2).filter((a) => a !== "--expect-silent");
+const expectSilent = process.argv.includes("--expect-silent");
+const hostUrl = args[0] ?? "http://localhost:5199/";
 // Must be absolute — the host's add-by-URL flow parses it with `new URL`
 // and routes the fetch through its same-origin /r2-proxy.
-const bundleUrl = process.argv[3] ?? new URL("/samples/q64-voice.wclap.tar.gz", hostUrl).href;
+const bundleUrl = args[1] ?? new URL("/samples/q64-voice.wclap.tar.gz", hostUrl).href;
 // The shelf chip is labeled from the URL's filename, sans extension.
 const chipLabel = (new URL(bundleUrl).pathname.split("/").pop() ?? "").replace(/\.(wclap\.tar\.gz|wasm)$/i, "");
 
@@ -66,17 +73,22 @@ try {
   // RMS meter to move — a plugin that loads but renders silence never
   // lights it.
   if (await page.locator("#playBtn").isEnabled()) await page.click("#playBtn");
-  await page.waitForFunction(
-    () => {
-      const w = document.getElementById("meterL")?.style.width ?? "0%";
-      return parseFloat(w) > 1;
-    },
-    undefined,
-    { timeout: 15_000 },
-  );
-  const meterL = await page.evaluate(() => document.getElementById("meterL").style.width);
-  const meterR = await page.evaluate(() => document.getElementById("meterR").style.width);
-  console.log(`ok: audio flowing — meters L=${meterL} R=${meterR}`);
+  if (expectSilent) {
+    await page.waitForTimeout(3000); // let any load/activate error surface
+    console.log("ok: loaded and running (note-driven instrument — silent without MIDI, as expected)");
+  } else {
+    await page.waitForFunction(
+      () => {
+        const w = document.getElementById("meterL")?.style.width ?? "0%";
+        return parseFloat(w) > 1;
+      },
+      undefined,
+      { timeout: 15_000 },
+    );
+    const meterL = await page.evaluate(() => document.getElementById("meterL").style.width);
+    const meterR = await page.evaluate(() => document.getElementById("meterR").style.width);
+    console.log(`ok: audio flowing — meters L=${meterL} R=${meterR}`);
+  }
 
   const errBoxHidden = await page.evaluate(() => document.getElementById("errorBox")?.hidden ?? true);
   if (!errBoxHidden) {

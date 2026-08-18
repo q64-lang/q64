@@ -152,9 +152,11 @@ v1 pins two payloads:
   A4 = 440 at key 69) and opens the **gate** at the velocity;
   note-off and choke close it. The gate is a gain *target* like any
   parameter — the guest's smoothing ramp is the attack/release
-  envelope, so v1 needs no envelope machinery on either side.
-  Monophonic in v1; voice allocation is a guest concern when
-  polyphony lands.
+  envelope, so v1 needs no envelope machinery on either side. That
+  describes the mono fallback; a guest that takes note events as
+  calls (the optional `note_on`/`note_off` exports, §below) owns
+  pitch, envelopes, and polyphony itself — voice allocation is a
+  guest concern by design (`examples/audio-poly`, 8 voices).
 
 Raw MIDI pass-through (`type = 10`, CC / pitch bend / aftertouch)
 is deferred; the queue and header do not change when it lands.
@@ -256,10 +258,26 @@ process(st, io, n: i64, p0…pk: f32) -> i64  @realtime     // one block
 ```
 
 with the shim defining the parameter table and mapping targets to the
-positional `f32` params. It is a strict subset of the face (state =
-the `self` struct, positional params = the declared table) and is
-superseded by it; the lowering from `fit X : AudioPlugin` to the same
-shim is mechanical.
+positional `f32` params. Four **optional** exports move behavior from
+the shim into the guest when present:
+
+```
+state_cells() -> i64                          // own state sizing (else 16)
+prepare(ref st, sr: f64) -> i64               // at activate; may allocate
+note_on(ref st, key: i64, vel: f32) -> i64    // @realtime
+note_off(ref st, key: i64) -> i64             // @realtime (also choke)
+```
+
+A guest exporting `note_on`/`note_off` receives note events as calls —
+polyphony, voice stealing, and envelopes are guest code, and the
+target's mono fallback (pitch table + gate) is not emitted. The
+resolution happens at wrap time from the export table, so absent
+extensions cost nothing. `examples/audio-poly` is the reference user.
+
+The convention is a strict subset of the face (state = the `self`
+struct, positional params = the declared table, the optional exports =
+the face's init/set_param split) and is superseded by it; the lowering
+from `fit X : AudioPlugin` to the same shim is mechanical.
 
 ### Exit criterion hook
 
@@ -276,7 +294,8 @@ synthesis treating it like any other face — tracked there, not here.
 | block size per call, max at activation | — |
 | `v.head` header handle, stable addresses | shared-memory / multi-thread buffers |
 | params `id → f64`, guest smoothing, block snap | sample-offset automation |
-| CLAP-shaped event header, param-value + note on/off/choke | raw MIDI pass-through (CC, pitch bend); polyphony |
+| CLAP-shaped event header, param-value + note on/off/choke | raw MIDI pass-through (CC, pitch bend) |
+| polyphony as guest-side voice allocation (notes forwarded as calls) | — |
 | one output port, planar channels | multi-port, sidechain |
 | `f64` sample rate at activation | rate changes while active |
 | — | state save/load, GUI (webview) surface |

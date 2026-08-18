@@ -1,0 +1,15 @@
+{
+  "manifest_version": 1,
+  "id": "dev.q64.poly",
+  "name": "q64 Poly",
+  "vendor": "q64",
+  "version": "0.1.0",
+  "description": "8-voice polyphonic saw synth written in q64: per-voice envelopes, round-robin voice stealing, shared low-pass and soft clip. Compiled by `q64 emit --wclap`; plays from a MIDI keyboard.",
+  "features": ["instrument", "synthesizer"],
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://q64.dev",
+  "has_ui": false,
+  "plugins": [
+    { "id": "dev.q64.poly", "name": "q64 Poly", "features": ["instrument", "synthesizer"], "has_ui": false }
+  ]
+}

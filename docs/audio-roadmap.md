@@ -321,8 +321,20 @@ envelope — no envelope machinery anywhere. The event layout matches the
 reference host's Web-MIDI encoder byte-for-byte, so a hardware keyboard
 plays the synth in plinken's wclap-host unmodified; `check.mjs` proves
 key 69 → exactly 440 Hz, velocity → linear amplitude, note-off →
-silence. Monophonic; polyphony is a guest concern for later. Native
-CLAP and AU/VST3 remain.)*
+silence.
+
+Polyphony followed, as guest code: the plugin convention grew four
+optional exports (`state_cells`, `prepare`, `note_on`, `note_off`,
+resolved at wrap time from the export table) and when a guest handles
+notes the shim forwards events as calls instead of driving its mono
+fallback. `examples/audio-poly` is an 8-voice saw synth whose voice
+allocation, round-robin stealing, per-voice envelopes, and
+ratio-walk pitch table (no exp2 anywhere) are all q64 source; its
+check proves independence in audio — silent before the first note,
+release A4 and E5 keeps sounding at its own measured pitch, a 10-note
+cluster on 8 voices mass-releases to silence. Loads in the reference
+host (`--expect-silent` smoke); a MIDI keyboard plays it. Native CLAP
+and AU/VST3 remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the
 reference browser host, and processes audio inside budget; `q64 show

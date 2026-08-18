@@ -1,0 +1,13 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "dev.q64.audio_poly",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "An 8-voice polyphonic saw synth with notes handled in-guest: the WCLAP shim forwards note events to note_on/note_off exports, and voice allocation, stealing, and the per-voice envelope are all q64 code. Per-key increments come from a ratio-walk table built at activate — no exp2 anywhere.",
+  "type": "library",
+  "entry": "src/lib.q",
+
+  "dependencies": {
+    "q64.audio": { "path": "../../stdlib/audio" },
+  },
+}
