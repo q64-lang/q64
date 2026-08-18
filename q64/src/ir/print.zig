@@ -337,6 +337,11 @@ fn hirExpr(gpa: std.mem.Allocator, out: *Buf, e: *const hir.Expr) Error!void {
             try hirExpr(gpa, out, s.rhs);
             try app(gpa, out, ")", .{});
         },
+        .simd_un => |s| {
+            try app(gpa, out, "simd_{s}.{s}(", .{ @tagName(s.kind), @tagName(s.shape) });
+            try hirExpr(gpa, out, s.operand);
+            try app(gpa, out, ")", .{});
+        },
         .logical => |lg| {
             try app(gpa, out, "(", .{});
             try hirExpr(gpa, out, lg.lhs);
@@ -659,6 +664,10 @@ fn mirInst(gpa: std.mem.Allocator, out: *Buf, inst: *const mir.Inst, depth: usiz
             try app(gpa, out, "simd_bin {s} {s}\n", .{ @tagName(s.kind), @tagName(s.shape) });
             try mirInst(gpa, out, s.lhs, depth + 1);
             try mirInst(gpa, out, s.rhs, depth + 1);
+        },
+        .simd_un => |s| {
+            try app(gpa, out, "simd_un {s} {s}\n", .{ @tagName(s.kind), @tagName(s.shape) });
+            try mirInst(gpa, out, s.operand, depth + 1);
         },
         .call => |cl| {
             try app(gpa, out, "call #{d}\n", .{cl.func});

@@ -9460,8 +9460,38 @@ fn simdLaneScalar(shape: ops.LaneShape) sema.exprtype.ScalarType {
 /// single source so the two can't skew.
 fn simdBinKind(method: []const u8) ?ops.BinKind {
     if (std.mem.eql(u8, method, "add")) return .add;
+    if (std.mem.eql(u8, method, "sub")) return .sub;
     if (std.mem.eql(u8, method, "mul")) return .mul;
+    if (std.mem.eql(u8, method, "div")) return .div;
+    if (std.mem.eql(u8, method, "min")) return .fmin;
+    if (std.mem.eql(u8, method, "max")) return .fmax;
     return null;
+}
+
+/// Whether a lane-wise binary op exists for the shape: `div`/`min`/`max`
+/// are f32x4-only (wasm SIMD has no i32x4 division; integer min/max are
+/// signedness-flavored and deferred with the rest of the i32x4 story).
+fn simdBinAllowed(kind: ops.BinKind, shape: ops.LaneShape) bool {
+    return switch (kind) {
+        .div, .fmin, .fmax => shape == .f32x4,
+        else => true,
+    };
+}
+
+/// The lane-wise SIMD unary op named by a method, or null. Same
+/// single-source discipline as `simdBinKind`. `sqrt` is f32x4-only.
+fn simdUnKind(method: []const u8) ?ops.UnKind {
+    if (std.mem.eql(u8, method, "neg")) return .neg;
+    if (std.mem.eql(u8, method, "abs")) return .fabs;
+    if (std.mem.eql(u8, method, "sqrt")) return .fsqrt;
+    return null;
+}
+
+fn simdUnAllowed(kind: ops.UnKind, shape: ops.LaneShape) bool {
+    return switch (kind) {
+        .fsqrt => shape == .f32x4,
+        else => true,
+    };
 }
 
 const TensorShape = struct { rows: i64, cols: i64 };
@@ -10004,7 +10034,8 @@ const ExprTypeBridge = struct {
             }
             if (self.scope.find(name[0..dot])) |head| {
                 if (simdShapeOfHir(head.ty)) |shape| {
-                    if (simdBinKind(mname) != null) return simdScTy(shape);
+                    if (simdBinKind(mname)) |sk| if (simdBinAllowed(sk, shape)) return simdScTy(shape);
+                    if (simdUnKind(mname)) |uk| if (simdUnAllowed(uk, shape)) return simdScTy(shape);
                     if (std.mem.eql(u8, mname, "extract")) return simdLaneScalar(shape);
                 }
             }
@@ -11236,6 +11267,7 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                         if (simdShapeOfHir(loc.ty)) |shape| {
                             const method = cname[dot + 1 ..];
                             if (simdBinKind(method)) |sk| {
+                                if (!simdBinAllowed(sk, shape)) return reject(b, .unsupported_call);
                                 var bit = cc.args();
                                 const a0 = bit.next() orelse return reject(b, .unsupported_call);
                                 if (bit.next() != null) return reject(b, .unsupported_call); // exactly one
@@ -11243,6 +11275,17 @@ fn buildIntExpr(b: *Builder, expr: ast.Expr, scope: *Scope) BuildError!*hir.Expr
                                 const lhs = try b.a.create(hir.Expr);
                                 lhs.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
                                 out.* = .{ .simd_bin = .{ .kind = sk, .shape = shape, .lhs = lhs, .rhs = try buildSimdOperand(b, a0, scope) } };
+                                return out;
+                            }
+                            // Lane-wise unaries: `v.neg()` / `v.abs()` /
+                            // `v.sqrt()` (f32x4 only for sqrt), no arguments.
+                            if (simdUnKind(method)) |uk| {
+                                if (!simdUnAllowed(uk, shape)) return reject(b, .unsupported_call);
+                                var uit = cc.args();
+                                if (uit.next() != null) return reject(b, .unsupported_call); // exactly zero
+                                const vec = try b.a.create(hir.Expr);
+                                vec.* = .{ .local = .{ .idx = loc.idx, .ty = loc.ty } };
+                                out.* = .{ .simd_un = .{ .kind = uk, .shape = shape, .operand = vec } };
                                 return out;
                             }
                             if (std.mem.eql(u8, method, "extract")) {

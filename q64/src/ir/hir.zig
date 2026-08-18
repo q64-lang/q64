@@ -437,6 +437,7 @@ pub const Expr = union(enum) {
     /// (not `bin`) because instruction selection needs the lane shape, which
     /// the operands' `v128` value type alone cannot provide.
     simd_bin: struct { kind: ops.BinKind, shape: ops.LaneShape, lhs: *Expr, rhs: *Expr },
+    simd_un: struct { kind: ops.UnKind, shape: ops.LaneShape, operand: *Expr },
     /// Short-circuit `&&` / `||`. Kept distinct from `bin` because it lowers
     /// to control flow (a value `if_`), not a backend binary op. Yields a
     /// boolean (i32 0/1); both operands are truthiness-tested.

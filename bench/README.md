@@ -40,6 +40,7 @@ checksum is not a result.
 |---|---|---|
 | `mac_f32` | serial multiply-accumulate, 1 chain | the floor: latency-bound, ~6 locals |
 | `mac_simd4` | the same on `Simd<f32, 4>` | measures the v0 Simd slice directly |
+| `clip_simd4` | branch-free cubic clip on `Simd<f32, 4>` | the full lane-op surface (mul/sub/min/max/add) |
 | `mix04` | 4 saw voices × gain, summed | the DAW summing loop: adds, muls, wrap branches |
 | `biquad4` | 4 cascaded DF2T biquads | the canonical IIR workload, ~22 locals |
 | `fir16` | 16-tap FIR, unrolled shift register | the convolution shape, ~38 locals |
@@ -50,13 +51,14 @@ checksum is not a result.
 
 ```
 kernel              q64-dbg      q64-rel         rust rel/rust
-mac_f32                1.45         1.44         1.46     1.0x
+mac_f32                1.44         1.41         1.46     1.0x
 mac_simd4              0.36         0.30         0.36     0.8x
-mix04                  3.56         3.12         3.95     0.8x
-biquad4                6.91         6.42         7.71     0.8x
-fir16                 12.01         9.07        17.66     0.5x
-softclip               3.01         4.35         2.99     1.5x
-wavetable16            4.57         3.79         3.35     1.1x
+clip_simd4             0.99         1.20         3.96     0.3x
+mix04                  4.20         3.79         3.91     1.0x
+biquad4               11.78         7.56         7.68     1.0x
+fir16                 25.40        21.37        17.45     1.2x
+softclip               3.09         4.34         4.10     1.1x
+wavetable16            4.58         3.78         3.16     1.2x
 ```
 
 ns/sample. q64 = `q64 emit --addr wasm32`, debug and `--release`, run under
@@ -149,10 +151,17 @@ memory-path signal — drops from 1.4× to 1.1× of Rust.
 
 ### Finding 4 — the v0 Simd slice works and pays
 
-`mac_simd4` runs 4.03× faster than `mac_f32` in q64 (0.23 vs 0.93
-ns/sample) — the v0 `Simd<f32, 4>` splat/add/mul/extract slice is real and
-matches LLVM-vectorized Rust. The lanes are there; what's missing for DSP is
-slice load/store and the rest of the op set (roadmap Phase A3).
+`mac_simd4` runs ~4× faster than `mac_f32` in q64 — the v0 `Simd<f32, 4>`
+slice is real and matches LLVM-vectorized Rust. The lane-wise op surface is
+now complete for f32x4 (`add`/`sub`/`mul`/`div`/`min`/`max`,
+`neg`/`abs`/`sqrt`; integer lanes keep `add`/`sub`/`mul`/`neg`/`abs`), and
+`clip_simd4` shows why explicit lanes beat hoping for autovectorization:
+the branch-free min/max clamp compiles straight to `f32x4` ops in q64
+(~1.0–1.2 ns/sample) while LLVM declines to vectorize the same math from
+the scalar Rust source (~4.0 ns/sample — float min/max NaN semantics block
+it) — q64 3–4× ahead on identical checksums. Still missing for DSP: slice
+load/store (SIMD can't touch a buffer), `Simd` in struct fields and across
+function boundaries, lane insert, relaxed FMA (roadmap phase A3).
 
 ### Finding 5 — v0 language gaps the kernels had to code around
 

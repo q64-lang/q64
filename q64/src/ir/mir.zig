@@ -186,6 +186,7 @@ pub const Op = union(enum) {
     /// Lane-wise add/mul on two same-shape `v128`s. Result `v128`. The shape
     /// on the op (not the operand type) selects the instruction family.
     simd_bin: struct { kind: ops.BinKind, shape: ops.LaneShape, lhs: *Inst, rhs: *Inst },
+    simd_un: struct { kind: ops.UnKind, shape: ops.LaneShape, operand: *Inst },
     call: struct { func: FuncId, args: []const *Inst },
     ret: ?*Inst,
     host_out_int: struct { value: *Inst, nl_off: u32, stream: Stream },

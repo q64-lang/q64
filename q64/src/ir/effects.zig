@@ -192,6 +192,7 @@ fn collectExpr(
             try collectExpr(a, s.lhs, d, e);
             try collectExpr(a, s.rhs, d, e);
         },
+        .simd_un => |s| try collectExpr(a, s.operand, d, e),
         .logical => |l| {
             try collectExpr(a, l.lhs, d, e);
             try collectExpr(a, l.rhs, d, e);

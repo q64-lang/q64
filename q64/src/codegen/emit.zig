@@ -1864,6 +1864,7 @@ fn bodyHasOut(inst: *const ir.mir.Inst, want_int: bool) bool {
         .simd_splat => |s| bodyHasOut(s.operand, want_int),
         .simd_extract => |s| bodyHasOut(s.vec, want_int),
         .simd_bin => |s| bodyHasOut(s.lhs, want_int) or bodyHasOut(s.rhs, want_int),
+        .simd_un => |s| bodyHasOut(s.operand, want_int),
         .call => |cl| blk: {
             for (cl.args) |a| if (bodyHasOut(a, want_int)) break :blk true;
             break :blk false;
@@ -2863,6 +2864,7 @@ fn scanScratch(inst: *const ir.mir.Inst, s: *Scratch) void {
             scanScratch(sb2.lhs, s);
             scanScratch(sb2.rhs, s);
         },
+        .simd_un => |su| scanScratch(su.operand, s),
         .call => |cl| {
             // The call wraps in a reclamation region around its args.
             var sub = Scratch{};
@@ -3384,16 +3386,37 @@ const Lowerer = struct {
                 const op = switch (s.shape) {
                     .f32x4 => switch (s.kind) {
                         .add => c.BinaryenAddVecF32x4(),
+                        .sub => c.BinaryenSubVecF32x4(),
                         .mul => c.BinaryenMulVecF32x4(),
+                        .div => c.BinaryenDivVecF32x4(),
+                        .fmin => c.BinaryenMinVecF32x4(),
+                        .fmax => c.BinaryenMaxVecF32x4(),
                         else => return Error.UnsupportedCall,
                     },
                     .i32x4 => switch (s.kind) {
                         .add => c.BinaryenAddVecI32x4(),
+                        .sub => c.BinaryenSubVecI32x4(),
                         .mul => c.BinaryenMulVecI32x4(),
                         else => return Error.UnsupportedCall,
                     },
                 };
                 return c.BinaryenBinary(module, op, try self.inst(s.lhs), try self.inst(s.rhs));
+            },
+            .simd_un => |s| {
+                const op = switch (s.shape) {
+                    .f32x4 => switch (s.kind) {
+                        .neg => c.BinaryenNegVecF32x4(),
+                        .fabs => c.BinaryenAbsVecF32x4(),
+                        .fsqrt => c.BinaryenSqrtVecF32x4(),
+                        else => return Error.UnsupportedCall,
+                    },
+                    .i32x4 => switch (s.kind) {
+                        .neg => c.BinaryenNegVecI32x4(),
+                        .fabs => c.BinaryenAbsVecI32x4(),
+                        else => return Error.UnsupportedCall,
+                    },
+                };
+                return c.BinaryenUnary(module, op, try self.inst(s.operand));
             },
             .call => |cl| {
                 // Frame reclamation (spec/memory.md §"Frame reclamation"):

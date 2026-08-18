@@ -62,6 +62,25 @@ fn mac_simd4(n: i64) -> f64 {
     a.iter().map(|v| *v as f64).sum()
 }
 
+fn clip_simd4(n: i64) -> f64 {
+    // Four lanes, branch-free clamp via min/max; LLVM vectorizes to f32x4
+    // with +simd128, matching the q64 Simd kernel.
+    let mut x = [0.5f32; 4];
+    let growth: f32 = black_box(1.0000004);
+    let mut acc = [0.0f32; 4];
+    let mut i: i64 = 0;
+    while i < n {
+        for l in 0..4 {
+            x[l] *= growth;
+            let t = 1.5 - 0.5 * x[l] * x[l];
+            let y = (x[l] * t).min(1.0).max(-1.0);
+            acc[l] += y;
+        }
+        i += 1;
+    }
+    acc.iter().map(|v| *v as f64).sum()
+}
+
 fn mix04(n: i64) -> f64 {
     let mut p = [0.0f32, 0.25, 0.5, 0.75];
     let inc = black_box([0.010986f32, 0.014648, 0.021973, 0.032959]);
@@ -208,6 +227,7 @@ fn wavetable16(n: i64) -> f64 {
 fn main() {
     timed("mac_f32", 4_000_000, 4_000_000, mac_f32);
     timed("mac_simd4", 4_000_000, 1_000_000, mac_simd4);
+    timed("clip_simd4", 4_000_000, 1_000_000, clip_simd4);
     timed("mix04", 2_000_000, 2_000_000, mix04);
     timed("biquad4", 1_000_000, 1_000_000, biquad4);
     timed("fir16", 1_000_000, 1_000_000, fir16);

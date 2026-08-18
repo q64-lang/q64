@@ -461,6 +461,11 @@ fn lowerExpr(ctx: Ctx, e: *const hir.Expr) Error!*mir.Inst {
             .lhs = try lowerExpr(ctx, s.lhs),
             .rhs = try lowerExpr(ctx, s.rhs),
         } }),
+        .simd_un => |s| return mk(ctx.a, .v128, .{ .simd_un = .{
+            .kind = s.kind,
+            .shape = s.shape,
+            .operand = try lowerExpr(ctx, s.operand),
+        } }),
         .un => |u| {
             // `not` yields a boolean (i32 0/1); `neg` preserves the
             // operand's numeric type (f64 stays f64); `bit_not` is i64.

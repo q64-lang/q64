@@ -71,7 +71,11 @@ aggregate-result `memory.copy` slides, per-call `sp` watermark save/restore
 — are exactly what these passes clean up; hand-fixing them in the lowerer
 is phase-C work only if the numbers say Binaryen didn't.
 
-**A3. Finish `Simd` for DSP.** In dependency order:
+**A3. Finish `Simd` for DSP.** *(First slice landed 2026-08: the f32x4
+lane-op surface is complete — `add`/`sub`/`mul`/`div`/`min`/`max`,
+`neg`/`abs`/`sqrt` — see `bench/README.md` finding 4 and the `clip_simd4`
+kernel. Slice load/store, struct fields, cross-function values, lane
+insert, and relaxed FMA remain.)* In dependency order:
 - loads/stores between `Simd<f32, 4>` and `[f32]` slices — without this
   SIMD cannot touch an audio buffer at all;
 - the full `f32x4` arithmetic set (`sub`, `div`, `neg`, `abs`, `min`,
