@@ -86,5 +86,6 @@ The contracts that constrain implementation choices:
 - [`spec/q64-cli.md`](./spec/q64-cli.md) — `q64` CLI surface
 - [`spec/effects.md`](./spec/effects.md) — effect markers and propagation
 - [`spec/env.md`](./spec/env.md) — capability model
+- [`spec/audio-face.md`](./spec/audio-face.md) — audio wire format + plugin surface
 
 When the spec and the code disagree, the spec is right and the code is a bug.

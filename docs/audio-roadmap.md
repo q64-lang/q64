@@ -234,6 +234,20 @@ as `spec/audio-face.md`:
 Planar f32 matches Web Audio, CLAP, and `Simd<f32, 4>` lanes
 simultaneously.
 
+*(Landed 2026-08 as `spec/audio-face.md` — pinned from the shipped
+phase-D implementation rather than ahead of it, which turned out to be
+the right order: the WCLAP target settled every open choice (the
+`v.head` header handle, host-owned overlay for plugin targets,
+block-boundary snapping with the `time` field reserved, guest-side
+one-pole smoothing, the CLAP-shaped event header adopted verbatim so
+plugin targets cast instead of re-encode). The spec also pins the
+declared `fit X : AudioPlugin` surface — closing the "exact AudioPlugin
+face" open item below — with `set_param` storing targets and `process`
+smoothing, `params()` as setup-time data, and the compiler owning
+everything C-shaped. Still open: the face in sema, the `env.audio`
+host, and the wire pieces the spec defers (note events, sample-offset
+automation, multi-port).)*
+
 **D2. Codegen prerequisites for a C-shaped plugin ABI.** The emitter
 currently produces no function tables and no `call_indirect` anywhere
 (closures inline, HOFs become loops). A CLAP-family target needs:
@@ -329,9 +343,11 @@ on D1's audio face.)*
 
 ## Open items deferred
 
-- The exact `AudioPlugin` face surface (parameter declaration syntax,
+- ~~The exact `AudioPlugin` face surface (parameter declaration syntax,
   preset/state hooks, UI entry point) — pin when D3 starts, informed by
-  D1's wire format.
+  D1's wire format.~~ Pinned 2026-08 in `spec/audio-face.md` (init /
+  params / set_param / process); preset/state hooks and the UI entry
+  point remain deferred there explicitly.
 - Whether relaxed SIMD's nondeterminism (fused vs unfused rounding) is
   acceptable under the deterministic profile, or `--deterministic` forces
   the strict forms.

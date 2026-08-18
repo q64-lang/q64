@@ -600,12 +600,18 @@ which option above we pick; (1) means hand-written decoders per face,
 (2) means generated bindings, (3) means very thin glue + Wasm GC
 interop.
 
-- [ ] Spec the audio face wire format as the first concrete
-      instance — drives the abstraction by example.
+- [x] Spec the audio face wire format as the first concrete
+      instance — drives the abstraction by example. **Done:**
+      `spec/audio-face.md` (planar f32 blocks, `v.head` buffer
+      handles, id→f64 param targets with guest smoothing,
+      CLAP-shaped event queue, the `AudioPlugin` face) — pinned
+      from the landed WCLAP target rather than speculation.
 - [ ] Sketch the browser-host JS glue API (`runQ64`, capability
       injection, AudioWorklet bridge) so the debug page in
       [qube web] can render it.
-- [ ] Cross-link from `env.md` and each face's spec.
+- [x] Cross-link from `env.md` and each face's spec. (audio done:
+      `env.md` capability table → `audio-face.md`; repeat per
+      future face.)
 
 ## Other open items
 

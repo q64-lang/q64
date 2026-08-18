@@ -33,6 +33,7 @@ suite.
 | [`streams.md`](./streams.md)                             | Signal / Event / Stream, @stage, graph, |>, pre(), fusion, SharedSignal          |
 | [`concurrency-model.md`](./concurrency-model.md)         | The consolidated concurrency/reactivity model: layer map, one-scheduler invariant, tasks-vs-actors-vs-graphs-vs-reactive decision table, the `Signal`/`State` naming rule, layer bridges |
 | [`env.md`](./env.md)                                     | Capability model, Env structure, main signature, with_capabilities, disclosure   |
+| [`audio-face.md`](./audio-face.md)                       | Real-time audio wire format (planar f32, blocks, params, events) and the `AudioPlugin` surface plugin targets synthesize from |
 | [`grammar.md`](./grammar.md)                             | Lexical structure and the consolidated syntactic grammar                          |
 | [`rpc.md`](./rpc.md)                                     | Qube-to-qube RPC over the synthesized WIT world: wRPC + component-value wire, the `@wire` effect, transports, addressing |
 | [`qview-protocol.md`](./qview-protocol.md)               | QView retained mutation protocol (Stage 1): `create_node`/`set_attr`/`remove`/`on`/`present`, node-kind/attr/event enums, the versioned Renderer contract |

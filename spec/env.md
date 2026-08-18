@@ -157,7 +157,7 @@ shipped by the runtime are:
 | `env.db`      | `Database`      | `@db`          | SQL database: query / execute / batch (SQLite dialect). See `q64.db`. |
 | `env.blob`    | `BlobStore`     | `@blob`        | Object store: get / put / delete / list of opaque blobs. See `q64.blob`. |
 | `env.config`  | `Config`        | `@config`      | Read-only application configuration / secrets, keyed by string. See `q64.config`. |
-| `env.audio`   | `Audio`         | `@audio`       | PCM input/output, audio worklets. See `q64.audio`.             |
+| `env.audio`   | `Audio`         | `@audio`       | PCM input/output, audio worklets. See `q64.audio` and [`audio-face.md`](./audio-face.md) (wire format). |
 | `env.midi`    | `Midi`          | `@midi`        | MIDI input/output. See `q64.midi`.                             |
 | `env.ai`      | `AiEnv`         | `@inference`   | Model loading, inference, vocabularies. See `q64.ai`.          |
 | `env.ui`      | `Ui`            | `@ui`          | Input events (clicks, keys), frame output. See `q64.ui`.       |
