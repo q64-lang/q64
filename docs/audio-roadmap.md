@@ -304,6 +304,15 @@ reference browser host, and processes audio inside budget; `q64 show
 world` on a plugin qube shows the audio face as its complete import
 surface.
 
+*(First criterion met 2026-08: the `--wclap` output bundled as
+`.wclap.tar.gz` loads in plinken-org's `apps/wclap-host` — the WebCLAP
+`wclap-host-js` runtime in an AudioWorklet, a host this repo does not
+control — and processes audio; `examples/audio-wclap/host-smoke.mjs`
+drives it through the UI with Playwright and requires the RMS meters to
+move. Budget: ~16 µs per 128-frame block against 2667 µs at 48 kHz,
+measured and gated in `check.mjs`. The `q64 show world` criterion waits
+on D1's audio face.)*
+
 ## Phase E — later, each gated on the phases above
 
 - **Threads and voice pools** over `@shared` + `SharedSignal`

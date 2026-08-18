@@ -243,7 +243,11 @@ const measurePeriod = (samples) => {
 };
 
 const BLOCKS = 400;
+const t0 = performance.now();
 const base = runBlocks(BLOCKS);
+const usPerBlock = ((performance.now() - t0) * 1000) / BLOCKS;
+// The realtime budget for a 128-frame quantum at 48 kHz is 2667 µs.
+if (usPerBlock > 1000) throw new Error(`${usPerBlock.toFixed(1)} µs/block — too close to the 2667 µs realtime budget`);
 let energy = 0;
 for (const x of base) energy += x * x;
 if (energy < 1) throw new Error("plugin is silent — audio never reached the host buffers");
@@ -254,7 +258,7 @@ const perBlock = energy / BLOCKS;
 if (Math.abs(perBlock - 84.7) > 8) throw new Error(`per-block energy ${perBlock.toFixed(2)}, expected ~84.7`);
 const basePeriod = measurePeriod(base.subarray(base.length / 2));
 if (Math.abs(basePeriod - SR / 110) > SR / 110 * 0.1) throw new Error(`baseline period ${basePeriod.toFixed(1)} samples, expected ~${(SR / 110).toFixed(1)} (110 Hz)`);
-console.log(`ok: ${BLOCKS} blocks, energy ${perBlock.toFixed(2)}/block, period ${basePeriod.toFixed(1)} samples (~${(SR / basePeriod).toFixed(1)} Hz), state persists, stereo mirrored`);
+console.log(`ok: ${BLOCKS} blocks, energy ${perBlock.toFixed(2)}/block, period ${basePeriod.toFixed(1)} samples (~${(SR / basePeriod).toFixed(1)} Hz), ${usPerBlock.toFixed(1)} µs/block (budget 2667), state persists, stereo mirrored`);
 
 // ---- automation: a param event through process must change the sound --
 pendingEvents = [paramEvent(0, 220)];

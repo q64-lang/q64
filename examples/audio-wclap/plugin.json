@@ -1,0 +1,15 @@
+{
+  "manifest_version": 1,
+  "id": "dev.q64.voice",
+  "name": "q64 Voice",
+  "vendor": "q64",
+  "version": "0.1.0",
+  "description": "A saw voice written in q64: phase-accumulator oscillator, biquad low-pass, soft clip. Compiled by `q64 emit --wclap`.",
+  "features": ["instrument", "synthesizer"],
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://q64.dev",
+  "has_ui": false,
+  "plugins": [
+    { "id": "dev.q64.voice", "name": "q64 Voice", "features": ["instrument", "synthesizer"], "has_ui": false }
+  ]
+}

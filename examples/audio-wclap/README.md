@@ -80,6 +80,9 @@ touches the module's own exports. It drives the full lifecycle
 same voice the worklet smoke test measures (~84.7 energy per 128-frame
 block, state persisting across blocks, channel 1 mirroring channel 0).
 
+It also measures throughput: ~16 µs per 128-frame block against the
+2667 µs realtime budget at 48 kHz (and fails above 1000 µs).
+
 For `clap.params` it goes further than reading the surface back: it
 installs real host trampolines — a JS function can't enter a funcref
 table, so it compiles a ~50-byte wasm module per signature (import
@@ -91,3 +94,41 @@ the default, 220.0 Hz after the event. `flush` outside processing and
 out-of-range clamping are exercised the same way. A params test that
 only checks `get_value` would pass with the DSP disconnected; measuring
 the audio is what makes it honest.
+
+## The reference browser host (the real conformance check)
+
+`check.mjs` is our host; the ultimate check is the *reference* host — the
+`apps/wclap-host` app in the public [plinken-org
+repo](https://github.com/plinken-org/plinken-wclap), which runs the
+WebCLAP `wclap-host-js` runtime inside an `AudioWorklet`. It ingests
+`.wclap.tar.gz` bundles with `module.wasm` at the root:
+
+```sh
+# bundle (plugin.json in this directory)
+tar czf q64-voice.wclap.tar.gz --transform 's/^voice.wclap.wasm/module.wasm/' \
+  voice.wclap.wasm plugin.json
+```
+
+With a plinken-org checkout (submodules initialized) serving the host —
+
+```sh
+git submodule update --init --recursive   # wclap-host-js + its wasi runtime
+pnpm install
+cd apps/wclap-host && ./node_modules/.bin/vite --port 5199 --strictPort
+```
+
+— and the bundle copied into its `public/samples/`, `host-smoke.mjs`
+drives the real thing end-to-end with Playwright, through the UI exactly
+as a user would: add the bundle URL to the shelf, click the chip into a
+rack slot, and require the RMS meters to move:
+
+```sh
+node host-smoke.mjs http://localhost:5199/
+# ok: q64 Voice loaded in slot 1.
+# ok: audio flowing — meters L=84.4% R=84.4%
+# host-smoke: PASS
+```
+
+That is the roadmap's phase-D exit criterion observed live: a q64
+program, compiled by `q64 emit --wclap`, loading and processing audio in
+a WCLAP host this repo does not control.
