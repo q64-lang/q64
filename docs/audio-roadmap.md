@@ -355,8 +355,18 @@ export — what a byte means is entirely the guest's mapping. audio-poly
 routes CC 1 (mod wheel) through its own set_param for a full-range
 cutoff sweep; the check confirms 100→7999 Hz by readback and that
 unmapped CCs are ignored. All three CLAP core event payloads
-(param-value, note, MIDI) are now pinned and routed. Native CLAP and
-AU/VST3 remain.)*
+(param-value, note, MIDI) are now pinned and routed.
+
+Sample-offset accuracy closed the last recorded event deferral: the
+process trampoline splits the block at event times (CLAP delivers them
+sorted), rendering the segments between applications — the guest's
+state-carried re-entrancy makes segmentation free on its side (the io
+header overlay just starts later in the host buffer), so no guest
+changed. audio-poly's check proves it with the sharpest possible
+boundary: a note-on carrying time=64 leaves samples [0,64) of its block
+exactly zero and [64,128) sounding; time=0 degenerates to the old
+apply-then-render path bit-for-bit (every prior check unchanged).
+Native CLAP and AU/VST3 remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the
 reference browser host, and processes audio inside budget; `q64 show

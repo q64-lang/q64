@@ -24,10 +24,12 @@
 //! because both reach the guest surface with pure arithmetic (inc =
 //! 2·f/sr; drive passes through), and the guest already one-pole-smooths
 //! every target in-state, so abrupt host automation lands click-free.
-//! Param-value events are read from `in_events` the only way a WCLAP
-//! plugin can: `call_indirect` through the host-installed size/get
-//! trampolines, snapping values at block boundaries (sample-offset
-//! accuracy is a recorded deferral). The filter stays fixed until the
+//! Events are read from `in_events` the only way a WCLAP plugin can:
+//! `call_indirect` through the host-installed size/get trampolines.
+//! Application is sample-offset-accurate: the process trampoline splits
+//! the block at event times (CLAP delivers them sorted) and renders the
+//! segments between applications — the guest's state-carried
+//! re-entrancy makes segmentation free on its side. The filter stays fixed until the
 //! declared plugin surface lands (coefficients need trig the shim
 //! shouldn't synthesize).
 //!
@@ -298,6 +300,7 @@ pub fn wclapWrap(allocator: std.mem.Allocator, wasm: []const u8, wasm64: bool, m
     addFactoryFns(b);
     addPluginFns(b, str_ports_id, str_params_id);
     addPortsFns(b, str_stereo);
+    addApplyOne(b);
     addApplyEvents(b);
     addParamsFns(b);
 
@@ -467,72 +470,159 @@ fn addPluginFns(b: B, ports_id: u32, params_id: u32) void {
 /// channel_count @8, latency @12, constant_mask u64 @16.
 fn addProcess(b: B) void {
     const m = b.m;
+
+    // `__wclap_render_seg(ch0, pos, len)` — one guest render over the
+    // sub-range [pos, pos+len) of the host's channel-0 buffer: the vec
+    // header is overlaid at the offset, so the guest just sees a shorter
+    // buffer. The guest's state-carried re-entrancy is what makes
+    // sample-offset segmentation free on its side.
+    {
+        const CH0 = 0;
+        const POS = 1;
+        const LEN = 2;
+        // inc = f32(2·freq / sr) — the saw increment convention.
+        const inc = c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenBinary(m, c.BinaryenDivFloat64(), c.BinaryenBinary(m, c.BinaryenMulFloat64(), c.BinaryenConst(m, c.BinaryenLiteralFloat64(2.0)), c.BinaryenGlobalGet(m, "__wclap_freq", b.f64t)), c.BinaryenGlobalGet(m, "__wclap_sr", b.f64t)));
+        const cf = struct {
+            fn k(bb: B, v: f64) c.BinaryenExpressionRef {
+                return c.BinaryenConst(bb.m, c.BinaryenLiteralFloat32(@floatCast(v)));
+            }
+        }.k;
+        // 1 kHz Butterworth low-pass @48k — the mono fallback's fixed
+        // filter (a guest-params guest carries its own coefficients).
+        var pargs = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+            b.addr(IO_HDR),
+            c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(LEN, b.i32t)),
+            inc,
+            cf(b, 0.000944692), cf(b, 0.001889384), cf(b, 0.000944692),
+            cf(b, -1.911196288), cf(b, 0.914975055),
+            c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_drive", b.f64t)),
+            // gain = the note gate; the guest smooths it — that ramp IS
+            // the ~7 ms attack/release envelope.
+            c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_gate", b.f64t)),
+        };
+        // A guest with its own parameter table takes the short signature —
+        // targets live in guest state, not positional args.
+        var pargs3 = [_]c.BinaryenExpressionRef{
+            c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
+            b.addr(IO_HDR),
+            c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(LEN, b.i32t)),
+        };
+        const process_call = if (b.guestParams())
+            c.BinaryenCall(m, b.fn_process, @ptrCast(&pargs3), pargs3.len, b.i64t)
+        else
+            c.BinaryenCall(m, b.fn_process, @ptrCast(&pargs), pargs.len, b.i64t);
+        var body = [_]c.BinaryenExpressionRef{
+            b.store32(0, b.addr(IO_HDR), c.BinaryenBinary(m, c.BinaryenAddInt32(), b.get(CH0, b.i32t), c.BinaryenBinary(m, c.BinaryenShlInt32(), b.get(POS, b.i32t), b.ci32(2)))),
+            b.store32(4, b.addr(IO_HDR), b.get(LEN, b.i32t)),
+            b.store32(8, b.addr(IO_HDR), b.get(LEN, b.i32t)),
+            c.BinaryenDrop(m, process_call),
+        };
+        var p3 = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+        _ = c.BinaryenAddFunction(m, "__wclap_render_seg", c.BinaryenTypeCreate(&p3, p3.len), b.none, null, 0, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.none));
+    }
+
+    // plugin.process itself: split the block at event times (CLAP
+    // delivers in_events sorted by time), rendering each segment with
+    // the targets as of that offset — sample-offset-accurate automation
+    // and notes with no guest involvement. time 0 degenerates to
+    // apply-then-render-whole-block.
     const P = 1; // param 1: clap_process*
-    // locals: 2=frames(i32) 3=outs(buffer*) 4=data32 5=ch0
     const FRAMES = 2;
-    // inc = f32(2·freq / sr) — the saw increment convention.
-    const inc = c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenBinary(m, c.BinaryenDivFloat64(), c.BinaryenBinary(m, c.BinaryenMulFloat64(), c.BinaryenConst(m, c.BinaryenLiteralFloat64(2.0)), c.BinaryenGlobalGet(m, "__wclap_freq", b.f64t)), c.BinaryenGlobalGet(m, "__wclap_sr", b.f64t)));
-    const cf = struct {
-        fn k(bb: B, v: f64) c.BinaryenExpressionRef {
-            return c.BinaryenConst(bb.m, c.BinaryenLiteralFloat32(@floatCast(v)));
-        }
-    }.k;
-    // 1 kHz Butterworth low-pass @48k — the filter stays fixed until the
-    // declared plugin surface lands (coefficients need trig).
-    var pargs = [_]c.BinaryenExpressionRef{
-        c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
-        b.addr(IO_HDR),
-        c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(FRAMES, b.i32t)),
-        inc,
-        cf(b, 0.000944692), cf(b, 0.001889384), cf(b, 0.000944692),
-        cf(b, -1.911196288), cf(b, 0.914975055),
-        c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_drive", b.f64t)),
-        // gain = the note gate (velocity while a note is held, 0 after
-        // note-off, 1 free-running); the guest smooths it — that ramp IS
-        // the ~7 ms attack/release envelope.
-        c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_gate", b.f64t)),
+    const OUTS = 3;
+    const DATA32 = 4;
+    const CH0 = 5;
+    const LIST = 6;
+    const NEV = 7;
+    const I = 8;
+    const EV = 9;
+    const POS = 10;
+    const T = 11;
+    var p1t = [_]c.BinaryenType{b.i32t};
+    var p2t = [_]c.BinaryenType{ b.i32t, b.i32t };
+    var size_args = [_]c.BinaryenExpressionRef{b.get(LIST, b.i32t)};
+    var get_args = [_]c.BinaryenExpressionRef{ b.get(LIST, b.i32t), b.get(I, b.i32t) };
+    var one_args = [_]c.BinaryenExpressionRef{b.get(EV, b.i32t)};
+    var flush_args = [_]c.BinaryenExpressionRef{b.get(LIST, b.i32t)};
+    var seg_args = [_]c.BinaryenExpressionRef{ b.get(CH0, b.i32t), b.get(POS, b.i32t), c.BinaryenBinary(m, c.BinaryenSubInt32(), b.get(T, b.i32t), b.get(POS, b.i32t)) };
+    var tail_args = [_]c.BinaryenExpressionRef{ b.get(CH0, b.i32t), b.get(POS, b.i32t), c.BinaryenBinary(m, c.BinaryenSubInt32(), b.get(FRAMES, b.i32t), b.get(POS, b.i32t)) };
+    var iter_body = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(m, EV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(8, b.get(LIST, b.i32t)), @ptrCast(&get_args), get_args.len, c.BinaryenTypeCreate(&p2t, p2t.len), b.i32t)),
+        c.BinaryenIf(
+            m,
+            c.BinaryenBinary(m, c.BinaryenNeInt32(), b.get(EV, b.i32t), b.ci32(0)),
+            c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
+                // t = min(header.time, frames)
+                c.BinaryenLocalSet(m, T, b.load32(4, b.get(EV, b.i32t))),
+                c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenGtUInt32(), b.get(T, b.i32t), b.get(FRAMES, b.i32t)), c.BinaryenLocalSet(m, T, b.get(FRAMES, b.i32t)), null),
+                // render up to the event's offset, then apply it
+                c.BinaryenIf(
+                    m,
+                    c.BinaryenBinary(m, c.BinaryenGtUInt32(), b.get(T, b.i32t), b.get(POS, b.i32t)),
+                    c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
+                        c.BinaryenCall(m, "__wclap_render_seg", @ptrCast(&seg_args), seg_args.len, b.none),
+                        c.BinaryenLocalSet(m, POS, b.get(T, b.i32t)),
+                    }), 2, b.none),
+                    null,
+                ),
+                c.BinaryenCall(m, "__wclap_apply_one", @ptrCast(&one_args), one_args.len, b.none),
+            }), 4, b.none),
+            null,
+        ),
+        c.BinaryenLocalSet(m, I, c.BinaryenBinary(m, c.BinaryenAddInt32(), b.get(I, b.i32t), b.ci32(1))),
+        c.BinaryenBreak(m, "seg", null, null),
     };
-    // A guest with its own parameter table takes the short signature —
-    // targets live in guest state, not positional args.
-    var pargs3 = [_]c.BinaryenExpressionRef{
-        c.BinaryenGlobalGet(m, "__wclap_st", b.i32t),
-        b.addr(IO_HDR),
-        c.BinaryenUnary(m, c.BinaryenExtendUInt32(), b.get(FRAMES, b.i32t)),
-    };
-    const process_call = if (b.guestParams())
-        c.BinaryenCall(m, b.fn_process, @ptrCast(&pargs3), pargs3.len, b.i64t)
-    else
-        c.BinaryenCall(m, b.fn_process, @ptrCast(&pargs), pargs.len, b.i64t);
-    var evargs = [_]c.BinaryenExpressionRef{b.load32(32, b.get(P, b.i32t))};
+    const ev_loop = c.BinaryenLoop(m, "seg", c.BinaryenIf(
+        m,
+        c.BinaryenBinary(m, c.BinaryenLtUInt32(), b.get(I, b.i32t), b.get(NEV, b.i32t)),
+        c.BinaryenBlock(m, null, @ptrCast(&iter_body), iter_body.len, b.none),
+        null,
+    ));
     var body = [_]c.BinaryenExpressionRef{
-        // param events first — targets snap at the block boundary and the
-        // guest's one-pole smoothing de-zippers them.
-        c.BinaryenCall(m, "__wclap_apply_events", @ptrCast(&evargs), evargs.len, b.none),
-        // frames = proc.frames_count
         c.BinaryenLocalSet(m, FRAMES, b.load32(8, b.get(P, b.i32t))),
-        // if (out_count == 0) return CONTINUE (nothing to fill)
-        c.BinaryenIf(m, c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.load32(28, b.get(P, b.i32t))), c.BinaryenReturn(m, b.ci32(1)), null),
+        c.BinaryenLocalSet(m, LIST, b.load32(32, b.get(P, b.i32t))),
+        // no outputs: events still apply (CLAP requires it), nothing renders
+        c.BinaryenIf(
+            m,
+            c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.load32(28, b.get(P, b.i32t))),
+            c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
+                c.BinaryenCall(m, "__wclap_apply_events", @ptrCast(&flush_args), flush_args.len, b.none),
+                c.BinaryenReturn(m, b.ci32(1)),
+            }), 2, b.none),
+            null,
+        ),
         // outs = proc.audio_outputs; data32 = outs[0].data32; ch0 = data32[0]
-        c.BinaryenLocalSet(m, 3, b.load32(20, b.get(P, b.i32t))),
-        c.BinaryenLocalSet(m, 4, b.load32(0, b.get(3, b.i32t))),
-        c.BinaryenLocalSet(m, 5, b.load32(0, b.get(4, b.i32t))),
-        // io header over the host's ch0 buffer: {data, len, cap}
-        b.store32(0, b.addr(IO_HDR), b.get(5, b.i32t)),
-        b.store32(4, b.addr(IO_HDR), b.get(FRAMES, b.i32t)),
-        b.store32(8, b.addr(IO_HDR), b.get(FRAMES, b.i32t)),
-        // the q64 voice renders straight into host memory
-        c.BinaryenDrop(m, process_call),
+        c.BinaryenLocalSet(m, OUTS, b.load32(20, b.get(P, b.i32t))),
+        c.BinaryenLocalSet(m, DATA32, b.load32(0, b.get(OUTS, b.i32t))),
+        c.BinaryenLocalSet(m, CH0, b.load32(0, b.get(DATA32, b.i32t))),
+        c.BinaryenLocalSet(m, NEV, b.ci32(0)),
+        c.BinaryenIf(
+            m,
+            c.BinaryenBinary(m, c.BinaryenNeInt32(), b.get(LIST, b.i32t), b.ci32(0)),
+            c.BinaryenLocalSet(m, NEV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(4, b.get(LIST, b.i32t)), @ptrCast(&size_args), size_args.len, c.BinaryenTypeCreate(&p1t, p1t.len), b.i32t)),
+            null,
+        ),
+        c.BinaryenLocalSet(m, I, b.ci32(0)),
+        c.BinaryenLocalSet(m, POS, b.ci32(0)),
+        ev_loop,
+        // the remainder of the block after the last event
+        c.BinaryenIf(
+            m,
+            c.BinaryenBinary(m, c.BinaryenLtUInt32(), b.get(POS, b.i32t), b.get(FRAMES, b.i32t)),
+            c.BinaryenCall(m, "__wclap_render_seg", @ptrCast(&tail_args), tail_args.len, b.none),
+            null,
+        ),
         // stereo: ch1 = ch0 when a second channel exists
         c.BinaryenIf(
             m,
-            c.BinaryenBinary(m, c.BinaryenGtUInt32(), b.load32(8, b.get(3, b.i32t)), b.ci32(1)),
-            c.BinaryenMemoryCopy(m, b.load32(4, b.get(4, b.i32t)), b.get(5, b.i32t), c.BinaryenBinary(m, c.BinaryenShlInt32(), b.get(FRAMES, b.i32t), b.ci32(2)), null, null),
+            c.BinaryenBinary(m, c.BinaryenGtUInt32(), b.load32(8, b.get(OUTS, b.i32t)), b.ci32(1)),
+            c.BinaryenMemoryCopy(m, b.load32(4, b.get(DATA32, b.i32t)), b.get(CH0, b.i32t), c.BinaryenBinary(m, c.BinaryenShlInt32(), b.get(FRAMES, b.i32t), b.ci32(2)), null, null),
             null,
         ),
         b.ci32(1), // CLAP_PROCESS_CONTINUE
     };
     var params = [_]c.BinaryenType{ b.i32t, b.i32t };
-    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t, b.i32t };
+    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t, b.i32t, b.i32t, b.i32t, b.i32t, b.i32t, b.i32t, b.i32t };
     _ = c.BinaryenAddFunction(m, "__wclap_p_process", c.BinaryenTypeCreate(&params, params.len), b.i32t, @ptrCast(&vt), vt.len, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.i32t));
 }
 
@@ -582,9 +672,42 @@ fn addApplyEvents(b: B) void {
     const N = 1;
     const I = 2;
     const EV = 3;
-    const PID = 4;
-    const TYPE = 5;
-    const KEY = 6;
+    var size_args = [_]c.BinaryenExpressionRef{b.get(LIST, b.i32t)};
+    var get_args = [_]c.BinaryenExpressionRef{ b.get(LIST, b.i32t), b.get(I, b.i32t) };
+    var p1 = [_]c.BinaryenType{b.i32t};
+    var p2 = [_]c.BinaryenType{ b.i32t, b.i32t };
+    var one_args = [_]c.BinaryenExpressionRef{b.get(EV, b.i32t)};
+    var iter_body = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(m, EV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(8, b.get(LIST, b.i32t)), @ptrCast(&get_args), get_args.len, c.BinaryenTypeCreate(&p2, p2.len), b.i32t)),
+        c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenNeInt32(), b.get(EV, b.i32t), b.ci32(0)), c.BinaryenCall(m, "__wclap_apply_one", @ptrCast(&one_args), one_args.len, b.none), null),
+        c.BinaryenLocalSet(m, I, c.BinaryenBinary(m, c.BinaryenAddInt32(), b.get(I, b.i32t), b.ci32(1))),
+        c.BinaryenBreak(m, "ev", null, null),
+    };
+    const loop = c.BinaryenLoop(m, "ev", c.BinaryenIf(
+        m,
+        c.BinaryenBinary(m, c.BinaryenLtUInt32(), b.get(I, b.i32t), b.get(N, b.i32t)),
+        c.BinaryenBlock(m, null, @ptrCast(&iter_body), iter_body.len, b.none),
+        null,
+    ));
+    var body = [_]c.BinaryenExpressionRef{
+        c.BinaryenIf(m, c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(LIST, b.i32t)), c.BinaryenReturn(m, null), null),
+        c.BinaryenLocalSet(m, N, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(4, b.get(LIST, b.i32t)), @ptrCast(&size_args), size_args.len, c.BinaryenTypeCreate(&p1, p1.len), b.i32t)),
+        c.BinaryenLocalSet(m, I, b.ci32(0)),
+        loop,
+    };
+    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+    _ = c.BinaryenAddFunction(m, "__wclap_apply_events", b.i32t, b.none, @ptrCast(&vt), vt.len, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.none));
+}
+
+/// `__wclap_apply_one(ev*)` — dispatch one core-space event to the
+/// parameter/note/MIDI targets. Shared by the flush walk above and the
+/// process trampoline's sample-offset segment loop.
+fn addApplyOne(b: B) void {
+    const m = b.m;
+    const EV = 0; // param
+    const PID = 1;
+    const TYPE = 2;
+    const KEY = 3;
     const clampSet = struct {
         fn f(bb: B, global: [*:0]const u8, ev_local: u32, lo: f64, hi: f64) c.BinaryenExpressionRef {
             const mm = bb.m;
@@ -598,10 +721,6 @@ fn addApplyEvents(b: B) void {
             return c.BinaryenBinary(bb.m, c.BinaryenEqInt32(), bb.get(TYPE, bb.i32t), bb.ci32(t));
         }
     }.f;
-    var size_args = [_]c.BinaryenExpressionRef{b.get(LIST, b.i32t)};
-    var get_args = [_]c.BinaryenExpressionRef{ b.get(LIST, b.i32t), b.get(I, b.i32t) };
-    var p1 = [_]c.BinaryenType{b.i32t};
-    var p2 = [_]c.BinaryenType{ b.i32t, b.i32t };
     // param-value (type 5): forward to the guest's set_param (it owns
     // clamping and derived math), or route by id into the shim's
     // built-in targets, clamped here.
@@ -678,51 +797,30 @@ fn addApplyEvents(b: B) void {
         c.BinaryenDrop(m, c.BinaryenCall(m, mf, @ptrCast(&midi_args), midi_args.len, b.i64t))
     else
         c.BinaryenNop(m);
-    var iter_body = [_]c.BinaryenExpressionRef{
-        c.BinaryenLocalSet(m, EV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(8, b.get(LIST, b.i32t)), @ptrCast(&get_args), get_args.len, c.BinaryenTypeCreate(&p2, p2.len), b.i32t)),
+    var body = [_]c.BinaryenExpressionRef{
+        // core-space events only
+        c.BinaryenIf(m, c.BinaryenLoad(m, 2, false, 8, 0, b.i32t, b.get(EV, b.i32t), null), c.BinaryenReturn(m, null), null),
+        c.BinaryenLocalSet(m, TYPE, c.BinaryenLoad(m, 2, false, 10, 0, b.i32t, b.get(EV, b.i32t), null)),
         c.BinaryenIf(
             m,
-            // core-space events only (ev != 0 && space_id == 0)
-            c.BinaryenBinary(m, c.BinaryenAndInt32(), c.BinaryenBinary(m, c.BinaryenNeInt32(), b.get(EV, b.i32t), b.ci32(0)), c.BinaryenUnary(m, c.BinaryenEqZInt32(), c.BinaryenLoad(m, 2, false, 8, 0, b.i32t, b.get(EV, b.i32t), null))),
-            c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
-                c.BinaryenLocalSet(m, TYPE, c.BinaryenLoad(m, 2, false, 10, 0, b.i32t, b.get(EV, b.i32t), null)),
+            typeIs(b, 5), // CLAP_EVENT_PARAM_VALUE
+            c.BinaryenBlock(m, null, @ptrCast(&param_body), param_body.len, b.none),
+            c.BinaryenIf(
+                m,
+                typeIs(b, 0), // CLAP_EVENT_NOTE_ON
+                c.BinaryenBlock(m, null, @ptrCast(&note_on_body), note_on_body.len, b.none),
                 c.BinaryenIf(
                     m,
-                    typeIs(b, 5), // CLAP_EVENT_PARAM_VALUE
-                    c.BinaryenBlock(m, null, @ptrCast(&param_body), param_body.len, b.none),
-                    c.BinaryenIf(
-                        m,
-                        typeIs(b, 0), // CLAP_EVENT_NOTE_ON
-                        c.BinaryenBlock(m, null, @ptrCast(&note_on_body), note_on_body.len, b.none),
-                        c.BinaryenIf(
-                            m,
-                            // NOTE_OFF (1) or NOTE_CHOKE (2) both release
-                            c.BinaryenBinary(m, c.BinaryenOrInt32(), typeIs(b, 1), typeIs(b, 2)),
-                            off_action,
-                            c.BinaryenIf(m, typeIs(b, 10), midi_action, null), // CLAP_EVENT_MIDI
-                        ),
-                    ),
+                    // NOTE_OFF (1) or NOTE_CHOKE (2) both release
+                    c.BinaryenBinary(m, c.BinaryenOrInt32(), typeIs(b, 1), typeIs(b, 2)),
+                    off_action,
+                    c.BinaryenIf(m, typeIs(b, 10), midi_action, null), // CLAP_EVENT_MIDI
                 ),
-            }), 2, b.none),
-            null,
+            ),
         ),
-        c.BinaryenLocalSet(m, I, c.BinaryenBinary(m, c.BinaryenAddInt32(), b.get(I, b.i32t), b.ci32(1))),
-        c.BinaryenBreak(m, "ev", null, null),
     };
-    const loop = c.BinaryenLoop(m, "ev", c.BinaryenIf(
-        m,
-        c.BinaryenBinary(m, c.BinaryenLtUInt32(), b.get(I, b.i32t), b.get(N, b.i32t)),
-        c.BinaryenBlock(m, null, @ptrCast(&iter_body), iter_body.len, b.none),
-        null,
-    ));
-    var body = [_]c.BinaryenExpressionRef{
-        c.BinaryenIf(m, c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(LIST, b.i32t)), c.BinaryenReturn(m, null), null),
-        c.BinaryenLocalSet(m, N, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(4, b.get(LIST, b.i32t)), @ptrCast(&size_args), size_args.len, c.BinaryenTypeCreate(&p1, p1.len), b.i32t)),
-        c.BinaryenLocalSet(m, I, b.ci32(0)),
-        loop,
-    };
-    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t, b.i32t, b.i32t, b.i32t };
-    _ = c.BinaryenAddFunction(m, "__wclap_apply_events", b.i32t, b.none, @ptrCast(&vt), vt.len, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.none));
+    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t };
+    _ = c.BinaryenAddFunction(m, "__wclap_apply_one", b.i32t, b.none, @ptrCast(&vt), vt.len, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.none));
 }
 
 /// The `clap.params` extension: count / get_info / get_value /

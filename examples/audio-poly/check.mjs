@@ -110,9 +110,10 @@ table.set(getIdx, trampoline((_l, i) => pendingEvents[i] ?? 0, 2));
 const inEvents = ex.malloc(12);
 mem().setUint32(inEvents + 4, sizeIdx, true);
 mem().setUint32(inEvents + 8, getIdx, true);
-const noteEvent = (type, key, velocity) => {
+const noteEvent = (type, key, velocity, time = 0) => {
   const ev = ex.malloc(40);
   mem().setUint32(ev + 0, 40, true);
+  mem().setUint32(ev + 4, time, true); // sample offset within the block
   mem().setUint16(ev + 10, type, true);
   mem().setInt16(ev + 24, key, true);
   mem().setFloat64(ev + 32, velocity, true);
@@ -257,5 +258,23 @@ pendingEvents = [midiEvent(0xb0, 7, 64)]; // CC 7 (volume) — must be ignored
 runBlocks(2);
 if (getValue(0) !== 100) throw new Error("unmapped CC changed the cutoff");
 console.log(`ok: raw MIDI — mod wheel sweeps cutoff (127 -> ${wheelFull.toFixed(1)} Hz, 0 -> 100 Hz), unmapped CC ignored`);
+
+// ---- sample-offset accuracy ------------------------------------------
+// A note-on carrying time=64 must leave the first 64 samples of that
+// block EXACTLY zero (the trampoline renders [0,64) before applying the
+// event, and a silent poly guest renders exact zeros) and produce sound
+// in [64,128). Block-snapped handling would ramp from sample 0 — this
+// boundary is the sharpest possible proof the time field is honored.
+pendingEvents = [noteEvent(0, 69, 1.0, 64)];
+const offsetBlock = runBlocks(1);
+for (let i = 0; i < 64; i++) {
+  if (offsetBlock[i] !== 0) throw new Error(`sample ${i} nonzero (${offsetBlock[i]}) before the time=64 note-on`);
+}
+let after = 0;
+for (let i = 64; i < FRAMES; i++) after += Math.abs(offsetBlock[i]);
+if (after === 0) throw new Error("no audio after the time=64 note-on within its block");
+pendingEvents = [noteEvent(1, 69, 0.0)];
+runBlocks(60);
+console.log("ok: sample-offset accuracy — time=64 note-on: [0,64) exactly zero, [64,128) sounding");
 
 console.log("poly-check: PASS");

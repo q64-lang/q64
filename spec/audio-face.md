@@ -114,10 +114,13 @@ stability is what keeps the per-block path `@realtime`-typed.
   every sample (the `q64.audio` convention, coefficient ≈ 0.003 at
   48 kHz ⇒ ~7 ms time constant). Host automation therefore lands
   click-free with no host-side ramp generation.
-- Values **snap at block boundaries** in v1. Sample-offset-accurate
-  automation (CLAP carries a `time` field; see the event header
-  below) is deferred — the field is already in the layout, so
-  adopting it later changes no wire bytes.
+- Values apply **sample-offset-accurately**: an event carrying a
+  `time` field takes effect at that frame — the plugin target splits
+  the block at event times and renders the segments between
+  applications (guest `process` is re-entrant over sub-ranges by
+  construction: state rides the state vec, and the io header overlay
+  just starts later in the host buffer). `time = 0` degenerates to
+  apply-then-render-whole-block.
 - Out-of-range values clamp before they reach the DSP — by the shim
   for shim-owned tables, by `set_param` for guest-declared ones.
 - A parameter **declaration** is setup-time data: `{id, name, min,
@@ -132,7 +135,7 @@ pointer cast rather than re-encoding:
 ```
 offset  size  field
 0       u32   size        total entry bytes (header + payload)
-4       u32   time        sample offset within the block (v1: ignored, block-snap)
+4       u32   time        sample offset within the block (clamped to the block length)
 8       u16   space_id    0 = core
 10      u16   type
 12      u32   flags
@@ -231,8 +234,8 @@ pub face AudioPlugin {
     fn init(self, sample_rate: f64, max_block: i64)
     /// Setup time. The parameter table — read once by the target.
     fn params(self) -> Vec<Param>
-    /// A new target for one parameter. Called at block boundaries,
-    /// before process. Store the target; smooth in process.
+    /// A new target for one parameter, applied at the event's sample
+    /// offset. Store the target; smooth in process.
     fn set_param(self, id: i64, value: f64) @realtime
     /// One block into the output buffer. The face is mono-per-buffer;
     /// multi-channel is repeated buffers (planar).
@@ -319,7 +322,7 @@ synthesis treating it like any other face — tracked there, not here.
 | planar `f32` | interleaved / integer PCM kinds |
 | block size per call, max at activation | — |
 | `v.head` header handle, stable addresses | shared-memory / multi-thread buffers |
-| params `id → f64`, guest smoothing, block snap | sample-offset automation |
+| params `id → f64`, guest smoothing, sample-offset application | — |
 | CLAP-shaped event header, param-value + note on/off/choke + raw MIDI | — |
 | polyphony as guest-side voice allocation (notes forwarded as calls) | — |
 | one output port, planar channels | multi-port, sidechain |

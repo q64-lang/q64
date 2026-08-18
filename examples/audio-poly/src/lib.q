@@ -58,7 +58,7 @@ pub fn state_cells() -> i64 {
 
 // RBJ low-pass at the shadowed cutoff, Q = 0.7071 (Butterworth), into
 // the coefficient-target cells. Runs at prepare and on each cutoff
-// set_param — block-boundary, never per sample.
+// set_param — per event, never per sample.
 fn lp_coeffs(ref st: Vec<f32>) -> i64 @realtime {
     let w = st[P_CUTOFF] / st[SR]
     let s = sin2pi(w)
