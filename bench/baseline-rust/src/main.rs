@@ -130,6 +130,27 @@ fn gain_buf(sweeps: i64) -> f64 {
     v[0] as f64 + v[1023] as f64
 }
 
+#[inline(never)]
+fn process(inp: &[f32], outp: &mut [f32], g: f32, n: usize) {
+    // The plugin process shape: out-of-place block gain behind a real call
+    // (inline(never) — the q64 twin pays a genuine function boundary too).
+    for i in 0..n {
+        outp[i] = inp[i] * g;
+    }
+}
+
+fn process_buf(sweeps: i64) -> f64 {
+    let inp = vec![1.0f32; 1024];
+    let mut outp = vec![0.0f32; 1024];
+    let g: f32 = black_box(0.9995);
+    let mut s: i64 = 0;
+    while s < sweeps {
+        process(&inp, &mut outp, g, 1024);
+        s += 1;
+    }
+    outp[0] as f64 + outp[1023] as f64
+}
+
 fn mix04(n: i64) -> f64 {
     let mut p = [0.0f32, 0.25, 0.5, 0.75];
     let inc = black_box([0.010986f32, 0.014648, 0.021973, 0.032959]);
@@ -280,6 +301,8 @@ fn main() {
     timed("biquad_bank4", 4_000_000, 1_000_000, biquad_bank4);
     timed("gain_buf", 2_048_000, 2_000, gain_buf);
     timed("gain_buf_simd4", 2_048_000, 2_000, gain_buf);
+    timed("process_buf", 2_048_000, 2_000, process_buf);
+    timed("process_buf_simd4", 2_048_000, 2_000, process_buf);
     timed("mix04", 2_000_000, 2_000_000, mix04);
     timed("biquad4", 1_000_000, 1_000_000, biquad4);
     timed("fir16", 1_000_000, 1_000_000, fir16);

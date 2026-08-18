@@ -44,6 +44,8 @@ checksum is not a result.
 | `biquad_bank4` | one DF2T biquad × 4 channels in lanes, fused via `mul_add` | relaxed-SIMD FMA + `replace` + cross-lane state |
 | `gain_buf` | scalar in-place gain over a 1024-sample `Vec<f32>` | the block-processing memory loop, per-element bounds checks |
 | `gain_buf_simd4` | the same via `Simd.load` / `x.store`, 4 lanes | vectorized buffer access, one bounds check per group |
+| `process_buf` | the gain loop behind `fn process(inp, out outp, …) @realtime` | the plugin process signature: caller-provided buffers through a checked function boundary |
+| `process_buf_simd4` | the same, four lanes at a time | the vectorized plugin process shape |
 | `mix04` | 4 saw voices × gain, summed | the DAW summing loop: adds, muls, wrap branches |
 | `biquad4` | 4 cascaded DF2T biquads | the canonical IIR workload, ~22 locals |
 | `fir16` | 16-tap FIR, unrolled shift register | the convolution shape, ~38 locals |

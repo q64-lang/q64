@@ -106,7 +106,14 @@ The language's central audio claim — "audio-thread safe, verified at
 compile time" — is currently parsed and ignored. This phase makes the
 assert half of `spec/effects.md` real.
 
-**B1. Intra-procedural assert checking.** Enforce `@no_alloc`,
+**B1. Intra-procedural assert checking.** *(First enforcement landed
+2026-08: `q64 check` verifies a declared assert set — closed under the
+implication graph — against the body's operations and its callees,
+emitting EFF100/EFF101/EFF110/EFF112; declared sets for annotated callees
+per the spec's subset rule, scanned transitive facts for unannotated
+ones. Token-scan level in `sema/check.zig`, same-file resolution; the
+HIR-level pass subsumes it later. Every `bench/` kernel's `pass` carries
+a checked `@realtime`.)* Enforce `@no_alloc`,
 `@no_suspend`, `@no_panic` (and therefore `@realtime` via the implication
 graph) against the operation table in `spec/effects.md` §"What breaks
 which assert", propagated through the existing capability-inference
@@ -123,9 +130,17 @@ operates on already-positioned buffers, allocates nothing — requires
 enough of the region pass to type `Vec<T, R>`/`Box<T, R>` against a named
 region and reject escapes (REG010); full `transfer` semantics can lag.
 
-**B3. Caller-provided buffers.** Make the `out` parameter mode work for
-`[f32]` slices, so `fn process(input: [f32], out output: [f32]) @realtime`
-is expressible and allocation-free — the universal DSP signature.
+**B3. Caller-provided buffers.** *(Landed 2026-08 on the v0 carrier:
+`fn process(input: Vec<f32>, out output: Vec<f32>, g: f32, n: i64)
+@realtime` compiles, checks, and runs — Vec parameters carry their element
+type (f32 cells), the `out`/`ref` parameter mode makes the buffer
+writable (writing through a modeless vec param is ImmutableAssign), and
+`Simd.load`/`store` work on parameter buffers. The `process_buf` kernels
+measure the boundary at ~zero cost vs the same loop inlined in `main`.
+The `[f32]`-slice spelling arrives with real slices.)* Make the `out`
+parameter mode work for `[f32]` slices, so
+`fn process(input: [f32], out output: [f32]) @realtime` is expressible
+and allocation-free — the universal DSP signature.
 
 Exit criteria: the `spec/tests/` conformance cases for EFF101/EFF102/
 EFF110/STR060 flip from `.todo` to green; a deliberately-allocating

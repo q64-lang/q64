@@ -3934,10 +3934,17 @@ fn collectCalleeParams(
             // so it has no runtime ABI and occupies no local slot.
             if (paramIsFnTyped(p)) continue;
             // A `Vec<…>` parameter: one address-width pointer (like a record),
-            // registered as a vec so `for x in xs` / `xs[i]` resolve in the body.
+            // registered as a vec so `for x in xs` / `xs[i]` resolve in the
+            // body. The element type rides along (a `Vec<f32>` param reads
+            // and writes 4-byte cells, and carries `Simd.load`/`store`), and
+            // the `out`/`ref` parameter mode makes the buffer writable —
+            // the caller-provided-buffer DSP shape
+            // (`fn process(input: Vec<f32>, out output: Vec<f32>)`).
             if (paramIsVec(b, p)) {
-                _ = try scope.declare(pn, false, .ptr);
+                const writable = if (p.mode()) |m| (m.kind == .KW_OUT or m.kind == .KW_REF) else false;
+                _ = try scope.declare(pn, writable, .ptr);
                 try scope.vecs.put(b.a, pn, {});
+                if (try vecElemType(b, p.type_())) |et| try scope.vec_elem.put(b.a, pn, et);
                 try params.append(b.a, .{ .name = pn, .ty = .ptr });
                 try rec_params.append(b.a, null);
                 continue;
@@ -4133,6 +4140,9 @@ fn registerVoidFunc(b: *Builder, owned: []const u8, fd: ast.FnDecl) BuildError!h
     } else {
         rec_params.deinit(b.a);
     }
+    // Vec-param flags, so a call site can pass a vec binding's base pointer
+    // (`process(input, output)` — value fns record these too).
+    try recordVecParams(b, id, fd);
 
     const block = try buildVoidBlock(b, fd.body() orelse return error.Unsupported, &scope);
     const extra = scope.extra();
@@ -12277,6 +12287,41 @@ test "operators: `a + b` on record bindings dispatches through the Add fit (spec
         "struct A { x: f64 }\nstruct B { x: f64 }\n" ++
             "fit A : Add {\n fn add(self, rhs: A) -> A { A { x: self.x + rhs.x } }\n}\n" ++
             "fn main {\n let a = A { x: 1.0 }\n let b = B { x: 2.0 }\n let c = a + b\n env.out(c.x)\n}\n", noLib)) == null);
+}
+
+test "vec params: out-mode buffers through a function boundary" {
+    // The canonical DSP process signature (docs/audio-roadmap.md phase B3):
+    // element type resolves through the parameter annotation (f32 cells),
+    // `out` mode makes the buffer writable, and the call passes base pointers.
+    var tr = TestResolver{ .a = testing.allocator };
+    defer tr.deinit();
+    try tr.addLib("pub fn process(inp: Vec<f32>, out outp: Vec<f32>, g: f32, n: i64) {\n" ++
+        " var i = 0\n while i < n {\n outp[i] = inp[i] * g\n i = i + 1\n }\n}\n");
+    var mod = (try buildFromSource(testing.allocator,
+        "fn main {\n var a: Vec<f32> = Vec.new()\n var o: Vec<f32> = Vec.new()\n" ++
+            " a.push(f32(2.0))\n o.push(f32(0.0))\n process(a, o, f32(0.5), 1)\n let x = o[0]\n env.out(\"{x}\")\n}\n",
+        tr.resolver())) orelse return error.TestUnexpectedResult;
+    mod.deinit();
+    // Without `out` (or `ref`) mode the parameter buffer stays read-only.
+    var tr2 = TestResolver{ .a = testing.allocator };
+    defer tr2.deinit();
+    try tr2.addLib("pub fn bad(o: Vec<f32>) {\n o[0] = f32(1.0)\n}\n");
+    try testing.expect((try buildFromSource(testing.allocator,
+        "fn main {\n var a: Vec<f32> = Vec.new()\n a.push(f32(2.0))\n bad(a)\n}\n",
+        tr2.resolver())) == null);
+    // Simd.load / x.store work on parameter buffers (in-param read,
+    // out-param write).
+    var tr3 = TestResolver{ .a = testing.allocator };
+    defer tr3.deinit();
+    try tr3.addLib("pub fn s4(inp: Vec<f32>, out outp: Vec<f32>, n: i64) {\n" ++
+        " let g = Simd.splat(f32(0.5))\n var i = 0\n while i < n {\n" ++
+        " var x = Simd.load(inp, i)\n x = x.mul(g)\n x.store(outp, i)\n i = i + 4\n }\n}\n");
+    var mod2 = (try buildFromSource(testing.allocator,
+        "fn main {\n var a: Vec<f32> = Vec.new()\n var o: Vec<f32> = Vec.new()\n var f = 0\n" ++
+            " while f < 4 {\n a.push(f32(4.0))\n o.push(f32(0.0))\n f = f + 1\n }\n" ++
+            " s4(a, o, 4)\n let x = o[0]\n env.out(\"{x}\")\n}\n",
+        tr3.resolver())) orelse return error.TestUnexpectedResult;
+    mod2.deinit();
 }
 
 test "simd: review-hardening — interpolation/comparison/annotation misuse rejects everywhere" {
