@@ -277,6 +277,51 @@ if (getValue(1) !== 3.0) throw new Error(`drive after flush ${getValue(1)}, expe
 if (getValue(0) !== 2000) throw new Error(`freq after out-of-range flush ${getValue(0)}, expected clamp to 2000`);
 console.log("ok: flush applies events, out-of-range values clamp");
 
+// ---- note events: the voice must be playable -------------------------
+const noteEvent = (type, key, velocity) => {
+  const ev = ex.malloc(40); // clap_event_note
+  mem().setUint32(ev + 0, 40, true);
+  mem().setUint32(ev + 4, 0, true); // time
+  mem().setUint16(ev + 8, 0, true); // core space
+  mem().setUint16(ev + 10, type, true); // 0 on, 1 off, 2 choke
+  mem().setUint32(ev + 12, 0, true); // flags
+  mem().setInt32(ev + 16, -1, true); // note_id
+  mem().setInt16(ev + 20, 0, true); // port_index
+  mem().setInt16(ev + 22, 0, true); // channel
+  mem().setInt16(ev + 24, key, true);
+  mem().setFloat64(ev + 32, velocity, true);
+  return ev;
+};
+const rms = (samples) => Math.sqrt(samples.reduce((a, x) => a + x * x, 0) / samples.length);
+
+// Note-on A4: pitch snaps to the equal-temperament table (exactly 440).
+pendingEvents = [noteEvent(0, 69, 1.0)];
+runBlocks(40); // settle the smoothing
+if (getValue(0) !== 440) throw new Error(`freq after note-on key 69: ${getValue(0)}, expected 440`);
+const a4 = runBlocks(40);
+const a4Period = measurePeriod(a4);
+if (Math.abs(a4Period - SR / 440) > SR / 440 * 0.1) throw new Error(`note-on period ${a4Period.toFixed(1)} samples, expected ~${(SR / 440).toFixed(1)} (440 Hz)`);
+const fullRms = rms(a4);
+
+// Velocity rides the gate: half velocity ≈ half amplitude (gain scales
+// after the clipper, so it's linear).
+pendingEvents = [noteEvent(0, 57, 0.5)];
+runBlocks(40);
+const a2s = runBlocks(40);
+const a2Period = measurePeriod(a2s);
+if (Math.abs(a2Period - SR / 220) > SR / 220 * 0.1) throw new Error(`note-on key 57 period ${a2Period.toFixed(1)} samples, expected ~${(SR / 220).toFixed(1)} (A3 = 220 Hz)`);
+const halfRms = rms(a2s);
+if (Math.abs(halfRms / fullRms - 0.5) > 0.1) throw new Error(`velocity 0.5 rms ratio ${(halfRms / fullRms).toFixed(3)}, expected ~0.5`);
+console.log(`ok: notes — key 69 -> 440 Hz (period ${a4Period.toFixed(1)}), key 57 vel 0.5 -> 220 Hz at ${(halfRms / fullRms).toFixed(2)}× amplitude`);
+
+// Note-off closes the gate; the guest's smoothing is the release ramp.
+pendingEvents = [noteEvent(1, 57, 0.0)];
+runBlocks(40);
+const tail = runBlocks(10);
+const tailRms = rms(tail);
+if (tailRms > 0.001) throw new Error(`rms ${tailRms} after note-off, expected silence`);
+console.log("ok: note-off releases to silence");
+
 P.stop(plugin);
 P.deactivate(plugin);
 P.destroy(plugin);

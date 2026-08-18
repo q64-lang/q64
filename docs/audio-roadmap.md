@@ -310,8 +310,19 @@ shims, as `wclap-host-js` does) and asserts the *audio* moved: measured
 110.0 Hz at default, 220.0 Hz after the event. The parameters are
 shim-defined pending the declared `fit X : AudioPlugin` surface
 (D1/`spec/audio-face.md`); the filter stays fixed until then
-(coefficients need trig the shim shouldn't synthesize). Native CLAP and
-AU/VST3 remain.)*
+(coefficients need trig the shim shouldn't synthesize).
+
+Note events followed — the voice is playable: note-on sets pitch from a
+wrap-time equal-temperament table (f64[128] in scratch; the shim never
+computes exp2) and opens a gate at the note velocity, note-off/choke
+close it. The gate rides a new smoothed `gain` target in the guest
+voice, so the guest's one-pole ramp IS the ~7 ms attack/release
+envelope — no envelope machinery anywhere. The event layout matches the
+reference host's Web-MIDI encoder byte-for-byte, so a hardware keyboard
+plays the synth in plinken's wclap-host unmodified; `check.mjs` proves
+key 69 → exactly 440 Hz, velocity → linear amplitude, note-off →
+silence. Monophonic; polyphony is a guest concern for later. Native
+CLAP and AU/VST3 remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the
 reference browser host, and processes audio inside budget; `q64 show

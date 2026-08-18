@@ -139,10 +139,25 @@ offset  size  field
 16      …     payload     (type-specific)
 ```
 
-v1 pins one type — `type = 5`, param-value: `param_id: u32 @16`,
-`value: f64 @40` (8-aligned; the intervening note/port/channel/key
-fields are −1 = wildcard). Note on/off and MIDI land here next; the
-queue and header do not change.
+v1 pins two payloads:
+
+- **param-value** (`type = 5`): `param_id: u32 @16`, `value: f64 @40`
+  (8-aligned; the intervening note/port/channel/key fields are −1 =
+  wildcard).
+- **note** (`type = 0` on, `1` off, `2` choke): `note_id: i32 @16`,
+  `port_index: i16 @20`, `channel: i16 @22`, `key: i16 @24` (MIDI
+  key, 0–127; out-of-range/wildcard keys are ignored),
+  `velocity: f64 @32` (8-aligned, 0–1, clamped at the boundary) —
+  40 bytes. Semantics: note-on sets the pitch (equal temperament,
+  A4 = 440 at key 69) and opens the **gate** at the velocity;
+  note-off and choke close it. The gate is a gain *target* like any
+  parameter — the guest's smoothing ramp is the attack/release
+  envelope, so v1 needs no envelope machinery on either side.
+  Monophonic in v1; voice allocation is a guest concern when
+  polyphony lands.
+
+Raw MIDI pass-through (`type = 10`, CC / pitch bend / aftertouch)
+is deferred; the queue and header do not change when it lands.
 
 In the app direction the queue lives in a guest `RingBuffer` region;
 in the plugin direction it is walked through the host's accessor
@@ -261,7 +276,7 @@ synthesis treating it like any other face — tracked there, not here.
 | block size per call, max at activation | — |
 | `v.head` header handle, stable addresses | shared-memory / multi-thread buffers |
 | params `id → f64`, guest smoothing, block snap | sample-offset automation |
-| CLAP-shaped event header, param-value type | note / MIDI event types |
+| CLAP-shaped event header, param-value + note on/off/choke | raw MIDI pass-through (CC, pitch bend); polyphony |
 | one output port, planar channels | multi-port, sidechain |
 | `f64` sample rate at activation | rate changes while active |
 | — | state save/load, GUI (webview) surface |

@@ -62,6 +62,25 @@ formatting is right for plain Hz/ratio values). The filter stays fixed
 (1 kHz Butterworth low-pass) until the declared `AudioPlugin` face lands
 — its coefficients need trig the shim shouldn't synthesize.
 
+## Notes — the voice is playable
+
+The same event walk handles CLAP note events (`spec/audio-face.md`
+§Events): **note-on** sets the pitch from a wrap-time equal-temperament
+table (`f64[128]` written into scratch by the data-init — the shim never
+computes `exp2`) and opens a gate at the note velocity; **note-off** and
+**choke** close it. The gate rides the guest voice's smoothed `gain`
+target, so the guest's one-pole ramp *is* the ~7 ms attack/release
+envelope — there is no envelope machinery in the shim or the guest.
+The gate starts at 1, so the voice free-runs until the first note
+arrives (hosts without a note source still hear it). Monophonic.
+
+The event layout matches the reference host's Web-MIDI encoder
+byte-for-byte (`apps/wclap-host/src/main.ts` `encodeClapNoteEvent`), so
+a hardware MIDI keyboard plays this synth in plinken's wclap-host with
+no adapter. `check.mjs` proves the path in audio, not bookkeeping:
+key 69 → exactly 440 Hz measured in the output, velocity 0.5 → half
+amplitude, note-off → silence.
+
 ## Check
 
 ```sh

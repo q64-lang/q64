@@ -13,7 +13,7 @@ const ex = instance.exports;
 const st = Number(ex.alloc_f32(16n));
 const io = Number(ex.alloc_f32(128n));
 const ioData = Number(ex.data_of(io));
-const args = [0.00458333, 0.000944692, 0.001889384, 0.000944692, -1.911196288, 0.914975055, 1.8];
+const args = [0.00458333, 0.000944692, 0.001889384, 0.000944692, -1.911196288, 0.914975055, 1.8, 1.0];
 
 let energy = 0, last = null, changed = false;
 for (let q = 0; q < 400; q++) {

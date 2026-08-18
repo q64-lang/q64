@@ -70,7 +70,7 @@ function currentParams(sr) {
   $("freq-out").textContent = f.toFixed(1) + " Hz";
   $("cutoff-out").textContent = c.toFixed(0) + " Hz";
   $("drive-out").textContent = d.toFixed(2) + "×";
-  return { inc: Math.fround(2 * f / sr), ...lowpassCoeffs(c, sr), drive: Math.fround(d) };
+  return { inc: Math.fround(2 * f / sr), ...lowpassCoeffs(c, sr), drive: Math.fround(d), gain: 1 };
 }
 
 let ctx = null, node = null;

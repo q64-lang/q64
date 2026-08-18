@@ -36,7 +36,7 @@ class Q64VoiceProcessor extends AudioWorkletProcessor {
     const n = Math.min(out.length, IO_CAP);
     const p = this.params;
     this.ex.process(this.stHead, this.ioHead, BigInt(n),
-      p.inc, p.b0, p.b1, p.b2, p.a1, p.a2, p.drive);
+      p.inc, p.b0, p.b1, p.b2, p.a1, p.a2, p.drive, p.gain ?? 1);
     out.set(new Float32Array(this.ex.memory.buffer, this.ioData, n));
     for (let ch = 1; ch < outputs[0].length; ch++) outputs[0][ch].set(out);
     return true;

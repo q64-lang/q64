@@ -11,7 +11,7 @@
 //!
 //! v0 plugin convention — the wrapped module must export:
 //!   alloc_f32(n: i64) -> i64                  // a state buffer, by v.head
-//!   process(st, io, n: i64, inc, b0, b1, b2, a1, a2, drive) -> i64
+//!   process(st, io, n: i64, inc, b0, b1, b2, a1, a2, drive, gain) -> i64
 //! (the `examples/audio-worklet` surface). The shim allocates the state
 //! vec at plugin.init, and at process() builds a vec *header* over the
 //! host's channel-0 buffer so the q64 code writes the host memory
@@ -30,6 +30,13 @@
 //! accuracy is a recorded deferral). The filter stays fixed until the
 //! declared plugin surface lands (coefficients need trig the shim
 //! shouldn't synthesize).
+//!
+//! Note events make the voice playable: note-on sets the pitch from a
+//! wrap-time equal-temperament table (f64[128] in scratch — the shim
+//! never computes exp2) and opens the gate at the note velocity;
+//! note-off/choke close it. The gate rides the guest `gain` target, so
+//! the guest's one-pole smoothing IS the ~7 ms attack/release envelope.
+//! The gate starts at 1: the voice free-runs until the first note.
 //!
 //! Layout: shim structs + strings live in a scratch block at SCRATCH
 //! (896 KiB — between the scope arena, which grows up from the static
@@ -79,7 +86,8 @@ const AUDIO_PORTS: u32 = 144; // clap_plugin_audio_ports: 2 fn ptrs = 8
 const FEATURES: u32 = 160; // const char*[3]: two features + null
 const IO_HDR: u32 = 176; // scratch Vec<f32> header {data, len, cap}
 const PARAMS_EXT: u32 = 200; // clap_plugin_params: 6 fn ptrs = 24
-const STRINGS: u32 = 224;
+const NOTE_TABLE: u32 = 224; // f64[128]: equal-temperament Hz per MIDI key
+const STRINGS: u32 = NOTE_TABLE + 128 * 8;
 
 // ---- table indices (order of `shim_funcs` below) ----------------------
 // Base 1: a host that null-checks a CLAP fn pointer must not see index 0.
@@ -211,6 +219,10 @@ pub fn wclapWrap(allocator: std.mem.Allocator, wasm: []const u8, wasm64: bool, m
     // The current parameter targets (the guest smooths them in-state).
     _ = c.BinaryenAddGlobal(m, "__wclap_freq", b.f64t, true, c.BinaryenConst(m, c.BinaryenLiteralFloat64(FREQ_DEFAULT)));
     _ = c.BinaryenAddGlobal(m, "__wclap_drive", b.f64t, true, c.BinaryenConst(m, c.BinaryenLiteralFloat64(DRIVE_DEFAULT)));
+    // The note gate: note-on sets it to the velocity, note-off to 0. It
+    // starts at 1 so the voice free-runs until the first note event —
+    // hosts without a note source still hear the plugin.
+    _ = c.BinaryenAddGlobal(m, "__wclap_gate", b.f64t, true, c.BinaryenConst(m, c.BinaryenLiteralFloat64(1.0)));
 
     // ---- malloc / free ------------------------------------------------
     // The host allocates id strings, event lists, and the clap_process
@@ -414,6 +426,10 @@ fn addProcess(b: B) void {
         cf(b, 0.000944692), cf(b, 0.001889384), cf(b, 0.000944692),
         cf(b, -1.911196288), cf(b, 0.914975055),
         c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_drive", b.f64t)),
+        // gain = the note gate (velocity while a note is held, 0 after
+        // note-off, 1 free-running); the guest smooths it — that ramp IS
+        // the ~7 ms attack/release envelope.
+        c.BinaryenUnary(m, c.BinaryenDemoteFloat64(), c.BinaryenGlobalGet(m, "__wclap_gate", b.f64t)),
     };
     var evargs = [_]c.BinaryenExpressionRef{b.load32(32, b.get(P, b.i32t))};
     var body = [_]c.BinaryenExpressionRef{
@@ -477,15 +493,17 @@ fn addPortsFns(b: B, stereo: u32) void {
 }
 
 /// `__wclap_apply_events(in_events*)` — walk a host `clap_input_events`
-/// list and update the parameter targets. The list's size/get members are
-/// *host* callbacks the host installed into our table (that's why the
-/// table must be growable), so the only way to reach them is
-/// `call_indirect` — the one place the shim calls back out.
+/// list and update the parameter/note targets. The list's size/get
+/// members are *host* callbacks the host installed into our table
+/// (that's why the table must be growable), so the only way to reach
+/// them is `call_indirect` — the one place the shim calls back out.
 /// clap_input_events (wasm32): ctx @0, size @4, get @8.
 /// clap_event_header: size @0, time @4, space_id u16 @8, type u16 @10,
 /// flags @12. clap_event_param_value: header(16) + param_id @16,
 /// cookie @20, note_id @24, port_index @28, channel @30, key @32,
-/// value f64 @40 (8-aligned).
+/// value f64 @40 (8-aligned). clap_event_note: header(16) +
+/// note_id @16, port_index @20, channel @22, key i16 @24,
+/// velocity f64 @32 (8-aligned).
 fn addApplyEvents(b: B) void {
     const m = b.m;
     const LIST = 0; // param
@@ -493,6 +511,8 @@ fn addApplyEvents(b: B) void {
     const I = 2;
     const EV = 3;
     const PID = 4;
+    const TYPE = 5;
+    const KEY = 6;
     const clampSet = struct {
         fn f(bb: B, global: [*:0]const u8, ev_local: u32, lo: f64, hi: f64) c.BinaryenExpressionRef {
             const mm = bb.m;
@@ -501,28 +521,63 @@ fn addApplyEvents(b: B) void {
             return c.BinaryenGlobalSet(mm, global, clamped);
         }
     }.f;
+    const typeIs = struct {
+        fn f(bb: B, t: i64) c.BinaryenExpressionRef {
+            return c.BinaryenBinary(bb.m, c.BinaryenEqInt32(), bb.get(TYPE, bb.i32t), bb.ci32(t));
+        }
+    }.f;
     var size_args = [_]c.BinaryenExpressionRef{b.get(LIST, b.i32t)};
     var get_args = [_]c.BinaryenExpressionRef{ b.get(LIST, b.i32t), b.get(I, b.i32t) };
     var p1 = [_]c.BinaryenType{b.i32t};
     var p2 = [_]c.BinaryenType{ b.i32t, b.i32t };
-    const is_param_value = c.BinaryenBinary(
-        m,
-        c.BinaryenAndInt32(),
-        c.BinaryenUnary(m, c.BinaryenEqZInt32(), c.BinaryenLoad(m, 2, false, 8, 0, b.i32t, b.get(EV, b.i32t), null)), // CLAP_CORE_EVENT_SPACE_ID
-        c.BinaryenBinary(m, c.BinaryenEqInt32(), c.BinaryenLoad(m, 2, false, 10, 0, b.i32t, b.get(EV, b.i32t), null), b.ci32(5)), // CLAP_EVENT_PARAM_VALUE
-    );
+    // param-value (type 5): route by param id, clamped.
+    var param_body = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(m, PID, b.load32(16, b.get(EV, b.i32t))),
+        c.BinaryenIf(
+            m,
+            c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(PID, b.i32t)),
+            clampSet(b, "__wclap_freq", EV, FREQ_MIN, FREQ_MAX),
+            c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenEqInt32(), b.get(PID, b.i32t), b.ci32(1)), clampSet(b, "__wclap_drive", EV, DRIVE_MIN, DRIVE_MAX), null),
+        ),
+    };
+    // note-on (type 0): pitch from the equal-temperament table, gate from
+    // the velocity. Ignore wildcard/out-of-range keys ((key & ~127) != 0).
+    var note_on_body = [_]c.BinaryenExpressionRef{
+        c.BinaryenLocalSet(m, KEY, c.BinaryenLoad(m, 2, true, 24, 0, b.i32t, b.get(EV, b.i32t), null)),
+        c.BinaryenIf(
+            m,
+            c.BinaryenUnary(m, c.BinaryenEqZInt32(), c.BinaryenBinary(m, c.BinaryenAndInt32(), b.get(KEY, b.i32t), b.ci32(~@as(i64, 127)))),
+            c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
+                c.BinaryenGlobalSet(m, "__wclap_freq", c.BinaryenLoad(m, 8, false, SCRATCH + NOTE_TABLE, 0, b.f64t, c.BinaryenBinary(m, c.BinaryenShlInt32(), b.get(KEY, b.i32t), b.ci32(3)), null)),
+                c.BinaryenGlobalSet(m, "__wclap_gate", c.BinaryenBinary(m, c.BinaryenMaxFloat64(), c.BinaryenBinary(m, c.BinaryenMinFloat64(), c.BinaryenLoad(m, 8, false, 32, 0, b.f64t, b.get(EV, b.i32t), null), c.BinaryenConst(m, c.BinaryenLiteralFloat64(1.0))), c.BinaryenConst(m, c.BinaryenLiteralFloat64(0.0)))),
+            }), 2, b.none),
+            null,
+        ),
+    };
     var iter_body = [_]c.BinaryenExpressionRef{
         c.BinaryenLocalSet(m, EV, c.BinaryenCallIndirect(m, "__indirect_function_table", b.load32(8, b.get(LIST, b.i32t)), @ptrCast(&get_args), get_args.len, c.BinaryenTypeCreate(&p2, p2.len), b.i32t)),
         c.BinaryenIf(
             m,
-            c.BinaryenBinary(m, c.BinaryenAndInt32(), c.BinaryenBinary(m, c.BinaryenNeInt32(), b.get(EV, b.i32t), b.ci32(0)), is_param_value),
+            // core-space events only (ev != 0 && space_id == 0)
+            c.BinaryenBinary(m, c.BinaryenAndInt32(), c.BinaryenBinary(m, c.BinaryenNeInt32(), b.get(EV, b.i32t), b.ci32(0)), c.BinaryenUnary(m, c.BinaryenEqZInt32(), c.BinaryenLoad(m, 2, false, 8, 0, b.i32t, b.get(EV, b.i32t), null))),
             c.BinaryenBlock(m, null, @constCast(&[_]c.BinaryenExpressionRef{
-                c.BinaryenLocalSet(m, PID, b.load32(16, b.get(EV, b.i32t))),
+                c.BinaryenLocalSet(m, TYPE, c.BinaryenLoad(m, 2, false, 10, 0, b.i32t, b.get(EV, b.i32t), null)),
                 c.BinaryenIf(
                     m,
-                    c.BinaryenUnary(m, c.BinaryenEqZInt32(), b.get(PID, b.i32t)),
-                    clampSet(b, "__wclap_freq", EV, FREQ_MIN, FREQ_MAX),
-                    c.BinaryenIf(m, c.BinaryenBinary(m, c.BinaryenEqInt32(), b.get(PID, b.i32t), b.ci32(1)), clampSet(b, "__wclap_drive", EV, DRIVE_MIN, DRIVE_MAX), null),
+                    typeIs(b, 5), // CLAP_EVENT_PARAM_VALUE
+                    c.BinaryenBlock(m, null, @ptrCast(&param_body), param_body.len, b.none),
+                    c.BinaryenIf(
+                        m,
+                        typeIs(b, 0), // CLAP_EVENT_NOTE_ON
+                        c.BinaryenBlock(m, null, @ptrCast(&note_on_body), note_on_body.len, b.none),
+                        c.BinaryenIf(
+                            m,
+                            // NOTE_OFF (1) or NOTE_CHOKE (2) both close the gate
+                            c.BinaryenBinary(m, c.BinaryenOrInt32(), typeIs(b, 1), typeIs(b, 2)),
+                            c.BinaryenGlobalSet(m, "__wclap_gate", c.BinaryenConst(m, c.BinaryenLiteralFloat64(0.0))),
+                            null,
+                        ),
+                    ),
                 ),
             }), 2, b.none),
             null,
@@ -542,7 +597,7 @@ fn addApplyEvents(b: B) void {
         c.BinaryenLocalSet(m, I, b.ci32(0)),
         loop,
     };
-    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t, b.i32t };
+    var vt = [_]c.BinaryenType{ b.i32t, b.i32t, b.i32t, b.i32t, b.i32t, b.i32t };
     _ = c.BinaryenAddFunction(m, "__wclap_apply_events", b.i32t, b.none, @ptrCast(&vt), vt.len, c.BinaryenBlock(m, null, @ptrCast(&body), body.len, b.none));
 }
 
@@ -695,6 +750,13 @@ fn addDataInit(allocator: std.mem.Allocator, b: B, strings: *StringTable, ds: De
         // features: ["instrument", "synthesizer", NULL]
         w(b, FEATURES + 0, ds.instrument), w(b, FEATURES + 4, ds.synth), w(b, FEATURES + 8, 0),
     });
+
+    // The equal-temperament note table: f64 Hz per MIDI key, A4 = 440 at
+    // key 69. Computed here at wrap time — the shim never needs exp2.
+    for (0..128) |key| {
+        const hz: f64 = 440.0 * std.math.pow(f64, 2.0, (@as(f64, @floatFromInt(key)) - 69.0) / 12.0);
+        try stmts.append(allocator, c.BinaryenStore(m, 8, NOTE_TABLE + @as(u32, @intCast(key)) * 8, 0, b.ci32(SCRATCH), c.BinaryenConst(m, c.BinaryenLiteralFloat64(hz)), b.f64t, null));
+    }
 
     // The interned strings, byte by byte.
     for (strings.bytes.items, 0..) |byte, i| {
