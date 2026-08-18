@@ -13,8 +13,11 @@ tests for the compiler, the stdlib, and the runtime adapters.
   [`design/example.md`](https://github.com/q64-lang/design/blob/main/example.md).
   Exercises `Signal<PCM<f32>>`, `Stream<Token<V>>`, vocab translation, and
   `@realtime` effect propagation.
-- **`audio-dsp/`** — a small synth + effects chain. Tests `q64.audio`,
-  fixed-shape SIMD kernels, and the audio-host runtime adapter.
+- **`audio-dsp/`** *(first slice exists)* — a small synth voice: `q64.audio`'s
+  saw oscillator → DF2T lowpass → soft clipper, rendered offline into a
+  caller-owned buffer (`qube run --addr wasm32` from the folder prints the
+  render's energy/peak). The SIMD-kernel and audio-host-adapter halves are
+  still planned.
 - **`3d-demo/`** — rigged character rendered with `q64.gfx` and `q64.anim`.
   Tests `Vec`/`Mat`/`Quat`, skinning, and the browser runtime adapter.
 - **`http-server/`** — minimal `q64.net` server qube targeting Wasmtime.

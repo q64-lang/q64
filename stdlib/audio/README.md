@@ -2,7 +2,16 @@
 
 Audio I/O, DSP primitives, and audio-graph plumbing.
 
-> **Status: not yet implemented.**
+> **Status: v1 implemented** — `src/lib.q` ships the first DSP building
+> blocks: stateful processors as structs with fit methods (`one_pole`
+> smoother, `biquad` DF2T, `saw` oscillator — created by constructor
+> functions, driven by `p.tick(x)` / `o.next()`), waveshapers
+> (`soft_clip`, `tanh_fast`), `denormal_flush` (wasm has no FTZ — every
+> recursive state update in the library flushes), `clamp1`, and a
+> caller-owned-buffer `delay_tick`. All f32; per-sample free functions
+> carry a checked `@realtime`. See `examples/audio-dsp/` for the smoke:
+> saw → lowpass → soft clip, rendered offline. The rest of the surface
+> below is still planned.
 
 ## Surface (planned)
 

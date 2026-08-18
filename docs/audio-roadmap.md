@@ -173,7 +173,15 @@ stream layer should do the same for any maximal `@realtime` subgraph:
   struct-of-arrays layout where lane-parallel, `relaxed_madd` in the
   filter kernels.
 
-Alongside it, **`stdlib/audio` v1**, prioritized for plugin building:
+Alongside it, **`stdlib/audio` v1**, prioritized for plugin building
+*(first slice landed 2026-08: `one_pole`, DF2T `biquad`, `saw`, caller-owned
+`delay_tick`, `soft_clip`, `tanh_fast`, `denormal_flush`, `clamp1` — all
+f32, stateful processors as structs with fit methods, per-sample free
+functions `@realtime`-checked; `examples/audio-dsp` renders a voice through
+them offline. Unblocked along the way: stateful fit methods (`self.y = …`),
+record bindings from constructors inside callee bodies, and cross-module
+method dispatch. SVF, envelopes, poly-BLEP, resamplers, FFT, and the
+coefficient-design helpers — which want `q64.math`'s f32 tier — remain)*:
 biquad + state-variable filter, delay line, poly-BLEP oscillators,
 envelopes, one-pole parameter smoother; FFT deliberately last (hardest,
 least needed for first effects). Two rules baked in from the start:

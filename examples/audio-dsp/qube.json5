@@ -1,0 +1,13 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "dev.q64.audio_dsp",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "A tiny synth voice built from q64.audio: saw oscillator into a DF2T lowpass into a soft clipper, rendered offline. The stdlib/audio smoke example the audio roadmap promised.",
+  "type": "application",
+  "entry": "src/main.q",
+
+  "dependencies": {
+    "q64.audio": { "path": "../../stdlib/audio" },
+  },
+}

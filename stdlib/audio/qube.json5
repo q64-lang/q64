@@ -1,0 +1,9 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "q64.audio",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "DSP building blocks, v1: stateful processors (one-pole smoother, DF2T biquad, saw oscillator) as structs with fit methods, waveshapers (soft_clip, tanh_fast), denormal flushing, and a caller-owned delay-line tick. All f32, all real-time-safe paths marked @realtime and checked.",
+  "type": "library",
+  "entry": "src/lib.q",
+}

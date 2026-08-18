@@ -41,6 +41,7 @@ dist/
 # qube build outputs (q64 emit / qube build); the tracked hello target/web host stays tracked
 examples/*/target/debug/
 examples/*/target/release/
+stdlib/*/target/
 examples/*/target/wasm32/
 examples/*/target/wasm64/
 

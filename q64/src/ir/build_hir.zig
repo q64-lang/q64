@@ -10493,6 +10493,19 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
                     return out;
                 }
             }
+            // A record-valued initializer (`var p = one_pole(0.5)` — a
+            // constructor call, a record literal, or a record-returning
+            // call) binds a `.ptr` local + a recs entry so field access and
+            // method dispatch resolve — the stateful-processor shape inside
+            // a callee body (`fn render(…) { var lp = biquad(…) … }`).
+            if (ls.type_() == null) {
+                if (try buildRecExpr(b, init_expr, scope)) |rv| {
+                    const ridx = try scope.declare(nm.text, ls.isVar(), .ptr);
+                    try scope.recs.put(b.a, nm.text, rv.si);
+                    out.* = .{ .let = .{ .idx = ridx, .value = rv.e } };
+                    return out;
+                }
+            }
             // A `bool` binding (`let even = n % 2 == 0`) gets a bool local; any
             // other value expression is i64. (str lets in a value body aren't
             // reached here — those functions take the str path.)
@@ -10552,6 +10565,40 @@ fn buildIntStmt(b: *Builder, stmt: ast.Stmt, scope: *Scope) BuildError!*hir.Stmt
                     break :blk bx;
                 };
                 out.* = .{ .assign = .{ .idx = loc.idx, .value = value } };
+            } else if (try findRecField(scope, tname)) |rf| {
+                // `self.y = …` / `p.x = …` in a callee body: a store at
+                // (base ptr, offset) — the stateful fit-method shape
+                // (`fn tick(self, x: f32) -> f32 { self.y = …; self.y }`).
+                // Writes through `self` are allowed like actor-state fields
+                // (the receiver is the record's base pointer); an explicit
+                // `ref self` mode arrives with the parameter-mode slice.
+                const self_recv = std.mem.startsWith(u8, tname, "self.");
+                if (!rf.mutable and !self_recv) return reject(b, .immutable_assign);
+                if (narrowRange(rf.ty) != null) {
+                    if (op.kind != .EQ) return error.Unsupported;
+                    const base0 = try b.a.create(hir.Expr);
+                    base0.* = .{ .local = .{ .idx = rf.base_idx, .ty = .ptr } };
+                    out.* = .{ .field_set = .{ .base = base0, .offset = rf.offset, .ty = rf.ty, .value = try buildNarrowValue(b, rf.ty, rhs_ast) } };
+                    return out;
+                }
+                const rhs_sc = try exprScalar(b, rhs_ast, scope);
+                if (op.kind == .EQ) {
+                    if (scalarBindTy(rhs_sc) != rf.ty) return error.Unsupported;
+                } else if (rf.ty == .f64) {
+                    if (op.kind == .PERCENT_EQ or rhs_sc != .f64) return error.Unsupported;
+                } else if (rf.ty != .i64) {
+                    return error.Unsupported;
+                }
+                const rhs = try buildIntExpr(b, rhs_ast, scope);
+                const value = if (op.kind == .EQ) rhs else blk: {
+                    const k = compoundOp(op) orelse return error.Unsupported;
+                    const bx = try b.a.create(hir.Expr);
+                    bx.* = .{ .bin = .{ .kind = k, .lhs = try recFieldExpr(b, rf), .rhs = rhs } };
+                    break :blk bx;
+                };
+                const base = try b.a.create(hir.Expr);
+                base.* = .{ .local = .{ .idx = rf.base_idx, .ty = .ptr } };
+                out.* = .{ .field_set = .{ .base = base, .offset = rf.offset, .ty = rf.ty, .value = value } };
             } else if (actorStateField(scope, tname)) |rf| {
                 // `n = …` on a bare actor-state field → a field_set on self.
                 if (rf.ty != .i64 and rf.ty != .bool and rf.ty != .f64 and rf.ty != .f32) return error.Unsupported;
