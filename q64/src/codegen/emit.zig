@@ -21,6 +21,7 @@ const ast = parser.ast;
 const ir = @import("ir");
 const sema = @import("sema");
 const component = @import("component.zig");
+pub const wclap = @import("wclap.zig");
 
 const c = @cImport({
     @cInclude("binaryen-c.h");

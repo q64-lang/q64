@@ -127,7 +127,7 @@ fn usage(io: std.Io) !void {
         \\                                     Format source in place (file or directory, recursive).
         \\                                     --stdout: read stdin (or path) and print to stdout.
         \\                                     --check: exit 64 if any file would change. --lint: report.
-        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--release] [--component] [--module name=file ...]
+        \\  emit <file.q> <out.wasm> [--addr wasm32|wasm64] [--release] [--component] [--wclap [--wclap-id id] [--wclap-name name]] [--module name=file ...]
         \\                                     Compile a q64 source file to wasm via codegen.
         \\                                     --addr selects the linear-memory address space
         \\                                     (default wasm64; wasm32 = 32-bit, WebKit/iPad).
@@ -551,6 +551,13 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     // emitted core (docs/audio-roadmap.md phase A2). Debug (the default)
     // stays pass-free.
     var want_release = false;
+    // `--wclap`: wrap the emitted core in a synthesized CLAP shim so a WCLAP
+    // browser host can load it directly (docs/audio-roadmap.md phase D). The
+    // module must export the v0 plugin convention (`alloc_f32` + `process`,
+    // the examples/audio-worklet surface). wasm32 only.
+    var want_wclap = false;
+    var wclap_id: ?[]const u8 = null;
+    var wclap_name: ?[]const u8 = null;
     // WIT rung 2: the world name + WIT package id for the synthesized `.wit`,
     // set by `qube build` from the manifest (`wit.world` / `wit.package`).
     // Null = derive from the source filename / `q64:<world>`.
@@ -575,6 +582,18 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
             want_asyncify = true;
         } else if (std.mem.eql(u8, a, "--release")) {
             want_release = true;
+        } else if (std.mem.eql(u8, a, "--wclap")) {
+            want_wclap = true;
+        } else if (std.mem.eql(u8, a, "--wclap-id")) {
+            wclap_id = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, a, "--wclap-name")) {
+            wclap_name = args_it.next() orelse {
+                try usage(io);
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, a, "--export-interface")) {
             export_interface = args_it.next() orelse {
                 try usage(io);
@@ -741,7 +760,29 @@ fn cmdEmit(gpa: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, ar
     } else asy_bytes;
     defer if (want_release) gpa.free(out_bytes);
 
-    try writeFile(io, out, out_bytes);
+    // --wclap: wrap last, so the shim survives the optimizer untouched (its
+    // table entries and start-written structs are invisible to escape
+    // analysis and must not be pruned).
+    const final_bytes = if (want_wclap) blk: {
+        var meta: emit.wclap.Meta = .{};
+        if (wclap_id) |v| meta.id = v;
+        if (wclap_name) |v| meta.name = v;
+        const wb = emit.wclap.wclapWrap(gpa, out_bytes, addr == .wasm64, meta) catch |err| {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writerStreaming(io, &buf);
+            switch (err) {
+                error.MissingExport => try w.interface.print("q64: --wclap requires the module to export `alloc_f32` and `process` (the audio-worklet plugin convention)\n", .{}),
+                error.Wasm64Unsupported => try w.interface.print("q64: --wclap requires --addr wasm32 (WCLAP hosts are browser hosts)\n", .{}),
+                else => try w.interface.print("q64: wclap wrap failed: {s}\n", .{@errorName(err)}),
+            }
+            try w.interface.flush();
+            std.process.exit(1);
+        };
+        break :blk wb;
+    } else out_bytes;
+    defer if (want_wclap) gpa.free(final_bytes);
+
+    try writeFile(io, out, final_bytes);
 
     // --component: additionally wrap the core module in a WebAssembly component,
     // written to `<out without .wasm>.component.wasm` (spec/q64-cli.md). A

@@ -245,6 +245,16 @@ currently produces no function tables and no `call_indirect` anywhere
   never on the audio path;
 - vtable structs in linear memory whose fields are table indices.
 
+*(Landed 2026-08, scoped to the wrap: `q64 emit … --wclap`
+(`q64/src/codegen/wclap.zig`) synthesizes all three as a read-back
+post-pass — an exported growable funcref table (initial 19, max 1024;
+slot 0 left null so hosts that null-check fn pointers stay honest), a
+16-byte-aligned bump `malloc`/`free` over a private region at 3 MiB
+(disjoint from the guest vec heap at 1 MiB), and the CLAP vtable structs
+written into a scratch block at 896 KiB by a start-chained data-init.
+The general emitter still produces no tables — `call_indirect` lands
+when the language needs it, not before.)*
+
 **D3. The `wclap`/`clap` build target.** None of D2 surfaces in the
 language — q64 rejects a C ABI on purpose, and plugins don't need one.
 `qube.json5` already specs `host: "audio-host"` with `formats:`; the
@@ -262,6 +272,20 @@ The conformance check must be an honest host: discover ports through the
 audio-ports extension, allocate through the plugin's own `malloc`, drive
 the real lifecycle — a validator that reaches into module internals passes
 for the wrong reasons and ships broken artifacts.
+
+*(WCLAP rung landed 2026-08 — `examples/audio-wclap`: the audio-worklet
+voice wrapped by `--wclap` into a single wasm module exporting
+`clap_entry` (i32 global), `memory`, growable `__indirect_function_table`,
+`malloc`/`free`, with `clap.plugin-factory`, the full plugin lifecycle,
+and `clap.audio-ports` (one stereo output, 276-byte info) served from
+synthesized shims; the process trampoline builds a `Vec<f32>` header over
+the host's channel-0 buffer (the `v.head` re-entry model, zero-copy) and
+mirrors channel 1. Validated by `check.mjs`, an honest minimal host per
+the rule below: 400 blocks, energy matches the worklet reference
+(~84.7/block), state persists, table grows. v0 fixes the voice parameters
+in the trampoline — `clap.params` is the next slice, and the declared
+`fit X : AudioPlugin` surface stays open in D1/`spec/audio-face.md`.
+Native CLAP and AU/VST3 remain.)*
 
 Exit criteria: the phase-C example builds as a `.wclap`, loads in the
 reference browser host, and processes audio inside budget; `q64 show
