@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>q64 audio-web</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-width: 720px; margin: 2rem auto; padding: 0 1rem;
+    background: Canvas; color: CanvasText;
+  }
+  h1 { font-size: 1.2rem; }
+  p  { line-height: 1.5; }
+  .row { display: flex; align-items: center; gap: 0.75rem; margin: 0.6rem 0; }
+  .row label { width: 6.5rem; }
+  .row input[type=range] { flex: 1; }
+  .row output { width: 6rem; text-align: right; }
+  button {
+    font: inherit; padding: 0.5rem 1.4rem; margin: 0.8rem 0.4rem 0.8rem 0;
+    cursor: pointer;
+  }
+  canvas { width: 100%; height: 140px; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); }
+  #status { opacity: 0.7; min-height: 1.4em; }
+</style>
+</head>
+<body>
+<h1>q64 audio-web — a synth voice, rendered by q64</h1>
+<p>
+  The DSP below runs in WebAssembly compiled by <code>q64</code> from
+  <code>q64.audio</code>: a sawtooth oscillator into a DF2T Butterworth
+  lowpass into a cubic soft clipper. Move a slider and the voice re-renders
+  (two seconds at 48&nbsp;kHz) through the wasm and plays through the Web
+  Audio API.
+</p>
+
+<div class="row"><label for="freq">frequency</label>
+  <input id="freq" type="range" min="0" max="1" step="0.001" value="0.25" />
+  <output id="freq-out"></output></div>
+<div class="row"><label for="cutoff">cutoff</label>
+  <input id="cutoff" type="range" min="0" max="1" step="0.001" value="0.35" />
+  <output id="cutoff-out"></output></div>
+<div class="row"><label for="drive">drive</label>
+  <input id="drive" type="range" min="0.5" max="4" step="0.01" value="1.8" />
+  <output id="drive-out"></output></div>
+
+<button id="play">play</button>
+<button id="stop">stop</button>
+<p id="status">loading wasm…</p>
+<canvas id="wave" width="1440" height="280"></canvas>
+
+<script type="module">
+// ---- q64 side -------------------------------------------------------
+// The module is stateless and its vec heap is never reclaimed in v0, so
+// each render instantiates a fresh instance (instantiation is far cheaper
+// than the render itself).
+const WASM_URL = "../target/debug/wasm32/dev.q64.audio_web.wasm";
+const SR = 48000;
+const SECONDS = 2;
+const N = SR * SECONDS;
+
+let wasmBytes = null;
+
+async function renderVoice(freqHz, cutoffHz, drive) {
+  if (!wasmBytes) {
+    wasmBytes = await (await fetch(WASM_URL)).arrayBuffer();
+  }
+  const { instance } = await WebAssembly.instantiate(wasmBytes, { env: {} });
+  const inc = (2 * freqHz) / SR;
+  const c = lowpassCoeffs(cutoffHz, SR);
+  const ptr = Number(instance.exports.render(
+    BigInt(N), Math.fround(inc),
+    c.b0, c.b1, c.b2, c.a1, c.a2, Math.fround(drive)));
+  // Copy out — the instance (and its memory) is dropped after this call.
+  return new Float32Array(instance.exports.memory.buffer, ptr, N).slice();
+}
+
+// RBJ cookbook Butterworth lowpass (Q = 1/√2), a0-normalized — the
+// coefficient design q64.audio will own once q64.math grows its f32 tier.
+function lowpassCoeffs(fc, sr) {
+  const w0 = 2 * Math.PI * (fc / sr);
+  const alpha = Math.sin(w0) / (2 * Math.SQRT1_2 * 2); // Q = 0.7071
+  const cw = Math.cos(w0);
+  const a0 = 1 + alpha;
+  return {
+    b0: Math.fround((1 - cw) / 2 / a0),
+    b1: Math.fround((1 - cw) / a0),
+    b2: Math.fround((1 - cw) / 2 / a0),
+    a1: Math.fround(-2 * cw / a0),
+    a2: Math.fround((1 - alpha) / a0),
+  };
+}
+
+// ---- UI -------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const status = $("status");
+const logRange = (v, lo, hi) => lo * Math.pow(hi / lo, v);
+const readFreq = () => logRange(parseFloat($("freq").value), 55, 880);
+const readCutoff = () => logRange(parseFloat($("cutoff").value), 200, 8000);
+const readDrive = () => parseFloat($("drive").value);
+
+let audioCtx = null;
+let source = null;
+let renderSeq = 0;
+
+function drawWave(samples) {
+  const cv = $("wave"), ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.strokeStyle = getComputedStyle(document.body).color;
+  ctx.beginPath();
+  const window_ = Math.floor(SR / 20); // ~50 ms
+  for (let x = 0; x < cv.width; x++) {
+    const s = samples[Math.floor((x / cv.width) * window_)];
+    const y = (1 - s) * cv.height / 2;
+    if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+async function rerender(play) {
+  const seq = ++renderSeq;
+  const f = readFreq(), c = readCutoff(), d = readDrive();
+  $("freq-out").textContent = f.toFixed(1) + " Hz";
+  $("cutoff-out").textContent = c.toFixed(0) + " Hz";
+  $("drive-out").textContent = d.toFixed(2) + "×";
+  status.textContent = "rendering…";
+  const t0 = performance.now();
+  const samples = await renderVoice(f, c, d);
+  if (seq !== renderSeq) return; // a newer render superseded this one
+  const ms = (performance.now() - t0).toFixed(1);
+  drawWave(samples);
+  status.textContent = `rendered ${N} samples in ${ms} ms`;
+  document.body.dataset.rendered = "1"; // headless-smoke hook
+  if (play) {
+    audioCtx ??= new AudioContext({ sampleRate: SR });
+    const buf = audioCtx.createBuffer(1, N, SR);
+    buf.copyToChannel(samples, 0);
+    source?.stop();
+    source = audioCtx.createBufferSource();
+    source.buffer = buf;
+    source.loop = true;
+    source.connect(audioCtx.destination);
+    source.start();
+  }
+}
+
+$("play").onclick = () => rerender(true);
+$("stop").onclick = () => { source?.stop(); source = null; };
+for (const id of ["freq", "cutoff", "drive"]) {
+  $(id).oninput = () => rerender(source != null);
+}
+
+// Initial render (no audio until the user presses play — autoplay policy).
+rerender(false);
+</script>
+</body>
+</html>

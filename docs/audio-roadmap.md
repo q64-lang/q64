@@ -206,6 +206,15 @@ with the hand-written stdlib kernels it fuses.
 
 ## Phase D — delivery: `env.audio` and a plugin target
 
+*(First delivery step landed 2026-08 ahead of D1–D3:
+`examples/audio-web` puts q64 audio in a browser — the `q64.audio` voice
+compiled to wasm32, called from a page through a plain `pub fn
+render(…) -> i64` export returning a `buf.ptr` address, played via the Web
+Audio API with live frequency/cutoff/drive sliders (~100 ms per 2-second
+debug render). It is the offline-render half of the browser story and
+needed no new ABI; the live AudioWorklet half is what D1–D3 below exist
+for.)*
+
 **D1. Spec the `env.audio` wire format** — the recorded next step in
 todo.md §"Host ABI for non-trivial faces", and the first capability face
 too structured for a raw ptr+len convention. Proposed shape, to be pinned

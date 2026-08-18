@@ -1,0 +1,13 @@
+{
+  "$schema": "https://q64.dev/schema/qube.json5",
+  "name": "dev.q64.audio_web",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "The audio-dsp synth voice as a browser-callable library: render(...) fills a buffer with one saw → lowpass → soft-clip voice and returns its address; web/index.html plays it through the Web Audio API. The first q64 audio in a browser.",
+  "type": "library",
+  "entry": "src/lib.q",
+
+  "dependencies": {
+    "q64.audio": { "path": "../../stdlib/audio" },
+  },
+}

@@ -18,6 +18,10 @@ tests for the compiler, the stdlib, and the runtime adapters.
   caller-owned buffer (`qube run --addr wasm32` from the folder prints the
   render's energy/peak). The SIMD-kernel and audio-host-adapter halves are
   still planned.
+- **`audio-web/`** — the same voice in a browser: a library qube exporting
+  `render(…) -> i64`, and a page with frequency/cutoff/drive sliders that
+  re-renders through the wasm and plays via the Web Audio API. `node
+  test.mjs` smokes the samples without a browser.
 - **`3d-demo/`** — rigged character rendered with `q64.gfx` and `q64.anim`.
   Tests `Vec`/`Mat`/`Quat`, skinning, and the browser runtime adapter.
 - **`http-server/`** — minimal `q64.net` server qube targeting Wasmtime.
