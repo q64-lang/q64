@@ -7,8 +7,10 @@ Audio I/O, DSP primitives, and audio-graph plumbing.
 > smoother, `biquad` DF2T, `saw` oscillator — created by constructor
 > functions, driven by `p.tick(x)` / `o.next()`), waveshapers
 > (`soft_clip`, `tanh_fast`), `denormal_flush` (wasm has no FTZ — every
-> recursive state update in the library flushes), `clamp1`, and a
-> caller-owned-buffer `delay_tick`. All f32; per-sample free functions
+> recursive state update in the library flushes), `clamp1`, a
+> caller-owned-buffer `delay_tick`, and turns-domain trig for in-guest
+> filter-coefficient math (`sin2pi`/`cos2pi`, endpoint-constrained
+> degree-7 polynomials, |err| < ~1e-6 on [0, 0.5] — no libm). All f32; per-sample free functions
 > carry a checked `@realtime`. See `examples/audio-dsp/` for the smoke:
 > saw → lowpass → soft clip, rendered offline. The rest of the surface
 > below is still planned.
